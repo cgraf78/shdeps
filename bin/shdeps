@@ -99,7 +99,10 @@ cmd_list() {
     pkg)
       local resolved
       resolved=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
-      if _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved"; then
+      if [[ "$resolved" == "NONE" ]]; then
+        status="skipped"
+        details="(pkg manager)"
+      elif _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved"; then
         status="installed"
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
@@ -161,7 +164,10 @@ cmd_check() {
     pkg)
       local resolved
       resolved=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
-      if _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved"; then
+      if [[ "$resolved" == "NONE" ]]; then
+        echo "$_name: skipped (pkg manager)"
+        return 0
+      elif _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved"; then
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
         echo "$_name: installed${ver:+ ($ver)}"
