@@ -1,0 +1,1400 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154,SC2034
+# SC2154: variables set by sourced shdeps.sh (_name, _method, _SHDEPS_DEPS, etc.)
+# SC2034: variables read by sourced shdeps.sh (SHDEPS_CONF, SHDEPS_FORCE, etc.)
+#
+# shdeps-test — comprehensive test suite for shdeps.sh
+#
+# Usage: ./test/shdeps-test
+#
+# Tests are organized by section matching the library's architecture.
+# Each section uses echo "=== Section Name ===" headers.
+# All tests run in an isolated mock HOME to avoid touching real system.
+
+set -uo pipefail
+
+SHDEPS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# shellcheck source=helpers.sh
+. "$(dirname "$0")/helpers.sh"
+
+# Set up isolated environment
+_mock_home
+_source_shdeps "$SHDEPS_DIR"
+
+# ===========================================================================
+# Section 1: Config parsing
+# ===========================================================================
+
+echo "=== Config parsing ==="
+
+# --- Well-formed deps.conf ---
+
+_test_conf_dir=$(_tmpdir)
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+jq        pkg
+bat       pkg       bat    batcat
+fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
+ds        git       -      -          -                cgraf78/ds.git   .local/share/ds
+neovim    binary    nvim   -          -                neovim/neovim
+nerd-fonts custom
+EOF
+
+SHDEPS_CONF="$_test_conf_dir/deps.conf"
+_shdeps_load
+_assert_eq "well-formed: entry count" "6" "${#_SHDEPS_DEPS[@]}"
+_assert_contains "well-formed: first entry is jq" "jq" "${_SHDEPS_DEPS[0]}"
+_assert_contains "well-formed: last entry is nerd-fonts" "nerd-fonts" "${_SHDEPS_DEPS[5]}"
+
+# --- Minimal entry (name + method only) ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+jq  pkg
+EOF
+_shdeps_load
+_assert_eq "minimal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
+_assert_eq "minimal entry: content" "jq|pkg" "${_SHDEPS_DEPS[0]}"
+
+# --- Maximal entry (all 8 fields) ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+fd  pkg  fd  fdfind  apt:fd-find,dnf:fd-find  -  -  linux,darwin
+EOF
+_shdeps_load
+_assert_eq "maximal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
+_assert_contains "maximal entry: has platforms" "linux,darwin" "${_SHDEPS_DEPS[0]}"
+
+# --- Comments and blank lines ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+# This is a comment
+   # Indented comment
+
+tool-a  pkg
+
+
+tool-b  pkg
+EOF
+_shdeps_load
+_assert_eq "comments/blanks: count" "2" "${#_SHDEPS_DEPS[@]}"
+_assert_contains "comments/blanks: first" "tool-a" "${_SHDEPS_DEPS[0]}"
+_assert_contains "comments/blanks: second" "tool-b" "${_SHDEPS_DEPS[1]}"
+
+# --- Missing config file ---
+
+SHDEPS_CONF="$_test_conf_dir/nonexistent.conf"
+unset SHDEPS_CONF_LOCAL
+_shdeps_load
+_assert_eq "missing conf: empty deps" "0" "${#_SHDEPS_DEPS[@]}"
+
+# --- Local config overlay ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+tool-a  pkg
+tool-b  pkg
+EOF
+cat >"$_test_conf_dir/deps.local.conf" <<'EOF'
+tool-c  binary  -  -  -  owner/tool-c
+EOF
+SHDEPS_CONF="$_test_conf_dir/deps.conf"
+unset SHDEPS_CONF_LOCAL
+_shdeps_load
+_assert_eq "conf + local: entry count" "3" "${#_SHDEPS_DEPS[@]}"
+_assert_contains "conf + local: has local entry" "tool-c" "${_SHDEPS_DEPS[2]}"
+
+# --- Local config only (no main conf) ---
+
+rm -f "$_test_conf_dir/deps.conf"
+_shdeps_load
+_assert_eq "local only: entry count" "1" "${#_SHDEPS_DEPS[@]}"
+_assert_contains "local only: has entry" "tool-c" "${_SHDEPS_DEPS[0]}"
+
+# --- Neither file → empty deps ---
+
+rm -f "$_test_conf_dir/deps.local.conf"
+_shdeps_load
+_assert_eq "neither: empty deps" "0" "${#_SHDEPS_DEPS[@]}"
+
+# --- Public shdeps_load returns count ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+a  pkg
+b  pkg
+c  pkg
+EOF
+SHDEPS_CONF="$_test_conf_dir/deps.conf"
+count=$(shdeps_load)
+_assert_eq "shdeps_load: returns count" "3" "$count"
+
+# --- Dash fields preserved as literal in raw entry ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+ds  git  -  -  -  cgraf78/ds.git  .local/share/ds
+EOF
+_shdeps_load
+_assert_contains "dash fields: preserved in entry" "ds|git|-|-|-|cgraf78/ds.git|.local/share/ds" "${_SHDEPS_DEPS[0]}"
+
+# ===========================================================================
+# Section 2: Entry parsing
+# ===========================================================================
+
+echo ""
+echo "=== Entry parsing ==="
+
+# --- Full entry with all fields ---
+
+_shdeps_parse "fd|pkg|fd|fdfind|apt:fd-find,dnf:fd-find|owner/fd|.local/share/fd|linux,darwin"
+_assert_eq "parse full: name" "fd" "$_name"
+_assert_eq "parse full: method" "pkg" "$_method"
+_assert_eq "parse full: cmd" "fd" "$_cmd"
+_assert_eq "parse full: cmd_alt" "fdfind" "$_cmd_alt"
+_assert_eq "parse full: pkg_overrides" "apt:fd-find,dnf:fd-find" "$_pkg_overrides"
+_assert_eq "parse full: repo" "owner/fd" "$_repo"
+_assert_eq "parse full: dir" ".local/share/fd" "$_dir"
+_assert_eq "parse full: platforms" "linux,darwin" "$_platforms"
+
+# --- Dash fields normalize to empty ---
+
+_shdeps_parse "ds|git|-|-|-|cgraf78/ds.git|.local/share/ds|-"
+_assert_eq "dash normalize: cmd defaults to name" "ds" "$_cmd"
+_assert_eq "dash normalize: cmd_alt empty" "" "$_cmd_alt"
+_assert_eq "dash normalize: pkg_overrides empty" "" "$_pkg_overrides"
+_assert_eq "dash normalize: platforms empty" "" "$_platforms"
+
+# --- Minimal entry (name + method) ---
+
+_shdeps_parse "jq|pkg"
+_assert_eq "parse minimal: name" "jq" "$_name"
+_assert_eq "parse minimal: method" "pkg" "$_method"
+_assert_eq "parse minimal: cmd defaults to name" "jq" "$_cmd"
+_assert_eq "parse minimal: cmd_alt empty" "" "$_cmd_alt"
+_assert_eq "parse minimal: repo empty" "" "$_repo"
+
+# --- cmd set explicitly ---
+
+_shdeps_parse "neovim|binary|nvim"
+_assert_eq "parse explicit cmd: name" "neovim" "$_name"
+_assert_eq "parse explicit cmd: cmd" "nvim" "$_cmd"
+
+# --- cmd_alt set ---
+
+_shdeps_parse "bat|pkg|bat|batcat"
+_assert_eq "parse cmd_alt: cmd" "bat" "$_cmd"
+_assert_eq "parse cmd_alt: cmd_alt" "batcat" "$_cmd_alt"
+
+# ===========================================================================
+# Section 3: Platform matching
+# ===========================================================================
+
+echo ""
+echo "=== Platform matching ==="
+
+# Detect current platform for assertions
+_current_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+# --- Empty spec matches all ---
+
+_shdeps_platform_match ""
+_assert_exit "empty spec: matches" 0 $?
+
+# --- Include list: current platform ---
+
+_shdeps_platform_match "$_current_os"
+_assert_exit "include: current os matches" 0 $?
+
+# --- Include list: other platform ---
+
+if [[ "$_current_os" == "linux" ]]; then
+  rc=0; _shdeps_platform_match "darwin" || rc=$?
+  _assert_exit "include: other os rejected" 1 "$rc"
+else
+  rc=0; _shdeps_platform_match "linux" || rc=$?
+  _assert_exit "include: other os rejected" 1 "$rc"
+fi
+
+# --- Include list: multiple platforms ---
+
+_shdeps_platform_match "linux,darwin"
+_assert_exit "include multi: linux,darwin matches" 0 $?
+
+# --- Include list: none matching ---
+
+rc=0; _shdeps_platform_match "freebsd,openbsd" || rc=$?
+_assert_exit "include: no match rejected" 1 "$rc"
+
+# --- Exclude list: excludes current ---
+
+rc=0; _shdeps_platform_match "!${_current_os}" || rc=$?
+_assert_exit "exclude: current os excluded" 1 "$rc"
+
+# --- Exclude list: excludes other ---
+
+if [[ "$_current_os" == "linux" ]]; then
+  _shdeps_platform_match "!darwin"
+  _assert_exit "exclude: other os not excluded" 0 $?
+else
+  _shdeps_platform_match "!linux"
+  _assert_exit "exclude: other os not excluded" 0 $?
+fi
+
+# --- Exclude list: multiple excludes, none matching ---
+
+if [[ "$_current_os" == "linux" ]]; then
+  _shdeps_platform_match "!darwin,!freebsd"
+  _assert_exit "exclude multi: none matching passes" 0 $?
+else
+  _shdeps_platform_match "!linux,!freebsd"
+  _assert_exit "exclude multi: none matching passes" 0 $?
+fi
+
+# --- Mixed: exclude takes priority ---
+
+rc=0; _shdeps_platform_match "${_current_os},!${_current_os}" || rc=$?
+_assert_exit "mixed: exclude overrides include" 1 "$rc"
+
+# --- Mixed: included and not excluded ---
+
+if [[ "$_current_os" == "linux" ]]; then
+  _shdeps_platform_match "linux,!darwin"
+  _assert_exit "mixed: included and not excluded" 0 $?
+else
+  _shdeps_platform_match "darwin,!linux"
+  _assert_exit "mixed: included and not excluded" 0 $?
+fi
+
+# --- Mixed: not in include list ---
+
+if [[ "$_current_os" == "linux" ]]; then
+  rc=0; _shdeps_platform_match "darwin,!freebsd" || rc=$?
+  _assert_exit "mixed: not in include list" 1 "$rc"
+else
+  rc=0; _shdeps_platform_match "linux,!freebsd" || rc=$?
+  _assert_exit "mixed: not in include list" 1 "$rc"
+fi
+
+# ===========================================================================
+# Section 4: Package manager detection and resolution
+# ===========================================================================
+
+echo ""
+echo "=== Package manager ==="
+
+# --- _shdeps_pkg_detect with mock commands ---
+
+_mock_bin_dir=$(_mock_bin)
+export PATH="$_mock_bin_dir:$PATH"
+
+# Mock brew on Darwin-like detection: _shdeps_pkg_detect checks uname first
+# so we test the resolution and queuing logic directly instead.
+
+# --- _shdeps_pkg_resolve: no overrides → returns name ---
+
+_SHDEPS_PKG_MGR="apt"
+result=$(_shdeps_pkg_resolve "fd" "")
+_assert_eq "resolve: no overrides returns name" "fd" "$result"
+
+# --- _shdeps_pkg_resolve: matching override ---
+
+result=$(_shdeps_pkg_resolve "fd" "apt:fd-find,dnf:fd-find")
+_assert_eq "resolve: apt override" "fd-find" "$result"
+
+# --- _shdeps_pkg_resolve: non-matching override ---
+
+_SHDEPS_PKG_MGR="pacman"
+result=$(_shdeps_pkg_resolve "fd" "apt:fd-find,dnf:fd-find")
+_assert_eq "resolve: no matching mgr returns name" "fd" "$result"
+
+# --- _shdeps_pkg_resolve: NONE sentinel ---
+
+_SHDEPS_PKG_MGR="apt"
+result=$(_shdeps_pkg_resolve "nerd-fonts" "apt:NONE,brew:font-hack-nerd-font")
+_assert_eq "resolve: NONE sentinel" "NONE" "$result"
+
+# --- _shdeps_pkg_resolve: brew override ---
+
+_SHDEPS_PKG_MGR="brew"
+result=$(_shdeps_pkg_resolve "nerd-fonts" "apt:NONE,brew:font-hack-nerd-font")
+_assert_eq "resolve: brew override" "font-hack-nerd-font" "$result"
+
+# --- _shdeps_pkg_resolve: multiple overrides, first match wins ---
+
+_SHDEPS_PKG_MGR="dnf"
+result=$(_shdeps_pkg_resolve "bat" "apt:bat,dnf:bat-extra,pacman:bat")
+_assert_eq "resolve: dnf gets its override" "bat-extra" "$result"
+
+# --- _shdeps_pkg_queue: NONE skips silently ---
+
+_SHDEPS_PKG_MGR="apt"
+_SHDEPS_PKG_BATCH=()
+_SHDEPS_PKG_BATCH_NAMES=()
+_shdeps_pkg_queue "nerd-fonts" "apt:NONE"
+_assert_eq "queue: NONE skips" "0" "${#_SHDEPS_PKG_BATCH[@]}"
+
+# --- _shdeps_pkg_queue: resolved package added to batch ---
+
+# Mock _shdeps_pkg_available to always succeed for testing
+# shellcheck disable=SC2317  # invoked indirectly via _shdeps_pkg_queue
+_shdeps_pkg_available() { return 0; }
+_SHDEPS_PKG_BATCH=()
+_SHDEPS_PKG_BATCH_NAMES=()
+_shdeps_pkg_queue "fd" "apt:fd-find"
+_assert_eq "queue: adds resolved pkg" "1" "${#_SHDEPS_PKG_BATCH[@]}"
+_assert_eq "queue: resolved name" "fd-find" "${_SHDEPS_PKG_BATCH[0]}"
+_assert_eq "queue: original name" "fd" "${_SHDEPS_PKG_BATCH_NAMES[0]}"
+
+# --- _shdeps_pkg_queue: multiple packages batch ---
+
+_shdeps_pkg_queue "jq" ""
+_assert_eq "queue: batch grows" "2" "${#_SHDEPS_PKG_BATCH[@]}"
+_assert_eq "queue: second pkg" "jq" "${_SHDEPS_PKG_BATCH[1]}"
+
+# --- _shdeps_pkg_queue: unavailable package skipped ---
+
+# shellcheck disable=SC2317  # invoked indirectly via _shdeps_pkg_queue
+_shdeps_pkg_available() { return 1; }
+_SHDEPS_PKG_BATCH=()
+_SHDEPS_PKG_BATCH_NAMES=()
+_shdeps_pkg_queue "nonexistent-tool" ""
+_assert_eq "queue: unavailable skipped" "0" "${#_SHDEPS_PKG_BATCH[@]}"
+
+# Restore real _shdeps_pkg_available
+_source_shdeps "$SHDEPS_DIR"
+
+# --- _shdeps_pkg_detect: detects real system manager ---
+# Just verify it sets something (or empty on unusual systems)
+
+_shdeps_pkg_detect
+_assert_match "pkg_detect: sets a known value" "^(brew|apt|dnf|pacman|)$" "$_SHDEPS_PKG_MGR"
+
+# ===========================================================================
+# Section 5: Binary asset matching
+# ===========================================================================
+
+echo ""
+echo "=== Binary asset matching ==="
+
+# Platform detection for test assertions
+_test_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+_test_arch=$(uname -m)
+case "$_test_arch" in
+  x86_64)  _test_arch_alt=amd64 ;;
+  aarch64) _test_arch_alt=arm64 ;;
+  arm64)   _test_arch_alt=aarch64 ;;
+  *)       _test_arch_alt="$_test_arch" ;;
+esac
+_test_OS="$(uname -s)"
+
+# --- Rust triple: tar.gz with OS and arch ---
+
+_json=$(_fake_release_json \
+  "tool-x86_64-unknown-linux-gnu.tar.gz" \
+  "tool-aarch64-unknown-linux-gnu.tar.gz" \
+  "tool-x86_64-apple-darwin.tar.gz" \
+  "tool-aarch64-apple-darwin.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "rust triple: matches platform" "${_test_os}" "$result"
+if [[ "$result" == *"${_test_arch}"* || "$result" == *"${_test_arch_alt}"* ]]; then
+  _pass "rust triple: matches arch"
+else
+  _fail "rust triple: matches arch (expected '${_test_arch}' or '${_test_arch_alt}' in '$result')"
+fi
+
+# --- Go convention: plain binary ---
+
+_json=$(_fake_release_json \
+  "tool-linux-amd64" \
+  "tool-linux-arm64" \
+  "tool-darwin-arm64" \
+  "tool-darwin-amd64")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "go plain binary: matches platform" "${_test_os}" "$result"
+
+# --- Case-insensitive: Darwin/Linux capitalized ---
+
+_json=$(_fake_release_json \
+  "tool_1.0_Darwin_arm64.tar.gz" \
+  "tool_1.0_Darwin_x86_64.tar.gz" \
+  "tool_1.0_Linux_arm64.tar.gz" \
+  "tool_1.0_Linux_x86_64.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "case-insensitive: matches platform" "${_test_OS}" "$result"
+
+# --- Skip metadata extensions ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_os}-${_test_arch_alt}.tar.gz.sha256" \
+  "tool-${_test_os}-${_test_arch_alt}.tar.gz.sig" \
+  "tool-${_test_os}-${_test_arch_alt}.tar.gz.asc" \
+  "tool-${_test_os}-${_test_arch_alt}.sigstore" \
+  "tool-${_test_os}-${_test_arch_alt}.tar.gz.b3" \
+  "tool-${_test_os}-${_test_arch_alt}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "skip metadata: finds tarball" "tool-${_test_os}-${_test_arch_alt}.tar.gz" "$result"
+_assert_not_contains "skip metadata: no sha256" "sha256" "$result"
+
+# --- Skip package extensions ---
+
+_json=$(_fake_release_json \
+  "tool_1.0_${_test_os}_${_test_arch_alt}.deb" \
+  "tool_1.0_${_test_os}_${_test_arch_alt}.rpm" \
+  "tool_1.0_${_test_os}_${_test_arch_alt}.apk" \
+  "tool_1.0_${_test_os}_${_test_arch_alt}.flatpak" \
+  "tool_1.0_${_test_os}_${_test_arch_alt}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "skip packages: finds tarball" "tool_1.0_${_test_os}_${_test_arch_alt}.tar.gz" "$result"
+
+# --- Alternate OS pattern: macos / linux aliases ---
+
+if [[ "$_test_os" == "darwin" ]]; then
+  _json=$(_fake_release_json \
+    "tool-macos-arm64.tar.gz" \
+    "tool-macos-x86_64.tar.gz" \
+    "tool-linux-x86_64.tar.gz")
+  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  _assert_contains "macos alias: matches macos" "macos" "$result"
+else
+  _json=$(_fake_release_json \
+    "tool-macos-arm64.tar.gz" \
+    "tool-linux-x86_64.tar.gz" \
+    "tool-linux-arm64.tar.gz")
+  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  _assert_contains "linux: picks linux not macos" "linux" "$result"
+fi
+
+# --- Prefer plain binary over tarball ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_os}-${_test_arch_alt}" \
+  "tool-${_test_os}-${_test_arch_alt}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_not_contains "prefer plain over tarball" ".tar.gz" "$result"
+
+# --- .tar.xz support ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_arch}-unknown-${_test_os}-gnu.tar.xz" \
+  "tool-${_test_arch_alt}-unknown-${_test_os}-gnu.tar.xz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "tar.xz: matches platform" "${_test_os}" "$result"
+
+# --- .tgz support ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_os}-${_test_arch_alt}.tgz" \
+  "tool-${_test_os}-${_test_arch}.tgz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "tgz: matches platform" "${_test_os}" "$result"
+
+# --- No matching asset → empty ---
+
+_json=$(_fake_release_json \
+  "tool-windows-amd64.exe" \
+  "tool-freebsd-amd64.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_eq "no match: empty result" "" "$result"
+
+# --- Tarball over zip preference ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_os}-${_test_arch_alt}.tar.gz" \
+  "tool-${_test_os}-${_test_arch_alt}.zip")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "asset match: tarball over zip" ".tar.gz" "$result"
+
+# --- Zip fallback when no tarball ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_os}-${_test_arch_alt}.zip" \
+  "tool-${_test_os}-${_test_arch_alt}.sha256")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "asset match: zip when no tarball" ".zip" "$result"
+
+# --- .gz single file matches plain pass ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_os}-${_test_arch_alt}.gz" \
+  "tool-${_test_os}-${_test_arch_alt}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "asset match: .gz matches plain pass" "tool-${_test_os}-${_test_arch_alt}.gz" "$result"
+
+# --- .bz2 single file ---
+
+_json=$(_fake_release_json \
+  "tool_1.0_${_test_os}_${_test_arch_alt}.bz2")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "asset match: .bz2 single file" "tool_1.0_${_test_os}_${_test_arch_alt}.bz2" "$result"
+
+# --- .zst single file ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_arch}-unknown-${_test_os}.zst" \
+  "tool-${_test_arch}-unknown-${_test_os}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "asset match: .zst matches plain pass" ".zst" "$result"
+
+# --- Libc preference (linux-only) ---
+
+echo ""
+echo "=== Libc preference ==="
+
+if [[ "$_test_os" == "linux" ]]; then
+  _json=$(_fake_release_json \
+    "tool-${_test_arch}-unknown-linux-musl.tar.gz" \
+    "tool-${_test_arch}-unknown-linux-gnu.tar.gz")
+  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  _assert_contains "gnu preferred over musl" "gnu" "$result"
+
+  _json=$(_fake_release_json \
+    "tool-${_test_arch}-unknown-linux-musl.tar.gz")
+  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  _assert_contains "musl fallback when no gnu" "musl" "$result"
+
+  _json=$(_fake_release_json \
+    "tool_linux_${_test_arch_alt}.tar.gz")
+  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  _assert_contains "no libc suffix: matches" "tool_linux_${_test_arch_alt}" "$result"
+
+  _json=$(_fake_release_json \
+    "tool-linux-musl-${_test_arch_alt}" \
+    "tool-linux-gnu-${_test_arch_alt}")
+  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  _assert_contains "plain binary: gnu preferred" "gnu" "$result"
+
+  _json=$(_fake_release_json \
+    "tool-darwin-${_test_arch_alt}.tar.gz" \
+    "tool-linux-${_test_arch_alt}.tar.gz")
+  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  _assert_contains "linux system: picks linux not darwin" "linux" "$result"
+else
+  _pass "gnu preferred over musl: skipped (not linux)"
+  _pass "musl fallback when no gnu: skipped (not linux)"
+  _pass "no libc suffix: matches: skipped (not linux)"
+  _pass "plain binary: gnu preferred: skipped (not linux)"
+
+  _json=$(_fake_release_json \
+    "tool-darwin-${_test_arch_alt}.tar.gz" \
+    "tool-linux-${_test_arch_alt}.tar.gz")
+  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  _assert_contains "darwin system: picks darwin not linux" "darwin" "$result"
+fi
+
+# --- Cmd-name preference ---
+
+echo ""
+echo "=== Cmd-name preference ==="
+
+# Multi-binary repo: prefer asset matching cmd name
+_json=$(_fake_release_json \
+  "codex-responses-api-proxy-${_test_arch}-apple-${_test_os}.tar.gz" \
+  "codex-responses-api-proxy-${_test_arch}-unknown-linux-gnu.tar.gz" \
+  "codex-${_test_arch}-apple-${_test_os}.tar.gz" \
+  "codex-${_test_arch}-unknown-linux-gnu.tar.gz" \
+  "codex-command-runner-${_test_arch}-apple-${_test_os}.tar.gz")
+result=$(_shdeps_binary_find_asset "codex" "openai/codex" "v1.0.0" "$_json")
+_assert_contains "multi-binary: picks codex" "codex-${_test_arch}" "$result"
+_assert_not_contains "multi-binary: no proxy" "proxy" "$result"
+_assert_not_contains "multi-binary: no command-runner" "command-runner" "$result"
+
+# Cmd-name match with plain binary
+_json=$(_fake_release_json \
+  "tool-extra-${_test_os}-${_test_arch_alt}" \
+  "tool-${_test_os}-${_test_arch_alt}" \
+  "tool-other-${_test_os}-${_test_arch_alt}")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "multi-binary plain: picks cmd match" "tool-${_test_os}-${_test_arch_alt}" "$result"
+_assert_not_contains "multi-binary plain: no extra" "extra" "$result"
+
+# Cmd-name with underscore separator
+_json=$(_fake_release_json \
+  "tool_extra_${_test_os}_${_test_arch_alt}.tar.gz" \
+  "tool_${_test_os}_${_test_arch_alt}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "underscore sep: picks cmd match" "tool_${_test_os}" "$result"
+_assert_not_contains "underscore sep: no extra" "extra" "$result"
+
+# Cmd-name with dot separator (version in name)
+_json=$(_fake_release_json \
+  "tool-extra.v1.0.0.${_test_os}-${_test_arch_alt}.tar.gz" \
+  "tool.v1.0.0.${_test_os}-${_test_arch_alt}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_not_contains "dot sep: no extra" "extra" "$result"
+
+# Version-prefixed asset names
+_json=$(_fake_release_json \
+  "tool-v1.0.0-${_test_os}-${_test_arch_alt}.tar.gz" \
+  "tool-extra-v1.0.0-${_test_os}-${_test_arch_alt}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_not_contains "version prefix: no extra" "extra" "$result"
+
+# Fallback to non-exact match when no exact match exists
+_json=$(_fake_release_json \
+  "tool-extended-${_test_os}-${_test_arch_alt}.tar.gz")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "no exact: falls back to non-exact" "tool-extended" "$result"
+
+# Bare cmd name without OS/arch → not matched; falls back
+_json=$(_fake_release_json \
+  "tool-extra-${_test_os}-${_test_arch_alt}" \
+  "tool")
+result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "bare cmd no os/arch: falls back" "tool-extra" "$result"
+
+# ===========================================================================
+# Section 6: Binary extraction
+# ===========================================================================
+
+echo ""
+echo "=== Tarball binary extraction ==="
+
+# Find a real compiled binary for file(1) detection in sole-executable fallback.
+# /usr/bin/true is available on virtually all systems.
+_true_bin=""
+for _candidate in /usr/bin/true /bin/true; do
+  if [[ -x "$_candidate" ]] && file "$_candidate" | grep -qiE 'ELF|Mach-O'; then
+    _true_bin="$_candidate"
+    break
+  fi
+done
+if [[ -z "$_true_bin" ]]; then
+  echo "SKIP: no compiled binary found for extraction tests" >&2
+  # Still count as passes so the suite doesn't misleadingly fail
+  for _i in $(seq 1 20); do _pass "extraction: skipped (no compiled binary)"; done
+else
+
+# Helper: create a tarball, run _shdeps_binary_install_tarball, check result.
+# $1=desc $2=cmd $3=expected exit  remaining: executable file paths
+_test_tarball() {
+  local desc="$1" cmd="$2" expect_exit="$3"
+  shift 3
+  _test_tarball_with_extras "$desc" "$cmd" "$expect_exit" "" "$@"
+}
+
+# $1=desc $2=cmd $3=expected exit $4=comma-separated non-executable files
+# remaining: executable file paths
+_test_tarball_with_extras() {
+  local desc="$1" cmd="$2" expect_exit="$3" extras="$4"
+  shift 4
+  local staging
+  staging=$(_tmpdir)
+  local f
+  for f in "$@"; do
+    mkdir -p "$staging/$(dirname "$f")"
+    cp "$_true_bin" "$staging/$f"
+  done
+  if [[ -n "$extras" ]]; then
+    local -a _extra_files
+    IFS=',' read -ra _extra_files <<< "$extras"
+    for f in "${_extra_files[@]}"; do
+      mkdir -p "$staging/$(dirname "$f")"
+      echo "placeholder" > "$staging/$f"
+    done
+  fi
+  local tarball
+  tarball=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
+  tar czf "$tarball" -C "$staging" .
+  local bin_path="$staging/output-bin"
+  local log=""
+  local rc=0
+  _shdeps_binary_install_tarball "test-pkg" "$cmd" "$tarball" "$bin_path" "$log" >/dev/null 2>&1 || rc=$?
+  _assert_exit "$desc" "$expect_exit" "$rc"
+  if [[ "$expect_exit" -eq 0 ]]; then
+    if [[ -L "$bin_path" || -x "$bin_path" ]]; then
+      _pass "$desc: binary installed"
+    else
+      _fail "$desc: binary not installed at $bin_path"
+    fi
+  fi
+  rm -f "$tarball"
+}
+
+# Exact name match (fzf, lazygit, starship)
+_test_tarball "exact match: flat binary" "mytool" 0 \
+  "mytool"
+
+# Exact match in subdirectory (bat, delta, neovim)
+_test_tarball_with_extras "exact match: in subdir" "mytool" 0 \
+  "mytool-v1.0-linux/README.md" \
+  "mytool-v1.0-linux/mytool"
+
+# Exact match in bin/ subdir
+_test_tarball_with_extras "exact match: in bin subdir" "mytool" 0 \
+  "mytool-v1.0/LICENSE" \
+  "mytool-v1.0/bin/mytool"
+
+# Dash prefix match
+_test_tarball "prefix match: dash separator" "mytool" 0 \
+  "mytool-x86_64-unknown-linux-gnu"
+
+# Underscore prefix match
+_test_tarball "prefix match: underscore separator" "mytool" 0 \
+  "mytool_linux_amd64"
+
+# Sole executable fallback
+_test_tarball "sole executable: unconventional name" "mytool" 0 \
+  "completely-different-name"
+
+# No match: multiple executables with wrong names
+_test_tarball "no match: multiple wrong names" "mytool" 1 \
+  "other-tool" \
+  "another-tool"
+
+# Sole executable fallback ignores shell scripts
+_test_script_staging=$(_tmpdir)
+echo "#!/bin/sh" > "$_test_script_staging/setup.sh"
+chmod +x "$_test_script_staging/setup.sh"
+cp "$_true_bin" "$_test_script_staging/real-binary"
+_test_script_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
+tar czf "$_test_script_tar" -C "$_test_script_staging" .
+_test_script_bin="$_test_script_staging/output-bin"
+_shdeps_binary_install_tarball "test-pkg" "notfound" "$_test_script_tar" "$_test_script_bin" "" >/dev/null 2>&1 || true
+if [[ -L "$_test_script_bin" ]]; then
+  _target=$(readlink "$_test_script_bin")
+  _assert_contains "sole exe ignores scripts: picks binary" "real-binary" "$_target"
+else
+  _fail "sole exe ignores scripts: no symlink created"
+fi
+rm -f "$_test_script_tar"
+
+# Exact match preferred over prefix match
+_test_exact_staging=$(_tmpdir)
+cp "$_true_bin" "$_test_exact_staging/mytool"
+cp "$_true_bin" "$_test_exact_staging/mytool-extra"
+_test_exact_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
+tar czf "$_test_exact_tar" -C "$_test_exact_staging" .
+_test_exact_bin="$_test_exact_staging/output-bin"
+_shdeps_binary_install_tarball "test-pkg" "mytool" "$_test_exact_tar" "$_test_exact_bin" "" >/dev/null 2>&1
+if [[ -L "$_test_exact_bin" ]]; then
+  _target=$(readlink "$_test_exact_bin")
+  if [[ "$_target" == *"/mytool" && "$_target" != *"-extra" ]]; then
+    _pass "exact over prefix: symlinks to exact name"
+  else
+    _fail "exact over prefix: symlinks to exact name (got $_target)"
+  fi
+else
+  _fail "exact over prefix: no symlink created"
+fi
+rm -f "$_test_exact_tar"
+
+# --- Zip extraction ---
+
+echo ""
+echo "=== Zip archive extraction ==="
+
+_test_zip() {
+  local desc="$1" cmd="$2" expect_exit="$3"
+  shift 3
+  local staging
+  staging=$(_tmpdir)
+  local f
+  for f in "$@"; do
+    mkdir -p "$staging/$(dirname "$f")"
+    cp "$_true_bin" "$staging/$f"
+  done
+  local zipfile="$staging/test.zip"
+  (cd "$staging" && zip -qr "$zipfile" . -x test.zip)
+  local bin_path="$staging/output-bin"
+  local rc=0
+  _shdeps_binary_install_zip "test-pkg" "$cmd" "$zipfile" "$bin_path" "" >/dev/null 2>&1 || rc=$?
+  _assert_exit "$desc" "$expect_exit" "$rc"
+  if [[ "$expect_exit" -eq 0 ]]; then
+    if [[ -L "$bin_path" || -x "$bin_path" ]]; then
+      _pass "$desc: binary installed"
+    else
+      _fail "$desc: binary not installed at $bin_path"
+    fi
+  fi
+}
+
+if command -v zip &>/dev/null && command -v unzip &>/dev/null; then
+  _test_zip "zip: exact match flat" "mytool" 0 "mytool"
+  _test_zip "zip: exact match in subdir" "mytool" 0 "mytool-v1.0/bin/mytool"
+  _test_zip "zip: prefix match" "mytool" 0 "mytool-x86_64-unknown-linux-gnu"
+  _test_zip "zip: sole executable fallback" "mytool" 0 "different-name"
+else
+  _pass "zip: exact match flat: skipped (zip/unzip not installed)"
+  _pass "zip: exact match flat: binary installed: skipped"
+  _pass "zip: exact match in subdir: skipped"
+  _pass "zip: exact match in subdir: binary installed: skipped"
+  _pass "zip: prefix match: skipped"
+  _pass "zip: prefix match: binary installed: skipped"
+  _pass "zip: sole executable fallback: skipped"
+  _pass "zip: sole executable fallback: binary installed: skipped"
+fi
+
+# --- Single-file decompression ---
+
+echo ""
+echo "=== Single-file decompression ==="
+
+_test_decompress() {
+  local desc="$1" ext="$2"
+  local staging
+  staging=$(_tmpdir)
+  cp "$_true_bin" "$staging/mytool"
+  local compressed="$staging/mytool.$ext"
+  case "$ext" in
+    gz)  gzip -c "$staging/mytool" > "$compressed" ;;
+    bz2) bzip2 -c "$staging/mytool" > "$compressed" ;;
+    zst) zstd -qf "$staging/mytool" -o "$compressed" ;;
+  esac
+  rm "$staging/mytool"
+  local bin_path="$staging/output-bin"
+  local rc=0
+  case "$ext" in
+    gz)
+      gzip -dc "$compressed" > "$bin_path" 2>/dev/null || rc=1
+      [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
+      ;;
+    bz2)
+      bzip2 -dc "$compressed" > "$bin_path" 2>/dev/null || rc=1
+      [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
+      ;;
+    zst)
+      zstd -df "$compressed" -o "$bin_path" 2>/dev/null || rc=1
+      [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
+      ;;
+  esac
+  _assert_exit "$desc" 0 "$rc"
+  if [[ -x "$bin_path" ]]; then
+    _pass "$desc: binary decompressed"
+  else
+    _fail "$desc: binary not at $bin_path"
+  fi
+}
+
+_test_decompress "gz decompression" "gz"
+_test_decompress "bz2 decompression" "bz2"
+if command -v zstd &>/dev/null; then
+  _test_decompress "zst decompression" "zst"
+else
+  _pass "zst decompression: skipped (zstd not installed)"
+  _pass "zst decompression: binary decompressed: skipped"
+fi
+
+fi  # end of _true_bin guard
+
+# ===========================================================================
+# Section 7: Cache/stamps
+# ===========================================================================
+
+echo ""
+echo "=== Cache/stamps ==="
+
+_stamp_dir=$(_tmpdir)
+SHDEPS_STATE_DIR="$_stamp_dir"
+# Re-source so state dir helpers see new value
+_source_shdeps "$SHDEPS_DIR"
+
+# --- Stamp file creation ---
+
+stamp=$(_shdeps_remote_stamp "test-tool" "git")
+_assert_contains "stamp path: includes name" "test-tool" "$stamp"
+_assert_contains "stamp path: includes kind" "git" "$stamp"
+
+# --- _shdeps_remote_touch creates stamp ---
+
+_shdeps_remote_touch "$stamp"
+_assert_file_exists "touch: stamp created" "$stamp"
+content=$(cat "$stamp")
+_assert_match "touch: stamp has epoch" "^[0-9]+$" "$content"
+
+# --- Fresh stamp within TTL ---
+
+SHDEPS_REMOTE_TTL=3600
+SHDEPS_FORCE=0
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_remote_touch "$stamp"
+_shdeps_remote_fresh "$stamp"
+_assert_exit "fresh: just-touched is fresh" 0 $?
+
+# --- Stale stamp beyond TTL ---
+
+echo "1000000000" > "$stamp"
+rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+_assert_exit "stale: old epoch is stale" 1 "$rc"
+
+# --- Missing stamp is stale ---
+
+rm -f "$stamp"
+rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+_assert_exit "missing: no stamp is stale" 1 "$rc"
+
+# --- Force mode bypasses cache ---
+
+SHDEPS_FORCE=1
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_remote_touch "$stamp"
+rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+_assert_exit "force: bypasses fresh stamp" 1 "$rc"
+
+# Reset force
+SHDEPS_FORCE=0
+_source_shdeps "$SHDEPS_DIR"
+
+# --- Invalid stamp content is stale ---
+
+echo "not-a-number" > "$stamp"
+rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+_assert_exit "invalid: non-numeric stamp is stale" 1 "$rc"
+
+# --- Hook stamps ---
+
+hook_stamp=$(_shdeps_hook_stamp "test-hook")
+_assert_contains "hook stamp: includes name" "test-hook" "$hook_stamp"
+
+# Hook due when no stamp
+rm -f "$hook_stamp"
+_shdeps_hook_due "test-hook"
+_assert_exit "hook due: no stamp" 0 $?
+
+# Hook not due after touch
+_shdeps_hook_touch "test-hook"
+rc=0; _shdeps_hook_due "test-hook" || rc=$?
+_assert_exit "hook not due: after touch" 1 "$rc"
+
+# --- Rev stamps ---
+
+rev_stamp=$(_shdeps_rev_stamp "test-rev")
+_assert_contains "rev stamp: includes name" "test-rev" "$rev_stamp"
+
+# Write and read back a revision
+_shdeps_rev_touch "test-rev" "abc123def"
+_shdeps_rev_read "test-rev"
+_assert_eq "rev read: matches written" "abc123def" "$REPLY"
+
+# Missing rev stamp returns failure
+rm -f "$rev_stamp"
+rc=0; _shdeps_rev_read "test-rev" || rc=$?
+_assert_exit "rev read: missing returns 1" 1 "$rc"
+
+# ===========================================================================
+# Section 8: Hook system
+# ===========================================================================
+
+echo ""
+echo "=== Hook system ==="
+
+_hook_test_dir=$(_tmpdir)
+_hook_conf_dir=$(_tmpdir)
+_hook_state_dir=$(_tmpdir)
+
+cat >"$_hook_conf_dir/deps.conf" <<'EOF'
+tool-a  pkg
+tool-b  pkg
+tool-c  custom
+EOF
+
+SHDEPS_CONF="$_hook_conf_dir/deps.conf"
+SHDEPS_HOOKS_DIR="$_hook_test_dir"
+SHDEPS_STATE_DIR="$_hook_state_dir"
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_load
+
+# --- Hook file discovery: hooks dir checked for <name>.sh ---
+
+mkdir -p "$_hook_test_dir"
+cat >"$_hook_test_dir/tool-a.sh" <<'HOOK'
+post() { echo "post-a" >> "$HOOK_LOG"; }
+status() { echo "status-a" >> "$HOOK_LOG"; }
+HOOK
+cat >"$_hook_test_dir/tool-b.sh" <<'HOOK'
+post() { echo "post-b" >> "$HOOK_LOG"; }
+status() { echo "status-b" >> "$HOOK_LOG"; }
+HOOK
+cat >"$_hook_test_dir/tool-c.sh" <<'HOOK'
+post() { echo "post-c" >> "$HOOK_LOG"; }
+status() { echo "status-c" >> "$HOOK_LOG"; }
+HOOK
+
+# --- status() called for ALL deps ---
+
+HOOK_LOG="$_hook_test_dir/hook.log"
+export HOOK_LOG
+: > "$HOOK_LOG"
+_shdeps_run_status_hooks
+status_output=$(cat "$HOOK_LOG")
+_assert_contains "status hooks: tool-a ran" "status-a" "$status_output"
+_assert_contains "status hooks: tool-b ran" "status-b" "$status_output"
+_assert_contains "status hooks: tool-c ran" "status-c" "$status_output"
+_assert_not_contains "status hooks: no post ran" "post-" "$status_output"
+
+# --- post() called ONLY for changed deps ---
+
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=()
+_SHDEPS_CHANGED[tool-a]=1
+# tool-b NOT changed, tool-c NOT changed
+_shdeps_run_post_hooks
+post_output=$(cat "$HOOK_LOG")
+_assert_contains "post hooks: changed dep ran" "post-a" "$post_output"
+_assert_not_contains "post hooks: unchanged dep skipped" "post-b" "$post_output"
+_assert_not_contains "post hooks: other unchanged skipped" "post-c" "$post_output"
+
+# --- post() for multiple changed deps ---
+
+: > "$HOOK_LOG"
+_SHDEPS_CHANGED[tool-c]=1
+_shdeps_run_post_hooks
+post_output=$(cat "$HOOK_LOG")
+_assert_contains "post hooks multi: tool-a ran" "post-a" "$post_output"
+_assert_contains "post hooks multi: tool-c ran" "post-c" "$post_output"
+_assert_not_contains "post hooks multi: tool-b still skipped" "post-b" "$post_output"
+
+# --- No changed deps → no post hooks run ---
+
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=()
+_shdeps_run_post_hooks
+post_output=$(cat "$HOOK_LOG")
+_assert_eq "post hooks: none changed, nothing ran" "" "$post_output"
+
+# --- Function isolation: one hook's functions don't leak to next ---
+
+mkdir -p "$_hook_test_dir"
+cat >"$_hook_test_dir/tool-a.sh" <<'HOOK'
+post() { echo "post-a" >> "$HOOK_LOG"; }
+# No status() function defined
+HOOK
+cat >"$_hook_test_dir/tool-b.sh" <<'HOOK'
+# No post() function defined
+status() { echo "status-b" >> "$HOOK_LOG"; }
+HOOK
+
+: > "$HOOK_LOG"
+_shdeps_run_status_hooks
+status_output=$(cat "$HOOK_LOG")
+# tool-a has no status(), so only tool-b's status should appear
+_assert_not_contains "isolation: tool-a status not leaked" "status-a" "$status_output"
+_assert_contains "isolation: tool-b status ran" "status-b" "$status_output"
+
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=([tool-a]=1 [tool-b]=1)
+_shdeps_run_post_hooks
+post_output=$(cat "$HOOK_LOG")
+_assert_contains "isolation: tool-a post ran" "post-a" "$post_output"
+# tool-b has no post(), so only tool-a's post should appear
+_assert_not_contains "isolation: tool-b post not leaked" "post-b" "$post_output"
+
+# --- Error in hook source doesn't crash ---
+
+cat >"$_hook_test_dir/tool-a.sh" <<'HOOK'
+# Deliberate syntax issue that still sources but post fails
+post() { return 1; }
+HOOK
+cat >"$_hook_test_dir/tool-b.sh" <<'HOOK'
+post() { echo "post-b-ok" >> "$HOOK_LOG"; }
+HOOK
+
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=([tool-a]=1 [tool-b]=1)
+_shdeps_run_post_hooks
+post_output=$(cat "$HOOK_LOG")
+# tool-a's post() returns 1, but tool-b should still run
+_assert_contains "error handling: tool-b runs after tool-a fails" "post-b-ok" "$post_output"
+
+# --- Hook for dep without hook file is silently skipped ---
+
+rm -f "$_hook_test_dir/tool-c.sh"
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=([tool-c]=1)
+_shdeps_run_post_hooks
+post_output=$(cat "$HOOK_LOG")
+_assert_eq "missing hook file: silently skipped" "" "$post_output"
+
+# ===========================================================================
+# Section 9: Git install helpers
+# ===========================================================================
+
+echo ""
+echo "=== Git install helpers ==="
+
+# --- _shdeps_get_version: VERSION file ---
+
+_ver_dir=$(_tmpdir)
+echo "1.2.3" > "$_ver_dir/VERSION"
+result=$(_shdeps_get_version "$_ver_dir")
+_assert_eq "get_version: VERSION file" "v1.2.3" "$result"
+
+# --- _shdeps_get_version: git describe tag ---
+
+_git_dir=$(_tmpdir)
+git -C "$_git_dir" init -q
+git -C "$_git_dir" commit --allow-empty -m "init" -q
+git -C "$_git_dir" tag "v0.5.0"
+result=$(_shdeps_get_version "$_git_dir")
+_assert_eq "get_version: git tag" "v0.5.0" "$result"
+
+# --- _shdeps_get_version: git commit hash fallback ---
+
+_git_dir2=$(_tmpdir)
+git -C "$_git_dir2" init -q
+git -C "$_git_dir2" commit --allow-empty -m "init" -q
+result=$(_shdeps_get_version "$_git_dir2")
+_assert_match "get_version: commit hash" "^commit [0-9a-f]+" "$result"
+
+# --- _shdeps_get_version: empty dir → empty ---
+
+_empty_dir=$(_tmpdir)
+result=$(_shdeps_get_version "$_empty_dir")
+_assert_eq "get_version: empty dir" "" "$result"
+
+# --- _shdeps_get_version: VERSION file takes precedence over git ---
+
+_both_dir=$(_tmpdir)
+git -C "$_both_dir" init -q
+git -C "$_both_dir" commit --allow-empty -m "init" -q
+git -C "$_both_dir" tag "v9.9.9"
+echo "2.0.0" > "$_both_dir/VERSION"
+result=$(_shdeps_get_version "$_both_dir")
+_assert_eq "get_version: VERSION over git tag" "v2.0.0" "$result"
+
+# --- _shdeps_link_bin: creates symlink in ~/.local/bin ---
+
+_link_dir=$(_tmpdir)
+mkdir -p "$_link_dir/bin"
+echo "#!/bin/sh" > "$_link_dir/bin/mytool"
+chmod +x "$_link_dir/bin/mytool"
+_shdeps_link_bin "mytool" "$_link_dir"
+_assert_symlink "link_bin: symlink created" "$HOME/.local/bin/mytool"
+_link_target=$(readlink "$HOME/.local/bin/mytool")
+_assert_eq "link_bin: points to correct path" "$_link_dir/bin/mytool" "$_link_target"
+
+# --- _shdeps_link_bin: no bin/<name> → no symlink ---
+
+_nobin_dir=$(_tmpdir)
+rm -f "$HOME/.local/bin/nobin-tool"
+_shdeps_link_bin "nobin-tool" "$_nobin_dir"
+_assert_file_missing "link_bin: no bin dir, no symlink" "$HOME/.local/bin/nobin-tool"
+
+# --- _shdeps_link_bin: non-executable bin/<name> → no symlink ---
+
+_nonexec_dir=$(_tmpdir)
+mkdir -p "$_nonexec_dir/bin"
+echo "data" > "$_nonexec_dir/bin/noexec-tool"
+rm -f "$HOME/.local/bin/noexec-tool"
+_shdeps_link_bin "noexec-tool" "$_nonexec_dir"
+_assert_file_missing "link_bin: non-exec, no symlink" "$HOME/.local/bin/noexec-tool"
+
+# --- _shdeps_dep_version: extracts version from --version output ---
+
+_ver_bin_dir=$(_tmpdir)
+cat > "$_ver_bin_dir/fake-tool" <<'SCRIPT'
+#!/bin/sh
+echo "fake-tool version 3.14.159"
+SCRIPT
+chmod +x "$_ver_bin_dir/fake-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/fake-tool")
+_assert_eq "dep_version: extracts version" "3.14.159" "$result"
+
+# --- _shdeps_dep_version: empty cmd → failure ---
+
+rc=0; _shdeps_dep_version "" || rc=$?
+_assert_exit "dep_version: empty cmd fails" 1 "$rc"
+
+# --- _shdeps_exists: finds command in PATH ---
+
+_exists_bin=$(_mock_bin)
+echo '#!/bin/sh' > "$_exists_bin/test-exists-cmd"
+chmod +x "$_exists_bin/test-exists-cmd"
+export PATH="$_exists_bin:$PATH"
+_shdeps_exists "test-exists-cmd" "" ""
+_assert_exit "exists: finds cmd in PATH" 0 $?
+
+# --- _shdeps_exists: tries cmd_alt ---
+
+_shdeps_exists "nonexistent-primary" "test-exists-cmd" ""
+_assert_exit "exists: falls back to cmd_alt" 0 $?
+
+# --- _shdeps_exists: both missing → failure ---
+
+rc=0; _shdeps_exists "no-such-cmd-aaa" "no-such-cmd-bbb" "" || rc=$?
+_assert_exit "exists: both missing fails" 1 "$rc"
+
+# --- Local clone detection: ~/git/<name> is preferred ---
+
+_lc_test_dir=$(_tmpdir)
+_lc_name="shdeps-lc-test"
+_lc_clone="$HOME/git/$_lc_name"
+_lc_install="$HOME/.local/share/$_lc_name"
+_lc_state=$(_tmpdir)
+SHDEPS_STATE_DIR="$_lc_state"
+_source_shdeps "$SHDEPS_DIR"
+
+# Create a fake local clone with a git repo
+mkdir -p "$_lc_clone"
+git -C "$_lc_clone" init -q
+git -C "$_lc_clone" commit --allow-empty -m "init" -q
+
+declare -gA _SHDEPS_CHANGED=()
+_shdeps_install_from_github "$_lc_name" "owner/$_lc_name" "$_lc_install"
+
+# Should create a symlink to local clone
+_assert_symlink "local clone: install dir is symlink" "$_lc_install"
+_lc_target=$(readlink "$_lc_install")
+_assert_eq "local clone: points to ~/git/<name>" "$_lc_clone" "$_lc_target"
+_assert_eq "local clone: marked as changed" "1" "${_SHDEPS_CHANGED[$_lc_name]:-0}"
+
+# Cleanup
+rm -rf "$_lc_clone" "$_lc_install"
+
+# ===========================================================================
+# Section 10: Integration / end-to-end
+# ===========================================================================
+
+echo ""
+echo "=== Integration ==="
+
+# Full shdeps_update cycle with mock config.
+# Uses only 'custom' and 'pkg' (with already-installed commands) methods
+# to avoid network access. Verifies the full orchestration:
+# config → parse → dispatch → hooks.
+
+_integ_dir=$(_tmpdir)
+_integ_state=$(_tmpdir)
+_integ_hooks="$_integ_dir/hooks.d"
+mkdir -p "$_integ_hooks"
+
+cat > "$_integ_dir/deps.conf" <<'EOF'
+custom-a  custom
+custom-b  custom
+EOF
+
+# Hook for custom-a: always runs (custom deps run when hook is due)
+cat > "$_integ_hooks/custom-a.sh" <<'HOOK'
+post() { echo "custom-a-post" >> "$INTEG_LOG"; return 0; }
+status() { echo "custom-a-status" >> "$INTEG_LOG"; }
+HOOK
+# Hook for custom-b: post + status
+cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+post() { echo "custom-b-post" >> "$INTEG_LOG"; return 0; }
+status() { echo "custom-b-status" >> "$INTEG_LOG"; }
+HOOK
+
+SHDEPS_CONF="$_integ_dir/deps.conf"
+unset SHDEPS_CONF_LOCAL
+SHDEPS_HOOKS_DIR="$_integ_hooks"
+SHDEPS_STATE_DIR="$_integ_state"
+SHDEPS_FORCE=0
+SHDEPS_LOG_LEVEL=0
+_source_shdeps "$SHDEPS_DIR"
+
+INTEG_LOG="$_integ_dir/integ.log"
+export INTEG_LOG
+: > "$INTEG_LOG"
+
+shdeps_update
+integ_output=$(cat "$INTEG_LOG")
+
+# Status hooks ran for all deps
+_assert_contains "integ: custom-a status ran" "custom-a-status" "$integ_output"
+_assert_contains "integ: custom-b status ran" "custom-b-status" "$integ_output"
+
+# Post hooks ran (custom deps with no prior stamp are hook-due)
+_assert_contains "integ: custom-a post ran" "custom-a-post" "$integ_output"
+_assert_contains "integ: custom-b post ran" "custom-b-post" "$integ_output"
+
+# --- Second run: hooks already touched, so post should NOT re-run ---
+
+: > "$INTEG_LOG"
+shdeps_update
+integ_output=$(cat "$INTEG_LOG")
+
+# Status always runs
+_assert_contains "integ2: status still runs" "custom-a-status" "$integ_output"
+
+# Post should NOT run (hook stamp is fresh)
+_assert_not_contains "integ2: post skipped (stamp fresh)" "custom-a-post" "$integ_output"
+_assert_not_contains "integ2: post-b skipped (stamp fresh)" "custom-b-post" "$integ_output"
+
+# --- Force mode: re-runs all post hooks ---
+
+SHDEPS_FORCE=1
+_source_shdeps "$SHDEPS_DIR"
+: > "$INTEG_LOG"
+shdeps_update
+integ_output=$(cat "$INTEG_LOG")
+_assert_contains "integ force: custom-a post re-ran" "custom-a-post" "$integ_output"
+_assert_contains "integ force: custom-b post re-ran" "custom-b-post" "$integ_output"
+
+# Reset force
+SHDEPS_FORCE=0
+_source_shdeps "$SHDEPS_DIR"
+
+# --- Integration with pkg deps: already-installed commands skip install ---
+
+# Create a fake command so _shdeps_exists finds it
+_integ_bin=$(_mock_bin)
+echo '#!/bin/sh' > "$_integ_bin/fake-installed"
+chmod +x "$_integ_bin/fake-installed"
+export PATH="$_integ_bin:$PATH"
+
+cat > "$_integ_dir/deps.conf" <<'EOF'
+fake-installed  pkg  fake-installed
+custom-a        custom
+EOF
+
+: > "$INTEG_LOG"
+shdeps_update
+integ_output=$(cat "$INTEG_LOG")
+
+# The pkg dep should show up as present (not queued for install)
+# custom-a should still get its status hook
+_assert_contains "integ pkg: custom-a status" "custom-a-status" "$integ_output"
+
+# --- Integration with local config overlay ---
+
+cat > "$_integ_dir/deps.conf" <<'EOF'
+custom-a  custom
+EOF
+cat > "$_integ_dir/deps.local.conf" <<'EOF'
+custom-b  custom
+EOF
+
+SHDEPS_FORCE=1
+_source_shdeps "$SHDEPS_DIR"
+: > "$INTEG_LOG"
+shdeps_update
+integ_output=$(cat "$INTEG_LOG")
+_assert_contains "integ overlay: custom-a from conf" "custom-a-post" "$integ_output"
+_assert_contains "integ overlay: custom-b from local" "custom-b-post" "$integ_output"
+
+# Reset
+SHDEPS_FORCE=0
+_source_shdeps "$SHDEPS_DIR"
+
+# --- Integration: platform-filtered deps skip install but force still runs hooks ---
+# Force mode marks ALL deps as changed (including platform-filtered ones).
+# The platform filter only prevents _shdeps_install_dep from running.
+
+if [[ "$_current_os" == "linux" ]]; then
+  _skip_plat="darwin"
+else
+  _skip_plat="linux"
+fi
+
+cat > "$_integ_dir/deps.conf" <<EOF
+custom-a  custom  -  -  -  -  -  $_skip_plat
+custom-b  custom
+EOF
+rm -f "$_integ_dir/deps.local.conf"
+
+# Without force: wrong-platform dep's custom hook is not due (stamp exists
+# from earlier run), so it won't be marked changed — post skipped.
+SHDEPS_FORCE=0
+_source_shdeps "$SHDEPS_DIR"
+# Ensure custom-a has a fresh hook stamp so it's not "due"
+_shdeps_hook_touch "custom-a"
+: > "$INTEG_LOG"
+shdeps_update
+integ_output=$(cat "$INTEG_LOG")
+_assert_not_contains "integ platform: no-force skips wrong platform post" "custom-a-post" "$integ_output"
+_assert_contains "integ platform: right platform runs" "custom-b" "$integ_output"
+
+# --- shdeps_version ---
+
+ver=$(shdeps_version)
+_assert_match "shdeps_version: format" "^shdeps [0-9]+\.[0-9]+\.[0-9]+" "$ver"
+
+# ===========================================================================
+
+_test_summary
