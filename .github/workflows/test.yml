@@ -1,0 +1,47 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y shellcheck
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      - name: Run shellcheck on all .sh files
+        run: |
+          shopt -s globstar nullglob
+          files=(shdeps.sh examples/**/*.sh)
+          if [[ ${#files[@]} -gt 0 ]]; then
+            shellcheck "${files[@]}"
+          fi
+
+      - name: Run shellcheck on CLI
+        run: shellcheck bin/shdeps
+
+      - name: Verify library sources cleanly
+        run: bash -c 'source shdeps.sh && shdeps_version'
+
+      - name: Run tests
+        run: |
+          if [[ -x test/shdeps-test ]]; then
+            ./test/shdeps-test
+          else
+            echo "No test runner found, skipping"
+          fi
