@@ -60,8 +60,8 @@ The CLI automatically finds `~/.config/shdeps/deps.conf` when no `-c` flag or `S
 | `pkg_overrides` | no | Per-manager package names: `apt:fd-find,dnf:fd-find` |
 | `repo` | no | GitHub `owner/repo` (for `git` and `binary` methods) |
 | `dir` | no | Install directory relative to `$HOME` (for `git` method) |
-| `platforms` | no | Platform filter: `linux,darwin`, `!wsl`, etc. |
-| `hosts` | no | Hostname filter: `nas,taylor`, `!workstation`, etc. |
+| `platforms` | no | Platform filter. Values: `linux`, `darwin`, `wsl`. Prefix `!` to exclude. |
+| `hosts` | no | Hostname filter (matches `hostname -s`, case-insensitive). Prefix `!` to exclude. |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
 
