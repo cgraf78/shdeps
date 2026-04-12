@@ -1,5 +1,8 @@
 # shdeps
 
+[![test](https://github.com/cgraf78/shdeps/actions/workflows/test.yml/badge.svg)](https://github.com/cgraf78/shdeps/actions/workflows/test.yml)
+[![license](https://img.shields.io/github/license/cgraf78/shdeps)](LICENSE)
+
 A standalone shell dependency manager. Declare your tools in a config file, and shdeps installs them via system package managers, GitHub git repos, or GitHub release binaries.
 
 ## Features
