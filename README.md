@@ -1,7 +1,9 @@
 # shdeps
 
-[![test](https://github.com/cgraf78/shdeps/actions/workflows/test.yml/badge.svg)](https://github.com/cgraf78/shdeps/actions/workflows/test.yml)
-[![license](https://img.shields.io/github/license/cgraf78/shdeps)](LICENSE)
+![Tests](https://github.com/cgraf78/shdeps/actions/workflows/test.yml/badge.svg?branch=main)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
 A standalone shell dependency manager. Declare your tools in a config file, and shdeps installs them via system package managers, GitHub git repos, or GitHub release binaries.
 
