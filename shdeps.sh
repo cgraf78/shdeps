@@ -19,7 +19,7 @@
 #   SHDEPS_REMOTE_TTL   Cache TTL in seconds        (default: 3600)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
 
-SHDEPS_VERSION="0.1.0"
+SHDEPS_VERSION="0.2.0"
 
 # ---------------------------------------------------------------------------
 # Configuration defaults
@@ -224,14 +224,14 @@ _shdeps_parse() {
 }
 
 # ---------------------------------------------------------------------------
-# Platform matching — include/exclude filter on OS
+# Platform matching — include/exclude filter on OS (public API)
 # ---------------------------------------------------------------------------
 
 # Check if the current platform matches a platforms spec.
 # Empty spec matches all platforms. Supports include (linux,darwin)
 # and exclude (!wsl,!darwin) lists. Mixed lists check excludes first.
 # Returns 0 if the dep should install on this platform.
-_shdeps_platform_match() {
+shdeps_platform_match() {
   local spec="${1:-}"
   if [[ -z "$spec" ]]; then return 0; fi
 
@@ -270,14 +270,15 @@ _shdeps_platform_match() {
 }
 
 # ---------------------------------------------------------------------------
-# Host matching — include/exclude filter on hostname
+# Host matching — include/exclude filter on hostname (public API)
 # ---------------------------------------------------------------------------
 
 # Check if the current hostname matches a hosts spec.
-# Same logic as _shdeps_platform_match but compares against hostname.
+# Same logic as shdeps_platform_match but compares against hostname.
 # Empty spec matches all hosts. Supports include (nas,taylor) and
 # exclude (!nas) lists. Mixed lists check excludes first.
-_shdeps_host_match() {
+# Returns 0 if the dep should install on this host.
+shdeps_host_match() {
   local spec="${1:-}"
   if [[ -z "$spec" ]]; then return 0; fi
 
@@ -1244,8 +1245,8 @@ _shdeps_install_dep() {
   _shdeps_parse "$entry"
 
   # Skip deps that don't match this platform or host
-  _shdeps_platform_match "$_platforms" || return 0
-  _shdeps_host_match "$_hosts" || return 0
+  shdeps_platform_match "$_platforms" || return 0
+  shdeps_host_match "$_hosts" || return 0
 
   case "$_method" in
   pkg)

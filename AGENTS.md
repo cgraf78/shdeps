@@ -17,7 +17,7 @@ let callers run arbitrary setup after each dependency changes.
 
 ## Naming Conventions
 
-- Public API functions: `shdeps_` prefix (e.g., `shdeps_update`, `shdeps_load`)
+- Public API functions: `shdeps_` prefix (e.g., `shdeps_update`, `shdeps_load`, `shdeps_platform_match`, `shdeps_host_match`)
 - Internal functions: `_shdeps_` prefix (e.g., `_shdeps_parse`, `_shdeps_pkg_detect`)
 - Internal global variables: `_SHDEPS_` prefix
 

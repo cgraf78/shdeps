@@ -197,81 +197,81 @@ _current_os=$(uname -s | tr '[:upper:]' '[:lower:]')
 
 # --- Empty spec matches all ---
 
-_shdeps_platform_match ""
+shdeps_platform_match ""
 _assert_exit "empty spec: matches" 0 $?
 
 # --- Include list: current platform ---
 
-_shdeps_platform_match "$_current_os"
+shdeps_platform_match "$_current_os"
 _assert_exit "include: current os matches" 0 $?
 
 # --- Include list: other platform ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  rc=0; _shdeps_platform_match "darwin" || rc=$?
+  rc=0; shdeps_platform_match "darwin" || rc=$?
   _assert_exit "include: other os rejected" 1 "$rc"
 else
-  rc=0; _shdeps_platform_match "linux" || rc=$?
+  rc=0; shdeps_platform_match "linux" || rc=$?
   _assert_exit "include: other os rejected" 1 "$rc"
 fi
 
 # --- Include list: multiple platforms ---
 
-_shdeps_platform_match "linux,darwin"
+shdeps_platform_match "linux,darwin"
 _assert_exit "include multi: linux,darwin matches" 0 $?
 
 # --- Include list: none matching ---
 
-rc=0; _shdeps_platform_match "freebsd,openbsd" || rc=$?
+rc=0; shdeps_platform_match "freebsd,openbsd" || rc=$?
 _assert_exit "include: no match rejected" 1 "$rc"
 
 # --- Exclude list: excludes current ---
 
-rc=0; _shdeps_platform_match "!${_current_os}" || rc=$?
+rc=0; shdeps_platform_match "!${_current_os}" || rc=$?
 _assert_exit "exclude: current os excluded" 1 "$rc"
 
 # --- Exclude list: excludes other ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  _shdeps_platform_match "!darwin"
+  shdeps_platform_match "!darwin"
   _assert_exit "exclude: other os not excluded" 0 $?
 else
-  _shdeps_platform_match "!linux"
+  shdeps_platform_match "!linux"
   _assert_exit "exclude: other os not excluded" 0 $?
 fi
 
 # --- Exclude list: multiple excludes, none matching ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  _shdeps_platform_match "!darwin,!freebsd"
+  shdeps_platform_match "!darwin,!freebsd"
   _assert_exit "exclude multi: none matching passes" 0 $?
 else
-  _shdeps_platform_match "!linux,!freebsd"
+  shdeps_platform_match "!linux,!freebsd"
   _assert_exit "exclude multi: none matching passes" 0 $?
 fi
 
 # --- Mixed: exclude takes priority ---
 
-rc=0; _shdeps_platform_match "${_current_os},!${_current_os}" || rc=$?
+rc=0; shdeps_platform_match "${_current_os},!${_current_os}" || rc=$?
 _assert_exit "mixed: exclude overrides include" 1 "$rc"
 
 # --- Mixed: included and not excluded ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  _shdeps_platform_match "linux,!darwin"
+  shdeps_platform_match "linux,!darwin"
   _assert_exit "mixed: included and not excluded" 0 $?
 else
-  _shdeps_platform_match "darwin,!linux"
+  shdeps_platform_match "darwin,!linux"
   _assert_exit "mixed: included and not excluded" 0 $?
 fi
 
 # --- Mixed: not in include list ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  rc=0; _shdeps_platform_match "darwin,!freebsd" || rc=$?
+  rc=0; shdeps_platform_match "darwin,!freebsd" || rc=$?
   _assert_exit "mixed: not in include list" 1 "$rc"
 else
-  rc=0; _shdeps_platform_match "linux,!freebsd" || rc=$?
+  rc=0; shdeps_platform_match "linux,!freebsd" || rc=$?
   _assert_exit "mixed: not in include list" 1 "$rc"
 fi
 
@@ -288,66 +288,66 @@ _current_host="${_current_host,,}"
 
 # --- Empty spec matches all ---
 
-_shdeps_host_match ""
+shdeps_host_match ""
 _assert_exit "empty spec: matches" 0 $?
 
 # --- Include list: current host ---
 
-_shdeps_host_match "$_current_host"
+shdeps_host_match "$_current_host"
 _assert_exit "include: current host matches" 0 $?
 
 # --- Include list: other host ---
 
-rc=0; _shdeps_host_match "nonexistent-host-xyz" || rc=$?
+rc=0; shdeps_host_match "nonexistent-host-xyz" || rc=$?
 _assert_exit "include: other host rejected" 1 "$rc"
 
 # --- Include list: multiple hosts ---
 
-_shdeps_host_match "other-host,$_current_host"
+shdeps_host_match "other-host,$_current_host"
 _assert_exit "include multi: current host in list matches" 0 $?
 
 # --- Include list: none matching ---
 
-rc=0; _shdeps_host_match "host-a,host-b" || rc=$?
+rc=0; shdeps_host_match "host-a,host-b" || rc=$?
 _assert_exit "include: no match rejected" 1 "$rc"
 
 # --- Exclude list: excludes current ---
 
-rc=0; _shdeps_host_match "!${_current_host}" || rc=$?
+rc=0; shdeps_host_match "!${_current_host}" || rc=$?
 _assert_exit "exclude: current host excluded" 1 "$rc"
 
 # --- Exclude list: excludes other ---
 
-_shdeps_host_match "!nonexistent-host-xyz"
+shdeps_host_match "!nonexistent-host-xyz"
 _assert_exit "exclude: other host not excluded" 0 $?
 
 # --- Exclude list: multiple excludes, none matching ---
 
-_shdeps_host_match "!host-a,!host-b"
+shdeps_host_match "!host-a,!host-b"
 _assert_exit "exclude multi: none matching passes" 0 $?
 
 # --- Mixed: exclude takes priority ---
 
-rc=0; _shdeps_host_match "${_current_host},!${_current_host}" || rc=$?
+rc=0; shdeps_host_match "${_current_host},!${_current_host}" || rc=$?
 _assert_exit "mixed: exclude overrides include" 1 "$rc"
 
 # --- Mixed: included and not excluded ---
 
-_shdeps_host_match "${_current_host},!other-host"
+shdeps_host_match "${_current_host},!other-host"
 _assert_exit "mixed: included and not excluded" 0 $?
 
 # --- Mixed: not in include list ---
 
-rc=0; _shdeps_host_match "other-host,!nonexistent" || rc=$?
+rc=0; shdeps_host_match "other-host,!nonexistent" || rc=$?
 _assert_exit "mixed: not in include list" 1 "$rc"
 
 # --- Case-insensitive matching ---
 
 _upper_host="${_current_host^^}"
-_shdeps_host_match "$_upper_host"
+shdeps_host_match "$_upper_host"
 _assert_exit "case-insensitive: uppercase spec matches" 0 $?
 
-rc=0; _shdeps_host_match "!${_upper_host}" || rc=$?
+rc=0; shdeps_host_match "!${_upper_host}" || rc=$?
 _assert_exit "case-insensitive: uppercase exclude works" 1 "$rc"
 
 # ===========================================================================

@@ -162,6 +162,8 @@ Available public functions:
 - `shdeps_update` — install/update all dependencies
 - `shdeps_load` — parse config and return dep count
 - `shdeps_version` — print version string
+- `shdeps_platform_match <spec>` — check if current platform matches a spec (e.g., `linux,darwin`, `!wsl`)
+- `shdeps_host_match <spec>` — check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`)
 
 ## Testing
 

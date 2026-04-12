@@ -88,11 +88,11 @@ cmd_list() {
     _shdeps_parse "$entry"
 
     # shellcheck disable=SC2154  # _name, _method, _cmd, etc. set by _shdeps_parse
-    if ! _shdeps_platform_match "$_platforms"; then
+    if ! shdeps_platform_match "$_platforms"; then
       printf '%-20s %-8s %-12s %s\n' "$_name" "$_method" "skipped" "(platform)"
       continue
     fi
-    if ! _shdeps_host_match "$_hosts"; then
+    if ! shdeps_host_match "$_hosts"; then
       printf '%-20s %-8s %-12s %s\n' "$_name" "$_method" "skipped" "(host)"
       continue
     fi
@@ -159,11 +159,11 @@ cmd_check() {
     [[ "$_name" == "$target" ]] || continue
     found=1
 
-    if ! _shdeps_platform_match "$_platforms"; then
+    if ! shdeps_platform_match "$_platforms"; then
       echo "$_name: skipped (platform mismatch)"
       return 0
     fi
-    if ! _shdeps_host_match "$_hosts"; then
+    if ! shdeps_host_match "$_hosts"; then
       echo "$_name: skipped (host mismatch)"
       return 0
     fi
