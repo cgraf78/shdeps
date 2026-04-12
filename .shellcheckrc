@@ -1,0 +1,4 @@
+shell=bash
+enable=all
+# SC2250: prefer ${var} over $var for consistency — not enforced here
+disable=SC2250
