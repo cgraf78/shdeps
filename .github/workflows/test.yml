@@ -25,12 +25,7 @@ jobs:
         run: brew install shellcheck
 
       - name: Run shellcheck on all .sh files
-        run: |
-          shopt -s globstar nullglob
-          files=(shdeps.sh examples/**/*.sh)
-          if [[ ${#files[@]} -gt 0 ]]; then
-            shellcheck "${files[@]}"
-          fi
+        run: shellcheck shdeps.sh $(find examples -name '*.sh' 2>/dev/null)
 
       - name: Run shellcheck on CLI
         run: shellcheck bin/shdeps
