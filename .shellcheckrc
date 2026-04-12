@@ -1,4 +1,6 @@
 shell=bash
 enable=all
 # SC2250: prefer ${var} over $var for consistency — not enforced here
-disable=SC2250
+# SC2312: command substitution in [[ ]] — masking is fine for simple accessors
+# SC2249: default *) case — intentional no-op fallthrough in package manager dispatch
+disable=SC2250,SC2312,SC2249
