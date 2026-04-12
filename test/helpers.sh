@@ -160,6 +160,9 @@ _mock_home() {
   REAL_HOME="$HOME"
   TEST_HOME=$(_tmpdir)
   export HOME="$TEST_HOME"
+  # Set git identity for test commits (CI has no global config)
+  git config --global user.email "test@test.com"
+  git config --global user.name "Test"
 }
 
 # Create a temp bin directory for mock commands. Returns the path.
