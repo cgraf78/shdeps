@@ -66,7 +66,7 @@ fi
 # Normal log line (level >= 1).
 if ! declare -f _shdeps_log &>/dev/null; then
   _shdeps_log() {
-    [[ "$(_shdeps_log_level)" -ge 1 ]] && printf '%s\n' "$*" >&2
+    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then printf '%s\n' "$*" >&2; fi
     return 0
   }
 fi
@@ -74,8 +74,9 @@ fi
 # Warning (always shown unless level 0).
 if ! declare -f _shdeps_warn &>/dev/null; then
   _shdeps_warn() {
-    [[ "$(_shdeps_log_level)" -ge 1 ]] &&
+    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
       printf '%s%s%s\n' "${_SHDEPS_C_RED}" "$*" "${_SHDEPS_C_RESET}" >&2
+    fi
     return 0
   }
 fi
@@ -83,8 +84,9 @@ fi
 # Success highlight.
 if ! declare -f _shdeps_log_ok &>/dev/null; then
   _shdeps_log_ok() {
-    [[ "$(_shdeps_log_level)" -ge 1 ]] &&
+    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
       printf '%s%s%s\n' "${_SHDEPS_C_GREEN}" "$*" "${_SHDEPS_C_RESET}" >&2
+    fi
     return 0
   }
 fi
@@ -92,8 +94,9 @@ fi
 # Dimmed / low-importance line.
 if ! declare -f _shdeps_log_dim &>/dev/null; then
   _shdeps_log_dim() {
-    [[ "$(_shdeps_log_level)" -ge 1 ]] &&
+    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
       printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >&2
+    fi
     return 0
   }
 fi
@@ -101,8 +104,9 @@ fi
 # Section header.
 if ! declare -f _shdeps_log_header &>/dev/null; then
   _shdeps_log_header() {
-    [[ "$(_shdeps_log_level)" -ge 1 ]] &&
+    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
       printf '%s%s%s\n' "${_SHDEPS_C_BOLD}" "$*" "${_SHDEPS_C_RESET}" >&2
+    fi
     return 0
   }
 fi
@@ -113,7 +117,8 @@ fi
 
 # Detect Windows Subsystem for Linux.
 _shdeps_is_wsl() {
-  [[ -f /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null
+  [[ -f /proc/version ]] || return 1
+  grep -qi microsoft /proc/version 2>/dev/null
 }
 
 # Create a temp file for capturing command output. Sets REPLY to the path.
@@ -147,9 +152,9 @@ _shdeps_run_logged() {
 # Acquire sudo. Returns 0 if root or sudo obtained.
 # In quiet mode, skips interactive prompt and returns 1 silently.
 _shdeps_require_sudo() {
-  [[ "$(id -u)" -eq 0 ]] && return 0
-  sudo -n true 2>/dev/null && return 0
-  [[ "$(_shdeps_quiet)" -eq 1 ]] && return 1
+  if [[ "$(id -u)" -eq 0 ]]; then return 0; fi
+  if sudo -n true 2>/dev/null; then return 0; fi
+  if [[ "$(_shdeps_quiet)" -eq 1 ]]; then return 1; fi
   sudo true 2>/dev/null
 }
 
@@ -179,8 +184,8 @@ _shdeps_load() {
     [[ -f "$f" ]] || continue
     while IFS= read -r line || [[ -n "$line" ]]; do
       # Skip comments and blank lines
-      [[ "$line" =~ ^[[:space:]]*# ]] && continue
-      [[ -z "${line// /}" ]] && continue
+      if [[ "$line" =~ ^[[:space:]]*# ]]; then continue; fi
+      if [[ -z "${line// /}" ]]; then continue; fi
       # Word-split the line, rejoin with pipe delimiters
       local fields
       # shellcheck disable=SC2086  # intentional word splitting
@@ -207,14 +212,14 @@ _shdeps_parse() {
   local entry="$1"
   IFS='|' read -r _name _method _cmd _cmd_alt _pkg_overrides _repo _dir _platforms <<<"$entry"
   # Dash means "use default" / "not specified"
-  [[ "$_cmd" == "-" ]] && _cmd=""
-  [[ "$_cmd_alt" == "-" ]] && _cmd_alt=""
-  [[ "$_pkg_overrides" == "-" ]] && _pkg_overrides=""
-  [[ "$_repo" == "-" ]] && _repo=""
-  [[ "$_dir" == "-" ]] && _dir=""
-  [[ "$_platforms" == "-" ]] && _platforms=""
+  if [[ "$_cmd" == "-" ]]; then _cmd=""; fi
+  if [[ "$_cmd_alt" == "-" ]]; then _cmd_alt=""; fi
+  if [[ "$_pkg_overrides" == "-" ]]; then _pkg_overrides=""; fi
+  if [[ "$_repo" == "-" ]]; then _repo=""; fi
+  if [[ "$_dir" == "-" ]]; then _dir=""; fi
+  if [[ "$_platforms" == "-" ]]; then _platforms=""; fi
   # Default cmd to name when unspecified
-  [[ -z "$_cmd" ]] && _cmd="$_name"
+  if [[ -z "$_cmd" ]]; then _cmd="$_name"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -227,11 +232,11 @@ _shdeps_parse() {
 # Returns 0 if the dep should install on this platform.
 _shdeps_platform_match() {
   local spec="${1:-}"
-  [[ -z "$spec" ]] && return 0
+  if [[ -z "$spec" ]]; then return 0; fi
 
   local current
   current=$(uname -s | tr '[:upper:]' '[:lower:]')
-  _shdeps_is_wsl && current="wsl"
+  if _shdeps_is_wsl; then current="wsl"; fi
 
   local item has_include=0 has_exclude=0
   local IFS=','
@@ -242,22 +247,22 @@ _shdeps_platform_match() {
   if [[ $has_include -eq 1 && $has_exclude -eq 1 ]]; then
     # Mixed: excludes take priority, then check includes
     for item in $spec; do
-      [[ "$item" == "!$current" ]] && return 1
+      if [[ "$item" == "!$current" ]]; then return 1; fi
     done
     for item in $spec; do
-      [[ "$item" == "$current" ]] && return 0
+      if [[ "$item" == "$current" ]]; then return 0; fi
     done
     return 1
   elif [[ $has_exclude -eq 1 ]]; then
     # Exclude-only: match unless explicitly excluded
     for item in $spec; do
-      [[ "$item" == "!$current" ]] && return 1
+      if [[ "$item" == "!$current" ]]; then return 1; fi
     done
     return 0
   else
     # Include-only: match only if listed
     for item in $spec; do
-      [[ "$item" == "$current" ]] && return 0
+      if [[ "$item" == "$current" ]]; then return 0; fi
     done
     return 1
   fi
@@ -273,8 +278,10 @@ _shdeps_platform_match() {
 _shdeps_exists() {
   local cmd="${1:-}" alt="${2:-}" name="${3:-}"
   if [[ -n "$cmd" ]]; then
-    command -v "$cmd" &>/dev/null && return 0
-    [[ -n "$alt" ]] && command -v "$alt" &>/dev/null && return 0
+    if command -v "$cmd" &>/dev/null; then return 0; fi
+    if [[ -n "$alt" ]]; then
+      if command -v "$alt" &>/dev/null; then return 0; fi
+    fi
   fi
   # Command not found (or empty) — try the package manager directly.
   if [[ -n "$name" ]]; then
@@ -292,7 +299,7 @@ _shdeps_exists() {
 # Extracts the first version-like token (digits+dots) from --version output.
 _shdeps_dep_version() {
   local cmd="${1:-}"
-  [[ -z "$cmd" ]] && return 1
+  if [[ -z "$cmd" ]]; then return 1; fi
   "$cmd" --version 2>/dev/null | head -1 |
     grep -oE '[0-9]+\.[0-9]+[0-9.]*' | head -1
 }
@@ -369,7 +376,7 @@ _shdeps_pkg_queue() {
 # Install all queued packages in a single command.
 # On batch failure, retries each package individually.
 _shdeps_pkg_install_batch() {
-  [[ ${#_SHDEPS_PKG_BATCH[@]} -eq 0 ]] && return 0
+  if [[ ${#_SHDEPS_PKG_BATCH[@]} -eq 0 ]]; then return 0; fi
 
   if [[ -z "$_SHDEPS_PKG_MGR" ]]; then
     _shdeps_warn "  warning: no package manager found — cannot install: ${_SHDEPS_PKG_BATCH[*]}"
@@ -418,7 +425,7 @@ _shdeps_pkg_install_batch() {
     local pkg
     for pkg in "${_SHDEPS_PKG_BATCH[@]}"; do
       rc=0
-      [[ -n "$log" ]] && : >"$log"
+      if [[ -n "$log" ]]; then : >"$log"; fi
       # shellcheck disable=SC2024  # sudo output captured in user-owned log
       case "$_SHDEPS_PKG_MGR" in
       brew)   _shdeps_run_logged brew install "$pkg" || rc=$? ;;
@@ -458,7 +465,7 @@ _shdeps_remote_stamp() {
 # Force mode always returns 1 (stale).
 _shdeps_remote_fresh() {
   local stamp="$1"
-  [[ "$(_shdeps_force)" -eq 1 ]] && return 1
+  if [[ "$(_shdeps_force)" -eq 1 ]]; then return 1; fi
   [[ -f "$stamp" ]] || return 1
 
   local cached="" now="" ttl=""
@@ -546,7 +553,7 @@ _shdeps_get_version() {
     if [[ -z "$ver" ]]; then
       local hash
       hash=$(git -C "$dir" log -1 --format='%h' 2>/dev/null || true)
-      [[ -n "$hash" ]] && ver="commit $hash"
+      if [[ -n "$hash" ]]; then ver="commit $hash"; fi
     fi
     echo "$ver"
   fi
@@ -703,7 +710,7 @@ _shdeps_github_install_fresh() {
     fi
     local clone_tmp="${install_dir}.tmp.$$"
     rm -rf "$clone_tmp"
-    [[ -n "${log:-}" ]] && : >"$log"
+    if [[ -n "${log:-}" ]]; then : >"$log"; fi
     if ! _shdeps_run_logged git clone --depth 1 "$repo" "$clone_tmp"; then
       rm -rf "$clone_tmp"
       _shdeps_logfile_print "$name clone" "$log"
@@ -721,7 +728,7 @@ _shdeps_github_install_fresh() {
   local ver
   ver=$(_shdeps_get_version "$install_dir")
   local method="git clone"
-  [[ -n "${tarball_url:-}" ]] && method="release tarball"
+  if [[ -n "${tarball_url:-}" ]]; then method="release tarball"; fi
 
   if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$(_shdeps_force)" -ne 1 ]]; then
     _shdeps_log_dim "  $name up to date ($method)${ver:+ -- $ver}"
@@ -845,7 +852,7 @@ _shdeps_binary_find_asset() {
           for ext in "${_skip_exts[@]}"; do
             [[ "$url_lower" == *"$ext" ]] && { skip=1; break; }
           done
-          [[ $skip -eq 1 ]] && continue
+          if [[ $skip -eq 1 ]]; then continue; fi
 
           # Pass-specific filtering
           if [[ "$pass" == "plain" ]]; then
@@ -878,7 +885,7 @@ _shdeps_binary_find_asset() {
             for tok in "${os_patterns[@]}" "${arch_patterns[@]}"; do
               [[ "$suffix" == "$tok"* ]] && { is_exact=1; break; }
             done
-            [[ $is_exact -eq 0 && "$suffix" =~ ^v?[0-9] ]] && is_exact=1
+            if [[ $is_exact -eq 0 && "$suffix" =~ ^v?[0-9] ]]; then is_exact=1; fi
           fi
 
           for arch_pat in "${arch_patterns[@]}"; do
@@ -889,12 +896,12 @@ _shdeps_binary_find_asset() {
                   echo "$url"
                   return 0
                 fi
-                [[ -z "$_other_match" ]] && _other_match="$url"
+                if [[ -z "$_other_match" ]]; then _other_match="$url"; fi
               else
                 if [[ $is_exact -eq 1 ]]; then
-                  [[ -z "$_exact_fallback" ]] && _exact_fallback="$url"
+                  if [[ -z "$_exact_fallback" ]]; then _exact_fallback="$url"; fi
                 else
-                  [[ -z "$_other_fallback" ]] && _other_fallback="$url"
+                  if [[ -z "$_other_fallback" ]]; then _other_fallback="$url"; fi
                 fi
               fi
               break
@@ -961,9 +968,9 @@ _shdeps_binary_install_from_extracted() {
     # Last resort: sole compiled binary (filter out scripts via file(1))
     local -a binaries=()
     while IFS= read -r -d '' f; do
-      [[ -x "$f" ]] && file "$f" | grep -qiE 'ELF|Mach-O' && binaries+=("$f")
+      if [[ -x "$f" ]] && file "$f" | grep -qiE 'ELF|Mach-O'; then binaries+=("$f"); fi
     done < <(find "$extract_dir" -type f -print0 2>/dev/null)
-    [[ ${#binaries[@]} -eq 1 ]] && found_bin="${binaries[0]}"
+    if [[ ${#binaries[@]} -eq 1 ]]; then found_bin="${binaries[0]}"; fi
   fi
   if [[ -z "$found_bin" ]]; then
     rm -rf "$orig_extract_dir"
@@ -976,7 +983,7 @@ _shdeps_binary_install_from_extracted() {
   rm -rf "$install_dir"
   mkdir -p "$(dirname "$install_dir")"
   mv "$extract_dir" "$install_dir"
-  [[ "$orig_extract_dir" != "$extract_dir" ]] && rm -rf "$orig_extract_dir"
+  if [[ "$orig_extract_dir" != "$extract_dir" ]]; then rm -rf "$orig_extract_dir"; fi
 
   # Symlink the binary into PATH
   local bin_rel="${found_bin#"$extract_dir/"}"
@@ -1112,7 +1119,7 @@ _shdeps_install_binary() {
     return 1
   fi
 
-  [[ -n "${log:-}" ]] && : >"$log"
+  if [[ -n "${log:-}" ]]; then : >"$log"; fi
   if ! _shdeps_run_logged curl -fsSL --no-netrc "$asset_url" -o "$tmp_file"; then
     _shdeps_logfile_print "$name download" "$log"
     rm -f "$tmp_file" "$log"
@@ -1249,7 +1256,7 @@ _shdeps_run_post_hooks() {
   local hooks_dir
   hooks_dir=$(_shdeps_hooks_dir)
 
-  [[ ${#_SHDEPS_CHANGED[@]} -eq 0 ]] && return 0
+  if [[ ${#_SHDEPS_CHANGED[@]} -eq 0 ]]; then return 0; fi
 
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
@@ -1318,7 +1325,7 @@ shdeps_update() {
         line+=" $pkg"
       fi
     done
-    [[ -n "$line" ]] && _shdeps_log_dim "$line"
+    if [[ -n "$line" ]]; then _shdeps_log_dim "$line"; fi
   fi
 
   # Install phase: take actions, report what changed
