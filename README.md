@@ -11,7 +11,7 @@ A standalone shell dependency manager. Declare your tools in a config file, and 
 
 - **Declarative config** — one line per dependency in `deps.conf`
 - **Multiple install methods** — system packages (brew/apt/dnf/pacman), git clones, GitHub release binaries, or fully custom hooks
-- **Cross-platform** — Linux, macOS, WSL with platform filtering per dep
+- **Cross-platform** — Linux, macOS, WSL with platform and hostname filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
 - **TTL-based caching** — avoids redundant network calls
@@ -48,7 +48,7 @@ The CLI automatically finds `~/.config/shdeps/deps.conf` when no `-c` flag or `S
 ### deps.conf Format
 
 ```
-# name    method    [cmd]  [cmd_alt]  [pkg_overrides]  [repo]  [dir]  [platforms]
+# name    method    [cmd]  [cmd_alt]  [pkg_overrides]  [repo]  [dir]  [platforms]  [hosts]
 ```
 
 | Field | Required | Description |
@@ -61,6 +61,7 @@ The CLI automatically finds `~/.config/shdeps/deps.conf` when no `-c` flag or `S
 | `repo` | no | GitHub `owner/repo` (for `git` and `binary` methods) |
 | `dir` | no | Install directory relative to `$HOME` (for `git` method) |
 | `platforms` | no | Platform filter: `linux,darwin`, `!wsl`, etc. |
+| `hosts` | no | Hostname filter: `nas,taylor`, `!workstation`, etc. |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
 
@@ -87,10 +88,11 @@ Installs via the detected package manager (brew, apt, dnf, or pacman). Packages 
 jq        pkg
 bat       pkg    bat    batcat
 fd        pkg    fd     fdfind    apt:fd-find,dnf:fd-find
-dust      pkg    -      -         -    -    -    darwin
+dust      pkg    -      -         -              -    -    darwin
+htop      pkg    -      -         -              -    -    -        nas
 ```
 
-Use `pkg_overrides` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`).
+Use `pkg_overrides` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`). Use `hosts` to limit a dep to specific machines.
 
 ### `git` — GitHub Git Repos
 

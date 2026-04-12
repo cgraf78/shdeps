@@ -207,10 +207,10 @@ shdeps_load() {
 # ---------------------------------------------------------------------------
 
 # Split a pipe-delimited registry entry into named variables.
-# Sets: _name, _method, _cmd, _cmd_alt, _pkg_overrides, _repo, _dir, _platforms
+# Sets: _name, _method, _cmd, _cmd_alt, _pkg_overrides, _repo, _dir, _platforms, _hosts
 _shdeps_parse() {
   local entry="$1"
-  IFS='|' read -r _name _method _cmd _cmd_alt _pkg_overrides _repo _dir _platforms <<<"$entry"
+  IFS='|' read -r _name _method _cmd _cmd_alt _pkg_overrides _repo _dir _platforms _hosts <<<"$entry"
   # Dash means "use default" / "not specified"
   if [[ "$_cmd" == "-" ]]; then _cmd=""; fi
   if [[ "$_cmd_alt" == "-" ]]; then _cmd_alt=""; fi
@@ -218,6 +218,7 @@ _shdeps_parse() {
   if [[ "$_repo" == "-" ]]; then _repo=""; fi
   if [[ "$_dir" == "-" ]]; then _dir=""; fi
   if [[ "$_platforms" == "-" ]]; then _platforms=""; fi
+  if [[ "$_hosts" == "-" ]]; then _hosts=""; fi
   # Default cmd to name when unspecified
   if [[ -z "$_cmd" ]]; then _cmd="$_name"; fi
 }
@@ -262,6 +263,54 @@ _shdeps_platform_match() {
   else
     # Include-only: match only if listed
     for item in $spec; do
+      if [[ "$item" == "$current" ]]; then return 0; fi
+    done
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Host matching — include/exclude filter on hostname
+# ---------------------------------------------------------------------------
+
+# Check if the current hostname matches a hosts spec.
+# Same logic as _shdeps_platform_match but compares against hostname.
+# Empty spec matches all hosts. Supports include (nas,taylor) and
+# exclude (!nas) lists. Mixed lists check excludes first.
+_shdeps_host_match() {
+  local spec="${1:-}"
+  if [[ -z "$spec" ]]; then return 0; fi
+
+  local current
+  current=$(hostname -s 2>/dev/null || hostname 2>/dev/null)
+  current="${current,,}"
+
+  local item has_include=0 has_exclude=0
+  local IFS=','
+  for item in $spec; do
+    item="${item,,}"
+    if [[ "$item" == !* ]]; then has_exclude=1; else has_include=1; fi
+  done
+
+  if [[ $has_include -eq 1 && $has_exclude -eq 1 ]]; then
+    for item in $spec; do
+      item="${item,,}"
+      if [[ "$item" == "!$current" ]]; then return 1; fi
+    done
+    for item in $spec; do
+      item="${item,,}"
+      if [[ "$item" == "$current" ]]; then return 0; fi
+    done
+    return 1
+  elif [[ $has_exclude -eq 1 ]]; then
+    for item in $spec; do
+      item="${item,,}"
+      if [[ "$item" == "!$current" ]]; then return 1; fi
+    done
+    return 0
+  else
+    for item in $spec; do
+      item="${item,,}"
       if [[ "$item" == "$current" ]]; then return 0; fi
     done
     return 1
@@ -1194,8 +1243,9 @@ _shdeps_install_dep() {
   local entry="$1"
   _shdeps_parse "$entry"
 
-  # Skip deps that don't match this platform
+  # Skip deps that don't match this platform or host
   _shdeps_platform_match "$_platforms" || return 0
+  _shdeps_host_match "$_hosts" || return 0
 
   case "$_method" in
   pkg)

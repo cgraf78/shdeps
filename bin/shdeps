@@ -69,7 +69,7 @@ cmd_update() {
   shdeps_update
 }
 
-# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _dir, _platforms set by _shdeps_parse
+# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _dir, _platforms, _hosts set by _shdeps_parse
 cmd_list() {
   _shdeps_load
   _shdeps_pkg_detect
@@ -90,6 +90,10 @@ cmd_list() {
     # shellcheck disable=SC2154  # _name, _method, _cmd, etc. set by _shdeps_parse
     if ! _shdeps_platform_match "$_platforms"; then
       printf '%-20s %-8s %-12s %s\n' "$_name" "$_method" "skipped" "(platform)"
+      continue
+    fi
+    if ! _shdeps_host_match "$_hosts"; then
+      printf '%-20s %-8s %-12s %s\n' "$_name" "$_method" "skipped" "(host)"
       continue
     fi
 
@@ -136,7 +140,7 @@ cmd_list() {
   done
 }
 
-# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _dir, _platforms set by _shdeps_parse
+# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _dir, _platforms, _hosts set by _shdeps_parse
 cmd_check() {
   local target="${1:-}"
   if [[ -z "$target" ]]; then
@@ -157,6 +161,10 @@ cmd_check() {
 
     if ! _shdeps_platform_match "$_platforms"; then
       echo "$_name: skipped (platform mismatch)"
+      return 0
+    fi
+    if ! _shdeps_host_match "$_hosts"; then
+      echo "$_name: skipped (host mismatch)"
       return 0
     fi
 

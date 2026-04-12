@@ -39,13 +39,14 @@ All behavior is controlled via environment variables (no hardcoded paths):
 ## Config File Format
 
 ```
-# name    method    [cmd]  [cmd_alt]  [pkg_overrides]  [repo]  [dir]  [platforms]
+# name    method    [cmd]  [cmd_alt]  [pkg_overrides]  [repo]  [dir]  [platforms]  [hosts]
 jq        pkg
 bat       pkg       bat    batcat
 fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
 ds        git       -      -          -                cgraf78/ds.git   .local/share/ds
 neovim    binary    nvim   -          -                neovim/neovim
 nerd-fonts custom
+codex     binary    -      -          -                openai/codex     -            -       nas
 ```
 
 Methods: `pkg` (system package manager), `git` (GitHub clone), `binary` (GitHub release), `custom` (hook-only).

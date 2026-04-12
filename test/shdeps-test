@@ -55,14 +55,15 @@ _shdeps_load
 _assert_eq "minimal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
 _assert_eq "minimal entry: content" "jq|pkg" "${_SHDEPS_DEPS[0]}"
 
-# --- Maximal entry (all 8 fields) ---
+# --- Maximal entry (all 9 fields) ---
 
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-fd  pkg  fd  fdfind  apt:fd-find,dnf:fd-find  -  -  linux,darwin
+fd  pkg  fd  fdfind  apt:fd-find,dnf:fd-find  -  -  linux,darwin  nas
 EOF
 _shdeps_load
 _assert_eq "maximal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
 _assert_contains "maximal entry: has platforms" "linux,darwin" "${_SHDEPS_DEPS[0]}"
+_assert_contains "maximal entry: has hosts" "nas" "${_SHDEPS_DEPS[0]}"
 
 # --- Comments and blank lines ---
 
@@ -152,6 +153,7 @@ _assert_eq "parse full: pkg_overrides" "apt:fd-find,dnf:fd-find" "$_pkg_override
 _assert_eq "parse full: repo" "owner/fd" "$_repo"
 _assert_eq "parse full: dir" ".local/share/fd" "$_dir"
 _assert_eq "parse full: platforms" "linux,darwin" "$_platforms"
+_assert_eq "parse full: hosts empty when absent" "" "$_hosts"
 
 # --- Dash fields normalize to empty ---
 
@@ -160,6 +162,7 @@ _assert_eq "dash normalize: cmd defaults to name" "ds" "$_cmd"
 _assert_eq "dash normalize: cmd_alt empty" "" "$_cmd_alt"
 _assert_eq "dash normalize: pkg_overrides empty" "" "$_pkg_overrides"
 _assert_eq "dash normalize: platforms empty" "" "$_platforms"
+_assert_eq "dash normalize: hosts empty" "" "$_hosts"
 
 # --- Minimal entry (name + method) ---
 
@@ -271,6 +274,113 @@ else
   rc=0; _shdeps_platform_match "linux,!freebsd" || rc=$?
   _assert_exit "mixed: not in include list" 1 "$rc"
 fi
+
+# ===========================================================================
+# Section 3b: Host matching
+# ===========================================================================
+
+echo ""
+echo "=== Host matching ==="
+
+# Detect current hostname for assertions
+_current_host=$(hostname -s 2>/dev/null || hostname 2>/dev/null)
+_current_host="${_current_host,,}"
+
+# --- Empty spec matches all ---
+
+_shdeps_host_match ""
+_assert_exit "empty spec: matches" 0 $?
+
+# --- Include list: current host ---
+
+_shdeps_host_match "$_current_host"
+_assert_exit "include: current host matches" 0 $?
+
+# --- Include list: other host ---
+
+rc=0; _shdeps_host_match "nonexistent-host-xyz" || rc=$?
+_assert_exit "include: other host rejected" 1 "$rc"
+
+# --- Include list: multiple hosts ---
+
+_shdeps_host_match "other-host,$_current_host"
+_assert_exit "include multi: current host in list matches" 0 $?
+
+# --- Include list: none matching ---
+
+rc=0; _shdeps_host_match "host-a,host-b" || rc=$?
+_assert_exit "include: no match rejected" 1 "$rc"
+
+# --- Exclude list: excludes current ---
+
+rc=0; _shdeps_host_match "!${_current_host}" || rc=$?
+_assert_exit "exclude: current host excluded" 1 "$rc"
+
+# --- Exclude list: excludes other ---
+
+_shdeps_host_match "!nonexistent-host-xyz"
+_assert_exit "exclude: other host not excluded" 0 $?
+
+# --- Exclude list: multiple excludes, none matching ---
+
+_shdeps_host_match "!host-a,!host-b"
+_assert_exit "exclude multi: none matching passes" 0 $?
+
+# --- Mixed: exclude takes priority ---
+
+rc=0; _shdeps_host_match "${_current_host},!${_current_host}" || rc=$?
+_assert_exit "mixed: exclude overrides include" 1 "$rc"
+
+# --- Mixed: included and not excluded ---
+
+_shdeps_host_match "${_current_host},!other-host"
+_assert_exit "mixed: included and not excluded" 0 $?
+
+# --- Mixed: not in include list ---
+
+rc=0; _shdeps_host_match "other-host,!nonexistent" || rc=$?
+_assert_exit "mixed: not in include list" 1 "$rc"
+
+# --- Case-insensitive matching ---
+
+_upper_host="${_current_host^^}"
+_shdeps_host_match "$_upper_host"
+_assert_exit "case-insensitive: uppercase spec matches" 0 $?
+
+rc=0; _shdeps_host_match "!${_upper_host}" || rc=$?
+_assert_exit "case-insensitive: uppercase exclude works" 1 "$rc"
+
+# ===========================================================================
+# Section 3c: Entry parsing with hosts field
+# ===========================================================================
+
+echo ""
+echo "=== Entry parsing (hosts field) ==="
+
+# --- Full entry with all 9 fields ---
+
+_shdeps_parse "codex|binary|codex|-|-|openai/codex|-|-|nas"
+_assert_eq "parse hosts: name" "codex" "$_name"
+_assert_eq "parse hosts: hosts" "nas" "$_hosts"
+
+# --- Dash hosts normalize to empty ---
+
+_shdeps_parse "jq|pkg|-|-|-|-|-|-|-"
+_assert_eq "dash hosts: empty" "" "$_hosts"
+
+# --- Missing hosts field → empty ---
+
+_shdeps_parse "jq|pkg"
+_assert_eq "missing hosts: empty" "" "$_hosts"
+
+# --- Maximal entry with hosts ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+codex  binary  -  -  -  openai/codex  -  -  nas,taylor
+EOF
+SHDEPS_CONF="$_test_conf_dir/deps.conf"
+_shdeps_load
+_assert_contains "maximal with hosts: has hosts" "nas,taylor" "${_SHDEPS_DEPS[0]}"
 
 # ===========================================================================
 # Section 4: Package manager detection and resolution
