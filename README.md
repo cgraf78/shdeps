@@ -34,12 +34,14 @@ EOF
 ~/.local/share/shdeps/bin/shdeps -c deps.conf update
 ```
 
-Or add `bin/` to your PATH:
+Or symlink the CLI into your PATH:
 
 ```bash
-export PATH="$HOME/.local/share/shdeps/bin:$PATH"
+ln -sf ~/.local/share/shdeps/bin/shdeps ~/.local/bin/shdeps
 shdeps update
 ```
+
+The CLI automatically finds `~/.config/shdeps/deps.conf` when no `-c` flag or `SHDEPS_CONF` env var is set. The library (`source shdeps.sh`) defaults to `./deps.conf`.
 
 ## Configuration
 
@@ -66,7 +68,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 
 | Variable | Default | Description |
 |---|---|---|
-| `SHDEPS_CONF` | `./deps.conf` | Main config file |
+| `SHDEPS_CONF` | `~/.config/shdeps/deps.conf` (CLI) or `./deps.conf` (library) | Main config file |
 | `SHDEPS_CONF_LOCAL` | `<conf_dir>/deps.local.conf` | Local overrides (same dir as conf) |
 | `SHDEPS_HOOKS_DIR` | `<conf_dir>/hooks.d` | Post-install hooks directory |
 | `SHDEPS_STATE_DIR` | `$XDG_STATE_HOME/shdeps` | Cache/state directory |
@@ -139,7 +141,7 @@ Commands:
   help            Show this help message
 
 Options:
-  -c, --config <path>   Path to deps.conf
+  -c, --config <path>   Path to deps.conf (default: ~/.config/shdeps/deps.conf)
   -f, --force           Force reinstall all dependencies
   -q, --quiet           Suppress interactive prompts
   -v, --verbose         Verbose output

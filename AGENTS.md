@@ -27,7 +27,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 
 | Variable | Default | Description |
 |---|---|---|
-| `SHDEPS_CONF` | `./deps.conf` | Main config file |
+| `SHDEPS_CONF` | `~/.config/shdeps/deps.conf` (CLI) or `./deps.conf` (library) | Main config file |
 | `SHDEPS_CONF_LOCAL` | `./deps.local.conf` (same dir as SHDEPS_CONF) | Local overrides |
 | `SHDEPS_HOOKS_DIR` | `./hooks.d` (same dir as SHDEPS_CONF) | Post-install hooks |
 | `SHDEPS_STATE_DIR` | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps` | Cache/state dir |
