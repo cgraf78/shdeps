@@ -364,7 +364,7 @@ _source_shdeps "$SHDEPS_DIR"
 # Just verify it sets something (or empty on unusual systems)
 
 _shdeps_pkg_detect
-_assert_match "pkg_detect: sets a known value" "^(brew|apt|dnf|pacman|)$" "$_SHDEPS_PKG_MGR"
+_assert_match "pkg_detect: sets a known value" "^(brew|apt|dnf|pacman)?$" "$_SHDEPS_PKG_MGR"
 
 # ===========================================================================
 # Section 5: Binary asset matching
