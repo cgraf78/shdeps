@@ -1068,6 +1068,18 @@ _assert_exit "force: bypasses fresh stamp" 1 "$rc"
 SHDEPS_FORCE=0
 _source_shdeps "$SHDEPS_DIR"
 
+# --- Reinstall mode also bypasses cache ---
+
+SHDEPS_REINSTALL=1
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_remote_touch "$stamp"
+rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+_assert_exit "reinstall: bypasses fresh stamp" 1 "$rc"
+
+# Reset reinstall
+SHDEPS_REINSTALL=0
+_source_shdeps "$SHDEPS_DIR"
+
 # --- Invalid stamp content is stale ---
 
 echo "not-a-number" > "$stamp"
@@ -1380,6 +1392,20 @@ _source_shdeps "$SHDEPS_DIR"
 rc=0; shdeps_force || rc=$?
 _assert_exit "shdeps_force: inactive when SHDEPS_FORCE=0" 1 "$rc"
 
+# --- shdeps_reinstall: returns 0 when reinstall is 1 ---
+
+SHDEPS_REINSTALL=1
+_source_shdeps "$SHDEPS_DIR"
+shdeps_reinstall
+_assert_exit "shdeps_reinstall: active when SHDEPS_REINSTALL=1" 0 $?
+
+# --- shdeps_reinstall: returns 1 when reinstall is 0 ---
+
+SHDEPS_REINSTALL=0
+_source_shdeps "$SHDEPS_DIR"
+rc=0; shdeps_reinstall || rc=$?
+_assert_exit "shdeps_reinstall: inactive when SHDEPS_REINSTALL=0" 1 "$rc"
+
 # --- shdeps_platform: returns a known platform ---
 
 result=$(shdeps_platform)
@@ -1676,18 +1702,37 @@ _assert_contains "integ2: status still runs" "custom-a-status" "$integ_output"
 _assert_not_contains "integ2: install skipped (stamp fresh)" "custom-a-install" "$integ_output"
 _assert_not_contains "integ2: install-b skipped (stamp fresh)" "custom-b-install" "$integ_output"
 
-# --- Force mode: re-runs all post hooks ---
+# --- Force mode (TTL bypass): re-checks but doesn't reinstall ---
 
 SHDEPS_FORCE=1
+SHDEPS_REINSTALL=0
 _source_shdeps "$SHDEPS_DIR"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
-_assert_contains "integ force: custom-a install re-ran" "custom-a-install" "$integ_output"
-_assert_contains "integ force: custom-b install re-ran" "custom-b-install" "$integ_output"
+# Force bypasses TTL so install() runs (stamp is stale), but this is a
+# fresh check, not a reinstall — the behavior is the same here because
+# custom install() hooks always run when due.
+_assert_contains "integ force: custom-a install ran" "custom-a-install" "$integ_output"
 
-# Reset force
+# Reset
 SHDEPS_FORCE=0
+_source_shdeps "$SHDEPS_DIR"
+
+# --- Reinstall mode: re-runs all install and post hooks ---
+
+SHDEPS_FORCE=1
+SHDEPS_REINSTALL=1
+_source_shdeps "$SHDEPS_DIR"
+: > "$INTEG_LOG"
+shdeps_update
+integ_output=$(cat "$INTEG_LOG")
+_assert_contains "integ reinstall: custom-a install re-ran" "custom-a-install" "$integ_output"
+_assert_contains "integ reinstall: custom-b install re-ran" "custom-b-install" "$integ_output"
+
+# Reset
+SHDEPS_FORCE=0
+SHDEPS_REINSTALL=0
 _source_shdeps "$SHDEPS_DIR"
 
 # --- Integration with pkg deps: already-installed commands skip install ---
@@ -1732,9 +1777,8 @@ _assert_contains "integ multi-file: custom-b from extra.conf" "custom-b-install"
 SHDEPS_FORCE=0
 _source_shdeps "$SHDEPS_DIR"
 
-# --- Integration: platform-filtered deps skip install but force still runs hooks ---
-# Force mode marks ALL deps as changed (including platform-filtered ones).
-# The platform filter only prevents _shdeps_install_dep from running.
+# --- Integration: platform-filtered deps skip install ---
+# The platform filter prevents _shdeps_install_dep from running.
 
 if [[ "$_current_os" == "linux" ]]; then
   _skip_plat="macos"

@@ -44,7 +44,8 @@ Commands:
 
 Options:
   -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
-  -f, --force           Force reinstall all dependencies
+  -f, --force           Bypass TTL cache (check for updates now)
+  -R, --reinstall       Force reinstall all dependencies (implies --force)
   -q, --quiet           Suppress interactive prompts
   -v, --verbose         Verbose output (log level 2)
 
@@ -269,6 +270,11 @@ main() {
       ;;
     -f|--force)
       export SHDEPS_FORCE=1
+      shift
+      ;;
+    -R|--reinstall)
+      export SHDEPS_FORCE=1
+      export SHDEPS_REINSTALL=1
       shift
       ;;
     -q|--quiet)

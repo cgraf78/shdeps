@@ -86,7 +86,8 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_CONF_DIR` | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded) |
 | `SHDEPS_HOOKS_DIR` | `<conf_dir>/hooks.d` | Post-install hooks directory |
 | `SHDEPS_STATE_DIR` | `$XDG_STATE_HOME/shdeps` | Cache/state directory |
-| `SHDEPS_FORCE` | `0` | Force reinstall all deps |
+| `SHDEPS_FORCE` | `0` | Bypass TTL cache (check for updates now) |
+| `SHDEPS_REINSTALL` | `0` | Force reinstall all deps |
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
 | `SHDEPS_LOG_LEVEL` | `1` | 0=quiet, 1=normal, 2=verbose |
@@ -155,7 +156,8 @@ These public functions are available to hook authors:
 | `shdeps_log_ok` | Success highlight |
 | `shdeps_log_dim` | Dimmed / low-importance line |
 | `shdeps_pkg_mgr` | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, or empty) |
-| `shdeps_force` | Return 0 if force mode is active |
+| `shdeps_force` | Return 0 if force mode is active (TTL bypass) |
+| `shdeps_reinstall` | Return 0 if reinstall mode is active |
 | `shdeps_platform` | Print normalized platform name (`linux`, `macos`, `wsl`) |
 | `shdeps_require_sudo` | Acquire sudo; returns 0 if root or sudo obtained |
 | `shdeps_platform_match` | Check if current platform matches a spec |
@@ -178,7 +180,8 @@ Commands:
 
 Options:
   -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
-  -f, --force           Force reinstall all dependencies (or bypass TTL for self-update)
+  -f, --force           Bypass TTL cache (check for updates now)
+  -R, --reinstall       Force reinstall all dependencies (implies --force)
   -q, --quiet           Suppress interactive prompts
   -v, --verbose         Verbose output
 ```
@@ -199,7 +202,8 @@ Available public functions:
 - `shdeps_platform_match <spec>` — check if current platform matches a spec (e.g., `linux,macos`, `!wsl`)
 - `shdeps_host_match <spec>` — check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`)
 - `shdeps_pkg_mgr` — print detected package manager
-- `shdeps_force` — return 0 if force mode is active
+- `shdeps_force` — return 0 if force mode is active (TTL bypass)
+- `shdeps_reinstall` — return 0 if reinstall mode is active
 - `shdeps_platform` — print normalized platform name (`linux`, `macos`, `wsl`)
 - `shdeps_require_sudo` — acquire sudo
 - `shdeps_log`, `shdeps_warn`, `shdeps_log_ok`, `shdeps_log_dim` — logging

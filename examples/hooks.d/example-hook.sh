@@ -15,7 +15,8 @@
 #   shdeps_log_dim        Dimmed / low-importance line
 #   shdeps_log_header     Section header
 #   shdeps_pkg_mgr        Detected package manager (brew/apt/dnf/pacman/"")
-#   shdeps_force          Returns 0 if force mode is active
+#   shdeps_force          Returns 0 if force mode is active (TTL bypass)
+#   shdeps_reinstall      Returns 0 if reinstall mode is active
 #   shdeps_platform       Normalized platform name (linux, macos, wsl)
 #   shdeps_require_sudo   Acquire sudo (returns 0 if root or sudo obtained)
 #   shdeps_platform_match Check if current platform matches a spec

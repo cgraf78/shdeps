@@ -14,7 +14,8 @@
 #   SHDEPS_CONF_DIR     Config directory            (default: ./shdeps)
 #   SHDEPS_HOOKS_DIR    Post-install hooks dir      (default: <conf_dir>/hooks.d)
 #   SHDEPS_STATE_DIR    Cache/state directory       (default: $XDG_STATE_HOME/shdeps)
-#   SHDEPS_FORCE        Force reinstall all deps    (default: 0)
+#   SHDEPS_FORCE        Bypass TTL cache            (default: 0)
+#   SHDEPS_REINSTALL    Force reinstall all deps    (default: 0)
 #   SHDEPS_QUIET        Suppress interactive prompts(default: 0)
 #   SHDEPS_REMOTE_TTL   Cache TTL in seconds        (default: 3600)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
@@ -46,6 +47,7 @@ shdeps_platform() {
   echo "$current"
 }
 shdeps_force()          { [[ "$(_shdeps_force)" -eq 1 ]]; }
+shdeps_reinstall()      { [[ "$(_shdeps_reinstall)" -eq 1 ]]; }
 shdeps_pkg_mgr()        { echo "${_SHDEPS_PKG_MGR:-}"; }
 shdeps_require_sudo()   { _shdeps_require_sudo; }
 
@@ -76,6 +78,7 @@ _shdeps_conf_dir() {
 _shdeps_hooks_dir()  { echo "${SHDEPS_HOOKS_DIR:-$(_shdeps_conf_dir)/hooks.d}"; }
 _shdeps_state_dir()  { echo "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}"; }
 _shdeps_force()      { echo "${SHDEPS_FORCE:-0}"; }
+_shdeps_reinstall()  { echo "${SHDEPS_REINSTALL:-0}"; }
 _shdeps_quiet()      { echo "${SHDEPS_QUIET:-0}"; }
 _shdeps_remote_ttl() { echo "${SHDEPS_REMOTE_TTL:-3600}"; }
 _shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
@@ -573,10 +576,10 @@ _shdeps_remote_stamp() {
 }
 
 # Check if a stamp is still fresh (within TTL). Returns 0 if fresh.
-# Force mode always returns 1 (stale).
+# Force or reinstall mode always returns 1 (stale).
 _shdeps_remote_fresh() {
   local stamp="$1"
-  if [[ "$(_shdeps_force)" -eq 1 ]]; then return 1; fi
+  if [[ "$(_shdeps_force)" -eq 1 || "$(_shdeps_reinstall)" -eq 1 ]]; then return 1; fi
   [[ -f "$stamp" ]] || return 1
 
   local cached="" now="" ttl=""
@@ -727,7 +730,7 @@ _shdeps_github_install_local_clone() {
   elif [[ "$rev_before" != "$rev_after" ]]; then
     _SHDEPS_CHANGED[$name]=1
     _shdeps_log_ok "  $name updated${ver:+ -- $ver} (local clone)"
-  elif [[ "$dirty_after" -eq 1 || "$(_shdeps_force)" -eq 1 ]]; then
+  elif [[ "$dirty_after" -eq 1 || "$(_shdeps_reinstall)" -eq 1 ]]; then
     _SHDEPS_CHANGED[$name]=1
     _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver} (local clone)"
   else
@@ -760,7 +763,7 @@ _shdeps_github_install_pull() {
     if [[ "$head_before" != "$head_after" ]]; then
       _SHDEPS_CHANGED[$name]=1
       _shdeps_log_ok "  $name updated${ver:+ -- $ver}"
-    elif [[ "$(_shdeps_force)" -eq 1 ]]; then
+    elif [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
       _SHDEPS_CHANGED[$name]=1
       _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
     else
@@ -841,7 +844,7 @@ _shdeps_github_install_fresh() {
   local method="git clone"
   if [[ -n "${tarball_url:-}" ]]; then method="release tarball"; fi
 
-  if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$(_shdeps_force)" -ne 1 ]]; then
+  if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$(_shdeps_reinstall)" -ne 1 ]]; then
     _shdeps_log_dim "  $name${ver:+ -- $ver} ($method)"
   else
     _SHDEPS_CHANGED[$name]=1
@@ -1201,8 +1204,8 @@ _shdeps_install_binary() {
   local latest_ver_num=""
   latest_ver_num=$(echo "$latest_ver" | grep -oE '[0-9]+\.[0-9]+[0-9.]*' | head -1)
 
-  # Skip if already at latest (unless force mode)
-  if [[ "$(_shdeps_force)" -ne 1 && -n "$current_ver" && -n "$latest_ver_num" && "$current_ver" == "$latest_ver_num" ]]; then
+  # Skip if already at latest (unless reinstall mode)
+  if [[ "$(_shdeps_reinstall)" -ne 1 && -n "$current_ver" && -n "$latest_ver_num" && "$current_ver" == "$latest_ver_num" ]]; then
     rm -f "$tmp_file" "$log"
     _shdeps_remote_touch "$stamp" || true
     _shdeps_log_dim "  $name -- $current_ver"
@@ -1446,9 +1449,9 @@ _shdeps_update() {
   # Status phase: read-only reporting (all installs complete)
   _shdeps_run_status_hooks
 
-  # Force mode: mark all deps as changed so all post() hooks run.
-  # (Install methods already checked shdeps_force individually during step 2.)
-  if [[ "$(_shdeps_force)" -eq 1 ]]; then
+  # Reinstall mode: mark all deps as changed so all post() hooks run.
+  # (Install methods already checked shdeps_reinstall individually during step 2.)
+  if [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
     for entry in "${_SHDEPS_DEPS[@]}"; do
       _SHDEPS_CHANGED["${entry%%|*}"]=1
     done
