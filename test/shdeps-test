@@ -1282,7 +1282,7 @@ _shdeps_run_status_hooks
 status_output=$(cat "$HOOK_LOG")
 _assert_contains "status: receives name as \$1" "status-name=api-tool" "$status_output"
 
-# --- install() called for custom deps ---
+# --- install() runs during install phase for custom deps ---
 
 _install_conf_dir=$(_tmpdir)
 _install_hooks_dir=$(_tmpdir)
@@ -1291,7 +1291,6 @@ mkdir -p "$_install_hooks_dir"
 
 cat >"$_install_conf_dir/deps.conf" <<'EOF'
 custom-tool  custom
-pkg-tool     pkg
 EOF
 SHDEPS_CONF_DIR="$_install_conf_dir"
 SHDEPS_HOOKS_DIR="$_install_hooks_dir"
@@ -1303,20 +1302,22 @@ cat >"$_install_hooks_dir/custom-tool.sh" <<'HOOK'
 install() { echo "install-ran" >> "$HOOK_LOG"; return 0; }
 post() { echo "post-ran" >> "$HOOK_LOG"; return 0; }
 HOOK
-cat >"$_install_hooks_dir/pkg-tool.sh" <<'HOOK'
-install() { echo "pkg-install-ran" >> "$HOOK_LOG"; return 0; }
-post() { echo "pkg-post-ran" >> "$HOOK_LOG"; return 0; }
-HOOK
 
 : > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=([custom-tool]=1 [pkg-tool]=1)
-_shdeps_run_post_hooks
-_install_output=$(cat "$HOOK_LOG")
+declare -gA _SHDEPS_CHANGED=()
 
-_assert_contains "install: called for custom dep" "install-ran" "$_install_output"
-_assert_contains "install: post also called for custom dep" "post-ran" "$_install_output"
-_assert_not_contains "install: not called for pkg dep" "pkg-install-ran" "$_install_output"
-_assert_contains "install: post called for pkg dep" "pkg-post-ran" "$_install_output"
+# install() runs during _shdeps_install_dep, not _shdeps_run_post_hooks
+_shdeps_install_dep "${_SHDEPS_DEPS[0]}"
+_install_output=$(cat "$HOOK_LOG")
+_assert_contains "install: called during install phase" "install-ran" "$_install_output"
+_assert_eq "install: marks dep as changed" "1" "${_SHDEPS_CHANGED[custom-tool]:-0}"
+
+# post() runs later in _shdeps_run_post_hooks
+: > "$HOOK_LOG"
+_shdeps_run_post_hooks
+_post_output=$(cat "$HOOK_LOG")
+_assert_contains "install: post runs in post phase" "post-ran" "$_post_output"
+_assert_not_contains "install: install does not re-run in post phase" "install-ran" "$_post_output"
 
 # ===========================================================================
 # Section 8c: Public API functions

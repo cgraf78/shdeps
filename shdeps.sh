@@ -1332,9 +1332,24 @@ _shdeps_install_dep() {
   custom)
     # Entirely managed by the hook's install() function.
     # Run only when the hook is due so no-op updates stay cheap.
-    if _shdeps_hook_due "$_name"; then
-      _SHDEPS_CHANGED[$_name]=1
+    if ! _shdeps_hook_due "$_name"; then return 0; fi
+    local hooks_dir
+    hooks_dir=$(_shdeps_hooks_dir)
+    local hook_file="$hooks_dir/$_name.sh"
+    [[ -f "$hook_file" ]] || return 0
+    unset -f install post status 2>/dev/null
+    # shellcheck source=/dev/null
+    . "$hook_file" || {
+      _shdeps_warn "  warning: failed to source $hook_file"
+      return 0
+    }
+    if declare -f install &>/dev/null; then
+      if install "$_name"; then
+        _shdeps_hook_touch "$_name" || true
+        _SHDEPS_CHANGED[$_name]=1
+      fi
     fi
+    unset -f install post status 2>/dev/null
     ;;
   esac
 }
@@ -1364,9 +1379,8 @@ _shdeps_run_status_hooks() {
   done
 }
 
-# Run install()/post() hooks for changed deps (after shdeps installs).
-# Custom deps: calls install() (the dep's installer), then post() if defined.
-# Other deps: calls post() only (shdeps already handled the install).
+# Run post() hooks for changed deps (post-install setup).
+# install() already ran during _shdeps_install_dep for custom deps.
 _shdeps_run_post_hooks() {
   local hooks_dir
   hooks_dir=$(_shdeps_hooks_dir)
@@ -1385,24 +1399,10 @@ _shdeps_run_post_hooks() {
       _shdeps_warn "  warning: failed to source $hook_file"
       continue
     }
-
-    # Extract method (second pipe-delimited field)
-    local method="${entry#*|}"
-    method="${method%%|*}"
-
-    local hook_ok=0
-    if [[ "$method" == "custom" ]]; then
-      # Custom deps: install() is the installer
-      if declare -f install &>/dev/null; then
-        install "$name" && hook_ok=1
-      fi
-    fi
-    # post() runs for all methods (post-install setup)
     if declare -f post &>/dev/null; then
-      post "$name" && hook_ok=1
-    fi
-    if [[ $hook_ok -eq 1 ]]; then
-      _shdeps_hook_touch "$name" || true
+      if post "$name"; then
+        _shdeps_hook_touch "$name" || true
+      fi
     fi
     unset -f install post status 2>/dev/null
   done
@@ -1411,11 +1411,11 @@ _shdeps_run_post_hooks() {
 # Install or upgrade all managed dependencies. Orchestrates:
 # 1. Load config
 # 2. Detect package manager
-# 3. Process each dep (queue pkg installs, run git/binary installs)
-# 4. Run status hooks
+# 3. Install each dep (pkg queues, git/binary install, custom install() hooks)
+# 4. Run status() hooks (read-only reporting)
 # 5. Report already-present system packages
 # 6. Batch-install queued packages
-# 7. Run post hooks for changed deps
+# 7. Run post() hooks for changed deps
 _shdeps_update() {
   if ! command -v git &>/dev/null; then
     _shdeps_warn "error: git is required for shdeps"
@@ -1436,7 +1436,8 @@ _shdeps_update() {
     _shdeps_install_dep "$entry" || true
   done
 
-  # Status phase: read-only reporting before any install actions
+  # Status phase: read-only reporting (after git/binary/custom installs,
+  # before batched pkg install)
   _shdeps_run_status_hooks
 
   # List already-present system packages in a compact block
