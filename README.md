@@ -90,6 +90,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_REINSTALL` | `0` | Force reinstall all deps |
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
+| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `git` method |
 | `SHDEPS_LOG_LEVEL` | `1` | 0=quiet, 1=normal, 2=verbose |
 
 ## Install Methods
@@ -110,7 +111,7 @@ Use `pkg_overrides` to map names across package managers. Use `NONE` to skip a d
 
 ### `git` — GitHub Git Repos
 
-Clones a GitHub repo into `$HOME/<dir>`. Prefers local clones in `~/git/<name>` (symlinked for live development). Falls back to release tarballs, then shallow clones.
+Clones a GitHub repo into `$HOME/<dir>`. Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<name>` (default `~/git/<name>`, symlinked for live development). Falls back to release tarballs, then shallow clones.
 
 ```
 ds    git    -    -    -    cgraf78/ds.git    .local/share/ds
@@ -180,6 +181,33 @@ export SHDEPS_CONF_DIR="$HOME/.config/myapp"
 source /path/to/shdeps.sh
 shdeps_update
 ```
+
+## Bootstrapping (Client Integration)
+
+For projects that embed shdeps (e.g., dotfiles managers), `install.sh --bootstrap` provides a single sourceable entry point that handles discovery, sourcing, CLI symlink, and self-update:
+
+```bash
+# Set your project's config before bootstrapping
+export SHDEPS_CONF_DIR="$HOME/.config/myapp"
+export SHDEPS_HOOKS_DIR="$HOME/.config/myapp/hooks.d"
+
+# Source shdeps — finds it automatically, installs if missing
+. ~/git/shdeps/install.sh --bootstrap ||
+  . ~/.local/share/shdeps/install.sh --bootstrap ||
+  { echo "shdeps not found"; return 1; }
+
+# shdeps_update is now available
+shdeps_update
+```
+
+The `--bootstrap` flag:
+
+- **Finds shdeps.sh** via `$SHDEPS_LIB` → `$SHDEPS_GIT_DEV_DIR/shdeps/` → `$SHDEPS_DIR/` → fresh install
+- **Sources it** into the caller (all `shdeps_*` functions become available)
+- **Symlinks the CLI** into `$SHDEPS_BIN` (default `~/.local/bin/shdeps`)
+- **Runs `self-update`** with TTL caching (skips dirty working trees)
+- **Is idempotent** — safe to call multiple times
+- **Does not leak `set -e`** into the caller's shell
 
 ## Public API
 

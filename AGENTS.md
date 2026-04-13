@@ -16,8 +16,10 @@ changes.
   Caller does: `source shdeps.sh; shdeps_update`
 - **`bin/shdeps`** — CLI wrapper. Parses args, sources `shdeps.sh`, dispatches
   to subcommands (`update`, `self-update`, `list`, `check`, `version`).
-- **`install.sh`** — curl-pipeable installer. Clones the repo, symlinks the
-  CLI into `~/.local/bin`. Idempotent (re-run updates). Supports `--uninstall`.
+- **`install.sh`** — curl-pipeable installer and bootstrap script. Clones the
+  repo, symlinks the CLI into `~/.local/bin`. Idempotent (re-run updates).
+  Supports `--uninstall` and `--bootstrap` (sourceable mode for client
+  integration — finds shdeps, sources it, symlinks CLI, runs self-update).
 - **`test/shdeps-test`** — test runner. Run with: `./test/shdeps-test`
 
 ## Code Organization
@@ -40,6 +42,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 | `SHDEPS_REINSTALL` | `0` | Force reinstall all deps |
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
+| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `git` method |
 | `SHDEPS_LOG_LEVEL` | `1` | Logging: 0=quiet, 1=normal, 2=verbose |
 
 ## Config File Format
