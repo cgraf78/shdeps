@@ -137,13 +137,18 @@ nerd-fonts    custom
 
 ## Hooks
 
-Place hook files in `<hooks_dir>/<name>.sh`. Each file can define:
+Place hook files in `<hooks_dir>/<name>.sh`. For `custom` deps, hooks define the full install lifecycle. For other methods, hooks provide optional post-install setup.
 
-- **`install(name)`** — the installer for `custom` deps. `$1` is the dep name. Return 0 to mark as complete.
-- **`post(name)`** — runs after a dep is installed/updated/changed (any method). `$1` is the dep name. Return 0 to mark as complete.
-- **`status(name)`** — runs every time for read-only status reporting. `$1` is the dep name.
+**Custom dep hooks:**
 
-For `custom` deps, define `install()` for the install logic. For other methods (`pkg`, `git`, `binary`), shdeps handles the install and `post()` runs afterward for additional setup (symlinking, config, etc.).
+- **`exists(name)`** — return 0 if installed (or not applicable), 1 if missing. Required for `custom` deps.
+- **`version(name)`** — print version string to stdout. Optional.
+- **`install(name)`** — perform the install unconditionally. shdeps only calls this when `exists()` returns 1 or `--reinstall` is used.
+- **`post(name)`** — optional post-install setup.
+
+**Non-custom dep hooks** (`pkg`, `git`, `binary`):
+
+- **`post(name)`** — runs after shdeps installs/updates the dep (symlinking, config, etc.).
 
 ### Hook API
 

@@ -603,28 +603,6 @@ _shdeps_remote_touch() {
   date +%s >"$stamp"
 }
 
-# Return path for a dep's post-hook stamp file.
-_shdeps_hook_stamp() {
-  local name="$1"
-  echo "$(_shdeps_state_dir)/${name}.hook.stamp"
-}
-
-# Check if a hook is due (stamp expired or missing).
-_shdeps_hook_due() {
-  local name="$1"
-  local stamp
-  stamp=$(_shdeps_hook_stamp "$name")
-  ! _shdeps_remote_fresh "$stamp"
-}
-
-# Mark a hook as freshly run.
-_shdeps_hook_touch() {
-  local name="$1"
-  local stamp
-  stamp=$(_shdeps_hook_stamp "$name")
-  _shdeps_remote_touch "$stamp"
-}
-
 # Return path for a dep's git revision stamp.
 _shdeps_rev_stamp() {
   local name="$1"
@@ -1339,53 +1317,48 @@ _shdeps_install_dep() {
     _shdeps_install_binary "$_name" "$_cmd" "$_repo"
     ;;
   custom)
-    # Entirely managed by the hook's install() function.
-    # Run only when the hook is due so no-op updates stay cheap.
-    if ! _shdeps_hook_due "$_name"; then return 0; fi
+    # Source hook file and use exists() to gate install().
     local hooks_dir
     hooks_dir=$(_shdeps_hooks_dir)
     local hook_file="$hooks_dir/$_name.sh"
     [[ -f "$hook_file" ]] || return 0
-    unset -f install post status 2>/dev/null
+    unset -f exists version install post 2>/dev/null
     # shellcheck source=/dev/null
     . "$hook_file" || {
       _shdeps_warn "  warning: failed to source $hook_file"
       return 0
     }
+    if ! declare -f exists &>/dev/null; then
+      _shdeps_warn "  warning: $_name hook missing exists() — skipping"
+      unset -f exists version install post 2>/dev/null
+      return 0
+    fi
+    local _existed=0 ver=""
+    exists "$_name" && _existed=1
+    if [[ $_existed -eq 1 && "$(_shdeps_reinstall)" -ne 1 ]]; then
+      if declare -f version &>/dev/null; then
+        ver=$(version "$_name" 2>/dev/null) || ver=""
+      fi
+      _shdeps_log_dim "  $_name${ver:+ -- $ver}"
+      unset -f exists version install post 2>/dev/null
+      return 0
+    fi
     if declare -f install &>/dev/null; then
+      local action="added"
+      [[ $_existed -eq 1 ]] && action="reinstalled"
       if install "$_name"; then
-        _shdeps_hook_touch "$_name" || true
         _SHDEPS_CHANGED[$_name]=1
+        if declare -f version &>/dev/null; then
+          ver=$(version "$_name" 2>/dev/null) || ver=""
+        fi
+        _shdeps_log_ok "  $_name $action${ver:+ -- $ver}"
+      else
+        _shdeps_warn "  warning: $_name install failed"
       fi
     fi
-    unset -f install post status 2>/dev/null
+    unset -f exists version install post 2>/dev/null
     ;;
   esac
-}
-
-# Run status() hooks for all deps (always — prints current state lines).
-# Each hook file may define install(), post(), and/or status().
-# Sourced per-dep to avoid function name collisions between hooks.
-_shdeps_run_status_hooks() {
-  local hooks_dir
-  hooks_dir=$(_shdeps_hooks_dir)
-
-  local entry
-  for entry in "${_SHDEPS_DEPS[@]}"; do
-    local name="${entry%%|*}"
-    local hook_file="$hooks_dir/$name.sh"
-    [[ -f "$hook_file" ]] || continue
-    unset -f install post status 2>/dev/null
-    # shellcheck source=/dev/null
-    . "$hook_file" || {
-      _shdeps_warn "  warning: failed to source $hook_file"
-      continue
-    }
-    if declare -f status &>/dev/null; then
-      status "$name" || true
-    fi
-    unset -f install post status 2>/dev/null
-  done
 }
 
 # Run post() hooks for changed deps (post-install setup).
@@ -1402,27 +1375,24 @@ _shdeps_run_post_hooks() {
     [[ -n "${_SHDEPS_CHANGED[$name]+x}" ]] || continue
     local hook_file="$hooks_dir/$name.sh"
     [[ -f "$hook_file" ]] || continue
-    unset -f install post status 2>/dev/null
+    unset -f exists version install post 2>/dev/null
     # shellcheck source=/dev/null
     . "$hook_file" || {
       _shdeps_warn "  warning: failed to source $hook_file"
       continue
     }
     if declare -f post &>/dev/null; then
-      if post "$name"; then
-        _shdeps_hook_touch "$name" || true
-      fi
+      post "$name" || true
     fi
-    unset -f install post status 2>/dev/null
+    unset -f exists version install post 2>/dev/null
   done
 }
 
 # Install or upgrade all managed dependencies. Orchestrates:
 # 1. Load config and detect package manager
-# 2. Install each dep (pkg queues, git/binary install, custom install() hooks)
+# 2. Install each dep (pkg queues, git/binary install, custom exists/install)
 # 3. Flush queued pkg installs
-# 4. Run status() hooks (all installs complete)
-# 5. Run post() hooks for changed deps
+# 4. Run post() hooks for changed deps
 _shdeps_update() {
   if ! command -v git &>/dev/null; then
     _shdeps_warn "error: git is required for shdeps"
@@ -1445,9 +1415,6 @@ _shdeps_update() {
 
   # Flush queued pkg installs
   _shdeps_pkg_install_batch
-
-  # Status phase: read-only reporting (all installs complete)
-  _shdeps_run_status_hooks
 
   # Reinstall mode: mark all deps as changed so all post() hooks run.
   # (Install methods already checked shdeps_reinstall individually during step 2.)

@@ -168,8 +168,23 @@ cmd_list() {
       fi
       ;;
     custom)
-      status="custom"
-      details="(hook-managed)"
+      local hooks_dir hook_file
+      hooks_dir=$(_shdeps_hooks_dir)
+      hook_file="$hooks_dir/$_name.sh"
+      if [[ -f "$hook_file" ]]; then
+        unset -f exists version install post 2>/dev/null
+        # shellcheck source=/dev/null
+        . "$hook_file" 2>/dev/null
+        if declare -f exists &>/dev/null && exists "$_name"; then
+          status="installed"
+          if declare -f version &>/dev/null; then
+            local ver
+            ver=$(version "$_name" 2>/dev/null) || ver=""
+            [[ -n "$ver" ]] && details="$ver"
+          fi
+        fi
+        unset -f exists version install post 2>/dev/null
+      fi
       ;;
     esac
 
@@ -239,8 +254,24 @@ cmd_check() {
       fi
       ;;
     custom)
-      echo "$_name: custom (hook-managed)"
-      return 0
+      local hooks_dir hook_file
+      hooks_dir=$(_shdeps_hooks_dir)
+      hook_file="$hooks_dir/$_name.sh"
+      if [[ -f "$hook_file" ]]; then
+        unset -f exists version install post 2>/dev/null
+        # shellcheck source=/dev/null
+        . "$hook_file" 2>/dev/null
+        if declare -f exists &>/dev/null && exists "$_name"; then
+          local ver=""
+          if declare -f version &>/dev/null; then
+            ver=$(version "$_name" 2>/dev/null) || ver=""
+          fi
+          echo "$_name: installed${ver:+ ($ver)}"
+          unset -f exists version install post 2>/dev/null
+          return 0
+        fi
+        unset -f exists version install post 2>/dev/null
+      fi
       ;;
     esac
 

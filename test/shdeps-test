@@ -1086,21 +1086,6 @@ echo "not-a-number" > "$stamp"
 rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
 _assert_exit "invalid: non-numeric stamp is stale" 1 "$rc"
 
-# --- Hook stamps ---
-
-hook_stamp=$(_shdeps_hook_stamp "test-hook")
-_assert_contains "hook stamp: includes name" "test-hook" "$hook_stamp"
-
-# Hook due when no stamp
-rm -f "$hook_stamp"
-_shdeps_hook_due "test-hook"
-_assert_exit "hook due: no stamp" 0 $?
-
-# Hook not due after touch
-_shdeps_hook_touch "test-hook"
-rc=0; _shdeps_hook_due "test-hook" || rc=$?
-_assert_exit "hook not due: after touch" 1 "$rc"
-
 # --- Rev stamps ---
 
 rev_stamp=$(_shdeps_rev_stamp "test-rev")
@@ -1117,7 +1102,7 @@ rc=0; _shdeps_rev_read "test-rev" || rc=$?
 _assert_exit "rev read: missing returns 1" 1 "$rc"
 
 # ===========================================================================
-# Section 8: Hook system
+# Section 8: Hook system — exists/version/install/post lifecycle
 # ===========================================================================
 
 echo ""
@@ -1126,68 +1111,39 @@ echo "=== Hook system ==="
 _hook_test_dir=$(_tmpdir)
 _hook_conf_dir=$(_tmpdir)
 _hook_state_dir=$(_tmpdir)
+mkdir -p "$_hook_test_dir"
+
+HOOK_LOG="$_hook_test_dir/hook.log"
+export HOOK_LOG
 
 cat >"$_hook_conf_dir/deps.conf" <<'EOF'
 tool-a  pkg
-tool-b  pkg
-tool-c  custom
+tool-b  custom
 EOF
 
 SHDEPS_CONF_DIR="$_hook_conf_dir"
 SHDEPS_HOOKS_DIR="$_hook_test_dir"
 SHDEPS_STATE_DIR="$_hook_state_dir"
+SHDEPS_REINSTALL=0
 _source_shdeps "$SHDEPS_DIR"
 _shdeps_load
 
-# --- Hook file discovery: hooks dir checked for <name>.sh ---
-
-mkdir -p "$_hook_test_dir"
-cat >"$_hook_test_dir/tool-a.sh" <<'HOOK'
-post() { echo "post-a" >> "$HOOK_LOG"; }
-status() { echo "status-a" >> "$HOOK_LOG"; }
-HOOK
-cat >"$_hook_test_dir/tool-b.sh" <<'HOOK'
-post() { echo "post-b" >> "$HOOK_LOG"; }
-status() { echo "status-b" >> "$HOOK_LOG"; }
-HOOK
-cat >"$_hook_test_dir/tool-c.sh" <<'HOOK'
-post() { echo "post-c" >> "$HOOK_LOG"; }
-status() { echo "status-c" >> "$HOOK_LOG"; }
-HOOK
-
-# --- status() called for ALL deps ---
-
-HOOK_LOG="$_hook_test_dir/hook.log"
-export HOOK_LOG
-: > "$HOOK_LOG"
-_shdeps_run_status_hooks
-status_output=$(cat "$HOOK_LOG")
-_assert_contains "status hooks: tool-a ran" "status-a" "$status_output"
-_assert_contains "status hooks: tool-b ran" "status-b" "$status_output"
-_assert_contains "status hooks: tool-c ran" "status-c" "$status_output"
-_assert_not_contains "status hooks: no post ran" "post-" "$status_output"
-
 # --- post() called ONLY for changed deps ---
 
+cat >"$_hook_test_dir/tool-a.sh" <<'HOOK'
+post() { echo "post-a" >> "$HOOK_LOG"; }
+HOOK
+cat >"$_hook_test_dir/tool-b.sh" <<'HOOK'
+exists() { return 0; }
+post() { echo "post-b" >> "$HOOK_LOG"; }
+HOOK
+
 : > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=()
-_SHDEPS_CHANGED[tool-a]=1
-# tool-b NOT changed, tool-c NOT changed
+declare -gA _SHDEPS_CHANGED=([tool-a]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
 _assert_contains "post hooks: changed dep ran" "post-a" "$post_output"
 _assert_not_contains "post hooks: unchanged dep skipped" "post-b" "$post_output"
-_assert_not_contains "post hooks: other unchanged skipped" "post-c" "$post_output"
-
-# --- post() for multiple changed deps ---
-
-: > "$HOOK_LOG"
-_SHDEPS_CHANGED[tool-c]=1
-_shdeps_run_post_hooks
-post_output=$(cat "$HOOK_LOG")
-_assert_contains "post hooks multi: tool-a ran" "post-a" "$post_output"
-_assert_contains "post hooks multi: tool-c ran" "post-c" "$post_output"
-_assert_not_contains "post hooks multi: tool-b still skipped" "post-b" "$post_output"
 
 # --- No changed deps → no post hooks run ---
 
@@ -1197,40 +1153,30 @@ _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
 _assert_eq "post hooks: none changed, nothing ran" "" "$post_output"
 
-# --- Function isolation: one hook's functions don't leak to next ---
+# --- Post hook function isolation: one hook's functions don't leak ---
 
-mkdir -p "$_hook_test_dir"
 cat >"$_hook_test_dir/tool-a.sh" <<'HOOK'
 post() { echo "post-a" >> "$HOOK_LOG"; }
-# No status() function defined
 HOOK
 cat >"$_hook_test_dir/tool-b.sh" <<'HOOK'
-# No post() function defined
-status() { echo "status-b" >> "$HOOK_LOG"; }
+exists() { return 0; }
+# No post() defined
 HOOK
-
-: > "$HOOK_LOG"
-_shdeps_run_status_hooks
-status_output=$(cat "$HOOK_LOG")
-# tool-a has no status(), so only tool-b's status should appear
-_assert_not_contains "isolation: tool-a status not leaked" "status-a" "$status_output"
-_assert_contains "isolation: tool-b status ran" "status-b" "$status_output"
 
 : > "$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=([tool-a]=1 [tool-b]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
 _assert_contains "isolation: tool-a post ran" "post-a" "$post_output"
-# tool-b has no post(), so only tool-a's post should appear
 _assert_not_contains "isolation: tool-b post not leaked" "post-b" "$post_output"
 
-# --- Error in hook source doesn't crash ---
+# --- Error in post hook doesn't crash ---
 
 cat >"$_hook_test_dir/tool-a.sh" <<'HOOK'
-# Deliberate syntax issue that still sources but post fails
 post() { return 1; }
 HOOK
 cat >"$_hook_test_dir/tool-b.sh" <<'HOOK'
+exists() { return 0; }
 post() { echo "post-b-ok" >> "$HOOK_LOG"; }
 HOOK
 
@@ -1238,98 +1184,153 @@ HOOK
 declare -gA _SHDEPS_CHANGED=([tool-a]=1 [tool-b]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
-# tool-a's post() returns 1, but tool-b should still run
 _assert_contains "error handling: tool-b runs after tool-a fails" "post-b-ok" "$post_output"
 
-# --- Hook for dep without hook file is silently skipped ---
+# --- Missing hook file is silently skipped ---
 
-rm -f "$_hook_test_dir/tool-c.sh"
+rm -f "$_hook_test_dir/tool-b.sh"
 : > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=([tool-c]=1)
+declare -gA _SHDEPS_CHANGED=([tool-b]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
 _assert_eq "missing hook file: silently skipped" "" "$post_output"
 
 # ===========================================================================
-# Section 8b: Hook API — dep name passed as $1
+# Section 8b: Custom dep lifecycle — exists/version/install
 # ===========================================================================
 
 echo ""
-echo "=== Hook API ==="
+echo "=== Custom dep lifecycle ==="
 
-_api_test_dir=$(_tmpdir)
-_api_conf_dir=$(_tmpdir)
-_api_state_dir=$(_tmpdir)
+_cust_conf_dir=$(_tmpdir)
+_cust_hooks_dir=$(_tmpdir)
+_cust_state_dir=$(_tmpdir)
+mkdir -p "$_cust_hooks_dir"
 
-cat >"$_api_conf_dir/deps.conf" <<'EOF'
-api-tool  custom
-EOF
-
-SHDEPS_CONF_DIR="$_api_conf_dir"
-SHDEPS_HOOKS_DIR="$_api_test_dir"
-SHDEPS_STATE_DIR="$_api_state_dir"
+SHDEPS_CONF_DIR="$_cust_conf_dir"
+SHDEPS_HOOKS_DIR="$_cust_hooks_dir"
+SHDEPS_STATE_DIR="$_cust_state_dir"
+SHDEPS_REINSTALL=0
 _source_shdeps "$SHDEPS_DIR"
+
+# --- exists() returns 0 → present, no install ---
+
+cat >"$_cust_conf_dir/deps.conf" <<'EOF'
+present-tool  custom
+EOF
 _shdeps_load
 
-# --- post() receives dep name as $1 ---
-
-mkdir -p "$_api_test_dir"
-cat >"$_api_test_dir/api-tool.sh" <<'HOOK'
-post() { echo "post-name=$1" >> "$HOOK_LOG"; }
-status() { echo "status-name=$1" >> "$HOOK_LOG"; }
-HOOK
-
-HOOK_LOG="$_api_test_dir/hook.log"
-export HOOK_LOG
-: > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=([api-tool]=1)
-_shdeps_run_post_hooks
-post_output=$(cat "$HOOK_LOG")
-_assert_contains "post: receives name as \$1" "post-name=api-tool" "$post_output"
-
-# --- status() receives dep name as $1 ---
-
-: > "$HOOK_LOG"
-_shdeps_run_status_hooks
-status_output=$(cat "$HOOK_LOG")
-_assert_contains "status: receives name as \$1" "status-name=api-tool" "$status_output"
-
-# --- install() runs during install phase for custom deps ---
-
-_install_conf_dir=$(_tmpdir)
-_install_hooks_dir=$(_tmpdir)
-_install_state_dir=$(_tmpdir)
-mkdir -p "$_install_hooks_dir"
-
-cat >"$_install_conf_dir/deps.conf" <<'EOF'
-custom-tool  custom
-EOF
-SHDEPS_CONF_DIR="$_install_conf_dir"
-SHDEPS_HOOKS_DIR="$_install_hooks_dir"
-SHDEPS_STATE_DIR="$_install_state_dir"
-_source_shdeps "$SHDEPS_DIR"
-_shdeps_load
-
-cat >"$_install_hooks_dir/custom-tool.sh" <<'HOOK'
-install() { echo "install-ran" >> "$HOOK_LOG"; return 0; }
-post() { echo "post-ran" >> "$HOOK_LOG"; return 0; }
+cat >"$_cust_hooks_dir/present-tool.sh" <<'HOOK'
+exists() { return 0; }
+version() { echo "1.2.3"; }
+install() { echo "should-not-run" >> "$HOOK_LOG"; return 0; }
 HOOK
 
 : > "$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=()
-
-# install() runs during _shdeps_install_dep, not _shdeps_run_post_hooks
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}"
-_install_output=$(cat "$HOOK_LOG")
-_assert_contains "install: called during install phase" "install-ran" "$_install_output"
-_assert_eq "install: marks dep as changed" "1" "${_SHDEPS_CHANGED[custom-tool]:-0}"
+_assert_eq "exists=0: install not called" "" "$(cat "$HOOK_LOG")"
+_assert_eq "exists=0: not marked changed" "" "${_SHDEPS_CHANGED[present-tool]:-}"
 
-# post() runs later in _shdeps_run_post_hooks
+# --- exists() returns 1 → install called, marked "added" ---
+
+cat >"$_cust_conf_dir/deps.conf" <<'EOF'
+missing-tool  custom
+EOF
+_shdeps_load
+
+cat >"$_cust_hooks_dir/missing-tool.sh" <<'HOOK'
+exists() { return 1; }
+version() { echo "2.0.0"; }
+install() { echo "install-ran" >> "$HOOK_LOG"; return 0; }
+HOOK
+
 : > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=()
+_shdeps_install_dep "${_SHDEPS_DEPS[0]}"
+_assert_contains "exists=1: install called" "install-ran" "$(cat "$HOOK_LOG")"
+_assert_eq "exists=1: marked changed" "1" "${_SHDEPS_CHANGED[missing-tool]:-0}"
+
+# --- exists() returns 0 + reinstall → install called, marked "reinstalled" ---
+
+cat >"$_cust_conf_dir/deps.conf" <<'EOF'
+reinstall-tool  custom
+EOF
+_shdeps_load
+
+cat >"$_cust_hooks_dir/reinstall-tool.sh" <<'HOOK'
+exists() { return 0; }
+install() { echo "reinstall-ran" >> "$HOOK_LOG"; return 0; }
+HOOK
+
+SHDEPS_REINSTALL=1
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_load
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=()
+_shdeps_install_dep "${_SHDEPS_DEPS[0]}"
+_assert_contains "reinstall: install called" "reinstall-ran" "$(cat "$HOOK_LOG")"
+_assert_eq "reinstall: marked changed" "1" "${_SHDEPS_CHANGED[reinstall-tool]:-0}"
+
+SHDEPS_REINSTALL=0
+_source_shdeps "$SHDEPS_DIR"
+
+# --- Missing exists() → warning, skipped ---
+
+cat >"$_cust_conf_dir/deps.conf" <<'EOF'
+no-exists-tool  custom
+EOF
+_shdeps_load
+
+cat >"$_cust_hooks_dir/no-exists-tool.sh" <<'HOOK'
+install() { echo "should-not-run" >> "$HOOK_LOG"; return 0; }
+HOOK
+
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=()
+_shdeps_install_dep "${_SHDEPS_DEPS[0]}" 2>/dev/null
+_assert_eq "no exists: install not called" "" "$(cat "$HOOK_LOG")"
+
+# --- version() included in output ---
+
+cat >"$_cust_conf_dir/deps.conf" <<'EOF'
+ver-tool  custom
+EOF
+_shdeps_load
+
+cat >"$_cust_hooks_dir/ver-tool.sh" <<'HOOK'
+exists() { return 1; }
+version() { echo "3.14"; }
+install() { return 0; }
+HOOK
+
+# Temporarily enable logging to capture output via temp file
+_source_shdeps "$SHDEPS_DIR"
+SHDEPS_LOG_LEVEL=1
+_shdeps_load
+declare -gA _SHDEPS_CHANGED=()
+_ver_log=$(_tmpdir)/ver.log
+_shdeps_install_dep "${_SHDEPS_DEPS[0]}" 2>"$_ver_log"
+_ver_output=$(cat "$_ver_log")
+_assert_contains "version: included in added output" "3.14" "$_ver_output"
+_source_shdeps "$SHDEPS_DIR"
+
+# --- post() receives name as $1 ---
+
+cat >"$_cust_conf_dir/deps.conf" <<'EOF'
+name-tool  custom
+EOF
+_shdeps_load
+
+cat >"$_cust_hooks_dir/name-tool.sh" <<'HOOK'
+exists() { return 0; }
+post() { echo "post-name=$1" >> "$HOOK_LOG"; }
+HOOK
+
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=([name-tool]=1)
 _shdeps_run_post_hooks
-_post_output=$(cat "$HOOK_LOG")
-_assert_contains "install: post runs in post phase" "post-ran" "$_post_output"
-_assert_not_contains "install: install does not re-run in post phase" "install-ran" "$_post_output"
+_assert_contains "post: receives name as \$1" "post-name=name-tool" "$(cat "$HOOK_LOG")"
 
 # ===========================================================================
 # Section 8c: Public API functions
@@ -1656,15 +1657,15 @@ custom-a  custom
 custom-b  custom
 EOF
 
-# Hook for custom-a: install + status
+# Hook for custom-a: exists returns 1 (missing) so install runs
 cat > "$_integ_hooks/custom-a.sh" <<'HOOK'
+exists() { return 1; }
 install() { echo "custom-a-install" >> "$INTEG_LOG"; return 0; }
-status() { echo "custom-a-status" >> "$INTEG_LOG"; }
 HOOK
-# Hook for custom-b: install + status
+# Hook for custom-b: same
 cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+exists() { return 1; }
 install() { echo "custom-b-install" >> "$INTEG_LOG"; return 0; }
-status() { echo "custom-b-status" >> "$INTEG_LOG"; }
 HOOK
 
 SHDEPS_CONF_DIR="$_integ_dir"
@@ -1681,54 +1682,46 @@ export INTEG_LOG
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
 
-# Status hooks ran for all deps
-_assert_contains "integ: custom-a status ran" "custom-a-status" "$integ_output"
-_assert_contains "integ: custom-b status ran" "custom-b-status" "$integ_output"
-
-# Post hooks ran (custom deps with no prior stamp are hook-due)
+# install() ran for both (exists returns 1)
 _assert_contains "integ: custom-a install ran" "custom-a-install" "$integ_output"
 _assert_contains "integ: custom-b install ran" "custom-b-install" "$integ_output"
 
-# --- Second run: hooks already touched, so post should NOT re-run ---
+# --- Second run: exists still returns 1, install runs again ---
 
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
+_assert_contains "integ2: install still runs (exists=1)" "custom-a-install" "$integ_output"
 
-# Status always runs
-_assert_contains "integ2: status still runs" "custom-a-status" "$integ_output"
+# --- Reinstall mode: exists=0 hooks still get install called ---
 
-# Post should NOT run (hook stamp is fresh)
-_assert_not_contains "integ2: install skipped (stamp fresh)" "custom-a-install" "$integ_output"
-_assert_not_contains "integ2: install-b skipped (stamp fresh)" "custom-b-install" "$integ_output"
+# Make hooks report as present
+cat > "$_integ_hooks/custom-a.sh" <<'HOOK'
+exists() { return 0; }
+install() { echo "custom-a-reinstall" >> "$INTEG_LOG"; return 0; }
+HOOK
+cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+exists() { return 0; }
+install() { echo "custom-b-reinstall" >> "$INTEG_LOG"; return 0; }
+HOOK
 
-# --- Force mode (TTL bypass): re-checks but doesn't reinstall ---
-
-SHDEPS_FORCE=1
+# Without reinstall: exists=0 → skip
 SHDEPS_REINSTALL=0
 _source_shdeps "$SHDEPS_DIR"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
-# Force bypasses TTL so install() runs (stamp is stale), but this is a
-# fresh check, not a reinstall — the behavior is the same here because
-# custom install() hooks always run when due.
-_assert_contains "integ force: custom-a install ran" "custom-a-install" "$integ_output"
+_assert_not_contains "integ present: install skipped" "reinstall" "$integ_output"
 
-# Reset
-SHDEPS_FORCE=0
-_source_shdeps "$SHDEPS_DIR"
-
-# --- Reinstall mode: re-runs all install and post hooks ---
-
+# With reinstall: exists=0 but install runs anyway
 SHDEPS_FORCE=1
 SHDEPS_REINSTALL=1
 _source_shdeps "$SHDEPS_DIR"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
-_assert_contains "integ reinstall: custom-a install re-ran" "custom-a-install" "$integ_output"
-_assert_contains "integ reinstall: custom-b install re-ran" "custom-b-install" "$integ_output"
+_assert_contains "integ reinstall: custom-a install ran" "custom-a-reinstall" "$integ_output"
+_assert_contains "integ reinstall: custom-b install ran" "custom-b-reinstall" "$integ_output"
 
 # Reset
 SHDEPS_FORCE=0
@@ -1743,21 +1736,19 @@ echo '#!/bin/sh' > "$_integ_bin/fake-installed"
 chmod +x "$_integ_bin/fake-installed"
 export PATH="$_integ_bin:$PATH"
 
-cat > "$_integ_dir/deps.conf" <<'EOF'
-fake-installed  pkg  fake-installed
-custom-a        custom
-EOF
-
-: > "$INTEG_LOG"
-shdeps_update
-integ_output=$(cat "$INTEG_LOG")
-
-# The pkg dep should show up as present (not queued for install)
-# custom-a should still get its status hook
-_assert_contains "integ pkg: custom-a status" "custom-a-status" "$integ_output"
-
 # --- Integration with multiple conf files ---
 
+# Restore hooks with exists=1 for multi-file test
+cat > "$_integ_hooks/custom-a.sh" <<'HOOK'
+exists() { return 1; }
+install() { echo "custom-a-install" >> "$INTEG_LOG"; return 0; }
+HOOK
+cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+exists() { return 1; }
+install() { echo "custom-b-install" >> "$INTEG_LOG"; return 0; }
+HOOK
+
+rm -f "$_integ_dir"/*.conf
 cat > "$_integ_dir/deps.conf" <<'EOF'
 custom-a  custom
 EOF
@@ -1765,17 +1756,11 @@ cat > "$_integ_dir/extra.conf" <<'EOF'
 custom-b  custom
 EOF
 
-SHDEPS_FORCE=1
-_source_shdeps "$SHDEPS_DIR"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
 _assert_contains "integ multi-file: custom-a from deps.conf" "custom-a-install" "$integ_output"
 _assert_contains "integ multi-file: custom-b from extra.conf" "custom-b-install" "$integ_output"
-
-# Reset
-SHDEPS_FORCE=0
-_source_shdeps "$SHDEPS_DIR"
 
 # --- Integration: platform-filtered deps skip install ---
 # The platform filter prevents _shdeps_install_dep from running.
@@ -1792,16 +1777,13 @@ custom-a  custom  -  -  -  -  -  $_skip_plat
 custom-b  custom
 EOF
 
-# Without force: wrong-platform dep's custom hook is not due (stamp exists
-# from earlier run), so it won't be marked changed — post skipped.
+# Platform-filtered custom-a should not run; custom-b should.
 SHDEPS_FORCE=0
 _source_shdeps "$SHDEPS_DIR"
-# Ensure custom-a has a fresh hook stamp so it's not "due"
-_shdeps_hook_touch "custom-a"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
-_assert_not_contains "integ platform: no-force skips wrong platform install" "custom-a-install" "$integ_output"
+_assert_not_contains "integ platform: wrong platform skipped" "custom-a-install" "$integ_output"
 _assert_contains "integ platform: right platform runs" "custom-b" "$integ_output"
 
 # --- shdeps_version ---
