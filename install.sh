@@ -66,13 +66,15 @@ _install() {
     ln -sf "$SHDEPS_DIR/bin/shdeps" "$SHDEPS_BIN"
   fi
 
-  # Hint if ~/.local/bin isn't on PATH
+  # Hint if the bin directory isn't on PATH
+  local bin_dir
+  bin_dir=$(dirname "$SHDEPS_BIN")
   case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
+  *":${bin_dir}:"*) ;;
   *)
     _info ""
-    _info "Add ~/.local/bin to your PATH if it isn't already:"
-    _info "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    _info "Add $bin_dir to your PATH if it isn't already:"
+    _info "  export PATH=\"${bin_dir}:\$PATH\""
     ;;
   esac
 }

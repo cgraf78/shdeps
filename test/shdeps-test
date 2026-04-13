@@ -1604,18 +1604,32 @@ _assert_file_exists "self-update: stamp created" "$_su_state/shdeps.self-update.
 
 # --- Fresh stamp skips pull (within TTL) ---
 
-# Touch the stamp to make it current
+# Touch the stamp so TTL is active
 _source_shdeps "$SHDEPS_DIR"
 SHDEPS_STATE_DIR="$_su_state"
 stamp=$(_shdeps_remote_stamp "shdeps" "self-update")
 _shdeps_remote_touch "$stamp"
-# Create a new commit on origin so we can detect if pull happened
-git -C "$_su_dir" commit --allow-empty -m "marker" -q
-git -C "$_su_dir" push -q 2>/dev/null
+
+# Push a new commit to origin from a separate worktree so origin is ahead
+_su_ttl_work=$(_tmpdir)
+git clone "$_su_origin" "$_su_ttl_work" >/dev/null 2>&1
+git -C "$_su_ttl_work" config user.email "test@test.com"
+git -C "$_su_ttl_work" config user.name "Test"
+git -C "$_su_ttl_work" commit --allow-empty -m "ttl-marker" -q
+git -C "$_su_ttl_work" push -q 2>/dev/null
+
 _su_head_before=$(git -C "$_su_dir" rev-parse HEAD)
 SHDEPS_STATE_DIR="$_su_state" SHDEPS_FORCE=0 "$_su_cli" self-update 2>/dev/null
 _su_head_after=$(git -C "$_su_dir" rev-parse HEAD)
 _assert_eq "self-update TTL: no pull within TTL" "$_su_head_before" "$_su_head_after"
+
+# --- Stale stamp triggers pull ---
+
+echo "1000000000" > "$_su_state/shdeps.self-update.stamp"
+_su_head_before=$(git -C "$_su_dir" rev-parse HEAD)
+SHDEPS_STATE_DIR="$_su_state" SHDEPS_FORCE=0 "$_su_cli" self-update 2>/dev/null
+_su_head_after=$(git -C "$_su_dir" rev-parse HEAD)
+_assert_neq "self-update stale: pull happened" "$_su_head_before" "$_su_head_after"
 
 # --- Force bypasses TTL ---
 
