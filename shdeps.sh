@@ -683,20 +683,26 @@ _shdeps_github_install_local_clone() {
     rev_before="$REPLY"
   fi
 
+  # Check worktree status once — reused for both pull gating and dirty flag.
+  local _status_output=""
+  _status_output=$(git -C "$local_clone" status --porcelain --untracked-files=normal 2>/dev/null || true)
+
   # Pull if TTL expired (or --force) and the clone is clean
   if ! _shdeps_remote_fresh "$stamp"; then
-    if [[ -z "$(git -C "$local_clone" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
+    if [[ -z "$_status_output" ]]; then
       if _shdeps_run_logged git -C "$local_clone" pull --ff-only --quiet; then
         _shdeps_remote_touch "$stamp" || true
       else
         _shdeps_logfile_print "$name update" "$log"
         _shdeps_warn "  warning: $name update failed"
       fi
+      # Re-check status only if pull ran (it may have introduced changes)
+      _status_output=$(git -C "$local_clone" status --porcelain --untracked-files=normal 2>/dev/null || true)
     fi
   fi
 
   rev_after=$(git -C "$local_clone" rev-parse HEAD 2>/dev/null || true)
-  if [[ -n "$(git -C "$local_clone" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
+  if [[ -n "$_status_output" ]]; then
     dirty_after=1
   fi
 
@@ -1145,6 +1151,15 @@ _shdeps_install_binary() {
   local log=""
   local stamp
   stamp=$(_shdeps_remote_stamp "$name" binary)
+
+  # Fast path: skip entirely if binary exists and TTL is fresh.
+  # Avoids temp file creation, API calls, and asset matching.
+  if [[ -x "$bin_path" ]] && _shdeps_remote_fresh "$stamp"; then
+    current_ver=$(_shdeps_dep_version "$cmd")
+    _shdeps_log_dim "  $name -- $current_ver"
+    return 0
+  fi
+
   if ! _shdeps_logfile_create; then
     _shdeps_warn "  warning: failed to create temp log for $name install"
   else
@@ -1157,35 +1172,29 @@ _shdeps_install_binary() {
     return 1
   }
 
-  # Get installed version
+  # Get installed version (only when TTL is stale or binary is new)
   if [[ -x "$bin_path" ]]; then
     current_ver=$(_shdeps_dep_version "$cmd")
   fi
 
-  # Skip if cache is fresh and binary exists
-  if [[ -n "$current_ver" ]] && _shdeps_remote_fresh "$stamp"; then
-    rm -f "$tmp_file" "$log"
-    _shdeps_log_dim "  $name -- $current_ver"
-    return 0
-  fi
-
-  # Fetch latest release info from GitHub API.
-  # Use gh auth token if available for higher rate limits.
+  # Use prefetched release JSON if available, otherwise fetch now.
+  # The prefetch runs all binary API calls in parallel before the
+  # sequential install loop, saving ~200-500ms per dep.
   local release_json=""
-  local -a _gh_curl_args=(curl -fsSL --no-netrc)
-  local _gh_token=""
-  _gh_token=$(gh auth token 2>/dev/null) || _gh_token="${GITHUB_TOKEN:-}"
-  if [[ -n "$_gh_token" ]]; then
-    _gh_curl_args+=(-H "Authorization: token $_gh_token")
-  else
-    _gh_curl_args+=(-H "Authorization:")
-  fi
-  if command -v curl &>/dev/null; then
+  if [[ "${_SHDEPS_PREFETCH_READY:-}" == 1 && -n "${_SHDEPS_PREFETCHED[$name]+x}" ]]; then
+    release_json="${_SHDEPS_PREFETCHED[$name]}"
+  elif command -v curl &>/dev/null; then
+    local -a _gh_curl_args=(curl -fsSL --no-netrc)
+    if [[ -n "${_SHDEPS_GH_TOKEN:-}" ]]; then
+      _gh_curl_args+=(-H "Authorization: token $_SHDEPS_GH_TOKEN")
+    else
+      _gh_curl_args+=(-H "Authorization:")
+    fi
     release_json=$("${_gh_curl_args[@]}" \
       "https://api.github.com/repos/$gh_repo/releases/latest" 2>/dev/null || true)
-    latest_ver=$(echo "$release_json" |
-      grep -o '"tag_name":[[:space:]]*"[^"]*"' | cut -d'"' -f4)
   fi
+  latest_ver=$(echo "$release_json" |
+    grep -o '"tag_name":[[:space:]]*"[^"]*"' | cut -d'"' -f4)
 
   # Extract numeric portion for comparison (handles v1.2.3, rust-v1.2.3, etc.)
   local latest_ver_num=""
@@ -1397,6 +1406,58 @@ _shdeps_run_post_hooks() {
   done
 }
 
+# Pre-fetch GitHub release JSON for all binary deps in parallel.
+# Identifies binary deps with stale TTL, fires background curl requests,
+# and stores results in _SHDEPS_PREFETCHED[name]=json for consumption
+# by _shdeps_install_binary.
+_shdeps_prefetch_binary_releases() {
+  declare -gA _SHDEPS_PREFETCHED=()
+  _SHDEPS_PREFETCH_READY=1
+  command -v curl &>/dev/null || return 0
+
+  local -a _pf_names=() _pf_tmpfiles=() _pf_pids=()
+  local -a _pf_curl_args=(curl -fsSL --no-netrc)
+  if [[ -n "${_SHDEPS_GH_TOKEN:-}" ]]; then
+    _pf_curl_args+=(-H "Authorization: token $_SHDEPS_GH_TOKEN")
+  else
+    _pf_curl_args+=(-H "Authorization:")
+  fi
+
+  local entry
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    _shdeps_parse "$entry"
+    [[ "$_method" == "binary" ]] || continue
+    _shdeps_platform_match "$_platforms" || continue
+    _shdeps_host_match "$_hosts" || continue
+
+    local bin_path="$HOME/.local/bin/$_cmd"
+    local stamp
+    stamp=$(_shdeps_remote_stamp "$_name" binary)
+
+    # Skip if binary exists and TTL is fresh
+    [[ -x "$bin_path" ]] && _shdeps_remote_fresh "$stamp" && continue
+
+    local tmp
+    tmp=$(mktemp 2>/dev/null) || continue
+    _pf_names+=("$_name")
+    _pf_tmpfiles+=("$tmp")
+
+    "${_pf_curl_args[@]}" \
+      "https://api.github.com/repos/$_repo/releases/latest" \
+      >"$tmp" 2>/dev/null &
+    _pf_pids+=($!)
+  done
+
+  # Wait for all background fetches
+  local i
+  for i in "${!_pf_pids[@]}"; do
+    if wait "${_pf_pids[$i]}" 2>/dev/null; then
+      _SHDEPS_PREFETCHED["${_pf_names[$i]}"]=$(<"${_pf_tmpfiles[$i]}")
+    fi
+    rm -f "${_pf_tmpfiles[$i]}"
+  done
+}
+
 # Install or upgrade all managed dependencies. Orchestrates:
 # 1. Load config and detect package manager
 # 2. Install each dep (pkg queues, git/binary install, custom exists/install)
@@ -1415,6 +1476,14 @@ _shdeps_update() {
   declare -gA _SHDEPS_CHANGED=()
 
   _shdeps_log_header "==> Installing/upgrading tools..."
+
+  # Cache GitHub auth token once (avoids per-dep subprocess overhead).
+  _SHDEPS_GH_TOKEN=$(gh auth token 2>/dev/null) || _SHDEPS_GH_TOKEN="${GITHUB_TOKEN:-}"
+
+  # Pre-fetch GitHub release JSON for all binary deps in parallel.
+  # Each background curl writes to a temp file; _shdeps_install_binary
+  # reads from the associative array instead of making its own API call.
+  _shdeps_prefetch_binary_releases
 
   # Install phase
   local entry
