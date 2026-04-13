@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Install or update shdeps.
+# Install, update, or bootstrap shdeps.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/cgraf78/shdeps/main/install.sh | bash
-#   SHDEPS_DIR=~/.local/share/shdeps ./install.sh
-#   ./install.sh --uninstall
+#   curl -fsSL .../install.sh | bash          # install/update
+#   . /path/to/install.sh --bootstrap         # source into caller
+#   ./install.sh --uninstall                  # remove
 #
 # Environment:
-#   SHDEPS_DIR    Install directory (default: ~/.local/share/shdeps)
-#   SHDEPS_REPO   Git repo URL (default: https://github.com/cgraf78/shdeps.git)
+#   SHDEPS_DIR          Install directory      (default: ~/.local/share/shdeps)
+#   SHDEPS_REPO         Git repo URL           (default: https://github.com/cgraf78/shdeps.git)
+#   SHDEPS_BIN          CLI symlink path       (default: ~/.local/bin/shdeps)
+#   SHDEPS_LIB          Direct path to shdeps.sh (skips discovery in --bootstrap)
+#   SHDEPS_GIT_DEV_DIR  Dev clone directory    (default: ~/git)
 
-set -euo pipefail
+# Strict mode when executed directly; skip when sourced (--bootstrap)
+# to avoid infecting the caller's shell options.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -euo pipefail
+fi
 
 SHDEPS_DIR="${SHDEPS_DIR:-$HOME/.local/share/shdeps}"
 SHDEPS_REPO="${SHDEPS_REPO:-https://github.com/cgraf78/shdeps.git}"
@@ -80,6 +87,63 @@ _install() {
 }
 
 # ---------------------------------------------------------------------------
+# Bootstrap — source shdeps into the caller
+# ---------------------------------------------------------------------------
+# Designed to be sourced: `. /path/to/install.sh --bootstrap`
+#
+# Finds shdeps.sh, sources it, symlinks the CLI, and runs self-update.
+# Clients set env vars (SHDEPS_CONF_DIR, SHDEPS_HOOKS_DIR, etc.) before
+# sourcing. Pre-defined _shdeps_log* functions are respected by shdeps.sh.
+#
+# Returns 0 if shdeps is ready, 1 if bootstrap failed.
+
+_bootstrap() {
+  # Idempotent — skip if already bootstrapped
+  declare -f shdeps_update &>/dev/null && return 0
+
+  local _bs_lib="" _bs_dir=""
+  local _dev_dir="${SHDEPS_GIT_DEV_DIR:-$HOME/git}"
+
+  # Find shdeps.sh: env override → dev clone → installed clone → fresh install
+  if [[ -n "${SHDEPS_LIB:-}" && -f "$SHDEPS_LIB" ]]; then
+    _bs_lib="$SHDEPS_LIB"
+    _bs_dir="${SHDEPS_LIB%/*}"
+  elif [[ -f "$_dev_dir/shdeps/shdeps.sh" ]]; then
+    _bs_lib="$_dev_dir/shdeps/shdeps.sh"
+    _bs_dir="$_dev_dir/shdeps"
+  elif [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
+    _bs_lib="$SHDEPS_DIR/shdeps.sh"
+    _bs_dir="$SHDEPS_DIR"
+  else
+    # Not installed — run _install in a subshell so exit doesn't kill caller
+    # shellcheck disable=SC2310  # intentional: subshell contains exit
+    if ( _install ) >/dev/null 2>&1; then
+      _bs_lib="$SHDEPS_DIR/shdeps.sh"
+      _bs_dir="$SHDEPS_DIR"
+    else
+      return 1
+    fi
+  fi
+
+  # Source the library
+  # shellcheck source=/dev/null
+  . "$_bs_lib" || return 1
+
+  # Symlink CLI into PATH
+  if [[ -n "$_bs_dir" && -x "$_bs_dir/bin/shdeps" ]]; then
+    mkdir -p "$(dirname "$SHDEPS_BIN")"
+    ln -sf "$_bs_dir/bin/shdeps" "$SHDEPS_BIN"
+  fi
+
+  # Self-update (TTL-cached, skips dirty clones).
+  # Clear SHDEPS_STATE_DIR so the CLI uses its own default,
+  # sharing the stamp with standalone `shdeps self-update`.
+  if [[ -n "$_bs_dir" && -x "$SHDEPS_BIN" ]]; then
+    SHDEPS_STATE_DIR='' "$SHDEPS_BIN" self-update 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Uninstall
 # ---------------------------------------------------------------------------
 
@@ -105,11 +169,12 @@ _uninstall() {
 # ---------------------------------------------------------------------------
 
 case "${1:-}" in
---uninstall) _uninstall ;;
-"")          _install ;;
+--uninstall)  _uninstall ;;
+--bootstrap)  _bootstrap ;;
+"")           _install ;;
 *)
   _error "unknown argument: $1"
-  _info "Usage: install.sh [--uninstall]"
+  _info "Usage: install.sh [--uninstall|--bootstrap]"
   exit 2
   ;;
 esac

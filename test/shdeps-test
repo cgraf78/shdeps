@@ -1889,6 +1889,107 @@ rc=0
 _assert_exit "install unknown arg: exits 2" 2 "$rc"
 
 # ===========================================================================
+# Section 11b: install.sh --bootstrap
+# ===========================================================================
+
+echo ""
+echo "=== install.sh --bootstrap ==="
+
+# --- Bootstrap sources shdeps ---
+
+# Undefine shdeps to test fresh bootstrap
+unset -f shdeps_update 2>/dev/null
+_bs_dir=$(_tmpdir)/shdeps-bs
+_bs_bin=$(_tmpdir)/bs-bin
+mkdir -p "$_bs_bin"
+# Copy working tree (not git clone) so tests use uncommitted install.sh
+cp -R "$SHDEPS_DIR"/. "$_bs_dir/"
+
+SHDEPS_DIR="$_bs_dir" SHDEPS_BIN="$_bs_bin/shdeps" \
+  . "$_bs_dir/install.sh" --bootstrap
+_assert_exit "bootstrap: sources shdeps" 0 $?
+if declare -f shdeps_update &>/dev/null; then
+  _pass "bootstrap: shdeps_update defined"
+else
+  _fail "bootstrap: shdeps_update defined"
+fi
+_assert_symlink "bootstrap: CLI symlinked" "$_bs_bin/shdeps"
+
+# --- Bootstrap is idempotent ---
+
+SHDEPS_DIR="$_bs_dir" SHDEPS_BIN="$_bs_bin/shdeps" \
+  . "$_bs_dir/install.sh" --bootstrap
+_assert_exit "bootstrap idempotent: no error" 0 $?
+
+# --- Bootstrap does not leak set -e ---
+
+# Verify set -e is not active before test
+if [[ $- == *e* ]]; then
+  _fail "bootstrap set-e: errexit was already active (test invalid)"
+else
+  unset -f shdeps_update 2>/dev/null
+  SHDEPS_DIR="$_bs_dir" SHDEPS_BIN="$_bs_bin/shdeps" \
+    . "$_bs_dir/install.sh" --bootstrap
+  if [[ $- == *e* ]]; then
+    _fail "bootstrap set-e: errexit leaked into caller"
+    set +e
+  else
+    _pass "bootstrap set-e: errexit not leaked"
+  fi
+fi
+
+# --- Bootstrap respects SHDEPS_LIB ---
+
+unset -f shdeps_update 2>/dev/null
+SHDEPS_LIB="$_bs_dir/shdeps.sh" SHDEPS_DIR="$_bs_dir" \
+  SHDEPS_BIN="$_bs_bin/shdeps" \
+  . "$_bs_dir/install.sh" --bootstrap
+if declare -f shdeps_update &>/dev/null; then
+  _pass "bootstrap SHDEPS_LIB: shdeps_update defined"
+else
+  _fail "bootstrap SHDEPS_LIB: shdeps_update defined"
+fi
+
+# --- Bootstrap respects SHDEPS_GIT_DEV_DIR ---
+
+unset -f shdeps_update 2>/dev/null
+_bs_dev_dir=$(_tmpdir)/bs-dev
+mkdir -p "$_bs_dev_dir/shdeps"
+cp -R "$_bs_dir"/. "$_bs_dev_dir/shdeps/"
+
+SHDEPS_GIT_DEV_DIR="$_bs_dev_dir" SHDEPS_DIR="/nonexistent" \
+  SHDEPS_BIN="$_bs_bin/shdeps" \
+  . "$_bs_dir/install.sh" --bootstrap
+if declare -f shdeps_update &>/dev/null; then
+  _pass "bootstrap dev dir: shdeps_update defined"
+else
+  _fail "bootstrap dev dir: shdeps_update defined"
+fi
+
+# --- Bootstrap fresh install fallback ---
+
+unset -f shdeps_update 2>/dev/null
+_bs_fresh_dir=$(_tmpdir)/shdeps-fresh-bs
+_bs_fresh_bin=$(_tmpdir)/fresh-bin
+_bs_fresh_repo="$SHDEPS_DIR"
+mkdir -p "$_bs_fresh_bin"
+
+# Use the original SHDEPS_DIR (a git repo) as SHDEPS_REPO so _install
+# can clone without network access
+SHDEPS_DIR="$_bs_fresh_dir" SHDEPS_BIN="$_bs_fresh_bin/shdeps" \
+  SHDEPS_REPO="$_bs_fresh_repo" SHDEPS_GIT_DEV_DIR="/nonexistent" \
+  . "$_bs_dir/install.sh" --bootstrap
+if declare -f shdeps_update &>/dev/null; then
+  _pass "bootstrap fresh: shdeps_update defined"
+else
+  _fail "bootstrap fresh: shdeps_update defined"
+fi
+_assert_file_exists "bootstrap fresh: shdeps.sh installed" "$_bs_fresh_dir/shdeps.sh"
+
+# Re-source the test shdeps for subsequent tests
+_source_shdeps "$SHDEPS_DIR"
+
+# ===========================================================================
 # Section 12: self-update command
 # ===========================================================================
 
