@@ -1313,6 +1313,7 @@ _shdeps_install_dep() {
   pkg)
     local resolved_pkg=""
     resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
+    if [[ "$resolved_pkg" == "NONE" ]]; then return 0; fi
     if _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
       local ver=""
       ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
