@@ -20,11 +20,12 @@ changes.
   CLI into `~/.local/bin`. Idempotent (re-run updates). Supports `--uninstall`.
 - **`test/shdeps-test`** — test runner. Run with: `./test/shdeps-test`
 
-## Naming Conventions
+## Code Organization
 
-- Public API functions: `shdeps_` prefix (e.g., `shdeps_update`, `shdeps_load`, `shdeps_platform_match`, `shdeps_host_match`, `shdeps_log`, `shdeps_pkg_mgr`)
-- Internal functions: `_shdeps_` prefix (e.g., `_shdeps_parse`, `_shdeps_pkg_detect`)
-- Internal global variables: `_SHDEPS_` prefix
+- **Public API section** at the top of `shdeps.sh` contains every `shdeps_` function — the complete public contract in one place. Most are thin wrappers that delegate to internal `_shdeps_` implementations.
+- **Internal sections** below are organized by concern (config parsing, platform matching, package management, etc.) and use `_shdeps_` prefixes.
+- **Internal global variables** use `_SHDEPS_` prefix.
+- When adding new public functions, define the implementation as `_shdeps_` in the appropriate internal section, then add a `shdeps_` wrapper to the public API section.
 
 ## Configuration
 

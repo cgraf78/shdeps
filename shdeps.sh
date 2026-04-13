@@ -152,27 +152,23 @@ _shdeps_require_sudo() {
   sudo true 2>/dev/null
 }
 
-# Print library version.
-shdeps_version() { echo "shdeps $SHDEPS_VERSION"; }
-
 # ---------------------------------------------------------------------------
-# Public hook API — stable interface available to hook authors
+# Public API — stable interface for callers and hook authors
 # ---------------------------------------------------------------------------
+# Everything below with a shdeps_ prefix (no leading underscore) is the
+# public contract.  Internal implementations live in later sections with
+# _shdeps_ prefixes.
 
-# Logging wrappers. Delegate to the internal (overridable) implementations.
-shdeps_log()        { _shdeps_log "$@"; }
-shdeps_warn()       { _shdeps_warn "$@"; }
-shdeps_log_ok()     { _shdeps_log_ok "$@"; }
-shdeps_log_dim()    { _shdeps_log_dim "$@"; }
-shdeps_log_header() { _shdeps_log_header "$@"; }
+# Core
+shdeps_version()        { echo "shdeps $SHDEPS_VERSION"; }
+shdeps_update()         { _shdeps_update "$@"; }
+shdeps_load()           { _shdeps_load; echo "${#_SHDEPS_DEPS[@]}"; }
 
-# Return the detected package manager name (brew, apt, dnf, pacman, or "").
-shdeps_pkg_mgr()    { echo "${_SHDEPS_PKG_MGR:-}"; }
+# Matching
+shdeps_platform_match() { _shdeps_platform_match "$@"; }
+shdeps_host_match()     { _shdeps_host_match "$@"; }
 
-# Return 0 if force mode is active, 1 otherwise.
-shdeps_force()      { [[ "$(_shdeps_force)" -eq 1 ]]; }
-
-# Print the normalized platform name (linux, macos, wsl).
+# Platform and environment
 shdeps_platform() {
   local current
   current=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -180,13 +176,19 @@ shdeps_platform() {
   if [[ "$current" == "darwin" ]]; then current="macos"; fi
   echo "$current"
 }
+shdeps_force()          { [[ "$(_shdeps_force)" -eq 1 ]]; }
+shdeps_pkg_mgr()        { echo "${_SHDEPS_PKG_MGR:-}"; }
+shdeps_require_sudo()   { _shdeps_require_sudo; }
 
-# Acquire sudo. Returns 0 if root or sudo obtained.
-# In quiet mode, skips interactive prompt and returns 1 silently.
-shdeps_require_sudo() { _shdeps_require_sudo; }
+# Logging
+shdeps_log()            { _shdeps_log "$@"; }
+shdeps_warn()           { _shdeps_warn "$@"; }
+shdeps_log_ok()         { _shdeps_log_ok "$@"; }
+shdeps_log_dim()        { _shdeps_log_dim "$@"; }
+shdeps_log_header()     { _shdeps_log_header "$@"; }
 
 # ---------------------------------------------------------------------------
-# Config parsing — read deps.conf into an array
+# Config parsing
 # ---------------------------------------------------------------------------
 
 # Parse config files into _SHDEPS_DEPS array.
@@ -228,12 +230,6 @@ _shdeps_load() {
   done
 }
 
-# Public wrapper that loads config and returns the dep count.
-shdeps_load() {
-  _shdeps_load
-  echo "${#_SHDEPS_DEPS[@]}"
-}
-
 # ---------------------------------------------------------------------------
 # Entry parsing — split pipe-delimited entries into named variables
 # ---------------------------------------------------------------------------
@@ -256,14 +252,14 @@ _shdeps_parse() {
 }
 
 # ---------------------------------------------------------------------------
-# Platform matching — include/exclude filter on OS (public API)
+# Platform matching — include/exclude filter on OS
 # ---------------------------------------------------------------------------
 
 # Check if the current platform matches a platforms spec.
 # Empty spec matches all platforms. Supports include (linux,macos)
 # and exclude (!wsl,!macos) lists. Mixed lists check excludes first.
 # Returns 0 if the dep should install on this platform.
-shdeps_platform_match() {
+_shdeps_platform_match() {
   local spec="${1:-}"
   if [[ -z "$spec" ]]; then return 0; fi
 
@@ -301,15 +297,15 @@ shdeps_platform_match() {
 }
 
 # ---------------------------------------------------------------------------
-# Host matching — include/exclude filter on hostname (public API)
+# Host matching — include/exclude filter on hostname
 # ---------------------------------------------------------------------------
 
 # Check if the current hostname matches a hosts spec.
-# Same logic as shdeps_platform_match but compares against hostname.
+# Same logic as _shdeps_platform_match but compares against hostname.
 # Empty spec matches all hosts. Supports include (nas,taylor) and
 # exclude (!nas) lists. Mixed lists check excludes first.
 # Returns 0 if the dep should install on this host.
-shdeps_host_match() {
+_shdeps_host_match() {
   local spec="${1:-}"
   if [[ -z "$spec" ]]; then return 0; fi
 
@@ -1306,8 +1302,8 @@ _shdeps_install_dep() {
   _shdeps_parse "$entry"
 
   # Skip deps that don't match this platform or host
-  shdeps_platform_match "$_platforms" || return 0
-  shdeps_host_match "$_hosts" || return 0
+  _shdeps_platform_match "$_platforms" || return 0
+  _shdeps_host_match "$_hosts" || return 0
 
   case "$_method" in
   pkg)
@@ -1391,8 +1387,7 @@ _shdeps_run_post_hooks() {
   done
 }
 
-# Install or upgrade all managed dependencies.
-# This is the main public entry point. Orchestrates:
+# Install or upgrade all managed dependencies. Orchestrates:
 # 1. Load config
 # 2. Detect package manager
 # 3. Process each dep (queue pkg installs, run git/binary installs)
@@ -1400,7 +1395,7 @@ _shdeps_run_post_hooks() {
 # 5. Report already-present system packages
 # 6. Batch-install queued packages
 # 7. Run post hooks for changed deps
-shdeps_update() {
+_shdeps_update() {
   if ! command -v git &>/dev/null; then
     _shdeps_warn "error: git is required for shdeps"
     return 1
