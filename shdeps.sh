@@ -1330,7 +1330,7 @@ _shdeps_install_dep() {
     _shdeps_install_binary "$_name" "$_cmd" "$_repo"
     ;;
   custom)
-    # Entirely managed by the post-install hook.
+    # Entirely managed by the hook's install() function.
     # Run only when the hook is due so no-op updates stay cheap.
     if _shdeps_hook_due "$_name"; then
       _SHDEPS_CHANGED[$_name]=1
@@ -1340,7 +1340,8 @@ _shdeps_install_dep() {
 }
 
 # Run status() hooks for all deps (always — prints current state lines).
-# Each hook file defines post() and/or status(); sourced per-dep to avoid collisions.
+# Each hook file may define install(), post(), and/or status().
+# Sourced per-dep to avoid function name collisions between hooks.
 _shdeps_run_status_hooks() {
   local hooks_dir
   hooks_dir=$(_shdeps_hooks_dir)
@@ -1350,7 +1351,7 @@ _shdeps_run_status_hooks() {
     local name="${entry%%|*}"
     local hook_file="$hooks_dir/$name.sh"
     [[ -f "$hook_file" ]] || continue
-    unset -f status post 2>/dev/null
+    unset -f install post status 2>/dev/null
     # shellcheck source=/dev/null
     . "$hook_file" || {
       _shdeps_warn "  warning: failed to source $hook_file"
@@ -1359,11 +1360,13 @@ _shdeps_run_status_hooks() {
     if declare -f status &>/dev/null; then
       status "$name" || true
     fi
-    unset -f status post 2>/dev/null
+    unset -f install post status 2>/dev/null
   done
 }
 
-# Run post() hooks for changed deps (after installs — applies changes).
+# Run install()/post() hooks for changed deps (after shdeps installs).
+# Custom deps: calls install() (the dep's installer), then post() if defined.
+# Other deps: calls post() only (shdeps already handled the install).
 _shdeps_run_post_hooks() {
   local hooks_dir
   hooks_dir=$(_shdeps_hooks_dir)
@@ -1376,18 +1379,32 @@ _shdeps_run_post_hooks() {
     [[ -n "${_SHDEPS_CHANGED[$name]+x}" ]] || continue
     local hook_file="$hooks_dir/$name.sh"
     [[ -f "$hook_file" ]] || continue
-    unset -f post status 2>/dev/null
+    unset -f install post status 2>/dev/null
     # shellcheck source=/dev/null
     . "$hook_file" || {
       _shdeps_warn "  warning: failed to source $hook_file"
       continue
     }
-    if declare -f post &>/dev/null; then
-      if post "$name"; then
-        _shdeps_hook_touch "$name" || true
+
+    # Extract method (second pipe-delimited field)
+    local method="${entry#*|}"
+    method="${method%%|*}"
+
+    local hook_ok=0
+    if [[ "$method" == "custom" ]]; then
+      # Custom deps: install() is the installer
+      if declare -f install &>/dev/null; then
+        install "$name" && hook_ok=1
       fi
     fi
-    unset -f post status 2>/dev/null
+    # post() runs for all methods (post-install setup)
+    if declare -f post &>/dev/null; then
+      post "$name" && hook_ok=1
+    fi
+    if [[ $hook_ok -eq 1 ]]; then
+      _shdeps_hook_touch "$name" || true
+    fi
+    unset -f install post status 2>/dev/null
   done
 }
 

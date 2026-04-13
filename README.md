@@ -138,8 +138,11 @@ nerd-fonts    custom
 
 Place hook files in `<hooks_dir>/<name>.sh`. Each file can define:
 
-- **`post(name)`** — runs after a dep is installed/updated/changed. `$1` is the dep name. Return 0 to mark as complete.
+- **`install(name)`** — the installer for `custom` deps. `$1` is the dep name. Return 0 to mark as complete.
+- **`post(name)`** — runs after a dep is installed/updated/changed (any method). `$1` is the dep name. Return 0 to mark as complete.
 - **`status(name)`** — runs every time for read-only status reporting. `$1` is the dep name.
+
+For `custom` deps, define `install()` for the install logic. For other methods (`pkg`, `git`, `binary`), shdeps handles the install and `post()` runs afterward for additional setup (symlinking, config, etc.).
 
 ### Hook API
 

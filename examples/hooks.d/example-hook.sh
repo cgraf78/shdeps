@@ -21,11 +21,11 @@
 #   shdeps_platform_match Check if current platform matches a spec
 #   shdeps_host_match     Check if current hostname matches a spec
 
-# post() — runs when the dependency is newly installed, updated, or forced.
-# $1 is the dependency name.
+# install() — runs for custom deps when the hook is due.
+# $1 is the dependency name. This IS the installer for custom deps.
 # Return 0 to mark the hook as complete (stamps the TTL).
 # Return non-zero to retry on the next run.
-post() {
+install() {
   local name="$1"
   local font_dir="$HOME/.local/share/fonts"
   local font_name="JetBrainsMono"

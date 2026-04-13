@@ -1282,6 +1282,42 @@ _shdeps_run_status_hooks
 status_output=$(cat "$HOOK_LOG")
 _assert_contains "status: receives name as \$1" "status-name=api-tool" "$status_output"
 
+# --- install() called for custom deps ---
+
+_install_conf_dir=$(_tmpdir)
+_install_hooks_dir=$(_tmpdir)
+_install_state_dir=$(_tmpdir)
+mkdir -p "$_install_hooks_dir"
+
+cat >"$_install_conf_dir/deps.conf" <<'EOF'
+custom-tool  custom
+pkg-tool     pkg
+EOF
+SHDEPS_CONF_DIR="$_install_conf_dir"
+SHDEPS_HOOKS_DIR="$_install_hooks_dir"
+SHDEPS_STATE_DIR="$_install_state_dir"
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_load
+
+cat >"$_install_hooks_dir/custom-tool.sh" <<'HOOK'
+install() { echo "install-ran" >> "$HOOK_LOG"; return 0; }
+post() { echo "post-ran" >> "$HOOK_LOG"; return 0; }
+HOOK
+cat >"$_install_hooks_dir/pkg-tool.sh" <<'HOOK'
+install() { echo "pkg-install-ran" >> "$HOOK_LOG"; return 0; }
+post() { echo "pkg-post-ran" >> "$HOOK_LOG"; return 0; }
+HOOK
+
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=([custom-tool]=1 [pkg-tool]=1)
+_shdeps_run_post_hooks
+_install_output=$(cat "$HOOK_LOG")
+
+_assert_contains "install: called for custom dep" "install-ran" "$_install_output"
+_assert_contains "install: post also called for custom dep" "post-ran" "$_install_output"
+_assert_not_contains "install: not called for pkg dep" "pkg-install-ran" "$_install_output"
+_assert_contains "install: post called for pkg dep" "pkg-post-ran" "$_install_output"
+
 # ===========================================================================
 # Section 8c: Public API functions
 # ===========================================================================
@@ -1593,14 +1629,14 @@ custom-a  custom
 custom-b  custom
 EOF
 
-# Hook for custom-a: always runs (custom deps run when hook is due)
+# Hook for custom-a: install + status
 cat > "$_integ_hooks/custom-a.sh" <<'HOOK'
-post() { echo "custom-a-post" >> "$INTEG_LOG"; return 0; }
+install() { echo "custom-a-install" >> "$INTEG_LOG"; return 0; }
 status() { echo "custom-a-status" >> "$INTEG_LOG"; }
 HOOK
-# Hook for custom-b: post + status
+# Hook for custom-b: install + status
 cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
-post() { echo "custom-b-post" >> "$INTEG_LOG"; return 0; }
+install() { echo "custom-b-install" >> "$INTEG_LOG"; return 0; }
 status() { echo "custom-b-status" >> "$INTEG_LOG"; }
 HOOK
 
@@ -1623,8 +1659,8 @@ _assert_contains "integ: custom-a status ran" "custom-a-status" "$integ_output"
 _assert_contains "integ: custom-b status ran" "custom-b-status" "$integ_output"
 
 # Post hooks ran (custom deps with no prior stamp are hook-due)
-_assert_contains "integ: custom-a post ran" "custom-a-post" "$integ_output"
-_assert_contains "integ: custom-b post ran" "custom-b-post" "$integ_output"
+_assert_contains "integ: custom-a install ran" "custom-a-install" "$integ_output"
+_assert_contains "integ: custom-b install ran" "custom-b-install" "$integ_output"
 
 # --- Second run: hooks already touched, so post should NOT re-run ---
 
@@ -1636,8 +1672,8 @@ integ_output=$(cat "$INTEG_LOG")
 _assert_contains "integ2: status still runs" "custom-a-status" "$integ_output"
 
 # Post should NOT run (hook stamp is fresh)
-_assert_not_contains "integ2: post skipped (stamp fresh)" "custom-a-post" "$integ_output"
-_assert_not_contains "integ2: post-b skipped (stamp fresh)" "custom-b-post" "$integ_output"
+_assert_not_contains "integ2: install skipped (stamp fresh)" "custom-a-install" "$integ_output"
+_assert_not_contains "integ2: install-b skipped (stamp fresh)" "custom-b-install" "$integ_output"
 
 # --- Force mode: re-runs all post hooks ---
 
@@ -1646,8 +1682,8 @@ _source_shdeps "$SHDEPS_DIR"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
-_assert_contains "integ force: custom-a post re-ran" "custom-a-post" "$integ_output"
-_assert_contains "integ force: custom-b post re-ran" "custom-b-post" "$integ_output"
+_assert_contains "integ force: custom-a install re-ran" "custom-a-install" "$integ_output"
+_assert_contains "integ force: custom-b install re-ran" "custom-b-install" "$integ_output"
 
 # Reset force
 SHDEPS_FORCE=0
@@ -1688,8 +1724,8 @@ _source_shdeps "$SHDEPS_DIR"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
-_assert_contains "integ multi-file: custom-a from deps.conf" "custom-a-post" "$integ_output"
-_assert_contains "integ multi-file: custom-b from extra.conf" "custom-b-post" "$integ_output"
+_assert_contains "integ multi-file: custom-a from deps.conf" "custom-a-install" "$integ_output"
+_assert_contains "integ multi-file: custom-b from extra.conf" "custom-b-install" "$integ_output"
 
 # Reset
 SHDEPS_FORCE=0
@@ -1720,7 +1756,7 @@ _shdeps_hook_touch "custom-a"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
-_assert_not_contains "integ platform: no-force skips wrong platform post" "custom-a-post" "$integ_output"
+_assert_not_contains "integ platform: no-force skips wrong platform install" "custom-a-install" "$integ_output"
 _assert_contains "integ platform: right platform runs" "custom-b" "$integ_output"
 
 # --- shdeps_version ---
