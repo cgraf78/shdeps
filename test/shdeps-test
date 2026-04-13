@@ -58,11 +58,11 @@ _assert_eq "minimal entry: content" "jq|pkg" "${_SHDEPS_DEPS[0]}"
 # --- Maximal entry (all 9 fields) ---
 
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-fd  pkg  fd  fdfind  apt:fd-find,dnf:fd-find  -  -  linux,darwin  nas
+fd  pkg  fd  fdfind  apt:fd-find,dnf:fd-find  -  -  linux,macos  nas
 EOF
 _shdeps_load
 _assert_eq "maximal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
-_assert_contains "maximal entry: has platforms" "linux,darwin" "${_SHDEPS_DEPS[0]}"
+_assert_contains "maximal entry: has platforms" "linux,macos" "${_SHDEPS_DEPS[0]}"
 _assert_contains "maximal entry: has hosts" "nas" "${_SHDEPS_DEPS[0]}"
 
 # --- Comments and blank lines ---
@@ -144,7 +144,7 @@ echo "=== Entry parsing ==="
 
 # --- Full entry with all fields ---
 
-_shdeps_parse "fd|pkg|fd|fdfind|apt:fd-find,dnf:fd-find|owner/fd|.local/share/fd|linux,darwin"
+_shdeps_parse "fd|pkg|fd|fdfind|apt:fd-find,dnf:fd-find|owner/fd|.local/share/fd|linux,macos"
 _assert_eq "parse full: name" "fd" "$_name"
 _assert_eq "parse full: method" "pkg" "$_method"
 _assert_eq "parse full: cmd" "fd" "$_cmd"
@@ -152,7 +152,7 @@ _assert_eq "parse full: cmd_alt" "fdfind" "$_cmd_alt"
 _assert_eq "parse full: pkg_overrides" "apt:fd-find,dnf:fd-find" "$_pkg_overrides"
 _assert_eq "parse full: repo" "owner/fd" "$_repo"
 _assert_eq "parse full: dir" ".local/share/fd" "$_dir"
-_assert_eq "parse full: platforms" "linux,darwin" "$_platforms"
+_assert_eq "parse full: platforms" "linux,macos" "$_platforms"
 _assert_eq "parse full: hosts empty when absent" "" "$_hosts"
 
 # --- Dash fields normalize to empty ---
@@ -192,8 +192,9 @@ _assert_eq "parse cmd_alt: cmd_alt" "batcat" "$_cmd_alt"
 echo ""
 echo "=== Platform matching ==="
 
-# Detect current platform for assertions
+# Detect current platform for assertions (normalized like shdeps does)
 _current_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+if [[ "$_current_os" == "darwin" ]]; then _current_os="macos"; fi
 
 # --- Empty spec matches all ---
 
@@ -208,7 +209,7 @@ _assert_exit "include: current os matches" 0 $?
 # --- Include list: other platform ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  rc=0; shdeps_platform_match "darwin" || rc=$?
+  rc=0; shdeps_platform_match "macos" || rc=$?
   _assert_exit "include: other os rejected" 1 "$rc"
 else
   rc=0; shdeps_platform_match "linux" || rc=$?
@@ -217,8 +218,8 @@ fi
 
 # --- Include list: multiple platforms ---
 
-shdeps_platform_match "linux,darwin"
-_assert_exit "include multi: linux,darwin matches" 0 $?
+shdeps_platform_match "linux,macos"
+_assert_exit "include multi: linux,macos matches" 0 $?
 
 # --- Include list: none matching ---
 
@@ -233,7 +234,7 @@ _assert_exit "exclude: current os excluded" 1 "$rc"
 # --- Exclude list: excludes other ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  shdeps_platform_match "!darwin"
+  shdeps_platform_match "!macos"
   _assert_exit "exclude: other os not excluded" 0 $?
 else
   shdeps_platform_match "!linux"
@@ -243,7 +244,7 @@ fi
 # --- Exclude list: multiple excludes, none matching ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  shdeps_platform_match "!darwin,!freebsd"
+  shdeps_platform_match "!macos,!freebsd"
   _assert_exit "exclude multi: none matching passes" 0 $?
 else
   shdeps_platform_match "!linux,!freebsd"
@@ -258,17 +259,17 @@ _assert_exit "mixed: exclude overrides include" 1 "$rc"
 # --- Mixed: included and not excluded ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  shdeps_platform_match "linux,!darwin"
+  shdeps_platform_match "linux,!macos"
   _assert_exit "mixed: included and not excluded" 0 $?
 else
-  shdeps_platform_match "darwin,!linux"
+  shdeps_platform_match "macos,!linux"
   _assert_exit "mixed: included and not excluded" 0 $?
 fi
 
 # --- Mixed: not in include list ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  rc=0; shdeps_platform_match "darwin,!freebsd" || rc=$?
+  rc=0; shdeps_platform_match "macos,!freebsd" || rc=$?
   _assert_exit "mixed: not in include list" 1 "$rc"
 else
   rc=0; shdeps_platform_match "linux,!freebsd" || rc=$?
@@ -1477,7 +1478,7 @@ _source_shdeps "$SHDEPS_DIR"
 # The platform filter only prevents _shdeps_install_dep from running.
 
 if [[ "$_current_os" == "linux" ]]; then
-  _skip_plat="darwin"
+  _skip_plat="macos"
 else
   _skip_plat="linux"
 fi

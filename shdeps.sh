@@ -228,8 +228,8 @@ _shdeps_parse() {
 # ---------------------------------------------------------------------------
 
 # Check if the current platform matches a platforms spec.
-# Empty spec matches all platforms. Supports include (linux,darwin)
-# and exclude (!wsl,!darwin) lists. Mixed lists check excludes first.
+# Empty spec matches all platforms. Supports include (linux,macos)
+# and exclude (!wsl,!macos) lists. Mixed lists check excludes first.
 # Returns 0 if the dep should install on this platform.
 shdeps_platform_match() {
   local spec="${1:-}"
@@ -238,6 +238,7 @@ shdeps_platform_match() {
   local current
   current=$(uname -s | tr '[:upper:]' '[:lower:]')
   if _shdeps_is_wsl; then current="wsl"; fi
+  if [[ "$current" == "darwin" ]]; then current="macos"; fi
 
   local item has_include=0 has_exclude=0
   local IFS=','

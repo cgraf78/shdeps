@@ -11,7 +11,7 @@ A standalone shell dependency manager. Declare your tools in a config file, and 
 
 - **Declarative config** — one line per dependency in `deps.conf`
 - **Multiple install methods** — system packages (brew/apt/dnf/pacman), git clones, GitHub release binaries, or fully custom hooks
-- **Cross-platform** — Linux, macOS, WSL with platform and hostname filtering per dep
+- **Cross-platform** — Linux, macOS, WSL with platform (`linux`, `macos`, `wsl`) and hostname filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
 - **TTL-based caching** — avoids redundant network calls
@@ -60,7 +60,7 @@ The CLI automatically finds `~/.config/shdeps/deps.conf` when no `-c` flag or `S
 | `pkg_overrides` | no | Per-manager package names: `apt:fd-find,dnf:fd-find` |
 | `repo` | no | GitHub `owner/repo` (for `git` and `binary` methods) |
 | `dir` | no | Install directory relative to `$HOME` (for `git` method) |
-| `platforms` | no | Platform filter. Values: `linux`, `darwin`, `wsl`. Prefix `!` to exclude. |
+| `platforms` | no | Platform filter. Values: `linux`, `macos`, `wsl`. Prefix `!` to exclude. |
 | `hosts` | no | Hostname filter (matches `hostname -s`, case-insensitive). Prefix `!` to exclude. |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
@@ -88,7 +88,7 @@ Installs via the detected package manager (brew, apt, dnf, or pacman). Packages 
 jq        pkg
 bat       pkg    bat    batcat
 fd        pkg    fd     fdfind    apt:fd-find,dnf:fd-find
-dust      pkg    -      -         -              -    -    darwin
+dust      pkg    -      -         -              -    -    macos
 htop      pkg    -      -         -              -    -    -        nas
 ```
 
@@ -162,7 +162,7 @@ Available public functions:
 - `shdeps_update` — install/update all dependencies
 - `shdeps_load` — parse config and return dep count
 - `shdeps_version` — print version string
-- `shdeps_platform_match <spec>` — check if current platform matches a spec (e.g., `linux,darwin`, `!wsl`)
+- `shdeps_platform_match <spec>` — check if current platform matches a spec (e.g., `linux,macos`, `!wsl`)
 - `shdeps_host_match <spec>` — check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`)
 
 ## Testing
