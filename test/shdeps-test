@@ -1297,6 +1297,87 @@ chmod +x "$_ver_bin_dir/fake-tool"
 result=$(_shdeps_dep_version "$_ver_bin_dir/fake-tool")
 _assert_eq "dep_version: extracts version" "3.14.159" "$result"
 
+# --- _shdeps_dep_version: version on line 2 (eza, shellcheck style) ---
+
+cat > "$_ver_bin_dir/line2-tool" <<'SCRIPT'
+#!/bin/sh
+echo "line2-tool - A modern replacement for foo"
+echo "v0.23.4 [+git]"
+SCRIPT
+chmod +x "$_ver_bin_dir/line2-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/line2-tool")
+_assert_eq "dep_version: version on line 2" "0.23.4" "$result"
+
+# --- _shdeps_dep_version: -V fallback (tmux/autossh style) ---
+
+cat > "$_ver_bin_dir/dashV-tool" <<'SCRIPT'
+#!/bin/sh
+case "$1" in
+  --version) echo "unknown option" >&2; exit 1 ;;
+  -V) echo "dashV-tool 3.6a" ;;
+esac
+SCRIPT
+chmod +x "$_ver_bin_dir/dashV-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/dashV-tool")
+_assert_eq "dep_version: falls back to -V" "3.6a" "$result"
+
+# --- _shdeps_dep_version: version on stderr (ssh style) ---
+
+cat > "$_ver_bin_dir/stderr-tool" <<'SCRIPT'
+#!/bin/sh
+case "$1" in
+  --version) echo "illegal option" >&2; exit 1 ;;
+  -V) echo "OpenFoo_10.2p1, LibBar 3.3.6" >&2; exit 0 ;;
+esac
+SCRIPT
+chmod +x "$_ver_bin_dir/stderr-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/stderr-tool")
+_assert_eq "dep_version: captures stderr" "10.2p1" "$result"
+
+# --- _shdeps_dep_version: non-zero exit with valid output (unzip style) ---
+
+cat > "$_ver_bin_dir/exitfail-tool" <<'SCRIPT'
+#!/bin/sh
+echo "ExitFail 6.00 of 20 April 2009" >&2
+exit 10
+SCRIPT
+chmod +x "$_ver_bin_dir/exitfail-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/exitfail-tool")
+_assert_eq "dep_version: non-zero exit still captured" "6.00" "$result"
+
+# --- _shdeps_dep_version: integer-only version (less style) ---
+
+cat > "$_ver_bin_dir/intver-tool" <<'SCRIPT'
+#!/bin/sh
+echo "intver-tool 668 (POSIX regular expressions)"
+SCRIPT
+chmod +x "$_ver_bin_dir/intver-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/intver-tool")
+_assert_eq "dep_version: integer-only version" "668" "$result"
+
+# --- _shdeps_dep_version: --version noise doesn't shadow -V result ---
+
+cat > "$_ver_bin_dir/noisy-tool" <<'SCRIPT'
+#!/bin/sh
+case "$1" in
+  --version) echo "usage: noisy-tool [-46AaCf] destination" >&2; exit 255 ;;
+  -V) echo "noisy-tool 10.2p1" >&2 ;;
+esac
+SCRIPT
+chmod +x "$_ver_bin_dir/noisy-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/noisy-tool")
+_assert_eq "dep_version: --version noise skipped for -V" "10.2p1" "$result"
+
+# --- _shdeps_dep_version: no version flag works → empty ---
+
+cat > "$_ver_bin_dir/nover-tool" <<'SCRIPT'
+#!/bin/sh
+echo "no version here" >&2; exit 1
+SCRIPT
+chmod +x "$_ver_bin_dir/nover-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/nover-tool")
+_assert_eq "dep_version: no version available" "" "$result"
+
 # --- _shdeps_dep_version: empty cmd → failure ---
 
 rc=0; _shdeps_dep_version "" || rc=$?
