@@ -4,10 +4,11 @@ This file provides context for AI agents when working in this repo.
 
 ## About
 
-**shdeps** is a standalone shell dependency manager. It reads a declarative
-config file (`deps.conf`) and installs/updates tools via system package
-managers, GitHub git repos, or GitHub release binaries. Post-install hooks
-let callers run arbitrary setup after each dependency changes.
+**shdeps** is a standalone shell dependency manager. It reads declarative
+config files (`*.conf`) from a config directory and installs/updates tools
+via system package managers, GitHub git repos, or GitHub release binaries.
+Post-install hooks let callers run arbitrary setup after each dependency
+changes.
 
 ## Architecture
 
@@ -31,9 +32,8 @@ All behavior is controlled via environment variables (no hardcoded paths):
 
 | Variable | Default | Description |
 |---|---|---|
-| `SHDEPS_CONF` | `~/.config/shdeps/deps.conf` (CLI) or `./deps.conf` (library) | Main config file |
-| `SHDEPS_CONF_LOCAL` | `./deps.local.conf` (same dir as SHDEPS_CONF) | Local overrides |
-| `SHDEPS_HOOKS_DIR` | `./hooks.d` (same dir as SHDEPS_CONF) | Post-install hooks |
+| `SHDEPS_CONF_DIR` | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded) |
+| `SHDEPS_HOOKS_DIR` | `<conf_dir>/hooks.d` | Post-install hooks |
 | `SHDEPS_STATE_DIR` | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps` | Cache/state dir |
 | `SHDEPS_FORCE` | `0` | Force reinstall all deps |
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |

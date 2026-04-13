@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2154,SC2034
 # SC2154: variables set by sourced shdeps.sh (_name, _method, _SHDEPS_DEPS, etc.)
-# SC2034: variables read by sourced shdeps.sh (SHDEPS_CONF, SHDEPS_FORCE, etc.)
+# SC2034: variables read by sourced shdeps.sh (SHDEPS_CONF_DIR, SHDEPS_FORCE, etc.)
 #
 # shdeps-test — comprehensive test suite for shdeps.sh
 #
@@ -28,7 +28,7 @@ _source_shdeps "$SHDEPS_DIR"
 
 echo "=== Config parsing ==="
 
-# --- Well-formed deps.conf ---
+# --- Well-formed conf file ---
 
 _test_conf_dir=$(_tmpdir)
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
@@ -40,7 +40,7 @@ neovim    binary    nvim   -          -                neovim/neovim
 nerd-fonts custom
 EOF
 
-SHDEPS_CONF="$_test_conf_dir/deps.conf"
+SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
 _assert_eq "well-formed: entry count" "6" "${#_SHDEPS_DEPS[@]}"
 _assert_contains "well-formed: first entry is jq" "jq" "${_SHDEPS_DEPS[0]}"
@@ -48,6 +48,7 @@ _assert_contains "well-formed: last entry is nerd-fonts" "nerd-fonts" "${_SHDEPS
 
 # --- Minimal entry (name + method only) ---
 
+rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
 jq  pkg
 EOF
@@ -81,57 +82,81 @@ _assert_eq "comments/blanks: count" "2" "${#_SHDEPS_DEPS[@]}"
 _assert_contains "comments/blanks: first" "tool-a" "${_SHDEPS_DEPS[0]}"
 _assert_contains "comments/blanks: second" "tool-b" "${_SHDEPS_DEPS[1]}"
 
-# --- Missing config file ---
+# --- Missing config dir ---
 
-SHDEPS_CONF="$_test_conf_dir/nonexistent.conf"
-unset SHDEPS_CONF_LOCAL
+SHDEPS_CONF_DIR="$_test_conf_dir/nonexistent"
 _shdeps_load
-_assert_eq "missing conf: empty deps" "0" "${#_SHDEPS_DEPS[@]}"
+_assert_eq "missing dir: empty deps" "0" "${#_SHDEPS_DEPS[@]}"
 
-# --- Local config overlay ---
+# --- Empty config dir (exists but no .conf files) ---
 
-cat >"$_test_conf_dir/deps.conf" <<'EOF'
+_empty_conf_dir=$(_tmpdir)
+SHDEPS_CONF_DIR="$_empty_conf_dir"
+_shdeps_load
+_assert_eq "empty dir: empty deps" "0" "${#_SHDEPS_DEPS[@]}"
+
+# --- Multiple conf files merged in sorted order ---
+
+_multi_conf_dir=$(_tmpdir)
+cat >"$_multi_conf_dir/00-core.conf" <<'EOF'
 tool-a  pkg
 tool-b  pkg
 EOF
-cat >"$_test_conf_dir/deps.local.conf" <<'EOF'
+cat >"$_multi_conf_dir/50-extras.conf" <<'EOF'
 tool-c  binary  -  -  -  owner/tool-c
 EOF
-SHDEPS_CONF="$_test_conf_dir/deps.conf"
-unset SHDEPS_CONF_LOCAL
+cat >"$_multi_conf_dir/99-local.conf" <<'EOF'
+tool-d  custom
+EOF
+SHDEPS_CONF_DIR="$_multi_conf_dir"
 _shdeps_load
-_assert_eq "conf + local: entry count" "3" "${#_SHDEPS_DEPS[@]}"
-_assert_contains "conf + local: has local entry" "tool-c" "${_SHDEPS_DEPS[2]}"
+_assert_eq "multi-file: entry count" "4" "${#_SHDEPS_DEPS[@]}"
+_assert_contains "multi-file: first from 00-core" "tool-a" "${_SHDEPS_DEPS[0]}"
+_assert_contains "multi-file: second from 00-core" "tool-b" "${_SHDEPS_DEPS[1]}"
+_assert_contains "multi-file: third from 50-extras" "tool-c" "${_SHDEPS_DEPS[2]}"
+_assert_contains "multi-file: fourth from 99-local" "tool-d" "${_SHDEPS_DEPS[3]}"
 
-# --- Local config only (no main conf) ---
+# --- Non-.conf files ignored ---
 
-rm -f "$_test_conf_dir/deps.conf"
+_mixed_dir=$(_tmpdir)
+cat >"$_mixed_dir/deps.conf" <<'EOF'
+tool-a  pkg
+EOF
+cat >"$_mixed_dir/notes.txt" <<'EOF'
+tool-b  pkg
+EOF
+cat >"$_mixed_dir/deps.conf.bak" <<'EOF'
+tool-c  pkg
+EOF
+SHDEPS_CONF_DIR="$_mixed_dir"
 _shdeps_load
-_assert_eq "local only: entry count" "1" "${#_SHDEPS_DEPS[@]}"
-_assert_contains "local only: has entry" "tool-c" "${_SHDEPS_DEPS[0]}"
+_assert_eq "non-conf ignored: count" "1" "${#_SHDEPS_DEPS[@]}"
+_assert_contains "non-conf ignored: only .conf loaded" "tool-a" "${_SHDEPS_DEPS[0]}"
 
-# --- Neither file → empty deps ---
+# --- Single conf file in dir ---
 
-rm -f "$_test_conf_dir/deps.local.conf"
+_single_dir=$(_tmpdir)
+cat >"$_single_dir/deps.conf" <<'EOF'
+tool-a  pkg
+tool-b  pkg
+EOF
+SHDEPS_CONF_DIR="$_single_dir"
 _shdeps_load
-_assert_eq "neither: empty deps" "0" "${#_SHDEPS_DEPS[@]}"
+_assert_eq "single file: entry count" "2" "${#_SHDEPS_DEPS[@]}"
 
 # --- Public shdeps_load returns count ---
 
-cat >"$_test_conf_dir/deps.conf" <<'EOF'
-a  pkg
-b  pkg
-c  pkg
-EOF
-SHDEPS_CONF="$_test_conf_dir/deps.conf"
+SHDEPS_CONF_DIR="$_single_dir"
 count=$(shdeps_load)
-_assert_eq "shdeps_load: returns count" "3" "$count"
+_assert_eq "shdeps_load: returns count" "2" "$count"
 
 # --- Dash fields preserved as literal in raw entry ---
 
+rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
 ds  git  -  -  -  cgraf78/ds.git  .local/share/ds
 EOF
+SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
 _assert_contains "dash fields: preserved in entry" "ds|git|-|-|-|cgraf78/ds.git|.local/share/ds" "${_SHDEPS_DEPS[0]}"
 
@@ -376,10 +401,11 @@ _assert_eq "missing hosts: empty" "" "$_hosts"
 
 # --- Maximal entry with hosts ---
 
+rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
 codex  binary  -  -  -  openai/codex  -  -  nas,taylor
 EOF
-SHDEPS_CONF="$_test_conf_dir/deps.conf"
+SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
 _assert_contains "maximal with hosts: has hosts" "nas,taylor" "${_SHDEPS_DEPS[0]}"
 
@@ -1095,7 +1121,7 @@ tool-b  pkg
 tool-c  custom
 EOF
 
-SHDEPS_CONF="$_hook_conf_dir/deps.conf"
+SHDEPS_CONF_DIR="$_hook_conf_dir"
 SHDEPS_HOOKS_DIR="$_hook_test_dir"
 SHDEPS_STATE_DIR="$_hook_state_dir"
 _source_shdeps "$SHDEPS_DIR"
@@ -1462,8 +1488,7 @@ post() { echo "custom-b-post" >> "$INTEG_LOG"; return 0; }
 status() { echo "custom-b-status" >> "$INTEG_LOG"; }
 HOOK
 
-SHDEPS_CONF="$_integ_dir/deps.conf"
-unset SHDEPS_CONF_LOCAL
+SHDEPS_CONF_DIR="$_integ_dir"
 SHDEPS_HOOKS_DIR="$_integ_hooks"
 SHDEPS_STATE_DIR="$_integ_state"
 SHDEPS_FORCE=0
@@ -1533,12 +1558,12 @@ integ_output=$(cat "$INTEG_LOG")
 # custom-a should still get its status hook
 _assert_contains "integ pkg: custom-a status" "custom-a-status" "$integ_output"
 
-# --- Integration with local config overlay ---
+# --- Integration with multiple conf files ---
 
 cat > "$_integ_dir/deps.conf" <<'EOF'
 custom-a  custom
 EOF
-cat > "$_integ_dir/deps.local.conf" <<'EOF'
+cat > "$_integ_dir/extra.conf" <<'EOF'
 custom-b  custom
 EOF
 
@@ -1547,8 +1572,8 @@ _source_shdeps "$SHDEPS_DIR"
 : > "$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
-_assert_contains "integ overlay: custom-a from conf" "custom-a-post" "$integ_output"
-_assert_contains "integ overlay: custom-b from local" "custom-b-post" "$integ_output"
+_assert_contains "integ multi-file: custom-a from deps.conf" "custom-a-post" "$integ_output"
+_assert_contains "integ multi-file: custom-b from extra.conf" "custom-b-post" "$integ_output"
 
 # Reset
 SHDEPS_FORCE=0
@@ -1564,11 +1589,11 @@ else
   _skip_plat="linux"
 fi
 
+rm -f "$_integ_dir"/*.conf
 cat > "$_integ_dir/deps.conf" <<EOF
 custom-a  custom  -  -  -  -  -  $_skip_plat
 custom-b  custom
 EOF
-rm -f "$_integ_dir/deps.local.conf"
 
 # Without force: wrong-platform dep's custom hook is not due (stamp exists
 # from earlier run), so it won't be marked changed — post skipped.

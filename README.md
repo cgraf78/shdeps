@@ -5,18 +5,18 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-A standalone shell dependency manager. Declare your tools in a config file, and shdeps installs them via system package managers, GitHub git repos, or GitHub release binaries.
+A standalone shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers, GitHub git repos, or GitHub release binaries.
 
 ## Features
 
-- **Declarative config** — one line per dependency in `deps.conf`
+- **Declarative config** — one line per dependency in `*.conf` files
 - **Multiple install methods** — system packages (brew/apt/dnf/pacman), git clones, GitHub release binaries, or fully custom hooks
 - **Cross-platform** — Linux, macOS, WSL with platform (`linux`, `macos`, `wsl`) and hostname filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
 - **TTL-based caching** — avoids redundant network calls
 - **Post-install hooks** — run arbitrary setup when a dependency changes
-- **Local overrides** — `deps.local.conf` for machine-specific deps
+- **Config composition** — split deps across multiple `*.conf` files in a config directory
 - **Usable as CLI or library** — `bin/shdeps` CLI or `source shdeps.sh`
 
 ## Quick Start
@@ -30,6 +30,7 @@ This clones shdeps to `~/.local/share/shdeps` and symlinks the CLI into `~/.loca
 Then create a config and run:
 
 ```bash
+mkdir -p ~/.config/shdeps
 cat > ~/.config/shdeps/deps.conf << 'EOF'
 jq    pkg
 fzf   pkg
@@ -38,7 +39,7 @@ EOF
 shdeps update
 ```
 
-The CLI automatically finds `~/.config/shdeps/deps.conf` when no `-c` flag or `SHDEPS_CONF` env var is set. The library (`source shdeps.sh`) defaults to `./deps.conf`.
+The CLI loads all `*.conf` files from `~/.config/shdeps/` (sorted alphabetically). Split deps across multiple files for organization (e.g., `00-core.conf`, `50-tools.conf`, `99-local.conf`). The library (`source shdeps.sh`) defaults to `./shdeps/`.
 
 ### Updating shdeps
 
@@ -58,7 +59,7 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 
 ## Configuration
 
-### deps.conf Format
+### Config File Format
 
 ```
 # name    method    [cmd]  [cmd_alt]  [pkg_overrides]  [repo]  [dir]  [platforms]  [hosts]
@@ -82,8 +83,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 
 | Variable | Default | Description |
 |---|---|---|
-| `SHDEPS_CONF` | `~/.config/shdeps/deps.conf` (CLI) or `./deps.conf` (library) | Main config file |
-| `SHDEPS_CONF_LOCAL` | `<conf_dir>/deps.local.conf` | Local overrides (same dir as conf) |
+| `SHDEPS_CONF_DIR` | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded) |
 | `SHDEPS_HOOKS_DIR` | `<conf_dir>/hooks.d` | Post-install hooks directory |
 | `SHDEPS_STATE_DIR` | `$XDG_STATE_HOME/shdeps` | Cache/state directory |
 | `SHDEPS_FORCE` | `0` | Force reinstall all deps |
@@ -157,7 +157,7 @@ Commands:
   help            Show this help message
 
 Options:
-  -c, --config <path>   Path to deps.conf (default: ~/.config/shdeps/deps.conf)
+  -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
   -f, --force           Force reinstall all dependencies (or bypass TTL for self-update)
   -q, --quiet           Suppress interactive prompts
   -v, --verbose         Verbose output
@@ -166,7 +166,7 @@ Options:
 ## As a Library
 
 ```bash
-export SHDEPS_CONF="$HOME/.config/myapp/deps.conf"
+export SHDEPS_CONF_DIR="$HOME/.config/myapp"
 source /path/to/shdeps.sh
 shdeps_update
 ```

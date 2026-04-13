@@ -43,14 +43,14 @@ Commands:
   help            Show this help message
 
 Options:
-  -c, --config <path>   Path to deps.conf (default: ~/.config/shdeps/deps.conf)
+  -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
   -f, --force           Force reinstall all dependencies
   -q, --quiet           Suppress interactive prompts
   -v, --verbose         Verbose output (log level 2)
 
 Examples:
   shdeps update
-  shdeps -c ~/.config/myapp/deps.conf update
+  shdeps -c ~/.config/myapp/ update
   shdeps --force update
   shdeps list
   shdeps check jq
@@ -294,15 +294,18 @@ main() {
     esac
   done
 
-  # Apply config path before sourcing the library.
-  # Priority: -c flag > SHDEPS_CONF env > XDG default > ./deps.conf (library default)
+  # Apply config dir before sourcing the library.
+  # -c flag accepts a directory or a file (dirname is used).
+  # Priority: -c flag > SHDEPS_CONF_DIR env > XDG default
   if [[ -n "$config_path" ]]; then
-    export SHDEPS_CONF="$config_path"
-  elif [[ -z "${SHDEPS_CONF:-}" ]]; then
-    local xdg_conf="${XDG_CONFIG_HOME:-$HOME/.config}/shdeps/deps.conf"
-    if [[ -f "$xdg_conf" ]]; then
-      export SHDEPS_CONF="$xdg_conf"
+    if [[ -d "$config_path" ]]; then
+      SHDEPS_CONF_DIR="$config_path"
+    else
+      SHDEPS_CONF_DIR="$(dirname "$config_path")"
     fi
+    export SHDEPS_CONF_DIR
+  elif [[ -z "${SHDEPS_CONF_DIR:-}" ]]; then
+    export SHDEPS_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/shdeps"
   fi
 
   # Source the library

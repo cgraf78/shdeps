@@ -1,17 +1,17 @@
 # shellcheck shell=bash
 # shdeps — standalone shell dependency manager.
 #
-# Reads a declarative config file (deps.conf) and installs/updates tools via
-# system package managers (brew/apt/dnf/pacman), GitHub git repos, or GitHub
-# release binaries. Post-install hooks run arbitrary setup after changes.
+# Reads declarative config files (*.conf) from a config directory and
+# installs/updates tools via system package managers (brew/apt/dnf/pacman),
+# GitHub git repos, or GitHub release binaries. Post-install hooks run
+# arbitrary setup after changes.
 #
 # Usage:
 #   source shdeps.sh
 #   shdeps_update
 #
 # Configuration (env vars, all optional):
-#   SHDEPS_CONF         Main config file           (default: ./deps.conf)
-#   SHDEPS_CONF_LOCAL   Local overrides file        (default: <conf_dir>/deps.local.conf)
+#   SHDEPS_CONF_DIR     Config directory            (default: ./shdeps)
 #   SHDEPS_HOOKS_DIR    Post-install hooks dir      (default: <conf_dir>/hooks.d)
 #   SHDEPS_STATE_DIR    Cache/state directory       (default: $XDG_STATE_HOME/shdeps)
 #   SHDEPS_FORCE        Force reinstall all deps    (default: 0)
@@ -25,21 +25,15 @@ SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown
 # Configuration defaults
 # ---------------------------------------------------------------------------
 
-# Resolve paths relative to the config file's directory, so callers can just
-# set SHDEPS_CONF and get hooks/local-conf for free.
+# Return the config directory (normalized to absolute path).
 _shdeps_conf_dir() {
-  local conf="${SHDEPS_CONF:-./deps.conf}"
-  local dir
-  dir=$(dirname "$conf")
-  # Normalize to absolute path
+  local dir="${SHDEPS_CONF_DIR:-./shdeps}"
   if [[ "$dir" != /* ]]; then
-    dir="$(cd "$dir" 2>/dev/null && pwd)" || dir="."
+    dir="$(cd "$dir" 2>/dev/null && pwd)" || dir="$(pwd)/$dir"
   fi
   echo "$dir"
 }
 
-_shdeps_conf()       { echo "${SHDEPS_CONF:-./deps.conf}"; }
-_shdeps_conf_local() { echo "${SHDEPS_CONF_LOCAL:-$(_shdeps_conf_dir)/deps.local.conf}"; }
 _shdeps_hooks_dir()  { echo "${SHDEPS_HOOKS_DIR:-$(_shdeps_conf_dir)/hooks.d}"; }
 _shdeps_state_dir()  { echo "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}"; }
 _shdeps_force()      { echo "${SHDEPS_FORCE:-0}"; }
@@ -166,22 +160,30 @@ shdeps_version() { echo "shdeps $SHDEPS_VERSION"; }
 # ---------------------------------------------------------------------------
 
 # Parse config files into _SHDEPS_DEPS array.
-# Reads SHDEPS_CONF and SHDEPS_CONF_LOCAL (if they exist). Each non-blank,
-# non-comment line becomes a pipe-delimited entry via word splitting.
+# Loads all *.conf files from SHDEPS_CONF_DIR (sorted alphabetically).
+# Each non-blank, non-comment line becomes a pipe-delimited entry via
+# word splitting.
 _shdeps_load() {
   _SHDEPS_DEPS=()
-  local conf conf_local
-  conf=$(_shdeps_conf)
-  conf_local=$(_shdeps_conf_local)
+  local conf_dir
+  conf_dir=$(_shdeps_conf_dir)
 
-  if [[ ! -f "$conf" && ! -f "$conf_local" ]]; then
-    _shdeps_warn "  warning: $conf not found — skipping dependency install"
+  # Collect sorted *.conf files
+  local -a conf_files=()
+  local f
+  if [[ -d "$conf_dir" ]]; then
+    while IFS= read -r -d '' f; do
+      conf_files+=("$f")
+    done < <(find "$conf_dir" -maxdepth 1 -name '*.conf' -print0 2>/dev/null | LC_ALL=C sort -z)
+  fi
+
+  if [[ ${#conf_files[@]} -eq 0 ]]; then
+    _shdeps_warn "  warning: no *.conf files in $conf_dir — skipping dependency install"
     return 0
   fi
 
-  local f line
-  for f in "$conf" "$conf_local"; do
-    [[ -f "$f" ]] || continue
+  local line
+  for f in "${conf_files[@]}"; do
     while IFS= read -r line || [[ -n "$line" ]]; do
       # Skip comments and blank lines
       if [[ "$line" =~ ^[[:space:]]*# ]]; then continue; fi
