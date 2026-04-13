@@ -349,10 +349,20 @@ _shdeps_exists() {
 # Get installed version of a command.
 # Extracts the first version-like token (digits+dots) from --version output.
 _shdeps_dep_version() {
-  local cmd="${1:-}"
+  local cmd="${1:-}" ver=""
   if [[ -z "$cmd" ]]; then return 1; fi
-  "$cmd" --version 2>/dev/null | head -1 |
-    grep -oE '[0-9]+\.[0-9]+[0-9.]*' | head -1
+  # Try --version, then -V (tmux, autossh), then version (no dash).
+  # Merge stderr — some tools (unzip) write version info to stderr.
+  # Search all output lines — some (eza, shellcheck) put it on line 2+.
+  # Ignore exit codes — some tools exit non-zero with version flags.
+  local flag
+  for flag in --version -V version; do
+    ver=$(("$cmd" $flag 2>&1 || true) | grep -oE '[0-9]+\.[0-9]+[0-9.a-z]*' | head -1)
+    if [[ -n "$ver" ]]; then
+      echo "$ver"
+      return 0
+    fi
+  done
 }
 
 # ---------------------------------------------------------------------------
