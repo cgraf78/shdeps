@@ -363,13 +363,11 @@ _shdeps_dep_version() {
   # or "version" keyword (less 668, gzip 479). Two passes prevent the
   # fallback from matching noise in --version error output when -V has
   # the real answer (e.g., ssh).
-  local flag
+  local flag _timeout=""
+  command -v timeout &>/dev/null && _timeout="timeout 2"
   for flag in --version -V; do
-    if command -v timeout &>/dev/null; then
-      output=$(timeout 2 "$cmd" $flag 2>&1 || true)
-    else
-      output=$("$cmd" $flag 2>&1 || true)
-    fi
+    # shellcheck disable=SC2086  # intentional word splitting on $_timeout
+    output=$($_timeout "$cmd" "$flag" 2>&1 || true)
     ver=$(echo "$output" | grep -oE '[0-9]+\.[0-9]+[0-9.a-z]*' | head -1)
     if [[ -n "$ver" ]]; then
       echo "$ver"
