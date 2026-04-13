@@ -1182,7 +1182,7 @@ _shdeps_install_binary() {
   if [[ -z "$latest_ver" ]]; then
     if [[ -n "$current_ver" ]]; then
       rm -f "$tmp_file" "$log"
-      _shdeps_log_dim "  $name $current_ver (couldn't check for updates)"
+      _shdeps_warn "  warning: $name $current_ver (couldn't check for updates)"
       return 0
     fi
     rm -f "$tmp_file" "$log"
