@@ -138,8 +138,25 @@ nerd-fonts    custom
 
 Place hook files in `<hooks_dir>/<name>.sh`. Each file can define:
 
-- **`post()`** — runs after a dep is installed/updated/changed. Return 0 to mark as complete.
-- **`status()`** — runs every time for read-only status reporting.
+- **`post(name)`** — runs after a dep is installed/updated/changed. `$1` is the dep name. Return 0 to mark as complete.
+- **`status(name)`** — runs every time for read-only status reporting. `$1` is the dep name.
+
+### Hook API
+
+These public functions are available to hook authors:
+
+| Function | Description |
+|---|---|
+| `shdeps_log` | Normal log line |
+| `shdeps_warn` | Warning (always shown unless quiet) |
+| `shdeps_log_ok` | Success highlight |
+| `shdeps_log_dim` | Dimmed / low-importance line |
+| `shdeps_pkg_mgr` | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, or empty) |
+| `shdeps_force` | Return 0 if force mode is active |
+| `shdeps_platform` | Print normalized platform name (`linux`, `macos`, `wsl`) |
+| `shdeps_require_sudo` | Acquire sudo; returns 0 if root or sudo obtained |
+| `shdeps_platform_match` | Check if current platform matches a spec |
+| `shdeps_host_match` | Check if current hostname matches a spec |
 
 See [examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh).
 
@@ -178,6 +195,11 @@ Available public functions:
 - `shdeps_version` — print version string
 - `shdeps_platform_match <spec>` — check if current platform matches a spec (e.g., `linux,macos`, `!wsl`)
 - `shdeps_host_match <spec>` — check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`)
+- `shdeps_pkg_mgr` — print detected package manager
+- `shdeps_force` — return 0 if force mode is active
+- `shdeps_platform` — print normalized platform name (`linux`, `macos`, `wsl`)
+- `shdeps_require_sudo` — acquire sudo
+- `shdeps_log`, `shdeps_warn`, `shdeps_log_ok`, `shdeps_log_dim` — logging
 
 ## Testing
 

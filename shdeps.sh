@@ -156,6 +156,36 @@ _shdeps_require_sudo() {
 shdeps_version() { echo "shdeps $SHDEPS_VERSION"; }
 
 # ---------------------------------------------------------------------------
+# Public hook API — stable interface available to hook authors
+# ---------------------------------------------------------------------------
+
+# Logging wrappers. Delegate to the internal (overridable) implementations.
+shdeps_log()        { _shdeps_log "$@"; }
+shdeps_warn()       { _shdeps_warn "$@"; }
+shdeps_log_ok()     { _shdeps_log_ok "$@"; }
+shdeps_log_dim()    { _shdeps_log_dim "$@"; }
+shdeps_log_header() { _shdeps_log_header "$@"; }
+
+# Return the detected package manager name (brew, apt, dnf, pacman, or "").
+shdeps_pkg_mgr()    { echo "${_SHDEPS_PKG_MGR:-}"; }
+
+# Return 0 if force mode is active, 1 otherwise.
+shdeps_force()      { [[ "$(_shdeps_force)" -eq 1 ]]; }
+
+# Print the normalized platform name (linux, macos, wsl).
+shdeps_platform() {
+  local current
+  current=$(uname -s | tr '[:upper:]' '[:lower:]')
+  if _shdeps_is_wsl; then current="wsl"; fi
+  if [[ "$current" == "darwin" ]]; then current="macos"; fi
+  echo "$current"
+}
+
+# Acquire sudo. Returns 0 if root or sudo obtained.
+# In quiet mode, skips interactive prompt and returns 1 silently.
+shdeps_require_sudo() { _shdeps_require_sudo; }
+
+# ---------------------------------------------------------------------------
 # Config parsing — read deps.conf into an array
 # ---------------------------------------------------------------------------
 
@@ -238,9 +268,7 @@ shdeps_platform_match() {
   if [[ -z "$spec" ]]; then return 0; fi
 
   local current
-  current=$(uname -s | tr '[:upper:]' '[:lower:]')
-  if _shdeps_is_wsl; then current="wsl"; fi
-  if [[ "$current" == "darwin" ]]; then current="macos"; fi
+  current=$(shdeps_platform)
 
   local item has_include=0 has_exclude=0
   local IFS=','
@@ -1329,7 +1357,7 @@ _shdeps_run_status_hooks() {
       continue
     }
     if declare -f status &>/dev/null; then
-      status || true
+      status "$name" || true
     fi
     unset -f status post 2>/dev/null
   done
@@ -1355,7 +1383,7 @@ _shdeps_run_post_hooks() {
       continue
     }
     if declare -f post &>/dev/null; then
-      if post; then
+      if post "$name"; then
         _shdeps_hook_touch "$name" || true
       fi
     fi

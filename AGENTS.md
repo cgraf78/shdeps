@@ -22,7 +22,7 @@ changes.
 
 ## Naming Conventions
 
-- Public API functions: `shdeps_` prefix (e.g., `shdeps_update`, `shdeps_load`, `shdeps_platform_match`, `shdeps_host_match`)
+- Public API functions: `shdeps_` prefix (e.g., `shdeps_update`, `shdeps_load`, `shdeps_platform_match`, `shdeps_host_match`, `shdeps_log`, `shdeps_pkg_mgr`)
 - Internal functions: `_shdeps_` prefix (e.g., `_shdeps_parse`, `_shdeps_pkg_detect`)
 - Internal global variables: `_SHDEPS_` prefix
 

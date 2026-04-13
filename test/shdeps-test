@@ -1239,6 +1239,122 @@ post_output=$(cat "$HOOK_LOG")
 _assert_eq "missing hook file: silently skipped" "" "$post_output"
 
 # ===========================================================================
+# Section 8b: Hook API — dep name passed as $1
+# ===========================================================================
+
+echo ""
+echo "=== Hook API ==="
+
+_api_test_dir=$(_tmpdir)
+_api_conf_dir=$(_tmpdir)
+_api_state_dir=$(_tmpdir)
+
+cat >"$_api_conf_dir/deps.conf" <<'EOF'
+api-tool  custom
+EOF
+
+SHDEPS_CONF_DIR="$_api_conf_dir"
+SHDEPS_HOOKS_DIR="$_api_test_dir"
+SHDEPS_STATE_DIR="$_api_state_dir"
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_load
+
+# --- post() receives dep name as $1 ---
+
+mkdir -p "$_api_test_dir"
+cat >"$_api_test_dir/api-tool.sh" <<'HOOK'
+post() { echo "post-name=$1" >> "$HOOK_LOG"; }
+status() { echo "status-name=$1" >> "$HOOK_LOG"; }
+HOOK
+
+HOOK_LOG="$_api_test_dir/hook.log"
+export HOOK_LOG
+: > "$HOOK_LOG"
+declare -gA _SHDEPS_CHANGED=([api-tool]=1)
+_shdeps_run_post_hooks
+post_output=$(cat "$HOOK_LOG")
+_assert_contains "post: receives name as \$1" "post-name=api-tool" "$post_output"
+
+# --- status() receives dep name as $1 ---
+
+: > "$HOOK_LOG"
+_shdeps_run_status_hooks
+status_output=$(cat "$HOOK_LOG")
+_assert_contains "status: receives name as \$1" "status-name=api-tool" "$status_output"
+
+# ===========================================================================
+# Section 8c: Public API functions
+# ===========================================================================
+
+echo ""
+echo "=== Public API functions ==="
+
+# --- shdeps_log delegates to internal ---
+
+_api_log_output=$(_shdeps_log_level_override=1 shdeps_log "test message" 2>&1)
+# Log output goes to stderr, so just verify it doesn't error
+_assert_exit "shdeps_log: no error" 0 $?
+
+# --- shdeps_warn delegates to internal ---
+
+shdeps_warn "test warning" 2>/dev/null
+_assert_exit "shdeps_warn: no error" 0 $?
+
+# --- shdeps_log_ok delegates to internal ---
+
+shdeps_log_ok "test ok" 2>/dev/null
+_assert_exit "shdeps_log_ok: no error" 0 $?
+
+# --- shdeps_log_dim delegates to internal ---
+
+shdeps_log_dim "test dim" 2>/dev/null
+_assert_exit "shdeps_log_dim: no error" 0 $?
+
+# --- shdeps_pkg_mgr returns detected manager ---
+
+_shdeps_pkg_detect
+result=$(shdeps_pkg_mgr)
+_assert_match "shdeps_pkg_mgr: known value" "^(brew|apt|dnf|pacman)?$" "$result"
+
+# --- shdeps_pkg_mgr reflects _SHDEPS_PKG_MGR ---
+
+_SHDEPS_PKG_MGR="apt"
+result=$(shdeps_pkg_mgr)
+_assert_eq "shdeps_pkg_mgr: returns apt" "apt" "$result"
+
+_SHDEPS_PKG_MGR=""
+result=$(shdeps_pkg_mgr)
+_assert_eq "shdeps_pkg_mgr: returns empty" "" "$result"
+
+# Reset to real value
+_shdeps_pkg_detect
+
+# --- shdeps_force: returns 0 when force is 1 ---
+
+SHDEPS_FORCE=1
+_source_shdeps "$SHDEPS_DIR"
+shdeps_force
+_assert_exit "shdeps_force: active when SHDEPS_FORCE=1" 0 $?
+
+# --- shdeps_force: returns 1 when force is 0 ---
+
+SHDEPS_FORCE=0
+_source_shdeps "$SHDEPS_DIR"
+rc=0; shdeps_force || rc=$?
+_assert_exit "shdeps_force: inactive when SHDEPS_FORCE=0" 1 "$rc"
+
+# --- shdeps_platform: returns a known platform ---
+
+result=$(shdeps_platform)
+_assert_match "shdeps_platform: known value" "^(linux|macos|wsl)$" "$result"
+
+# --- shdeps_require_sudo: returns without crashing ---
+# Can't test sudo acquisition in CI, just verify the function exists
+
+declare -f shdeps_require_sudo &>/dev/null
+_assert_exit "shdeps_require_sudo: function exists" 0 $?
+
+# ===========================================================================
 # Section 9: Git install helpers
 # ===========================================================================
 

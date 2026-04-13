@@ -5,23 +5,39 @@
 # define post() and/or status() functions.
 #
 # Place this file at: <hooks_dir>/nerd-fonts.sh
-# (hooks_dir defaults to the same directory as deps.conf, under hooks.d/)
+# (hooks_dir defaults to <conf_dir>/hooks.d/)
+#
+# Public API available to hooks:
+#   $1                    Dependency name (passed to both post and status)
+#   shdeps_log            Normal log line
+#   shdeps_warn           Warning (always shown unless quiet)
+#   shdeps_log_ok         Success highlight
+#   shdeps_log_dim        Dimmed / low-importance line
+#   shdeps_log_header     Section header
+#   shdeps_pkg_mgr        Detected package manager (brew/apt/dnf/pacman/"")
+#   shdeps_force          Returns 0 if force mode is active
+#   shdeps_platform       Normalized platform name (linux, macos, wsl)
+#   shdeps_require_sudo   Acquire sudo (returns 0 if root or sudo obtained)
+#   shdeps_platform_match Check if current platform matches a spec
+#   shdeps_host_match     Check if current hostname matches a spec
 
 # post() — runs when the dependency is newly installed, updated, or forced.
+# $1 is the dependency name.
 # Return 0 to mark the hook as complete (stamps the TTL).
 # Return non-zero to retry on the next run.
 post() {
+  local name="$1"
   local font_dir="$HOME/.local/share/fonts"
   local font_name="JetBrainsMono"
   local repo="ryanoasis/nerd-fonts"
 
   # Skip if already installed
   if ls "$font_dir"/"$font_name"*.ttf &>/dev/null; then
-    _shdeps_log "  nerd-fonts: $font_name already installed"
+    shdeps_log "  $name: $font_name already installed"
     return 0
   fi
 
-  _shdeps_log "  nerd-fonts: installing $font_name..."
+  shdeps_log "  $name: installing $font_name..."
   mkdir -p "$font_dir"
 
   local url="https://github.com/$repo/releases/latest/download/$font_name.tar.xz"
@@ -30,21 +46,23 @@ post() {
     if command -v fc-cache &>/dev/null; then
       fc-cache -f "$font_dir" 2>/dev/null || true
     fi
-    _shdeps_log_ok "  nerd-fonts: $font_name installed"
+    shdeps_log_ok "  $name: $font_name installed"
     return 0
   else
-    _shdeps_warn "  nerd-fonts: failed to install $font_name"
+    shdeps_warn "  $name: failed to install $font_name"
     return 1
   fi
 }
 
 # status() — runs every time (read-only reporting).
+# $1 is the dependency name.
 # Use this to print current state without making changes.
 status() {
+  local name="$1"
   local font_dir="$HOME/.local/share/fonts"
   if ls "$font_dir"/JetBrainsMono*.ttf &>/dev/null; then
     local count
     count=$(find "$font_dir" -name 'JetBrainsMono*.ttf' -maxdepth 1 2>/dev/null | wc -l)
-    _shdeps_log_dim "  nerd-fonts: $count font files installed"
+    shdeps_log_dim "  $name: $count font files installed"
   fi
 }
