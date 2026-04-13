@@ -179,7 +179,6 @@ _source_shdeps() {
   # Reset any previously defined functions/vars
   unset -f _shdeps_log _shdeps_warn _shdeps_log_ok _shdeps_log_dim _shdeps_log_header 2>/dev/null
   unset _SHDEPS_DEPS _SHDEPS_PKG_MGR _SHDEPS_PKG_BATCH _SHDEPS_PKG_BATCH_NAMES 2>/dev/null
-  unset _SHDEPS_PKG_PRESENT 2>/dev/null
   unset _SHDEPS_CHANGED 2>/dev/null
   # Suppress all output during tests
   export SHDEPS_LOG_LEVEL=0

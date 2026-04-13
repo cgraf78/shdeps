@@ -723,15 +723,15 @@ _shdeps_github_install_local_clone() {
 
   if [[ "$link_before" != "$local_clone" ]]; then
     _SHDEPS_CHANGED[$name]=1
-    _shdeps_log_ok "  $name -> $local_clone (local clone)${ver:+ -- $ver}"
+    _shdeps_log_ok "  $name added${ver:+ -- $ver} (local clone)"
   elif [[ "$rev_before" != "$rev_after" ]]; then
     _SHDEPS_CHANGED[$name]=1
-    _shdeps_log_ok "  $name updated (local clone)${ver:+ -- $ver}"
+    _shdeps_log_ok "  $name updated${ver:+ -- $ver} (local clone)"
   elif [[ "$dirty_after" -eq 1 || "$(_shdeps_force)" -eq 1 ]]; then
     _SHDEPS_CHANGED[$name]=1
-    _shdeps_log_ok "  $name reinstalled (local clone)${ver:+ -- $ver}"
+    _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver} (local clone)"
   else
-    _shdeps_log_dim "  $name up to date${ver:+ -- $ver}"
+    _shdeps_log_dim "  $name${ver:+ -- $ver} (local clone)"
   fi
   rm -f "$log"
 }
@@ -743,7 +743,7 @@ _shdeps_github_install_pull() {
     _shdeps_link_bin "$name" "$install_dir"
     local ver
     ver=$(_shdeps_get_version "$install_dir")
-    _shdeps_log_dim "  $name up to date${ver:+ -- $ver}"
+    _shdeps_log_dim "  $name${ver:+ -- $ver}"
     rm -f "$log"
     return 0
   fi
@@ -764,7 +764,7 @@ _shdeps_github_install_pull() {
       _SHDEPS_CHANGED[$name]=1
       _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
     else
-      _shdeps_log_dim "  $name up to date${ver:+ -- $ver}"
+      _shdeps_log_dim "  $name${ver:+ -- $ver}"
     fi
   else
     _shdeps_logfile_print "$name update" "$log"
@@ -842,13 +842,13 @@ _shdeps_github_install_fresh() {
   if [[ -n "${tarball_url:-}" ]]; then method="release tarball"; fi
 
   if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$(_shdeps_force)" -ne 1 ]]; then
-    _shdeps_log_dim "  $name up to date ($method)${ver:+ -- $ver}"
+    _shdeps_log_dim "  $name${ver:+ -- $ver} ($method)"
   else
     _SHDEPS_CHANGED[$name]=1
     if [[ -n "$ver_before" && "$ver_before" == "$ver" ]]; then
-      _shdeps_log_ok "  $name reinstalled ($method)${ver:+ -- $ver}"
+      _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver} ($method)"
     else
-      _shdeps_log_ok "  $name installed ($method)${ver:+ -- $ver}"
+      _shdeps_log_ok "  $name added${ver:+ -- $ver} ($method)"
     fi
   fi
 }
@@ -1175,7 +1175,7 @@ _shdeps_install_binary() {
   # Skip if cache is fresh and binary exists
   if [[ -n "$current_ver" ]] && _shdeps_remote_fresh "$stamp"; then
     rm -f "$tmp_file" "$log"
-    _shdeps_log_dim "  $name up to date -- $current_ver"
+    _shdeps_log_dim "  $name -- $current_ver"
     return 0
   fi
 
@@ -1205,7 +1205,7 @@ _shdeps_install_binary() {
   if [[ "$(_shdeps_force)" -ne 1 && -n "$current_ver" && -n "$latest_ver_num" && "$current_ver" == "$latest_ver_num" ]]; then
     rm -f "$tmp_file" "$log"
     _shdeps_remote_touch "$stamp" || true
-    _shdeps_log_dim "  $name up to date -- $current_ver"
+    _shdeps_log_dim "  $name -- $current_ver"
     return 0
   fi
 
@@ -1288,7 +1288,7 @@ _shdeps_install_binary() {
 
   _SHDEPS_CHANGED[$name]=1
   if [[ -z "$current_ver" ]]; then
-    _shdeps_log_ok "  $name installed -- $latest_ver"
+    _shdeps_log_ok "  $name added -- $latest_ver"
   elif [[ "$current_ver" == "$latest_ver_num" ]]; then
     _shdeps_log_ok "  $name reinstalled -- $latest_ver"
   else
@@ -1314,7 +1314,12 @@ _shdeps_install_dep() {
     local resolved_pkg=""
     resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
     if _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
-      _SHDEPS_PKG_PRESENT+=("$_name")
+      local ver=""
+      ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+      if [[ -z "$ver" && -n "$_cmd_alt" ]]; then
+        ver=$(_shdeps_dep_version "$_cmd_alt" 2>/dev/null || true)
+      fi
+      _shdeps_log_dim "  $_name${ver:+ -- $ver}"
       # Package exists but expected command missing — trigger post hook
       if ! _shdeps_exists "$_cmd" "$_cmd_alt"; then
         _SHDEPS_CHANGED[$_name]=1
@@ -1424,7 +1429,6 @@ _shdeps_update() {
   _shdeps_pkg_detect
   _SHDEPS_PKG_BATCH=()
   _SHDEPS_PKG_BATCH_NAMES=()
-  _SHDEPS_PKG_PRESENT=()
   declare -gA _SHDEPS_CHANGED=()
 
   _shdeps_log_header "==> Installing/upgrading tools..."
@@ -1434,23 +1438,6 @@ _shdeps_update() {
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_install_dep "$entry" || true
   done
-
-  # Report already-present system packages
-  if [[ ${#_SHDEPS_PKG_PRESENT[@]} -gt 0 ]]; then
-    local cols=72
-    _shdeps_log_dim "  system:"
-    local line="   "
-    local pkg
-    for pkg in "${_SHDEPS_PKG_PRESENT[@]}"; do
-      if ((${#line} + ${#pkg} + 1 > cols)); then
-        _shdeps_log_dim "$line"
-        line="    $pkg"
-      else
-        line+=" $pkg"
-      fi
-    done
-    if [[ -n "$line" ]]; then _shdeps_log_dim "$line"; fi
-  fi
 
   # Flush queued pkg installs
   _shdeps_pkg_install_batch
