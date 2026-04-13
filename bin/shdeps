@@ -143,6 +143,9 @@ cmd_list() {
         status="installed"
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+        if [[ -z "$ver" && -n "$_cmd_alt" ]]; then
+          ver=$(_shdeps_dep_version "$_cmd_alt" 2>/dev/null || true)
+        fi
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
@@ -211,6 +214,9 @@ cmd_check() {
       elif _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved"; then
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+        if [[ -z "$ver" && -n "$_cmd_alt" ]]; then
+          ver=$(_shdeps_dep_version "$_cmd_alt" 2>/dev/null || true)
+        fi
         echo "$_name: installed${ver:+ ($ver)}"
         return 0
       fi
