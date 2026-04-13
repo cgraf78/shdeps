@@ -22,6 +22,45 @@
 SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
 
 # ---------------------------------------------------------------------------
+# Public API — stable interface for callers and hook authors
+# ---------------------------------------------------------------------------
+# Every shdeps_ function (no leading underscore) is defined here.  This is
+# the complete public contract.  Internal implementations live in later
+# sections with _shdeps_ prefixes.
+
+# Core
+shdeps_version()        { echo "shdeps $SHDEPS_VERSION"; }
+shdeps_update()         { _shdeps_update "$@"; }
+shdeps_load()           { _shdeps_load; echo "${#_SHDEPS_DEPS[@]}"; }
+
+# Matching
+shdeps_platform_match() { _shdeps_platform_match "$@"; }
+shdeps_host_match()     { _shdeps_host_match "$@"; }
+
+# Platform and environment
+shdeps_platform() {
+  local current
+  current=$(uname -s | tr '[:upper:]' '[:lower:]')
+  if _shdeps_is_wsl; then current="wsl"; fi
+  if [[ "$current" == "darwin" ]]; then current="macos"; fi
+  echo "$current"
+}
+shdeps_force()          { [[ "$(_shdeps_force)" -eq 1 ]]; }
+shdeps_pkg_mgr()        { echo "${_SHDEPS_PKG_MGR:-}"; }
+shdeps_require_sudo()   { _shdeps_require_sudo; }
+
+# Logging
+shdeps_log()            { _shdeps_log "$@"; }
+shdeps_warn()           { _shdeps_warn "$@"; }
+shdeps_log_ok()         { _shdeps_log_ok "$@"; }
+shdeps_log_dim()        { _shdeps_log_dim "$@"; }
+shdeps_log_header()     { _shdeps_log_header "$@"; }
+
+# ===========================================================================
+# Internal implementation — everything below is private (_shdeps_ prefix)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
 # Configuration defaults
 # ---------------------------------------------------------------------------
 
@@ -151,41 +190,6 @@ _shdeps_require_sudo() {
   if [[ "$(_shdeps_quiet)" -eq 1 ]]; then return 1; fi
   sudo true 2>/dev/null
 }
-
-# ---------------------------------------------------------------------------
-# Public API — stable interface for callers and hook authors
-# ---------------------------------------------------------------------------
-# Everything below with a shdeps_ prefix (no leading underscore) is the
-# public contract.  Internal implementations live in later sections with
-# _shdeps_ prefixes.
-
-# Core
-shdeps_version()        { echo "shdeps $SHDEPS_VERSION"; }
-shdeps_update()         { _shdeps_update "$@"; }
-shdeps_load()           { _shdeps_load; echo "${#_SHDEPS_DEPS[@]}"; }
-
-# Matching
-shdeps_platform_match() { _shdeps_platform_match "$@"; }
-shdeps_host_match()     { _shdeps_host_match "$@"; }
-
-# Platform and environment
-shdeps_platform() {
-  local current
-  current=$(uname -s | tr '[:upper:]' '[:lower:]')
-  if _shdeps_is_wsl; then current="wsl"; fi
-  if [[ "$current" == "darwin" ]]; then current="macos"; fi
-  echo "$current"
-}
-shdeps_force()          { [[ "$(_shdeps_force)" -eq 1 ]]; }
-shdeps_pkg_mgr()        { echo "${_SHDEPS_PKG_MGR:-}"; }
-shdeps_require_sudo()   { _shdeps_require_sudo; }
-
-# Logging
-shdeps_log()            { _shdeps_log "$@"; }
-shdeps_warn()           { _shdeps_warn "$@"; }
-shdeps_log_ok()         { _shdeps_log_ok "$@"; }
-shdeps_log_dim()        { _shdeps_log_dim "$@"; }
-shdeps_log_header()     { _shdeps_log_header "$@"; }
 
 # ---------------------------------------------------------------------------
 # Config parsing
