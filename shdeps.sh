@@ -1409,13 +1409,11 @@ _shdeps_run_post_hooks() {
 }
 
 # Install or upgrade all managed dependencies. Orchestrates:
-# 1. Load config
-# 2. Detect package manager
-# 3. Install each dep (pkg queues, git/binary install, custom install() hooks)
-# 4. Run status() hooks (read-only reporting)
-# 5. Report already-present system packages
-# 6. Batch-install queued packages
-# 7. Run post() hooks for changed deps
+# 1. Load config and detect package manager
+# 2. Install each dep (pkg queues, git/binary install, custom install() hooks)
+# 3. Flush queued pkg installs
+# 4. Run status() hooks (all installs complete)
+# 5. Run post() hooks for changed deps
 _shdeps_update() {
   if ! command -v git &>/dev/null; then
     _shdeps_warn "error: git is required for shdeps"
@@ -1431,16 +1429,13 @@ _shdeps_update() {
 
   _shdeps_log_header "==> Installing/upgrading tools..."
 
+  # Install phase
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_install_dep "$entry" || true
   done
 
-  # Status phase: read-only reporting (after git/binary/custom installs,
-  # before batched pkg install)
-  _shdeps_run_status_hooks
-
-  # List already-present system packages in a compact block
+  # Report already-present system packages
   if [[ ${#_SHDEPS_PKG_PRESENT[@]} -gt 0 ]]; then
     local cols=72
     _shdeps_log_dim "  system:"
@@ -1457,15 +1452,20 @@ _shdeps_update() {
     if [[ -n "$line" ]]; then _shdeps_log_dim "$line"; fi
   fi
 
-  # Install phase: take actions, report what changed
+  # Flush queued pkg installs
   _shdeps_pkg_install_batch
 
-  # Force mode: mark all deps as changed so all post() hooks run
+  # Status phase: read-only reporting (all installs complete)
+  _shdeps_run_status_hooks
+
+  # Force mode: mark all deps as changed so all post() hooks run.
+  # (Install methods already checked shdeps_force individually during step 2.)
   if [[ "$(_shdeps_force)" -eq 1 ]]; then
     for entry in "${_SHDEPS_DEPS[@]}"; do
       _SHDEPS_CHANGED["${entry%%|*}"]=1
     done
   fi
 
+  # Post-install phase
   _shdeps_run_post_hooks
 }
