@@ -349,20 +349,42 @@ _shdeps_exists() {
 # Get installed version of a command.
 # Extracts the first version-like token (digits+dots) from --version output.
 _shdeps_dep_version() {
-  local cmd="${1:-}" ver=""
+  local cmd="${1:-}" output="" ver="" all_output=""
   if [[ -z "$cmd" ]]; then return 1; fi
-  # Try --version, then -V (tmux, autossh), then version (no dash).
-  # Merge stderr — some tools (unzip) write version info to stderr.
+  # Try --version then -V (tmux, autossh, ssh). Skip -v (grep -v inverts
+  # match, gzip -v compresses stdin) and bare "version" subcommand (curl
+  # fetches http://version, ssh connects to host "version").
+  # Merge stderr — some tools (unzip, ssh) write version info there.
   # Search all output lines — some (eza, shellcheck) put it on line 2+.
-  # Ignore exit codes — some tools exit non-zero with version flags.
+  # Timeout after 2s — some tools (nano/pico on macOS) hang with --version.
+  #
+  # Two passes: first try dotted versions (1.2.3, 3.6a) across all flags,
+  # then fall back to integer-only versions anchored near the tool name
+  # or "version" keyword (less 668, gzip 479). Two passes prevent the
+  # fallback from matching noise in --version error output when -V has
+  # the real answer (e.g., ssh).
   local flag
-  for flag in --version -V version; do
-    ver=$(("$cmd" $flag 2>&1 || true) | grep -oE '[0-9]+\.[0-9]+[0-9.a-z]*' | head -1)
+  for flag in --version -V; do
+    if command -v timeout &>/dev/null; then
+      output=$(timeout 2 "$cmd" $flag 2>&1 || true)
+    else
+      output=$("$cmd" $flag 2>&1 || true)
+    fi
+    ver=$(echo "$output" | grep -oE '[0-9]+\.[0-9]+[0-9.a-z]*' | head -1)
     if [[ -n "$ver" ]]; then
       echo "$ver"
       return 0
     fi
+    all_output+="$output"$'\n'
   done
+  # Fallback: integer-only version near the tool name or "version" keyword.
+  local name="${cmd##*/}"
+  ver=$(echo "$all_output" |
+    grep -iE "(version|$name)" |
+    grep -oE '[0-9]+[a-z]?' | head -1)
+  if [[ -n "$ver" ]]; then
+    echo "$ver"
+  fi
 }
 
 # ---------------------------------------------------------------------------
