@@ -14,7 +14,7 @@ set -euo pipefail
 
 SHDEPS_DIR="${SHDEPS_DIR:-$HOME/.local/share/shdeps}"
 SHDEPS_REPO="${SHDEPS_REPO:-https://github.com/cgraf78/shdeps.git}"
-SHDEPS_BIN="$HOME/.local/bin/shdeps"
+SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,10 +45,11 @@ _install() {
     # Already installed — pull latest if clean
     if [[ -n "$(git -C "$SHDEPS_DIR" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
       _info "shdeps: dirty working tree, skipping update"
-    elif git -C "$SHDEPS_DIR" pull --ff-only --quiet 2>/dev/null; then
+    elif git -C "$SHDEPS_DIR" pull --ff-only --quiet 2>&1; then
       _info "shdeps: updated"
     else
-      _info "shdeps: already up to date"
+      _error "shdeps: update failed (git pull --ff-only failed)"
+      exit 1
     fi
   elif [[ -d "$SHDEPS_DIR" ]]; then
     _error "$SHDEPS_DIR exists but is not a git repo"
@@ -84,11 +85,11 @@ _uninstall() {
   local removed=0
   if [[ -L "$SHDEPS_BIN" ]]; then
     rm "$SHDEPS_BIN"
-    ((removed++))
+    ((removed++)) || true
   fi
   if [[ -d "$SHDEPS_DIR" ]]; then
     rm -rf "$SHDEPS_DIR"
-    ((removed++))
+    ((removed++)) || true
   fi
   if [[ $removed -gt 0 ]]; then
     _info "shdeps: uninstalled"

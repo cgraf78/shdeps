@@ -96,6 +96,9 @@ cmd_self_update() {
 
   if git -C "$shdeps_dir" pull --ff-only --quiet 2>/dev/null; then
     _shdeps_remote_touch "$stamp" || true
+  else
+    echo "shdeps: self-update failed (git pull --ff-only failed)" >&2
+    _shdeps_remote_touch "$stamp" || true
   fi
 }
 

@@ -13,6 +13,10 @@ let callers run arbitrary setup after each dependency changes.
 
 - **`shdeps.sh`** — the core library. Sourceable by any bash script.
   Caller does: `source shdeps.sh; shdeps_update`
+- **`bin/shdeps`** — CLI wrapper. Parses args, sources `shdeps.sh`, dispatches
+  to subcommands (`update`, `self-update`, `list`, `check`, `version`).
+- **`install.sh`** — curl-pipeable installer. Clones the repo, symlinks the
+  CLI into `~/.local/bin`. Idempotent (re-run updates). Supports `--uninstall`.
 - **`test/shdeps-test`** — test runner. Run with: `./test/shdeps-test`
 
 ## Naming Conventions
