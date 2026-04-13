@@ -43,8 +43,9 @@ EOF
 SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
 _assert_eq "well-formed: entry count" "6" "${#_SHDEPS_DEPS[@]}"
-_assert_contains "well-formed: first entry is jq" "jq" "${_SHDEPS_DEPS[0]}"
-_assert_contains "well-formed: last entry is nerd-fonts" "nerd-fonts" "${_SHDEPS_DEPS[5]}"
+_assert_contains "well-formed: first entry is bat (sorted)" "bat" "${_SHDEPS_DEPS[0]}"
+_assert_contains "well-formed: last entry is neovim (sorted)" "neovim" "${_SHDEPS_DEPS[4]}"
+_assert_contains "well-formed: nerd-fonts after neovim (sorted)" "nerd-fonts" "${_SHDEPS_DEPS[5]}"
 
 # --- Minimal entry (name + method only) ---
 
@@ -111,10 +112,10 @@ EOF
 SHDEPS_CONF_DIR="$_multi_conf_dir"
 _shdeps_load
 _assert_eq "multi-file: entry count" "4" "${#_SHDEPS_DEPS[@]}"
-_assert_contains "multi-file: first from 00-core" "tool-a" "${_SHDEPS_DEPS[0]}"
-_assert_contains "multi-file: second from 00-core" "tool-b" "${_SHDEPS_DEPS[1]}"
-_assert_contains "multi-file: third from 50-extras" "tool-c" "${_SHDEPS_DEPS[2]}"
-_assert_contains "multi-file: fourth from 99-local" "tool-d" "${_SHDEPS_DEPS[3]}"
+_assert_contains "multi-file: sorted first" "tool-a" "${_SHDEPS_DEPS[0]}"
+_assert_contains "multi-file: sorted second" "tool-b" "${_SHDEPS_DEPS[1]}"
+_assert_contains "multi-file: sorted third" "tool-c" "${_SHDEPS_DEPS[2]}"
+_assert_contains "multi-file: sorted fourth" "tool-d" "${_SHDEPS_DEPS[3]}"
 
 # --- Non-.conf files ignored ---
 

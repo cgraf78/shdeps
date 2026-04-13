@@ -235,6 +235,15 @@ _shdeps_load() {
       _SHDEPS_DEPS+=("${fields// /|}")
     done <"$f"
   done
+
+  # Sort alphabetically by name for stable, scannable output.
+  # Processing order doesn't affect correctness — pkg deps are batched,
+  # and git/binary/custom deps are independent of each other.
+  if [[ ${#_SHDEPS_DEPS[@]} -gt 1 ]]; then
+    local -a sorted=()
+    readarray -t sorted < <(printf '%s\n' "${_SHDEPS_DEPS[@]}" | LC_ALL=C sort -t'|' -k1,1f)
+    _SHDEPS_DEPS=("${sorted[@]}")
+  fi
 }
 
 # ---------------------------------------------------------------------------
