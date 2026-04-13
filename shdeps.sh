@@ -19,7 +19,7 @@
 #   SHDEPS_REMOTE_TTL   Cache TTL in seconds        (default: 3600)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
 
-SHDEPS_VERSION="0.2.0"
+SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
 
 # ---------------------------------------------------------------------------
 # Configuration defaults
