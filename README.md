@@ -22,26 +22,39 @@ A standalone shell dependency manager. Declare your tools in a config file, and 
 ## Quick Start
 
 ```bash
-git clone https://github.com/cgraf78/shdeps.git ~/.local/share/shdeps
+curl -fsSL https://raw.githubusercontent.com/cgraf78/shdeps/main/install.sh | bash
+```
 
-# Create a config file
-cat > deps.conf << 'EOF'
+This clones shdeps to `~/.local/share/shdeps` and symlinks the CLI into `~/.local/bin/shdeps`. Re-running the installer updates to the latest version.
+
+Then create a config and run:
+
+```bash
+cat > ~/.config/shdeps/deps.conf << 'EOF'
 jq    pkg
 fzf   pkg
 EOF
 
-# Run it
-~/.local/share/shdeps/bin/shdeps -c deps.conf update
-```
-
-Or symlink the CLI into your PATH:
-
-```bash
-ln -sf ~/.local/share/shdeps/bin/shdeps ~/.local/bin/shdeps
 shdeps update
 ```
 
 The CLI automatically finds `~/.config/shdeps/deps.conf` when no `-c` flag or `SHDEPS_CONF` env var is set. The library (`source shdeps.sh`) defaults to `./deps.conf`.
+
+### Updating shdeps
+
+```bash
+shdeps self-update
+```
+
+Uses TTL-based caching to avoid redundant pulls. Skips updates if the working tree has uncommitted changes (active development). Use `--force` to bypass the TTL cache.
+
+### Uninstalling
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cgraf78/shdeps/main/install.sh | bash -s -- --uninstall
+```
+
+Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 
 ## Configuration
 
@@ -137,6 +150,7 @@ Usage: shdeps [options] <command> [args]
 
 Commands:
   update          Install/update all dependencies
+  self-update     Update shdeps itself (git pull with TTL caching)
   list            List all configured dependencies with status
   check <name>    Check if a specific dependency is installed
   version         Print shdeps version
@@ -144,7 +158,7 @@ Commands:
 
 Options:
   -c, --config <path>   Path to deps.conf (default: ~/.config/shdeps/deps.conf)
-  -f, --force           Force reinstall all dependencies
+  -f, --force           Force reinstall all dependencies (or bypass TTL for self-update)
   -q, --quiet           Suppress interactive prompts
   -v, --verbose         Verbose output
 ```
