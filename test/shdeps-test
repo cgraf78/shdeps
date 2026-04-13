@@ -1636,6 +1636,34 @@ _assert_eq "local clone: marked as changed" "1" "${_SHDEPS_CHANGED[$_lc_name]:-0
 # Cleanup
 rm -rf "$_lc_clone" "$_lc_install"
 
+# --- SHDEPS_GIT_DEV_DIR overrides dev clone location ---
+
+_lc_custom_dev=$(_tmpdir)/custom-dev
+_lc_name2="shdeps-devdir-test"
+_lc_clone2="$_lc_custom_dev/$_lc_name2"
+_lc_install2="$HOME/.local/share/$_lc_name2"
+
+mkdir -p "$_lc_clone2"
+git -C "$_lc_clone2" init -q
+git -C "$_lc_clone2" commit --allow-empty -m "init" -q
+
+declare -gA _SHDEPS_CHANGED=()
+SHDEPS_GIT_DEV_DIR="$_lc_custom_dev" \
+  _shdeps_install_from_github "$_lc_name2" "owner/$_lc_name2" "$_lc_install2"
+
+_assert_symlink "dev dir override: install dir is symlink" "$_lc_install2"
+_lc_target2=$(readlink "$_lc_install2")
+_assert_eq "dev dir override: points to custom dev dir" "$_lc_clone2" "$_lc_target2"
+_assert_eq "dev dir override: marked as changed" "1" "${_SHDEPS_CHANGED[$_lc_name2]:-0}"
+
+rm -rf "$_lc_clone2" "$_lc_install2"
+unset SHDEPS_GIT_DEV_DIR
+
+# --- Default SHDEPS_GIT_DEV_DIR ignores non-existent ~/git/<name> ---
+
+# With no clone at ~/git/ or custom dir, should fall through to fresh install
+# (tested implicitly by existing integration tests)
+
 # ===========================================================================
 # Section 10: Integration / end-to-end
 # ===========================================================================

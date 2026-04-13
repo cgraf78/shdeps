@@ -18,6 +18,7 @@
 #   SHDEPS_REINSTALL    Force reinstall all deps    (default: 0)
 #   SHDEPS_QUIET        Suppress interactive prompts(default: 0)
 #   SHDEPS_REMOTE_TTL   Cache TTL in seconds        (default: 3600)
+#   SHDEPS_GIT_DEV_DIR  Dev clone directory          (default: ~/git)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
 
 SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
@@ -81,6 +82,7 @@ _shdeps_force()      { echo "${SHDEPS_FORCE:-0}"; }
 _shdeps_reinstall()  { echo "${SHDEPS_REINSTALL:-0}"; }
 _shdeps_quiet()      { echo "${SHDEPS_QUIET:-0}"; }
 _shdeps_remote_ttl() { echo "${SHDEPS_REMOTE_TTL:-3600}"; }
+_shdeps_dev_dir()    { echo "${SHDEPS_GIT_DEV_DIR:-$HOME/git}"; }
 _shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 
 # ---------------------------------------------------------------------------
@@ -850,7 +852,7 @@ _shdeps_github_install_fresh() {
 }
 
 # Install or upgrade a tool from GitHub (git method).
-# Priority: ~/git/<name> (symlink) > existing clone (pull) > release tarball > fresh clone.
+# Priority: $SHDEPS_GIT_DEV_DIR/<name> (symlink) > existing clone (pull) > release tarball > fresh clone.
 # Env var override: SHDEPS_<NAME>_REPO overrides the repo URL.
 _shdeps_install_from_github() {
   local name="$1" default_repo="$2" install_dir="$3"
@@ -858,7 +860,7 @@ _shdeps_install_from_github() {
   upper="${upper//-/_}"
   local env_var="SHDEPS_${upper}_REPO"
   local repo="${!env_var:-https://github.com/$default_repo}"
-  local local_clone="$HOME/git/$name"
+  local local_clone="$(_shdeps_dev_dir)/$name"
   local stamp
   stamp=$(_shdeps_remote_stamp "$name" git)
   local log=""
