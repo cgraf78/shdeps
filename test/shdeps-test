@@ -504,6 +504,102 @@ _source_shdeps "$SHDEPS_DIR"
 _shdeps_pkg_detect
 _assert_match "pkg_detect: sets a known value" "^(brew|apt|dnf|pacman)?$" "$_SHDEPS_PKG_MGR"
 
+# --- _shdeps_check_pkg_needed: all deps installed → 0 ---
+
+_cpn_dir=$(_tmpdir)
+_cpn_bin=$(_mock_bin)
+cat >"$_cpn_dir/deps.conf" <<'EOF'
+tool-a  pkg
+tool-b  pkg
+EOF
+# Create mock commands so _shdeps_exists finds them
+printf '#!/bin/sh\n' >"$_cpn_bin/tool-a" && chmod +x "$_cpn_bin/tool-a"
+printf '#!/bin/sh\n' >"$_cpn_bin/tool-b" && chmod +x "$_cpn_bin/tool-b"
+_saved_path="$PATH"
+export PATH="$_cpn_bin:$PATH"
+SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
+_SHDEPS_PKG_MGR="dnf"
+unset _SHDEPS_PKG_INSTALL_NEEDED
+_shdeps_check_pkg_needed
+_assert_eq "check_pkg_needed: all installed → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+export PATH="$_saved_path"
+
+# --- _shdeps_check_pkg_needed: missing dep → 1 ---
+
+cat >"$_cpn_dir/deps.conf" <<'EOF'
+tool-a  pkg
+missing-tool  pkg
+EOF
+SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
+unset _SHDEPS_PKG_INSTALL_NEEDED
+_shdeps_check_pkg_needed
+_assert_eq "check_pkg_needed: missing dep → 1" "1" "$_SHDEPS_PKG_INSTALL_NEEDED"
+
+# --- _shdeps_check_pkg_needed: skips non-pkg methods ---
+
+cat >"$_cpn_dir/deps.conf" <<'EOF'
+my-tool  git  -  -  -  user/repo  .local/share/my-tool
+EOF
+SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
+unset _SHDEPS_PKG_INSTALL_NEEDED
+_shdeps_check_pkg_needed
+_assert_eq "check_pkg_needed: skips git method" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+
+# --- _shdeps_check_pkg_needed: skips when pkg manager is brew ---
+
+cat >"$_cpn_dir/deps.conf" <<'EOF'
+missing-tool  pkg
+EOF
+SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
+_SHDEPS_PKG_MGR="brew"
+unset _SHDEPS_PKG_INSTALL_NEEDED
+_shdeps_check_pkg_needed
+_assert_eq "check_pkg_needed: brew → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+
+# --- _shdeps_check_pkg_needed: skips when no pkg manager ---
+
+_SHDEPS_PKG_MGR=""
+unset _SHDEPS_PKG_INSTALL_NEEDED
+_shdeps_check_pkg_needed
+_assert_eq "check_pkg_needed: no mgr → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+
+# --- _shdeps_check_pkg_needed: idempotent (does not re-scan) ---
+
+_SHDEPS_PKG_MGR="dnf"
+_SHDEPS_PKG_INSTALL_NEEDED=0
+_shdeps_check_pkg_needed
+_assert_eq "check_pkg_needed: idempotent (cached 0)" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+_SHDEPS_PKG_INSTALL_NEEDED=1
+_shdeps_check_pkg_needed
+_assert_eq "check_pkg_needed: idempotent (cached 1)" "1" "$_SHDEPS_PKG_INSTALL_NEEDED"
+
+# --- _shdeps_pkg_refresh_metadata: skips when no install needed ---
+
+unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PKG_CACHE_REFRESHED
+_SHDEPS_PKG_MGR="dnf"
+# All deps installed (tool-a exists from earlier mock)
+cat >"$_cpn_dir/deps.conf" <<'EOF'
+tool-a  pkg
+EOF
+_saved_path="$PATH"
+export PATH="$_cpn_bin:$PATH"
+SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
+unset _SHDEPS_PKG_INSTALL_NEEDED
+_shdeps_pkg_refresh_metadata
+_assert_neq "refresh_metadata: skipped when all installed" "1" "${_SHDEPS_PKG_CACHE_REFRESHED:-}"
+export PATH="$_saved_path"
+
+# --- _shdeps_pkg_refresh_metadata: idempotent via _SHDEPS_PKG_CACHE_REFRESHED ---
+
+_SHDEPS_PKG_INSTALL_NEEDED=1
+_SHDEPS_PKG_CACHE_REFRESHED=1
+_shdeps_pkg_refresh_metadata
+_assert_eq "refresh_metadata: idempotent" "1" "$_SHDEPS_PKG_CACHE_REFRESHED"
+
+# Restore state
+unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PKG_CACHE_REFRESHED
+_source_shdeps "$SHDEPS_DIR"
+
 # ===========================================================================
 # Section 5: Binary asset matching
 # ===========================================================================
