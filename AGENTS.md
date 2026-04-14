@@ -15,7 +15,7 @@ changes.
 - **`shdeps.sh`** — the core library. Sourceable by any bash script.
   Caller does: `source shdeps.sh; shdeps_update`
 - **`bin/shdeps`** — CLI wrapper. Parses args, sources `shdeps.sh`, dispatches
-  to subcommands (`update`, `self-update`, `list`, `check`, `version`).
+  to subcommands (`update`, `self-update`, `list`, `check`, `prune`, `version`).
 - **`install.sh`** — curl-pipeable installer and bootstrap script. Clones the
   repo, symlinks the CLI into `~/.local/bin`. Idempotent (re-run updates).
   Supports `--uninstall` and `--bootstrap` (sourceable mode for client
@@ -59,6 +59,26 @@ codex     binary    -      -          -                openai/codex     -       
 ```
 
 Methods: `pkg` (system package manager), `git` (GitHub clone), `binary` (GitHub release), `custom` (hook-only).
+
+## State Tracking
+
+shdeps tracks installed deps in a manifest file at
+`$SHDEPS_STATE_DIR/manifest`. Each line is pipe-delimited:
+`name|method|cmd|install_path`. Written automatically during `shdeps update`.
+
+When a dep is removed from config but still in the manifest, `shdeps update`
+prints an orphan notice. Run `shdeps prune` to remove orphaned artifacts.
+
+## Hook Contract
+
+Hook files in `hooks.d/$name.sh` may define these functions:
+
+- `exists(name)` — **required**. Returns 0 if the dep is installed.
+- `install(name)` — install the dep. Called when `exists` returns 1.
+- `version(name)` — return version string.
+- `post(name)` — post-install setup. Runs after any change.
+- `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
+  an orphaned custom dep. Should reverse what `install()` did.
 
 ## Code Quality
 

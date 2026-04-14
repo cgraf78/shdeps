@@ -35,6 +35,7 @@ shdeps_version()        { echo "shdeps $SHDEPS_VERSION"; }
 shdeps_update()         { _shdeps_update "$@"; }
 shdeps_self_update()    { _shdeps_self_update "$@"; }
 shdeps_load()           { _shdeps_load; echo "${#_SHDEPS_DEPS[@]}"; }
+shdeps_prune()          { _shdeps_prune "$@"; }
 
 # Matching
 shdeps_platform_match() { _shdeps_platform_match "$@"; }
@@ -639,6 +640,214 @@ _shdeps_rev_touch() {
   stamp_dir=$(dirname "$stamp")
   mkdir -p "$stamp_dir" || return 1
   printf '%s\n' "$rev" >"$stamp"
+}
+
+# ---------------------------------------------------------------------------
+# Manifest — tracks installed deps for orphan detection and pruning
+# ---------------------------------------------------------------------------
+
+# Return path to the manifest file.
+_shdeps_manifest_path() {
+  echo "$(_shdeps_state_dir)/manifest"
+}
+
+# Read the manifest file into _SHDEPS_MANIFEST associative array.
+# Each entry: _SHDEPS_MANIFEST[$name]="method|cmd|install_path"
+_shdeps_manifest_read() {
+  declare -gA _SHDEPS_MANIFEST=()
+  local manifest
+  manifest=$(_shdeps_manifest_path)
+  [[ -f "$manifest" ]] || return 0
+  local m_name m_rest
+  while IFS='|' read -r m_name m_rest || [[ -n "$m_name" ]]; do
+    [[ -n "$m_name" ]] || continue
+    _SHDEPS_MANIFEST[$m_name]="$m_rest"
+  done <"$manifest"
+}
+
+# Add or update a manifest entry.
+# $1=name $2=method $3=cmd $4=install_path
+_shdeps_manifest_upsert() {
+  local name="$1" method="$2" cmd="$3" install_path="${4:-}"
+  local manifest
+  manifest=$(_shdeps_manifest_path)
+  local manifest_dir
+  manifest_dir=$(dirname "$manifest")
+  mkdir -p "$manifest_dir" || return 1
+  # Remove existing entry (grep -v to temp file + mv for portability)
+  if [[ -f "$manifest" ]]; then
+    local tmp="$manifest.tmp.$$"
+    grep -v "^${name}|" "$manifest" >"$tmp" 2>/dev/null || true
+    mv "$tmp" "$manifest"
+  fi
+  printf '%s\n' "$name|$method|$cmd|$install_path" >>"$manifest"
+}
+
+# Remove a manifest entry by name.
+_shdeps_manifest_remove() {
+  local name="$1"
+  local manifest
+  manifest=$(_shdeps_manifest_path)
+  [[ -f "$manifest" ]] || return 0
+  local tmp="$manifest.tmp.$$"
+  grep -v "^${name}|" "$manifest" >"$tmp" 2>/dev/null || true
+  mv "$tmp" "$manifest"
+}
+
+# Detect orphaned deps: in manifest but not in config.
+# Sets _SHDEPS_ORPHANS array with "name|method|cmd|install_path" entries.
+# Returns 0 if orphans found, 1 if none.
+_shdeps_detect_orphans() {
+  _SHDEPS_ORPHANS=()
+  _shdeps_manifest_read
+
+  if [[ ${#_SHDEPS_MANIFEST[@]} -eq 0 ]]; then return 1; fi
+
+  # Build set of all config dep names (regardless of platform/host filtering)
+  local -A config_names=()
+  local entry
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    config_names["${entry%%|*}"]=1
+  done
+
+  # Any manifest entry not in config is an orphan
+  local name
+  for name in "${!_SHDEPS_MANIFEST[@]}"; do
+    if [[ -z "${config_names[$name]+x}" ]]; then
+      _SHDEPS_ORPHANS+=("$name|${_SHDEPS_MANIFEST[$name]}")
+    fi
+  done
+
+  [[ ${#_SHDEPS_ORPHANS[@]} -gt 0 ]]
+}
+
+# Remove state stamps for a dep.
+_shdeps_remove_stamps() {
+  local name="$1"
+  local state_dir
+  state_dir=$(_shdeps_state_dir)
+  rm -f "$state_dir/$name".*.stamp "$state_dir/$name.rev"
+}
+
+# Remove artifacts for one orphaned dep.
+# $1=name $2=method $3=cmd $4=install_path
+_shdeps_remove_dep() {
+  local name="$1" method="$2" cmd="$3" install_path="$4"
+
+  case "$method" in
+  pkg)
+    _shdeps_warn "  $name: pkg dep — remove manually via ${_SHDEPS_PKG_MGR:-system package manager}"
+    ;;
+  git)
+    if [[ -n "$install_path" ]]; then
+      rm -rf "${HOME:?}/$install_path"
+    fi
+    rm -f "$HOME/.local/bin/$name"
+    _shdeps_remove_stamps "$name"
+    _shdeps_log_ok "  $name removed"
+    ;;
+  binary)
+    rm -f "$HOME/.local/bin/$cmd"
+    if [[ -d "$HOME/.local/share/$name" ]]; then
+      rm -rf "${HOME:?}/.local/share/$name"
+    fi
+    _shdeps_remove_stamps "$name"
+    _shdeps_log_ok "  $name removed"
+    ;;
+  custom)
+    local hooks_dir
+    hooks_dir=$(_shdeps_hooks_dir)
+    local hook_file="$hooks_dir/$name.sh"
+    if [[ -f "$hook_file" ]]; then
+      unset -f exists version install post uninstall 2>/dev/null
+      # shellcheck source=/dev/null
+      if ! . "$hook_file"; then
+        _shdeps_warn "  warning: failed to source $hook_file"
+      elif declare -f uninstall &>/dev/null; then
+        if uninstall "$name"; then
+          _shdeps_log_ok "  $name removed"
+        else
+          _shdeps_warn "  warning: $name uninstall hook failed"
+        fi
+      else
+        _shdeps_warn "  warning: $name has no uninstall() hook — manual cleanup may be needed"
+      fi
+      unset -f exists version install post uninstall 2>/dev/null
+    else
+      _shdeps_warn "  warning: $name hook file missing — manual cleanup may be needed"
+    fi
+    _shdeps_remove_stamps "$name"
+    ;;
+  esac
+}
+
+# Remove all orphaned deps (in manifest but not in config).
+# Flags: -y (skip confirmation), --dry-run (show what would be removed).
+_shdeps_prune() {
+  local yes=0 dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    -y)        yes=1; shift ;;
+    --dry-run) dry_run=1; shift ;;
+    *)         _shdeps_warn "error: unknown prune option '$1'"; return 2 ;;
+    esac
+  done
+
+  _shdeps_load
+  _shdeps_pkg_detect
+
+  # Guard: if config is empty but manifest has entries, all deps would appear
+  # orphaned. Require explicit -y to proceed (prevents accidental wipe from
+  # a missing or empty config dir).
+  if [[ ${#_SHDEPS_DEPS[@]} -eq 0 ]]; then
+    _shdeps_manifest_read
+    if [[ ${#_SHDEPS_MANIFEST[@]} -gt 0 && $yes -eq 0 ]]; then
+      _shdeps_warn "warning: no deps in config but ${#_SHDEPS_MANIFEST[@]} in manifest — all would be orphaned"
+      _shdeps_warn "  If intentional, re-run with -y"
+      return 1
+    fi
+  fi
+
+  if ! _shdeps_detect_orphans; then
+    _shdeps_log "No orphaned deps found."
+    return 0
+  fi
+
+  # List orphans
+  local count=${#_SHDEPS_ORPHANS[@]}
+  _shdeps_log_header "==> $count orphaned dep(s) no longer in config:"
+  local orphan o_name o_method o_cmd o_install_path
+  for orphan in "${_SHDEPS_ORPHANS[@]}"; do
+    IFS='|' read -r o_name o_method o_cmd o_install_path <<<"$orphan"
+    _shdeps_log "  $o_name ($o_method)"
+  done
+
+  if [[ $dry_run -eq 1 ]]; then
+    _shdeps_log "Dry run — nothing removed."
+    return 0
+  fi
+
+  # Quiet mode without -y: silently skip (no prompt, no action)
+  if [[ "$(_shdeps_quiet)" -eq 1 && $yes -eq 0 ]]; then
+    return 0
+  fi
+
+  # Confirm unless -y
+  if [[ $yes -eq 0 ]]; then
+    local reply=""
+    read -r -p "Remove? [y/N] " reply
+    if [[ "${reply,,}" != "y" ]]; then
+      _shdeps_log "Aborted."
+      return 0
+    fi
+  fi
+
+  # Remove each orphan
+  for orphan in "${_SHDEPS_ORPHANS[@]}"; do
+    IFS='|' read -r o_name o_method o_cmd o_install_path <<<"$orphan"
+    _shdeps_remove_dep "$o_name" "$o_method" "$o_cmd" "$o_install_path" || true
+    _shdeps_manifest_remove "$o_name"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -1328,15 +1537,19 @@ _shdeps_install_dep() {
       if ! _shdeps_exists "$_cmd" "$_cmd_alt"; then
         _SHDEPS_CHANGED[$_name]=1
       fi
+      _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
       return 0
     fi
     _shdeps_pkg_queue "$_name" "$_pkg_overrides"
+    _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
     ;;
   git)
     _shdeps_install_from_github "$_name" "$_repo" "$HOME/$_dir"
+    _shdeps_manifest_upsert "$_name" "git" "$_cmd" "$_dir"
     ;;
   binary)
     _shdeps_install_binary "$_name" "$_cmd" "$_repo"
+    _shdeps_manifest_upsert "$_name" "binary" "$_cmd" ".local/bin/$_cmd"
     ;;
   custom)
     # Source hook file and use exists() to gate install().
@@ -1344,7 +1557,7 @@ _shdeps_install_dep() {
     hooks_dir=$(_shdeps_hooks_dir)
     local hook_file="$hooks_dir/$_name.sh"
     [[ -f "$hook_file" ]] || return 0
-    unset -f exists version install post 2>/dev/null
+    unset -f exists version install post uninstall 2>/dev/null
     # shellcheck source=/dev/null
     . "$hook_file" || {
       _shdeps_warn "  warning: failed to source $hook_file"
@@ -1352,7 +1565,7 @@ _shdeps_install_dep() {
     }
     if ! declare -f exists &>/dev/null; then
       _shdeps_warn "  warning: $_name hook missing exists() — skipping"
-      unset -f exists version install post 2>/dev/null
+      unset -f exists version install post uninstall 2>/dev/null
       return 0
     fi
     local _existed=0 ver=""
@@ -1362,7 +1575,8 @@ _shdeps_install_dep() {
         ver=$(version "$_name" 2>/dev/null) || ver=""
       fi
       _shdeps_log_dim "  $_name${ver:+ -- $ver}"
-      unset -f exists version install post 2>/dev/null
+      unset -f exists version install post uninstall 2>/dev/null
+      _shdeps_manifest_upsert "$_name" "custom" "$_cmd" ""
       return 0
     fi
     if declare -f install &>/dev/null; then
@@ -1374,11 +1588,12 @@ _shdeps_install_dep() {
           ver=$(version "$_name" 2>/dev/null) || ver=""
         fi
         _shdeps_log_ok "  $_name $action${ver:+ -- $ver}"
+        _shdeps_manifest_upsert "$_name" "custom" "$_cmd" ""
       else
         _shdeps_warn "  warning: $_name install failed"
       fi
     fi
-    unset -f exists version install post 2>/dev/null
+    unset -f exists version install post uninstall 2>/dev/null
     ;;
   esac
 }
@@ -1397,7 +1612,7 @@ _shdeps_run_post_hooks() {
     [[ -n "${_SHDEPS_CHANGED[$name]+x}" ]] || continue
     local hook_file="$hooks_dir/$name.sh"
     [[ -f "$hook_file" ]] || continue
-    unset -f exists version install post 2>/dev/null
+    unset -f exists version install post uninstall 2>/dev/null
     # shellcheck source=/dev/null
     . "$hook_file" || {
       _shdeps_warn "  warning: failed to source $hook_file"
@@ -1406,7 +1621,7 @@ _shdeps_run_post_hooks() {
     if declare -f post &>/dev/null; then
       post "$name" || true
     fi
-    unset -f exists version install post 2>/dev/null
+    unset -f exists version install post uninstall 2>/dev/null
   done
 }
 
@@ -1565,4 +1780,20 @@ _shdeps_update() {
 
   # Post-install phase
   _shdeps_run_post_hooks
+
+  # Notify about orphaned deps (in manifest but no longer in config)
+  if _shdeps_detect_orphans; then
+    local _orphan_count=${#_SHDEPS_ORPHANS[@]}
+    local _orphan_list="" _o
+    for _o in "${_SHDEPS_ORPHANS[@]}"; do
+      local _o_name="${_o%%|*}"
+      local _o_rest="${_o#*|}"
+      local _o_method="${_o_rest%%|*}"
+      _orphan_list+="${_orphan_list:+, }$_o_name ($_o_method)"
+    done
+    _shdeps_warn ""
+    _shdeps_warn "==> $_orphan_count orphaned dep(s) (removed from config but still installed):"
+    _shdeps_warn "  $_orphan_list"
+    _shdeps_warn "  Run: shdeps prune"
+  fi
 }

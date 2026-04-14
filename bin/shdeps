@@ -39,6 +39,7 @@ Commands:
   self-update     Update shdeps itself (git pull with TTL caching)
   list            List all configured dependencies with status
   check <name>    Check if a specific dependency is installed
+  prune           Remove orphaned deps no longer in config
   version         Print shdeps version
   help            Show this help message
 
@@ -49,12 +50,18 @@ Options:
   -q, --quiet           Suppress interactive prompts
   -v, --verbose         Verbose output (log level 2)
 
+Prune options:
+  -y                    Skip confirmation prompt
+  --dry-run             Show what would be removed without removing
+
 Examples:
   shdeps update
   shdeps -c ~/.config/myapp/ update
   shdeps --force update
   shdeps list
   shdeps check jq
+  shdeps prune --dry-run
+  shdeps prune -y
 
 Exit codes:
   0  Success
@@ -145,7 +152,7 @@ cmd_list() {
       hooks_dir=$(_shdeps_hooks_dir)
       hook_file="$hooks_dir/$_name.sh"
       if [[ -f "$hook_file" ]]; then
-        unset -f exists version install post 2>/dev/null
+        unset -f exists version install post uninstall 2>/dev/null
         # shellcheck source=/dev/null
         . "$hook_file" 2>/dev/null
         if declare -f exists &>/dev/null && exists "$_name"; then
@@ -156,7 +163,7 @@ cmd_list() {
             [[ -n "$ver" ]] && details="$ver"
           fi
         fi
-        unset -f exists version install post 2>/dev/null
+        unset -f exists version install post uninstall 2>/dev/null
       fi
       ;;
     esac
@@ -231,7 +238,7 @@ cmd_check() {
       hooks_dir=$(_shdeps_hooks_dir)
       hook_file="$hooks_dir/$_name.sh"
       if [[ -f "$hook_file" ]]; then
-        unset -f exists version install post 2>/dev/null
+        unset -f exists version install post uninstall 2>/dev/null
         # shellcheck source=/dev/null
         . "$hook_file" 2>/dev/null
         if declare -f exists &>/dev/null && exists "$_name"; then
@@ -240,10 +247,10 @@ cmd_check() {
             ver=$(version "$_name" 2>/dev/null) || ver=""
           fi
           echo "$_name: installed${ver:+ ($ver)}"
-          unset -f exists version install post 2>/dev/null
+          unset -f exists version install post uninstall 2>/dev/null
           return 0
         fi
-        unset -f exists version install post 2>/dev/null
+        unset -f exists version install post uninstall 2>/dev/null
       fi
       ;;
     esac
@@ -256,6 +263,10 @@ cmd_check() {
     echo "error: unknown dependency '$target'" >&2
     return 1
   fi
+}
+
+cmd_prune() {
+  shdeps_prune "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -331,6 +342,7 @@ main() {
   self-update) cmd_self_update "$@" ;;
   list)        cmd_list "$@" ;;
   check)       cmd_check "$@" ;;
+  prune)       cmd_prune "$@" ;;
   version)     shdeps_version ;;
   help)        usage ;;
   *)

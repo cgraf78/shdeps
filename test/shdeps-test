@@ -1665,6 +1665,374 @@ unset SHDEPS_GIT_DEV_DIR
 # (tested implicitly by existing integration tests)
 
 # ===========================================================================
+# Section 9b: Manifest and pruning
+# ===========================================================================
+
+echo ""
+echo "=== Manifest and pruning ==="
+
+# --- Manifest helpers ---
+
+_mfst_state=$(_tmpdir)
+SHDEPS_STATE_DIR="$_mfst_state"
+_source_shdeps "$SHDEPS_DIR"
+
+# manifest_path returns expected value
+_mfst_path=$(_shdeps_manifest_path)
+_assert_eq "manifest path: in state dir" "$_mfst_state/manifest" "$_mfst_path"
+
+# upsert to empty manifest creates file and entry
+_shdeps_manifest_upsert "tool-a" "pkg" "tool-a" ""
+_assert_file_exists "upsert: creates file" "$_mfst_path"
+_assert_file_content "upsert: first entry" "tool-a|pkg|tool-a|" "$_mfst_path"
+
+# upsert adds alongside existing
+_shdeps_manifest_upsert "tool-b" "binary" "tb" ".local/bin/tb"
+_mfst_content=$(cat "$_mfst_path")
+_assert_contains "upsert: has tool-a" "tool-a|pkg|tool-a|" "$_mfst_content"
+_assert_contains "upsert: has tool-b" "tool-b|binary|tb|.local/bin/tb" "$_mfst_content"
+
+# upsert replaces existing (no duplicates)
+_shdeps_manifest_upsert "tool-a" "git" "tool-a" ".local/share/tool-a"
+_mfst_content=$(cat "$_mfst_path")
+_assert_contains "upsert replace: new value" "tool-a|git|tool-a|.local/share/tool-a" "$_mfst_content"
+_assert_not_contains "upsert replace: old value gone" "tool-a|pkg|tool-a|" "$_mfst_content"
+_mfst_count=$(grep -c "^tool-a|" "$_mfst_path")
+_assert_eq "upsert replace: no duplicates" "1" "$_mfst_count"
+
+# read populates associative array
+_shdeps_manifest_read
+_assert_eq "read: tool-a value" "git|tool-a|.local/share/tool-a" "${_SHDEPS_MANIFEST[tool-a]:-}"
+_assert_eq "read: tool-b value" "binary|tb|.local/bin/tb" "${_SHDEPS_MANIFEST[tool-b]:-}"
+
+# read missing file produces empty array
+_mfst_empty_state=$(_tmpdir)
+SHDEPS_STATE_DIR="$_mfst_empty_state"
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_manifest_read
+_assert_eq "read missing: empty array" "0" "${#_SHDEPS_MANIFEST[@]}"
+
+# remove deletes entry, leaves others
+SHDEPS_STATE_DIR="$_mfst_state"
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_manifest_remove "tool-a"
+_mfst_content=$(cat "$_mfst_path")
+_assert_not_contains "remove: tool-a gone" "tool-a" "$_mfst_content"
+_assert_contains "remove: tool-b kept" "tool-b" "$_mfst_content"
+
+# remove from missing file is no-op
+SHDEPS_STATE_DIR="$_mfst_empty_state"
+_source_shdeps "$SHDEPS_DIR"
+rc=0; _shdeps_manifest_remove "nonexistent" || rc=$?
+_assert_eq "remove missing file: no error" "0" "$rc"
+
+# --- Orphan detection ---
+
+_orp_state=$(_tmpdir)
+_orp_conf=$(_tmpdir)
+SHDEPS_STATE_DIR="$_orp_state"
+SHDEPS_CONF_DIR="$_orp_conf"
+_source_shdeps "$SHDEPS_DIR"
+
+# Create manifest with A, B, C
+_shdeps_manifest_upsert "dep-a" "pkg" "dep-a" ""
+_shdeps_manifest_upsert "dep-b" "binary" "dep-b" ".local/bin/dep-b"
+_shdeps_manifest_upsert "dep-c" "git" "dep-c" ".local/share/dep-c"
+
+# Config has only A, B
+cat >"$_orp_conf/deps.conf" <<'EOF'
+dep-a  pkg
+dep-b  binary  dep-b  -  -  owner/dep-b
+EOF
+_shdeps_load
+
+rc=0; _shdeps_detect_orphans || rc=$?
+_assert_eq "orphan: found" "0" "$rc"
+_assert_eq "orphan: count" "1" "${#_SHDEPS_ORPHANS[@]}"
+_assert_contains "orphan: dep-c is orphaned" "dep-c" "${_SHDEPS_ORPHANS[0]}"
+
+# manifest matches config → no orphans
+cat >>"$_orp_conf/deps.conf" <<'EOF'
+dep-c  git  -  -  -  owner/dep-c  .local/share/dep-c
+EOF
+_shdeps_load
+rc=0; _shdeps_detect_orphans || rc=$?
+_assert_eq "orphan: none when matching" "1" "$rc"
+_assert_eq "orphan: empty array" "0" "${#_SHDEPS_ORPHANS[@]}"
+
+# empty manifest → no orphans
+SHDEPS_STATE_DIR="$_mfst_empty_state"
+_source_shdeps "$SHDEPS_DIR"
+SHDEPS_CONF_DIR="$_orp_conf"
+_shdeps_load
+rc=0; _shdeps_detect_orphans || rc=$?
+_assert_eq "orphan: none with empty manifest" "1" "$rc"
+
+# platform-filtered config dep is NOT an orphan
+_orp_plat_state=$(_tmpdir)
+_orp_plat_conf=$(_tmpdir)
+SHDEPS_STATE_DIR="$_orp_plat_state"
+SHDEPS_CONF_DIR="$_orp_plat_conf"
+_source_shdeps "$SHDEPS_DIR"
+
+_shdeps_manifest_upsert "dep-x" "pkg" "dep-x" ""
+
+if [[ "$(shdeps_platform)" == "linux" ]]; then
+  _skip_plat="macos"
+else
+  _skip_plat="linux"
+fi
+cat >"$_orp_plat_conf/deps.conf" <<EOF
+dep-x  pkg  -  -  -  -  -  $_skip_plat
+EOF
+_shdeps_load
+rc=0; _shdeps_detect_orphans || rc=$?
+_assert_eq "orphan: platform-filtered is NOT orphan" "1" "$rc"
+
+# --- Prune per method ---
+
+# git symlink removal
+_prune_state=$(_tmpdir)
+_prune_conf=$(_tmpdir)
+SHDEPS_STATE_DIR="$_prune_state"
+SHDEPS_CONF_DIR="$_prune_conf"
+_source_shdeps "$SHDEPS_DIR"
+
+_prune_git_target=$(_tmpdir)
+_prune_git_link="$HOME/.local/share/prune-git-test"
+mkdir -p "$(dirname "$_prune_git_link")"
+ln -sfn "$_prune_git_target" "$_prune_git_link"
+mkdir -p "$HOME/.local/bin"
+ln -sf "$_prune_git_link/bin/prune-git-test" "$HOME/.local/bin/prune-git-test"
+date +%s >"$_prune_state/prune-git-test.git.stamp"
+_shdeps_manifest_upsert "prune-git-test" "git" "prune-git-test" ".local/share/prune-git-test"
+
+cat >"$_prune_conf/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+_shdeps_prune -y
+_assert_file_missing "prune git: symlink removed" "$_prune_git_link"
+_assert_file_missing "prune git: bin symlink removed" "$HOME/.local/bin/prune-git-test"
+_assert_file_missing "prune git: stamp removed" "$_prune_state/prune-git-test.git.stamp"
+# Target dir should still exist (we only removed the symlink)
+_assert_dir_exists "prune git: target dir preserved" "$_prune_git_target"
+# Manifest entry gone
+_shdeps_manifest_read
+_assert_eq "prune git: manifest cleared" "" "${_SHDEPS_MANIFEST[prune-git-test]:-}"
+
+# git real dir removal
+_prune_state2=$(_tmpdir)
+_prune_conf2=$(_tmpdir)
+SHDEPS_STATE_DIR="$_prune_state2"
+SHDEPS_CONF_DIR="$_prune_conf2"
+_source_shdeps "$SHDEPS_DIR"
+
+_prune_git_dir="$HOME/.local/share/prune-gitdir-test"
+mkdir -p "$_prune_git_dir"
+echo "content" >"$_prune_git_dir/file"
+_shdeps_manifest_upsert "prune-gitdir-test" "git" "prune-gitdir-test" ".local/share/prune-gitdir-test"
+
+cat >"$_prune_conf2/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+_shdeps_prune -y
+_assert_dir_missing "prune git dir: removed" "$_prune_git_dir"
+
+# binary removal
+_prune_state3=$(_tmpdir)
+_prune_conf3=$(_tmpdir)
+SHDEPS_STATE_DIR="$_prune_state3"
+SHDEPS_CONF_DIR="$_prune_conf3"
+_source_shdeps "$SHDEPS_DIR"
+
+mkdir -p "$HOME/.local/bin" "$HOME/.local/share/prune-bin-test"
+echo '#!/bin/sh' >"$HOME/.local/bin/pbt-cmd"
+chmod +x "$HOME/.local/bin/pbt-cmd"
+echo "data" >"$HOME/.local/share/prune-bin-test/file"
+date +%s >"$_prune_state3/prune-bin-test.binary.stamp"
+_shdeps_manifest_upsert "prune-bin-test" "binary" "pbt-cmd" ".local/bin/pbt-cmd"
+
+cat >"$_prune_conf3/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+_shdeps_prune -y
+_assert_file_missing "prune binary: bin removed" "$HOME/.local/bin/pbt-cmd"
+_assert_dir_missing "prune binary: share dir removed" "$HOME/.local/share/prune-bin-test"
+_assert_file_missing "prune binary: stamp removed" "$_prune_state3/prune-bin-test.binary.stamp"
+
+# custom with uninstall() hook
+_prune_state4=$(_tmpdir)
+_prune_conf4=$(_tmpdir)
+_prune_hooks4="$_prune_conf4/hooks.d"
+mkdir -p "$_prune_hooks4"
+SHDEPS_STATE_DIR="$_prune_state4"
+SHDEPS_CONF_DIR="$_prune_conf4"
+SHDEPS_HOOKS_DIR="$_prune_hooks4"
+_source_shdeps "$SHDEPS_DIR"
+
+_prune_marker="$_prune_state4/uninstall-marker"
+cat >"$_prune_hooks4/prune-custom-test.sh" <<HOOK
+uninstall() { echo "uninstalled" > "$_prune_marker"; return 0; }
+exists() { return 0; }
+HOOK
+date +%s >"$_prune_state4/prune-custom-test.custom.stamp"
+_shdeps_manifest_upsert "prune-custom-test" "custom" "prune-custom-test" ""
+
+cat >"$_prune_conf4/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+_shdeps_prune -y
+_assert_file_exists "prune custom: uninstall() called" "$_prune_marker"
+_assert_file_content "prune custom: marker content" "uninstalled" "$_prune_marker"
+_assert_file_missing "prune custom: stamp removed" "$_prune_state4/prune-custom-test.custom.stamp"
+
+# custom without uninstall() — warning, stamps still removed
+_prune_state5=$(_tmpdir)
+_prune_conf5=$(_tmpdir)
+_prune_hooks5="$_prune_conf5/hooks.d"
+mkdir -p "$_prune_hooks5"
+SHDEPS_STATE_DIR="$_prune_state5"
+SHDEPS_CONF_DIR="$_prune_conf5"
+SHDEPS_HOOKS_DIR="$_prune_hooks5"
+_source_shdeps "$SHDEPS_DIR"
+
+cat >"$_prune_hooks5/prune-nouninstall.sh" <<'HOOK'
+exists() { return 0; }
+install() { return 0; }
+HOOK
+date +%s >"$_prune_state5/prune-nouninstall.custom.stamp"
+_shdeps_manifest_upsert "prune-nouninstall" "custom" "prune-nouninstall" ""
+
+cat >"$_prune_conf5/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+SHDEPS_LOG_LEVEL=1
+_prune_warn=$(_shdeps_prune -y 2>&1)
+SHDEPS_LOG_LEVEL=0
+_assert_contains "prune custom no uninstall: warning" "no uninstall" "$_prune_warn"
+_assert_file_missing "prune custom no uninstall: stamp removed" "$_prune_state5/prune-nouninstall.custom.stamp"
+
+# custom missing hook file — warning, stamps removed
+_prune_state6=$(_tmpdir)
+_prune_conf6=$(_tmpdir)
+mkdir -p "$_prune_conf6/hooks.d"
+SHDEPS_STATE_DIR="$_prune_state6"
+SHDEPS_CONF_DIR="$_prune_conf6"
+SHDEPS_HOOKS_DIR="$_prune_conf6/hooks.d"
+_source_shdeps "$SHDEPS_DIR"
+
+date +%s >"$_prune_state6/prune-nohook.custom.stamp"
+_shdeps_manifest_upsert "prune-nohook" "custom" "prune-nohook" ""
+
+cat >"$_prune_conf6/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+SHDEPS_LOG_LEVEL=1
+_prune_warn2=$(_shdeps_prune -y 2>&1)
+SHDEPS_LOG_LEVEL=0
+_assert_contains "prune custom no hook: warning" "hook file missing" "$_prune_warn2"
+_assert_file_missing "prune custom no hook: stamp removed" "$_prune_state6/prune-nohook.custom.stamp"
+
+# pkg: warning only, nothing removed
+_prune_state7=$(_tmpdir)
+_prune_conf7=$(_tmpdir)
+SHDEPS_STATE_DIR="$_prune_state7"
+SHDEPS_CONF_DIR="$_prune_conf7"
+_source_shdeps "$SHDEPS_DIR"
+
+_shdeps_manifest_upsert "prune-pkg-test" "pkg" "prune-pkg-test" ""
+
+cat >"$_prune_conf7/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+SHDEPS_LOG_LEVEL=1
+_prune_pkg_warn=$(_shdeps_prune -y 2>&1)
+SHDEPS_LOG_LEVEL=0
+_assert_contains "prune pkg: warns manual removal" "remove manually" "$_prune_pkg_warn"
+
+# dry-run: nothing removed
+_prune_state8=$(_tmpdir)
+_prune_conf8=$(_tmpdir)
+SHDEPS_STATE_DIR="$_prune_state8"
+SHDEPS_CONF_DIR="$_prune_conf8"
+_source_shdeps "$SHDEPS_DIR"
+
+mkdir -p "$HOME/.local/bin"
+echo '#!/bin/sh' >"$HOME/.local/bin/dryrun-cmd"
+chmod +x "$HOME/.local/bin/dryrun-cmd"
+_shdeps_manifest_upsert "dryrun-test" "binary" "dryrun-cmd" ".local/bin/dryrun-cmd"
+
+cat >"$_prune_conf8/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+_shdeps_prune --dry-run 2>/dev/null
+_assert_file_exists "prune dry-run: binary NOT removed" "$HOME/.local/bin/dryrun-cmd"
+_shdeps_manifest_read
+_assert_neq "prune dry-run: manifest NOT cleared" "" "${_SHDEPS_MANIFEST[dryrun-test]:-}"
+
+# Clean up dry-run artifact
+rm -f "$HOME/.local/bin/dryrun-cmd"
+
+# quiet mode without -y: silently skips
+_prune_state9=$(_tmpdir)
+_prune_conf9=$(_tmpdir)
+SHDEPS_STATE_DIR="$_prune_state9"
+SHDEPS_CONF_DIR="$_prune_conf9"
+SHDEPS_QUIET=1
+_source_shdeps "$SHDEPS_DIR"
+
+mkdir -p "$HOME/.local/bin"
+echo '#!/bin/sh' >"$HOME/.local/bin/quiet-cmd"
+chmod +x "$HOME/.local/bin/quiet-cmd"
+_shdeps_manifest_upsert "quiet-test" "binary" "quiet-cmd" ".local/bin/quiet-cmd"
+
+cat >"$_prune_conf9/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+_shdeps_prune 2>/dev/null
+_assert_file_exists "prune quiet: binary NOT removed" "$HOME/.local/bin/quiet-cmd"
+
+# Clean up
+rm -f "$HOME/.local/bin/quiet-cmd"
+SHDEPS_QUIET=0
+_source_shdeps "$SHDEPS_DIR"
+
+# --- Integration: manifest written during update ---
+
+_integ_mfst_dir=$(_tmpdir)
+_integ_mfst_state=$(_tmpdir)
+_integ_mfst_hooks="$_integ_mfst_dir/hooks.d"
+mkdir -p "$_integ_mfst_hooks"
+SHDEPS_CONF_DIR="$_integ_mfst_dir"
+SHDEPS_HOOKS_DIR="$_integ_mfst_hooks"
+SHDEPS_STATE_DIR="$_integ_mfst_state"
+SHDEPS_FORCE=0
+SHDEPS_LOG_LEVEL=0
+_source_shdeps "$SHDEPS_DIR"
+
+cat >"$_integ_mfst_dir/deps.conf" <<'EOF'
+mfst-custom  custom
+EOF
+cat >"$_integ_mfst_hooks/mfst-custom.sh" <<'HOOK'
+exists() { return 1; }
+install() { return 0; }
+HOOK
+
+shdeps_update
+_shdeps_manifest_read
+_assert_neq "integ manifest: custom dep recorded" "" "${_SHDEPS_MANIFEST[mfst-custom]:-}"
+_assert_contains "integ manifest: method is custom" "custom" "${_SHDEPS_MANIFEST[mfst-custom]:-}"
+
+# ===========================================================================
 # Section 10: Integration / end-to-end
 # ===========================================================================
 

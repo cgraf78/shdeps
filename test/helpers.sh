@@ -108,6 +108,15 @@ _assert_symlink() {
   fi
 }
 
+_assert_dir_missing() {
+  local desc="$1" path="$2"
+  if [[ ! -d "$path" ]]; then
+    _pass "$desc"
+  else
+    _fail "$desc (dir should not exist: $path)"
+  fi
+}
+
 _assert_file_content() {
   local desc="$1" expected="$2" path="$3"
   if [[ -f "$path" ]]; then

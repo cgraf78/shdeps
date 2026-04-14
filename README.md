@@ -145,6 +145,7 @@ Place hook files in `<hooks_dir>/<name>.sh`. For `custom` deps, hooks define the
 - **`exists(name)`** — return 0 if installed (or not applicable), 1 if missing. Required for `custom` deps.
 - **`version(name)`** — print version string to stdout. Optional.
 - **`install(name)`** — perform the install unconditionally. shdeps only calls this when `exists()` returns 1 or `--reinstall` is used.
+- **`uninstall(name)`** — reverse what `install()` did. Optional. Called by `shdeps prune` when removing an orphaned custom dep.
 - **`post(name)`** — optional post-install setup.
 
 **Non-custom dep hooks** (`pkg`, `git`, `binary`):
@@ -163,6 +164,7 @@ Commands:
   self-update     Update shdeps itself (git pull with TTL caching)
   list            List all configured dependencies with status
   check <name>    Check if a specific dependency is installed
+  prune           Remove orphaned deps no longer in config
   version         Print shdeps version
   help            Show this help message
 
@@ -172,7 +174,29 @@ Options:
   -R, --reinstall       Force reinstall all dependencies (implies --force)
   -q, --quiet           Suppress interactive prompts
   -v, --verbose         Verbose output
+
+Prune options:
+  -y                    Skip confirmation prompt
+  --dry-run             Show what would be removed without removing
 ```
+
+### Removing Dependencies
+
+When you remove a dep from your config, `shdeps update` will notify you that it's orphaned. Run `shdeps prune` to clean up the artifacts:
+
+```bash
+# Remove a dep from config, then update
+shdeps update
+# ==> 1 orphaned dep(s) (removed from config but still installed):
+#   neovim (binary)
+#   Run: shdeps prune
+
+shdeps prune           # interactive confirmation
+shdeps prune -y        # skip confirmation
+shdeps prune --dry-run # preview without removing
+```
+
+For `pkg` deps, prune warns that manual removal is needed (system packages may be shared). For `custom` deps, prune calls the optional `uninstall()` hook function.
 
 ## As a Library
 
@@ -217,6 +241,7 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 |---|---|
 | `shdeps_update` | Install/update all dependencies |
 | `shdeps_self_update [dir]` | Update shdeps itself (TTL-cached git pull, skips dirty trees) |
+| `shdeps_prune [-y] [--dry-run]` | Remove orphaned deps no longer in config |
 | `shdeps_load` | Parse config and return dep count |
 | `shdeps_version` | Print version string |
 | `shdeps_platform_match <spec>` | Check if current platform matches a spec (e.g., `linux,macos`, `!wsl`) |
