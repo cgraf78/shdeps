@@ -145,7 +145,7 @@ Place hook files in `<hooks_dir>/<name>.sh`. For `custom` deps, hooks define the
 - **`exists(name)`** — return 0 if installed (or not applicable), 1 if missing. Required for `custom` deps.
 - **`version(name)`** — print version string to stdout. Optional.
 - **`install(name)`** — perform the install unconditionally. shdeps only calls this when `exists()` returns 1 or `--reinstall` is used.
-- **`uninstall(name)`** — reverse what `install()` did. Optional. Called by `shdeps prune` when removing an orphaned custom dep.
+- **`uninstall(name)`** — reverse what `install()` or `post()` created. Optional. Called by `shdeps prune` when removing an orphaned dep (any method). For custom deps, this is the only cleanup. For other methods, runs before the built-in cleanup.
 - **`post(name)`** — optional post-install setup.
 
 **Non-custom dep hooks** (`pkg`, `git`, `binary`):

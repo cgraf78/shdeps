@@ -78,7 +78,9 @@ Hook files in `hooks.d/$name.sh` may define these functions:
 - `version(name)` — return version string.
 - `post(name)` — post-install setup. Runs after any change.
 - `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
-  an orphaned custom dep. Should reverse what `install()` did.
+  an orphaned dep (any method). For custom deps, this is the only cleanup.
+  For git/binary deps, this runs before the built-in cleanup — use it to
+  reverse what `post()` created (symlinks, config files).
 
 ## Code Quality
 

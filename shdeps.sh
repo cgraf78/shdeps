@@ -730,10 +730,31 @@ _shdeps_remove_stamps() {
 }
 
 # Remove artifacts for one orphaned dep.
+# Calls uninstall() from hook file if defined (all methods), then does
+# built-in cleanup per method.
 # $1=name $2=method $3=cmd $4=install_path
 _shdeps_remove_dep() {
   local name="$1" method="$2" cmd="$3" install_path="$4"
 
+  # Run uninstall() hook if present (reverses what post()/install() created)
+  local hooks_dir hook_file _had_uninstall=0
+  hooks_dir=$(_shdeps_hooks_dir)
+  hook_file="$hooks_dir/$name.sh"
+  if [[ -f "$hook_file" ]]; then
+    unset -f exists version install post uninstall 2>/dev/null
+    # shellcheck source=/dev/null
+    if ! . "$hook_file"; then
+      _shdeps_warn "  warning: failed to source $hook_file"
+    elif declare -f uninstall &>/dev/null; then
+      _had_uninstall=1
+      if ! uninstall "$name"; then
+        _shdeps_warn "  warning: $name uninstall hook failed"
+      fi
+    fi
+    unset -f exists version install post uninstall 2>/dev/null
+  fi
+
+  # Built-in cleanup per method
   case "$method" in
   pkg)
     _shdeps_warn "  $name: pkg dep — remove manually via ${_SHDEPS_PKG_MGR:-system package manager}"
@@ -755,26 +776,12 @@ _shdeps_remove_dep() {
     _shdeps_log_ok "  $name removed"
     ;;
   custom)
-    local hooks_dir
-    hooks_dir=$(_shdeps_hooks_dir)
-    local hook_file="$hooks_dir/$name.sh"
-    if [[ -f "$hook_file" ]]; then
-      unset -f exists version install post uninstall 2>/dev/null
-      # shellcheck source=/dev/null
-      if ! . "$hook_file"; then
-        _shdeps_warn "  warning: failed to source $hook_file"
-      elif declare -f uninstall &>/dev/null; then
-        if uninstall "$name"; then
-          _shdeps_log_ok "  $name removed"
-        else
-          _shdeps_warn "  warning: $name uninstall hook failed"
-        fi
-      else
-        _shdeps_warn "  warning: $name has no uninstall() hook — manual cleanup may be needed"
-      fi
-      unset -f exists version install post uninstall 2>/dev/null
-    else
+    if [[ $_had_uninstall -eq 1 ]]; then
+      _shdeps_log_ok "  $name removed"
+    elif [[ ! -f "$hook_file" ]]; then
       _shdeps_warn "  warning: $name hook file missing — manual cleanup may be needed"
+    else
+      _shdeps_warn "  warning: $name has no uninstall() hook — manual cleanup may be needed"
     fi
     _shdeps_remove_stamps "$name"
     ;;

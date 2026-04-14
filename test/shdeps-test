@@ -1840,6 +1840,35 @@ EOF
 _shdeps_prune -y
 _assert_dir_missing "prune git dir: removed" "$_prune_git_dir"
 
+# git with uninstall() hook — hook runs before built-in cleanup
+_prune_state2b=$(_tmpdir)
+_prune_conf2b=$(_tmpdir)
+_prune_hooks2b="$_prune_conf2b/hooks.d"
+mkdir -p "$_prune_hooks2b"
+SHDEPS_STATE_DIR="$_prune_state2b"
+SHDEPS_CONF_DIR="$_prune_conf2b"
+SHDEPS_HOOKS_DIR="$_prune_hooks2b"
+_source_shdeps "$SHDEPS_DIR"
+
+_prune_git_extra="$HOME/.extra-symlink-from-post"
+ln -sfn /dev/null "$_prune_git_extra"
+_prune_git_marker="$_prune_state2b/git-uninstall-marker"
+cat >"$_prune_hooks2b/prune-githook-test.sh" <<HOOK
+uninstall() { rm -f "$_prune_git_extra"; echo "ran" > "$_prune_git_marker"; }
+HOOK
+_prune_git_hookdir="$HOME/.local/share/prune-githook-test"
+mkdir -p "$_prune_git_hookdir"
+_shdeps_manifest_upsert "prune-githook-test" "git" "prune-githook-test" ".local/share/prune-githook-test"
+
+cat >"$_prune_conf2b/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+_shdeps_prune -y
+_assert_file_exists "prune git hook: uninstall() called" "$_prune_git_marker"
+_assert_file_missing "prune git hook: extra symlink removed" "$_prune_git_extra"
+_assert_dir_missing "prune git hook: dir still removed by built-in" "$_prune_git_hookdir"
+
 # binary removal
 _prune_state3=$(_tmpdir)
 _prune_conf3=$(_tmpdir)
