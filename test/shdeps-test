@@ -2573,6 +2573,20 @@ rc=0
 _shdeps_self_update "$_su_nongit" 2>/dev/null || rc=$?
 _assert_exit "self-update non-git: exits 1" 1 "$rc"
 
+# --- Re-sourcing under stderr redirection preserves ANSI codes ---
+# Self-update re-sources shdeps.sh after pulling. If the caller redirected
+# stderr (e.g. install.sh --bootstrap does 2>/dev/null), the [[ -t 2 ]]
+# check would fail and wipe ANSI codes. The guard must preserve them.
+
+_source_shdeps "$SHDEPS_DIR"
+# Simulate initial source with a terminal — set ANSI codes
+_SHDEPS_C_RESET=$'\033[0m'
+_SHDEPS_C_CLEARLN=$'\r\033[2K'
+# Re-source under stderr redirection (simulates self-update path)
+. "$SHDEPS_DIR/shdeps.sh" 2>/dev/null
+_assert_eq "re-source: ANSI codes preserved under 2>/dev/null" $'\033[0m' "$_SHDEPS_C_RESET"
+_assert_eq "re-source: CLEARLN preserved under 2>/dev/null" $'\r\033[2K' "$_SHDEPS_C_CLEARLN"
+
 # ===========================================================================
 
 _test_summary
