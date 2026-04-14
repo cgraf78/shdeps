@@ -92,16 +92,20 @@ _shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 # ---------------------------------------------------------------------------
 
 # ANSI color codes, enabled only when stderr is a terminal.
-if [[ -t 2 ]]; then
-  _SHDEPS_C_RESET=$'\033[0m'
-  _SHDEPS_C_RED=$'\033[0;31m'
-  _SHDEPS_C_GREEN=$'\033[0;32m'
-  _SHDEPS_C_DIM=$'\033[0;90m'
-  _SHDEPS_C_BOLD=$'\033[1m'
-  _SHDEPS_C_CLEARLN=$'\r\033[2K'
-else
-  _SHDEPS_C_RESET="" _SHDEPS_C_RED="" _SHDEPS_C_GREEN=""
-  _SHDEPS_C_DIM="" _SHDEPS_C_BOLD="" _SHDEPS_C_CLEARLN=""
+# Skip if already set — re-sourcing (e.g. self-update) may happen under
+# stderr redirection, which would incorrectly clear the codes.
+if [[ -z "${_SHDEPS_C_RESET+x}" ]]; then
+  if [[ -t 2 ]]; then
+    _SHDEPS_C_RESET=$'\033[0m'
+    _SHDEPS_C_RED=$'\033[0;31m'
+    _SHDEPS_C_GREEN=$'\033[0;32m'
+    _SHDEPS_C_DIM=$'\033[0;90m'
+    _SHDEPS_C_BOLD=$'\033[1m'
+    _SHDEPS_C_CLEARLN=$'\r\033[2K'
+  else
+    _SHDEPS_C_RESET="" _SHDEPS_C_RED="" _SHDEPS_C_GREEN=""
+    _SHDEPS_C_DIM="" _SHDEPS_C_BOLD="" _SHDEPS_C_CLEARLN=""
+  fi
 fi
 
 _SHDEPS_STATUS_ACTIVE=0
