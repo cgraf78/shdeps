@@ -135,11 +135,15 @@ _bootstrap() {
     ln -sf "$_bs_dir/bin/shdeps" "$SHDEPS_BIN"
   fi
 
-  # Self-update (TTL-cached, skips dirty clones).
-  # Calls the library function directly — no subprocess overhead.
-  # _shdeps_self_update handles its own state dir for stamp sharing.
+  # Always self-update in bootstrap — the host tool (e.g. dotfiles) may
+  # have just pulled changes that depend on the latest shdeps. Skipping
+  # due to a fresh TTL stamp would cause staggered-update breakage.
+  # Still skips dirty clones (active development).
   if [[ -n "$_bs_dir" ]] && declare -f _shdeps_self_update &>/dev/null; then
+    local _saved_force="${SHDEPS_FORCE:-0}"
+    SHDEPS_FORCE=1
     _shdeps_self_update "$_bs_dir" 2>/dev/null || true
+    SHDEPS_FORCE="$_saved_force"
   fi
 }
 
