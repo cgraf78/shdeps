@@ -98,58 +98,74 @@ if [[ -t 2 ]]; then
   _SHDEPS_C_GREEN=$'\033[0;32m'
   _SHDEPS_C_DIM=$'\033[0;90m'
   _SHDEPS_C_BOLD=$'\033[1m'
+  _SHDEPS_C_CLEARLN=$'\r\033[2K'
 else
   _SHDEPS_C_RESET="" _SHDEPS_C_RED="" _SHDEPS_C_GREEN=""
-  _SHDEPS_C_DIM="" _SHDEPS_C_BOLD=""
+  _SHDEPS_C_DIM="" _SHDEPS_C_BOLD="" _SHDEPS_C_CLEARLN=""
 fi
+
+_SHDEPS_STATUS_ACTIVE=0
+
+# Clear any active status line before printing a permanent log line.
+_shdeps_log_clear() {
+  if [[ $_SHDEPS_STATUS_ACTIVE -eq 1 ]]; then
+    printf '%s' "${_SHDEPS_C_CLEARLN}" >&2
+    _SHDEPS_STATUS_ACTIVE=0
+  fi
+}
+
+# Temporary in-place status (overwritten by the next log line).
+# No-op when stderr is not a terminal or log level is 0.
+_shdeps_log_status() {
+  if [[ -z "$_SHDEPS_C_CLEARLN" || "$(_shdeps_log_level)" -lt 1 ]]; then return 0; fi
+  printf '%s%s%s%s' "${_SHDEPS_C_CLEARLN}" "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >&2
+  _SHDEPS_STATUS_ACTIVE=1
+}
+
+# Log functions — callers may override by redefining these after sourcing.
 
 # Normal log line (level >= 1).
-if ! declare -f _shdeps_log &>/dev/null; then
-  _shdeps_log() {
-    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then printf '%s\n' "$*" >&2; fi
-    return 0
-  }
-fi
+_shdeps_log() {
+  _shdeps_log_clear
+  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then printf '%s\n' "$*" >&2; fi
+  return 0
+}
 
 # Warning (always shown unless level 0).
-if ! declare -f _shdeps_warn &>/dev/null; then
-  _shdeps_warn() {
-    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
-      printf '%s%s%s\n' "${_SHDEPS_C_RED}" "$*" "${_SHDEPS_C_RESET}" >&2
-    fi
-    return 0
-  }
-fi
+_shdeps_warn() {
+  _shdeps_log_clear
+  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
+    printf '%s%s%s\n' "${_SHDEPS_C_RED}" "$*" "${_SHDEPS_C_RESET}" >&2
+  fi
+  return 0
+}
 
 # Success highlight.
-if ! declare -f _shdeps_log_ok &>/dev/null; then
-  _shdeps_log_ok() {
-    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
-      printf '%s%s%s\n' "${_SHDEPS_C_GREEN}" "$*" "${_SHDEPS_C_RESET}" >&2
-    fi
-    return 0
-  }
-fi
+_shdeps_log_ok() {
+  _shdeps_log_clear
+  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
+    printf '%s%s%s\n' "${_SHDEPS_C_GREEN}" "$*" "${_SHDEPS_C_RESET}" >&2
+  fi
+  return 0
+}
 
 # Dimmed / low-importance line.
-if ! declare -f _shdeps_log_dim &>/dev/null; then
-  _shdeps_log_dim() {
-    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
-      printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >&2
-    fi
-    return 0
-  }
-fi
+_shdeps_log_dim() {
+  _shdeps_log_clear
+  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
+    printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >&2
+  fi
+  return 0
+}
 
 # Section header.
-if ! declare -f _shdeps_log_header &>/dev/null; then
-  _shdeps_log_header() {
-    if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
-      printf '%s%s%s\n' "${_SHDEPS_C_BOLD}" "$*" "${_SHDEPS_C_RESET}" >&2
-    fi
-    return 0
-  }
-fi
+_shdeps_log_header() {
+  _shdeps_log_clear
+  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
+    printf '%s%s%s\n' "${_SHDEPS_C_BOLD}" "$*" "${_SHDEPS_C_RESET}" >&2
+  fi
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -533,6 +549,7 @@ _shdeps_pkg_refresh_metadata() {
     return 0
   fi
 
+  _shdeps_log_status "  refreshing $_SHDEPS_PKG_MGR package metadata..."
   case "$_SHDEPS_PKG_MGR" in
   apt)    sudo apt-get update -qq >/dev/null 2>&1 || true ;;
   dnf)    sudo dnf makecache -q &>/dev/null || true ;;
@@ -593,6 +610,7 @@ _shdeps_pkg_install_batch() {
   fi
 
   # Batch install
+  _shdeps_log_status "  ${_SHDEPS_PKG_MGR}: installing ${#_SHDEPS_PKG_BATCH[@]} packages..."
   # shellcheck disable=SC2024  # sudo output captured in user-owned log
   case "$_SHDEPS_PKG_MGR" in
   brew)   _shdeps_run_logged brew install "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
@@ -600,6 +618,7 @@ _shdeps_pkg_install_batch() {
   dnf)    _shdeps_run_logged sudo dnf install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
   pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
   esac
+  _shdeps_log_clear
 
   # On batch failure, retry individually so one bad package doesn't block all
   if [[ $rc -ne 0 ]]; then
@@ -609,6 +628,7 @@ _shdeps_pkg_install_batch() {
     for pkg in "${_SHDEPS_PKG_BATCH[@]}"; do
       rc=0
       if [[ -n "$log" ]]; then : >"$log"; fi
+      _shdeps_log_status "  ${_SHDEPS_PKG_MGR}: installing $pkg..."
       # shellcheck disable=SC2024  # sudo output captured in user-owned log
       case "$_SHDEPS_PKG_MGR" in
       brew)   _shdeps_run_logged brew install "$pkg" || rc=$? ;;
@@ -965,6 +985,7 @@ _shdeps_github_install_local_clone() {
   # Pull if TTL expired (or --force) and the clone is clean
   if ! _shdeps_remote_fresh "$stamp"; then
     if [[ -z "$_status_output" ]]; then
+      _shdeps_log_status "  $name: pulling latest..."
       if _shdeps_run_logged git -C "$local_clone" pull --ff-only --quiet; then
         _shdeps_remote_touch "$stamp" || true
       else
@@ -1002,7 +1023,7 @@ _shdeps_github_install_local_clone() {
     _SHDEPS_CHANGED[$name]=1
     _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver} (local clone)"
   else
-    _shdeps_log_dim "  $name${ver:+ -- $ver} (local clone)"
+    _shdeps_log "  $name${ver:+ -- $ver} (local clone)"
   fi
   rm -f "$log"
 }
@@ -1014,13 +1035,14 @@ _shdeps_github_install_pull() {
     _shdeps_link_bin "$name" "$install_dir"
     local ver
     ver=$(_shdeps_get_version "$install_dir")
-    _shdeps_log_dim "  $name${ver:+ -- $ver}"
+    _shdeps_log "  $name${ver:+ -- $ver}"
     rm -f "$log"
     return 0
   fi
 
   local head_before
   head_before=$(git -C "$install_dir" rev-parse HEAD 2>/dev/null || true)
+  _shdeps_log_status "  $name: pulling latest..."
   if _shdeps_run_logged git -C "$install_dir" pull --ff-only --quiet; then
     _shdeps_link_bin "$name" "$install_dir"
     local head_after
@@ -1035,7 +1057,7 @@ _shdeps_github_install_pull() {
       _SHDEPS_CHANGED[$name]=1
       _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
     else
-      _shdeps_log_dim "  $name${ver:+ -- $ver}"
+      _shdeps_log "  $name${ver:+ -- $ver}"
     fi
   else
     _shdeps_logfile_print "$name update" "$log"
@@ -1067,6 +1089,7 @@ _shdeps_github_install_fresh() {
 
   if [[ -n "${tarball_url:-}" ]]; then
     tmp_dir=$(mktemp -d)
+    _shdeps_log_status "  $name: downloading release tarball..."
     # shellcheck disable=SC2016  # single quotes intentional — inner script uses $1/$2
     if _shdeps_run_logged bash -c 'curl -fsSL "$1" | tar xz -C "$2"' _ "$tarball_url" "$tmp_dir"; then
       rm -rf "$install_dir"
@@ -1093,6 +1116,7 @@ _shdeps_github_install_fresh() {
     local clone_tmp="${install_dir}.tmp.$$"
     rm -rf "$clone_tmp"
     if [[ -n "${log:-}" ]]; then : >"$log"; fi
+    _shdeps_log_status "  $name: cloning repository..."
     if ! _shdeps_run_logged git clone --depth 1 "$repo" "$clone_tmp"; then
       rm -rf "$clone_tmp"
       _shdeps_logfile_print "$name clone" "$log"
@@ -1113,7 +1137,7 @@ _shdeps_github_install_fresh() {
   if [[ -n "${tarball_url:-}" ]]; then method="release tarball"; fi
 
   if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$(_shdeps_reinstall)" -ne 1 ]]; then
-    _shdeps_log_dim "  $name${ver:+ -- $ver} ($method)"
+    _shdeps_log "  $name${ver:+ -- $ver} ($method)"
   else
     _SHDEPS_CHANGED[$name]=1
     if [[ -n "$ver_before" && "$ver_before" == "$ver" ]]; then
@@ -1432,7 +1456,7 @@ _shdeps_install_binary() {
   # Avoids temp file creation, API calls, and asset matching.
   if [[ -x "$bin_path" ]] && _shdeps_remote_fresh "$stamp"; then
     current_ver=$(_shdeps_dep_version "$cmd")
-    _shdeps_log_dim "  $name -- $current_ver"
+    _shdeps_log "  $name -- $current_ver"
     return 0
   fi
 
@@ -1480,7 +1504,7 @@ _shdeps_install_binary() {
   if [[ "$(_shdeps_reinstall)" -ne 1 && -n "$current_ver" && -n "$latest_ver_num" && "$current_ver" == "$latest_ver_num" ]]; then
     rm -f "$tmp_file" "$log"
     _shdeps_remote_touch "$stamp" || true
-    _shdeps_log_dim "  $name -- $current_ver"
+    _shdeps_log "  $name -- $current_ver"
     return 0
   fi
 
@@ -1506,6 +1530,7 @@ _shdeps_install_binary() {
   fi
 
   if [[ -n "${log:-}" ]]; then : >"$log"; fi
+  _shdeps_log_status "  $name: downloading $latest_ver..."
   if ! _shdeps_run_logged curl -fsSL --no-netrc "$asset_url" -o "$tmp_file"; then
     _shdeps_logfile_print "$name download" "$log"
     rm -f "$tmp_file" "$log"
@@ -1595,7 +1620,7 @@ _shdeps_install_dep() {
       if [[ -z "$ver" && -n "$_cmd_alt" ]]; then
         ver=$(_shdeps_dep_version "$_cmd_alt" 2>/dev/null || true)
       fi
-      _shdeps_log_dim "  $_name${ver:+ -- $ver}"
+      _shdeps_log "  $_name${ver:+ -- $ver}"
       # Package exists but expected command missing — trigger post hook
       if ! _shdeps_exists "$_cmd" "$_cmd_alt"; then
         _SHDEPS_CHANGED[$_name]=1
@@ -1637,7 +1662,7 @@ _shdeps_install_dep() {
       if declare -f version &>/dev/null; then
         ver=$(version "$_name" 2>/dev/null) || ver=""
       fi
-      _shdeps_log_dim "  $_name${ver:+ -- $ver}"
+      _shdeps_log "  $_name${ver:+ -- $ver}"
       unset -f exists version install post uninstall 2>/dev/null
       _shdeps_manifest_upsert "$_name" "custom" "$_cmd" ""
       return 0
