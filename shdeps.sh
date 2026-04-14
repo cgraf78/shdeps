@@ -117,24 +117,29 @@ _shdeps_log_clear() {
 # Temporary in-place status (overwritten by the next log line).
 # No-op when stderr is not a terminal or log level is 0.
 _shdeps_log_status() {
-  if [[ -z "$_SHDEPS_C_CLEARLN" || "$(_shdeps_log_level)" -lt 1 ]]; then return 0; fi
+  if [[ -z "$_SHDEPS_C_CLEARLN" ]] || ! _shdeps_should_log; then return 0; fi
   printf '%s%s%s%s' "${_SHDEPS_C_CLEARLN}" "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >&2
   _SHDEPS_STATUS_ACTIVE=1
 }
 
 # Log functions — callers may override by redefining these after sourcing.
 
-# Normal log line (level >= 1).
+# Should this log line be shown? Checks log level and quiet mode.
+_shdeps_should_log() {
+  [[ "$(_shdeps_log_level)" -ge 1 && "$(_shdeps_quiet)" -ne 1 ]]
+}
+
+# Normal log line (level >= 1, not quiet).
 _shdeps_log() {
   _shdeps_log_clear
-  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then printf '%s\n' "$*" >&2; fi
+  if _shdeps_should_log; then printf '%s\n' "$*" >&2; fi
   return 0
 }
 
-# Warning (always shown unless level 0).
+# Warning (same visibility as normal log).
 _shdeps_warn() {
   _shdeps_log_clear
-  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
+  if _shdeps_should_log; then
     printf '%s%s%s\n' "${_SHDEPS_C_RED}" "$*" "${_SHDEPS_C_RESET}" >&2
   fi
   return 0
@@ -143,7 +148,7 @@ _shdeps_warn() {
 # Success highlight.
 _shdeps_log_ok() {
   _shdeps_log_clear
-  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
+  if _shdeps_should_log; then
     printf '%s%s%s\n' "${_SHDEPS_C_GREEN}" "$*" "${_SHDEPS_C_RESET}" >&2
   fi
   return 0
@@ -152,7 +157,7 @@ _shdeps_log_ok() {
 # Dimmed / low-importance line.
 _shdeps_log_dim() {
   _shdeps_log_clear
-  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
+  if _shdeps_should_log; then
     printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >&2
   fi
   return 0
@@ -161,7 +166,7 @@ _shdeps_log_dim() {
 # Section header.
 _shdeps_log_header() {
   _shdeps_log_clear
-  if [[ "$(_shdeps_log_level)" -ge 1 ]]; then
+  if _shdeps_should_log; then
     printf '%s%s%s\n' "${_SHDEPS_C_BOLD}" "$*" "${_SHDEPS_C_RESET}" >&2
   fi
   return 0
