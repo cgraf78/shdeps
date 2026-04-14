@@ -198,17 +198,17 @@ _shdeps_require_sudo() {
   sudo true
 }
 
-# Prime sudo credentials if any deps will need them.
-# Scans loaded deps for uninstalled pkg deps on non-brew managers.
+# Check if any pkg dep needs installing on this platform.
+# Sets _SHDEPS_PKG_INSTALL_NEEDED=1 if so. Idempotent — only scans once.
 # Call after _shdeps_load and _shdeps_pkg_detect.
-_shdeps_maybe_prime_sudo() {
-  # Brew doesn't need sudo; root doesn't need prompting
-  if [[ "$_SHDEPS_PKG_MGR" == "brew" || -z "$_SHDEPS_PKG_MGR" ]]; then return 0; fi
-  if [[ "$(id -u)" -eq 0 ]]; then return 0; fi
-  if sudo -n true 2>/dev/null; then return 0; fi
+_shdeps_check_pkg_needed() {
+  [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-}" != 0 ]] || return 0
+  [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-}" != 1 ]] || return 0
+  _SHDEPS_PKG_INSTALL_NEEDED=0
 
-  # Check if any pkg dep actually needs installing
-  local entry _needs_sudo=0
+  if [[ "$_SHDEPS_PKG_MGR" == "brew" || -z "$_SHDEPS_PKG_MGR" ]]; then return 0; fi
+
+  local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
     [[ "$_method" == "pkg" ]] || continue
@@ -218,16 +218,22 @@ _shdeps_maybe_prime_sudo() {
     resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
     [[ "$resolved_pkg" == "NONE" ]] && continue
     if ! _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
-      _needs_sudo=1
-      break
+      _SHDEPS_PKG_INSTALL_NEEDED=1
+      return 0
     fi
   done
+}
 
-  if [[ $_needs_sudo -eq 1 ]]; then
-    if [[ "$(_shdeps_quiet)" -eq 1 ]]; then return 0; fi
-    _shdeps_log "  sudo required for package installs"
-    _shdeps_require_sudo
-  fi
+# Prime sudo credentials if any deps will need them.
+# Call after _shdeps_load and _shdeps_pkg_detect.
+_shdeps_maybe_prime_sudo() {
+  _shdeps_check_pkg_needed
+  [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-0}" -eq 1 ]] || return 0
+  if [[ "$(id -u)" -eq 0 ]]; then return 0; fi
+  if sudo -n true 2>/dev/null; then return 0; fi
+  if [[ "$(_shdeps_quiet)" -eq 1 ]]; then return 0; fi
+  _shdeps_log "  sudo required for package installs"
+  _shdeps_require_sudo
 }
 
 # ---------------------------------------------------------------------------
@@ -513,6 +519,29 @@ _shdeps_pkg_available() {
   esac
 }
 
+# Refresh package manager metadata cache once per update run.
+# Ensures _shdeps_pkg_available sees all available packages, even on
+# a fresh machine where the cache is empty.
+_shdeps_pkg_refresh_metadata() {
+  _shdeps_check_pkg_needed
+  [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-0}" -eq 1 ]] || return 0
+  [[ "${_SHDEPS_PKG_CACHE_REFRESHED:-}" != 1 ]] || return 0
+
+  # apt/dnf/pacman write to root-owned cache dirs — require sudo.
+  if [[ "$(id -u)" -ne 0 ]] && ! sudo -n true 2>/dev/null; then
+    _SHDEPS_PKG_CACHE_REFRESHED=1
+    return 0
+  fi
+
+  case "$_SHDEPS_PKG_MGR" in
+  apt)    sudo apt-get update -qq >/dev/null 2>&1 || true ;;
+  dnf)    sudo dnf makecache -q &>/dev/null || true ;;
+  pacman) sudo pacman -Sy &>/dev/null || true ;;
+  esac
+  _SHDEPS_PKG_CACHE_REFRESHED=1
+  _shdeps_log_dim "  $_SHDEPS_PKG_MGR package metadata refreshed"
+}
+
 # Queue a package for batched install.
 # $1=name $2=pkg_overrides
 # Skips if resolved name is NONE (platform not supported) or unavailable.
@@ -562,11 +591,6 @@ _shdeps_pkg_install_batch() {
   else
     log="$REPLY"
   fi
-
-  # Pre-update apt cache if needed
-  case "$_SHDEPS_PKG_MGR" in
-  apt) sudo apt-get update -qq >/dev/null 2>&1 || true ;;
-  esac
 
   # Batch install
   # shellcheck disable=SC2024  # sudo output captured in user-owned log
@@ -1795,6 +1819,10 @@ _shdeps_update() {
   # Prime sudo early so the password prompt is visible, not buried inside
   # a _shdeps_run_logged redirect where it silently hangs.
   _shdeps_maybe_prime_sudo
+
+  # Refresh package metadata so _shdeps_pkg_available sees all repos.
+  # On a fresh machine the cache is empty and packages appear unavailable.
+  _shdeps_pkg_refresh_metadata
 
   # Cache GitHub auth token once (avoids per-dep subprocess overhead).
   _SHDEPS_GH_TOKEN=$(gh auth token 2>/dev/null) || _SHDEPS_GH_TOKEN="${GITHUB_TOKEN:-}"
