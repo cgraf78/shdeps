@@ -195,7 +195,39 @@ _shdeps_require_sudo() {
   if [[ "$(id -u)" -eq 0 ]]; then return 0; fi
   if sudo -n true 2>/dev/null; then return 0; fi
   if [[ "$(_shdeps_quiet)" -eq 1 ]]; then return 1; fi
-  sudo true 2>/dev/null
+  sudo true
+}
+
+# Prime sudo credentials if any deps will need them.
+# Scans loaded deps for uninstalled pkg deps on non-brew managers.
+# Call after _shdeps_load and _shdeps_pkg_detect.
+_shdeps_maybe_prime_sudo() {
+  # Brew doesn't need sudo; root doesn't need prompting
+  if [[ "$_SHDEPS_PKG_MGR" == "brew" || -z "$_SHDEPS_PKG_MGR" ]]; then return 0; fi
+  if [[ "$(id -u)" -eq 0 ]]; then return 0; fi
+  if sudo -n true 2>/dev/null; then return 0; fi
+
+  # Check if any pkg dep actually needs installing
+  local entry _needs_sudo=0
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    _shdeps_parse "$entry"
+    [[ "$_method" == "pkg" ]] || continue
+    _shdeps_platform_match "$_platforms" || continue
+    _shdeps_host_match "$_hosts" || continue
+    local resolved_pkg
+    resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
+    [[ "$resolved_pkg" == "NONE" ]] && continue
+    if ! _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
+      _needs_sudo=1
+      break
+    fi
+  done
+
+  if [[ $_needs_sudo -eq 1 ]]; then
+    if [[ "$(_shdeps_quiet)" -eq 1 ]]; then return 0; fi
+    _shdeps_log "  sudo required for package installs"
+    _shdeps_require_sudo
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1759,6 +1791,10 @@ _shdeps_update() {
   declare -gA _SHDEPS_CHANGED=()
 
   _shdeps_log_header "==> Installing/upgrading tools..."
+
+  # Prime sudo early so the password prompt is visible, not buried inside
+  # a _shdeps_run_logged redirect where it silently hangs.
+  _shdeps_maybe_prime_sudo
 
   # Cache GitHub auth token once (avoids per-dep subprocess overhead).
   _SHDEPS_GH_TOKEN=$(gh auth token 2>/dev/null) || _SHDEPS_GH_TOKEN="${GITHUB_TOKEN:-}"
