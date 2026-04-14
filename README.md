@@ -216,6 +216,7 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | Function | Description |
 |---|---|
 | `shdeps_update` | Install/update all dependencies |
+| `shdeps_self_update [dir]` | Update shdeps itself (TTL-cached git pull, skips dirty trees) |
 | `shdeps_load` | Parse config and return dep count |
 | `shdeps_version` | Print version string |
 | `shdeps_platform_match <spec>` | Check if current platform matches a spec (e.g., `linux,macos`, `!wsl`) |

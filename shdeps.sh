@@ -33,6 +33,7 @@ SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown
 # Core
 shdeps_version()        { echo "shdeps $SHDEPS_VERSION"; }
 shdeps_update()         { _shdeps_update "$@"; }
+shdeps_self_update()    { _shdeps_self_update "$@"; }
 shdeps_load()           { _shdeps_load; echo "${#_SHDEPS_DEPS[@]}"; }
 
 # Matching
@@ -860,7 +861,8 @@ _shdeps_install_from_github() {
   upper="${upper//-/_}"
   local env_var="SHDEPS_${upper}_REPO"
   local repo="${!env_var:-https://github.com/$default_repo}"
-  local local_clone="$(_shdeps_dev_dir)/$name"
+  local local_clone
+  local_clone="$(_shdeps_dev_dir)/$name"
   local stamp
   stamp=$(_shdeps_remote_stamp "$name" git)
   local log=""
@@ -1407,6 +1409,63 @@ _shdeps_run_post_hooks() {
     unset -f exists version install post 2>/dev/null
   done
 }
+
+# ---------------------------------------------------------------------------
+# Self-update — pull latest shdeps if clean and TTL expired
+# ---------------------------------------------------------------------------
+
+# Update the shdeps installation itself (git pull with TTL caching).
+# Locates the shdeps source directory from BASH_SOURCE, or accepts an
+# explicit directory via $1. Skips dirty working trees (active development).
+# Uses its own state dir (not the caller's SHDEPS_STATE_DIR) so the TTL
+# stamp is shared across standalone and embedded invocations.
+_shdeps_self_update() {
+  local shdeps_dir="${1:-${BASH_SOURCE[0]%/*}}"
+
+  if [[ ! -d "$shdeps_dir/.git" ]]; then
+    _shdeps_warn "shdeps: not a git clone, cannot self-update"
+    return 1
+  fi
+
+  # Use shdeps's own state dir for the stamp, not the caller's override,
+  # so the TTL is shared with standalone `shdeps self-update` calls.
+  local _saved_state="${SHDEPS_STATE_DIR:-}"
+  SHDEPS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/shdeps"
+
+  local stamp
+  stamp=$(_shdeps_remote_stamp "shdeps" "self-update")
+
+  if _shdeps_remote_fresh "$stamp"; then
+    SHDEPS_STATE_DIR="$_saved_state"
+    return 0
+  fi
+
+  # Skip if dirty (uncommitted changes = active development)
+  if [[ -n "$(git -C "$shdeps_dir" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+    SHDEPS_STATE_DIR="$_saved_state"
+    return 0
+  fi
+
+  if git -C "$shdeps_dir" pull --ff-only --quiet 2>/dev/null; then
+    _shdeps_remote_touch "$stamp" || true
+    # Re-source if shdeps.sh was updated so in-memory functions are current
+    if [[ -f "$shdeps_dir/shdeps.sh" ]]; then
+      SHDEPS_STATE_DIR="$_saved_state"
+      # shellcheck source=/dev/null
+      . "$shdeps_dir/shdeps.sh"
+      return 0
+    fi
+  else
+    _shdeps_warn "shdeps: self-update failed (git pull --ff-only failed)"
+    _shdeps_remote_touch "$stamp" || true
+  fi
+
+  SHDEPS_STATE_DIR="$_saved_state"
+}
+
+# ---------------------------------------------------------------------------
+# Parallel binary prefetch
+# ---------------------------------------------------------------------------
 
 # Pre-fetch GitHub release JSON for all binary deps in parallel.
 # Identifies binary deps with stale TTL, fires background curl requests,

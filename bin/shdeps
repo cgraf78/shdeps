@@ -71,36 +71,9 @@ cmd_update() {
   shdeps_update
 }
 
-# Pull latest shdeps if the install dir is clean and TTL has expired.
-# Dirty working trees (active development) are left alone.
-# Respects SHDEPS_FORCE and SHDEPS_REMOTE_TTL.
+# Delegate to the library's self-update implementation.
 cmd_self_update() {
-  local shdeps_dir="$SHDEPS_CLI_DIR/.."
-
-  # Not a git repo (e.g., installed from tarball) — nothing to update
-  if [[ ! -d "$shdeps_dir/.git" ]]; then
-    echo "shdeps: not a git clone, cannot self-update" >&2
-    return 1
-  fi
-
-  local stamp
-  stamp=$(_shdeps_remote_stamp "shdeps" "self-update")
-
-  if _shdeps_remote_fresh "$stamp"; then
-    return 0
-  fi
-
-  # Skip if dirty (uncommitted changes = active development)
-  if [[ -n "$(git -C "$shdeps_dir" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
-    return 0
-  fi
-
-  if git -C "$shdeps_dir" pull --ff-only --quiet 2>/dev/null; then
-    _shdeps_remote_touch "$stamp" || true
-  else
-    echo "shdeps: self-update failed (git pull --ff-only failed)" >&2
-    _shdeps_remote_touch "$stamp" || true
-  fi
+  shdeps_self_update "$SHDEPS_CLI_DIR/.."
 }
 
 # shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _dir, _platforms, _hosts set by _shdeps_parse

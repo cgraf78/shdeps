@@ -136,10 +136,10 @@ _bootstrap() {
   fi
 
   # Self-update (TTL-cached, skips dirty clones).
-  # Clear SHDEPS_STATE_DIR so the CLI uses its own default,
-  # sharing the stamp with standalone `shdeps self-update`.
-  if [[ -n "$_bs_dir" && -x "$SHDEPS_BIN" ]]; then
-    SHDEPS_STATE_DIR='' "$SHDEPS_BIN" self-update 2>/dev/null || true
+  # Calls the library function directly — no subprocess overhead.
+  # _shdeps_self_update handles its own state dir for stamp sharing.
+  if [[ -n "$_bs_dir" ]] && declare -f _shdeps_self_update &>/dev/null; then
+    _shdeps_self_update "$_bs_dir" 2>/dev/null || true
   fi
 }
 
