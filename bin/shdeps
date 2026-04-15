@@ -147,7 +147,7 @@ cmd_list() {
       fi
       ;;
     binary)
-      local bin_path="$HOME/.local/bin/$_cmd"
+      local bin_path="$(_shdeps_bin_dir)/$_cmd"
       if [[ -x "$bin_path" ]]; then
         status="installed"
         local ver
@@ -234,7 +234,7 @@ cmd_check() {
       fi
       ;;
     binary)
-      if [[ -x "$HOME/.local/bin/$_cmd" ]]; then
+      if [[ -x "$(_shdeps_bin_dir)/$_cmd" ]]; then
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
         echo "$_name: installed${ver:+ ($ver)}"
