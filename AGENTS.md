@@ -72,6 +72,27 @@ shdeps tracks installed deps in a manifest file at
 When a dep is removed from config but still in the manifest, `shdeps update`
 prints an orphan notice. Run `shdeps prune` to remove orphaned artifacts.
 
+## Extras Linking
+
+shdeps auto-discovers man pages and shell completions from `git` and `binary`
+installs and symlinks them to XDG user-local directories:
+
+| Type | Target | Auto-discovered? |
+|------|--------|-----------------|
+| Man pages | `~/.local/share/man/man<N>/` | No — needs `MANPATH` |
+| Bash completions | `~/.local/share/bash-completion/completions/` | Yes |
+| Zsh completions | `~/.local/share/zsh/site-functions/` | No — needs `fpath` |
+| Fish completions | `~/.local/share/fish/vendor_completions.d/` | Yes |
+
+Discovery uses four pattern arrays (`_SHDEPS_MAN_PATTERNS`, `_SHDEPS_BASH_COMP_PATTERNS`,
+`_SHDEPS_ZSH_COMP_PATTERNS`, `_SHDEPS_FISH_COMP_PATTERNS`) defined near the top of
+`shdeps.sh`. Adding a new convention = appending one glob to the appropriate array.
+
+State tracking: each dep's linked symlinks are recorded in
+`$SHDEPS_STATE_DIR/<name>.links`. On re-link (update), stale symlinks are
+cleaned before new ones are created. On prune, `_shdeps_unlink_extras` removes
+all tracked symlinks.
+
 ## Hook Contract
 
 Hook files in `hooks.d/$name.sh` may define these functions:

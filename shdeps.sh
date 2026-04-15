@@ -59,6 +59,10 @@ shdeps_install_dir()    { _shdeps_install_dir; }
 shdeps_git_dev_dir()    { _shdeps_git_dev_dir; }
 shdeps_bin_dir()        { _shdeps_bin_dir; }
 
+# Extras linking (man pages, shell completions)
+shdeps_link_extras()    { _shdeps_link_extras "$@"; }
+shdeps_unlink_extras()  { _shdeps_unlink_extras "$@"; }
+
 # Logging
 shdeps_log()            { _shdeps_log "$@"; }
 shdeps_warn()           { _shdeps_warn "$@"; }
@@ -93,6 +97,62 @@ _shdeps_git_dev_dir() { echo "${SHDEPS_GIT_DEV_DIR:-$HOME/git}"; }
 _shdeps_install_dir() { echo "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"; }
 _shdeps_bin_dir()     { echo "${SHDEPS_BIN_DIR:-$HOME/.local/bin}"; }
 _shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
+
+# Target directory accessors for extras linking (man pages, completions).
+# Man pages route to section subdirs: _shdeps_man_dir 1 → .../man/man1/
+_shdeps_man_dir() {
+  local section="${1:-1}"
+  echo "$(_shdeps_install_dir)/man/man${section}"
+}
+_shdeps_bash_comp_dir() { echo "$(_shdeps_install_dir)/bash-completion/completions"; }
+_shdeps_zsh_comp_dir()  { echo "$(_shdeps_install_dir)/zsh/site-functions"; }
+_shdeps_fish_comp_dir() { echo "$(_shdeps_install_dir)/fish/vendor_completions.d"; }
+
+# ---------------------------------------------------------------------------
+# Extras discovery patterns — path globs relative to a dep's install dir.
+# Adding a new convention = appending one line to the appropriate array.
+# ---------------------------------------------------------------------------
+
+_SHDEPS_MAN_PATTERNS=(
+  # Structured paths — match all sections (1-8)
+  "share/man/man[0-9]/*.[0-9]"    # FHS prefix tree (neovim, gh)
+  "share/man/man[0-9]/*.[0-9].gz"
+  "man/man[0-9]/*.[0-9]"          # alternate prefix (zoxide)
+  "man/man[0-9]/*.[0-9].gz"
+  "manpages/*.[0-9]"              # goreleaser (gum, chezmoi)
+  "manpages/*.[0-9].gz"
+  "doc/*.[0-9]"                   # Rust/BurntSushi (ripgrep)
+  "doc/*.[0-9].gz"
+  # Flat top-level — section 1 only to avoid false positives
+  "*.1"                           # fd, bat, hyperfine
+  "*.1.gz"
+)
+
+_SHDEPS_BASH_COMP_PATTERNS=(
+  "share/bash-completion/completions/*"  # FHS
+  "completions/*.bash"                   # goreleaser (gum, chezmoi, jj)
+  "completion/*.bash"                    # bottom
+  "complete/*.bash"                      # ripgrep
+  "autocomplete/*.bash"                  # fd, bat, hyperfine
+)
+
+_SHDEPS_ZSH_COMP_PATTERNS=(
+  "share/zsh/site-functions/_*"   # FHS
+  "completions/_*"                # zoxide, sd
+  "completions/*.zsh"             # goreleaser (gum — needs rename to _<cmd>)
+  "completion/_*"                 # bottom
+  "complete/_*"                   # ripgrep
+  "autocomplete/_*"               # fd, hyperfine
+  "autocomplete/*.zsh"            # bat (non-underscore variant)
+)
+
+_SHDEPS_FISH_COMP_PATTERNS=(
+  "share/fish/vendor_completions.d/*.fish"  # FHS
+  "completions/*.fish"                      # goreleaser (gum, chezmoi, jj)
+  "completion/*.fish"                       # bottom
+  "complete/*.fish"                         # ripgrep
+  "autocomplete/*.fish"                     # fd, bat, hyperfine
+)
 
 # ---------------------------------------------------------------------------
 # Logging — callers may override by defining these before sourcing
@@ -860,6 +920,7 @@ _shdeps_remove_dep() {
     _shdeps_warn "  $name: pkg dep — remove manually via ${_SHDEPS_PKG_MGR:-system package manager}"
     ;;
   git)
+    _shdeps_unlink_extras "$name"
     if [[ -n "$install_path" ]]; then
       # install_path may be absolute (current format) or relative to HOME (legacy manifest entries)
       local rm_path="$install_path"
@@ -871,6 +932,7 @@ _shdeps_remove_dep() {
     _shdeps_log_ok "  $name removed"
     ;;
   binary)
+    _shdeps_unlink_extras "$name"
     rm -f "$(_shdeps_bin_dir)/$cmd"
     local binary_install_dir
     binary_install_dir="$(_shdeps_install_dir)/$name"
@@ -993,6 +1055,139 @@ _shdeps_link_bin() {
   fi
 }
 
+# Remove symlinks tracked in a dep's .links state file.
+_shdeps_unlink_extras() {
+  local name="$1"
+  local state_dir
+  state_dir=$(_shdeps_state_dir)
+  local links_file="$state_dir/$name.links"
+  [[ -f "$links_file" ]] || return 0
+  while IFS= read -r link; do
+    [[ -L "$link" ]] && rm -f "$link"
+  done < "$links_file"
+  rm -f "$links_file"
+}
+
+# Dedup, mkdir, symlink, and record. Reads/writes caller's `seen` and
+# `created_links` arrays. $1=source $2=target
+_shdeps_extras_add() {
+  local src="$1" tgt="$2"
+  [[ -n "${seen[$tgt]+x}" ]] && return 0
+  seen[$tgt]=1
+  mkdir -p "$(dirname "$tgt")"
+  ln -sf "$src" "$tgt"
+  created_links+=("$tgt")
+}
+
+# Discover man pages and shell completions in a dep's install dir and
+# symlink them to XDG user-local directories for discoverability.
+_shdeps_link_extras() {
+  local name="$1" install_dir="$2"
+  [[ -d "$install_dir" ]] || return 0
+
+  # Clean stale symlinks from previous version before re-linking
+  _shdeps_unlink_extras "$name"
+
+  local state_dir
+  state_dir=$(_shdeps_state_dir)
+  local -a created_links=()
+  local -A seen=()
+  local pattern file base section tgt_dir comp_dir name_nogz tgt_name
+
+  # --- Man pages ---
+  for pattern in "${_SHDEPS_MAN_PATTERNS[@]}"; do
+    # Flat patterns (*.1, *.1.gz) need maxdepth 1 to avoid false positives
+    if [[ "$pattern" != */* ]]; then
+      while IFS= read -r -d '' file; do
+        [[ -f "$file" ]] || continue
+        base=$(basename "$file")
+        name_nogz="$base"
+        [[ "$name_nogz" == *.gz ]] && name_nogz="${name_nogz%.gz}"
+        section="${name_nogz##*.}"
+        tgt_dir=$(_shdeps_man_dir "$section")
+        _shdeps_extras_add "$file" "$tgt_dir/$base"
+      done < <(find "$install_dir" -maxdepth 1 -name "$pattern" -print0 2>/dev/null)
+    else
+      # shellcheck disable=SC2086
+      for file in "$install_dir"/$pattern; do
+        [[ -f "$file" ]] || continue
+        base=$(basename "$file")
+        name_nogz="$base"
+        [[ "$name_nogz" == *.gz ]] && name_nogz="${name_nogz%.gz}"
+        section="${name_nogz##*.}"
+        tgt_dir=$(_shdeps_man_dir "$section")
+        _shdeps_extras_add "$file" "$tgt_dir/$base"
+      done
+    fi
+  done
+
+  # --- Bash completions ---
+  comp_dir=$(_shdeps_bash_comp_dir)
+  for pattern in "${_SHDEPS_BASH_COMP_PATTERNS[@]}"; do
+    # shellcheck disable=SC2086
+    for file in "$install_dir"/$pattern; do
+      [[ -f "$file" ]] || continue
+      base=$(basename "$file")
+      tgt_name="${base%.bash}"
+      _shdeps_extras_add "$file" "$comp_dir/$tgt_name"
+    done
+  done
+
+  # --- Zsh completions ---
+  comp_dir=$(_shdeps_zsh_comp_dir)
+  for pattern in "${_SHDEPS_ZSH_COMP_PATTERNS[@]}"; do
+    # shellcheck disable=SC2086
+    for file in "$install_dir"/$pattern; do
+      [[ -f "$file" ]] || continue
+      base=$(basename "$file")
+      # .zsh files need renaming to _<cmd> for fpath discovery
+      if [[ "$base" == *.zsh ]]; then
+        tgt_name="_${base%.zsh}"
+      elif [[ "$base" == _* ]]; then
+        tgt_name="$base"
+      else
+        tgt_name="_$base"
+      fi
+      _shdeps_extras_add "$file" "$comp_dir/$tgt_name"
+    done
+  done
+
+  # --- Fish completions ---
+  comp_dir=$(_shdeps_fish_comp_dir)
+  for pattern in "${_SHDEPS_FISH_COMP_PATTERNS[@]}"; do
+    # shellcheck disable=SC2086
+    for file in "$install_dir"/$pattern; do
+      [[ -f "$file" ]] || continue
+      base=$(basename "$file")
+      _shdeps_extras_add "$file" "$comp_dir/$base"
+    done
+  done
+
+  # Write state file for cleanup tracking
+  if [[ ${#created_links[@]} -gt 0 ]]; then
+    mkdir -p "$state_dir"
+    printf '%s\n' "${created_links[@]}" > "$state_dir/$name.links"
+    _shdeps_extras_hint
+  fi
+}
+
+# Print a one-time hint about MANPATH and fpath setup.
+_shdeps_extras_hint() {
+  local state_dir
+  state_dir=$(_shdeps_state_dir)
+  local stamp="$state_dir/extras-hint.shown"
+  [[ -f "$stamp" ]] && return 0
+  mkdir -p "$state_dir"
+  touch "$stamp"
+  _shdeps_log ""
+  _shdeps_log "  ${_SHDEPS_C_BOLD}Extras linked:${_SHDEPS_C_RESET} man pages and completions symlinked to ~/.local/share/"
+  _shdeps_log "  To enable, add to your shell config:"
+  _shdeps_log "    ${_SHDEPS_C_DIM}export MANPATH=\"\$HOME/.local/share/man:\$MANPATH\"${_SHDEPS_C_RESET}"
+  _shdeps_log "    ${_SHDEPS_C_DIM}fpath=(\"\$HOME/.local/share/zsh/site-functions\" \$fpath)  # before compinit${_SHDEPS_C_RESET}"
+  _shdeps_log "  Bash and fish completions are auto-discovered."
+  _shdeps_log ""
+}
+
 # Strategy: ~/git/<name> exists — symlink for live development, pull if TTL
 # expired and the working tree is clean.
 _shdeps_github_install_local_clone() {
@@ -1035,6 +1230,7 @@ _shdeps_github_install_local_clone() {
   mkdir -p "$(dirname "$install_dir")"
   ln -sfn "$local_clone" "$install_dir"
   _shdeps_link_bin "$name" "$install_dir"
+  _shdeps_link_extras "$name" "$install_dir"
 
   local ver
   ver=$(_shdeps_get_version "$local_clone")
@@ -1062,6 +1258,7 @@ _shdeps_github_install_pull() {
   local name="$1" install_dir="$2" stamp="$3" log="$4"
   if _shdeps_remote_fresh "$stamp"; then
     _shdeps_link_bin "$name" "$install_dir"
+    _shdeps_link_extras "$name" "$install_dir"
     local ver
     ver=$(_shdeps_get_version "$install_dir")
     _shdeps_log "  $name${ver:+ -- $ver}"
@@ -1074,6 +1271,7 @@ _shdeps_github_install_pull() {
   _shdeps_log_status "  $name: pulling latest..."
   if _shdeps_run_logged git -C "$install_dir" pull --ff-only --quiet; then
     _shdeps_link_bin "$name" "$install_dir"
+    _shdeps_link_extras "$name" "$install_dir"
     local head_after
     head_after=$(git -C "$install_dir" rev-parse HEAD 2>/dev/null || true)
     local ver
@@ -1158,6 +1356,7 @@ _shdeps_github_install_fresh() {
   fi
 
   _shdeps_link_bin "$name" "$install_dir"
+  _shdeps_link_extras "$name" "$install_dir"
   rm -f "$log"
   _shdeps_remote_touch "$stamp" || true
   local ver
@@ -1425,6 +1624,7 @@ _shdeps_binary_install_from_extracted() {
   # Symlink the binary into PATH
   local bin_rel="${found_bin#"$extract_dir/"}"
   ln -sf "$install_dir/$bin_rel" "$bin_path"
+  _shdeps_link_extras "$name" "$install_dir"
 }
 
 # Extract a tarball, find the binary, install to $SHDEPS_INSTALL_DIR/<name>.
@@ -1486,6 +1686,9 @@ _shdeps_install_binary() {
   # Fast path: skip entirely if binary exists and TTL is fresh.
   # Avoids temp file creation, API calls, and asset matching.
   if [[ -x "$bin_path" ]] && _shdeps_remote_fresh "$stamp"; then
+    local install_dir
+    install_dir="$(_shdeps_install_dir)/$name"
+    _shdeps_link_extras "$name" "$install_dir"
     current_ver=$(_shdeps_dep_version "$cmd")
     _shdeps_log "  $name -- $current_ver"
     return 0

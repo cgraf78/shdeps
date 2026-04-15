@@ -154,6 +154,31 @@ Place hook files in `<hooks_dir>/<name>.sh`. For `custom` deps, hooks define the
 
 All [public API functions](#public-api) are available to hook authors. See [examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh).
 
+## Man Pages & Completions
+
+shdeps automatically discovers man pages and shell completions bundled inside `git` and `binary` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking.
+
+**What gets linked:**
+
+| Type | Target directory | Auto-discovered by shell? |
+|------|-----------------|--------------------------|
+| Man pages | `~/.local/share/man/man<N>/` | No |
+| Bash completions | `~/.local/share/bash-completion/completions/` | Yes |
+| Zsh completions | `~/.local/share/zsh/site-functions/` | No |
+| Fish completions | `~/.local/share/fish/vendor_completions.d/` | Yes |
+
+**Required shell config** (bash and fish need nothing):
+
+```bash
+# Man pages — add to your shell env
+export MANPATH="$HOME/.local/share/man:$MANPATH"
+
+# Zsh completions — add before compinit
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+```
+
+Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdeps prune` removes symlinks along with the dep. Updates clean stale symlinks before re-linking.
+
 ## CLI Usage
 
 ```
@@ -253,6 +278,8 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | `shdeps_install_dir` | Print base install directory (`$SHDEPS_INSTALL_DIR`, default `~/.local/share`) |
 | `shdeps_git_dev_dir` | Print git dev clone directory (`$SHDEPS_GIT_DEV_DIR`, default `~/git`) |
 | `shdeps_bin_dir` | Print binary symlink directory (`$SHDEPS_BIN_DIR`, default `~/.local/bin`) |
+| `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir |
+| `shdeps_unlink_extras <name>` | Remove all extras symlinks tracked for a dep |
 | `shdeps_require_sudo` | Acquire sudo; returns 0 if root or sudo obtained |
 | `shdeps_log` | Normal log line |
 | `shdeps_warn` | Warning (always shown unless quiet) |

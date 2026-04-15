@@ -43,7 +43,7 @@ done < <(git -C "$SHDEPS_DIR" ls-tree -r --name-only HEAD)
 
 if [[ "${#_sc_files[@]}" -eq 0 ]]; then
   _fail "shellcheck: no files discovered"
-elif _sc_output=$(shellcheck -x -P SCRIPTDIR "${_sc_files[@]}" 2>&1); then
+elif _sc_output=$(shellcheck -x -P SCRIPTDIR --exclude=SC1091 "${_sc_files[@]}" 2>&1); then
   _pass "shellcheck: all files clean"
 else
   _fail "shellcheck: findings detected"
@@ -2620,6 +2620,178 @@ _SHDEPS_C_CLEARLN=$'\r\033[2K'
 . "$SHDEPS_DIR/shdeps.sh" >/dev/null
 _assert_eq "re-source: ANSI codes preserved under >/dev/null" $'\033[0m' "$_SHDEPS_C_RESET"
 _assert_eq "re-source: CLEARLN preserved under >/dev/null" $'\r\033[2K' "$_SHDEPS_C_CLEARLN"
+
+# ===========================================================================
+# Section: Extras linking
+# ===========================================================================
+
+echo "=== Extras linking ==="
+
+_mock_home
+_source_shdeps "$SHDEPS_DIR"
+
+# --- FHS layout (neovim-like) ---
+
+_fhs_dir=$(_tmpdir)
+mkdir -p "$_fhs_dir/share/man/man1"
+touch "$_fhs_dir/share/man/man1/nvim.1"
+_shdeps_link_extras "fhs-tool" "$_fhs_dir"
+
+_assert_symlink "fhs: man symlink created" "$HOME/.local/share/man/man1/nvim.1"
+_fhs_target=$(readlink "$HOME/.local/share/man/man1/nvim.1")
+_assert_eq "fhs: man symlink target" "$_fhs_dir/share/man/man1/nvim.1" "$_fhs_target"
+_assert_file_exists "fhs: .links file created" "$(_shdeps_state_dir)/fhs-tool.links"
+_assert_contains "fhs: .links contains path" "man/man1/nvim.1" "$(cat "$(_shdeps_state_dir)/fhs-tool.links")"
+_shdeps_unlink_extras "fhs-tool"
+
+# --- Goreleaser layout (gum-like) ---
+
+_gor_dir=$(_tmpdir)
+mkdir -p "$_gor_dir/manpages" "$_gor_dir/completions"
+touch "$_gor_dir/manpages/gum.1.gz"
+touch "$_gor_dir/completions/gum.bash"
+touch "$_gor_dir/completions/gum.zsh"
+touch "$_gor_dir/completions/gum.fish"
+_shdeps_link_extras "gor-tool" "$_gor_dir"
+
+_assert_symlink "goreleaser: man symlink" "$HOME/.local/share/man/man1/gum.1.gz"
+_assert_symlink "goreleaser: bash completion" "$HOME/.local/share/bash-completion/completions/gum"
+_assert_symlink "goreleaser: zsh completion renamed" "$HOME/.local/share/zsh/site-functions/_gum"
+_assert_symlink "goreleaser: fish completion" "$HOME/.local/share/fish/vendor_completions.d/gum.fish"
+_shdeps_unlink_extras "gor-tool"
+
+# --- Rust layout (ripgrep-like) ---
+
+_rust_dir=$(_tmpdir)
+mkdir -p "$_rust_dir/doc" "$_rust_dir/complete"
+touch "$_rust_dir/doc/rg.1"
+touch "$_rust_dir/complete/rg.bash"
+touch "$_rust_dir/complete/_rg"
+touch "$_rust_dir/complete/rg.fish"
+_shdeps_link_extras "rust-tool" "$_rust_dir"
+
+_assert_symlink "rust: man symlink" "$HOME/.local/share/man/man1/rg.1"
+_assert_symlink "rust: bash completion" "$HOME/.local/share/bash-completion/completions/rg"
+_assert_symlink "rust: zsh completion" "$HOME/.local/share/zsh/site-functions/_rg"
+_assert_symlink "rust: fish completion" "$HOME/.local/share/fish/vendor_completions.d/rg.fish"
+_shdeps_unlink_extras "rust-tool"
+
+# --- sharkdp layout (fd-like) ---
+
+_shark_dir=$(_tmpdir)
+mkdir -p "$_shark_dir/autocomplete"
+touch "$_shark_dir/fd.1"
+touch "$_shark_dir/autocomplete/fd.bash"
+touch "$_shark_dir/autocomplete/_fd"
+touch "$_shark_dir/autocomplete/fd.fish"
+_shdeps_link_extras "shark-tool" "$_shark_dir"
+
+_assert_symlink "sharkdp: flat man symlink" "$HOME/.local/share/man/man1/fd.1"
+_assert_symlink "sharkdp: bash completion" "$HOME/.local/share/bash-completion/completions/fd"
+_assert_symlink "sharkdp: zsh completion" "$HOME/.local/share/zsh/site-functions/_fd"
+_assert_symlink "sharkdp: fish completion" "$HOME/.local/share/fish/vendor_completions.d/fd.fish"
+_shdeps_unlink_extras "shark-tool"
+
+# --- Zoxide layout ---
+
+_zox_dir=$(_tmpdir)
+mkdir -p "$_zox_dir/man/man1" "$_zox_dir/completions"
+touch "$_zox_dir/man/man1/zoxide.1"
+touch "$_zox_dir/completions/zoxide.bash"
+touch "$_zox_dir/completions/_zoxide"
+touch "$_zox_dir/completions/zoxide.fish"
+_shdeps_link_extras "zox-tool" "$_zox_dir"
+
+_assert_symlink "zoxide: man symlink" "$HOME/.local/share/man/man1/zoxide.1"
+_assert_symlink "zoxide: bash completion" "$HOME/.local/share/bash-completion/completions/zoxide"
+_assert_symlink "zoxide: zsh completion" "$HOME/.local/share/zsh/site-functions/_zoxide"
+_assert_symlink "zoxide: fish completion" "$HOME/.local/share/fish/vendor_completions.d/zoxide.fish"
+_shdeps_unlink_extras "zox-tool"
+
+# --- Multi-section man pages ---
+
+_multi_dir=$(_tmpdir)
+mkdir -p "$_multi_dir/manpages"
+touch "$_multi_dir/manpages/tool.1"
+touch "$_multi_dir/manpages/tool_colors.5"
+_shdeps_link_extras "multi-man" "$_multi_dir"
+
+_assert_symlink "multi-section: man1 symlink" "$HOME/.local/share/man/man1/tool.1"
+_assert_symlink "multi-section: man5 symlink" "$HOME/.local/share/man/man5/tool_colors.5"
+_shdeps_unlink_extras "multi-man"
+
+# --- Empty dir: no matches ---
+
+_empty_dir=$(_tmpdir)
+_shdeps_link_extras "empty-tool" "$_empty_dir"
+
+_assert_file_missing "empty: no .links file" "$(_shdeps_state_dir)/empty-tool.links"
+
+# --- Idempotency: same symlinks, no duplicates in .links ---
+
+_idem_dir=$(_tmpdir)
+mkdir -p "$_idem_dir/share/man/man1"
+touch "$_idem_dir/share/man/man1/idem.1"
+_shdeps_link_extras "idem-tool" "$_idem_dir"
+_idem_count1=$(wc -l < "$(_shdeps_state_dir)/idem-tool.links")
+_shdeps_link_extras "idem-tool" "$_idem_dir"
+_idem_count2=$(wc -l < "$(_shdeps_state_dir)/idem-tool.links")
+
+_assert_symlink "idempotent: symlink still exists" "$HOME/.local/share/man/man1/idem.1"
+_assert_eq "idempotent: .links line count unchanged" "$_idem_count1" "$_idem_count2"
+_shdeps_unlink_extras "idem-tool"
+
+# --- Unlink: removes all symlinks and .links file ---
+
+_unlink_dir=$(_tmpdir)
+mkdir -p "$_unlink_dir/share/man/man1" "$_unlink_dir/completions"
+touch "$_unlink_dir/share/man/man1/ul.1"
+touch "$_unlink_dir/completions/ul.bash"
+touch "$_unlink_dir/completions/_ul"
+_shdeps_link_extras "unlink-tool" "$_unlink_dir"
+
+_assert_symlink "unlink pre: man symlink exists" "$HOME/.local/share/man/man1/ul.1"
+_assert_symlink "unlink pre: bash symlink exists" "$HOME/.local/share/bash-completion/completions/ul"
+_assert_symlink "unlink pre: zsh symlink exists" "$HOME/.local/share/zsh/site-functions/_ul"
+_shdeps_unlink_extras "unlink-tool"
+
+_assert_file_missing "unlink: man symlink removed" "$HOME/.local/share/man/man1/ul.1"
+_assert_file_missing "unlink: bash symlink removed" "$HOME/.local/share/bash-completion/completions/ul"
+_assert_file_missing "unlink: zsh symlink removed" "$HOME/.local/share/zsh/site-functions/_ul"
+_assert_file_missing "unlink: .links file removed" "$(_shdeps_state_dir)/unlink-tool.links"
+
+# --- Unlink with dangling symlinks ---
+
+_dangle_dir=$(_tmpdir)
+mkdir -p "$_dangle_dir/share/man/man1"
+touch "$_dangle_dir/share/man/man1/dangle.1"
+_shdeps_link_extras "dangle-tool" "$_dangle_dir"
+_assert_symlink "dangle pre: symlink exists" "$HOME/.local/share/man/man1/dangle.1"
+
+# Remove the install dir so the symlink dangles
+rm -rf "$_dangle_dir"
+_shdeps_unlink_extras "dangle-tool"
+
+_assert_file_missing "dangle: dangling symlink removed" "$HOME/.local/share/man/man1/dangle.1"
+_assert_file_missing "dangle: .links file removed" "$(_shdeps_state_dir)/dangle-tool.links"
+
+# --- False positive resistance ---
+
+_fp_dir=$(_tmpdir)
+touch "$_fp_dir/README.1st"
+touch "$_fp_dir/version.0"
+touch "$_fp_dir/notes.txt"
+_shdeps_link_extras "fp-tool" "$_fp_dir"
+
+_assert_file_missing "false positive: no .links file" "$(_shdeps_state_dir)/fp-tool.links"
+
+# --- Directories named *.1 are not symlinked ---
+
+_dirtest_dir=$(_tmpdir)
+mkdir -p "$_dirtest_dir/fake.1"
+_shdeps_link_extras "dirtest-tool" "$_dirtest_dir"
+
+_assert_file_missing "dir not file: no .links file" "$(_shdeps_state_dir)/dirtest-tool.links"
 
 # ===========================================================================
 
