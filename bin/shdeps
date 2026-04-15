@@ -83,7 +83,7 @@ cmd_self_update() {
   shdeps_self_update "$SHDEPS_CLI_DIR/.."
 }
 
-# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _dir, _platforms, _hosts set by _shdeps_parse
+# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _platforms, _hosts set by _shdeps_parse
 cmd_list() {
   _shdeps_load
   _shdeps_pkg_detect
@@ -111,7 +111,7 @@ cmd_list() {
       continue
     fi
 
-    # shellcheck disable=SC2154  # _cmd, _cmd_alt, _pkg_overrides, _dir set by _shdeps_parse
+    # shellcheck disable=SC2154  # _cmd, _cmd_alt, _pkg_overrides set by _shdeps_parse
     local status="missing" details=""
     case "$_method" in
     pkg)
@@ -131,10 +131,10 @@ cmd_list() {
       fi
       ;;
     git)
-      if [[ -d "$HOME/$_dir" ]]; then
+      if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
         status="installed"
         local ver
-        ver=$(_shdeps_get_version "$HOME/$_dir")
+        ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
@@ -172,7 +172,7 @@ cmd_list() {
   done
 }
 
-# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _dir, _platforms, _hosts set by _shdeps_parse
+# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _platforms, _hosts set by _shdeps_parse
 cmd_check() {
   local target="${1:-}"
   if [[ -z "$target" ]]; then
@@ -187,7 +187,7 @@ cmd_check() {
   local entry found=0
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
-    # shellcheck disable=SC2154  # _name, _method, _cmd, _dir, etc. set by _shdeps_parse
+    # shellcheck disable=SC2154  # _name, _method, _cmd, etc. set by _shdeps_parse
     [[ "$_name" == "$target" ]] || continue
     found=1
 
@@ -218,9 +218,9 @@ cmd_check() {
       fi
       ;;
     git)
-      if [[ -d "$HOME/$_dir" ]]; then
+      if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
         local ver
-        ver=$(_shdeps_get_version "$HOME/$_dir")
+        ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
         echo "$_name: installed${ver:+ ($ver)}"
         return 0
       fi

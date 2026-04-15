@@ -62,7 +62,7 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 ### Config File Format
 
 ```
-# name    method    [cmd]  [cmd_alt]  [pkg_overrides]  [repo]  [dir]  [platforms]  [hosts]
+# name    method    [cmd]  [cmd_alt]  [pkg_overrides]  [repo]  [platforms]  [hosts]
 ```
 
 | Field | Required | Description |
@@ -73,7 +73,6 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 | `cmd_alt` | no | Alternate binary name (e.g., `batcat` for `bat`) |
 | `pkg_overrides` | no | Per-manager package names: `apt:fd-find,dnf:fd-find` |
 | `repo` | no | GitHub `owner/repo` (for `git` and `binary` methods) |
-| `dir` | no | Install directory relative to `$HOME` (for `git` method) |
 | `platforms` | no | Platform filter. Values: `linux`, `macos`, `wsl`. Prefix `!` to exclude. |
 | `hosts` | no | Hostname filter (matches `hostname -s`, case-insensitive). Prefix `!` to exclude. |
 
@@ -91,6 +90,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
 | `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `git` method |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `git` and `binary` installs |
 | `SHDEPS_LOG_LEVEL` | `1` | 0=quiet, 1=normal, 2=verbose |
 
 ## Install Methods
@@ -103,18 +103,18 @@ Installs via the detected package manager (brew, apt, dnf, or pacman). Packages 
 jq        pkg
 bat       pkg    bat    batcat
 fd        pkg    fd     fdfind    apt:fd-find,dnf:fd-find
-dust      pkg    -      -         -              -    -    macos
-htop      pkg    -      -         -              -    -    -        nas
+dust      pkg    -      -         -              -    macos
+htop      pkg    -      -         -              -    -    nas
 ```
 
 Use `pkg_overrides` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`). Use `hosts` to limit a dep to specific machines.
 
 ### `git` — GitHub Git Repos
 
-Clones a GitHub repo into `$HOME/<dir>`. Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<name>` (default `~/git/<name>`, symlinked for live development). Falls back to release tarballs, then shallow clones.
+Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<name>` (default `~/.local/share/<name>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<name>` (default `~/git/<name>`, symlinked for live development). Falls back to release tarballs, then shallow clones.
 
 ```
-ds    git    -    -    -    cgraf78/ds.git    .local/share/ds
+ds    git    -    -    -    cgraf78/ds.git
 ```
 
 Override the repo URL with `SHDEPS_<NAME>_REPO` env vars.

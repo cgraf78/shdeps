@@ -19,6 +19,7 @@
 #   SHDEPS_QUIET        Suppress interactive prompts(default: 0)
 #   SHDEPS_REMOTE_TTL   Cache TTL in seconds        (default: 3600)
 #   SHDEPS_GIT_DEV_DIR  Dev clone directory          (default: ~/git)
+#   SHDEPS_INSTALL_DIR  Base dir for git/binary installs (default: ~/.local/share)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
 
 SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
@@ -53,6 +54,7 @@ shdeps_force()          { [[ "$(_shdeps_force)" -eq 1 ]]; }
 shdeps_reinstall()      { [[ "$(_shdeps_reinstall)" -eq 1 ]]; }
 shdeps_pkg_mgr()        { echo "${_SHDEPS_PKG_MGR:-}"; }
 shdeps_require_sudo()   { _shdeps_require_sudo; }
+shdeps_install_dir()    { _shdeps_install_dir; }
 
 # Logging
 shdeps_log()            { _shdeps_log "$@"; }
@@ -85,6 +87,7 @@ _shdeps_reinstall()  { echo "${SHDEPS_REINSTALL:-0}"; }
 _shdeps_quiet()      { echo "${SHDEPS_QUIET:-0}"; }
 _shdeps_remote_ttl() { echo "${SHDEPS_REMOTE_TTL:-3600}"; }
 _shdeps_dev_dir()    { echo "${SHDEPS_GIT_DEV_DIR:-$HOME/git}"; }
+_shdeps_install_dir() { echo "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"; }
 _shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 
 # ---------------------------------------------------------------------------
@@ -318,16 +321,15 @@ _shdeps_load() {
 # ---------------------------------------------------------------------------
 
 # Split a pipe-delimited registry entry into named variables.
-# Sets: _name, _method, _cmd, _cmd_alt, _pkg_overrides, _repo, _dir, _platforms, _hosts
+# Sets: _name, _method, _cmd, _cmd_alt, _pkg_overrides, _repo, _platforms, _hosts
 _shdeps_parse() {
   local entry="$1"
-  IFS='|' read -r _name _method _cmd _cmd_alt _pkg_overrides _repo _dir _platforms _hosts <<<"$entry"
+  IFS='|' read -r _name _method _cmd _cmd_alt _pkg_overrides _repo _platforms _hosts <<<"$entry"
   # Dash means "use default" / "not specified"
   if [[ "$_cmd" == "-" ]]; then _cmd=""; fi
   if [[ "$_cmd_alt" == "-" ]]; then _cmd_alt=""; fi
   if [[ "$_pkg_overrides" == "-" ]]; then _pkg_overrides=""; fi
   if [[ "$_repo" == "-" ]]; then _repo=""; fi
-  if [[ "$_dir" == "-" ]]; then _dir=""; fi
   if [[ "$_platforms" == "-" ]]; then _platforms=""; fi
   if [[ "$_hosts" == "-" ]]; then _hosts=""; fi
   # Default cmd to name when unspecified
@@ -846,7 +848,10 @@ _shdeps_remove_dep() {
     ;;
   git)
     if [[ -n "$install_path" ]]; then
-      rm -rf "${HOME:?}/$install_path"
+      # install_path may be absolute (current format) or relative to HOME (legacy manifest entries)
+      local rm_path="$install_path"
+      [[ "$rm_path" != /* ]] && rm_path="${HOME:?}/$rm_path"
+      rm -rf "$rm_path"
     fi
     rm -f "$HOME/.local/bin/$name"
     _shdeps_remove_stamps "$name"
@@ -854,8 +859,10 @@ _shdeps_remove_dep() {
     ;;
   binary)
     rm -f "$HOME/.local/bin/$cmd"
-    if [[ -d "$HOME/.local/share/$name" ]]; then
-      rm -rf "${HOME:?}/.local/share/$name"
+    local binary_install_dir
+    binary_install_dir="$(_shdeps_install_dir)/$name"
+    if [[ -d "$binary_install_dir" ]]; then
+      rm -rf "$binary_install_dir"
     fi
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
@@ -1357,7 +1364,7 @@ _shdeps_binary_find_asset() {
 
 # Find and install a binary from an extracted archive directory.
 # Searches for the binary by name patterns and installs it into
-# ~/.local/share/<name> with a symlink in ~/.local/bin.
+# $SHDEPS_INSTALL_DIR/<name> with a symlink in ~/.local/bin.
 # $1=name $2=cmd $3=extract_dir $4=orig_extract_dir $5=bin_path
 _shdeps_binary_install_from_extracted() {
   local name="$1" cmd="$2" extract_dir="$3" orig_extract_dir="$4" bin_path="$5"
@@ -1394,8 +1401,9 @@ _shdeps_binary_install_from_extracted() {
     return 1
   fi
 
-  # Move extracted contents to ~/.local/share/<name>
-  local install_dir="$HOME/.local/share/$name"
+  # Move extracted contents to $SHDEPS_INSTALL_DIR/<name>
+  local install_dir
+  install_dir="$(_shdeps_install_dir)/$name"
   rm -rf "$install_dir"
   mkdir -p "$(dirname "$install_dir")"
   mv "$extract_dir" "$install_dir"
@@ -1406,7 +1414,7 @@ _shdeps_binary_install_from_extracted() {
   ln -sf "$install_dir/$bin_rel" "$bin_path"
 }
 
-# Extract a tarball, find the binary, install to ~/.local/share/<name>.
+# Extract a tarball, find the binary, install to $SHDEPS_INSTALL_DIR/<name>.
 # $1=name $2=cmd $3=tmp_file $4=bin_path $5=log
 _shdeps_binary_install_tarball() {
   local name="$1" cmd="$2" tmp_file="$3" bin_path="$4" log="$5"
@@ -1425,7 +1433,7 @@ _shdeps_binary_install_tarball() {
   _shdeps_binary_install_from_extracted "$name" "$cmd" "$extract_dir" "$extract_dir" "$bin_path"
 }
 
-# Extract a zip, find the binary, install to ~/.local/share/<name>.
+# Extract a zip, find the binary, install to $SHDEPS_INSTALL_DIR/<name>.
 # $1=name $2=cmd $3=tmp_file $4=bin_path $5=log
 _shdeps_binary_install_zip() {
   local name="$1" cmd="$2" tmp_file="$3" bin_path="$4" log="$5"
@@ -1641,8 +1649,10 @@ _shdeps_install_dep() {
     _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
     ;;
   git)
-    _shdeps_install_from_github "$_name" "$_repo" "$HOME/$_dir"
-    _shdeps_manifest_upsert "$_name" "git" "$_cmd" "$_dir"
+    local _git_install_dir
+    _git_install_dir="$(_shdeps_install_dir)/$_name"
+    _shdeps_install_from_github "$_name" "$_repo" "$_git_install_dir"
+    _shdeps_manifest_upsert "$_name" "git" "$_cmd" "$_git_install_dir"
     ;;
   binary)
     _shdeps_install_binary "$_name" "$_cmd" "$_repo"
