@@ -145,14 +145,14 @@ _bootstrap() {
   # shellcheck source=/dev/null
   . "$_bs_lib" || return 1
 
-  # Set up all symlinks (CLI, man, completions)
-  [[ -n "$_bs_dir" ]] && _setup_links "$_bs_dir"
-
-  # Pull latest shdeps (skips dirty clones / active development).
-  # Self-update re-links extras after pulling, so changes are picked up.
+  # Pull latest shdeps (skips dirty clones / active development)
   if [[ -n "$_bs_dir" ]] && declare -f _shdeps_self_update &>/dev/null; then
     _shdeps_self_update "$_bs_dir" 2>/dev/null || true
   fi
+
+  # Set up symlinks (CLI, man, completions) after self-update so newly
+  # pulled files (e.g. man pages, completions) are linked immediately.
+  [[ -n "$_bs_dir" ]] && _setup_links "$_bs_dir"
 }
 
 # ---------------------------------------------------------------------------
