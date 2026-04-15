@@ -1074,7 +1074,9 @@ _shdeps_extras_add() {
   local src="$1" tgt="$2"
   [[ -n "${seen[$tgt]+x}" ]] && return 0
   seen[$tgt]=1
-  mkdir -p "$(dirname "$tgt")"
+  # Create parent dirs with 0755 regardless of umask so zsh compaudit
+  # doesn't flag them as insecure (group/other-writable).
+  (umask 022 && mkdir -p "$(dirname "$tgt")")
   ln -sf "$src" "$tgt"
   created_links+=("$tgt")
 }

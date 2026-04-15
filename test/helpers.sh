@@ -141,6 +141,21 @@ _assert_match() {
   fi
 }
 
+_assert_perms() {
+  local desc="$1" expected="$2" path="$3"
+  local actual
+  if [[ "$(uname)" == "Darwin" ]]; then
+    actual=$(stat -f '%Lp' "$path")
+  else
+    actual=$(stat -c '%a' "$path")
+  fi
+  if [[ "$actual" == "$expected" ]]; then
+    _pass "$desc"
+  else
+    _fail "$desc (expected perms $expected, got $actual on $path)"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Temp directory management
 # ---------------------------------------------------------------------------

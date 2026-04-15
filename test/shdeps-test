@@ -2793,6 +2793,21 @@ _shdeps_link_extras "dirtest-tool" "$_dirtest_dir"
 
 _assert_file_missing "dir not file: no .links file" "$(_shdeps_state_dir)/dirtest-tool.links"
 
+# --- Permissive umask doesn't create group-writable dirs (compaudit) ---
+
+_umask_dir=$(_tmpdir)
+mkdir -p "$_umask_dir/completions"
+touch "$_umask_dir/completions/umask-tool.zsh"
+_saved_umask=$(umask)
+umask 002
+_shdeps_link_extras "umask-tool" "$_umask_dir"
+umask "$_saved_umask"
+
+_assert_symlink "umask: zsh completion created" "$HOME/.local/share/zsh/site-functions/_umask-tool"
+_assert_perms "umask: zsh site-functions is 755" "755" "$HOME/.local/share/zsh/site-functions"
+_assert_perms "umask: zsh parent dir is 755" "755" "$HOME/.local/share/zsh"
+_shdeps_unlink_extras "umask-tool"
+
 # ===========================================================================
 
 _test_summary
