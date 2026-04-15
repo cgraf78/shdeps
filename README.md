@@ -91,6 +91,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
 | `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `git` method |
 | `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `git` and `binary` installs |
+| `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
 | `SHDEPS_LOG_LEVEL` | `1` | 0=quiet, 1=normal, 2=verbose |
 
 ## Install Methods
@@ -252,6 +253,7 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | `shdeps_pkg_mgr` | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, or empty) |
 | `shdeps_install_dir` | Print base install directory (`$SHDEPS_INSTALL_DIR`, default `~/.local/share`) |
 | `shdeps_git_dev_dir` | Print git dev clone directory (`$SHDEPS_GIT_DEV_DIR`, default `~/git`) |
+| `shdeps_bin_dir` | Print binary symlink directory (`$SHDEPS_BIN_DIR`, default `~/.local/bin`) |
 | `shdeps_require_sudo` | Acquire sudo; returns 0 if root or sudo obtained |
 | `shdeps_log` | Normal log line |
 | `shdeps_warn` | Warning (always shown unless quiet) |

@@ -20,6 +20,7 @@
 #   SHDEPS_REMOTE_TTL   Cache TTL in seconds        (default: 3600)
 #   SHDEPS_GIT_DEV_DIR  Dev clone directory          (default: ~/git)
 #   SHDEPS_INSTALL_DIR  Base dir for git/binary installs (default: ~/.local/share)
+#   SHDEPS_BIN_DIR      Directory for binary symlinks (default: ~/.local/bin)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
 
 SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
@@ -56,6 +57,7 @@ shdeps_pkg_mgr()        { echo "${_SHDEPS_PKG_MGR:-}"; }
 shdeps_require_sudo()   { _shdeps_require_sudo; }
 shdeps_install_dir()    { _shdeps_install_dir; }
 shdeps_git_dev_dir()    { _shdeps_git_dev_dir; }
+shdeps_bin_dir()        { _shdeps_bin_dir; }
 
 # Logging
 shdeps_log()            { _shdeps_log "$@"; }
@@ -89,6 +91,7 @@ _shdeps_quiet()      { echo "${SHDEPS_QUIET:-0}"; }
 _shdeps_remote_ttl() { echo "${SHDEPS_REMOTE_TTL:-3600}"; }
 _shdeps_git_dev_dir() { echo "${SHDEPS_GIT_DEV_DIR:-$HOME/git}"; }
 _shdeps_install_dir() { echo "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"; }
+_shdeps_bin_dir()     { echo "${SHDEPS_BIN_DIR:-$HOME/.local/bin}"; }
 _shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 
 # ---------------------------------------------------------------------------
@@ -854,12 +857,12 @@ _shdeps_remove_dep() {
       [[ "$rm_path" != /* ]] && rm_path="${HOME:?}/$rm_path"
       rm -rf "$rm_path"
     fi
-    rm -f "$HOME/.local/bin/$name"
+    rm -f "$(_shdeps_bin_dir)/$name"
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
   binary)
-    rm -f "$HOME/.local/bin/$cmd"
+    rm -f "$(_shdeps_bin_dir)/$cmd"
     local binary_install_dir
     binary_install_dir="$(_shdeps_install_dir)/$name"
     if [[ -d "$binary_install_dir" ]]; then
@@ -972,12 +975,12 @@ _shdeps_get_version() {
   fi
 }
 
-# Symlink bin/<name> into ~/.local/bin if it exists.
+# Symlink bin/<name> into $SHDEPS_BIN_DIR if it exists.
 _shdeps_link_bin() {
   local name="$1" install_dir="$2"
   if [[ -x "$install_dir/bin/$name" ]]; then
-    mkdir -p "$HOME/.local/bin"
-    ln -sf "$install_dir/bin/$name" "$HOME/.local/bin/$name"
+    mkdir -p "$(_shdeps_bin_dir)"
+    ln -sf "$install_dir/bin/$name" "$(_shdeps_bin_dir)/$name"
   fi
 }
 
@@ -1365,7 +1368,7 @@ _shdeps_binary_find_asset() {
 
 # Find and install a binary from an extracted archive directory.
 # Searches for the binary by name patterns and installs it into
-# $SHDEPS_INSTALL_DIR/<name> with a symlink in ~/.local/bin.
+# $SHDEPS_INSTALL_DIR/<name> with a symlink in $SHDEPS_BIN_DIR.
 # $1=name $2=cmd $3=extract_dir $4=orig_extract_dir $5=bin_path
 _shdeps_binary_install_from_extracted() {
   local name="$1" cmd="$2" extract_dir="$3" orig_extract_dir="$4" bin_path="$5"
@@ -1464,7 +1467,7 @@ _shdeps_binary_install_zip() {
 # Usage: _shdeps_install_binary <name> <cmd> <owner/repo>
 _shdeps_install_binary() {
   local name="$1" cmd="$2" gh_repo="$3"
-  local bin_path="$HOME/.local/bin/$cmd"
+  local bin_path="$(_shdeps_bin_dir)/$cmd"
   local current_ver="" latest_ver=""
   local log=""
   local stamp
@@ -1556,7 +1559,7 @@ _shdeps_install_binary() {
     return 1
   fi
 
-  mkdir -p "$HOME/.local/bin"
+  mkdir -p "$(_shdeps_bin_dir)"
 
   # Install based on asset type: archive, compressed single, or direct binary
   local asset_lower="${asset_url,,}"
@@ -1657,7 +1660,7 @@ _shdeps_install_dep() {
     ;;
   binary)
     _shdeps_install_binary "$_name" "$_cmd" "$_repo"
-    _shdeps_manifest_upsert "$_name" "binary" "$_cmd" ".local/bin/$_cmd"
+    _shdeps_manifest_upsert "$_name" "binary" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
     ;;
   custom)
     # Source hook file and use exists() to gate install().
@@ -1814,7 +1817,7 @@ _shdeps_prefetch_binary_releases() {
     _shdeps_platform_match "$_platforms" || continue
     _shdeps_host_match "$_hosts" || continue
 
-    local bin_path="$HOME/.local/bin/$_cmd"
+    local bin_path="$(_shdeps_bin_dir)/$_cmd"
     local stamp
     stamp=$(_shdeps_remote_stamp "$_name" binary)
 

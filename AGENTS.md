@@ -44,6 +44,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
 | `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `git` method |
 | `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `git` and `binary` installs |
+| `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
 | `SHDEPS_LOG_LEVEL` | `1` | Logging: 0=quiet, 1=normal, 2=verbose |
 
 ## Config File Format
