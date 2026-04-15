@@ -86,7 +86,7 @@ _shdeps_force()      { echo "${SHDEPS_FORCE:-0}"; }
 _shdeps_reinstall()  { echo "${SHDEPS_REINSTALL:-0}"; }
 _shdeps_quiet()      { echo "${SHDEPS_QUIET:-0}"; }
 _shdeps_remote_ttl() { echo "${SHDEPS_REMOTE_TTL:-3600}"; }
-_shdeps_dev_dir()    { echo "${SHDEPS_GIT_DEV_DIR:-$HOME/git}"; }
+_shdeps_git_dev_dir() { echo "${SHDEPS_GIT_DEV_DIR:-$HOME/git}"; }
 _shdeps_install_dir() { echo "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"; }
 _shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 
@@ -1174,7 +1174,7 @@ _shdeps_install_from_github() {
   local env_var="SHDEPS_${upper}_REPO"
   local repo="${!env_var:-https://github.com/$default_repo}"
   local local_clone
-  local_clone="$(_shdeps_dev_dir)/$name"
+  local_clone="$(_shdeps_git_dev_dir)/$name"
   local stamp
   stamp=$(_shdeps_remote_stamp "$name" git)
   local log=""
