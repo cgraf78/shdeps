@@ -448,6 +448,8 @@ _shdeps_exists() {
     if [[ -n "$alt" ]]; then
       if command -v "$alt" &>/dev/null; then return 0; fi
     fi
+    # Git subcommands (git-foo) live in git's exec-path, not on $PATH.
+    if [[ "$cmd" == git-* ]] && git "${cmd#git-}" --version &>/dev/null; then return 0; fi
   fi
   # Command not found (or empty) — try the package manager directly.
   if [[ -n "$name" ]]; then
@@ -480,6 +482,12 @@ _shdeps_dep_version() {
   # the real answer (e.g., ssh).
   local flag _timeout=""
   command -v timeout &>/dev/null && _timeout="timeout 2"
+  # Git subcommands (git-foo) live in git's exec-path, not on $PATH.
+  if [[ "$cmd" == git-* ]] && ! command -v "$cmd" &>/dev/null; then
+    output=$(git "${cmd#git-}" --version 2>&1 || true)
+    ver=$(echo "$output" | grep -oE '[0-9]+\.[0-9]+[0-9.a-z]*' | head -1)
+    if [[ -n "$ver" ]]; then echo "$ver"; return 0; fi
+  fi
   for flag in --version -V; do
     # shellcheck disable=SC2086  # intentional word splitting on $_timeout
     output=$($_timeout "$cmd" "$flag" 2>&1 || true)
