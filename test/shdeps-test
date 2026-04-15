@@ -35,8 +35,8 @@ cat >"$_test_conf_dir/deps.conf" <<'EOF'
 jq        pkg
 bat       pkg       bat    batcat
 fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
-ds        git       -      -          -                cgraf78/ds.git
-neovim    binary    nvim   -          -                neovim/neovim
+ds        git       -      -          cgraf78/ds.git
+neovim    binary    nvim   -          neovim/neovim
 nerd-fonts custom
 EOF
 
@@ -57,10 +57,10 @@ _shdeps_load
 _assert_eq "minimal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
 _assert_eq "minimal entry: content" "jq|pkg" "${_SHDEPS_DEPS[0]}"
 
-# --- Maximal entry (all 8 fields) ---
+# --- Maximal entry (all 7 fields) ---
 
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-fd  pkg  fd  fdfind  apt:fd-find,dnf:fd-find  -  linux,macos  nas
+fd  pkg  fd  fdfind  apt:fd-find,dnf:fd-find  linux,macos  nas
 EOF
 _shdeps_load
 _assert_eq "maximal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
@@ -104,7 +104,7 @@ tool-a  pkg
 tool-b  pkg
 EOF
 cat >"$_multi_conf_dir/50-extras.conf" <<'EOF'
-tool-c  binary  -  -  -  owner/tool-c
+tool-c  binary  -  -  owner/tool-c
 EOF
 cat >"$_multi_conf_dir/99-local.conf" <<'EOF'
 tool-d  custom
@@ -155,11 +155,11 @@ _assert_eq "shdeps_load: returns count" "2" "$count"
 
 rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-ds  git  -  -  -  cgraf78/ds.git
+ds  git  -  -  cgraf78/ds.git
 EOF
 SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
-_assert_contains "dash fields: preserved in entry" "ds|git|-|-|-|cgraf78/ds.git" "${_SHDEPS_DEPS[0]}"
+_assert_contains "dash fields: preserved in entry" "ds|git|-|-|cgraf78/ds.git" "${_SHDEPS_DEPS[0]}"
 
 # ===========================================================================
 # Section 2: Entry parsing
@@ -168,24 +168,29 @@ _assert_contains "dash fields: preserved in entry" "ds|git|-|-|-|cgraf78/ds.git"
 echo ""
 echo "=== Entry parsing ==="
 
-# --- Full entry with all fields ---
+# --- Full pkg entry with all fields ---
 
-_shdeps_parse "fd|pkg|fd|fdfind|apt:fd-find,dnf:fd-find|owner/fd|linux,macos"
+_shdeps_parse "fd|pkg|fd|fdfind|apt:fd-find,dnf:fd-find|linux,macos"
 _assert_eq "parse full: name" "fd" "$_name"
 _assert_eq "parse full: method" "pkg" "$_method"
 _assert_eq "parse full: cmd" "fd" "$_cmd"
 _assert_eq "parse full: cmd_alt" "fdfind" "$_cmd_alt"
-_assert_eq "parse full: pkg_overrides" "apt:fd-find,dnf:fd-find" "$_pkg_overrides"
-_assert_eq "parse full: repo" "owner/fd" "$_repo"
+_assert_eq "parse full: source" "apt:fd-find,dnf:fd-find" "$_source"
 _assert_eq "parse full: platforms" "linux,macos" "$_platforms"
 _assert_eq "parse full: hosts empty when absent" "" "$_hosts"
 
+# --- Full binary entry (source is owner/repo) ---
+
+_shdeps_parse "neovim|binary|nvim|-|neovim/neovim|linux,macos"
+_assert_eq "parse binary: source" "neovim/neovim" "$_source"
+_assert_eq "parse binary: platforms" "linux,macos" "$_platforms"
+
 # --- Dash fields normalize to empty ---
 
-_shdeps_parse "ds|git|-|-|-|cgraf78/ds.git|-"
-_assert_eq "dash normalize: cmd defaults to name" "ds" "$_cmd"
+_shdeps_parse "pkg-a|pkg|-|-|-"
+_assert_eq "dash normalize: cmd defaults to name" "pkg-a" "$_cmd"
 _assert_eq "dash normalize: cmd_alt empty" "" "$_cmd_alt"
-_assert_eq "dash normalize: pkg_overrides empty" "" "$_pkg_overrides"
+_assert_eq "dash normalize: source empty" "" "$_source"
 _assert_eq "dash normalize: platforms empty" "" "$_platforms"
 _assert_eq "dash normalize: hosts empty" "" "$_hosts"
 
@@ -196,7 +201,7 @@ _assert_eq "parse minimal: name" "jq" "$_name"
 _assert_eq "parse minimal: method" "pkg" "$_method"
 _assert_eq "parse minimal: cmd defaults to name" "jq" "$_cmd"
 _assert_eq "parse minimal: cmd_alt empty" "" "$_cmd_alt"
-_assert_eq "parse minimal: repo empty" "" "$_repo"
+_assert_eq "parse minimal: source empty" "" "$_source"
 
 # --- cmd set explicitly ---
 
@@ -383,15 +388,15 @@ _assert_exit "case-insensitive: uppercase exclude works" 1 "$rc"
 echo ""
 echo "=== Entry parsing (hosts field) ==="
 
-# --- Full entry with all 8 fields ---
+# --- Full entry with all 7 fields ---
 
-_shdeps_parse "codex|binary|codex|-|-|openai/codex|-|nas"
+_shdeps_parse "codex|binary|codex|-|openai/codex|-|nas"
 _assert_eq "parse hosts: name" "codex" "$_name"
 _assert_eq "parse hosts: hosts" "nas" "$_hosts"
 
 # --- Dash hosts normalize to empty ---
 
-_shdeps_parse "jq|pkg|-|-|-|-|-|-"
+_shdeps_parse "jq|pkg|-|-|-|-|-"
 _assert_eq "dash hosts: empty" "" "$_hosts"
 
 # --- Missing hosts field → empty ---
@@ -403,7 +408,7 @@ _assert_eq "missing hosts: empty" "" "$_hosts"
 
 rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-codex  binary  -  -  -  openai/codex  -  nas,taylor
+codex  binary  -  -  openai/codex  -  nas,taylor
 EOF
 SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
@@ -537,7 +542,7 @@ _assert_eq "check_pkg_needed: missing dep → 1" "1" "$_SHDEPS_PKG_INSTALL_NEEDE
 # --- _shdeps_check_pkg_needed: skips non-pkg methods ---
 
 cat >"$_cpn_dir/deps.conf" <<'EOF'
-my-tool  git  -  -  -  user/repo
+my-tool  git  -  -  user/repo
 EOF
 SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
 unset _SHDEPS_PKG_INSTALL_NEEDED
@@ -1837,7 +1842,7 @@ _shdeps_manifest_upsert "dep-c" "git" "dep-c" ".local/share/dep-c"
 # Config has only A, B
 cat >"$_orp_conf/deps.conf" <<'EOF'
 dep-a  pkg
-dep-b  binary  dep-b  -  -  owner/dep-b
+dep-b  binary  dep-b  -  owner/dep-b
 EOF
 _shdeps_load
 
@@ -1848,7 +1853,7 @@ _assert_contains "orphan: dep-c is orphaned" "dep-c" "${_SHDEPS_ORPHANS[0]}"
 
 # manifest matches config → no orphans
 cat >>"$_orp_conf/deps.conf" <<'EOF'
-dep-c  git  -  -  -  owner/dep-c
+dep-c  git  -  -  owner/dep-c
 EOF
 _shdeps_load
 rc=0; _shdeps_detect_orphans || rc=$?
@@ -1878,7 +1883,7 @@ else
   _skip_plat="linux"
 fi
 cat >"$_orp_plat_conf/deps.conf" <<EOF
-dep-x  pkg  -  -  -  -  -  $_skip_plat
+dep-x  pkg  -  -  -  -  $_skip_plat
 EOF
 _shdeps_load
 rc=0; _shdeps_detect_orphans || rc=$?
@@ -2294,7 +2299,7 @@ fi
 
 rm -f "$_integ_dir"/*.conf
 cat > "$_integ_dir/deps.conf" <<EOF
-custom-a  custom  -  -  -  -  -  $_skip_plat
+custom-a  custom  -  -  -  -  $_skip_plat
 custom-b  custom
 EOF
 

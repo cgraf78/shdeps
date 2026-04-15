@@ -247,7 +247,7 @@ _shdeps_check_pkg_needed() {
     _shdeps_platform_match "$_platforms" || continue
     _shdeps_host_match "$_hosts" || continue
     local resolved_pkg
-    resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
+    resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_source")
     [[ "$resolved_pkg" == "NONE" ]] && continue
     if ! _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
       _SHDEPS_PKG_INSTALL_NEEDED=1
@@ -325,15 +325,15 @@ _shdeps_load() {
 # ---------------------------------------------------------------------------
 
 # Split a pipe-delimited registry entry into named variables.
-# Sets: _name, _method, _cmd, _cmd_alt, _pkg_overrides, _repo, _platforms, _hosts
+# Sets: _name, _method, _cmd, _cmd_alt, _source, _platforms, _hosts
+# _source is method-dependent: pkg_overrides for pkg, owner/repo for git/binary.
 _shdeps_parse() {
   local entry="$1"
-  IFS='|' read -r _name _method _cmd _cmd_alt _pkg_overrides _repo _platforms _hosts <<<"$entry"
+  IFS='|' read -r _name _method _cmd _cmd_alt _source _platforms _hosts <<<"$entry"
   # Dash means "use default" / "not specified"
   if [[ "$_cmd" == "-" ]]; then _cmd=""; fi
   if [[ "$_cmd_alt" == "-" ]]; then _cmd_alt=""; fi
-  if [[ "$_pkg_overrides" == "-" ]]; then _pkg_overrides=""; fi
-  if [[ "$_repo" == "-" ]]; then _repo=""; fi
+  if [[ "$_source" == "-" ]]; then _source=""; fi
   if [[ "$_platforms" == "-" ]]; then _platforms=""; fi
   if [[ "$_hosts" == "-" ]]; then _hosts=""; fi
   # Default cmd to name when unspecified
@@ -520,7 +520,7 @@ _shdeps_pkg_detect() {
 }
 
 # Resolve canonical package name to OS-specific name via overrides.
-# $1=name $2=pkg_overrides (e.g. "apt:fd-find,dnf:fd-find")
+# $1=name $2=source (pkg overrides, e.g. "apt:fd-find,dnf:fd-find")
 _shdeps_pkg_resolve() {
   local name="$1" overrides="${2:-}"
   if [[ -n "$overrides" && -n "$_SHDEPS_PKG_MGR" ]]; then
@@ -575,7 +575,7 @@ _shdeps_pkg_refresh_metadata() {
 }
 
 # Queue a package for batched install.
-# $1=name $2=pkg_overrides
+# $1=name $2=source (pkg overrides)
 # Skips if resolved name is NONE (platform not supported) or unavailable.
 _shdeps_pkg_queue() {
   local name="$1" overrides="${2:-}"
@@ -1633,7 +1633,7 @@ _shdeps_install_dep() {
   case "$_method" in
   pkg)
     local resolved_pkg=""
-    resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
+    resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_source")
     if [[ "$resolved_pkg" == "NONE" ]]; then return 0; fi
     if _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
       local ver=""
@@ -1649,17 +1649,17 @@ _shdeps_install_dep() {
       _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
       return 0
     fi
-    _shdeps_pkg_queue "$_name" "$_pkg_overrides"
+    _shdeps_pkg_queue "$_name" "$_source"
     _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
     ;;
   git)
     local _git_install_dir
     _git_install_dir="$(_shdeps_install_dir)/$_name"
-    _shdeps_install_from_github "$_name" "$_repo" "$_git_install_dir"
+    _shdeps_install_from_github "$_name" "$_source" "$_git_install_dir"
     _shdeps_manifest_upsert "$_name" "git" "$_cmd" "$_git_install_dir"
     ;;
   binary)
-    _shdeps_install_binary "$_name" "$_cmd" "$_repo"
+    _shdeps_install_binary "$_name" "$_cmd" "$_source"
     _shdeps_manifest_upsert "$_name" "binary" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
     ;;
   custom)
@@ -1830,7 +1830,7 @@ _shdeps_prefetch_binary_releases() {
     _pf_tmpfiles+=("$tmp")
 
     "${_pf_curl_args[@]}" \
-      "https://api.github.com/repos/$_repo/releases/latest" \
+      "https://api.github.com/repos/$_source/releases/latest" \
       >"$tmp" 2>/dev/null &
     _pf_pids+=($!)
   done

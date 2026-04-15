@@ -83,7 +83,7 @@ cmd_self_update() {
   shdeps_self_update "$SHDEPS_CLI_DIR/.."
 }
 
-# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _platforms, _hosts set by _shdeps_parse
+# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _source, _platforms, _hosts set by _shdeps_parse
 cmd_list() {
   _shdeps_load
   _shdeps_pkg_detect
@@ -119,12 +119,12 @@ cmd_list() {
       continue
     fi
 
-    # shellcheck disable=SC2154  # _cmd, _cmd_alt, _pkg_overrides set by _shdeps_parse
+    # shellcheck disable=SC2154  # _cmd, _cmd_alt, _source set by _shdeps_parse
     local status="missing" details=""
     case "$_method" in
     pkg)
       local resolved
-      resolved=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
+      resolved=$(_shdeps_pkg_resolve "$_name" "$_source")
       if [[ "$resolved" == "NONE" ]]; then
         status="skipped"
         details="(pkg manager)"
@@ -180,7 +180,7 @@ cmd_list() {
   done
 }
 
-# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _pkg_overrides, _platforms, _hosts set by _shdeps_parse
+# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _source, _platforms, _hosts set by _shdeps_parse
 cmd_check() {
   local target="${1:-}"
   if [[ -z "$target" ]]; then
@@ -211,7 +211,7 @@ cmd_check() {
     case "$_method" in
     pkg)
       local resolved
-      resolved=$(_shdeps_pkg_resolve "$_name" "$_pkg_overrides")
+      resolved=$(_shdeps_pkg_resolve "$_name" "$_source")
       if [[ "$resolved" == "NONE" ]]; then
         echo "$_name: skipped (pkg manager)"
         return 0

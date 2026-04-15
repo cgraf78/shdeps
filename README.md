@@ -62,7 +62,7 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 ### Config File Format
 
 ```
-# name    method    [cmd]  [cmd_alt]  [pkg_overrides]  [repo]  [platforms]  [hosts]
+# name    method    [cmd]  [cmd_alt]  [source]  [platforms]  [hosts]
 ```
 
 | Field | Required | Description |
@@ -71,8 +71,7 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 | `method` | yes | Install method: `pkg`, `git`, `binary`, or `custom` |
 | `cmd` | no | Binary to check for existence (defaults to name) |
 | `cmd_alt` | no | Alternate binary name (e.g., `batcat` for `bat`) |
-| `pkg_overrides` | no | Per-manager package names: `apt:fd-find,dnf:fd-find` |
-| `repo` | no | GitHub `owner/repo` (for `git` and `binary` methods) |
+| `source` | no | For `pkg`: per-manager package names (`apt:fd-find,dnf:fd-find`). For `git`/`binary`: GitHub `owner/repo`. |
 | `platforms` | no | Platform filter. Values: `linux`, `macos`, `wsl`. Prefix `!` to exclude. |
 | `hosts` | no | Hostname filter (matches `hostname -s`, case-insensitive). Prefix `!` to exclude. |
 
@@ -104,18 +103,18 @@ Installs via the detected package manager (brew, apt, dnf, or pacman). Packages 
 jq        pkg
 bat       pkg    bat    batcat
 fd        pkg    fd     fdfind    apt:fd-find,dnf:fd-find
-dust      pkg    -      -         -              -    macos
-htop      pkg    -      -         -              -    -    nas
+dust      pkg    -      -         -             macos
+htop      pkg    -      -         -             -    nas
 ```
 
-Use `pkg_overrides` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`). Use `hosts` to limit a dep to specific machines.
+Use `source` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`). Use `hosts` to limit a dep to specific machines.
 
 ### `git` — GitHub Git Repos
 
 Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<name>` (default `~/.local/share/<name>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<name>` (default `~/git/<name>`, symlinked for live development). Falls back to release tarballs, then shallow clones.
 
 ```
-ds    git    -    -    -    cgraf78/ds.git
+ds    git    -    -    cgraf78/ds.git
 ```
 
 Override the repo URL with `SHDEPS_<NAME>_REPO` env vars.
@@ -125,8 +124,8 @@ Override the repo URL with `SHDEPS_<NAME>_REPO` env vars.
 Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries.
 
 ```
-neovim    binary    nvim    -    -    neovim/neovim
-shfmt     binary    -       -    -    mvdan/sh
+neovim    binary    nvim    -    neovim/neovim
+shfmt     binary    -       -    mvdan/sh
 ```
 
 ### `custom` — Hook-Only
