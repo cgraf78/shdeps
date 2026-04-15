@@ -186,7 +186,7 @@ Usage: shdeps [options] <command> [args]
 
 Commands:
   update          Install/update all dependencies
-  self-update     Update shdeps itself (git pull with TTL caching)
+  self-update     Update shdeps itself (git pull, skips dirty trees)
   list            List all configured dependencies with status
   check <name>    Check if a specific dependency is installed
   prune           Remove orphaned deps no longer in config
@@ -254,7 +254,7 @@ The `--bootstrap` flag:
 - **Finds shdeps.sh** via `$SHDEPS_LIB` → `$SHDEPS_GIT_DEV_DIR/shdeps/` → `$SHDEPS_DIR/` → fresh install
 - **Sources it** into the caller (all `shdeps_*` functions become available)
 - **Symlinks the CLI** into `$SHDEPS_BIN` (default `~/.local/bin/shdeps`)
-- **Runs `self-update`** with TTL caching (skips dirty working trees)
+- **Runs `self-update`** (skips dirty working trees)
 - **Is idempotent** — safe to call multiple times
 - **Does not leak `set -e`** into the caller's shell
 
@@ -265,7 +265,7 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | Function | Description |
 |---|---|
 | `shdeps_update` | Install/update all dependencies |
-| `shdeps_self_update [dir]` | Update shdeps itself (TTL-cached git pull, skips dirty trees) |
+| `shdeps_self_update [dir]` | Update shdeps itself (git pull, skips dirty trees) |
 | `shdeps_prune [-y] [--dry-run]` | Remove orphaned deps no longer in config |
 | `shdeps_load` | Parse config and return dep count |
 | `shdeps_version` | Print version string |

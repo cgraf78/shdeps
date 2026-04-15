@@ -2531,69 +2531,25 @@ git clone "$_su_origin" "$_su_dir" >/dev/null 2>&1
 git -C "$_su_dir" config user.email "test@test.com"
 git -C "$_su_dir" config user.name "Test"
 
-# _shdeps_self_update uses its own state dir internally:
-# ${XDG_STATE_HOME:-$HOME/.local/state}/shdeps
-# Tests must use this path for stamp assertions.
-_su_state="$HOME/.local/state/shdeps"
-mkdir -p "$_su_state"
 _source_shdeps "$SHDEPS_DIR"
 
-# --- Fresh stamp triggers pull ---
+# --- Always pulls when origin is ahead ---
 
-SHDEPS_FORCE=0
-_shdeps_self_update "$_su_dir" 2>/dev/null
-_assert_file_exists "self-update: stamp created" "$_su_state/shdeps.self-update.stamp"
-
-# --- Fresh stamp skips pull (within TTL) ---
-
-# Push a new commit to origin from a separate worktree so origin is ahead
-_su_ttl_work=$(_tmpdir)
-git clone "$_su_origin" "$_su_ttl_work" >/dev/null 2>&1
-git -C "$_su_ttl_work" config user.email "test@test.com"
-git -C "$_su_ttl_work" config user.name "Test"
-git -C "$_su_ttl_work" commit --allow-empty -m "ttl-marker" -q
-git -C "$_su_ttl_work" push -q 2>/dev/null
-
-_su_head_before=$(git -C "$_su_dir" rev-parse HEAD)
-SHDEPS_FORCE=0
-_shdeps_self_update "$_su_dir" 2>/dev/null
-_su_head_after=$(git -C "$_su_dir" rev-parse HEAD)
-_assert_eq "self-update TTL: no pull within TTL" "$_su_head_before" "$_su_head_after"
-
-# --- Stale stamp triggers pull ---
-
-echo "1000000000" > "$_su_state/shdeps.self-update.stamp"
-_su_head_before=$(git -C "$_su_dir" rev-parse HEAD)
-SHDEPS_FORCE=0
-_shdeps_self_update "$_su_dir" 2>/dev/null
-_su_head_after=$(git -C "$_su_dir" rev-parse HEAD)
-_assert_neq "self-update stale: pull happened" "$_su_head_before" "$_su_head_after"
-
-# --- Force bypasses TTL ---
-
-# Push a new commit to origin from a separate worktree
 _su_work=$(_tmpdir)
 git clone "$_su_origin" "$_su_work" >/dev/null 2>&1
 git -C "$_su_work" config user.email "test@test.com"
 git -C "$_su_work" config user.name "Test"
-git -C "$_su_work" commit --allow-empty -m "force-test" -q
+git -C "$_su_work" commit --allow-empty -m "pull-test" -q
 git -C "$_su_work" push -q 2>/dev/null
 
 _su_head_before=$(git -C "$_su_dir" rev-parse HEAD)
-SHDEPS_FORCE=1
 _shdeps_self_update "$_su_dir" 2>/dev/null
 _su_head_after=$(git -C "$_su_dir" rev-parse HEAD)
-_assert_neq "self-update force: pulled new commit" "$_su_head_before" "$_su_head_after"
-
-# Reset force
-SHDEPS_FORCE=0
-_source_shdeps "$SHDEPS_DIR"
+_assert_neq "self-update: pulled new commit" "$_su_head_before" "$_su_head_after"
 
 # --- Dirty working tree skips pull ---
 
 echo "dirty" >> "$_su_dir/shdeps.sh"
-# Make stamp stale so TTL wouldn't block
-echo "1000000000" > "$_su_state/shdeps.self-update.stamp"
 _su_head_before=$(git -C "$_su_dir" rev-parse HEAD)
 _shdeps_self_update "$_su_dir" 2>/dev/null
 _su_head_after=$(git -C "$_su_dir" rev-parse HEAD)

@@ -1976,40 +1976,20 @@ _shdeps_self_update() {
     return 1
   fi
 
-  # Use shdeps's own state dir for the stamp, not the caller's override,
-  # so the TTL is shared with standalone `shdeps self-update` calls.
-  local _saved_state="${SHDEPS_STATE_DIR:-}"
-  SHDEPS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/shdeps"
-
-  local stamp
-  stamp=$(_shdeps_remote_stamp "shdeps" "self-update")
-
-  if _shdeps_remote_fresh "$stamp"; then
-    SHDEPS_STATE_DIR="$_saved_state"
-    return 0
-  fi
-
   # Skip if dirty (uncommitted changes = active development)
   if [[ -n "$(git -C "$shdeps_dir" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
-    SHDEPS_STATE_DIR="$_saved_state"
     return 0
   fi
 
   if git -C "$shdeps_dir" pull --ff-only --quiet 2>/dev/null; then
-    _shdeps_remote_touch "$stamp" || true
     # Re-source if shdeps.sh was updated so in-memory functions are current
     if [[ -f "$shdeps_dir/shdeps.sh" ]]; then
-      SHDEPS_STATE_DIR="$_saved_state"
       # shellcheck source=/dev/null
       . "$shdeps_dir/shdeps.sh"
-      return 0
     fi
   else
     _shdeps_warn "shdeps: self-update failed (git pull --ff-only failed)"
-    _shdeps_remote_touch "$stamp" || true
   fi
-
-  SHDEPS_STATE_DIR="$_saved_state"
 }
 
 # ---------------------------------------------------------------------------

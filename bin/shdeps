@@ -36,7 +36,7 @@ Usage: shdeps [options] <command> [args]
 
 Commands:
   update          Install/update all dependencies
-  self-update     Update shdeps itself (git pull with TTL caching)
+  self-update     Update shdeps itself (git pull, skips dirty trees)
   list            List all configured dependencies with status
   check <name>    Check if a specific dependency is installed
   prune           Remove orphaned deps no longer in config
