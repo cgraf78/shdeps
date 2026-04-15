@@ -1167,12 +1167,14 @@ _shdeps_link_extras() {
   if [[ ${#created_links[@]} -gt 0 ]]; then
     mkdir -p "$state_dir"
     printf '%s\n' "${created_links[@]}" > "$state_dir/$name.links"
-    _shdeps_extras_hint
+    _SHDEPS_EXTRAS_LINKED=1
   fi
 }
 
 # Print a one-time hint about MANPATH and fpath setup.
+# Called at the end of _shdeps_update to avoid interrupting the dep list.
 _shdeps_extras_hint() {
+  [[ "${_SHDEPS_EXTRAS_LINKED:-0}" -eq 1 ]] || return 0
   local state_dir
   state_dir=$(_shdeps_state_dir)
   local stamp="$state_dir/extras-hint.shown"
@@ -1180,7 +1182,7 @@ _shdeps_extras_hint() {
   mkdir -p "$state_dir"
   touch "$stamp"
   _shdeps_log ""
-  _shdeps_log "  ${_SHDEPS_C_BOLD}Extras linked:${_SHDEPS_C_RESET} man pages and completions symlinked to ~/.local/share/"
+  _shdeps_log "  ${_SHDEPS_C_GREEN}Extras linked:${_SHDEPS_C_RESET} man pages and completions symlinked to ~/.local/share/"
   _shdeps_log "  To enable, add to your shell config:"
   _shdeps_log "    ${_SHDEPS_C_DIM}export MANPATH=\"\$HOME/.local/share/man:\$MANPATH\"${_SHDEPS_C_RESET}"
   _shdeps_log "    ${_SHDEPS_C_DIM}fpath=(\"\$HOME/.local/share/zsh/site-functions\" \$fpath)  # before compinit${_SHDEPS_C_RESET}"
@@ -2132,4 +2134,6 @@ _shdeps_update() {
     _shdeps_warn "  $_orphan_list"
     _shdeps_warn "  Run: shdeps prune"
   fi
+
+  _shdeps_extras_hint
 }
