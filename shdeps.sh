@@ -1738,6 +1738,9 @@ _shdeps_install_binary() {
   if [[ "$(_shdeps_reinstall)" -ne 1 && -n "$current_ver" && -n "$latest_ver_num" && "$current_ver" == "$latest_ver_num" ]]; then
     rm -f "$tmp_file" "$log"
     _shdeps_remote_touch "$stamp" || true
+    local install_dir
+    install_dir="$(_shdeps_install_dir)/$name"
+    _shdeps_link_extras "$name" "$install_dir"
     _shdeps_log "  $name -- $current_ver"
     return 0
   fi
