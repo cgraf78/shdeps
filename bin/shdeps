@@ -94,8 +94,16 @@ cmd_list() {
     return 0
   fi
 
-  printf '%-20s %-8s %-12s %s\n' "NAME" "METHOD" "STATUS" "DETAILS"
-  printf '%-20s %-8s %-12s %s\n' "----" "------" "------" "-------"
+  # Pre-pass: find the longest dep name to size the NAME column.
+  local _col=4  # minimum: length of "NAME"
+  local _e
+  for _e in "${_SHDEPS_DEPS[@]}"; do
+    local _n="${_e%%|*}"
+    (( ${#_n} > _col )) && _col=${#_n}
+  done
+
+  printf "%-${_col}s %-8s %-12s %s\n" "NAME" "METHOD" "STATUS" "DETAILS"
+  printf "%-${_col}s %-8s %-12s %s\n" "----" "------" "------" "-------"
 
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
@@ -103,11 +111,11 @@ cmd_list() {
 
     # shellcheck disable=SC2154  # _name, _method, _cmd, etc. set by _shdeps_parse
     if ! shdeps_platform_match "$_platforms"; then
-      printf '%-20s %-8s %-12s %s\n' "$_name" "$_method" "skipped" "(platform)"
+      printf "%-${_col}s %-8s %-12s %s\n" "$_name" "$_method" "skipped" "(platform)"
       continue
     fi
     if ! shdeps_host_match "$_hosts"; then
-      printf '%-20s %-8s %-12s %s\n' "$_name" "$_method" "skipped" "(host)"
+      printf "%-${_col}s %-8s %-12s %s\n" "$_name" "$_method" "skipped" "(host)"
       continue
     fi
 
@@ -168,7 +176,7 @@ cmd_list() {
       ;;
     esac
 
-    printf '%-20s %-8s %-12s %s\n' "$_name" "$_method" "$status" "$details"
+    printf "%-${_col}s %-8s %-12s %s\n" "$_name" "$_method" "$status" "$details"
   done
 }
 
