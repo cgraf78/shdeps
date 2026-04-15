@@ -1467,7 +1467,8 @@ _shdeps_binary_install_zip() {
 # Usage: _shdeps_install_binary <name> <cmd> <owner/repo>
 _shdeps_install_binary() {
   local name="$1" cmd="$2" gh_repo="$3"
-  local bin_path="$(_shdeps_bin_dir)/$cmd"
+  local bin_path
+  bin_path="$(_shdeps_bin_dir)/$cmd"
   local current_ver="" latest_ver=""
   local log=""
   local stamp
@@ -1817,7 +1818,8 @@ _shdeps_prefetch_binary_releases() {
     _shdeps_platform_match "$_platforms" || continue
     _shdeps_host_match "$_hosts" || continue
 
-    local bin_path="$(_shdeps_bin_dir)/$_cmd"
+    local bin_path
+    bin_path="$(_shdeps_bin_dir)/$_cmd"
     local stamp
     stamp=$(_shdeps_remote_stamp "$_name" binary)
 
