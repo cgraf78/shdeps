@@ -584,6 +584,7 @@ _shdeps_pkg_queue() {
   if [[ "$resolved" == "NONE" ]]; then
     return 0
   fi
+  _shdeps_log_status "  $name: checking ${_SHDEPS_PKG_MGR} repos..."
   if ! _shdeps_pkg_available "$resolved"; then
     _shdeps_warn "  warning: $name not available in $_SHDEPS_PKG_MGR repos — skipping"
     return 0
