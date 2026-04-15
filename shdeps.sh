@@ -1641,7 +1641,10 @@ _shdeps_binary_install_tarball() {
     _shdeps_warn "  warning: failed to create extract dir for $name"
     return 1
   }
-  if ! tar xf "$tmp_file" -C "$extract_dir" 2>/dev/null; then
+  # --no-same-owner: when running as root, tar preserves original file
+  # ownership from the archive, which causes zsh compaudit to flag
+  # completion files as insecure (wrong owner).
+  if ! tar xf "$tmp_file" -C "$extract_dir" --no-same-owner 2>/dev/null; then
     rm -rf "$extract_dir" "$tmp_file" "$log"
     _shdeps_warn "  warning: failed to extract $name tarball"
     return 1
