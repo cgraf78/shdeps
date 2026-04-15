@@ -1960,14 +1960,12 @@ _shdeps_run_post_hooks() {
 }
 
 # ---------------------------------------------------------------------------
-# Self-update — pull latest shdeps if clean and TTL expired
+# Self-update — pull latest shdeps if clean
 # ---------------------------------------------------------------------------
 
-# Update the shdeps installation itself (git pull with TTL caching).
+# Update the shdeps installation itself (git pull --ff-only).
 # Locates the shdeps source directory from BASH_SOURCE, or accepts an
 # explicit directory via $1. Skips dirty working trees (active development).
-# Uses its own state dir (not the caller's SHDEPS_STATE_DIR) so the TTL
-# stamp is shared across standalone and embedded invocations.
 _shdeps_self_update() {
   local shdeps_dir="${1:-${BASH_SOURCE[0]%/*}}"
 
