@@ -55,6 +55,7 @@ shdeps_reinstall()      { [[ "$(_shdeps_reinstall)" -eq 1 ]]; }
 shdeps_pkg_mgr()        { echo "${_SHDEPS_PKG_MGR:-}"; }
 shdeps_require_sudo()   { _shdeps_require_sudo; }
 shdeps_install_dir()    { _shdeps_install_dir; }
+shdeps_git_dev_dir()    { _shdeps_git_dev_dir; }
 
 # Logging
 shdeps_log()            { _shdeps_log "$@"; }

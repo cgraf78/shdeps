@@ -250,6 +250,8 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | `shdeps_force` | Return 0 if force mode is active (TTL bypass) |
 | `shdeps_reinstall` | Return 0 if reinstall mode is active |
 | `shdeps_pkg_mgr` | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, or empty) |
+| `shdeps_install_dir` | Print base install directory (`$SHDEPS_INSTALL_DIR`, default `~/.local/share`) |
+| `shdeps_git_dev_dir` | Print git dev clone directory (`$SHDEPS_GIT_DEV_DIR`, default `~/git`) |
 | `shdeps_require_sudo` | Acquire sudo; returns 0 if root or sudo obtained |
 | `shdeps_log` | Normal log line |
 | `shdeps_warn` | Warning (always shown unless quiet) |
