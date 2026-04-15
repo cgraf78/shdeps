@@ -3,4 +3,6 @@ enable=all
 # SC2250: prefer ${var} over $var for consistency — not enforced here
 # SC2312: command substitution in [[ ]] — masking is fine for simple accessors
 # SC2249: default *) case — intentional no-op fallthrough in package manager dispatch
-disable=SC2250,SC2312,SC2249
+# SC2119: subcommand dispatchers intentionally don't forward $@ to library functions
+# SC2310: boolean-returning functions intentionally used in if/!/|| conditions
+disable=SC2250,SC2312,SC2249,SC2119,SC2310

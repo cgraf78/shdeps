@@ -23,6 +23,36 @@ _mock_home
 _source_shdeps "$SHDEPS_DIR"
 
 # ===========================================================================
+# Section 0: Static analysis
+# ===========================================================================
+
+echo "=== ShellCheck ==="
+
+_sc_files=()
+while IFS= read -r _tracked; do
+  _f="$SHDEPS_DIR/$_tracked"
+  [[ -f "$_f" && ! -L "$_f" ]] || continue
+  case "$_tracked" in
+    *.sh | *.bash) _sc_files+=("$_f"); continue ;;
+  esac
+  IFS= read -r _first <"$_f" || true
+  case "$_first" in
+    '#!/usr/bin/env bash' | '#!/bin/bash') _sc_files+=("$_f") ;;
+  esac
+done < <(git -C "$SHDEPS_DIR" ls-tree -r --name-only HEAD)
+
+if [[ "${#_sc_files[@]}" -eq 0 ]]; then
+  _fail "shellcheck: no files discovered"
+elif _sc_output=$(shellcheck -x -P SCRIPTDIR "${_sc_files[@]}" 2>&1); then
+  _pass "shellcheck: all files clean"
+else
+  _fail "shellcheck: findings detected"
+  while IFS= read -r _line; do
+    printf '    %s\n' "$_line" >&2
+  done <<<"$_sc_output"
+fi
+
+# ===========================================================================
 # Section 1: Config parsing
 # ===========================================================================
 
@@ -475,7 +505,7 @@ _assert_eq "queue: NONE skips" "0" "${#_SHDEPS_PKG_BATCH[@]}"
 # --- _shdeps_pkg_queue: resolved package added to batch ---
 
 # Mock _shdeps_pkg_available to always succeed for testing
-# shellcheck disable=SC2317  # invoked indirectly via _shdeps_pkg_queue
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via _shdeps_pkg_queue
 _shdeps_pkg_available() { return 0; }
 _SHDEPS_PKG_BATCH=()
 _SHDEPS_PKG_BATCH_NAMES=()
@@ -492,7 +522,7 @@ _assert_eq "queue: second pkg" "jq" "${_SHDEPS_PKG_BATCH[1]}"
 
 # --- _shdeps_pkg_queue: unavailable package skipped ---
 
-# shellcheck disable=SC2317  # invoked indirectly via _shdeps_pkg_queue
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via _shdeps_pkg_queue
 _shdeps_pkg_available() { return 1; }
 _SHDEPS_PKG_BATCH=()
 _SHDEPS_PKG_BATCH_NAMES=()
