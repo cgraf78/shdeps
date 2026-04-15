@@ -1,0 +1,345 @@
+.TH SHDEPS 1 "2026-04-15" "shdeps 0.3.0" "User Commands"
+.SH NAME
+shdeps \- declarative shell dependency manager
+.SH SYNOPSIS
+.B shdeps
+.RI [ options ]
+.I command
+.RI [ args ]
+.SH DESCRIPTION
+.B shdeps
+reads declarative config files and installs or updates shell tools via
+system package managers, GitHub git repos, GitHub release binaries, or
+fully custom hooks.
+Dependencies are declared in
+.B *.conf
+files within a config directory (default:
+.IR ~/.config/shdeps/ ).
+.SH COMMANDS
+.TP
+.B update
+Install or update all configured dependencies.
+.TP
+.B self\-update
+Update shdeps itself by pulling the latest from its git repository.
+Skips the update if the local tree has uncommitted changes.
+.TP
+.B list
+List all configured dependencies with columns for name, method, status,
+and version details.
+.TP
+.BI check " name"
+Check whether a specific dependency is installed.
+Exits 0 if installed, 1 if not.
+.TP
+.B prune
+Remove orphaned dependencies that are no longer present in any config file.
+Accepts
+.B \-y
+to skip the confirmation prompt and
+.B \-\-dry\-run
+to preview what would be removed.
+.TP
+.B version
+Print the shdeps version string.
+.TP
+.B help
+Show the built-in help message.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIpath\fR
+Config directory or file.
+If a file is given, its parent directory is used.
+Default:
+.IR ~/.config/shdeps/ .
+.TP
+.BR \-f ", " \-\-force
+Bypass the TTL cache and check for updates immediately.
+.TP
+.BR \-R ", " \-\-reinstall
+Force reinstall all dependencies.
+Implies
+.BR \-\-force .
+.TP
+.BR \-q ", " \-\-quiet
+Suppress interactive prompts.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output (log level 2).
+.TP
+.BR \-h ", " \-\-help
+Show the help message.
+.SS Prune options
+.TP
+.B \-y
+Skip the confirmation prompt during prune.
+.TP
+.B \-\-dry\-run
+Show what would be removed without actually removing anything.
+.SH CONFIGURATION
+Config files use a whitespace-delimited format.
+All
+.B *.conf
+files in the config directory are loaded, sorted alphabetically.
+Lines starting with
+.B #
+are comments.
+.PP
+.RS
+.nf
+# name    method    [cmd]  [cmd_alt]  [source]         [platforms]  [hosts]
+jq        pkg
+bat       pkg       bat    batcat
+fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
+ds        git       \-      \-          cgraf78/ds.git
+neovim    binary    nvim   \-          neovim/neovim
+dust      pkg       \-      \-          \-                macos
+htop      pkg       \-      \-          \-                \-            nas
+nerd-fonts custom
+.fi
+.RE
+.SS Fields
+.TP
+.B name
+Required.
+Identifier for the dependency.
+.TP
+.B method
+Required.
+One of
+.BR pkg ", " git ", " binary ", or " custom .
+.TP
+.B cmd
+Binary name to check for.
+Defaults to
+.IR name .
+Use
+.B \-
+to keep the default.
+.TP
+.B cmd_alt
+Alternate binary name (e.g.,
+.B batcat
+on Debian for
+.BR bat ).
+.TP
+.B source
+For
+.BR pkg :
+comma-separated per-manager overrides (e.g.,
+.BR apt:fd-find,dnf:fd-find ).
+Use
+.B NONE
+to skip a specific manager.
+For
+.BR git " and " binary :
+GitHub
+.IB owner / repo
+(e.g.,
+.BR neovim/neovim ).
+.TP
+.B platforms
+Comma-separated platform filter:
+.BR linux ", " macos ", " wsl .
+Prefix with
+.B !
+to exclude.
+.TP
+.B hosts
+Comma-separated hostname filter, same syntax as platforms.
+.SS Install Methods
+.TP
+.B pkg
+Uses the detected system package manager (brew, apt, dnf, or pacman).
+Batches all pkg installs into one command; retries individually on failure.
+.TP
+.B git
+Clones from GitHub.
+Prefers a local dev clone in
+.B $SHDEPS_GIT_DEV_DIR
+if present; otherwise pulls existing clones, fetches release tarballs, or
+falls back to a shallow clone.
+.TP
+.B binary
+Downloads a pre-built binary from GitHub Releases.
+Handles
+.BR .tar.gz ", " .tar.xz ", " .tar.bz2 ", " .zip ", " .gz ", " .bz2 ", " .zst ,
+and raw binaries.
+.TP
+.B custom
+Hook-only.
+Requires
+.B exists()
+and
+.B install()
+functions in the hook file.
+.SH HOOKS
+Hook files are sourced from
+.IB $SHDEPS_HOOKS_DIR / name .sh
+(default:
+.IR <conf_dir>/hooks.d/ ).
+They may define the following functions:
+.TP
+.BI exists( name )
+Required for custom deps.
+Return 0 if the dependency is installed.
+.TP
+.BI install( name )
+Perform the installation.
+.TP
+.BI version( name )
+Print a version string.
+.TP
+.BI post( name )
+Post-install setup.
+Runs after any method if the dependency changed.
+.TP
+.BI uninstall( name )
+Cleanup during
+.BR "shdeps prune" .
+For custom deps this is the only cleanup path.
+For git/binary deps it runs before built-in cleanup.
+.SH EXTRAS LINKING
+For
+.B git
+and
+.B binary
+installs, shdeps auto-discovers and symlinks man pages
+and shell completions to user-local directories:
+.PP
+.RS
+.nf
+Man pages       ~/.local/share/man/man<N>/
+Bash completions ~/.local/share/bash-completion/completions/
+Zsh completions  ~/.local/share/zsh/site-functions/
+Fish completions ~/.local/share/fish/vendor_completions.d/
+.fi
+.RE
+.PP
+Tracked per-dep in
+.IR $SHDEPS_STATE_DIR/<name>.links .
+.SH ENVIRONMENT
+.TP
+.B SHDEPS_CONF_DIR
+Config directory.
+Default:
+.I ~/.config/shdeps/
+(CLI) or
+.I ./shdeps/
+(library mode).
+.TP
+.B SHDEPS_HOOKS_DIR
+Hooks directory.
+Default:
+.IR <conf_dir>/hooks.d .
+.TP
+.B SHDEPS_STATE_DIR
+State and cache directory.
+Default:
+.IR $XDG_STATE_HOME/shdeps .
+.TP
+.B SHDEPS_FORCE
+Set to
+.B 1
+to bypass TTL cache.
+.TP
+.B SHDEPS_REINSTALL
+Set to
+.B 1
+to force reinstall all deps.
+.TP
+.B SHDEPS_QUIET
+Set to
+.B 1
+to suppress interactive prompts.
+.TP
+.B SHDEPS_REMOTE_TTL
+Cache TTL in seconds.
+Default: 3600.
+.TP
+.B SHDEPS_GIT_DEV_DIR
+Dev clone directory for the git method.
+Default:
+.IR ~/git .
+.TP
+.B SHDEPS_INSTALL_DIR
+Base directory for git and binary installs.
+Default:
+.IR ~/.local/share .
+.TP
+.B SHDEPS_BIN_DIR
+Directory for binary symlinks.
+Default:
+.IR ~/.local/bin .
+.TP
+.B SHDEPS_LOG_LEVEL
+Logging verbosity: 0=quiet, 1=normal, 2=verbose.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error (dependency not found, install failure, etc.).
+.TP
+.B 2
+Usage error (unknown command or missing argument).
+.SH FILES
+.TP
+.I ~/.config/shdeps/*.conf
+Default config files.
+.TP
+.I ~/.config/shdeps/hooks.d/*.sh
+Hook scripts.
+.TP
+.I $SHDEPS_STATE_DIR/manifest
+Installed dependency manifest.
+.SH EXAMPLES
+Install or update all dependencies:
+.PP
+.RS
+.B shdeps update
+.RE
+.PP
+Force update, bypassing TTL cache:
+.PP
+.RS
+.B shdeps \-\-force update
+.RE
+.PP
+Use an alternate config directory:
+.PP
+.RS
+.B shdeps \-c ~/.config/myapp/ update
+.RE
+.PP
+List all dependencies and their status:
+.PP
+.RS
+.B shdeps list
+.RE
+.PP
+Check if a specific dependency is installed:
+.PP
+.RS
+.B shdeps check jq
+.RE
+.PP
+Preview orphaned dependencies without removing:
+.PP
+.RS
+.B shdeps prune \-\-dry\-run
+.RE
+.PP
+Remove orphaned dependencies without confirmation:
+.PP
+.RS
+.B shdeps prune \-y
+.RE
+.SH SEE ALSO
+.BR brew (1),
+.BR apt (8),
+.BR dnf (8),
+.BR gh (1)
+.SH AUTHORS
+Chris Graf

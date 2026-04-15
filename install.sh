@@ -41,6 +41,21 @@ _check_prereqs() {
   fi
 }
 
+# Symlink CLI into PATH and link man page + shell completions.
+# Requires shdeps.sh to be sourced first (for _shdeps_link_extras).
+_setup_links() {
+  local shdeps_dir="$1"
+
+  if [[ -x "$shdeps_dir/bin/shdeps" ]]; then
+    mkdir -p "$(dirname "$SHDEPS_BIN")"
+    ln -sf "$shdeps_dir/bin/shdeps" "$SHDEPS_BIN"
+  fi
+
+  if declare -f _shdeps_link_extras &>/dev/null; then
+    _shdeps_link_extras "shdeps" "$shdeps_dir"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Install / update
 # ---------------------------------------------------------------------------
@@ -67,10 +82,11 @@ _install() {
     _info "shdeps: installed"
   fi
 
-  # Symlink CLI into PATH
-  if [[ -x "$SHDEPS_DIR/bin/shdeps" ]]; then
-    mkdir -p "$(dirname "$SHDEPS_BIN")"
-    ln -sf "$SHDEPS_DIR/bin/shdeps" "$SHDEPS_BIN"
+  # Source the library and set up all symlinks (CLI, man, completions)
+  if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
+    # shellcheck source=/dev/null
+    . "$SHDEPS_DIR/shdeps.sh"
+    _setup_links "$SHDEPS_DIR"
   fi
 
   # Hint if the bin directory isn't on PATH
@@ -129,13 +145,11 @@ _bootstrap() {
   # shellcheck source=/dev/null
   . "$_bs_lib" || return 1
 
-  # Symlink CLI into PATH
-  if [[ -n "$_bs_dir" && -x "$_bs_dir/bin/shdeps" ]]; then
-    mkdir -p "$(dirname "$SHDEPS_BIN")"
-    ln -sf "$_bs_dir/bin/shdeps" "$SHDEPS_BIN"
-  fi
+  # Set up all symlinks (CLI, man, completions)
+  [[ -n "$_bs_dir" ]] && _setup_links "$_bs_dir"
 
   # Pull latest shdeps (skips dirty clones / active development).
+  # Self-update re-links extras after pulling, so changes are picked up.
   if [[ -n "$_bs_dir" ]] && declare -f _shdeps_self_update &>/dev/null; then
     _shdeps_self_update "$_bs_dir" 2>/dev/null || true
   fi
@@ -147,6 +161,14 @@ _bootstrap() {
 
 _uninstall() {
   local removed=0
+
+  # Clean up extras symlinks (man page, completions) before removing the repo
+  if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
+    # shellcheck source=/dev/null
+    . "$SHDEPS_DIR/shdeps.sh"
+    _shdeps_unlink_extras "shdeps"
+  fi
+
   if [[ -L "$SHDEPS_BIN" ]]; then
     rm "$SHDEPS_BIN"
     ((removed++)) || true

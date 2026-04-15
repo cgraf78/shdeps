@@ -1974,20 +1974,21 @@ _shdeps_self_update() {
     return 1
   fi
 
-  # Skip if dirty (uncommitted changes = active development)
-  if [[ -n "$(git -C "$shdeps_dir" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
-    return 0
+  # Pull latest unless dirty (uncommitted changes = active development)
+  if [[ -z "$(git -C "$shdeps_dir" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+    if git -C "$shdeps_dir" pull --ff-only --quiet 2>/dev/null; then
+      # Re-source if shdeps.sh was updated so in-memory functions are current
+      if [[ -f "$shdeps_dir/shdeps.sh" ]]; then
+        # shellcheck source=/dev/null
+        . "$shdeps_dir/shdeps.sh"
+      fi
+    else
+      _shdeps_warn "shdeps: self-update failed (git pull --ff-only failed)"
+    fi
   fi
 
-  if git -C "$shdeps_dir" pull --ff-only --quiet 2>/dev/null; then
-    # Re-source if shdeps.sh was updated so in-memory functions are current
-    if [[ -f "$shdeps_dir/shdeps.sh" ]]; then
-      # shellcheck source=/dev/null
-      . "$shdeps_dir/shdeps.sh"
-    fi
-  else
-    _shdeps_warn "shdeps: self-update failed (git pull --ff-only failed)"
-  fi
+  # Always re-link extras (man page, completions) from current tree
+  _shdeps_link_extras "shdeps" "$shdeps_dir"
 }
 
 # ---------------------------------------------------------------------------
