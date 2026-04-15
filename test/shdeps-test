@@ -1407,7 +1407,7 @@ SHDEPS_LOG_LEVEL=1
 _shdeps_load
 declare -gA _SHDEPS_CHANGED=()
 _ver_log=$(_tmpdir)/ver.log
-_shdeps_install_dep "${_SHDEPS_DEPS[0]}" 2>"$_ver_log"
+_shdeps_install_dep "${_SHDEPS_DEPS[0]}" >"$_ver_log"
 _ver_output=$(cat "$_ver_log")
 _assert_contains "version: included in added output" "3.14" "$_ver_output"
 _source_shdeps "$SHDEPS_DIR"
@@ -1438,8 +1438,8 @@ echo "=== Public API functions ==="
 
 # --- shdeps_log delegates to internal ---
 
-_api_log_output=$(_shdeps_log_level_override=1 shdeps_log "test message" 2>&1)
-# Log output goes to stderr, so just verify it doesn't error
+_api_log_output=$(_shdeps_log_level_override=1 shdeps_log "test message")
+# Log output goes to stdout, verify it doesn't error
 _assert_exit "shdeps_log: no error" 0 $?
 
 # --- shdeps_warn delegates to internal ---
@@ -2573,19 +2573,19 @@ rc=0
 _shdeps_self_update "$_su_nongit" 2>/dev/null || rc=$?
 _assert_exit "self-update non-git: exits 1" 1 "$rc"
 
-# --- Re-sourcing under stderr redirection preserves ANSI codes ---
+# --- Re-sourcing under stdout redirection preserves ANSI codes ---
 # Self-update re-sources shdeps.sh after pulling. If the caller redirected
-# stderr (e.g. install.sh --bootstrap does 2>/dev/null), the [[ -t 2 ]]
+# stdout (e.g. install.sh --bootstrap does >/dev/null), the [[ -t 1 ]]
 # check would fail and wipe ANSI codes. The guard must preserve them.
 
 _source_shdeps "$SHDEPS_DIR"
 # Simulate initial source with a terminal — set ANSI codes
 _SHDEPS_C_RESET=$'\033[0m'
 _SHDEPS_C_CLEARLN=$'\r\033[2K'
-# Re-source under stderr redirection (simulates self-update path)
-. "$SHDEPS_DIR/shdeps.sh" 2>/dev/null
-_assert_eq "re-source: ANSI codes preserved under 2>/dev/null" $'\033[0m' "$_SHDEPS_C_RESET"
-_assert_eq "re-source: CLEARLN preserved under 2>/dev/null" $'\r\033[2K' "$_SHDEPS_C_CLEARLN"
+# Re-source under stdout redirection (simulates self-update path)
+. "$SHDEPS_DIR/shdeps.sh" >/dev/null
+_assert_eq "re-source: ANSI codes preserved under >/dev/null" $'\033[0m' "$_SHDEPS_C_RESET"
+_assert_eq "re-source: CLEARLN preserved under >/dev/null" $'\r\033[2K' "$_SHDEPS_C_CLEARLN"
 
 # ===========================================================================
 

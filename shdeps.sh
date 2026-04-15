@@ -91,11 +91,11 @@ _shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 # Logging — callers may override by defining these before sourcing
 # ---------------------------------------------------------------------------
 
-# ANSI color codes, enabled only when stderr is a terminal.
+# ANSI color codes, enabled only when stdout is a terminal.
 # Skip if already set — re-sourcing (e.g. self-update) may happen under
-# stderr redirection, which would incorrectly clear the codes.
+# stdout redirection, which would incorrectly clear the codes.
 if [[ -z "${_SHDEPS_C_RESET+x}" ]]; then
-  if [[ -t 2 ]]; then
+  if [[ -t 1 ]]; then
     _SHDEPS_C_RESET=$'\033[0m'
     _SHDEPS_C_RED=$'\033[0;31m'
     _SHDEPS_C_GREEN=$'\033[0;32m'
@@ -113,16 +113,16 @@ _SHDEPS_STATUS_ACTIVE=0
 # Clear any active status line before printing a permanent log line.
 _shdeps_log_clear() {
   if [[ $_SHDEPS_STATUS_ACTIVE -eq 1 ]]; then
-    printf '%s' "${_SHDEPS_C_CLEARLN}" >&2
+    printf '%s' "${_SHDEPS_C_CLEARLN}"
     _SHDEPS_STATUS_ACTIVE=0
   fi
 }
 
 # Temporary in-place status (overwritten by the next log line).
-# No-op when stderr is not a terminal or log level is 0.
+# No-op when stdout is not a terminal or log level is 0.
 _shdeps_log_status() {
   if [[ -z "$_SHDEPS_C_CLEARLN" ]] || ! _shdeps_should_log; then return 0; fi
-  printf '%s%s%s%s' "${_SHDEPS_C_CLEARLN}" "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >&2
+  printf '%s%s%s%s' "${_SHDEPS_C_CLEARLN}" "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}"
   _SHDEPS_STATUS_ACTIVE=1
 }
 
@@ -136,11 +136,11 @@ _shdeps_should_log() {
 # Normal log line (level >= 1, not quiet).
 _shdeps_log() {
   _shdeps_log_clear
-  if _shdeps_should_log; then printf '%s\n' "$*" >&2; fi
+  if _shdeps_should_log; then printf '%s\n' "$*"; fi
   return 0
 }
 
-# Warning (same visibility as normal log).
+# Warning (red, always to stderr).
 _shdeps_warn() {
   _shdeps_log_clear
   if _shdeps_should_log; then
@@ -153,7 +153,7 @@ _shdeps_warn() {
 _shdeps_log_ok() {
   _shdeps_log_clear
   if _shdeps_should_log; then
-    printf '%s%s%s\n' "${_SHDEPS_C_GREEN}" "$*" "${_SHDEPS_C_RESET}" >&2
+    printf '%s%s%s\n' "${_SHDEPS_C_GREEN}" "$*" "${_SHDEPS_C_RESET}"
   fi
   return 0
 }
@@ -162,7 +162,7 @@ _shdeps_log_ok() {
 _shdeps_log_dim() {
   _shdeps_log_clear
   if _shdeps_should_log; then
-    printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >&2
+    printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}"
   fi
   return 0
 }
@@ -171,7 +171,7 @@ _shdeps_log_dim() {
 _shdeps_log_header() {
   _shdeps_log_clear
   if _shdeps_should_log; then
-    printf '%s%s%s\n' "${_SHDEPS_C_BOLD}" "$*" "${_SHDEPS_C_RESET}" >&2
+    printf '%s%s%s\n' "${_SHDEPS_C_BOLD}" "$*" "${_SHDEPS_C_RESET}"
   fi
   return 0
 }
