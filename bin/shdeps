@@ -147,7 +147,8 @@ cmd_list() {
       fi
       ;;
     binary)
-      local bin_path="$(_shdeps_bin_dir)/$_cmd"
+      local bin_path
+      bin_path="$(_shdeps_bin_dir)/$_cmd"
       if [[ -x "$bin_path" ]]; then
         status="installed"
         local ver
