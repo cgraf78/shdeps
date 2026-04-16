@@ -5,7 +5,7 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-A cross-platform (macOS, Linux, WSL) shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers (brew, apt, dnf, pacman), GitHub repos, or GitHub release binaries.
+A cross-platform (macOS, Linux, WSL) shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers (brew, apt, dnf, pacman), GitHub repos, or GitHub release binaries. One declarative manifest. Abstracts the install & update mechanics across package managers and GitHub artifacts.
 
 <p align="center">
   <img src="demo/demo.gif" alt="shdeps demo">
@@ -69,31 +69,31 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 # name    method    [cmd]  [aliases]  [filter]
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `name` | yes | Dependency name (used for hooks, logging, tracking). For `github:repo`/`github:release`: GitHub `owner/repo`. |
-| `method` | yes | Install method: `pkg`, `github:repo`, `github:release`, or `custom` |
-| `cmd` | no | Command to check for existence (defaults to name). Supports `mgr:name` qualifiers for platform-specific command names (e.g., `apt:batcat`). |
-| `aliases` | no | For `pkg`: per-manager package name overrides (`apt:fd-find,dnf:fd-find`). Use `NONE` to skip a specific manager (e.g., `brew:NONE`). |
-| `filter` | no | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:linux,host:nas`, `os:!wsl`). |
+| Field     | Required | Description                                                                                                                                 |
+| --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`    | yes      | Dependency name (used for hooks, logging, tracking). For `github:repo`/`github:release`: GitHub `owner/repo`.                               |
+| `method`  | yes      | Install method: `pkg`, `github:repo`, `github:release`, or `custom`                                                                         |
+| `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` qualifiers for platform-specific command names (e.g., `apt:batcat`). |
+| `aliases` | no       | For `pkg`: per-manager package name overrides (`apt:fd-find,dnf:fd-find`). Use `NONE` to skip a specific manager (e.g., `brew:NONE`).       |
+| `filter`  | no       | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:linux,host:nas`, `os:!wsl`).                |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `SHDEPS_CONF_DIR` | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded) |
-| `SHDEPS_HOOKS_DIR` | `<conf_dir>/hooks.d` | Post-install hooks directory |
-| `SHDEPS_STATE_DIR` | `$XDG_STATE_HOME/shdeps` | Cache/state directory |
-| `SHDEPS_FORCE` | `0` | Bypass TTL cache (check for updates now) |
-| `SHDEPS_REINSTALL` | `0` | Force reinstall all deps |
-| `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
-| `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
-| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for `github:repo` deps (prefers `<dir>/<repo>` over fresh clone) |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github` installs (uses `<dir>/<owner>/<repo>`) |
-| `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
-| `SHDEPS_LOG_LEVEL` | `1` | 0=quiet, 1=normal, 2=verbose |
+| Variable             | Default                                            | Description                                                                          |
+| -------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `SHDEPS_CONF_DIR`    | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded)                                         |
+| `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                               | Post-install hooks directory                                                         |
+| `SHDEPS_STATE_DIR`   | `$XDG_STATE_HOME/shdeps`                           | Cache/state directory                                                                |
+| `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache (check for updates now)                                             |
+| `SHDEPS_REINSTALL`   | `0`                                                | Force reinstall all deps                                                             |
+| `SHDEPS_QUIET`       | `0`                                                | Suppress interactive prompts                                                         |
+| `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                 |
+| `SHDEPS_GIT_DEV_DIR` | `~/git`                                            | Dev clone directory for `github:repo` deps (prefers `<dir>/<repo>` over fresh clone) |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github` installs (uses `<dir>/<owner>/<repo>`)                   |
+| `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                        |
+| `SHDEPS_LOG_LEVEL`   | `1`                                                | 0=quiet, 1=normal, 2=verbose                                                         |
 
 ## Install Methods
 
@@ -164,12 +164,12 @@ shdeps automatically discovers man pages and shell completions bundled inside `g
 
 **What gets linked:**
 
-| Type | Target directory | Auto-discovered by shell? |
-|------|-----------------|--------------------------|
-| Man pages | `~/.local/share/man/man<N>/` | No |
-| Bash completions | `~/.local/share/bash-completion/completions/` | Yes |
-| Zsh completions | `~/.local/share/zsh/site-functions/` | No |
-| Fish completions | `~/.local/share/fish/vendor_completions.d/` | Yes |
+| Type             | Target directory                              | Auto-discovered by shell? |
+| ---------------- | --------------------------------------------- | ------------------------- |
+| Man pages        | `~/.local/share/man/man<N>/`                  | No                        |
+| Bash completions | `~/.local/share/bash-completion/completions/` | Yes                       |
+| Zsh completions  | `~/.local/share/zsh/site-functions/`          | No                        |
+| Fish completions | `~/.local/share/fish/vendor_completions.d/`   | Yes                       |
 
 **Required shell config** (bash and fish need nothing):
 
@@ -266,31 +266,31 @@ The `--bootstrap` flag:
 
 All `shdeps_` functions are defined in a single section at the top of `shdeps.sh`. This is the complete public contract — available to callers, library users, and hook authors.
 
-| Function | Description |
-|---|---|
-| `shdeps_update` | Install/update all dependencies |
-| `shdeps_self_update [dir]` | Update shdeps itself (git pull, skips dirty trees) |
-| `shdeps_prune [-y] [--dry-run]` | Remove orphaned deps no longer in config |
-| `shdeps_load` | Parse config and return dep count |
-| `shdeps_version` | Print version string |
-| `shdeps_filter_match <spec>` | Check if current platform/host matches a filter spec (e.g., `os:linux,host:nas`, `os:!wsl`) |
-| `shdeps_platform_match <spec>` | Check if current platform matches a spec (e.g., `linux,macos`, `!wsl`) |
-| `shdeps_host_match <spec>` | Check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`) |
-| `shdeps_platform` | Print normalized platform name (`linux`, `macos`, `wsl`) |
-| `shdeps_force` | Return 0 if force mode is active (TTL bypass) |
-| `shdeps_reinstall` | Return 0 if reinstall mode is active |
-| `shdeps_pkg_mgr` | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, or empty) |
-| `shdeps_install_dir` | Print base install directory (`$SHDEPS_INSTALL_DIR`, default `~/.local/share`) |
-| `shdeps_git_dev_dir` | Print git dev clone directory (`$SHDEPS_GIT_DEV_DIR`, default `~/git`) |
-| `shdeps_bin_dir` | Print binary symlink directory (`$SHDEPS_BIN_DIR`, default `~/.local/bin`) |
-| `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir |
-| `shdeps_unlink_extras <name>` | Remove all extras symlinks tracked for a dep |
-| `shdeps_require_sudo` | Acquire sudo; returns 0 if root or sudo obtained |
-| `shdeps_log` | Normal log line |
-| `shdeps_warn` | Warning (always shown unless quiet) |
-| `shdeps_log_ok` | Success highlight |
-| `shdeps_log_dim` | Dimmed / low-importance line |
-| `shdeps_log_header` | Section header |
+| Function                          | Description                                                                                 |
+| --------------------------------- | ------------------------------------------------------------------------------------------- |
+| `shdeps_update`                   | Install/update all dependencies                                                             |
+| `shdeps_self_update [dir]`        | Update shdeps itself (git pull, skips dirty trees)                                          |
+| `shdeps_prune [-y] [--dry-run]`   | Remove orphaned deps no longer in config                                                    |
+| `shdeps_load`                     | Parse config and return dep count                                                           |
+| `shdeps_version`                  | Print version string                                                                        |
+| `shdeps_filter_match <spec>`      | Check if current platform/host matches a filter spec (e.g., `os:linux,host:nas`, `os:!wsl`) |
+| `shdeps_platform_match <spec>`    | Check if current platform matches a spec (e.g., `linux,macos`, `!wsl`)                      |
+| `shdeps_host_match <spec>`        | Check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`)               |
+| `shdeps_platform`                 | Print normalized platform name (`linux`, `macos`, `wsl`)                                    |
+| `shdeps_force`                    | Return 0 if force mode is active (TTL bypass)                                               |
+| `shdeps_reinstall`                | Return 0 if reinstall mode is active                                                        |
+| `shdeps_pkg_mgr`                  | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, or empty)                   |
+| `shdeps_install_dir`              | Print base install directory (`$SHDEPS_INSTALL_DIR`, default `~/.local/share`)              |
+| `shdeps_git_dev_dir`              | Print git dev clone directory (`$SHDEPS_GIT_DEV_DIR`, default `~/git`)                      |
+| `shdeps_bin_dir`                  | Print binary symlink directory (`$SHDEPS_BIN_DIR`, default `~/.local/bin`)                  |
+| `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir                          |
+| `shdeps_unlink_extras <name>`     | Remove all extras symlinks tracked for a dep                                                |
+| `shdeps_require_sudo`             | Acquire sudo; returns 0 if root or sudo obtained                                            |
+| `shdeps_log`                      | Normal log line                                                                             |
+| `shdeps_warn`                     | Warning (always shown unless quiet)                                                         |
+| `shdeps_log_ok`                   | Success highlight                                                                           |
+| `shdeps_log_dim`                  | Dimmed / low-importance line                                                                |
+| `shdeps_log_header`               | Section header                                                                              |
 
 ## Testing
 
