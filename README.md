@@ -5,7 +5,7 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-A cross-platform (macOS, Linux, WSL) shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers (brew, apt, dnf, pacman), GitHub repos, or GitHub release binaries. One declarative manifest. Abstracts the install & update mechanics across package managers and GitHub artifacts.
+Declare your shell tools in one config file. shdeps installs and updates them everywhere — brew, apt, dnf, pacman, GitHub repos, or GitHub release binaries. One manifest, any machine.
 
 <p align="center">
   <img src="demo/demo.gif" alt="shdeps demo">
