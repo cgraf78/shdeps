@@ -7,6 +7,8 @@
 
 A standalone shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers, GitHub git repos, or GitHub release binaries.
 
+![shdeps demo](demo/demo.gif)
+
 ## Features
 
 - **Declarative config** — one line per dependency in `*.conf` files
