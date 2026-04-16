@@ -1077,7 +1077,8 @@ _shdeps_prune() {
 _shdeps_get_version() {
   local dir="$1"
   if [[ -f "$dir/VERSION" ]]; then
-    echo "v$(cat "$dir/VERSION")"
+    # Report verbatim — preserve the upstream's own versioning convention.
+    cat "$dir/VERSION"
   elif [[ -d "$dir/.git" ]]; then
     local ver
     ver=$(git -C "$dir" describe --tags --abbrev=0 2>/dev/null || true)

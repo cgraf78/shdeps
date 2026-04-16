@@ -1647,7 +1647,14 @@ echo "=== Git install helpers ==="
 _ver_dir=$(_tmpdir)
 echo "1.2.3" > "$_ver_dir/VERSION"
 result=$(_shdeps_get_version "$_ver_dir")
-_assert_eq "get_version: VERSION file" "v1.2.3" "$result"
+_assert_eq "get_version: VERSION file" "1.2.3" "$result"
+
+# --- _shdeps_get_version: VERSION file reported verbatim ---
+
+_ver_dir_v=$(_tmpdir)
+echo "v0.7.1" > "$_ver_dir_v/VERSION"
+result=$(_shdeps_get_version "$_ver_dir_v")
+_assert_eq "get_version: VERSION file verbatim" "v0.7.1" "$result"
 
 # --- _shdeps_get_version: git describe tag ---
 
@@ -1680,7 +1687,7 @@ git -C "$_both_dir" commit --allow-empty -m "init" -q
 git -C "$_both_dir" tag "v9.9.9"
 echo "2.0.0" > "$_both_dir/VERSION"
 result=$(_shdeps_get_version "$_both_dir")
-_assert_eq "get_version: VERSION over git tag" "v2.0.0" "$result"
+_assert_eq "get_version: VERSION over git tag" "2.0.0" "$result"
 
 # --- _shdeps_link_bin: creates symlink in ~/.local/bin ---
 
