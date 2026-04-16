@@ -445,6 +445,84 @@ _shdeps_load
 _assert_contains "maximal with hosts: has hosts" "nas,taylor" "${_SHDEPS_DEPS[0]}"
 
 # ===========================================================================
+# Section 3b: Short name helper
+# ===========================================================================
+
+echo ""
+echo "=== Short name ==="
+
+result=$(_shdeps_short_name "neovim/neovim")
+_assert_eq "short_name: owner/repo" "neovim" "$result"
+
+result=$(_shdeps_short_name "bat")
+_assert_eq "short_name: bare name" "bat" "$result"
+
+result=$(_shdeps_short_name "zsh-users/zsh-autosuggestions")
+_assert_eq "short_name: hyphenated" "zsh-autosuggestions" "$result"
+
+# ===========================================================================
+# Section 3c: Filter matching
+# ===========================================================================
+
+echo ""
+echo "=== Filter matching ==="
+
+# --- Empty filter matches all ---
+
+rc=0; _shdeps_filter_match "" || rc=$?
+_assert_eq "filter: empty matches" "0" "$rc"
+
+# --- os: filter ---
+
+rc=0; _shdeps_filter_match "os:$(shdeps_platform)" || rc=$?
+_assert_eq "filter: current os matches" "0" "$rc"
+
+if [[ "$(shdeps_platform)" == "macos" ]]; then
+  _other_os="linux"
+else
+  _other_os="macos"
+fi
+
+rc=0; _shdeps_filter_match "os:$_other_os" || rc=$?
+_assert_eq "filter: other os rejected" "1" "$rc"
+
+# --- host: filter ---
+
+_current_host=$(hostname -s 2>/dev/null || hostname 2>/dev/null)
+_current_host="${_current_host,,}"
+
+rc=0; _shdeps_filter_match "host:$_current_host" || rc=$?
+_assert_eq "filter: current host matches" "0" "$rc"
+
+rc=0; _shdeps_filter_match "host:nonexistent-host-xyz" || rc=$?
+_assert_eq "filter: other host rejected" "2" "$rc"
+
+# --- Mixed os + host ---
+
+rc=0; _shdeps_filter_match "os:$(shdeps_platform),host:$_current_host" || rc=$?
+_assert_eq "filter: mixed both match" "0" "$rc"
+
+rc=0; _shdeps_filter_match "os:$_other_os,host:$_current_host" || rc=$?
+_assert_eq "filter: mixed os fails" "1" "$rc"
+
+rc=0; _shdeps_filter_match "os:$(shdeps_platform),host:nonexistent-host-xyz" || rc=$?
+_assert_eq "filter: mixed host fails" "2" "$rc"
+
+# --- Negation ---
+
+rc=0; _shdeps_filter_match "os:!$_other_os" || rc=$?
+_assert_eq "filter: negated other os passes" "0" "$rc"
+
+rc=0; _shdeps_filter_match "os:!$(shdeps_platform)" || rc=$?
+_assert_eq "filter: negated current os fails" "1" "$rc"
+
+rc=0; _shdeps_filter_match "host:!nonexistent-host-xyz" || rc=$?
+_assert_eq "filter: negated other host passes" "0" "$rc"
+
+rc=0; _shdeps_filter_match "host:!$_current_host" || rc=$?
+_assert_eq "filter: negated current host fails" "2" "$rc"
+
+# ===========================================================================
 # Section 4: Package manager detection and resolution
 # ===========================================================================
 
@@ -459,39 +537,39 @@ export PATH="$_mock_bin_dir:$PATH"
 # Mock brew on Darwin-like detection: _shdeps_pkg_detect checks uname first
 # so we test the resolution and queuing logic directly instead.
 
-# --- _shdeps_pkg_resolve: no overrides → returns name ---
+# --- _shdeps_resolve_override: no overrides → returns name ---
 
 _SHDEPS_PKG_MGR="apt"
-result=$(_shdeps_pkg_resolve "fd" "")
+result=$(_shdeps_resolve_override "fd" "")
 _assert_eq "resolve: no overrides returns name" "fd" "$result"
 
-# --- _shdeps_pkg_resolve: matching override ---
+# --- _shdeps_resolve_override: matching override ---
 
-result=$(_shdeps_pkg_resolve "fd" "apt:fd-find,dnf:fd-find")
+result=$(_shdeps_resolve_override "fd" "apt:fd-find,dnf:fd-find")
 _assert_eq "resolve: apt override" "fd-find" "$result"
 
-# --- _shdeps_pkg_resolve: non-matching override ---
+# --- _shdeps_resolve_override: non-matching override ---
 
 _SHDEPS_PKG_MGR="pacman"
-result=$(_shdeps_pkg_resolve "fd" "apt:fd-find,dnf:fd-find")
+result=$(_shdeps_resolve_override "fd" "apt:fd-find,dnf:fd-find")
 _assert_eq "resolve: no matching mgr returns name" "fd" "$result"
 
-# --- _shdeps_pkg_resolve: NONE sentinel ---
+# --- _shdeps_resolve_override: NONE sentinel ---
 
 _SHDEPS_PKG_MGR="apt"
-result=$(_shdeps_pkg_resolve "nerd-fonts" "apt:NONE,brew:font-hack-nerd-font")
+result=$(_shdeps_resolve_override "nerd-fonts" "apt:NONE,brew:font-hack-nerd-font")
 _assert_eq "resolve: NONE sentinel" "NONE" "$result"
 
-# --- _shdeps_pkg_resolve: brew override ---
+# --- _shdeps_resolve_override: brew override ---
 
 _SHDEPS_PKG_MGR="brew"
-result=$(_shdeps_pkg_resolve "nerd-fonts" "apt:NONE,brew:font-hack-nerd-font")
+result=$(_shdeps_resolve_override "nerd-fonts" "apt:NONE,brew:font-hack-nerd-font")
 _assert_eq "resolve: brew override" "font-hack-nerd-font" "$result"
 
-# --- _shdeps_pkg_resolve: multiple overrides, first match wins ---
+# --- _shdeps_resolve_override: multiple overrides, first match wins ---
 
 _SHDEPS_PKG_MGR="dnf"
-result=$(_shdeps_pkg_resolve "bat" "apt:bat,dnf:bat-extra,pacman:bat")
+result=$(_shdeps_resolve_override "bat" "apt:bat,dnf:bat-extra,pacman:bat")
 _assert_eq "resolve: dnf gets its override" "bat-extra" "$result"
 
 # --- _shdeps_pkg_queue: NONE skips silently ---

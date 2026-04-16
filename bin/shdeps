@@ -124,7 +124,7 @@ cmd_list() {
     case "$_method" in
     pkg)
       local resolved
-      resolved=$(_shdeps_pkg_resolve "$_name" "$_source")
+      resolved=$(_shdeps_resolve_override "$_name" "$_source")
       if [[ "$resolved" == "NONE" ]]; then
         status="skipped"
         details="(pkg manager)"
@@ -212,7 +212,7 @@ cmd_check() {
     case "$_method" in
     pkg)
       local resolved
-      resolved=$(_shdeps_pkg_resolve "$_name" "$_source")
+      resolved=$(_shdeps_resolve_override "$_name" "$_source")
       if [[ "$resolved" == "NONE" ]]; then
         echo "$_name: skipped (pkg manager)"
         return 0

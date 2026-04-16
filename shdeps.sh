@@ -42,6 +42,7 @@ shdeps_prune()          { _shdeps_prune "$@"; }
 # Matching
 shdeps_platform_match() { _shdeps_platform_match "$@"; }
 shdeps_host_match()     { _shdeps_host_match "$@"; }
+shdeps_filter_match()   { _shdeps_filter_match "$@"; }
 
 # Platform and environment
 shdeps_platform() {
@@ -307,7 +308,7 @@ _shdeps_check_pkg_needed() {
     _shdeps_platform_match "$_platforms" || continue
     _shdeps_host_match "$_hosts" || continue
     local resolved_pkg
-    resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_source")
+    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_source")
     [[ "$resolved_pkg" == "NONE" ]] && continue
     if ! _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
       _SHDEPS_PKG_INSTALL_NEEDED=1
@@ -494,6 +495,31 @@ _shdeps_host_match() {
   fi
 }
 
+# Unified filter matching — parses a comma-separated filter spec with
+# os: and host: prefixed tokens, delegates to platform/host matchers.
+# Returns: 0=match, 1=platform mismatch, 2=host mismatch.
+_shdeps_filter_match() {
+  local spec="${1:-}"
+  if [[ -z "$spec" ]]; then return 0; fi
+
+  local token platform_spec="" host_spec=""
+  local IFS=','
+  for token in $spec; do
+    case "$token" in
+    os:*)   platform_spec+="${platform_spec:+,}${token#os:}" ;;
+    host:*) host_spec+="${host_spec:+,}${token#host:}" ;;
+    esac
+  done
+
+  if [[ -n "$platform_spec" ]]; then
+    _shdeps_platform_match "$platform_spec" || return 1
+  fi
+  if [[ -n "$host_spec" ]]; then
+    _shdeps_host_match "$host_spec" || return 2
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Dep existence and version checking
 # ---------------------------------------------------------------------------
@@ -587,9 +613,10 @@ _shdeps_pkg_detect() {
   fi
 }
 
-# Resolve canonical package name to OS-specific name via overrides.
-# $1=name $2=source (pkg overrides, e.g. "apt:fd-find,dnf:fd-find")
-_shdeps_pkg_resolve() {
+# Resolve a value via mgr:name overrides against the current package manager.
+# Returns the override for the matching manager, or $1 (default) if none match.
+# $1=default $2=overrides (comma-separated mgr:name pairs, e.g. "apt:fd-find,dnf:fd-find")
+_shdeps_resolve_override() {
   local name="$1" overrides="${2:-}"
   if [[ -n "$overrides" && -n "$_SHDEPS_PKG_MGR" ]]; then
     local pair pairs
@@ -604,6 +631,12 @@ _shdeps_pkg_resolve() {
     done
   fi
   echo "$name"
+}
+
+# Extract short name from owner/repo, or return bare name as-is.
+# "neovim/neovim" → "neovim", "bat" → "bat"
+_shdeps_short_name() {
+  echo "${1##*/}"
 }
 
 # Check if a package is available in the current package manager's repos.
@@ -648,7 +681,7 @@ _shdeps_pkg_refresh_metadata() {
 _shdeps_pkg_queue() {
   local name="$1" overrides="${2:-}"
   local resolved
-  resolved=$(_shdeps_pkg_resolve "$name" "$overrides")
+  resolved=$(_shdeps_resolve_override "$name" "$overrides")
   if [[ "$resolved" == "NONE" ]]; then
     return 0
   fi
@@ -1820,7 +1853,7 @@ _shdeps_install_dep() {
   case "$_method" in
   pkg)
     local resolved_pkg=""
-    resolved_pkg=$(_shdeps_pkg_resolve "$_name" "$_source")
+    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_source")
     if [[ "$resolved_pkg" == "NONE" ]]; then return 0; fi
     if _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
       local ver=""
