@@ -113,7 +113,7 @@ Use `source` to map names across package managers. Use `NONE` to skip a dep on a
 
 ### `github:repo` — GitHub Repos
 
-Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<name>` (default `~/.local/share/<name>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<name>` (default `~/git/<name>`, symlinked for live development). Falls back to release tarballs, then shallow clones.
+Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<name>` (default `~/.local/share/<name>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<name>` (default `~/git/<name>`, symlinked for live development). Falls back to a shallow clone for fresh installs.
 
 ```
 ds    github:repo    -    -    cgraf78/ds.git

@@ -1297,67 +1297,33 @@ _shdeps_github_repo_install_pull() {
   rm -f "$log"
 }
 
-# Strategy: no existing install — try release tarball, fall back to git clone.
+# Strategy: no existing install — shallow clone from GitHub.
+# Clones to a temp dir first so a failed clone doesn't destroy an
+# existing install (e.g. network unreachable).
 _shdeps_github_repo_install_fresh() {
   local name="$1" repo="$2" install_dir="$3" stamp="$4" log="$5"
-  local tarball_url="" tmp_dir
 
   local ver_before
   ver_before=$(_shdeps_get_version "$install_dir")
 
-  # Try GitHub release tarball first (faster than full clone).
-  # Strip auth to prevent stale tokens from causing 401 on public repos.
-  local gh_repo=""
-  if [[ "$repo" =~ github\.com[:/]([^/]+/[^/.]+) ]]; then
-    gh_repo="${BASH_REMATCH[1]}"
+  if ! command -v git &>/dev/null; then
+    rm -f "$log"
+    _shdeps_warn "  warning: git not available — cannot install $name"
+    return 1
   fi
-  if [[ -n "$gh_repo" ]] && command -v curl &>/dev/null; then
-    tarball_url=$(curl -fsSL --no-netrc -H "Authorization:" \
-      "https://api.github.com/repos/$gh_repo/releases/latest" 2>/dev/null |
-      grep -o '"browser_download_url":[[:space:]]*"[^"]*\.tar\.gz"' |
-      head -1 | cut -d'"' -f4)
-  fi
-
-  if [[ -n "${tarball_url:-}" ]]; then
-    tmp_dir=$(mktemp -d)
-    _shdeps_log_status "  $name: downloading release tarball..."
-    # shellcheck disable=SC2016  # single quotes intentional — inner script uses $1/$2
-    if _shdeps_run_logged bash -c 'curl -fsSL "$1" | tar xz -C "$2"' _ "$tarball_url" "$tmp_dir"; then
-      rm -rf "$install_dir"
-      mkdir -p "$install_dir"
-      # Tarball typically has a top-level dir; move contents up
-      mv "$tmp_dir"/*/* "$install_dir/" 2>/dev/null || mv "$tmp_dir"/* "$install_dir/"
-      rm -rf "$tmp_dir"
-    else
-      rm -rf "$tmp_dir"
-      _shdeps_logfile_print "$name release download" "$log"
-      _shdeps_warn "  warning: failed to download $name release (trying git clone)"
-      tarball_url=""
-    fi
-  fi
-
-  # Fallback: git clone to a temp dir so we don't destroy an existing
-  # install on failure (e.g. network unreachable).
-  if [[ -z "${tarball_url:-}" ]]; then
-    if ! command -v git &>/dev/null; then
-      rm -f "$log"
-      _shdeps_warn "  warning: no curl release and no git — cannot install $name"
-      return 1
-    fi
-    local clone_tmp="${install_dir}.tmp.$$"
+  local clone_tmp="${install_dir}.tmp.$$"
+  rm -rf "$clone_tmp"
+  if [[ -n "${log:-}" ]]; then : >"$log"; fi
+  _shdeps_log_status "  $name: cloning repository..."
+  if ! _shdeps_run_logged git clone --depth 1 "$repo" "$clone_tmp"; then
     rm -rf "$clone_tmp"
-    if [[ -n "${log:-}" ]]; then : >"$log"; fi
-    _shdeps_log_status "  $name: cloning repository..."
-    if ! _shdeps_run_logged git clone --depth 1 "$repo" "$clone_tmp"; then
-      rm -rf "$clone_tmp"
-      _shdeps_logfile_print "$name clone" "$log"
-      rm -f "$log"
-      _shdeps_warn "  warning: failed to clone $name (network unreachable?)"
-      return 1
-    fi
-    rm -rf "$install_dir"
-    mv "$clone_tmp" "$install_dir"
+    _shdeps_logfile_print "$name clone" "$log"
+    rm -f "$log"
+    _shdeps_warn "  warning: failed to clone $name (network unreachable?)"
+    return 1
   fi
+  rm -rf "$install_dir"
+  mv "$clone_tmp" "$install_dir"
 
   _shdeps_link_bin "$name" "$install_dir"
   _shdeps_link_extras "$name" "$install_dir"
@@ -1365,23 +1331,21 @@ _shdeps_github_repo_install_fresh() {
   _shdeps_remote_touch "$stamp" || true
   local ver
   ver=$(_shdeps_get_version "$install_dir")
-  local method="git clone"
-  if [[ -n "${tarball_url:-}" ]]; then method="release tarball"; fi
 
   if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$(_shdeps_reinstall)" -ne 1 ]]; then
-    _shdeps_log "  $name${ver:+ -- $ver} ($method)"
+    _shdeps_log "  $name${ver:+ -- $ver}"
   else
     _SHDEPS_CHANGED[$name]=1
     if [[ -n "$ver_before" && "$ver_before" == "$ver" ]]; then
-      _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver} ($method)"
+      _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
     else
-      _shdeps_log_ok "  $name added${ver:+ -- $ver} ($method)"
+      _shdeps_log_ok "  $name added${ver:+ -- $ver}"
     fi
   fi
 }
 
 # Install or upgrade a tool from GitHub (github:repo method).
-# Priority: $SHDEPS_GIT_DEV_DIR/<name> (symlink) > existing clone (pull) > release tarball > fresh clone.
+# Priority: $SHDEPS_GIT_DEV_DIR/<name> (symlink) > existing clone (pull) > fresh clone.
 # Env var override: SHDEPS_<NAME>_REPO overrides the repo URL.
 _shdeps_github_repo_install() {
   local name="$1" default_repo="$2" install_dir="$3"
