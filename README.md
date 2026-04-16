@@ -5,7 +5,7 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-A standalone shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers, GitHub git repos, or GitHub release binaries.
+A cross-platform (macOS, Linux, WSL) shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers (brew, apt, dnf, pacman), GitHub git repos, or GitHub release binaries.
 
 ![shdeps demo](demo/demo.gif)
 
