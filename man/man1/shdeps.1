@@ -9,7 +9,7 @@ shdeps \- declarative shell dependency manager
 .SH DESCRIPTION
 .B shdeps
 reads declarative config files and installs or updates shell tools via
-system package managers, GitHub git repos, GitHub release binaries, or
+system package managers, GitHub repos, GitHub release binaries, or
 fully custom hooks.
 Dependencies are declared in
 .B *.conf
@@ -87,15 +87,15 @@ are comments.
 .PP
 .RS
 .nf
-# name    method    [cmd]  [cmd_alt]  [source]         [platforms]  [hosts]
-jq        pkg
-bat       pkg       bat    batcat
-fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
-ds        git       \-      \-          cgraf78/ds.git
-neovim    binary    nvim   \-          neovim/neovim
-dust      pkg       \-      \-          \-                macos
-htop      pkg       \-      \-          \-                \-            nas
-nerd-fonts custom
+# name       method           [cmd]  [cmd_alt]  [source]                 [platforms]  [hosts]
+jq           pkg
+bat          pkg              bat    batcat
+fd           pkg              fd     fdfind     apt:fd-find,dnf:fd-find
+ds           github:repo      \-     \-         cgraf78/ds.git
+neovim       github:release   nvim   \-         neovim/neovim
+dust         pkg              \-     \-         \-                       macos
+htop         pkg              \-     \-         \-                       \-           nas
+nerd-fonts   custom
 .fi
 .RE
 .SS Fields
@@ -107,10 +107,10 @@ Identifier for the dependency.
 .B method
 Required.
 One of
-.BR pkg ", " git ", " binary ", or " custom .
+.BR pkg ", " github:repo ", " github:release ", or " custom .
 .TP
 .B cmd
-Binary name to check for.
+Command name to check for.
 Defaults to
 .IR name .
 Use
@@ -118,7 +118,7 @@ Use
 to keep the default.
 .TP
 .B cmd_alt
-Alternate binary name (e.g.,
+Alternate command name (e.g.,
 .B batcat
 on Debian for
 .BR bat ).
@@ -132,7 +132,7 @@ Use
 .B NONE
 to skip a specific manager.
 For
-.BR git " and " binary :
+.BR github:repo " and " github:release :
 GitHub
 .IB owner / repo
 (e.g.,
@@ -153,14 +153,14 @@ Comma-separated hostname filter, same syntax as platforms.
 Uses the detected system package manager (brew, apt, dnf, or pacman).
 Batches all pkg installs into one command; retries individually on failure.
 .TP
-.B git
+.B github:repo
 Clones from GitHub.
 Prefers a local dev clone in
 .B $SHDEPS_GIT_DEV_DIR
 if present; otherwise pulls existing clones, fetches release tarballs, or
 falls back to a shallow clone.
 .TP
-.B binary
+.B github:release
 Downloads a pre-built binary from GitHub Releases.
 Handles
 .BR .tar.gz ", " .tar.xz ", " .tar.bz2 ", " .zip ", " .gz ", " .bz2 ", " .zst ,
@@ -198,12 +198,12 @@ Runs after any method if the dependency changed.
 Cleanup during
 .BR "shdeps prune" .
 For custom deps this is the only cleanup path.
-For git/binary deps it runs before built-in cleanup.
+For github:repo/github:release deps it runs before built-in cleanup.
 .SH EXTRAS LINKING
 For
-.B git
+.B github:repo
 and
-.B binary
+.B github:release
 installs, shdeps auto-discovers and symlinks man pages
 and shell completions to user-local directories:
 .PP
@@ -258,17 +258,17 @@ Cache TTL in seconds.
 Default: 3600.
 .TP
 .B SHDEPS_GIT_DEV_DIR
-Dev clone directory for the git method.
+Dev clone directory for the github:repo method.
 Default:
 .IR ~/git .
 .TP
 .B SHDEPS_INSTALL_DIR
-Base directory for git and binary installs.
+Base directory for github:repo and github:release installs.
 Default:
 .IR ~/.local/share .
 .TP
 .B SHDEPS_BIN_DIR
-Directory for binary symlinks.
+Directory for symlinks to installed binaries.
 Default:
 .IR ~/.local/bin .
 .TP

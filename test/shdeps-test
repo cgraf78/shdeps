@@ -65,8 +65,8 @@ cat >"$_test_conf_dir/deps.conf" <<'EOF'
 jq        pkg
 bat       pkg       bat    batcat
 fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
-ds        git       -      -          cgraf78/ds.git
-neovim    binary    nvim   -          neovim/neovim
+ds        github:repo      -      -          cgraf78/ds.git
+neovim    github:release   nvim   -          neovim/neovim
 nerd-fonts custom
 EOF
 
@@ -134,7 +134,7 @@ tool-a  pkg
 tool-b  pkg
 EOF
 cat >"$_multi_conf_dir/50-extras.conf" <<'EOF'
-tool-c  binary  -  -  owner/tool-c
+tool-c  github:release  -  -  owner/tool-c
 EOF
 cat >"$_multi_conf_dir/99-local.conf" <<'EOF'
 tool-d  custom
@@ -185,11 +185,11 @@ _assert_eq "shdeps_load: returns count" "2" "$count"
 
 rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-ds  git  -  -  cgraf78/ds.git
+ds  github:repo  -  -  cgraf78/ds.git
 EOF
 SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
-_assert_contains "dash fields: preserved in entry" "ds|git|-|-|cgraf78/ds.git" "${_SHDEPS_DEPS[0]}"
+_assert_contains "dash fields: preserved in entry" "ds|github:repo|-|-|cgraf78/ds.git" "${_SHDEPS_DEPS[0]}"
 
 # ===========================================================================
 # Section 2: Entry parsing
@@ -209,11 +209,11 @@ _assert_eq "parse full: source" "apt:fd-find,dnf:fd-find" "$_source"
 _assert_eq "parse full: platforms" "linux,macos" "$_platforms"
 _assert_eq "parse full: hosts empty when absent" "" "$_hosts"
 
-# --- Full binary entry (source is owner/repo) ---
+# --- Full github:release entry (source is owner/repo) ---
 
-_shdeps_parse "neovim|binary|nvim|-|neovim/neovim|linux,macos"
-_assert_eq "parse binary: source" "neovim/neovim" "$_source"
-_assert_eq "parse binary: platforms" "linux,macos" "$_platforms"
+_shdeps_parse "neovim|github:release|nvim|-|neovim/neovim|linux,macos"
+_assert_eq "parse github:release: source" "neovim/neovim" "$_source"
+_assert_eq "parse github:release: platforms" "linux,macos" "$_platforms"
 
 # --- Dash fields normalize to empty ---
 
@@ -235,7 +235,7 @@ _assert_eq "parse minimal: source empty" "" "$_source"
 
 # --- cmd set explicitly ---
 
-_shdeps_parse "neovim|binary|nvim"
+_shdeps_parse "neovim|github:release|nvim"
 _assert_eq "parse explicit cmd: name" "neovim" "$_name"
 _assert_eq "parse explicit cmd: cmd" "nvim" "$_cmd"
 
@@ -438,7 +438,7 @@ _assert_eq "missing hosts: empty" "" "$_hosts"
 
 rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-codex  binary  -  -  openai/codex  -  nas,taylor
+codex  github:release  -  -  openai/codex  -  nas,taylor
 EOF
 SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
@@ -572,12 +572,12 @@ _assert_eq "check_pkg_needed: missing dep → 1" "1" "$_SHDEPS_PKG_INSTALL_NEEDE
 # --- _shdeps_check_pkg_needed: skips non-pkg methods ---
 
 cat >"$_cpn_dir/deps.conf" <<'EOF'
-my-tool  git  -  -  user/repo
+my-tool  github:repo  -  -  user/repo
 EOF
 SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
 unset _SHDEPS_PKG_INSTALL_NEEDED
 _shdeps_check_pkg_needed
-_assert_eq "check_pkg_needed: skips git method" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+_assert_eq "check_pkg_needed: skips github:repo method" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
 
 # --- _shdeps_check_pkg_needed: skips when pkg manager is brew ---
 
@@ -659,7 +659,7 @@ _json=$(_fake_release_json \
   "tool-aarch64-unknown-linux-gnu.tar.gz" \
   "tool-x86_64-apple-darwin.tar.gz" \
   "tool-aarch64-apple-darwin.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "rust triple: matches platform" "${_test_os}" "$result"
 if [[ "$result" == *"${_test_arch}"* || "$result" == *"${_test_arch_alt}"* ]]; then
   _pass "rust triple: matches arch"
@@ -674,7 +674,7 @@ _json=$(_fake_release_json \
   "tool-linux-arm64" \
   "tool-darwin-arm64" \
   "tool-darwin-amd64")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "go plain binary: matches platform" "${_test_os}" "$result"
 
 # --- Case-insensitive: Darwin/Linux capitalized ---
@@ -684,7 +684,7 @@ _json=$(_fake_release_json \
   "tool_1.0_Darwin_x86_64.tar.gz" \
   "tool_1.0_Linux_arm64.tar.gz" \
   "tool_1.0_Linux_x86_64.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "case-insensitive: matches platform" "${_test_OS}" "$result"
 
 # --- Skip metadata extensions ---
@@ -696,7 +696,7 @@ _json=$(_fake_release_json \
   "tool-${_test_os}-${_test_arch_alt}.sigstore" \
   "tool-${_test_os}-${_test_arch_alt}.tar.gz.b3" \
   "tool-${_test_os}-${_test_arch_alt}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "skip metadata: finds tarball" "tool-${_test_os}-${_test_arch_alt}.tar.gz" "$result"
 _assert_not_contains "skip metadata: no sha256" "sha256" "$result"
 
@@ -708,7 +708,7 @@ _json=$(_fake_release_json \
   "tool_1.0_${_test_os}_${_test_arch_alt}.apk" \
   "tool_1.0_${_test_os}_${_test_arch_alt}.flatpak" \
   "tool_1.0_${_test_os}_${_test_arch_alt}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "skip packages: finds tarball" "tool_1.0_${_test_os}_${_test_arch_alt}.tar.gz" "$result"
 
 # --- Alternate OS pattern: macos / linux aliases ---
@@ -718,14 +718,14 @@ if [[ "$_test_os" == "darwin" ]]; then
     "tool-macos-arm64.tar.gz" \
     "tool-macos-x86_64.tar.gz" \
     "tool-linux-x86_64.tar.gz")
-  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
   _assert_contains "macos alias: matches macos" "macos" "$result"
 else
   _json=$(_fake_release_json \
     "tool-macos-arm64.tar.gz" \
     "tool-linux-x86_64.tar.gz" \
     "tool-linux-arm64.tar.gz")
-  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
   _assert_contains "linux: picks linux not macos" "linux" "$result"
 fi
 
@@ -734,7 +734,7 @@ fi
 _json=$(_fake_release_json \
   "tool-${_test_os}-${_test_arch_alt}" \
   "tool-${_test_os}-${_test_arch_alt}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_not_contains "prefer plain over tarball" ".tar.gz" "$result"
 
 # --- .tar.xz support ---
@@ -742,7 +742,7 @@ _assert_not_contains "prefer plain over tarball" ".tar.gz" "$result"
 _json=$(_fake_release_json \
   "tool-${_test_arch}-unknown-${_test_os}-gnu.tar.xz" \
   "tool-${_test_arch_alt}-unknown-${_test_os}-gnu.tar.xz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "tar.xz: matches platform" "${_test_os}" "$result"
 
 # --- .tgz support ---
@@ -750,7 +750,7 @@ _assert_contains "tar.xz: matches platform" "${_test_os}" "$result"
 _json=$(_fake_release_json \
   "tool-${_test_os}-${_test_arch_alt}.tgz" \
   "tool-${_test_os}-${_test_arch}.tgz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "tgz: matches platform" "${_test_os}" "$result"
 
 # --- No matching asset → empty ---
@@ -758,7 +758,7 @@ _assert_contains "tgz: matches platform" "${_test_os}" "$result"
 _json=$(_fake_release_json \
   "tool-windows-amd64.exe" \
   "tool-freebsd-amd64.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_eq "no match: empty result" "" "$result"
 
 # --- Tarball over zip preference ---
@@ -766,7 +766,7 @@ _assert_eq "no match: empty result" "" "$result"
 _json=$(_fake_release_json \
   "tool-${_test_os}-${_test_arch_alt}.tar.gz" \
   "tool-${_test_os}-${_test_arch_alt}.zip")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "asset match: tarball over zip" ".tar.gz" "$result"
 
 # --- Zip fallback when no tarball ---
@@ -774,7 +774,7 @@ _assert_contains "asset match: tarball over zip" ".tar.gz" "$result"
 _json=$(_fake_release_json \
   "tool-${_test_os}-${_test_arch_alt}.zip" \
   "tool-${_test_os}-${_test_arch_alt}.sha256")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "asset match: zip when no tarball" ".zip" "$result"
 
 # --- .gz single file matches plain pass ---
@@ -782,14 +782,14 @@ _assert_contains "asset match: zip when no tarball" ".zip" "$result"
 _json=$(_fake_release_json \
   "tool-${_test_os}-${_test_arch_alt}.gz" \
   "tool-${_test_os}-${_test_arch_alt}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "asset match: .gz matches plain pass" "tool-${_test_os}-${_test_arch_alt}.gz" "$result"
 
 # --- .bz2 single file ---
 
 _json=$(_fake_release_json \
   "tool_1.0_${_test_os}_${_test_arch_alt}.bz2")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "asset match: .bz2 single file" "tool_1.0_${_test_os}_${_test_arch_alt}.bz2" "$result"
 
 # --- .zst single file ---
@@ -797,7 +797,7 @@ _assert_contains "asset match: .bz2 single file" "tool_1.0_${_test_os}_${_test_a
 _json=$(_fake_release_json \
   "tool-${_test_arch}-unknown-${_test_os}.zst" \
   "tool-${_test_arch}-unknown-${_test_os}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "asset match: .zst matches plain pass" ".zst" "$result"
 
 # --- Libc preference (linux-only) ---
@@ -809,29 +809,29 @@ if [[ "$_test_os" == "linux" ]]; then
   _json=$(_fake_release_json \
     "tool-${_test_arch}-unknown-linux-musl.tar.gz" \
     "tool-${_test_arch}-unknown-linux-gnu.tar.gz")
-  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
   _assert_contains "gnu preferred over musl" "gnu" "$result"
 
   _json=$(_fake_release_json \
     "tool-${_test_arch}-unknown-linux-musl.tar.gz")
-  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
   _assert_contains "musl fallback when no gnu" "musl" "$result"
 
   _json=$(_fake_release_json \
     "tool_linux_${_test_arch_alt}.tar.gz")
-  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
   _assert_contains "no libc suffix: matches" "tool_linux_${_test_arch_alt}" "$result"
 
   _json=$(_fake_release_json \
     "tool-linux-musl-${_test_arch_alt}" \
     "tool-linux-gnu-${_test_arch_alt}")
-  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
   _assert_contains "plain binary: gnu preferred" "gnu" "$result"
 
   _json=$(_fake_release_json \
     "tool-darwin-${_test_arch_alt}.tar.gz" \
     "tool-linux-${_test_arch_alt}.tar.gz")
-  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
   _assert_contains "linux system: picks linux not darwin" "linux" "$result"
 else
   _pass "gnu preferred over musl: skipped (not linux)"
@@ -842,7 +842,7 @@ else
   _json=$(_fake_release_json \
     "tool-darwin-${_test_arch_alt}.tar.gz" \
     "tool-linux-${_test_arch_alt}.tar.gz")
-  result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+  result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
   _assert_contains "darwin system: picks darwin not linux" "darwin" "$result"
 fi
 
@@ -858,7 +858,7 @@ _json=$(_fake_release_json \
   "codex-${_test_arch}-apple-${_test_os}.tar.gz" \
   "codex-${_test_arch}-unknown-linux-gnu.tar.gz" \
   "codex-command-runner-${_test_arch}-apple-${_test_os}.tar.gz")
-result=$(_shdeps_binary_find_asset "codex" "openai/codex" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "codex" "openai/codex" "v1.0.0" "$_json")
 _assert_contains "multi-binary: picks codex" "codex-${_test_arch}" "$result"
 _assert_not_contains "multi-binary: no proxy" "proxy" "$result"
 _assert_not_contains "multi-binary: no command-runner" "command-runner" "$result"
@@ -868,7 +868,7 @@ _json=$(_fake_release_json \
   "tool-extra-${_test_os}-${_test_arch_alt}" \
   "tool-${_test_os}-${_test_arch_alt}" \
   "tool-other-${_test_os}-${_test_arch_alt}")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "multi-binary plain: picks cmd match" "tool-${_test_os}-${_test_arch_alt}" "$result"
 _assert_not_contains "multi-binary plain: no extra" "extra" "$result"
 
@@ -876,7 +876,7 @@ _assert_not_contains "multi-binary plain: no extra" "extra" "$result"
 _json=$(_fake_release_json \
   "tool_extra_${_test_os}_${_test_arch_alt}.tar.gz" \
   "tool_${_test_os}_${_test_arch_alt}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "underscore sep: picks cmd match" "tool_${_test_os}" "$result"
 _assert_not_contains "underscore sep: no extra" "extra" "$result"
 
@@ -884,27 +884,27 @@ _assert_not_contains "underscore sep: no extra" "extra" "$result"
 _json=$(_fake_release_json \
   "tool-extra.v1.0.0.${_test_os}-${_test_arch_alt}.tar.gz" \
   "tool.v1.0.0.${_test_os}-${_test_arch_alt}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_not_contains "dot sep: no extra" "extra" "$result"
 
 # Version-prefixed asset names
 _json=$(_fake_release_json \
   "tool-v1.0.0-${_test_os}-${_test_arch_alt}.tar.gz" \
   "tool-extra-v1.0.0-${_test_os}-${_test_arch_alt}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_not_contains "version prefix: no extra" "extra" "$result"
 
 # Fallback to non-exact match when no exact match exists
 _json=$(_fake_release_json \
   "tool-extended-${_test_os}-${_test_arch_alt}.tar.gz")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "no exact: falls back to non-exact" "tool-extended" "$result"
 
 # Bare cmd name without OS/arch → not matched; falls back
 _json=$(_fake_release_json \
   "tool-extra-${_test_os}-${_test_arch_alt}" \
   "tool")
-result=$(_shdeps_binary_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "bare cmd no os/arch: falls back" "tool-extra" "$result"
 
 # ===========================================================================
@@ -929,7 +929,7 @@ if [[ -z "$_true_bin" ]]; then
   for _i in $(seq 1 20); do _pass "extraction: skipped (no compiled binary)"; done
 else
 
-# Helper: create a tarball, run _shdeps_binary_install_tarball, check result.
+# Helper: create a tarball, run _shdeps_github_release_install_tarball, check result.
 # $1=desc $2=cmd $3=expected exit  remaining: executable file paths
 _test_tarball() {
   local desc="$1" cmd="$2" expect_exit="$3"
@@ -963,7 +963,7 @@ _test_tarball_with_extras() {
   local bin_path="$staging/output-bin"
   local log=""
   local rc=0
-  _shdeps_binary_install_tarball "test-pkg" "$cmd" "$tarball" "$bin_path" "$log" >/dev/null 2>&1 || rc=$?
+  _shdeps_github_release_install_tarball "test-pkg" "$cmd" "$tarball" "$bin_path" "$log" >/dev/null 2>&1 || rc=$?
   _assert_exit "$desc" "$expect_exit" "$rc"
   if [[ "$expect_exit" -eq 0 ]]; then
     if [[ -L "$bin_path" || -x "$bin_path" ]]; then
@@ -1014,7 +1014,7 @@ cp "$_true_bin" "$_test_script_staging/real-binary"
 _test_script_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
 tar czf "$_test_script_tar" -C "$_test_script_staging" .
 _test_script_bin="$_test_script_staging/output-bin"
-_shdeps_binary_install_tarball "test-pkg" "notfound" "$_test_script_tar" "$_test_script_bin" "" >/dev/null 2>&1 || true
+_shdeps_github_release_install_tarball "test-pkg" "notfound" "$_test_script_tar" "$_test_script_bin" "" >/dev/null 2>&1 || true
 if [[ -L "$_test_script_bin" ]]; then
   _target=$(readlink "$_test_script_bin")
   _assert_contains "sole exe ignores scripts: picks binary" "real-binary" "$_target"
@@ -1030,7 +1030,7 @@ cp "$_true_bin" "$_test_exact_staging/mytool-extra"
 _test_exact_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
 tar czf "$_test_exact_tar" -C "$_test_exact_staging" .
 _test_exact_bin="$_test_exact_staging/output-bin"
-_shdeps_binary_install_tarball "test-pkg" "mytool" "$_test_exact_tar" "$_test_exact_bin" "" >/dev/null 2>&1
+_shdeps_github_release_install_tarball "test-pkg" "mytool" "$_test_exact_tar" "$_test_exact_bin" "" >/dev/null 2>&1
 if [[ -L "$_test_exact_bin" ]]; then
   _target=$(readlink "$_test_exact_bin")
   if [[ "$_target" == *"/mytool" && "$_target" != *"-extra" ]]; then
@@ -1062,7 +1062,7 @@ _test_zip() {
   (cd "$staging" && zip -qr "$zipfile" . -x test.zip)
   local bin_path="$staging/output-bin"
   local rc=0
-  _shdeps_binary_install_zip "test-pkg" "$cmd" "$zipfile" "$bin_path" "" >/dev/null 2>&1 || rc=$?
+  _shdeps_github_release_install_zip "test-pkg" "$cmd" "$zipfile" "$bin_path" "" >/dev/null 2>&1 || rc=$?
   _assert_exit "$desc" "$expect_exit" "$rc"
   if [[ "$expect_exit" -eq 0 ]]; then
     if [[ -L "$bin_path" || -x "$bin_path" ]]; then
@@ -1155,9 +1155,9 @@ _source_shdeps "$SHDEPS_DIR"
 
 # --- Stamp file creation ---
 
-stamp=$(_shdeps_remote_stamp "test-tool" "git")
+stamp=$(_shdeps_remote_stamp "test-tool" "repo")
 _assert_contains "stamp path: includes name" "test-tool" "$stamp"
-_assert_contains "stamp path: includes kind" "git" "$stamp"
+_assert_contains "stamp path: includes kind" "repo" "$stamp"
 
 # --- _shdeps_remote_touch creates stamp ---
 
@@ -1755,7 +1755,7 @@ git -C "$_lc_clone" init -q
 git -C "$_lc_clone" commit --allow-empty -m "init" -q
 
 declare -gA _SHDEPS_CHANGED=()
-_shdeps_install_from_github "$_lc_name" "owner/$_lc_name" "$_lc_install"
+_shdeps_github_repo_install "$_lc_name" "owner/$_lc_name" "$_lc_install"
 
 # Should create a symlink to local clone
 _assert_symlink "local clone: install dir is symlink" "$_lc_install"
@@ -1779,7 +1779,7 @@ git -C "$_lc_clone2" commit --allow-empty -m "init" -q
 
 declare -gA _SHDEPS_CHANGED=()
 SHDEPS_GIT_DEV_DIR="$_lc_custom_dev" \
-  _shdeps_install_from_github "$_lc_name2" "owner/$_lc_name2" "$_lc_install2"
+  _shdeps_github_repo_install "$_lc_name2" "owner/$_lc_name2" "$_lc_install2"
 
 _assert_symlink "dev dir override: install dir is symlink" "$_lc_install2"
 _lc_target2=$(readlink "$_lc_install2")
@@ -1817,23 +1817,23 @@ _assert_file_exists "upsert: creates file" "$_mfst_path"
 _assert_file_content "upsert: first entry" "tool-a|pkg|tool-a|" "$_mfst_path"
 
 # upsert adds alongside existing
-_shdeps_manifest_upsert "tool-b" "binary" "tb" ".local/bin/tb"
+_shdeps_manifest_upsert "tool-b" "github:release" "tb" ".local/bin/tb"
 _mfst_content=$(cat "$_mfst_path")
 _assert_contains "upsert: has tool-a" "tool-a|pkg|tool-a|" "$_mfst_content"
-_assert_contains "upsert: has tool-b" "tool-b|binary|tb|.local/bin/tb" "$_mfst_content"
+_assert_contains "upsert: has tool-b" "tool-b|github:release|tb|.local/bin/tb" "$_mfst_content"
 
 # upsert replaces existing (no duplicates)
-_shdeps_manifest_upsert "tool-a" "git" "tool-a" ".local/share/tool-a"
+_shdeps_manifest_upsert "tool-a" "github:repo" "tool-a" ".local/share/tool-a"
 _mfst_content=$(cat "$_mfst_path")
-_assert_contains "upsert replace: new value" "tool-a|git|tool-a|.local/share/tool-a" "$_mfst_content"
+_assert_contains "upsert replace: new value" "tool-a|github:repo|tool-a|.local/share/tool-a" "$_mfst_content"
 _assert_not_contains "upsert replace: old value gone" "tool-a|pkg|tool-a|" "$_mfst_content"
 _mfst_count=$(grep -c "^tool-a|" "$_mfst_path")
 _assert_eq "upsert replace: no duplicates" "1" "$_mfst_count"
 
 # read populates associative array
 _shdeps_manifest_read
-_assert_eq "read: tool-a value" "git|tool-a|.local/share/tool-a" "${_SHDEPS_MANIFEST[tool-a]:-}"
-_assert_eq "read: tool-b value" "binary|tb|.local/bin/tb" "${_SHDEPS_MANIFEST[tool-b]:-}"
+_assert_eq "read: tool-a value" "github:repo|tool-a|.local/share/tool-a" "${_SHDEPS_MANIFEST[tool-a]:-}"
+_assert_eq "read: tool-b value" "github:release|tb|.local/bin/tb" "${_SHDEPS_MANIFEST[tool-b]:-}"
 
 # read missing file produces empty array
 _mfst_empty_state=$(_tmpdir)
@@ -1866,13 +1866,13 @@ _source_shdeps "$SHDEPS_DIR"
 
 # Create manifest with A, B, C
 _shdeps_manifest_upsert "dep-a" "pkg" "dep-a" ""
-_shdeps_manifest_upsert "dep-b" "binary" "dep-b" ".local/bin/dep-b"
-_shdeps_manifest_upsert "dep-c" "git" "dep-c" ".local/share/dep-c"
+_shdeps_manifest_upsert "dep-b" "github:release" "dep-b" ".local/bin/dep-b"
+_shdeps_manifest_upsert "dep-c" "github:repo" "dep-c" ".local/share/dep-c"
 
 # Config has only A, B
 cat >"$_orp_conf/deps.conf" <<'EOF'
 dep-a  pkg
-dep-b  binary  dep-b  -  owner/dep-b
+dep-b  github:release  dep-b  -  owner/dep-b
 EOF
 _shdeps_load
 
@@ -1883,7 +1883,7 @@ _assert_contains "orphan: dep-c is orphaned" "dep-c" "${_SHDEPS_ORPHANS[0]}"
 
 # manifest matches config → no orphans
 cat >>"$_orp_conf/deps.conf" <<'EOF'
-dep-c  git  -  -  owner/dep-c
+dep-c  github:repo  -  -  owner/dep-c
 EOF
 _shdeps_load
 rc=0; _shdeps_detect_orphans || rc=$?
@@ -1934,8 +1934,8 @@ mkdir -p "$(dirname "$_prune_git_link")"
 ln -sfn "$_prune_git_target" "$_prune_git_link"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$_prune_git_link/bin/prune-git-test" "$HOME/.local/bin/prune-git-test"
-date +%s >"$_prune_state/prune-git-test.git.stamp"
-_shdeps_manifest_upsert "prune-git-test" "git" "prune-git-test" ".local/share/prune-git-test"
+date +%s >"$_prune_state/prune-git-test.repo.stamp"
+_shdeps_manifest_upsert "prune-git-test" "github:repo" "prune-git-test" ".local/share/prune-git-test"
 
 cat >"$_prune_conf/deps.conf" <<'EOF'
 other-dep  pkg
@@ -1944,7 +1944,7 @@ EOF
 _shdeps_prune -y
 _assert_file_missing "prune git: symlink removed" "$_prune_git_link"
 _assert_file_missing "prune git: bin symlink removed" "$HOME/.local/bin/prune-git-test"
-_assert_file_missing "prune git: stamp removed" "$_prune_state/prune-git-test.git.stamp"
+_assert_file_missing "prune git: stamp removed" "$_prune_state/prune-git-test.repo.stamp"
 # Target dir should still exist (we only removed the symlink)
 _assert_dir_exists "prune git: target dir preserved" "$_prune_git_target"
 # Manifest entry gone
@@ -1961,7 +1961,7 @@ _source_shdeps "$SHDEPS_DIR"
 _prune_git_dir="$HOME/.local/share/prune-gitdir-test"
 mkdir -p "$_prune_git_dir"
 echo "content" >"$_prune_git_dir/file"
-_shdeps_manifest_upsert "prune-gitdir-test" "git" "prune-gitdir-test" ".local/share/prune-gitdir-test"
+_shdeps_manifest_upsert "prune-gitdir-test" "github:repo" "prune-gitdir-test" ".local/share/prune-gitdir-test"
 
 cat >"$_prune_conf2/deps.conf" <<'EOF'
 other-dep  pkg
@@ -1988,7 +1988,7 @@ uninstall() { rm -f "$_prune_git_extra"; echo "ran" > "$_prune_git_marker"; }
 HOOK
 _prune_git_hookdir="$HOME/.local/share/prune-githook-test"
 mkdir -p "$_prune_git_hookdir"
-_shdeps_manifest_upsert "prune-githook-test" "git" "prune-githook-test" ".local/share/prune-githook-test"
+_shdeps_manifest_upsert "prune-githook-test" "github:repo" "prune-githook-test" ".local/share/prune-githook-test"
 
 cat >"$_prune_conf2b/deps.conf" <<'EOF'
 other-dep  pkg
@@ -2010,8 +2010,8 @@ mkdir -p "$HOME/.local/bin" "$HOME/.local/share/prune-bin-test"
 echo '#!/bin/sh' >"$HOME/.local/bin/pbt-cmd"
 chmod +x "$HOME/.local/bin/pbt-cmd"
 echo "data" >"$HOME/.local/share/prune-bin-test/file"
-date +%s >"$_prune_state3/prune-bin-test.binary.stamp"
-_shdeps_manifest_upsert "prune-bin-test" "binary" "pbt-cmd" ".local/bin/pbt-cmd"
+date +%s >"$_prune_state3/prune-bin-test.release.stamp"
+_shdeps_manifest_upsert "prune-bin-test" "github:release" "pbt-cmd" ".local/bin/pbt-cmd"
 
 cat >"$_prune_conf3/deps.conf" <<'EOF'
 other-dep  pkg
@@ -2020,7 +2020,7 @@ EOF
 _shdeps_prune -y
 _assert_file_missing "prune binary: bin removed" "$HOME/.local/bin/pbt-cmd"
 _assert_dir_missing "prune binary: share dir removed" "$HOME/.local/share/prune-bin-test"
-_assert_file_missing "prune binary: stamp removed" "$_prune_state3/prune-bin-test.binary.stamp"
+_assert_file_missing "prune binary: stamp removed" "$_prune_state3/prune-bin-test.release.stamp"
 
 # custom with uninstall() hook
 _prune_state4=$(_tmpdir)
@@ -2126,7 +2126,7 @@ _source_shdeps "$SHDEPS_DIR"
 mkdir -p "$HOME/.local/bin"
 echo '#!/bin/sh' >"$HOME/.local/bin/dryrun-cmd"
 chmod +x "$HOME/.local/bin/dryrun-cmd"
-_shdeps_manifest_upsert "dryrun-test" "binary" "dryrun-cmd" ".local/bin/dryrun-cmd"
+_shdeps_manifest_upsert "dryrun-test" "github:release" "dryrun-cmd" ".local/bin/dryrun-cmd"
 
 cat >"$_prune_conf8/deps.conf" <<'EOF'
 other-dep  pkg
@@ -2151,7 +2151,7 @@ _source_shdeps "$SHDEPS_DIR"
 mkdir -p "$HOME/.local/bin"
 echo '#!/bin/sh' >"$HOME/.local/bin/quiet-cmd"
 chmod +x "$HOME/.local/bin/quiet-cmd"
-_shdeps_manifest_upsert "quiet-test" "binary" "quiet-cmd" ".local/bin/quiet-cmd"
+_shdeps_manifest_upsert "quiet-test" "github:release" "quiet-cmd" ".local/bin/quiet-cmd"
 
 cat >"$_prune_conf9/deps.conf" <<'EOF'
 other-dep  pkg

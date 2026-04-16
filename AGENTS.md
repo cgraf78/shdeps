@@ -6,7 +6,7 @@ This file provides context for AI agents when working in this repo.
 
 **shdeps** is a standalone shell dependency manager. It reads declarative
 config files (`*.conf`) from a config directory and installs/updates tools
-via system package managers, GitHub git repos, or GitHub release binaries.
+via system package managers, GitHub repos, or GitHub release binaries.
 Post-install hooks let callers run arbitrary setup after each dependency
 changes.
 
@@ -42,8 +42,8 @@ All behavior is controlled via environment variables (no hardcoded paths):
 | `SHDEPS_REINSTALL` | `0` | Force reinstall all deps |
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
-| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `git` method |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `git` and `binary` installs |
+| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `github:repo` method |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github:repo` and `github:release` installs |
 | `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
 | `SHDEPS_LOG_LEVEL` | `1` | Logging: 0=quiet, 1=normal, 2=verbose |
 
@@ -54,14 +54,14 @@ All behavior is controlled via environment variables (no hardcoded paths):
 jq        pkg
 bat       pkg       bat    batcat
 fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
-ds        git       -      -          cgraf78/ds.git
-neovim    binary    nvim   -          neovim/neovim
+ds        github:repo      -      -          cgraf78/ds.git
+neovim    github:release   nvim   -          neovim/neovim
 nerd-fonts custom
-codex     binary    -      -          openai/codex     -            nas
+codex     github:release   -      -          openai/codex     -            nas
 ```
 
-Methods: `pkg` (system package manager), `git` (GitHub clone), `binary` (GitHub release), `custom` (hook-only).
-`source`: for `pkg`, per-manager package name overrides (`apt:fd-find`); for `git`/`binary`, GitHub `owner/repo`.
+Methods: `pkg` (system package manager), `github:repo` (GitHub clone), `github:release` (GitHub release binary), `custom` (hook-only).
+`source`: for `pkg`, per-manager package name overrides (`apt:fd-find`); for `github:repo`/`github:release`, GitHub `owner/repo`.
 
 ## State Tracking
 
@@ -74,7 +74,7 @@ prints an orphan notice. Run `shdeps prune` to remove orphaned artifacts.
 
 ## Extras Linking
 
-shdeps auto-discovers man pages and shell completions from `git` and `binary`
+shdeps auto-discovers man pages and shell completions from `github:repo` and `github:release`
 installs and symlinks them to XDG user-local directories:
 
 | Type | Target | Auto-discovered? |
@@ -103,8 +103,8 @@ Hook files in `hooks.d/$name.sh` may define these functions:
 - `post(name)` — post-install setup. Runs after any change.
 - `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
   an orphaned dep (any method). For custom deps, this is the only cleanup.
-  For git/binary deps, this runs before the built-in cleanup — use it to
-  reverse what `post()` created (symlinks, config files).
+  For github:repo/github:release deps, this runs before the built-in cleanup —
+  use it to reverse what `post()` created (symlinks, config files).
 
 ## Code Quality
 

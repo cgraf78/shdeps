@@ -5,14 +5,14 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-A cross-platform (macOS, Linux, WSL) shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers (brew, apt, dnf, pacman), GitHub git repos, or GitHub release binaries.
+A cross-platform (macOS, Linux, WSL) shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers (brew, apt, dnf, pacman), GitHub repos, or GitHub release binaries.
 
 ![shdeps demo](demo/demo.gif)
 
 ## Features
 
 - **Declarative config** — one line per dependency in `*.conf` files
-- **Multiple install methods** — system packages (brew/apt/dnf/pacman), git clones, GitHub release binaries, or fully custom hooks
+- **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, or fully custom hooks
 - **Cross-platform** — Linux, macOS, WSL with platform (`linux`, `macos`, `wsl`) and hostname filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
@@ -70,10 +70,10 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Dependency name (used for hooks, logging, tracking) |
-| `method` | yes | Install method: `pkg`, `git`, `binary`, or `custom` |
-| `cmd` | no | Binary to check for existence (defaults to name) |
-| `cmd_alt` | no | Alternate binary name (e.g., `batcat` for `bat`) |
-| `source` | no | For `pkg`: per-manager package names (`apt:fd-find,dnf:fd-find`). For `git`/`binary`: GitHub `owner/repo`. |
+| `method` | yes | Install method: `pkg`, `github:repo`, `github:release`, or `custom` |
+| `cmd` | no | Command to check for existence (defaults to name) |
+| `cmd_alt` | no | Alternate command name (e.g., `batcat` for `bat`) |
+| `source` | no | For `pkg`: per-manager package names (`apt:fd-find,dnf:fd-find`). For `github:repo`/`github:release`: GitHub `owner/repo`. |
 | `platforms` | no | Platform filter. Values: `linux`, `macos`, `wsl`. Prefix `!` to exclude. |
 | `hosts` | no | Hostname filter (matches `hostname -s`, case-insensitive). Prefix `!` to exclude. |
 
@@ -90,8 +90,8 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_REINSTALL` | `0` | Force reinstall all deps |
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
-| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `git` method |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `git` and `binary` installs |
+| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `github:repo` method |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github:repo` and `github:release` installs |
 | `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
 | `SHDEPS_LOG_LEVEL` | `1` | 0=quiet, 1=normal, 2=verbose |
 
@@ -111,23 +111,23 @@ htop      pkg    -      -         -             -    nas
 
 Use `source` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`). Use `hosts` to limit a dep to specific machines.
 
-### `git` — GitHub Git Repos
+### `github:repo` — GitHub Repos
 
 Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<name>` (default `~/.local/share/<name>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<name>` (default `~/git/<name>`, symlinked for live development). Falls back to release tarballs, then shallow clones.
 
 ```
-ds    git    -    -    cgraf78/ds.git
+ds    github:repo    -    -    cgraf78/ds.git
 ```
 
 Override the repo URL with `SHDEPS_<NAME>_REPO` env vars.
 
-### `binary` — GitHub Release Binaries
+### `github:release` — GitHub Release Binaries
 
 Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries.
 
 ```
-neovim    binary    nvim    -    neovim/neovim
-shfmt     binary    -       -    mvdan/sh
+neovim    github:release    nvim    -    neovim/neovim
+shfmt     github:release    -       -    mvdan/sh
 ```
 
 ### `custom` — Hook-Only
@@ -150,7 +150,7 @@ Place hook files in `<hooks_dir>/<name>.sh`. For `custom` deps, hooks define the
 - **`uninstall(name)`** — reverse what `install()` or `post()` created. Optional. Called by `shdeps prune` when removing an orphaned dep (any method). For custom deps, this is the only cleanup. For other methods, runs before the built-in cleanup.
 - **`post(name)`** — optional post-install setup.
 
-**Non-custom dep hooks** (`pkg`, `git`, `binary`):
+**Non-custom dep hooks** (`pkg`, `github:repo`, `github:release`):
 
 - **`post(name)`** — runs after shdeps installs/updates the dep (symlinking, config, etc.).
 
@@ -158,7 +158,7 @@ All [public API functions](#public-api) are available to hook authors. See [exam
 
 ## Man Pages & Completions
 
-shdeps automatically discovers man pages and shell completions bundled inside `git` and `binary` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking.
+shdeps automatically discovers man pages and shell completions bundled inside `github:repo` and `github:release` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking.
 
 **What gets linked:**
 
@@ -215,7 +215,7 @@ When you remove a dep from your config, `shdeps update` will notify you that it'
 # Remove a dep from config, then update
 shdeps update
 # ==> 1 orphaned dep(s) (removed from config but still installed):
-#   neovim (binary)
+#   neovim (github:release)
 #   Run: shdeps prune
 
 shdeps prune           # interactive confirmation

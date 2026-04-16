@@ -3,7 +3,7 @@
 #
 # Reads declarative config files (*.conf) from a config directory and
 # installs/updates tools via system package managers (brew/apt/dnf/pacman),
-# GitHub git repos, or GitHub release binaries. Post-install hooks run
+# GitHub repos, or GitHub release binaries. Post-install hooks run
 # arbitrary setup after changes.
 #
 # Usage:
@@ -386,7 +386,7 @@ _shdeps_load() {
 
 # Split a pipe-delimited registry entry into named variables.
 # Sets: _name, _method, _cmd, _cmd_alt, _source, _platforms, _hosts
-# _source is method-dependent: pkg_overrides for pkg, owner/repo for git/binary.
+# _source is method-dependent: pkg_overrides for pkg, owner/repo for github:repo/github:release.
 _shdeps_parse() {
   local entry="$1"
   IFS='|' read -r _name _method _cmd _cmd_alt _source _platforms _hosts <<<"$entry"
@@ -919,7 +919,7 @@ _shdeps_remove_dep() {
   pkg)
     _shdeps_warn "  $name: pkg dep — remove manually via ${_SHDEPS_PKG_MGR:-system package manager}"
     ;;
-  git)
+  github:repo)
     _shdeps_unlink_extras "$name"
     if [[ -n "$install_path" ]]; then
       # install_path may be absolute (current format) or relative to HOME (legacy manifest entries)
@@ -931,7 +931,7 @@ _shdeps_remove_dep() {
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
-  binary)
+  github:release)
     _shdeps_unlink_extras "$name"
     rm -f "$(_shdeps_bin_dir)/$cmd"
     local binary_install_dir
@@ -1025,7 +1025,7 @@ _shdeps_prune() {
 }
 
 # ---------------------------------------------------------------------------
-# GitHub/git install methods
+# GitHub repo (github:repo) install methods
 # ---------------------------------------------------------------------------
 
 # Get version string for an installed tool.
@@ -1194,7 +1194,7 @@ _shdeps_extras_hint() {
 
 # Strategy: ~/git/<name> exists — symlink for live development, pull if TTL
 # expired and the working tree is clean.
-_shdeps_github_install_local_clone() {
+_shdeps_github_repo_install_local() {
   local name="$1" local_clone="$2" install_dir="$3" stamp="$4" log="$5"
   local link_before=""
   if [[ -L "$install_dir" ]]; then
@@ -1258,7 +1258,7 @@ _shdeps_github_install_local_clone() {
 }
 
 # Strategy: install_dir/.git exists — pull to update.
-_shdeps_github_install_pull() {
+_shdeps_github_repo_install_pull() {
   local name="$1" install_dir="$2" stamp="$3" log="$4"
   if _shdeps_remote_fresh "$stamp"; then
     _shdeps_link_bin "$name" "$install_dir"
@@ -1298,7 +1298,7 @@ _shdeps_github_install_pull() {
 }
 
 # Strategy: no existing install — try release tarball, fall back to git clone.
-_shdeps_github_install_fresh() {
+_shdeps_github_repo_install_fresh() {
   local name="$1" repo="$2" install_dir="$3" stamp="$4" log="$5"
   local tarball_url="" tmp_dir
 
@@ -1380,10 +1380,10 @@ _shdeps_github_install_fresh() {
   fi
 }
 
-# Install or upgrade a tool from GitHub (git method).
+# Install or upgrade a tool from GitHub (github:repo method).
 # Priority: $SHDEPS_GIT_DEV_DIR/<name> (symlink) > existing clone (pull) > release tarball > fresh clone.
 # Env var override: SHDEPS_<NAME>_REPO overrides the repo URL.
-_shdeps_install_from_github() {
+_shdeps_github_repo_install() {
   local name="$1" default_repo="$2" install_dir="$3"
   local upper="${name^^}"
   upper="${upper//-/_}"
@@ -1392,7 +1392,7 @@ _shdeps_install_from_github() {
   local local_clone
   local_clone="$(_shdeps_git_dev_dir)/$name"
   local stamp
-  stamp=$(_shdeps_remote_stamp "$name" git)
+  stamp=$(_shdeps_remote_stamp "$name" repo)
   local log=""
   if ! _shdeps_logfile_create; then
     _shdeps_warn "  warning: failed to create temp log for $name install"
@@ -1401,27 +1401,27 @@ _shdeps_install_from_github() {
   fi
 
   if [[ -d "$local_clone" ]]; then
-    _shdeps_github_install_local_clone "$name" "$local_clone" "$install_dir" "$stamp" "$log"
+    _shdeps_github_repo_install_local "$name" "$local_clone" "$install_dir" "$stamp" "$log"
     return $?
   fi
 
   if [[ -d "$install_dir/.git" ]]; then
-    _shdeps_github_install_pull "$name" "$install_dir" "$stamp" "$log"
+    _shdeps_github_repo_install_pull "$name" "$install_dir" "$stamp" "$log"
     return $?
   fi
 
-  _shdeps_github_install_fresh "$name" "$repo" "$install_dir" "$stamp" "$log"
+  _shdeps_github_repo_install_fresh "$name" "$repo" "$install_dir" "$stamp" "$log"
 }
 
 # ---------------------------------------------------------------------------
-# GitHub binary install methods
+# GitHub release (github:release) install methods
 # ---------------------------------------------------------------------------
 
 # Find a release asset URL matching the current OS and architecture.
 # Multi-pass: standalone binary → tarball → zip.
 # Prefers exact cmd-name matches and matching libc (gnu/musl).
 # Prints the URL to stdout; empty string if no match.
-_shdeps_binary_find_asset() {
+_shdeps_github_release_find_asset() {
   local cmd="$1" gh_repo="$2" tag="$3" release_json="$4"
 
   local os arch libc
@@ -1582,7 +1582,7 @@ _shdeps_binary_find_asset() {
 # Searches for the binary by name patterns and installs it into
 # $SHDEPS_INSTALL_DIR/<name> with a symlink in $SHDEPS_BIN_DIR.
 # $1=name $2=cmd $3=extract_dir $4=orig_extract_dir $5=bin_path
-_shdeps_binary_install_from_extracted() {
+_shdeps_github_release_install_from_extracted() {
   local name="$1" cmd="$2" extract_dir="$3" orig_extract_dir="$4" bin_path="$5"
 
   # If the archive has a single top-level directory, descend into it
@@ -1633,7 +1633,7 @@ _shdeps_binary_install_from_extracted() {
 
 # Extract a tarball, find the binary, install to $SHDEPS_INSTALL_DIR/<name>.
 # $1=name $2=cmd $3=tmp_file $4=bin_path $5=log
-_shdeps_binary_install_tarball() {
+_shdeps_github_release_install_tarball() {
   local name="$1" cmd="$2" tmp_file="$3" bin_path="$4" log="$5"
   local extract_dir
   extract_dir=$(mktemp -d) || {
@@ -1650,12 +1650,12 @@ _shdeps_binary_install_tarball() {
     return 1
   fi
   rm -f "$tmp_file"
-  _shdeps_binary_install_from_extracted "$name" "$cmd" "$extract_dir" "$extract_dir" "$bin_path"
+  _shdeps_github_release_install_from_extracted "$name" "$cmd" "$extract_dir" "$extract_dir" "$bin_path"
 }
 
 # Extract a zip, find the binary, install to $SHDEPS_INSTALL_DIR/<name>.
 # $1=name $2=cmd $3=tmp_file $4=bin_path $5=log
-_shdeps_binary_install_zip() {
+_shdeps_github_release_install_zip() {
   local name="$1" cmd="$2" tmp_file="$3" bin_path="$4" log="$5"
   if ! command -v unzip &>/dev/null; then
     rm -f "$tmp_file" "$log"
@@ -1674,21 +1674,21 @@ _shdeps_binary_install_zip() {
     return 1
   fi
   rm -f "$tmp_file"
-  _shdeps_binary_install_from_extracted "$name" "$cmd" "$extract_dir" "$extract_dir" "$bin_path"
+  _shdeps_github_release_install_from_extracted "$name" "$cmd" "$extract_dir" "$extract_dir" "$bin_path"
 }
 
 # Install or upgrade a tool via GitHub release binary.
 # Searches release assets for an executable matching the current OS/arch.
 # Handles tarballs, zips, compressed singles (.gz/.bz2/.zst), and raw binaries.
-# Usage: _shdeps_install_binary <name> <cmd> <owner/repo>
-_shdeps_install_binary() {
+# Usage: _shdeps_github_release_install <name> <cmd> <owner/repo>
+_shdeps_github_release_install() {
   local name="$1" cmd="$2" gh_repo="$3"
   local bin_path
   bin_path="$(_shdeps_bin_dir)/$cmd"
   local current_ver="" latest_ver=""
   local log=""
   local stamp
-  stamp=$(_shdeps_remote_stamp "$name" binary)
+  stamp=$(_shdeps_remote_stamp "$name" release)
 
   # Fast path: skip entirely if binary exists and TTL is fresh.
   # Avoids temp file creation, API calls, and asset matching.
@@ -1765,7 +1765,7 @@ _shdeps_install_binary() {
 
   # Find the right asset URL for this platform
   local asset_url=""
-  asset_url=$(_shdeps_binary_find_asset "$cmd" "$gh_repo" "$latest_ver" "$release_json")
+  asset_url=$(_shdeps_github_release_find_asset "$cmd" "$gh_repo" "$latest_ver" "$release_json")
 
   if [[ -z "$asset_url" ]]; then
     rm -f "$tmp_file" "$log"
@@ -1787,11 +1787,11 @@ _shdeps_install_binary() {
   # Install based on asset type: archive, compressed single, or direct binary
   local asset_lower="${asset_url,,}"
   if [[ "$asset_lower" == *.tar.gz || "$asset_lower" == *.tar.xz || "$asset_lower" == *.tar.bz2 || "$asset_lower" == *.tgz ]]; then
-    if ! _shdeps_binary_install_tarball "$name" "$cmd" "$tmp_file" "$bin_path" "$log"; then
+    if ! _shdeps_github_release_install_tarball "$name" "$cmd" "$tmp_file" "$bin_path" "$log"; then
       return 1
     fi
   elif [[ "$asset_lower" == *.zip ]]; then
-    if ! _shdeps_binary_install_zip "$name" "$cmd" "$tmp_file" "$bin_path" "$log"; then
+    if ! _shdeps_github_release_install_zip "$name" "$cmd" "$tmp_file" "$bin_path" "$log"; then
       return 1
     fi
   elif [[ "$asset_lower" == *.gz ]]; then
@@ -1875,15 +1875,15 @@ _shdeps_install_dep() {
     _shdeps_pkg_queue "$_name" "$_source"
     _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
     ;;
-  git)
+  github:repo)
     local _git_install_dir
     _git_install_dir="$(_shdeps_install_dir)/$_name"
-    _shdeps_install_from_github "$_name" "$_source" "$_git_install_dir"
-    _shdeps_manifest_upsert "$_name" "git" "$_cmd" "$_git_install_dir"
+    _shdeps_github_repo_install "$_name" "$_source" "$_git_install_dir"
+    _shdeps_manifest_upsert "$_name" "github:repo" "$_cmd" "$_git_install_dir"
     ;;
-  binary)
-    _shdeps_install_binary "$_name" "$_cmd" "$_source"
-    _shdeps_manifest_upsert "$_name" "binary" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
+  github:release)
+    _shdeps_github_release_install "$_name" "$_cmd" "$_source"
+    _shdeps_manifest_upsert "$_name" "github:release" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
     ;;
   custom)
     # Source hook file and use exists() to gate install().
@@ -1998,8 +1998,8 @@ _shdeps_self_update() {
 # Pre-fetch GitHub release JSON for all binary deps in parallel.
 # Identifies binary deps with stale TTL, fires background curl requests,
 # and stores results in _SHDEPS_PREFETCHED[name]=json for consumption
-# by _shdeps_install_binary.
-_shdeps_prefetch_binary_releases() {
+# by _shdeps_github_release_install.
+_shdeps_github_release_prefetch() {
   declare -gA _SHDEPS_PREFETCHED=()
   _SHDEPS_PREFETCH_READY=1
   command -v curl &>/dev/null || return 0
@@ -2015,14 +2015,14 @@ _shdeps_prefetch_binary_releases() {
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
-    [[ "$_method" == "binary" ]] || continue
+    [[ "$_method" == "github:release" ]] || continue
     _shdeps_platform_match "$_platforms" || continue
     _shdeps_host_match "$_hosts" || continue
 
     local bin_path
     bin_path="$(_shdeps_bin_dir)/$_cmd"
     local stamp
-    stamp=$(_shdeps_remote_stamp "$_name" binary)
+    stamp=$(_shdeps_remote_stamp "$_name" release)
 
     # Skip if binary exists and TTL is fresh
     [[ -x "$bin_path" ]] && _shdeps_remote_fresh "$stamp" && continue
@@ -2050,7 +2050,7 @@ _shdeps_prefetch_binary_releases() {
 
 # Install or upgrade all managed dependencies. Orchestrates:
 # 1. Load config and detect package manager
-# 2. Install each dep (pkg queues, git/binary install, custom exists/install)
+# 2. Install each dep (pkg queues, github:repo/release install, custom exists/install)
 # 3. Flush queued pkg installs
 # 4. Run post() hooks for changed deps
 _shdeps_update() {
@@ -2079,9 +2079,9 @@ _shdeps_update() {
   _SHDEPS_GH_TOKEN=$(gh auth token 2>/dev/null) || _SHDEPS_GH_TOKEN="${GITHUB_TOKEN:-}"
 
   # Pre-fetch GitHub release JSON for all binary deps in parallel.
-  # Each background curl writes to a temp file; _shdeps_install_binary
+  # Each background curl writes to a temp file; _shdeps_github_release_install
   # reads from the associative array instead of making its own API call.
-  _shdeps_prefetch_binary_releases
+  _shdeps_github_release_prefetch
 
   # Install phase
   local entry

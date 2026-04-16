@@ -102,8 +102,8 @@ cmd_list() {
     (( ${#_n} > _col )) && _col=${#_n}
   done
 
-  printf "%-${_col}s %-8s %-12s %s\n" "NAME" "METHOD" "STATUS" "DETAILS"
-  printf "%-${_col}s %-8s %-12s %s\n" "----" "------" "------" "-------"
+  printf "%-${_col}s %-16s %-12s %s\n" "NAME" "METHOD" "STATUS" "DETAILS"
+  printf "%-${_col}s %-16s %-12s %s\n" "----" "------" "------" "-------"
 
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
@@ -111,11 +111,11 @@ cmd_list() {
 
     # shellcheck disable=SC2154  # _name, _method, _cmd, etc. set by _shdeps_parse
     if ! shdeps_platform_match "$_platforms"; then
-      printf "%-${_col}s %-8s %-12s %s\n" "$_name" "$_method" "skipped" "(platform)"
+      printf "%-${_col}s %-16s %-12s %s\n" "$_name" "$_method" "skipped" "(platform)"
       continue
     fi
     if ! shdeps_host_match "$_hosts"; then
-      printf "%-${_col}s %-8s %-12s %s\n" "$_name" "$_method" "skipped" "(host)"
+      printf "%-${_col}s %-16s %-12s %s\n" "$_name" "$_method" "skipped" "(host)"
       continue
     fi
 
@@ -138,7 +138,7 @@ cmd_list() {
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
-    git)
+    github:repo)
       if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
         status="installed"
         local ver
@@ -146,7 +146,7 @@ cmd_list() {
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
-    binary)
+    github:release)
       local bin_path
       bin_path="$(_shdeps_bin_dir)/$_cmd"
       if [[ -x "$bin_path" ]]; then
@@ -177,7 +177,7 @@ cmd_list() {
       ;;
     esac
 
-    printf "%-${_col}s %-8s %-12s %s\n" "$_name" "$_method" "$status" "$details"
+    printf "%-${_col}s %-16s %-12s %s\n" "$_name" "$_method" "$status" "$details"
   done
 }
 
@@ -226,7 +226,7 @@ cmd_check() {
         return 0
       fi
       ;;
-    git)
+    github:repo)
       if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
         local ver
         ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
@@ -234,7 +234,7 @@ cmd_check() {
         return 0
       fi
       ;;
-    binary)
+    github:release)
       if [[ -x "$(_shdeps_bin_dir)/$_cmd" ]]; then
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
