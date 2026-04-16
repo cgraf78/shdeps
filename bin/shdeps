@@ -371,28 +371,33 @@ cmd_migrate() {
     fi
   done
 
-  # Sweep manifest for any remaining bare-name github entries (old install
-  # dirs may already be gone from a previous migrate or shdeps update).
+  # Sweep manifest: remove any bare-name github/git/binary entry whose name
+  # doesn't match a current config dep. Catches cases where the old manifest
+  # name differs from the repo short name (e.g., shfmt vs mvdan/sh).
   if [[ $dry_run -eq 0 && -f "$manifest" ]]; then
-    local swept=0
+    local -A config_names=()
     for entry in "${_SHDEPS_DEPS[@]}"; do
-      _shdeps_parse "$entry"
-      [[ "$_method" == github:repo || "$_method" == github:release ]] || continue
-      [[ "$_name" == */* ]] || continue
-      local short
-      short=$(_shdeps_short_name "$_name")
-      if awk -F'|' -v old="$short" \
-          '$1 == old && ($2 == "github:repo" || $2 == "github:release" || $2 == "git" || $2 == "binary")' \
-          "$manifest" 2>/dev/null | grep -q .; then
-        local tmp="$manifest.tmp.$$"
-        awk -F'|' -v old="$short" \
-          '$1 != old || ($2 != "github:repo" && $2 != "github:release" && $2 != "git" && $2 != "binary")' \
-          "$manifest" > "$tmp"
-        mv "$tmp" "$manifest"
-        swept=$((swept + 1))
-      fi
+      config_names["${entry%%|*}"]=1
     done
+    local swept=0 m_name m_rest
+    while IFS='|' read -r m_name m_rest || [[ -n "$m_name" ]]; do
+      [[ -n "$m_name" ]] || continue
+      local m_method="${m_rest%%|*}"
+      # Only target github/git/binary entries with bare names (no slash)
+      [[ "$m_name" != */* ]] || continue
+      case "$m_method" in
+        github:repo|github:release|git|binary) ;;
+        *) continue ;;
+      esac
+      # If this bare name isn't in the current config, it's stale
+      [[ -z "${config_names[$m_name]+x}" ]] || continue
+      swept=$((swept + 1))
+    done < "$manifest"
     if [[ $swept -gt 0 ]]; then
+      local tmp="$manifest.tmp.$$"
+      awk -F'|' '$1 ~ /\// || ($2 != "github:repo" && $2 != "github:release" && $2 != "git" && $2 != "binary")' \
+        "$manifest" > "$tmp"
+      mv "$tmp" "$manifest"
       echo "  cleaned $swept stale manifest entry/entries"
       count=$((count + swept))
     fi
