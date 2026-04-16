@@ -7,7 +7,9 @@
 
 A cross-platform (macOS, Linux, WSL) shell dependency manager. Declare your tools in config files, and shdeps installs them via system package managers (brew, apt, dnf, pacman), GitHub repos, or GitHub release binaries.
 
-![shdeps demo](demo/demo.gif)
+<p align="center">
+  <img src="demo/demo.gif" alt="shdeps demo">
+</p>
 
 ## Features
 
