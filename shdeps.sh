@@ -19,7 +19,7 @@
 #   SHDEPS_QUIET        Suppress interactive prompts(default: 0)
 #   SHDEPS_REMOTE_TTL   Cache TTL in seconds        (default: 3600)
 #   SHDEPS_GIT_DEV_DIR  Dev clone directory          (default: ~/git)
-#   SHDEPS_INSTALL_DIR  Base dir for git/binary installs (default: ~/.local/share)
+#   SHDEPS_INSTALL_DIR  Base dir for github installs (default: ~/.local/share)
 #   SHDEPS_BIN_DIR      Directory for binary symlinks (default: ~/.local/bin)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
 
@@ -67,6 +67,7 @@ shdeps_unlink_extras()  { _shdeps_unlink_extras "$@"; }
 # Logging
 shdeps_log()            { _shdeps_log "$@"; }
 shdeps_warn()           { _shdeps_warn "$@"; }
+shdeps_log_warn()       { _shdeps_log_warn "$@"; }
 shdeps_log_ok()         { _shdeps_log_ok "$@"; }
 shdeps_log_dim()        { _shdeps_log_dim "$@"; }
 shdeps_log_header()     { _shdeps_log_header "$@"; }
@@ -166,12 +167,13 @@ if [[ -z "${_SHDEPS_C_RESET+x}" ]]; then
   if [[ -t 1 ]]; then
     _SHDEPS_C_RESET=$'\033[0m'
     _SHDEPS_C_RED=$'\033[0;31m'
+    _SHDEPS_C_YELLOW=$'\033[33m'
     _SHDEPS_C_GREEN=$'\033[0;32m'
     _SHDEPS_C_DIM=$'\033[0;90m'
     _SHDEPS_C_BOLD=$'\033[1m'
     _SHDEPS_C_CLEARLN=$'\r\033[2K'
   else
-    _SHDEPS_C_RESET="" _SHDEPS_C_RED="" _SHDEPS_C_GREEN=""
+    _SHDEPS_C_RESET="" _SHDEPS_C_RED="" _SHDEPS_C_YELLOW="" _SHDEPS_C_GREEN=""
     _SHDEPS_C_DIM="" _SHDEPS_C_BOLD="" _SHDEPS_C_CLEARLN=""
   fi
 fi
@@ -213,6 +215,15 @@ _shdeps_warn() {
   _shdeps_log_clear
   if _shdeps_should_log; then
     printf '%s%s%s\n' "${_SHDEPS_C_RED}" "$*" "${_SHDEPS_C_RESET}" >&2
+  fi
+  return 0
+}
+
+# Warning (yellow, to stderr).
+_shdeps_log_warn() {
+  _shdeps_log_clear
+  if _shdeps_should_log; then
+    printf '%s%s%s\n' "${_SHDEPS_C_YELLOW}" "$*" "${_SHDEPS_C_RESET}" >&2
   fi
   return 0
 }
@@ -305,12 +316,11 @@ _shdeps_check_pkg_needed() {
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
     [[ "$_method" == "pkg" ]] || continue
-    _shdeps_platform_match "$_platforms" || continue
-    _shdeps_host_match "$_hosts" || continue
+    _shdeps_filter_match "$_filter" || continue
     local resolved_pkg
-    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_source")
+    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
     [[ "$resolved_pkg" == "NONE" ]] && continue
-    if ! _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
+    if ! _shdeps_exists "$_cmd" "$resolved_pkg"; then
       _SHDEPS_PKG_INSTALL_NEEDED=1
       return 0
     fi
@@ -373,7 +383,7 @@ _shdeps_load() {
 
   # Sort alphabetically by name for stable, scannable output.
   # Processing order doesn't affect correctness — pkg deps are batched,
-  # and git/binary/custom deps are independent of each other.
+  # and github:repo/release/custom deps are independent of each other.
   if [[ ${#_SHDEPS_DEPS[@]} -gt 1 ]]; then
     local -a sorted=()
     readarray -t sorted < <(printf '%s\n' "${_SHDEPS_DEPS[@]}" | LC_ALL=C sort -t'|' -k1,1f)
@@ -386,19 +396,23 @@ _shdeps_load() {
 # ---------------------------------------------------------------------------
 
 # Split a pipe-delimited registry entry into named variables.
-# Sets: _name, _method, _cmd, _cmd_alt, _source, _platforms, _hosts
-# _source is method-dependent: pkg_overrides for pkg, owner/repo for github:repo/github:release.
+# Sets: _name, _method, _cmd, _aliases, _filter
+# For github:* methods, _name is owner/repo.
+# _aliases is pkg-only: per-manager package name overrides.
+# _filter uses os: and host: prefixed tokens (e.g. "os:linux,host:nas").
 _shdeps_parse() {
   local entry="$1"
-  IFS='|' read -r _name _method _cmd _cmd_alt _source _platforms _hosts <<<"$entry"
+  IFS='|' read -r _name _method _cmd _aliases _filter <<<"$entry"
   # Dash means "use default" / "not specified"
   if [[ "$_cmd" == "-" ]]; then _cmd=""; fi
-  if [[ "$_cmd_alt" == "-" ]]; then _cmd_alt=""; fi
-  if [[ "$_source" == "-" ]]; then _source=""; fi
-  if [[ "$_platforms" == "-" ]]; then _platforms=""; fi
-  if [[ "$_hosts" == "-" ]]; then _hosts=""; fi
-  # Default cmd to name when unspecified
-  if [[ -z "$_cmd" ]]; then _cmd="$_name"; fi
+  if [[ "$_aliases" == "-" ]]; then _aliases=""; fi
+  if [[ "$_filter" == "-" ]]; then _filter=""; fi
+  # Default cmd to short name (handles owner/repo → repo)
+  if [[ -z "$_cmd" ]]; then _cmd="$(_shdeps_short_name "$_name")"; fi
+  # Resolve platform-qualified cmd (e.g. apt:batcat → batcat on apt)
+  if [[ "$_cmd" == *:* ]]; then
+    _cmd=$(_shdeps_resolve_override "$(_shdeps_short_name "$_name")" "$_cmd")
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -524,16 +538,13 @@ _shdeps_filter_match() {
 # Dep existence and version checking
 # ---------------------------------------------------------------------------
 
-# Check if a dependency is installed. Returns 0 if cmd or cmd_alt is found.
+# Check if a dependency is installed. Returns 0 if cmd is found.
 # Falls back to querying the package manager when command lookup fails
 # (useful for deps like fonts that don't provide binaries).
 _shdeps_exists() {
-  local cmd="${1:-}" alt="${2:-}" name="${3:-}"
+  local cmd="${1:-}" name="${2:-}"
   if [[ -n "$cmd" ]]; then
     if command -v "$cmd" &>/dev/null; then return 0; fi
-    if [[ -n "$alt" ]]; then
-      if command -v "$alt" &>/dev/null; then return 0; fi
-    fi
     # Git subcommands (git-foo) live in git's exec-path, not on $PATH.
     if [[ "$cmd" == git-* ]] && git "${cmd#git-}" --version &>/dev/null; then return 0; fi
   fi
@@ -676,7 +687,7 @@ _shdeps_pkg_refresh_metadata() {
 }
 
 # Queue a package for batched install.
-# $1=name $2=source (pkg overrides)
+# $1=name $2=aliases (pkg overrides)
 # Skips if resolved name is NONE (platform not supported) or unavailable.
 _shdeps_pkg_queue() {
   local name="$1" overrides="${2:-}"
@@ -775,7 +786,7 @@ _shdeps_pkg_install_batch() {
 # ---------------------------------------------------------------------------
 
 # Return path for a dep's cache stamp file.
-# $1=name $2=kind (git, binary, etc.)
+# $1=name $2=kind (repo, release, etc.)
 _shdeps_remote_stamp() {
   local name="$1" kind="$2"
   echo "$(_shdeps_state_dir)/${name}.${kind}.stamp"
@@ -867,10 +878,10 @@ _shdeps_manifest_upsert() {
   local manifest_dir
   manifest_dir=$(dirname "$manifest")
   mkdir -p "$manifest_dir" || return 1
-  # Remove existing entry (grep -v to temp file + mv for portability)
+  # Remove existing entry (awk handles / in owner/repo names safely)
   if [[ -f "$manifest" ]]; then
     local tmp="$manifest.tmp.$$"
-    grep -v "^${name}|" "$manifest" >"$tmp" 2>/dev/null || true
+    awk -F'|' -v n="$name" '$1 != n' "$manifest" >"$tmp" 2>/dev/null || true
     mv "$tmp" "$manifest"
   fi
   printf '%s\n' "$name|$method|$cmd|$install_path" >>"$manifest"
@@ -883,7 +894,7 @@ _shdeps_manifest_remove() {
   manifest=$(_shdeps_manifest_path)
   [[ -f "$manifest" ]] || return 0
   local tmp="$manifest.tmp.$$"
-  grep -v "^${name}|" "$manifest" >"$tmp" 2>/dev/null || true
+  awk -F'|' -v n="$name" '$1 != n' "$manifest" >"$tmp" 2>/dev/null || true
   mv "$tmp" "$manifest"
 }
 
@@ -960,7 +971,7 @@ _shdeps_remove_dep() {
       [[ "$rm_path" != /* ]] && rm_path="${HOME:?}/$rm_path"
       rm -rf "$rm_path"
     fi
-    rm -f "$(_shdeps_bin_dir)/$name"
+    rm -f "$(_shdeps_bin_dir)/$(_shdeps_short_name "$name")"
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
@@ -1079,12 +1090,14 @@ _shdeps_get_version() {
   fi
 }
 
-# Symlink bin/<name> into $SHDEPS_BIN_DIR if it exists.
+# Symlink bin/<short_name> into $SHDEPS_BIN_DIR if it exists.
 _shdeps_link_bin() {
   local name="$1" install_dir="$2"
-  if [[ -x "$install_dir/bin/$name" ]]; then
+  local short
+  short=$(_shdeps_short_name "$name")
+  if [[ -x "$install_dir/bin/$short" ]]; then
     mkdir -p "$(_shdeps_bin_dir)"
-    ln -sf "$install_dir/bin/$name" "$(_shdeps_bin_dir)/$name"
+    ln -sf "$install_dir/bin/$short" "$(_shdeps_bin_dir)/$short"
   fi
 }
 
@@ -1200,7 +1213,7 @@ _shdeps_link_extras() {
 
   # Write state file for cleanup tracking
   if [[ ${#created_links[@]} -gt 0 ]]; then
-    mkdir -p "$state_dir"
+    mkdir -p "$(dirname "$state_dir/$name.links")"
     printf '%s\n' "${created_links[@]}" > "$state_dir/$name.links"
     _SHDEPS_EXTRAS_LINKED=1
   fi
@@ -1344,6 +1357,7 @@ _shdeps_github_repo_install_fresh() {
     _shdeps_warn "  warning: git not available — cannot install $name"
     return 1
   fi
+  mkdir -p "$(dirname "$install_dir")"
   local clone_tmp="${install_dir}.tmp.$$"
   rm -rf "$clone_tmp"
   if [[ -n "${log:-}" ]]; then : >"$log"; fi
@@ -1378,16 +1392,18 @@ _shdeps_github_repo_install_fresh() {
 }
 
 # Install or upgrade a tool from GitHub (github:repo method).
-# Priority: $SHDEPS_GIT_DEV_DIR/<name> (symlink) > existing clone (pull) > fresh clone.
+# Priority: $SHDEPS_GIT_DEV_DIR/<short_name> (symlink) > existing clone (pull) > fresh clone.
 # Env var override: SHDEPS_<NAME>_REPO overrides the repo URL.
 _shdeps_github_repo_install() {
   local name="$1" default_repo="$2" install_dir="$3"
-  local upper="${name^^}"
+  local short
+  short=$(_shdeps_short_name "$name")
+  local upper="${short^^}"
   upper="${upper//-/_}"
   local env_var="SHDEPS_${upper}_REPO"
   local repo="${!env_var:-https://github.com/$default_repo}"
   local local_clone
-  local_clone="$(_shdeps_git_dev_dir)/$name"
+  local_clone="$(_shdeps_git_dev_dir)/$short"
   local stamp
   stamp=$(_shdeps_remote_stamp "$name" repo)
   local log=""
@@ -1677,9 +1693,9 @@ _shdeps_github_release_install_zip() {
 # Install or upgrade a tool via GitHub release binary.
 # Searches release assets for an executable matching the current OS/arch.
 # Handles tarballs, zips, compressed singles (.gz/.bz2/.zst), and raw binaries.
-# Usage: _shdeps_github_release_install <name> <cmd> <owner/repo>
+# $1=name (owner/repo) $2=cmd
 _shdeps_github_release_install() {
-  local name="$1" cmd="$2" gh_repo="$3"
+  local name="$1" cmd="$2" gh_repo="$1"
   local bin_path
   bin_path="$(_shdeps_bin_dir)/$cmd"
   local current_ver="" latest_ver=""
@@ -1847,39 +1863,35 @@ _shdeps_install_dep() {
   _shdeps_parse "$entry"
 
   # Skip deps that don't match this platform or host
-  _shdeps_platform_match "$_platforms" || return 0
-  _shdeps_host_match "$_hosts" || return 0
+  _shdeps_filter_match "$_filter" || return 0
 
   case "$_method" in
   pkg)
     local resolved_pkg=""
-    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_source")
+    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
     if [[ "$resolved_pkg" == "NONE" ]]; then return 0; fi
-    if _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved_pkg"; then
+    if _shdeps_exists "$_cmd" "$resolved_pkg"; then
       local ver=""
       ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
-      if [[ -z "$ver" && -n "$_cmd_alt" ]]; then
-        ver=$(_shdeps_dep_version "$_cmd_alt" 2>/dev/null || true)
-      fi
       _shdeps_log "  $_name${ver:+ -- $ver}"
       # Package exists but expected command missing — trigger post hook
-      if ! _shdeps_exists "$_cmd" "$_cmd_alt"; then
+      if ! _shdeps_exists "$_cmd"; then
         _SHDEPS_CHANGED[$_name]=1
       fi
       _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
       return 0
     fi
-    _shdeps_pkg_queue "$_name" "$_source"
+    _shdeps_pkg_queue "$_name" "$_aliases"
     _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
     ;;
   github:repo)
     local _git_install_dir
     _git_install_dir="$(_shdeps_install_dir)/$_name"
-    _shdeps_github_repo_install "$_name" "$_source" "$_git_install_dir"
+    _shdeps_github_repo_install "$_name" "$_name" "$_git_install_dir"
     _shdeps_manifest_upsert "$_name" "github:repo" "$_cmd" "$_git_install_dir"
     ;;
   github:release)
-    _shdeps_github_release_install "$_name" "$_cmd" "$_source"
+    _shdeps_github_release_install "$_name" "$_cmd"
     _shdeps_manifest_upsert "$_name" "github:release" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
     ;;
   custom)
@@ -2013,8 +2025,7 @@ _shdeps_github_release_prefetch() {
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
     [[ "$_method" == "github:release" ]] || continue
-    _shdeps_platform_match "$_platforms" || continue
-    _shdeps_host_match "$_hosts" || continue
+    _shdeps_filter_match "$_filter" || continue
 
     local bin_path
     bin_path="$(_shdeps_bin_dir)/$_cmd"
@@ -2030,7 +2041,7 @@ _shdeps_github_release_prefetch() {
     _pf_tmpfiles+=("$tmp")
 
     "${_pf_curl_args[@]}" \
-      "https://api.github.com/repos/$_source/releases/latest" \
+      "https://api.github.com/repos/$_name/releases/latest" \
       >"$tmp" 2>/dev/null &
     _pf_pids+=($!)
   done
@@ -2110,10 +2121,11 @@ _shdeps_update() {
       local _o_method="${_o_rest%%|*}"
       _orphan_list+="${_orphan_list:+, }$_o_name ($_o_method)"
     done
-    _shdeps_warn ""
-    _shdeps_warn "==> $_orphan_count orphaned dep(s) (removed from config but still installed):"
-    _shdeps_warn "  $_orphan_list"
-    _shdeps_warn "  Run: shdeps prune"
+    _shdeps_log_warn ""
+    _shdeps_log_warn "==> $_orphan_count orphaned dep(s) (removed from config but still installed):"
+    _shdeps_log_warn "  $_orphan_list"
+    _shdeps_log_warn "  Run: shdeps prune"
+    _shdeps_log_warn ""
   fi
 
   _shdeps_extras_hint

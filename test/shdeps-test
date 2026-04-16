@@ -63,10 +63,10 @@ echo "=== Config parsing ==="
 _test_conf_dir=$(_tmpdir)
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
 jq        pkg
-bat       pkg       bat    batcat
-fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
-ds        github:repo      -      -          cgraf78/ds.git
-neovim    github:release   nvim   -          neovim/neovim
+bat       pkg       apt:batcat
+fd        pkg       apt:fdfind     apt:fd-find,dnf:fd-find
+cgraf78/ds github:repo
+neovim/neovim github:release nvim
 nerd-fonts custom
 EOF
 
@@ -74,7 +74,7 @@ SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
 _assert_eq "well-formed: entry count" "6" "${#_SHDEPS_DEPS[@]}"
 _assert_contains "well-formed: first entry is bat (sorted)" "bat" "${_SHDEPS_DEPS[0]}"
-_assert_contains "well-formed: last entry is neovim (sorted)" "neovim" "${_SHDEPS_DEPS[4]}"
+_assert_contains "well-formed: last entry is neovim/neovim (sorted)" "neovim/neovim" "${_SHDEPS_DEPS[4]}"
 _assert_contains "well-formed: nerd-fonts after neovim (sorted)" "nerd-fonts" "${_SHDEPS_DEPS[5]}"
 
 # --- Minimal entry (name + method only) ---
@@ -87,15 +87,15 @@ _shdeps_load
 _assert_eq "minimal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
 _assert_eq "minimal entry: content" "jq|pkg" "${_SHDEPS_DEPS[0]}"
 
-# --- Maximal entry (all 7 fields) ---
+# --- Maximal entry (all 5 fields) ---
 
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-fd  pkg  fd  fdfind  apt:fd-find,dnf:fd-find  linux,macos  nas
+fd  pkg  apt:fdfind  apt:fd-find,dnf:fd-find  os:linux,os:macos,host:nas
 EOF
 _shdeps_load
 _assert_eq "maximal entry: count" "1" "${#_SHDEPS_DEPS[@]}"
-_assert_contains "maximal entry: has platforms" "linux,macos" "${_SHDEPS_DEPS[0]}"
-_assert_contains "maximal entry: has hosts" "nas" "${_SHDEPS_DEPS[0]}"
+_assert_contains "maximal entry: has os filter" "os:linux,os:macos" "${_SHDEPS_DEPS[0]}"
+_assert_contains "maximal entry: has host filter" "host:nas" "${_SHDEPS_DEPS[0]}"
 
 # --- Comments and blank lines ---
 
@@ -134,7 +134,7 @@ tool-a  pkg
 tool-b  pkg
 EOF
 cat >"$_multi_conf_dir/50-extras.conf" <<'EOF'
-tool-c  github:release  -  -  owner/tool-c
+owner/tool-c  github:release
 EOF
 cat >"$_multi_conf_dir/99-local.conf" <<'EOF'
 tool-d  custom
@@ -142,9 +142,9 @@ EOF
 SHDEPS_CONF_DIR="$_multi_conf_dir"
 _shdeps_load
 _assert_eq "multi-file: entry count" "4" "${#_SHDEPS_DEPS[@]}"
-_assert_contains "multi-file: sorted first" "tool-a" "${_SHDEPS_DEPS[0]}"
-_assert_contains "multi-file: sorted second" "tool-b" "${_SHDEPS_DEPS[1]}"
-_assert_contains "multi-file: sorted third" "tool-c" "${_SHDEPS_DEPS[2]}"
+_assert_contains "multi-file: sorted first" "owner/tool-c" "${_SHDEPS_DEPS[0]}"
+_assert_contains "multi-file: sorted second" "tool-a" "${_SHDEPS_DEPS[1]}"
+_assert_contains "multi-file: sorted third" "tool-b" "${_SHDEPS_DEPS[2]}"
 _assert_contains "multi-file: sorted fourth" "tool-d" "${_SHDEPS_DEPS[3]}"
 
 # --- Non-.conf files ignored ---
@@ -185,11 +185,11 @@ _assert_eq "shdeps_load: returns count" "2" "$count"
 
 rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-ds  github:repo  -  -  cgraf78/ds.git
+cgraf78/ds  github:repo  -  -
 EOF
 SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
-_assert_contains "dash fields: preserved in entry" "ds|github:repo|-|-|cgraf78/ds.git" "${_SHDEPS_DEPS[0]}"
+_assert_contains "dash fields: preserved in entry" "cgraf78/ds|github:repo|-|-" "${_SHDEPS_DEPS[0]}"
 
 # ===========================================================================
 # Section 2: Entry parsing
@@ -198,31 +198,36 @@ _assert_contains "dash fields: preserved in entry" "ds|github:repo|-|-|cgraf78/d
 echo ""
 echo "=== Entry parsing ==="
 
+# Ensure pkg manager is detected for platform-qualified cmd resolution
+_shdeps_pkg_detect
+
 # --- Full pkg entry with all fields ---
 
-_shdeps_parse "fd|pkg|fd|fdfind|apt:fd-find,dnf:fd-find|linux,macos"
+_shdeps_parse "fd|pkg|apt:fdfind|apt:fd-find,dnf:fd-find|os:linux,os:macos"
 _assert_eq "parse full: name" "fd" "$_name"
 _assert_eq "parse full: method" "pkg" "$_method"
-_assert_eq "parse full: cmd" "fd" "$_cmd"
-_assert_eq "parse full: cmd_alt" "fdfind" "$_cmd_alt"
-_assert_eq "parse full: source" "apt:fd-find,dnf:fd-find" "$_source"
-_assert_eq "parse full: platforms" "linux,macos" "$_platforms"
-_assert_eq "parse full: hosts empty when absent" "" "$_hosts"
+# apt:fdfind is platform-qualified; on brew it resolves to default name "fd"
+if [[ "${_SHDEPS_PKG_MGR:-}" == "apt" ]]; then
+  _assert_eq "parse full: cmd (apt)" "fdfind" "$_cmd"
+else
+  _assert_eq "parse full: cmd (non-apt)" "fd" "$_cmd"
+fi
+_assert_eq "parse full: aliases" "apt:fd-find,dnf:fd-find" "$_aliases"
+_assert_eq "parse full: filter" "os:linux,os:macos" "$_filter"
 
-# --- Full github:release entry (source is owner/repo) ---
+# --- Full github:release entry (name is owner/repo) ---
 
-_shdeps_parse "neovim|github:release|nvim|-|neovim/neovim|linux,macos"
-_assert_eq "parse github:release: source" "neovim/neovim" "$_source"
-_assert_eq "parse github:release: platforms" "linux,macos" "$_platforms"
+_shdeps_parse "neovim/neovim|github:release|nvim|-|os:linux,os:macos"
+_assert_eq "parse github:release: name" "neovim/neovim" "$_name"
+_assert_eq "parse github:release: cmd" "nvim" "$_cmd"
+_assert_eq "parse github:release: filter" "os:linux,os:macos" "$_filter"
 
 # --- Dash fields normalize to empty ---
 
 _shdeps_parse "pkg-a|pkg|-|-|-"
 _assert_eq "dash normalize: cmd defaults to name" "pkg-a" "$_cmd"
-_assert_eq "dash normalize: cmd_alt empty" "" "$_cmd_alt"
-_assert_eq "dash normalize: source empty" "" "$_source"
-_assert_eq "dash normalize: platforms empty" "" "$_platforms"
-_assert_eq "dash normalize: hosts empty" "" "$_hosts"
+_assert_eq "dash normalize: aliases empty" "" "$_aliases"
+_assert_eq "dash normalize: filter empty" "" "$_filter"
 
 # --- Minimal entry (name + method) ---
 
@@ -230,20 +235,23 @@ _shdeps_parse "jq|pkg"
 _assert_eq "parse minimal: name" "jq" "$_name"
 _assert_eq "parse minimal: method" "pkg" "$_method"
 _assert_eq "parse minimal: cmd defaults to name" "jq" "$_cmd"
-_assert_eq "parse minimal: cmd_alt empty" "" "$_cmd_alt"
-_assert_eq "parse minimal: source empty" "" "$_source"
+_assert_eq "parse minimal: aliases empty" "" "$_aliases"
 
 # --- cmd set explicitly ---
 
-_shdeps_parse "neovim|github:release|nvim"
-_assert_eq "parse explicit cmd: name" "neovim" "$_name"
+_shdeps_parse "neovim/neovim|github:release|nvim"
+_assert_eq "parse explicit cmd: name" "neovim/neovim" "$_name"
 _assert_eq "parse explicit cmd: cmd" "nvim" "$_cmd"
 
-# --- cmd_alt set ---
+# --- platform-qualified cmd ---
 
-_shdeps_parse "bat|pkg|bat|batcat"
-_assert_eq "parse cmd_alt: cmd" "bat" "$_cmd"
-_assert_eq "parse cmd_alt: cmd_alt" "batcat" "$_cmd_alt"
+_SHDEPS_PKG_MGR="apt"
+_shdeps_parse "bat|pkg|apt:batcat"
+_assert_eq "parse platform cmd (apt): cmd" "batcat" "$_cmd"
+_SHDEPS_PKG_MGR="brew"
+_shdeps_parse "bat|pkg|apt:batcat"
+_assert_eq "parse platform cmd (brew): cmd" "bat" "$_cmd"
+_shdeps_pkg_detect
 
 # ===========================================================================
 # Section 3: Platform matching
@@ -412,37 +420,37 @@ rc=0; shdeps_host_match "!${_upper_host}" || rc=$?
 _assert_exit "case-insensitive: uppercase exclude works" 1 "$rc"
 
 # ===========================================================================
-# Section 3c: Entry parsing with hosts field
+# Section 3c: Entry parsing with filter field
 # ===========================================================================
 
 echo ""
-echo "=== Entry parsing (hosts field) ==="
+echo "=== Entry parsing (filter field) ==="
 
-# --- Full entry with all 7 fields ---
+# --- Full entry with host filter ---
 
-_shdeps_parse "codex|binary|codex|-|openai/codex|-|nas"
-_assert_eq "parse hosts: name" "codex" "$_name"
-_assert_eq "parse hosts: hosts" "nas" "$_hosts"
+_shdeps_parse "openai/codex|github:release|codex|-|host:nas"
+_assert_eq "parse filter: name" "openai/codex" "$_name"
+_assert_eq "parse filter: filter" "host:nas" "$_filter"
 
-# --- Dash hosts normalize to empty ---
+# --- Dash filter normalizes to empty ---
 
-_shdeps_parse "jq|pkg|-|-|-|-|-"
-_assert_eq "dash hosts: empty" "" "$_hosts"
+_shdeps_parse "jq|pkg|-|-|-"
+_assert_eq "dash filter: empty" "" "$_filter"
 
-# --- Missing hosts field → empty ---
+# --- Missing filter field → empty ---
 
 _shdeps_parse "jq|pkg"
-_assert_eq "missing hosts: empty" "" "$_hosts"
+_assert_eq "missing filter: empty" "" "$_filter"
 
 # --- Maximal entry with hosts ---
 
 rm -f "$_test_conf_dir"/*.conf
 cat >"$_test_conf_dir/deps.conf" <<'EOF'
-codex  github:release  -  -  openai/codex  -  nas,taylor
+openai/codex  github:release  -  -  host:nas,host:taylor
 EOF
 SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
-_assert_contains "maximal with hosts: has hosts" "nas,taylor" "${_SHDEPS_DEPS[0]}"
+_assert_contains "maximal with hosts: has hosts" "host:nas,host:taylor" "${_SHDEPS_DEPS[0]}"
 
 # ===========================================================================
 # Section 3b: Short name helper
@@ -650,7 +658,7 @@ _assert_eq "check_pkg_needed: missing dep → 1" "1" "$_SHDEPS_PKG_INSTALL_NEEDE
 # --- _shdeps_check_pkg_needed: skips non-pkg methods ---
 
 cat >"$_cpn_dir/deps.conf" <<'EOF'
-my-tool  github:repo  -  -  user/repo
+user/repo  github:repo
 EOF
 SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
 unset _SHDEPS_PKG_INSTALL_NEEDED
@@ -1804,41 +1812,42 @@ _exists_bin=$(_mock_bin)
 echo '#!/bin/sh' > "$_exists_bin/test-exists-cmd"
 chmod +x "$_exists_bin/test-exists-cmd"
 export PATH="$_exists_bin:$PATH"
-_shdeps_exists "test-exists-cmd" "" ""
+_shdeps_exists "test-exists-cmd" ""
 _assert_exit "exists: finds cmd in PATH" 0 $?
 
-# --- _shdeps_exists: tries cmd_alt ---
+# --- _shdeps_exists: falls back to pkg manager check ---
 
-_shdeps_exists "nonexistent-primary" "test-exists-cmd" ""
-_assert_exit "exists: falls back to cmd_alt" 0 $?
+rc=0; _shdeps_exists "nonexistent-primary" "test-exists-cmd" || rc=$?
+_assert_exit "exists: cmd missing, tries name" 0 $?
 
 # --- _shdeps_exists: both missing → failure ---
 
-rc=0; _shdeps_exists "no-such-cmd-aaa" "no-such-cmd-bbb" "" || rc=$?
+rc=0; _shdeps_exists "no-such-cmd-aaa" "no-such-name-bbb" || rc=$?
 _assert_exit "exists: both missing fails" 1 "$rc"
 
 # --- Local clone detection: ~/git/<name> is preferred ---
 
 _lc_test_dir=$(_tmpdir)
-_lc_name="shdeps-lc-test"
-_lc_clone="$HOME/git/$_lc_name"
+_lc_short="shdeps-lc-test"
+_lc_name="owner/$_lc_short"
+_lc_clone="$HOME/git/$_lc_short"
 _lc_install="$HOME/.local/share/$_lc_name"
 _lc_state=$(_tmpdir)
 SHDEPS_STATE_DIR="$_lc_state"
 _source_shdeps "$SHDEPS_DIR"
 
-# Create a fake local clone with a git repo
+# Create a fake local clone with a git repo (at short name path)
 mkdir -p "$_lc_clone"
 git -C "$_lc_clone" init -q
 git -C "$_lc_clone" commit --allow-empty -m "init" -q
 
 declare -gA _SHDEPS_CHANGED=()
-_shdeps_github_repo_install "$_lc_name" "owner/$_lc_name" "$_lc_install"
+_shdeps_github_repo_install "$_lc_name" "$_lc_name" "$_lc_install"
 
 # Should create a symlink to local clone
 _assert_symlink "local clone: install dir is symlink" "$_lc_install"
 _lc_target=$(readlink "$_lc_install")
-_assert_eq "local clone: points to ~/git/<name>" "$_lc_clone" "$_lc_target"
+_assert_eq "local clone: points to ~/git/<short_name>" "$_lc_clone" "$_lc_target"
 _assert_eq "local clone: marked as changed" "1" "${_SHDEPS_CHANGED[$_lc_name]:-0}"
 
 # Cleanup
@@ -1847,8 +1856,9 @@ rm -rf "$_lc_clone" "$_lc_install"
 # --- SHDEPS_GIT_DEV_DIR overrides dev clone location ---
 
 _lc_custom_dev=$(_tmpdir)/custom-dev
-_lc_name2="shdeps-devdir-test"
-_lc_clone2="$_lc_custom_dev/$_lc_name2"
+_lc_short2="shdeps-devdir-test"
+_lc_name2="owner/$_lc_short2"
+_lc_clone2="$_lc_custom_dev/$_lc_short2"
 _lc_install2="$HOME/.local/share/$_lc_name2"
 
 mkdir -p "$_lc_clone2"
@@ -1857,7 +1867,7 @@ git -C "$_lc_clone2" commit --allow-empty -m "init" -q
 
 declare -gA _SHDEPS_CHANGED=()
 SHDEPS_GIT_DEV_DIR="$_lc_custom_dev" \
-  _shdeps_github_repo_install "$_lc_name2" "owner/$_lc_name2" "$_lc_install2"
+  _shdeps_github_repo_install "$_lc_name2" "$_lc_name2" "$_lc_install2"
 
 _assert_symlink "dev dir override: install dir is symlink" "$_lc_install2"
 _lc_target2=$(readlink "$_lc_install2")
@@ -1867,10 +1877,56 @@ _assert_eq "dev dir override: marked as changed" "1" "${_SHDEPS_CHANGED[$_lc_nam
 rm -rf "$_lc_clone2" "$_lc_install2"
 unset SHDEPS_GIT_DEV_DIR
 
-# --- Default SHDEPS_GIT_DEV_DIR ignores non-existent ~/git/<name> ---
+# --- Fresh clone creates owner/ subdirectory ---
 
-# With no clone at ~/git/ or custom dir, should fall through to fresh install
-# (tested implicitly by existing integration tests)
+_fc_state=$(_tmpdir)
+_fc_install_base=$(_tmpdir)
+_fc_name="testowner/fresh-clone-test"
+_fc_install="$_fc_install_base/$_fc_name"
+SHDEPS_STATE_DIR="$_fc_state"
+SHDEPS_INSTALL_DIR="$_fc_install_base"
+_source_shdeps "$SHDEPS_DIR"
+
+# Create a local repo to clone from (simulates GitHub)
+_fc_origin=$(_tmpdir)/origin.git
+git init --bare "$_fc_origin" -q
+_fc_staging=$(_tmpdir)/staging
+git clone "$_fc_origin" "$_fc_staging" -q 2>/dev/null
+git -C "$_fc_staging" commit --allow-empty -m "init" -q
+git -C "$_fc_staging" push -q 2>/dev/null
+rm -rf "$_fc_staging"
+
+# Ensure owner/ subdir does NOT exist yet
+_assert_dir_missing "fresh clone pre: owner dir absent" "$_fc_install_base/testowner"
+
+declare -gA _SHDEPS_CHANGED=()
+SHDEPS_FRESH_CLONE_TEST_REPO="$_fc_origin" \
+  _shdeps_github_repo_install "$_fc_name" "$_fc_name" "$_fc_install" 2>/dev/null
+
+_assert_dir_exists "fresh clone: owner subdir created" "$_fc_install_base/testowner"
+_assert_dir_exists "fresh clone: install dir created" "$_fc_install"
+_assert_dir_exists "fresh clone: has .git" "$_fc_install/.git"
+_assert_eq "fresh clone: marked changed" "1" "${_SHDEPS_CHANGED[$_fc_name]:-0}"
+
+# State files should be under owner/ subdir too
+_assert_file_exists "fresh clone: stamp in owner subdir" "$_fc_state/testowner/fresh-clone-test.repo.stamp"
+
+rm -rf "$_fc_install" "$_fc_origin"
+unset SHDEPS_INSTALL_DIR
+
+# --- Extras linking creates owner/ subdir for .links file ---
+
+_el_state=$(_tmpdir)
+_el_install=$(_tmpdir)/elowner/el-test
+mkdir -p "$_el_install/share/man/man1"
+echo ".TH TEST 1" > "$_el_install/share/man/man1/el-test.1"
+SHDEPS_STATE_DIR="$_el_state"
+_source_shdeps "$SHDEPS_DIR"
+
+_shdeps_link_extras "elowner/el-test" "$_el_install"
+_assert_file_exists "extras link: .links file in owner subdir" "$_el_state/elowner/el-test.links"
+
+rm -rf "$_el_install"
 
 # ===========================================================================
 # Section 9b: Manifest and pruning
@@ -1928,6 +1984,34 @@ _mfst_content=$(cat "$_mfst_path")
 _assert_not_contains "remove: tool-a gone" "tool-a" "$_mfst_content"
 _assert_contains "remove: tool-b kept" "tool-b" "$_mfst_content"
 
+# --- Manifest with owner/repo names (slash handling) ---
+
+_mfst_slash_state=$(_tmpdir)
+SHDEPS_STATE_DIR="$_mfst_slash_state"
+_source_shdeps "$SHDEPS_DIR"
+
+_shdeps_manifest_upsert "neovim/neovim" "github:release" "nvim" ".local/bin/nvim"
+_shdeps_manifest_upsert "cgraf78/ds" "github:repo" "ds" ".local/share/cgraf78/ds"
+_shdeps_manifest_upsert "jq" "pkg" "jq" ""
+_mfst_slash_path=$(_shdeps_manifest_path)
+_mfst_slash_content=$(cat "$_mfst_slash_path")
+_assert_contains "manifest slash: has neovim/neovim" "neovim/neovim|github:release" "$_mfst_slash_content"
+_assert_contains "manifest slash: has cgraf78/ds" "cgraf78/ds|github:repo" "$_mfst_slash_content"
+
+# upsert replaces only the exact owner/repo, not a prefix match
+_shdeps_manifest_upsert "neovim/neovim" "github:release" "nvim" ".local/bin/nvim-updated"
+_mfst_slash_content=$(cat "$_mfst_slash_path")
+_mfst_neovim_count=$(grep -c "neovim/neovim" "$_mfst_slash_path")
+_assert_eq "manifest slash: no duplicates after upsert" "1" "$_mfst_neovim_count"
+_assert_contains "manifest slash: updated path" "nvim-updated" "$_mfst_slash_content"
+
+# remove with slash name deletes only exact match
+_shdeps_manifest_remove "neovim/neovim"
+_mfst_slash_content=$(cat "$_mfst_slash_path")
+_assert_not_contains "manifest slash: neovim removed" "neovim/neovim" "$_mfst_slash_content"
+_assert_contains "manifest slash: cgraf78/ds kept" "cgraf78/ds" "$_mfst_slash_content"
+_assert_contains "manifest slash: jq kept" "jq|pkg" "$_mfst_slash_content"
+
 # remove from missing file is no-op
 SHDEPS_STATE_DIR="$_mfst_empty_state"
 _source_shdeps "$SHDEPS_DIR"
@@ -1944,24 +2028,24 @@ _source_shdeps "$SHDEPS_DIR"
 
 # Create manifest with A, B, C
 _shdeps_manifest_upsert "dep-a" "pkg" "dep-a" ""
-_shdeps_manifest_upsert "dep-b" "github:release" "dep-b" ".local/bin/dep-b"
-_shdeps_manifest_upsert "dep-c" "github:repo" "dep-c" ".local/share/dep-c"
+_shdeps_manifest_upsert "owner/dep-b" "github:release" "dep-b" ".local/bin/dep-b"
+_shdeps_manifest_upsert "owner/dep-c" "github:repo" "dep-c" ".local/share/dep-c"
 
 # Config has only A, B
 cat >"$_orp_conf/deps.conf" <<'EOF'
 dep-a  pkg
-dep-b  github:release  dep-b  -  owner/dep-b
+owner/dep-b  github:release  dep-b
 EOF
 _shdeps_load
 
 rc=0; _shdeps_detect_orphans || rc=$?
 _assert_eq "orphan: found" "0" "$rc"
 _assert_eq "orphan: count" "1" "${#_SHDEPS_ORPHANS[@]}"
-_assert_contains "orphan: dep-c is orphaned" "dep-c" "${_SHDEPS_ORPHANS[0]}"
+_assert_contains "orphan: dep-c is orphaned" "owner/dep-c" "${_SHDEPS_ORPHANS[0]}"
 
 # manifest matches config → no orphans
 cat >>"$_orp_conf/deps.conf" <<'EOF'
-dep-c  github:repo  -  -  owner/dep-c
+owner/dep-c  github:repo
 EOF
 _shdeps_load
 rc=0; _shdeps_detect_orphans || rc=$?
@@ -1991,7 +2075,7 @@ else
   _skip_plat="linux"
 fi
 cat >"$_orp_plat_conf/deps.conf" <<EOF
-dep-x  pkg  -  -  -  -  $_skip_plat
+dep-x  pkg  -  -  os:$_skip_plat
 EOF
 _shdeps_load
 rc=0; _shdeps_detect_orphans || rc=$?
@@ -2099,6 +2183,33 @@ _shdeps_prune -y
 _assert_file_missing "prune binary: bin removed" "$HOME/.local/bin/pbt-cmd"
 _assert_dir_missing "prune binary: share dir removed" "$HOME/.local/share/prune-bin-test"
 _assert_file_missing "prune binary: stamp removed" "$_prune_state3/prune-bin-test.release.stamp"
+
+# github:repo prune with owner/repo name (subdirectory cleanup)
+_prune_slash_state=$(_tmpdir)
+_prune_slash_conf=$(_tmpdir)
+SHDEPS_STATE_DIR="$_prune_slash_state"
+SHDEPS_CONF_DIR="$_prune_slash_conf"
+_source_shdeps "$SHDEPS_DIR"
+
+_prune_slash_dir="$HOME/.local/share/testowner/prune-slash-test"
+mkdir -p "$_prune_slash_dir"
+echo "content" >"$_prune_slash_dir/file"
+mkdir -p "$HOME/.local/bin"
+ln -sf "$_prune_slash_dir/bin/prune-slash-test" "$HOME/.local/bin/prune-slash-test"
+mkdir -p "$_prune_slash_state/testowner"
+date +%s >"$_prune_slash_state/testowner/prune-slash-test.repo.stamp"
+_shdeps_manifest_upsert "testowner/prune-slash-test" "github:repo" "prune-slash-test" "$HOME/.local/share/testowner/prune-slash-test"
+
+cat >"$_prune_slash_conf/deps.conf" <<'EOF'
+other-dep  pkg
+EOF
+
+_shdeps_prune -y
+_assert_dir_missing "prune owner/repo: install dir removed" "$_prune_slash_dir"
+_assert_file_missing "prune owner/repo: bin symlink removed" "$HOME/.local/bin/prune-slash-test"
+_assert_file_missing "prune owner/repo: stamp removed" "$_prune_slash_state/testowner/prune-slash-test.repo.stamp"
+_shdeps_manifest_read
+_assert_eq "prune owner/repo: manifest cleared" "" "${_SHDEPS_MANIFEST[testowner/prune-slash-test]:-}"
 
 # custom with uninstall() hook
 _prune_state4=$(_tmpdir)
@@ -2407,7 +2518,7 @@ fi
 
 rm -f "$_integ_dir"/*.conf
 cat > "$_integ_dir/deps.conf" <<EOF
-custom-a  custom  -  -  -  -  $_skip_plat
+custom-a  custom  -  -  os:$_skip_plat
 custom-b  custom
 EOF
 

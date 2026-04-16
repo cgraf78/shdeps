@@ -21,15 +21,15 @@ done
 # -- Write demo config --
 mkdir -p "$WORK_DIR"/{conf,state,install,bin}
 cat > "$WORK_DIR/conf/deps.conf" << 'CONF'
-# name          method    cmd       cmd_alt   source
-jq              pkg
-fzf             pkg
-bat             pkg       bat       batcat
-ripgrep         pkg       rg
-neovim          binary    nvim      -         neovim/neovim
-lazygit         binary    -         -         jesseduffield/lazygit
-shfmt           binary    -         -         mvdan/sh
-tpm             git       -         -         tmux-plugins/tpm
+# name                    method           cmd          aliases
+jq                        pkg
+fzf                       pkg
+bat                       pkg              apt:batcat
+ripgrep                   pkg              rg
+neovim/neovim             github:release   nvim
+jesseduffield/lazygit     github:release
+mvdan/sh                  github:release   shfmt
+tmux-plugins/tpm          github:repo
 CONF
 
 # -- Write the demo script --
@@ -56,15 +56,15 @@ pause 0.3
 # -- Show config --
 prompt
 type_cmd "cat ~/.config/shdeps/deps.conf"
-printf '\033[2m# name          method    cmd       source\033[0m\n'
-echo "jq              pkg"
-echo "fzf             pkg"
-echo "bat             pkg       bat       batcat"
-echo "ripgrep         pkg       rg"
-echo "neovim          binary    nvim      neovim/neovim"
-echo "lazygit         binary              jesseduffield/lazygit"
-echo "shfmt           binary              mvdan/sh"
-echo "tpm             git                 tmux-plugins/tpm"
+printf '\033[2m# name                    method           cmd          aliases\033[0m\n'
+echo "jq                        pkg"
+echo "fzf                       pkg"
+echo "bat                       pkg              apt:batcat"
+echo "ripgrep                   pkg              rg"
+echo "neovim/neovim             github:release   nvim"
+echo "jesseduffield/lazygit     github:release"
+echo "mvdan/sh                  github:release   shfmt"
+echo "tmux-plugins/tpm          github:repo"
 pause 3
 
 # -- Update (fresh install) --

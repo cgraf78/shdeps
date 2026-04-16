@@ -43,25 +43,26 @@ All behavior is controlled via environment variables (no hardcoded paths):
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
 | `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `github:repo` method |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github:repo` and `github:release` installs |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github` installs |
 | `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
 | `SHDEPS_LOG_LEVEL` | `1` | Logging: 0=quiet, 1=normal, 2=verbose |
 
 ## Config File Format
 
 ```
-# name    method    [cmd]  [cmd_alt]  [source]  [platforms]  [hosts]
-jq        pkg
-bat       pkg       bat    batcat
-fd        pkg       fd     fdfind     apt:fd-find,dnf:fd-find
-ds        github:repo      -      -          cgraf78/ds.git
-neovim    github:release   nvim   -          neovim/neovim
-nerd-fonts custom
-codex     github:release   -      -          openai/codex     -            nas
+# name              method           [cmd]            [aliases]                [filter]
+jq                  pkg
+bat                 pkg              apt:batcat
+fd                  pkg              apt:fdfind       apt:fd-find,dnf:fd-find
+cgraf78/ds          github:repo
+neovim/neovim       github:release   nvim
+nerd-fonts          custom
+openai/codex        github:release   -                -                        host:nas
+dust                pkg              -                -                        os:macos
 ```
 
 Methods: `pkg` (system package manager), `github:repo` (GitHub clone), `github:release` (GitHub release binary), `custom` (hook-only).
-`source`: for `pkg`, per-manager package name overrides (`apt:fd-find`); for `github:repo`/`github:release`, GitHub `owner/repo`.
+Fields are ordered most-used to least-used. For `github:repo`/`github:release`, the `owner/repo` is the `name` field. `cmd` supports `mgr:name` qualifiers (e.g., `apt:batcat`). `aliases` holds per-manager package name overrides for `pkg` deps. `filter` uses `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:!wsl`).
 
 ## State Tracking
 
@@ -74,7 +75,7 @@ prints an orphan notice. Run `shdeps prune` to remove orphaned artifacts.
 
 ## Extras Linking
 
-shdeps auto-discovers man pages and shell completions from `github:repo` and `github:release`
+shdeps auto-discovers man pages and shell completions from `github`
 installs and symlinks them to XDG user-local directories:
 
 | Type | Target | Auto-discovered? |
@@ -95,7 +96,7 @@ all tracked symlinks.
 
 ## Hook Contract
 
-Hook files in `hooks.d/$name.sh` may define these functions:
+Hook files in `hooks.d/$name.sh` may define these functions (for `github:*` deps, hooks go in `hooks.d/owner/repo.sh`):
 
 - `exists(name)` — **required**. Returns 0 if the dep is installed.
 - `install(name)` — install the dep. Called when `exists` returns 1.

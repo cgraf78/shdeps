@@ -83,7 +83,7 @@ cmd_self_update() {
   shdeps_self_update "$SHDEPS_CLI_DIR/.."
 }
 
-# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _source, _platforms, _hosts set by _shdeps_parse
+# shellcheck disable=SC2154  # _name, _method, _cmd, _aliases, _filter set by _shdeps_parse
 cmd_list() {
   _shdeps_load
   _shdeps_pkg_detect
@@ -94,47 +94,46 @@ cmd_list() {
     return 0
   fi
 
-  # Pre-pass: find the longest dep name to size the NAME column.
-  local _col=4  # minimum: length of "NAME"
-  local _e
+  # Pre-pass: find longest name and method to size columns dynamically.
+  local _ncol=4 _mcol=6  # minimums: "NAME", "METHOD"
+  local _e _n _m
   for _e in "${_SHDEPS_DEPS[@]}"; do
-    local _n="${_e%%|*}"
-    (( ${#_n} > _col )) && _col=${#_n}
+    _n="${_e%%|*}"
+    _m="${_e#*|}"; _m="${_m%%|*}"
+    (( ${#_n} > _ncol )) && _ncol=${#_n}
+    (( ${#_m} > _mcol )) && _mcol=${#_m}
   done
 
-  printf "%-${_col}s %-16s %-12s %s\n" "NAME" "METHOD" "STATUS" "DETAILS"
-  printf "%-${_col}s %-16s %-12s %s\n" "----" "------" "------" "-------"
+  printf "%-${_ncol}s %-${_mcol}s %-12s %s\n" "NAME" "METHOD" "STATUS" "DETAILS"
+  printf "%-${_ncol}s %-${_mcol}s %-12s %s\n" "----" "------" "------" "-------"
 
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
 
-    # shellcheck disable=SC2154  # _name, _method, _cmd, etc. set by _shdeps_parse
-    if ! shdeps_platform_match "$_platforms"; then
-      printf "%-${_col}s %-16s %-12s %s\n" "$_name" "$_method" "skipped" "(platform)"
+    # shellcheck disable=SC2154  # _name, _method, _cmd, _aliases, _filter set by _shdeps_parse
+    local _frc=0
+    _shdeps_filter_match "$_filter" || _frc=$?
+    if [[ $_frc -eq 1 ]]; then
+      printf "%-${_ncol}s %-${_mcol}s %-12s %s\n" "$_name" "$_method" "skipped" "(platform)"
       continue
-    fi
-    if ! shdeps_host_match "$_hosts"; then
-      printf "%-${_col}s %-16s %-12s %s\n" "$_name" "$_method" "skipped" "(host)"
+    elif [[ $_frc -eq 2 ]]; then
+      printf "%-${_ncol}s %-${_mcol}s %-12s %s\n" "$_name" "$_method" "skipped" "(host)"
       continue
     fi
 
-    # shellcheck disable=SC2154  # _cmd, _cmd_alt, _source set by _shdeps_parse
     local status="missing" details=""
     case "$_method" in
     pkg)
       local resolved
-      resolved=$(_shdeps_resolve_override "$_name" "$_source")
+      resolved=$(_shdeps_resolve_override "$_name" "$_aliases")
       if [[ "$resolved" == "NONE" ]]; then
         status="skipped"
         details="(pkg manager)"
-      elif _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved"; then
+      elif _shdeps_exists "$_cmd" "$resolved"; then
         status="installed"
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
-        if [[ -z "$ver" && -n "$_cmd_alt" ]]; then
-          ver=$(_shdeps_dep_version "$_cmd_alt" 2>/dev/null || true)
-        fi
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
@@ -177,11 +176,11 @@ cmd_list() {
       ;;
     esac
 
-    printf "%-${_col}s %-16s %-12s %s\n" "$_name" "$_method" "$status" "$details"
+    printf "%-${_ncol}s %-${_mcol}s %-12s %s\n" "$_name" "$_method" "$status" "$details"
   done
 }
 
-# shellcheck disable=SC2154  # _name, _method, _cmd, _cmd_alt, _source, _platforms, _hosts set by _shdeps_parse
+# shellcheck disable=SC2154  # _name, _method, _cmd, _aliases, _filter set by _shdeps_parse
 cmd_check() {
   local target="${1:-}"
   if [[ -z "$target" ]]; then
@@ -196,15 +195,16 @@ cmd_check() {
   local entry found=0
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
-    # shellcheck disable=SC2154  # _name, _method, _cmd, etc. set by _shdeps_parse
+    # shellcheck disable=SC2154  # _name, _method, _cmd, _aliases, _filter set by _shdeps_parse
     [[ "$_name" == "$target" ]] || continue
     found=1
 
-    if ! shdeps_platform_match "$_platforms"; then
+    local _frc=0
+    _shdeps_filter_match "$_filter" || _frc=$?
+    if [[ $_frc -eq 1 ]]; then
       echo "$_name: skipped (platform mismatch)"
       return 0
-    fi
-    if ! shdeps_host_match "$_hosts"; then
+    elif [[ $_frc -eq 2 ]]; then
       echo "$_name: skipped (host mismatch)"
       return 0
     fi
@@ -212,16 +212,13 @@ cmd_check() {
     case "$_method" in
     pkg)
       local resolved
-      resolved=$(_shdeps_resolve_override "$_name" "$_source")
+      resolved=$(_shdeps_resolve_override "$_name" "$_aliases")
       if [[ "$resolved" == "NONE" ]]; then
         echo "$_name: skipped (pkg manager)"
         return 0
-      elif _shdeps_exists "$_cmd" "$_cmd_alt" "$resolved"; then
+      elif _shdeps_exists "$_cmd" "$resolved"; then
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
-        if [[ -z "$ver" && -n "$_cmd_alt" ]]; then
-          ver=$(_shdeps_dep_version "$_cmd_alt" 2>/dev/null || true)
-        fi
         echo "$_name: installed${ver:+ ($ver)}"
         return 0
       fi
@@ -276,6 +273,152 @@ cmd_check() {
 
 cmd_prune() {
   shdeps_prune "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Migrate — one-off command to move state from bare-name to owner/repo paths.
+# Delete this function and its case branch after migration is complete.
+# ---------------------------------------------------------------------------
+
+cmd_migrate() {
+  local dry_run=0
+  [[ "${1:-}" == "--dry-run" ]] && dry_run=1
+
+  _shdeps_load
+  _shdeps_pkg_detect
+
+  local install_dir state_dir manifest
+  install_dir=$(_shdeps_install_dir)
+  state_dir=$(_shdeps_state_dir)
+  manifest=$(_shdeps_manifest_path)
+
+  local count=0
+  echo "==> Scanning for github deps needing migration..."
+
+  local entry
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    _shdeps_parse "$entry"
+    [[ "$_method" == github:repo || "$_method" == github:release ]] || continue
+    [[ "$_name" == */* ]] || continue
+
+    local short old_install new_install
+    short=$(_shdeps_short_name "$_name")
+    old_install="$install_dir/$short"
+    new_install="$install_dir/$_name"
+
+    # Skip if nothing to clean up
+    if [[ ! -e "$old_install" && ! -L "$old_install" ]]; then continue; fi
+
+    # When owner == repo (e.g., neovim/neovim), old_install is the parent
+    # of new_install — it's structural, not stale. Skip.
+    if [[ "$new_install" == "$old_install"/* ]]; then continue; fi
+
+    # New path already exists (shdeps update already ran) — just remove old
+    if [[ -e "$new_install" || -L "$new_install" ]]; then
+      echo "  $short (removing stale old path)"
+      count=$((count + 1))
+      if [[ $dry_run -eq 1 ]]; then
+        echo "    remove: $old_install"
+        continue
+      fi
+      rm -rf "$old_install"
+      # Clean up old state files too
+      rm -f "$state_dir/$short".*.stamp "$state_dir/$short.rev" "$state_dir/$short.links"
+      # Remove old manifest entry (github methods incl. pre-rename git/binary)
+      if [[ -f "$manifest" ]]; then
+        local tmp="$manifest.tmp.$$"
+        awk -F'|' -v old="$short" \
+          '$1 != old || ($2 != "github:repo" && $2 != "github:release" && $2 != "git" && $2 != "binary")' \
+          "$manifest" > "$tmp"
+        mv "$tmp" "$manifest"
+      fi
+      continue
+    fi
+
+    echo "  $short → $_name"
+    count=$((count + 1))
+
+    if [[ $dry_run -eq 1 ]]; then
+      echo "    install: $old_install → $new_install"
+      continue
+    fi
+
+    # Move install dir (handle symlinks for local dev clones)
+    mkdir -p "$(dirname "$new_install")"
+    if [[ -L "$old_install" ]]; then
+      ln -sfn "$(readlink "$old_install")" "$new_install"
+      rm -f "$old_install"
+    else
+      mv "$old_install" "$new_install"
+    fi
+
+    # Move state files
+    local f suffix
+    for f in "$state_dir/$short".*.stamp "$state_dir/$short.rev" "$state_dir/$short.links"; do
+      [[ -f "$f" ]] || continue
+      suffix="${f#"$state_dir/$short"}"
+      mkdir -p "$state_dir/$(dirname "$_name")"
+      mv "$f" "$state_dir/$_name$suffix"
+    done
+
+    # Update manifest (match name AND github method to avoid renaming pkg deps)
+    if [[ -f "$manifest" ]]; then
+      local tmp="$manifest.tmp.$$"
+      awk -F'|' -v old="$short" -v new="$_name" -v olddir="$install_dir/$short" -v newdir="$install_dir/$_name" \
+        'BEGIN{OFS="|"} $1==old && ($2=="github:repo" || $2=="github:release" || $2=="git" || $2=="binary"){$1=new; gsub(olddir,newdir)} {print}' \
+        "$manifest" > "$tmp"
+      mv "$tmp" "$manifest"
+    fi
+  done
+
+  # Sweep manifest for any remaining bare-name github entries (old install
+  # dirs may already be gone from a previous migrate or shdeps update).
+  if [[ $dry_run -eq 0 && -f "$manifest" ]]; then
+    local swept=0
+    for entry in "${_SHDEPS_DEPS[@]}"; do
+      _shdeps_parse "$entry"
+      [[ "$_method" == github:repo || "$_method" == github:release ]] || continue
+      [[ "$_name" == */* ]] || continue
+      local short
+      short=$(_shdeps_short_name "$_name")
+      if awk -F'|' -v old="$short" \
+          '$1 == old && ($2 == "github:repo" || $2 == "github:release" || $2 == "git" || $2 == "binary")' \
+          "$manifest" 2>/dev/null | grep -q .; then
+        local tmp="$manifest.tmp.$$"
+        awk -F'|' -v old="$short" \
+          '$1 != old || ($2 != "github:repo" && $2 != "github:release" && $2 != "git" && $2 != "binary")' \
+          "$manifest" > "$tmp"
+        mv "$tmp" "$manifest"
+        swept=$((swept + 1))
+      fi
+    done
+    if [[ $swept -gt 0 ]]; then
+      echo "  cleaned $swept stale manifest entry/entries"
+      count=$((count + swept))
+    fi
+  fi
+
+  # Clean up old dotfiles state dir (dot used to override SHDEPS_STATE_DIR)
+  local old_dot_state="${XDG_STATE_HOME:-$HOME/.local/state}/dot/deps"
+  if [[ -d "$old_dot_state" ]]; then
+    if [[ $dry_run -eq 1 ]]; then
+      echo "  would remove old dotfiles state dir: $old_dot_state"
+    else
+      rm -rf "$old_dot_state"
+      echo "  removed old dotfiles state dir"
+    fi
+    count=$((count + 1))
+  fi
+
+  if [[ $dry_run -eq 1 && $count -gt 0 ]]; then
+    echo ""
+    echo "Dry run: $count dep(s) would be migrated. Re-run without --dry-run to apply."
+  elif [[ $count -gt 0 ]]; then
+    echo ""
+    echo "==> Migrated $count dep(s). Run 'shdeps list' to verify."
+  else
+    echo "  Nothing to migrate — all deps already at owner/repo paths."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -352,6 +495,7 @@ main() {
   list)        cmd_list "$@" ;;
   check)       cmd_check "$@" ;;
   prune)       cmd_prune "$@" ;;
+  migrate)     cmd_migrate "$@" ;;
   version)     shdeps_version ;;
   help)        usage ;;
   *)

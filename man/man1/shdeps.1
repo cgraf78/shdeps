@@ -87,15 +87,15 @@ are comments.
 .PP
 .RS
 .nf
-# name       method           [cmd]  [cmd_alt]  [source]                 [platforms]  [hosts]
-jq           pkg
-bat          pkg              bat    batcat
-fd           pkg              fd     fdfind     apt:fd-find,dnf:fd-find
-ds           github:repo      \-     \-         cgraf78/ds.git
-neovim       github:release   nvim   \-         neovim/neovim
-dust         pkg              \-     \-         \-                       macos
-htop         pkg              \-     \-         \-                       \-           nas
-nerd-fonts   custom
+# name            method           [cmd]            [aliases]                [filter]
+jq                pkg
+bat               pkg              apt:batcat
+fd                pkg              apt:fdfind       apt:fd-find,dnf:fd-find
+cgraf78/ds        github:repo
+neovim/neovim     github:release   nvim
+dust              pkg              \-               \-                       os:macos
+htop              pkg              \-               \-                       host:nas
+nerd-fonts        custom
 .fi
 .RE
 .SS Fields
@@ -103,6 +103,14 @@ nerd-fonts   custom
 .B name
 Required.
 Identifier for the dependency.
+For
+.B github:repo
+and
+.B github:release
+methods, this is the GitHub
+.IB owner / repo
+(e.g.,
+.BR neovim/neovim ).
 .TP
 .B method
 Required.
@@ -113,40 +121,35 @@ One of
 Command name to check for.
 Defaults to
 .IR name .
+Supports
+.B mgr:name
+qualifiers for platform-specific command names (e.g.,
+.BR apt:batcat ).
 Use
 .B \-
 to keep the default.
 .TP
-.B cmd_alt
-Alternate command name (e.g.,
-.B batcat
-on Debian for
-.BR bat ).
-.TP
-.B source
+.B aliases
 For
 .BR pkg :
-comma-separated per-manager overrides (e.g.,
+comma-separated per-manager package name overrides (e.g.,
 .BR apt:fd-find,dnf:fd-find ).
 Use
 .B NONE
 to skip a specific manager.
-For
-.BR github:repo " and " github:release :
-GitHub
-.IB owner / repo
-(e.g.,
-.BR neovim/neovim ).
 .TP
-.B platforms
-Comma-separated platform filter:
-.BR linux ", " macos ", " wsl .
+.B filter
+Combined platform and hostname filter using
+.B os:
+and
+.B host:
+prefixes.
+Comma-separated (e.g.,
+.BR os:linux,host:nas ).
 Prefix with
 .B !
-to exclude.
-.TP
-.B hosts
-Comma-separated hostname filter, same syntax as platforms.
+to exclude (e.g.,
+.BR os:!wsl ).
 .SS Install Methods
 .TP
 .B pkg
@@ -154,13 +157,19 @@ Uses the detected system package manager (brew, apt, dnf, or pacman).
 Batches all pkg installs into one command; retries individually on failure.
 .TP
 .B github:repo
-Clones from GitHub.
+Clones from GitHub (the
+.B name
+field is the
+.IB owner / repo ).
 Prefers a local dev clone in
 .B $SHDEPS_GIT_DEV_DIR
 if present; otherwise pulls existing clones or does a fresh shallow clone.
 .TP
 .B github:release
-Downloads a pre-built binary from GitHub Releases.
+Downloads a pre-built binary from GitHub Releases (the
+.B name
+field is the
+.IB owner / repo ).
 Handles
 .BR .tar.gz ", " .tar.xz ", " .tar.bz2 ", " .zip ", " .gz ", " .bz2 ", " .zst ,
 and raw binaries.
@@ -177,6 +186,8 @@ Hook files are sourced from
 .IB $SHDEPS_HOOKS_DIR / name .sh
 (default:
 .IR <conf_dir>/hooks.d/ ).
+For github:* deps, hooks go in
+.IB $SHDEPS_HOOKS_DIR / owner / repo .sh .
 They may define the following functions:
 .TP
 .BI exists( name )
@@ -257,12 +268,12 @@ Cache TTL in seconds.
 Default: 3600.
 .TP
 .B SHDEPS_GIT_DEV_DIR
-Dev clone directory for the github:repo method.
+Dev clone directory for github:repo deps (prefers <dir>/<repo> over fresh clone).
 Default:
 .IR ~/git .
 .TP
 .B SHDEPS_INSTALL_DIR
-Base directory for github:repo and github:release installs.
+Base directory for github installs (uses <dir>/<owner>/<repo>).
 Default:
 .IR ~/.local/share .
 .TP

@@ -13,7 +13,7 @@ A cross-platform (macOS, Linux, WSL) shell dependency manager. Declare your tool
 
 - **Declarative config** — one line per dependency in `*.conf` files
 - **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, or fully custom hooks
-- **Cross-platform** — Linux, macOS, WSL with platform (`linux`, `macos`, `wsl`) and hostname filtering per dep
+- **Cross-platform** — Linux, macOS, WSL with `os:` and `host:` filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
 - **TTL-based caching** — avoids redundant network calls
@@ -64,18 +64,16 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 ### Config File Format
 
 ```
-# name    method    [cmd]  [cmd_alt]  [source]  [platforms]  [hosts]
+# name    method    [cmd]  [aliases]  [filter]
 ```
 
 | Field | Required | Description |
 |---|---|---|
-| `name` | yes | Dependency name (used for hooks, logging, tracking) |
+| `name` | yes | Dependency name (used for hooks, logging, tracking). For `github:repo`/`github:release`: GitHub `owner/repo`. |
 | `method` | yes | Install method: `pkg`, `github:repo`, `github:release`, or `custom` |
-| `cmd` | no | Command to check for existence (defaults to name) |
-| `cmd_alt` | no | Alternate command name (e.g., `batcat` for `bat`) |
-| `source` | no | For `pkg`: per-manager package names (`apt:fd-find,dnf:fd-find`). For `github:repo`/`github:release`: GitHub `owner/repo`. |
-| `platforms` | no | Platform filter. Values: `linux`, `macos`, `wsl`. Prefix `!` to exclude. |
-| `hosts` | no | Hostname filter (matches `hostname -s`, case-insensitive). Prefix `!` to exclude. |
+| `cmd` | no | Command to check for existence (defaults to name). Supports `mgr:name` qualifiers for platform-specific command names (e.g., `apt:batcat`). |
+| `aliases` | no | For `pkg`: per-manager package name overrides (`apt:fd-find,dnf:fd-find`). Use `NONE` to skip a specific manager (e.g., `brew:NONE`). |
+| `filter` | no | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:linux,host:nas`, `os:!wsl`). |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
 
@@ -90,8 +88,8 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_REINSTALL` | `0` | Force reinstall all deps |
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
-| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `github:repo` method |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github:repo` and `github:release` installs |
+| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for `github:repo` deps (prefers `<dir>/<repo>` over fresh clone) |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github` installs (uses `<dir>/<owner>/<repo>`) |
 | `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
 | `SHDEPS_LOG_LEVEL` | `1` | 0=quiet, 1=normal, 2=verbose |
 
@@ -103,32 +101,34 @@ Installs via the detected package manager (brew, apt, dnf, or pacman). Packages 
 
 ```
 jq        pkg
-bat       pkg    bat    batcat
-fd        pkg    fd     fdfind    apt:fd-find,dnf:fd-find
-dust      pkg    -      -         -             macos
-htop      pkg    -      -         -             -    nas
+bat       pkg    apt:batcat
+fd        pkg    apt:fdfind       apt:fd-find,dnf:fd-find
+dust      pkg    -                -                        os:macos
+htop      pkg    -                -                        host:nas
 ```
 
-Use `source` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`). Use `hosts` to limit a dep to specific machines.
+Use `aliases` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`). Use `filter` with `os:` and `host:` prefixes to limit deps to specific platforms or machines.
 
 ### `github:repo` — GitHub Repos
 
-Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<name>` (default `~/.local/share/<name>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<name>` (default `~/git/<name>`, symlinked for live development). Falls back to a shallow clone for fresh installs.
+Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<owner>/<repo>` (default `~/.local/share/<owner>/<repo>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<repo>` (default `~/git/<repo>`, symlinked for live development). Falls back to a shallow clone for fresh installs.
 
 ```
-ds    github:repo    -    -    cgraf78/ds.git
+cgraf78/ds.git    github:repo
 ```
 
-Override the repo URL with `SHDEPS_<NAME>_REPO` env vars.
+The `owner/repo` is the `name` field. Override the repo URL with `SHDEPS_<NAME>_REPO` env vars.
 
 ### `github:release` — GitHub Release Binaries
 
 Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries.
 
 ```
-neovim    github:release    nvim    -    neovim/neovim
-shfmt     github:release    -       -    mvdan/sh
+neovim/neovim    github:release    nvim
+mvdan/sh         github:release
 ```
+
+The `owner/repo` is the `name` field.
 
 ### `custom` — Hook-Only
 
@@ -140,7 +140,7 @@ nerd-fonts    custom
 
 ## Hooks
 
-Place hook files in `<hooks_dir>/<name>.sh`. For `custom` deps, hooks define the full install lifecycle. For other methods, hooks provide optional post-install setup.
+Place hook files in `<hooks_dir>/<name>.sh`. For `github:*` deps, hooks go in `hooks.d/owner/repo.sh`. For `custom` deps, hooks define the full install lifecycle. For other methods, hooks provide optional post-install setup.
 
 **Custom dep hooks:**
 
@@ -158,7 +158,7 @@ All [public API functions](#public-api) are available to hook authors. See [exam
 
 ## Man Pages & Completions
 
-shdeps automatically discovers man pages and shell completions bundled inside `github:repo` and `github:release` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking.
+shdeps automatically discovers man pages and shell completions bundled inside `github` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking.
 
 **What gets linked:**
 
@@ -215,7 +215,7 @@ When you remove a dep from your config, `shdeps update` will notify you that it'
 # Remove a dep from config, then update
 shdeps update
 # ==> 1 orphaned dep(s) (removed from config but still installed):
-#   neovim (github:release)
+#   neovim/neovim (github:release)
 #   Run: shdeps prune
 
 shdeps prune           # interactive confirmation
@@ -271,6 +271,7 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | `shdeps_prune [-y] [--dry-run]` | Remove orphaned deps no longer in config |
 | `shdeps_load` | Parse config and return dep count |
 | `shdeps_version` | Print version string |
+| `shdeps_filter_match <spec>` | Check if current platform/host matches a filter spec (e.g., `os:linux,host:nas`, `os:!wsl`) |
 | `shdeps_platform_match <spec>` | Check if current platform matches a spec (e.g., `linux,macos`, `!wsl`) |
 | `shdeps_host_match <spec>` | Check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`) |
 | `shdeps_platform` | Print normalized platform name (`linux`, `macos`, `wsl`) |
