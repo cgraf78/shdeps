@@ -108,6 +108,17 @@ _assert_symlink() {
   fi
 }
 
+# Assert nothing exists at $path — no regular file, no directory, no symlink
+# (including broken symlinks, which `_assert_file_missing`'s `! -f` misses).
+_assert_not_exists() {
+  local desc="$1" path="$2"
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    _pass "$desc"
+  else
+    _fail "$desc (path should not exist: $path)"
+  fi
+}
+
 _assert_dir_missing() {
   local desc="$1" path="$2"
   if [[ ! -d "$path" ]]; then

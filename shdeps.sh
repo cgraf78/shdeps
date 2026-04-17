@@ -1091,15 +1091,23 @@ _shdeps_get_version() {
   fi
 }
 
-# Symlink bin/<short_name> into $SHDEPS_BIN_DIR if it exists.
+# Symlink an executable at $bin_path into $SHDEPS_BIN_DIR as $cmd.
+# Primitive used by callers that already know the absolute bin path.
 _shdeps_link_bin() {
+  local cmd="$1" bin_path="$2"
+  [[ -x "$bin_path" ]] || return 0
+  mkdir -p "$(_shdeps_bin_dir)"
+  ln -sf "$bin_path" "$(_shdeps_bin_dir)/$cmd"
+}
+
+# Legacy wrapper: derive cmd from short_name(name) and bin path from
+# $install_dir/bin/<cmd>. Used by github:repo call sites that pass the
+# install directory rather than the absolute binary path.
+_shdeps_link_bin_from_dir() {
   local name="$1" install_dir="$2"
-  local short
-  short=$(_shdeps_short_name "$name")
-  if [[ -x "$install_dir/bin/$short" ]]; then
-    mkdir -p "$(_shdeps_bin_dir)"
-    ln -sf "$install_dir/bin/$short" "$(_shdeps_bin_dir)/$short"
-  fi
+  local cmd
+  cmd=$(_shdeps_short_name "$name")
+  _shdeps_link_bin "$cmd" "$install_dir/bin/$cmd"
 }
 
 # Remove symlinks tracked in a dep's .links state file.
@@ -1280,7 +1288,7 @@ _shdeps_github_repo_install_local() {
   rm -rf "$install_dir"
   mkdir -p "$(dirname "$install_dir")"
   ln -sfn "$local_clone" "$install_dir"
-  _shdeps_link_bin "$name" "$install_dir"
+  _shdeps_link_bin_from_dir "$name" "$install_dir"
   _shdeps_link_extras "$name" "$install_dir"
 
   local ver
@@ -1308,7 +1316,7 @@ _shdeps_github_repo_install_local() {
 _shdeps_github_repo_install_pull() {
   local name="$1" install_dir="$2" stamp="$3" log="$4"
   if _shdeps_remote_fresh "$stamp"; then
-    _shdeps_link_bin "$name" "$install_dir"
+    _shdeps_link_bin_from_dir "$name" "$install_dir"
     _shdeps_link_extras "$name" "$install_dir"
     local ver
     ver=$(_shdeps_get_version "$install_dir")
@@ -1321,7 +1329,7 @@ _shdeps_github_repo_install_pull() {
   head_before=$(git -C "$install_dir" rev-parse HEAD 2>/dev/null || true)
   _shdeps_log_status "  $name: pulling latest..."
   if _shdeps_run_logged git -C "$install_dir" pull --ff-only --quiet; then
-    _shdeps_link_bin "$name" "$install_dir"
+    _shdeps_link_bin_from_dir "$name" "$install_dir"
     _shdeps_link_extras "$name" "$install_dir"
     local head_after
     head_after=$(git -C "$install_dir" rev-parse HEAD 2>/dev/null || true)
@@ -1373,7 +1381,7 @@ _shdeps_github_repo_install_fresh() {
   rm -rf "$install_dir"
   mv "$clone_tmp" "$install_dir"
 
-  _shdeps_link_bin "$name" "$install_dir"
+  _shdeps_link_bin_from_dir "$name" "$install_dir"
   _shdeps_link_extras "$name" "$install_dir"
   rm -f "$log"
   _shdeps_remote_touch "$stamp" || true

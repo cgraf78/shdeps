@@ -1689,32 +1689,85 @@ echo "2.0.0" > "$_both_dir/VERSION"
 result=$(_shdeps_get_version "$_both_dir")
 _assert_eq "get_version: VERSION over git tag" "2.0.0" "$result"
 
-# --- _shdeps_link_bin: creates symlink in ~/.local/bin ---
+# --- _shdeps_link_bin primitive: symlinks bin_path to $SHDEPS_BIN_DIR/$cmd ---
+
+_prim_dir=$(_tmpdir)
+mkdir -p "$_prim_dir/bin"
+echo "#!/bin/sh" > "$_prim_dir/bin/foo"
+chmod +x "$_prim_dir/bin/foo"
+rm -f "$HOME/.local/bin/foo"
+_shdeps_link_bin "foo" "$_prim_dir/bin/foo"
+_assert_symlink "link_bin primitive: symlink created" "$HOME/.local/bin/foo"
+_prim_target=$(readlink "$HOME/.local/bin/foo")
+_assert_eq "link_bin primitive: points to bin_path" "$_prim_dir/bin/foo" "$_prim_target"
+
+# --- _shdeps_link_bin primitive: non-executable bin_path → no symlink ---
+
+_prim_noexec=$(_tmpdir)
+mkdir -p "$_prim_noexec/bin"
+echo "data" > "$_prim_noexec/bin/baz"
+rm -f "$HOME/.local/bin/baz"
+_shdeps_link_bin "baz" "$_prim_noexec/bin/baz"
+_assert_not_exists "link_bin primitive: non-exec, no symlink" "$HOME/.local/bin/baz"
+
+# --- _shdeps_link_bin primitive: missing bin_path → no symlink ---
+
+_prim_missing=$(_tmpdir)
+rm -f "$HOME/.local/bin/gone"
+_shdeps_link_bin "gone" "$_prim_missing/bin/gone"
+_assert_not_exists "link_bin primitive: missing path, no symlink" "$HOME/.local/bin/gone"
+
+# --- _shdeps_link_bin primitive: differing cmd name (overrides install dir name) ---
+
+_prim_alias=$(_tmpdir)
+mkdir -p "$_prim_alias/bin"
+echo "#!/bin/sh" > "$_prim_alias/bin/upstream"
+chmod +x "$_prim_alias/bin/upstream"
+rm -f "$HOME/.local/bin/localname"
+_shdeps_link_bin "localname" "$_prim_alias/bin/upstream"
+_assert_symlink "link_bin primitive: honors cmd for symlink name" "$HOME/.local/bin/localname"
+_alias_target=$(readlink "$HOME/.local/bin/localname")
+_assert_eq "link_bin primitive: target is raw bin_path" "$_prim_alias/bin/upstream" "$_alias_target"
+
+# --- _shdeps_link_bin_from_dir: derives cmd + bin_path from name + install_dir ---
 
 _link_dir=$(_tmpdir)
 mkdir -p "$_link_dir/bin"
 echo "#!/bin/sh" > "$_link_dir/bin/mytool"
 chmod +x "$_link_dir/bin/mytool"
-_shdeps_link_bin "mytool" "$_link_dir"
-_assert_symlink "link_bin: symlink created" "$HOME/.local/bin/mytool"
+rm -f "$HOME/.local/bin/mytool"
+_shdeps_link_bin_from_dir "mytool" "$_link_dir"
+_assert_symlink "link_bin_from_dir: symlink created" "$HOME/.local/bin/mytool"
 _link_target=$(readlink "$HOME/.local/bin/mytool")
-_assert_eq "link_bin: points to correct path" "$_link_dir/bin/mytool" "$_link_target"
+_assert_eq "link_bin_from_dir: points to correct path" "$_link_dir/bin/mytool" "$_link_target"
 
-# --- _shdeps_link_bin: no bin/<name> → no symlink ---
+# --- _shdeps_link_bin_from_dir: owner/repo name → short-name lookup ---
+
+_link_owner_dir=$(_tmpdir)
+mkdir -p "$_link_owner_dir/bin"
+echo "#!/bin/sh" > "$_link_owner_dir/bin/foo"
+chmod +x "$_link_owner_dir/bin/foo"
+rm -f "$HOME/.local/bin/foo"
+_shdeps_link_bin_from_dir "owner/foo" "$_link_owner_dir"
+_assert_symlink "link_bin_from_dir: owner/repo resolves to short name" "$HOME/.local/bin/foo"
+_owner_target=$(readlink "$HOME/.local/bin/foo")
+_assert_eq "link_bin_from_dir: owner/repo points to bin/<short>" "$_link_owner_dir/bin/foo" "$_owner_target"
+
+# --- _shdeps_link_bin_from_dir: no bin/<name> → no symlink ---
 
 _nobin_dir=$(_tmpdir)
 rm -f "$HOME/.local/bin/nobin-tool"
-_shdeps_link_bin "nobin-tool" "$_nobin_dir"
-_assert_file_missing "link_bin: no bin dir, no symlink" "$HOME/.local/bin/nobin-tool"
+_shdeps_link_bin_from_dir "nobin-tool" "$_nobin_dir"
+_assert_not_exists "link_bin_from_dir: no bin dir, no symlink" "$HOME/.local/bin/nobin-tool"
 
-# --- _shdeps_link_bin: non-executable bin/<name> → no symlink ---
+# --- _shdeps_link_bin_from_dir: non-executable bin/<name> → no symlink ---
 
 _nonexec_dir=$(_tmpdir)
 mkdir -p "$_nonexec_dir/bin"
 echo "data" > "$_nonexec_dir/bin/noexec-tool"
 rm -f "$HOME/.local/bin/noexec-tool"
-_shdeps_link_bin "noexec-tool" "$_nonexec_dir"
-_assert_file_missing "link_bin: non-exec, no symlink" "$HOME/.local/bin/noexec-tool"
+_shdeps_link_bin_from_dir "noexec-tool" "$_nonexec_dir"
+_assert_not_exists "link_bin_from_dir: non-exec, no symlink" "$HOME/.local/bin/noexec-tool"
 
 # --- _shdeps_dep_version: extracts version from --version output ---
 
