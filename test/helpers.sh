@@ -239,6 +239,100 @@ _fake_release_json() {
 }
 
 # ---------------------------------------------------------------------------
+# Mocks for external installers (cargo, go)
+# ---------------------------------------------------------------------------
+
+# Install a mock `cargo` on PATH that intercepts `cargo install --root <dir>
+# <crate> [--force]` and `cargo uninstall --root <dir> <crate>`. Creates
+# `<dir>/bin/<crate>` on install and removes it on uninstall. Records each
+# invocation to $MOCK_CARGO_LOG (if set). Returns the dir to prepend to PATH.
+_mock_cargo_setup() {
+  local dir
+  dir=$(_tmpdir)
+  cat > "$dir/cargo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+subcmd="$1"; shift
+root=""; force=0; crate=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)  root="$2"; shift 2 ;;
+    --force) force=1; shift ;;
+    *)       crate="$1"; shift ;;
+  esac
+done
+[[ -n "${MOCK_CARGO_LOG:-}" ]] && \
+  echo "subcmd=$subcmd root=$root force=$force crate=$crate" >> "$MOCK_CARGO_LOG"
+case "$subcmd" in
+  install)
+    [[ -n "$root" && -n "$crate" ]] || { echo "mock cargo: missing args" >&2; exit 2; }
+    mkdir -p "$root/bin"
+    cat > "$root/bin/$crate" <<EOF
+#!/bin/sh
+echo "mock-$crate 1.0.0"
+EOF
+    chmod +x "$root/bin/$crate"
+    printf '[v1]\n"%s 1.0.0" = []\n' "$crate" > "$root/.crates.toml"
+    ;;
+  uninstall)
+    rm -f "$root/bin/$crate" "$root/.crates.toml"
+    ;;
+  *)
+    echo "mock cargo: unsupported subcmd $subcmd" >&2
+    exit 2
+    ;;
+esac
+SH
+  chmod +x "$dir/cargo"
+  echo "$dir"
+}
+
+# Install a mock `go` on PATH that handles `go install <module>@<ver>` by
+# creating $GOBIN/<basename(module)>, and a minimal `go env <VAR>...` shim.
+# Returns the dir to prepend to PATH.
+_mock_go_setup() {
+  local dir
+  dir=$(_tmpdir)
+  cat > "$dir/go" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+subcmd="$1"; shift
+case "$subcmd" in
+  install)
+    spec="$1"
+    module="${spec%@*}"
+    ver="${spec#*@}"
+    base="${module##*/}"
+    : "${GOBIN:?GOBIN must be set}"
+    mkdir -p "$GOBIN"
+    cat > "$GOBIN/$base" <<EOF
+#!/bin/sh
+echo "mock-$base $ver"
+EOF
+    chmod +x "$GOBIN/$base"
+    [[ -n "${MOCK_GO_LOG:-}" ]] && \
+      echo "install module=$module ver=$ver GOBIN=$GOBIN" >> "$MOCK_GO_LOG"
+    ;;
+  env)
+    for k in "$@"; do
+      case "$k" in
+        GOBIN)  echo "${GOBIN:-}" ;;
+        GOPATH) echo "${GOPATH:-$HOME/go}" ;;
+        *)      echo "" ;;
+      esac
+    done
+    ;;
+  *)
+    echo "mock go: unsupported subcmd $subcmd" >&2
+    exit 2
+    ;;
+esac
+SH
+  chmod +x "$dir/go"
+  echo "$dir"
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
