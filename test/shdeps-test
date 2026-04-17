@@ -2598,6 +2598,188 @@ _assert_neq "integ manifest: custom dep recorded" "" "${_SHDEPS_MANIFEST[mfst-cu
 _assert_contains "integ manifest: method is custom" "custom" "${_SHDEPS_MANIFEST[mfst-custom]:-}"
 
 # ===========================================================================
+# Section 9c: cargo and go methods (end-to-end via mocked toolchains)
+# ===========================================================================
+
+echo ""
+echo "=== cargo method ==="
+
+# Isolated environment with mocked cargo on PATH.
+_mock_home
+_cargo_mock_dir=$(_mock_cargo_setup)
+PATH="$_cargo_mock_dir:$PATH"
+_cargo_log=$(_tmpdir)/cargo.log
+export MOCK_CARGO_LOG="$_cargo_log"
+_source_shdeps "$SHDEPS_DIR"
+
+_cargo_conf=$(_tmpdir)
+cat > "$_cargo_conf/deps.conf" <<'CONF'
+mytool   cargo
+CONF
+SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+
+_assert_file_exists "cargo: binary installed" "$HOME/.local/share/mytool/bin/mytool"
+_assert_symlink     "cargo: bin symlink created"  "$HOME/.local/bin/mytool"
+
+_shdeps_manifest_read
+_assert_contains "cargo: manifest records bin path" \
+  "cargo|mytool|$HOME/.local/share/mytool/bin/mytool" "${_SHDEPS_MANIFEST[mytool]:-}"
+
+# TTL-fresh re-run → no new install invocation
+: > "$_cargo_log"
+SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+_assert_eq "cargo: TTL-fresh re-run skips install" "" "$(cat "$_cargo_log")"
+
+# --reinstall → --force passed
+: > "$_cargo_log"
+SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 SHDEPS_REINSTALL=1 shdeps_update >/dev/null
+_assert_contains "cargo: --reinstall passes --force" "force=1" "$(cat "$_cargo_log")"
+
+# Prune: remove from config, run prune
+echo "" > "$_cargo_conf/deps.conf"
+SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
+_assert_not_exists "cargo: prune removes install dir" "$HOME/.local/share/mytool"
+_assert_not_exists "cargo: prune removes symlink"     "$HOME/.local/bin/mytool"
+
+# cmd overrides name (e.g. the 'ripgrep' crate installs 'rg'); cargo mock names
+# its output after the crate, so here we only verify the symlink name follows
+# cmd when the helper sees cmd≠name. The mock creates bin/$crate = bin/ripgrep,
+# and the dispatcher's manifest upsert records bin/$cmd = bin/rg. The helper's
+# bin_path check at bin/$cmd will fail in this case. So the "cmd≠name" path is
+# exercised by the helper tests in Section 9a, not here.
+
+echo ""
+echo "=== cargo failure modes ==="
+
+# Missing cargo → single warning, dep skipped, no manifest entry.
+_mock_home
+_cargo_conf=$(_tmpdir)
+cat > "$_cargo_conf/deps.conf" <<'CONF'
+mytool   cargo
+CONF
+_cargo_missing_out=$(
+  SHDEPS_LOG_LEVEL=1 SHDEPS_CONF_DIR="$_cargo_conf" bash -c '
+    command() {
+      if [[ "$1" == -v ]]; then
+        case "$2" in
+          cargo|go) return 1 ;;
+          *) builtin command "$@" ;;
+        esac
+      else
+        builtin command "$@"
+      fi
+    }
+    . '"$SHDEPS_DIR"'/shdeps.sh
+    shdeps_update
+  ' 2>&1
+)
+_cargo_warn_count=$(echo "$_cargo_missing_out" | grep -cE 'warning: cargo not found' || true)
+_assert_eq "cargo: missing tool warns exactly once" "1" "$_cargo_warn_count"
+_assert_not_exists "cargo: no binary when tool missing" "$HOME/.local/share/mytool/bin/mytool"
+manifest_path="${XDG_STATE_HOME:-$HOME/.local/state}/shdeps/manifest"
+if [[ -f "$manifest_path" ]]; then
+  _cargo_mfst=$(grep -c '^mytool|' "$manifest_path" || true)
+else
+  _cargo_mfst=0
+fi
+_assert_eq "cargo: no manifest entry when tool missing" "0" "$_cargo_mfst"
+
+# Tool exits clean but writes no binary → warning, no manifest entry.
+_mock_home
+_cargo_broken_dir=$(_tmpdir)
+cat > "$_cargo_broken_dir/cargo" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$_cargo_broken_dir/cargo"
+_cargo_conf=$(_tmpdir)
+cat > "$_cargo_conf/deps.conf" <<'CONF'
+brokentool   cargo
+CONF
+PATH="$_cargo_broken_dir:$PATH"
+_source_shdeps "$SHDEPS_DIR"
+_cargo_broken_out=$(
+  SHDEPS_LOG_LEVEL=1 SHDEPS_CONF_DIR="$_cargo_conf" shdeps_update 2>&1
+)
+_assert_contains "cargo: no-binary-produced warns" "produced no binary" "$_cargo_broken_out"
+manifest_path="${XDG_STATE_HOME:-$HOME/.local/state}/shdeps/manifest"
+if [[ -f "$manifest_path" ]]; then
+  _cargo_broken_mfst=$(grep -c '^brokentool|' "$manifest_path" || true)
+else
+  _cargo_broken_mfst=0
+fi
+_assert_eq "cargo: no manifest when no binary produced" "0" "$_cargo_broken_mfst"
+
+echo ""
+echo "=== go method ==="
+
+# Isolated env with mocked go on PATH
+_mock_home
+_go_mock_dir=$(_mock_go_setup)
+PATH="$_go_mock_dir:$PATH"
+_go_log=$(_tmpdir)/go.log
+export MOCK_GO_LOG="$_go_log"
+_source_shdeps "$SHDEPS_DIR"
+
+_go_conf=$(_tmpdir)
+cat > "$_go_conf/deps.conf" <<'CONF'
+github.com/junegunn/fzf   go
+CONF
+SHDEPS_CONF_DIR="$_go_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+
+_assert_file_exists "go: binary installed at nested path" \
+  "$HOME/.local/share/github.com/junegunn/fzf/bin/fzf"
+_assert_symlink "go: bin symlink created" "$HOME/.local/bin/fzf"
+
+_shdeps_manifest_read
+_assert_contains "go: manifest records go method" \
+  "go|fzf|$HOME/.local/share/github.com/junegunn/fzf/bin/fzf" \
+  "${_SHDEPS_MANIFEST[github.com/junegunn/fzf]:-}"
+
+# TTL-fresh re-run → no new install invocation
+: > "$_go_log"
+SHDEPS_CONF_DIR="$_go_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+_assert_eq "go: TTL-fresh re-run skips install" "" "$(cat "$_go_log")"
+
+# Prune
+echo "" > "$_go_conf/deps.conf"
+SHDEPS_CONF_DIR="$_go_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
+_assert_not_exists "go: prune removes nested install dir" "$HOME/.local/share/github.com/junegunn/fzf"
+_assert_not_exists "go: prune removes symlink" "$HOME/.local/bin/fzf"
+
+echo ""
+echo "=== go failure modes ==="
+
+# Missing go → warning, dep skipped, no manifest entry
+_mock_home
+_go_conf=$(_tmpdir)
+cat > "$_go_conf/deps.conf" <<'CONF'
+github.com/junegunn/fzf   go
+CONF
+_go_missing_out=$(
+  SHDEPS_LOG_LEVEL=1 SHDEPS_CONF_DIR="$_go_conf" bash -c '
+    command() {
+      if [[ "$1" == -v ]]; then
+        case "$2" in
+          cargo|go) return 1 ;;
+          *) builtin command "$@" ;;
+        esac
+      else
+        builtin command "$@"
+      fi
+    }
+    . '"$SHDEPS_DIR"'/shdeps.sh
+    shdeps_update
+  ' 2>&1
+)
+_go_warn_count=$(echo "$_go_missing_out" | grep -cE 'warning: go not found' || true)
+_assert_eq "go: missing tool warns exactly once" "1" "$_go_warn_count"
+_assert_not_exists "go: no binary when tool missing" \
+  "$HOME/.local/share/github.com/junegunn/fzf/bin/fzf"
+
+unset MOCK_CARGO_LOG MOCK_GO_LOG
+
+# ===========================================================================
 # Section 10: Integration / end-to-end
 # ===========================================================================
 

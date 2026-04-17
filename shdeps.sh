@@ -1007,6 +1007,17 @@ _shdeps_remove_dep() {
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
+  cargo|go)
+    _shdeps_unlink_extras "$name"
+    rm -f "$(_shdeps_bin_dir)/$cmd"
+    local ext_install_dir
+    ext_install_dir="$(_shdeps_install_dir)/$name"
+    if [[ -d "$ext_install_dir" ]]; then
+      rm -rf "$ext_install_dir"
+    fi
+    _shdeps_remove_stamps "$name"
+    _shdeps_log_ok "  $name removed"
+    ;;
   custom)
     if [[ $_had_uninstall -eq 1 ]]; then
       _shdeps_log_ok "  $name removed"
@@ -1991,6 +2002,22 @@ _shdeps_install_dep() {
   github:release)
     _shdeps_github_release_install "$_name" "$_cmd"
     _shdeps_manifest_upsert "$_name" "github:release" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
+    ;;
+  cargo)
+    local _cargo_install_dir
+    _cargo_install_dir="$(_shdeps_install_dir)/$_name"
+    local -a _cargo_argv=(cargo install --root "$_cargo_install_dir" "$_name")
+    if _shdeps_external_install "$_name" cargo "$_cmd" cargo _cargo_argv "--force"; then
+      _shdeps_manifest_upsert "$_name" cargo "$_cmd" "$_cargo_install_dir/bin/$_cmd"
+    fi
+    ;;
+  go)
+    local _go_install_dir
+    _go_install_dir="$(_shdeps_install_dir)/$_name"
+    local -a _go_argv=(env "GOBIN=$_go_install_dir/bin" go install "$_name@latest")
+    if _shdeps_external_install "$_name" go "$_cmd" go _go_argv ""; then
+      _shdeps_manifest_upsert "$_name" go "$_cmd" "$_go_install_dir/bin/$_cmd"
+    fi
     ;;
   custom)
     # Source hook file and use exists() to gate install().
