@@ -1989,6 +1989,119 @@ _assert_file_exists "extras link: .links file in owner subdir" "$_el_state/elown
 rm -rf "$_el_install"
 
 # ===========================================================================
+# Section 9a: _shdeps_external_install
+# ===========================================================================
+
+echo ""
+echo "=== _shdeps_external_install ==="
+
+# --- Happy path: invokes tool, creates binary, symlinks, marks changed ---
+
+_ext_fake_dir=$(_tmpdir)
+_ext_log="$_ext_fake_dir/invocations.log"
+cat > "$_ext_fake_dir/faketool" <<SH
+#!/usr/bin/env bash
+set -e
+echo "invoked: \$*" >> "$_ext_log"
+# Parse: install --root <dir> <name>
+shift # drop "install"
+root=""; name=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --root) root="\$2"; shift 2 ;;
+    *)      name="\$1"; shift ;;
+  esac
+done
+mkdir -p "\$root/bin"
+cat > "\$root/bin/\$name" <<EOF
+#!/bin/sh
+echo "\$name 1.2.3"
+EOF
+chmod +x "\$root/bin/\$name"
+SH
+chmod +x "$_ext_fake_dir/faketool"
+PATH="$_ext_fake_dir:$PATH"
+
+# Isolate install/state/bin dirs
+SHDEPS_INSTALL_DIR=$(_tmpdir)
+SHDEPS_BIN_DIR=$(_tmpdir)
+SHDEPS_STATE_DIR=$(_tmpdir)
+_source_shdeps "$SHDEPS_DIR"
+declare -gA _SHDEPS_CHANGED=()
+
+declare -a _ext_argv=(faketool install --root "$SHDEPS_INSTALL_DIR/widget" widget)
+rc=0
+_shdeps_external_install widget faketool widget faketool _ext_argv "" || rc=$?
+_assert_exit "external_install: rc=0 on success" 0 "$rc"
+_assert_file_exists "external_install: creates binary at install_dir/bin/cmd" "$SHDEPS_INSTALL_DIR/widget/bin/widget"
+_assert_symlink "external_install: symlinks into SHDEPS_BIN_DIR" "$SHDEPS_BIN_DIR/widget"
+_assert_eq "external_install: _SHDEPS_CHANGED[widget]=1" "1" "${_SHDEPS_CHANGED[widget]:-}"
+_assert_file_exists "external_install: writes stamp file" "$SHDEPS_STATE_DIR/widget.faketool.stamp"
+_assert_eq "external_install: invoked tool exactly once" "1" "$(wc -l <"$_ext_log" | tr -d ' ')"
+
+# --- Fast path: second call with fresh TTL returns 0 without invoking tool ---
+
+rc=0
+_shdeps_external_install widget faketool widget faketool _ext_argv "" || rc=$?
+_assert_exit "external_install: rc=0 on fast path" 0 "$rc"
+_assert_eq "external_install: tool not re-invoked on fast path" "1" "$(wc -l <"$_ext_log" | tr -d ' ')"
+
+# --- Tool missing: returns 1, no binary, no _SHDEPS_CHANGED ---
+
+SHDEPS_INSTALL_DIR=$(_tmpdir)
+SHDEPS_BIN_DIR=$(_tmpdir)
+SHDEPS_STATE_DIR=$(_tmpdir)
+_source_shdeps "$SHDEPS_DIR"
+declare -gA _SHDEPS_CHANGED=()
+
+_ext_saved_path="$PATH"
+PATH="/usr/bin:/bin"
+declare -a _ext_missing_argv=(nosuchtool install --root "$SHDEPS_INSTALL_DIR/gadget" gadget)
+rc=0
+_shdeps_external_install gadget nosuchtool gadget nosuchtool _ext_missing_argv "" 2>/dev/null || rc=$?
+PATH="$_ext_saved_path"
+_assert_exit "external_install: rc=1 when tool missing" 1 "$rc"
+_assert_not_exists "external_install: no binary when tool missing" "$SHDEPS_INSTALL_DIR/gadget/bin/gadget"
+_assert_eq "external_install: no changed entry when tool missing" "" "${_SHDEPS_CHANGED[gadget]:-}"
+
+# --- Tool runs but produces no binary: rc=1, warning, no changed, no link ---
+
+_ext_noop_dir=$(_tmpdir)
+cat > "$_ext_noop_dir/noop-tool" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$_ext_noop_dir/noop-tool"
+PATH="$_ext_noop_dir:$PATH"
+
+SHDEPS_INSTALL_DIR=$(_tmpdir)
+SHDEPS_BIN_DIR=$(_tmpdir)
+SHDEPS_STATE_DIR=$(_tmpdir)
+_source_shdeps "$SHDEPS_DIR"
+# Raise log level after sourcing so warnings are visible to capture.
+export SHDEPS_LOG_LEVEL=2
+declare -gA _SHDEPS_CHANGED=()
+
+declare -a _ext_noop_argv=(noop-tool install --root "$SHDEPS_INSTALL_DIR/ghost" ghost)
+# Single-execution capture: redirect stderr to a file so rc and warning
+# text come from the same call (not two separate invocations).
+_ext_noop_err=$(_tmpdir)/noop-stderr
+rc=0
+_shdeps_external_install ghost noop-tool ghost noop-tool _ext_noop_argv "" \
+  >/dev/null 2>"$_ext_noop_err" || rc=$?
+_ext_stderr=$(cat "$_ext_noop_err")
+_assert_exit "external_install: rc=1 when tool produces no binary" 1 "$rc"
+_assert_contains "external_install: warning on missing binary" "produced no binary" "$_ext_stderr"
+_assert_not_exists "external_install: no binary created" "$SHDEPS_INSTALL_DIR/ghost/bin/ghost"
+_assert_not_exists "external_install: no symlink created" "$SHDEPS_BIN_DIR/ghost"
+_assert_eq "external_install: no changed entry when no binary" "" "${_SHDEPS_CHANGED[ghost]:-}"
+
+# Restore quiet logging and default dir overrides for subsequent sections
+unset SHDEPS_INSTALL_DIR SHDEPS_BIN_DIR SHDEPS_STATE_DIR
+export SHDEPS_LOG_LEVEL=0
+_source_shdeps "$SHDEPS_DIR"
+
+# ===========================================================================
 # Section 9b: Manifest and pruning
 # ===========================================================================
 

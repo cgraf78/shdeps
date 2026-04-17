@@ -1863,6 +1863,74 @@ _shdeps_github_release_install() {
 }
 
 # ---------------------------------------------------------------------------
+# External installers — cargo, go, and future pipx/npm/gem/uv
+# ---------------------------------------------------------------------------
+
+# Install a dep by invoking an external tool. Shared skeleton for cargo/go.
+# $1=name  $2=method  $3=cmd  $4=tool  $5=argv-nameref  $6=force-flag-or-empty
+#
+# Writes _SHDEPS_CHANGED[$name]=1 iff the install command actually ran.
+# Returns 0 iff the binary exists at the expected path on completion
+# (either fast path or successful install). Returns non-zero on any
+# failure or when the required tool is missing — caller MUST skip
+# manifest upsert so we never claim success for a broken install.
+_shdeps_external_install() {
+  local name="$1" method="$2" cmd="$3" tool="$4"
+  local -n install_argv="$5"
+  local force_flag="${6:-}"
+
+  local install_dir bin_path stamp
+  install_dir="$(_shdeps_install_dir)/$name"
+  bin_path="$install_dir/bin/$cmd"
+  stamp=$(_shdeps_remote_stamp "$name" "$method")
+
+  # Fast path: binary present, TTL fresh, not reinstalling.
+  if [[ -x "$bin_path" ]] && _shdeps_remote_fresh "$stamp"; then
+    local ver
+    ver=$(_shdeps_dep_version "$cmd" 2>/dev/null || true)
+    _shdeps_log "  $name${ver:+ -- $ver}"
+    return 0
+  fi
+
+  # Tool must be present. Pre-scan warns at startup; here we silently
+  # short-circuit with non-zero so the caller does not touch the manifest.
+  command -v "$tool" &>/dev/null || return 1
+
+  mkdir -p "$install_dir/bin" || return 1
+
+  local -a argv=("${install_argv[@]}")
+  if [[ -n "$force_flag" && "$(_shdeps_reinstall)" -eq 1 ]]; then
+    argv+=("$force_flag")
+  fi
+
+  local log=""
+  _shdeps_logfile_create && log="$REPLY"
+
+  _shdeps_log_status "  $name: installing via $tool..."
+  if ! _shdeps_run_logged "${argv[@]}"; then
+    _shdeps_logfile_print "$name install" "$log"
+    rm -f "$log"
+    _shdeps_warn "  warning: $tool install failed for $name"
+    return 1
+  fi
+  rm -f "$log"
+
+  if [[ ! -x "$bin_path" ]]; then
+    _shdeps_warn "  warning: $tool install for $name produced no binary at $bin_path"
+    return 1
+  fi
+
+  _shdeps_link_bin "$cmd" "$bin_path"
+  _shdeps_remote_touch "$stamp" || true
+  _SHDEPS_CHANGED[$name]=1
+
+  local ver
+  ver=$(_shdeps_dep_version "$cmd" 2>/dev/null || true)
+  _shdeps_log_ok "  $name installed${ver:+ -- $ver}"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher and hooks
 # ---------------------------------------------------------------------------
 
