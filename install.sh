@@ -35,8 +35,8 @@ _check_prereqs() {
     _error "git is required"
     exit 1
   fi
-  if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
-    _error "bash 4+ is required (found ${BASH_VERSION})"
+  if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    _error "bash 4.3+ is required (found ${BASH_VERSION})"
     exit 1
   fi
 }

@@ -2,7 +2,7 @@
 
 ![Tests](https://github.com/cgraf78/shdeps/actions/workflows/test.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.0-blue.svg)](https://www.gnu.org/software/bash/)
+[![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.3-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
 Declare your shell tools in one config file. shdeps installs and updates them everywhere — brew, apt, dnf, pacman, GitHub repos, or GitHub release binaries. One manifest, any machine.
@@ -298,7 +298,7 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 ./test/shdeps-test
 ```
 
-Requires bash 4.0+ (for associative arrays).
+Requires bash 4.3+ (for associative arrays and namerefs).
 
 ## License
 
