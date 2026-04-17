@@ -302,46 +302,43 @@ _shdeps_require_sudo() {
   sudo true
 }
 
-# Check if any pkg dep needs installing on this platform.
-# Sets _SHDEPS_PKG_INSTALL_NEEDED=1 if so. Idempotent — only scans once.
-# Call after _shdeps_load and _shdeps_pkg_detect.
-_shdeps_check_pkg_needed() {
-  [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-}" != 0 ]] || return 0
-  [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-}" != 1 ]] || return 0
+# Scan active deps once to determine install prerequisites:
+#   - sets _SHDEPS_PKG_INSTALL_NEEDED=1 if any pkg dep needs installing
+#     (used to gate sudo priming and metadata refresh)
+#   - emits one warning per missing external tool (cargo, go)
+# Idempotent via _SHDEPS_PREREQS_SCANNED. Call after _shdeps_load and
+# _shdeps_pkg_detect.
+_shdeps_check_prereqs() {
+  [[ "${_SHDEPS_PREREQS_SCANNED:-0}" -eq 1 ]] && return 0
+  _SHDEPS_PREREQS_SCANNED=1
   _SHDEPS_PKG_INSTALL_NEEDED=0
 
-  if [[ "$_SHDEPS_PKG_MGR" == "brew" || -z "$_SHDEPS_PKG_MGR" ]]; then return 0; fi
+  local pkg_scan_active=1
+  [[ "$_SHDEPS_PKG_MGR" == "brew" || -z "$_SHDEPS_PKG_MGR" ]] && pkg_scan_active=0
 
-  local entry
-  for entry in "${_SHDEPS_DEPS[@]}"; do
-    _shdeps_parse "$entry"
-    [[ "$_method" == "pkg" ]] || continue
-    _shdeps_filter_match "$_filter" || continue
-    local resolved_pkg
-    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
-    [[ "$resolved_pkg" == "NONE" ]] && continue
-    if ! _shdeps_exists "$_cmd" "$resolved_pkg"; then
-      _SHDEPS_PKG_INSTALL_NEEDED=1
-      return 0
-    fi
-  done
-}
-
-# Warn once per missing external tool (cargo, go). Per-dep installs
-# silently skip when the tool is absent. Call after _shdeps_load.
-_shdeps_check_external_tools() {
-  local -A needed=()
+  local -A ext_tools=()
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
     _shdeps_filter_match "$_filter" || continue
     case "$_method" in
-    cargo) needed[cargo]=1 ;;
-    go)    needed[go]=1 ;;
+    pkg)
+      if [[ $pkg_scan_active -eq 1 && "$_SHDEPS_PKG_INSTALL_NEEDED" -eq 0 ]]; then
+        local resolved_pkg
+        resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
+        [[ "$resolved_pkg" == "NONE" ]] && continue
+        if ! _shdeps_exists "$_cmd" "$resolved_pkg"; then
+          _SHDEPS_PKG_INSTALL_NEEDED=1
+        fi
+      fi
+      ;;
+    cargo) ext_tools[cargo]=1 ;;
+    go)    ext_tools[go]=1 ;;
     esac
   done
+
   local tool
-  for tool in "${!needed[@]}"; do
+  for tool in "${!ext_tools[@]}"; do
     if ! command -v "$tool" &>/dev/null; then
       _shdeps_warn "  warning: $tool not found — skipping all $tool deps"
     fi
@@ -351,7 +348,7 @@ _shdeps_check_external_tools() {
 # Prime sudo credentials if any deps will need them.
 # Call after _shdeps_load and _shdeps_pkg_detect.
 _shdeps_maybe_prime_sudo() {
-  _shdeps_check_pkg_needed
+  _shdeps_check_prereqs
   [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-0}" -eq 1 ]] || return 0
   if [[ "$(id -u)" -eq 0 ]]; then return 0; fi
   if sudo -n true 2>/dev/null; then return 0; fi
@@ -687,7 +684,7 @@ _shdeps_pkg_available() {
 # Ensures _shdeps_pkg_available sees all available packages, even on
 # a fresh machine where the cache is empty.
 _shdeps_pkg_refresh_metadata() {
-  _shdeps_check_pkg_needed
+  _shdeps_check_prereqs
   [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-0}" -eq 1 ]] || return 0
   [[ "${_SHDEPS_PKG_CACHE_REFRESHED:-}" != 1 ]] || return 0
 
@@ -2190,11 +2187,9 @@ _shdeps_update() {
   _shdeps_log_header "==> Installing/upgrading tools..."
 
   # Prime sudo early so the password prompt is visible, not buried inside
-  # a _shdeps_run_logged redirect where it silently hangs.
+  # a _shdeps_run_logged redirect where it silently hangs. Prime-sudo also
+  # triggers the prereqs scan, which emits cargo/go missing-tool warnings.
   _shdeps_maybe_prime_sudo
-
-  # Warn once per missing external tool (cargo, go); per-dep installs skip.
-  _shdeps_check_external_tools
 
   # Refresh package metadata so _shdeps_pkg_available sees all repos.
   # On a fresh machine the cache is empty and packages appear unavailable.

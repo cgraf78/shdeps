@@ -624,7 +624,7 @@ _source_shdeps "$SHDEPS_DIR"
 _shdeps_pkg_detect
 _assert_match "pkg_detect: sets a known value" "^(brew|apt|dnf|pacman)?$" "$_SHDEPS_PKG_MGR"
 
-# --- _shdeps_check_pkg_needed: all deps installed → 0 ---
+# --- _shdeps_check_prereqs: all pkg deps installed → NEEDED=0 ---
 
 _cpn_dir=$(_tmpdir)
 _cpn_bin=$(_mock_bin)
@@ -639,59 +639,61 @@ _saved_path="$PATH"
 export PATH="$_cpn_bin:$PATH"
 SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
 _SHDEPS_PKG_MGR="dnf"
-unset _SHDEPS_PKG_INSTALL_NEEDED
-_shdeps_check_pkg_needed
-_assert_eq "check_pkg_needed: all installed → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PREREQS_SCANNED
+_shdeps_check_prereqs
+_assert_eq "check_prereqs: all pkg installed → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
 export PATH="$_saved_path"
 
-# --- _shdeps_check_pkg_needed: missing dep → 1 ---
+# --- _shdeps_check_prereqs: missing pkg dep → NEEDED=1 ---
 
 cat >"$_cpn_dir/deps.conf" <<'EOF'
 tool-a  pkg
 missing-tool  pkg
 EOF
 SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
-unset _SHDEPS_PKG_INSTALL_NEEDED
-_shdeps_check_pkg_needed
-_assert_eq "check_pkg_needed: missing dep → 1" "1" "$_SHDEPS_PKG_INSTALL_NEEDED"
+unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PREREQS_SCANNED
+_shdeps_check_prereqs
+_assert_eq "check_prereqs: missing pkg dep → 1" "1" "$_SHDEPS_PKG_INSTALL_NEEDED"
 
-# --- _shdeps_check_pkg_needed: skips non-pkg methods ---
+# --- _shdeps_check_prereqs: non-pkg methods leave NEEDED=0 ---
 
 cat >"$_cpn_dir/deps.conf" <<'EOF'
 user/repo  github:repo
 EOF
 SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
-unset _SHDEPS_PKG_INSTALL_NEEDED
-_shdeps_check_pkg_needed
-_assert_eq "check_pkg_needed: skips github:repo method" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PREREQS_SCANNED
+_shdeps_check_prereqs
+_assert_eq "check_prereqs: skips github:repo method" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
 
-# --- _shdeps_check_pkg_needed: skips when pkg manager is brew ---
+# --- _shdeps_check_prereqs: pkg manager brew → NEEDED stays 0 ---
 
 cat >"$_cpn_dir/deps.conf" <<'EOF'
 missing-tool  pkg
 EOF
 SHDEPS_CONF_DIR="$_cpn_dir" _shdeps_load
 _SHDEPS_PKG_MGR="brew"
-unset _SHDEPS_PKG_INSTALL_NEEDED
-_shdeps_check_pkg_needed
-_assert_eq "check_pkg_needed: brew → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PREREQS_SCANNED
+_shdeps_check_prereqs
+_assert_eq "check_prereqs: brew → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
 
-# --- _shdeps_check_pkg_needed: skips when no pkg manager ---
+# --- _shdeps_check_prereqs: no pkg manager → NEEDED stays 0 ---
 
 _SHDEPS_PKG_MGR=""
-unset _SHDEPS_PKG_INSTALL_NEEDED
-_shdeps_check_pkg_needed
-_assert_eq "check_pkg_needed: no mgr → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PREREQS_SCANNED
+_shdeps_check_prereqs
+_assert_eq "check_prereqs: no mgr → 0" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
 
-# --- _shdeps_check_pkg_needed: idempotent (does not re-scan) ---
+# --- _shdeps_check_prereqs: idempotent (does not re-scan) ---
 
 _SHDEPS_PKG_MGR="dnf"
+_SHDEPS_PREREQS_SCANNED=1
 _SHDEPS_PKG_INSTALL_NEEDED=0
-_shdeps_check_pkg_needed
-_assert_eq "check_pkg_needed: idempotent (cached 0)" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
+_shdeps_check_prereqs
+_assert_eq "check_prereqs: idempotent (cached 0)" "0" "$_SHDEPS_PKG_INSTALL_NEEDED"
 _SHDEPS_PKG_INSTALL_NEEDED=1
-_shdeps_check_pkg_needed
-_assert_eq "check_pkg_needed: idempotent (cached 1)" "1" "$_SHDEPS_PKG_INSTALL_NEEDED"
+_shdeps_check_prereqs
+_assert_eq "check_prereqs: idempotent (cached 1)" "1" "$_SHDEPS_PKG_INSTALL_NEEDED"
+unset _SHDEPS_PREREQS_SCANNED
 
 # --- _shdeps_pkg_refresh_metadata: skips when no install needed ---
 
@@ -2101,9 +2103,9 @@ unset SHDEPS_INSTALL_DIR SHDEPS_BIN_DIR SHDEPS_STATE_DIR
 export SHDEPS_LOG_LEVEL=0
 _source_shdeps "$SHDEPS_DIR"
 
-# --- _shdeps_check_external_tools: warns once per missing tool ---
+# --- _shdeps_check_prereqs: warns once per missing external tool ---
 
-echo "=== _shdeps_check_external_tools ==="
+echo "=== _shdeps_check_prereqs (external tools) ==="
 
 # With cargo + go deps in config but neither tool visible → one warning each.
 # Override `command -v` in the subshell so real cargo/go (if installed on
@@ -2127,22 +2129,22 @@ _cet_run() {
     }
     . '"$SHDEPS_DIR"'/shdeps.sh
     _shdeps_load
-    _shdeps_check_external_tools
+    _shdeps_check_prereqs
   ' 2>&1
 }
 _cet_out=$(_cet_run)
 # Match whole-word tool names so "cargo not found" doesn't double-count "go".
 _cet_cargo=$(echo "$_cet_out" | grep -cE 'warning: cargo not found' || true)
 _cet_go=$(echo "$_cet_out" | grep -cE 'warning: go not found' || true)
-_assert_eq "check_external_tools: warns once for cargo" "1" "$_cet_cargo"
-_assert_eq "check_external_tools: warns once for go" "1" "$_cet_go"
+_assert_eq "check_prereqs: warns once for cargo" "1" "$_cet_cargo"
+_assert_eq "check_prereqs: warns once for go" "1" "$_cet_go"
 
 # No cargo/go deps → no warnings.
 cat > "$_cet_conf/deps.conf" <<'CONF'
 jq  pkg
 CONF
 _cet_out=$(_cet_run)
-_assert_not_contains "check_external_tools: silent with no external deps" "not found" "$_cet_out"
+_assert_not_contains "check_prereqs: silent with no external deps" "not found" "$_cet_out"
 unset -f _cet_run
 
 # ===========================================================================
