@@ -996,24 +996,13 @@ _shdeps_remove_dep() {
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
-  github:release)
+  github:release|cargo|go)
     _shdeps_unlink_extras "$name"
     rm -f "$(_shdeps_bin_dir)/$cmd"
     local binary_install_dir
     binary_install_dir="$(_shdeps_install_dir)/$name"
     if [[ -d "$binary_install_dir" ]]; then
       rm -rf "$binary_install_dir"
-    fi
-    _shdeps_remove_stamps "$name"
-    _shdeps_log_ok "  $name removed"
-    ;;
-  cargo|go)
-    _shdeps_unlink_extras "$name"
-    rm -f "$(_shdeps_bin_dir)/$cmd"
-    local ext_install_dir
-    ext_install_dir="$(_shdeps_install_dir)/$name"
-    if [[ -d "$ext_install_dir" ]]; then
-      rm -rf "$ext_install_dir"
     fi
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
