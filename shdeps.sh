@@ -327,6 +327,27 @@ _shdeps_check_pkg_needed() {
   done
 }
 
+# Warn once per missing external tool (cargo, go). Per-dep installs
+# silently skip when the tool is absent. Call after _shdeps_load.
+_shdeps_check_external_tools() {
+  local -A needed=()
+  local entry
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    _shdeps_parse "$entry"
+    _shdeps_filter_match "$_filter" || continue
+    case "$_method" in
+    cargo) needed[cargo]=1 ;;
+    go)    needed[go]=1 ;;
+    esac
+  done
+  local tool
+  for tool in "${!needed[@]}"; do
+    if ! command -v "$tool" &>/dev/null; then
+      _shdeps_warn "  warning: $tool not found — skipping all $tool deps"
+    fi
+  done
+}
+
 # Prime sudo credentials if any deps will need them.
 # Call after _shdeps_load and _shdeps_pkg_detect.
 _shdeps_maybe_prime_sudo() {
@@ -2155,6 +2176,9 @@ _shdeps_update() {
   # Prime sudo early so the password prompt is visible, not buried inside
   # a _shdeps_run_logged redirect where it silently hangs.
   _shdeps_maybe_prime_sudo
+
+  # Warn once per missing external tool (cargo, go); per-dep installs skip.
+  _shdeps_check_external_tools
 
   # Refresh package metadata so _shdeps_pkg_available sees all repos.
   # On a fresh machine the cache is empty and packages appear unavailable.
