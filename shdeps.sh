@@ -2194,8 +2194,11 @@ _shdeps_github_release_prefetch() {
 
 # Install or upgrade all managed dependencies. Orchestrates:
 # 1. Load config and detect package manager
-# 2. Install each dep (pkg queues, github:repo/release install, custom exists/install)
-# 3. Flush queued pkg installs
+# 2. Phase A: queue and flush `pkg` installs first, so system packages
+#    that other methods depend on (git, curl, tar, language toolchains)
+#    are available before non-pkg deps run
+# 3. Phase B: install everything else (github:*, cargo, go, uv, custom)
+#    in config order
 # 4. Run post() hooks for changed deps
 _shdeps_update() {
   if ! command -v git &>/dev/null; then
@@ -2228,14 +2231,25 @@ _shdeps_update() {
   # reads from the associative array instead of making its own API call.
   _shdeps_github_release_prefetch
 
-  # Install phase
-  local entry
+  # Phase A: system packages first (queue then flush), so tools like git,
+  # curl, tar, and language toolchains are available before non-pkg deps.
+  local entry _phase_method
   for entry in "${_SHDEPS_DEPS[@]}"; do
+    _phase_method="${entry#*|}"
+    _phase_method="${_phase_method%%|*}"
+    [[ "$_phase_method" == "pkg" ]] || continue
     _shdeps_install_dep "$entry" || true
   done
-
-  # Flush queued pkg installs
   _shdeps_pkg_install_batch
+
+  # Phase B: non-pkg installs (github:*, cargo, go, uv, custom) now that
+  # system prereqs are in place.
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    _phase_method="${entry#*|}"
+    _phase_method="${_phase_method%%|*}"
+    [[ "$_phase_method" == "pkg" ]] && continue
+    _shdeps_install_dep "$entry" || true
+  done
 
   # Reinstall mode: mark all deps as changed so all post() hooks run.
   # (Install methods already checked shdeps_reinstall individually during step 2.)

@@ -2914,6 +2914,47 @@ CONF
 _lc_empty_list=$(SHDEPS_CONF_DIR="$_lc_empty_conf" "$SHDEPS_DIR/bin/shdeps" list 2>&1)
 _assert_contains "list: empty manifest shows missing" "missing" "$_lc_empty_list"
 
+echo ""
+echo "=== pkg-first install ordering ==="
+
+# Verify `pkg` deps install BEFORE non-pkg deps. This test relies on the
+# alphabetical load order: `pf-a-probe` (custom) sorts before `pf-z-pkg`
+# (pkg), so under the OLD single-loop code the custom probe's `install()`
+# would fire before the pkg dep is even dispatched — the manifest would
+# be empty and `pf-probe-saw-pkg` would NOT be created. Under the NEW
+# phase-split code, Phase A dispatches all pkg deps first (regardless of
+# config/alphabetical position), the manifest gains the pkg entry, and
+# only then does Phase B run the custom probe, which observes the entry.
+_mock_home
+_pf_conf=$(_tmpdir)
+_pf_hooks=$(_tmpdir)/hooks.d
+mkdir -p "$_pf_hooks"
+cat > "$_pf_conf/deps.conf" <<'CONF'
+pf-a-probe               custom
+pf-z-pkg                 pkg    bash
+CONF
+# Probe records whether it observed the pkg manifest entry at install() time.
+cat > "$_pf_hooks/pf-a-probe.sh" <<'HOOK'
+exists() { [[ -f "$HOME/pf-probe-ran" ]]; }
+install() {
+  : > "$HOME/pf-probe-ran"
+  local manifest
+  manifest="$(_shdeps_state_dir)/manifest"
+  if [[ -f "$manifest" ]] && grep -q '^pf-z-pkg|pkg|' "$manifest"; then
+    : > "$HOME/pf-probe-saw-pkg"
+  fi
+}
+HOOK
+
+export SHDEPS_CONF_DIR="$_pf_conf"
+export SHDEPS_HOOKS_DIR="$_pf_hooks"
+export SHDEPS_QUIET=1
+_source_shdeps "$SHDEPS_DIR"
+shdeps_update >/dev/null 2>&1
+_assert_file_exists "pkg-first: custom probe ran"      "$HOME/pf-probe-ran"
+_assert_file_exists "pkg-first: probe saw pkg manifest" "$HOME/pf-probe-saw-pkg"
+unset SHDEPS_CONF_DIR SHDEPS_HOOKS_DIR SHDEPS_QUIET
+
 # ===========================================================================
 # Section 10: Integration / end-to-end
 # ===========================================================================
