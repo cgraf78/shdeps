@@ -14,7 +14,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 ## Features
 
 - **Declarative config** — one line per dependency in `*.conf` files
-- **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, or fully custom hooks
+- **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), or fully custom hooks
 - **Cross-platform** — Linux, macOS, WSL with `os:` and `host:` filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
@@ -71,8 +71,8 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 
 | Field     | Required | Description                                                                                                                                 |
 | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`    | yes      | Dependency name (used for hooks, logging, tracking). For `github:repo`/`github:release`: GitHub `owner/repo`.                               |
-| `method`  | yes      | Install method: `pkg`, `github:repo`, `github:release`, or `custom`                                                                         |
+| `name`    | yes      | Dependency name (used for hooks, logging, tracking). For `github:repo`/`github:release`: GitHub `owner/repo`. For `go`: full module path.   |
+| `method`  | yes      | Install method: `pkg`, `github:repo`, `github:release`, `cargo`, `go`, or `custom`                                                          |
 | `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` qualifiers for platform-specific command names (e.g., `apt:batcat`). |
 | `aliases` | no       | For `pkg`: per-manager package name overrides (`apt:fd-find,dnf:fd-find`). Use `NONE` to skip a specific manager (e.g., `brew:NONE`).       |
 | `filter`  | no       | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:linux,host:nas`, `os:!wsl`).                |
@@ -131,6 +131,33 @@ mvdan/sh         github:release
 ```
 
 The `owner/repo` is the `name` field.
+
+### `cargo` — Rust Crates
+
+Installs crates from crates.io via `cargo install --root "$SHDEPS_INSTALL_DIR/<name>" <name>`. Binaries land in a per-dep install directory and are symlinked into `$SHDEPS_BIN_DIR`.
+
+```
+ripgrep   cargo    rg
+tokei     cargo
+```
+
+The `name` field is the crate name. Override `cmd` when the crate installs a binary with a different name (e.g., the `ripgrep` crate installs `rg`). `--reinstall` passes `--force` to cargo.
+
+Requires `cargo` on `$PATH`. If absent, shdeps warns once at startup and skips all cargo deps.
+
+### `go` — Go Modules
+
+Installs Go binaries via `GOBIN=... go install <module>@latest`. Supports any module host (github.com, golang.org, k8s.io, private registries).
+
+```
+github.com/junegunn/fzf             go
+golang.org/x/tools/cmd/goimports    go
+github.com/charmbracelet/gum        go    gum
+```
+
+The `name` field is the full Go module path (including any `cmd/...` subpath). `cmd` defaults to the basename of the module path.
+
+Requires `go` on `$PATH`. If absent, shdeps warns once at startup and skips all go deps.
 
 ### `custom` — Hook-Only
 

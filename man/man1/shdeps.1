@@ -9,7 +9,8 @@ shdeps \- declarative shell dependency manager
 .SH DESCRIPTION
 .B shdeps
 reads declarative config files and installs or updates shell tools via
-system package managers, GitHub repos, GitHub release binaries, or
+system package managers, GitHub repos, GitHub release binaries,
+Rust crates (\fBcargo install\fR), Go modules (\fBgo install\fR), or
 fully custom hooks.
 Dependencies are declared in
 .B *.conf
@@ -93,6 +94,8 @@ bat               pkg              apt:batcat
 fd                pkg              apt:fdfind       apt:fd-find,dnf:fd-find
 cgraf78/ds        github:repo
 neovim/neovim     github:release   nvim
+ripgrep           cargo            rg
+github.com/junegunn/fzf             go
 dust              pkg              \-               \-                       os:macos
 htop              pkg              \-               \-                       host:nas
 nerd-fonts        custom
@@ -111,11 +114,18 @@ methods, this is the GitHub
 .IB owner / repo
 (e.g.,
 .BR neovim/neovim ).
+For
+.BR go ,
+this is the full module path (e.g.,
+.BR github.com/junegunn/fzf ).
+For
+.BR cargo ,
+this is the crate name.
 .TP
 .B method
 Required.
 One of
-.BR pkg ", " github:repo ", " github:release ", or " custom .
+.BR pkg ", " github:repo ", " github:release ", " cargo ", " go ", or " custom .
 .TP
 .B cmd
 Command name to check for.
@@ -173,6 +183,28 @@ field is the
 Handles
 .BR .tar.gz ", " .tar.xz ", " .tar.bz2 ", " .zip ", " .gz ", " .bz2 ", " .zst ,
 and raw binaries.
+.TP
+.B cargo
+Installs Rust crates via
+.BR "cargo install --root $SHDEPS_INSTALL_DIR/<name> <crate>" .
+The binary is symlinked into
+.BR $SHDEPS_BIN_DIR .
+Requires
+.B cargo
+on
+.BR $PATH .
+.TP
+.B go
+Installs Go modules via
+.BR "GOBIN=$SHDEPS_INSTALL_DIR/<name>/bin go install <module>@latest" .
+The
+.B name
+field is the full Go module path (e.g.,
+.BR github.com/junegunn/fzf ).
+Requires
+.B go
+on
+.BR $PATH .
 .TP
 .B custom
 Hook-only.

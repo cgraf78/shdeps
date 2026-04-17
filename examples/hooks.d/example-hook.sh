@@ -60,3 +60,18 @@ install() {
     return 1
   fi
 }
+
+
+# -----------------------------------------------------------------------------
+# Example: regenerate completions for a cargo/go dep after install
+# -----------------------------------------------------------------------------
+# For cargo/go deps, shdeps does not auto-discover man pages or shell
+# completions (the install produces a single binary only). Generate them
+# from the tool itself in post(). Save as hooks.d/ripgrep.sh for a
+# `ripgrep cargo rg` entry:
+#
+# post() {
+#   local comp="$HOME/.local/share/bash-completion/completions/rg"
+#   mkdir -p "$(dirname "$comp")"
+#   rg --generate=complete-bash > "$comp"
+# }
