@@ -91,7 +91,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_QUIET`       | `0`                                                | Suppress interactive prompts                                                         |
 | `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                 |
 | `SHDEPS_GIT_DEV_DIR` | `~/git`                                            | Dev clone directory for `github:repo` deps (prefers `<dir>/<repo>` over fresh clone) |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github` installs (uses `<dir>/<owner>/<repo>`)                   |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github:*`, `cargo`, `go`, and `uv` installs (each dep lives in `<dir>/<name>/`) |
 | `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                        |
 | `SHDEPS_LOG_LEVEL`   | `1`                                                | 0=quiet, 1=normal, 2=verbose                                                         |
 
@@ -184,7 +184,7 @@ nerd-fonts    custom
 
 ## Hooks
 
-Place hook files in `<hooks_dir>/<name>.sh`. For `github:*` deps, hooks go in `hooks.d/owner/repo.sh`. For `custom` deps, hooks define the full install lifecycle. For other methods, hooks provide optional post-install setup.
+Place hook files in `<hooks_dir>/<name>.sh`. For methods whose `name` contains path segments (`github:*`, `go`), hooks nest accordingly — e.g., `hooks.d/owner/repo.sh` or `hooks.d/github.com/owner/repo.sh`. For `custom` deps, hooks define the full install lifecycle. For other methods, hooks provide optional post-install setup.
 
 **Custom dep hooks:**
 
@@ -194,7 +194,7 @@ Place hook files in `<hooks_dir>/<name>.sh`. For `github:*` deps, hooks go in `h
 - **`uninstall(name)`** — reverse what `install()` or `post()` created. Optional. Called by `shdeps prune` when removing an orphaned dep (any method). For custom deps, this is the only cleanup. For other methods, runs before the built-in cleanup.
 - **`post(name)`** — optional post-install setup.
 
-**Non-custom dep hooks** (`pkg`, `github:repo`, `github:release`):
+**Non-custom dep hooks** (`pkg`, `github:repo`, `github:release`, `cargo`, `go`, `uv`):
 
 - **`post(name)`** — runs after shdeps installs/updates the dep (symlinking, config, etc.).
 
@@ -202,7 +202,7 @@ All [public API functions](#public-api) are available to hook authors. See [exam
 
 ## Man Pages & Completions
 
-shdeps automatically discovers man pages and shell completions bundled inside `github` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking.
+shdeps automatically discovers man pages and shell completions bundled inside `github` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking. `cargo`, `go`, and `uv` deps install single binaries without bundled extras — generate completions from the tool itself in a `post()` hook (see [examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh)).
 
 **What gets linked:**
 

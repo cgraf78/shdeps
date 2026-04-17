@@ -305,7 +305,7 @@ _shdeps_require_sudo() {
 # Scan active deps once to determine install prerequisites:
 #   - sets _SHDEPS_PKG_INSTALL_NEEDED=1 if any pkg dep needs installing
 #     (used to gate sudo priming and metadata refresh)
-#   - emits one warning per missing external tool (cargo, go)
+#   - emits one warning per missing external tool (cargo, go, uv)
 # Idempotent via _SHDEPS_PREREQS_SCANNED. Call after _shdeps_load and
 # _shdeps_pkg_detect.
 _shdeps_check_prereqs() {
@@ -1892,10 +1892,10 @@ _shdeps_github_release_install() {
 }
 
 # ---------------------------------------------------------------------------
-# External installers — cargo, go, and future pipx/npm/gem/uv
+# External installers — cargo, go, uv, and future pipx/npm/gem
 # ---------------------------------------------------------------------------
 
-# Install a dep by invoking an external tool. Shared skeleton for cargo/go.
+# Install a dep by invoking an external tool. Shared skeleton for cargo/go/uv.
 # $1=name  $2=method  $3=cmd  $4=tool  $5=argv-nameref  $6=force-flag-or-empty
 #
 # Writes _SHDEPS_CHANGED[$name]=1 iff the install command actually ran.

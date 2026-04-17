@@ -239,7 +239,7 @@ _fake_release_json() {
 }
 
 # ---------------------------------------------------------------------------
-# Mocks for external installers (cargo, go)
+# Mocks for external installers (cargo, go, uv)
 # ---------------------------------------------------------------------------
 
 # Install a mock `cargo` on PATH that intercepts `cargo install --root <dir>

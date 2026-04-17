@@ -43,7 +43,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 | `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
 | `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `github:repo` method |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github` installs |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github:*`, `cargo`, `go`, and `uv` installs (each dep lives in `<dir>/<name>/`) |
 | `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
 | `SHDEPS_LOG_LEVEL` | `1` | Logging: 0=quiet, 1=normal, 2=verbose |
 
@@ -79,7 +79,9 @@ prints an orphan notice. Run `shdeps prune` to remove orphaned artifacts.
 ## Extras Linking
 
 shdeps auto-discovers man pages and shell completions from `github`
-installs and symlinks them to XDG user-local directories:
+installs and symlinks them to XDG user-local directories. `cargo`, `go`,
+and `uv` installs produce single binaries only — users should generate
+extras from the tool itself in a `post()` hook:
 
 | Type | Target | Auto-discovered? |
 |------|--------|-----------------|
@@ -99,16 +101,18 @@ all tracked symlinks.
 
 ## Hook Contract
 
-Hook files in `hooks.d/$name.sh` may define these functions (for `github:*` deps, hooks go in `hooks.d/owner/repo.sh`):
+Hook files in `hooks.d/$name.sh` may define these functions (for `github:*`
+and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
+`hooks.d/owner/repo.sh` or `hooks.d/github.com/owner/repo.sh`):
 
-- `exists(name)` — **required**. Returns 0 if the dep is installed.
-- `install(name)` — install the dep. Called when `exists` returns 1.
+- `exists(name)` — **required for `custom`**. Returns 0 if the dep is installed.
+- `install(name)` — **required for `custom`**. Called when `exists` returns 1.
 - `version(name)` — return version string.
 - `post(name)` — post-install setup. Runs after any change.
 - `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
   an orphaned dep (any method). For custom deps, this is the only cleanup.
-  For github:repo/github:release deps, this runs before the built-in cleanup —
-  use it to reverse what `post()` created (symlinks, config files).
+  For other methods, runs before the built-in cleanup — use it to reverse
+  what `post()` created (symlinks, config files).
 
 ## Code Quality
 
