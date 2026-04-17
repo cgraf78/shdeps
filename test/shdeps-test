@@ -2632,6 +2632,14 @@ _assert_contains "cargo: manifest records bin path" \
 SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 _assert_eq "cargo: TTL-fresh re-run skips install" "" "$(cat "$_cargo_log")"
 
+# Fast-path self-heal: if the user deletes the public bin symlink, the next
+# TTL-fresh run should re-create it without re-invoking the tool.
+rm -f "$HOME/.local/bin/mytool"
+: > "$_cargo_log"
+SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+_assert_symlink "cargo: fast-path restores deleted bin symlink" "$HOME/.local/bin/mytool"
+_assert_eq "cargo: self-heal did not rerun cargo" "" "$(cat "$_cargo_log")"
+
 # --reinstall → --force passed
 : > "$_cargo_log"
 SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 SHDEPS_REINSTALL=1 shdeps_update >/dev/null
@@ -2748,6 +2756,10 @@ echo "" > "$_go_conf/deps.conf"
 SHDEPS_CONF_DIR="$_go_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
 _assert_not_exists "go: prune removes nested install dir" "$HOME/.local/share/github.com/junegunn/fzf"
 _assert_not_exists "go: prune removes symlink" "$HOME/.local/bin/fzf"
+# Empty parent dirs under SHDEPS_INSTALL_DIR should be cleaned up too.
+_assert_not_exists "go: prune removes empty parent (owner)" "$HOME/.local/share/github.com/junegunn"
+_assert_not_exists "go: prune removes empty parent (host)"  "$HOME/.local/share/github.com"
+_assert_dir_exists "go: prune leaves SHDEPS_INSTALL_DIR intact" "$HOME/.local/share"
 
 echo ""
 echo "=== go failure modes ==="

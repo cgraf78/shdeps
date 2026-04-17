@@ -1001,6 +1001,16 @@ _shdeps_remove_dep() {
     if [[ -d "$binary_install_dir" ]]; then
       rm -rf "$binary_install_dir"
     fi
+    # For nested names (e.g. go module paths like github.com/owner/repo),
+    # rmdir walks up and removes now-empty parent dirs. rmdir fails on
+    # non-empty dirs so siblings are left intact.
+    local parent base
+    parent=$(dirname "$binary_install_dir")
+    base=$(_shdeps_install_dir)
+    while [[ "$parent" != "$base" && "$parent" != / ]]; do
+      rmdir "$parent" 2>/dev/null || break
+      parent=$(dirname "$parent")
+    done
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
@@ -1903,7 +1913,10 @@ _shdeps_external_install() {
   stamp=$(_shdeps_remote_stamp "$name" "$method")
 
   # Fast path: binary present, TTL fresh, not reinstalling.
+  # Refresh the public bin symlink idempotently so a manually-deleted
+  # symlink is restored without triggering a full re-install.
   if [[ -x "$bin_path" ]] && _shdeps_remote_fresh "$stamp"; then
+    _shdeps_link_bin "$cmd" "$bin_path"
     local ver
     ver=$(_shdeps_dep_version "$cmd" 2>/dev/null || true)
     _shdeps_log "  $name${ver:+ -- $ver}"
