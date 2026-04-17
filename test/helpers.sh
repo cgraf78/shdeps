@@ -334,6 +334,43 @@ SH
   echo "$dir"
 }
 
+# Install a mock `uv` on PATH that handles `uv tool install [--force] <pkg>`
+# (with $UV_TOOL_DIR and $UV_TOOL_BIN_DIR set) by creating
+# `$UV_TOOL_BIN_DIR/<pkg>`. Records invocations to $MOCK_UV_LOG (if set).
+# Returns the dir to prepend to PATH.
+_mock_uv_setup() {
+  local dir
+  dir=$(_tmpdir)
+  cat > "$dir/uv" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == "tool" ]] || { echo "mock uv: expected 'tool' subcommand, got '${1:-}'" >&2; exit 2; }
+shift
+[[ "${1:-}" == "install" ]] || { echo "mock uv: only supports 'install', got '${1:-}'" >&2; exit 2; }
+shift
+force=0; pkg=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) force=1; shift ;;
+    *)       pkg="$1"; shift ;;
+  esac
+done
+: "${UV_TOOL_DIR:?UV_TOOL_DIR must be set}"
+: "${UV_TOOL_BIN_DIR:?UV_TOOL_BIN_DIR must be set}"
+mkdir -p "$UV_TOOL_DIR" "$UV_TOOL_BIN_DIR"
+cat > "$UV_TOOL_BIN_DIR/$pkg" <<EOF
+#!/bin/sh
+echo "mock-$pkg 1.0.0"
+EOF
+chmod +x "$UV_TOOL_BIN_DIR/$pkg"
+if [[ -n "${MOCK_UV_LOG:-}" ]]; then
+  echo "install force=$force pkg=$pkg UV_TOOL_DIR=$UV_TOOL_DIR" >> "$MOCK_UV_LOG"
+fi
+SH
+  chmod +x "$dir/uv"
+  echo "$dir"
+}
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

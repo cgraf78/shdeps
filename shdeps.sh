@@ -334,6 +334,7 @@ _shdeps_check_prereqs() {
       ;;
     cargo) ext_tools[cargo]=1 ;;
     go)    ext_tools[go]=1 ;;
+    uv)    ext_tools[uv]=1 ;;
     esac
   done
 
@@ -993,7 +994,7 @@ _shdeps_remove_dep() {
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
-  github:release|cargo|go)
+  github:release|cargo|go|uv)
     _shdeps_unlink_extras "$name"
     rm -f "$(_shdeps_bin_dir)/$cmd"
     local binary_install_dir
@@ -2016,6 +2017,17 @@ _shdeps_install_dep() {
     local -a _go_argv=(env "GOBIN=$_go_install_dir/bin" go install "$_name@latest")
     if _shdeps_external_install "$_name" go "$_cmd" go _go_argv ""; then
       _shdeps_manifest_upsert "$_name" go "$_cmd" "$_go_install_dir/bin/$_cmd"
+    fi
+    ;;
+  uv)
+    local _uv_install_dir
+    _uv_install_dir="$(_shdeps_install_dir)/$_name"
+    local -a _uv_argv=(
+      env "UV_TOOL_DIR=$_uv_install_dir/tools" "UV_TOOL_BIN_DIR=$_uv_install_dir/bin"
+      uv tool install "$_name"
+    )
+    if _shdeps_external_install "$_name" uv "$_cmd" uv _uv_argv "--force"; then
+      _shdeps_manifest_upsert "$_name" uv "$_cmd" "$_uv_install_dir/bin/$_cmd"
     fi
     ;;
   custom)

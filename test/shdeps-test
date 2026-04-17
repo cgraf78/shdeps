@@ -2791,21 +2791,100 @@ _assert_eq "go: missing tool warns exactly once" "1" "$_go_warn_count"
 _assert_not_exists "go: no binary when tool missing" \
   "$HOME/.local/share/github.com/junegunn/fzf/bin/fzf"
 
-unset MOCK_CARGO_LOG MOCK_GO_LOG
+echo ""
+echo "=== uv method ==="
+
+# Isolated env with mocked uv on PATH
+_mock_home
+_uv_mock_dir=$(_mock_uv_setup)
+PATH="$_uv_mock_dir:$PATH"
+_uv_log=$(_tmpdir)/uv.log
+export MOCK_UV_LOG="$_uv_log"
+_source_shdeps "$SHDEPS_DIR"
+
+_uv_conf=$(_tmpdir)
+cat > "$_uv_conf/deps.conf" <<'CONF'
+ruff   uv
+CONF
+SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+
+_assert_file_exists "uv: binary installed" "$HOME/.local/share/ruff/bin/ruff"
+_assert_symlink     "uv: bin symlink created" "$HOME/.local/bin/ruff"
+_assert_dir_exists  "uv: tools dir created"   "$HOME/.local/share/ruff/tools"
+
+_shdeps_manifest_read
+_assert_contains "uv: manifest records bin path" \
+  "uv|ruff|$HOME/.local/share/ruff/bin/ruff" "${_SHDEPS_MANIFEST[ruff]:-}"
+
+# TTL-fresh re-run → no new install invocation
+: > "$_uv_log"
+SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+_assert_eq "uv: TTL-fresh re-run skips install" "" "$(cat "$_uv_log")"
+
+# Fast-path self-heal
+rm -f "$HOME/.local/bin/ruff"
+: > "$_uv_log"
+SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+_assert_symlink "uv: fast-path restores deleted bin symlink" "$HOME/.local/bin/ruff"
+_assert_eq "uv: self-heal did not rerun uv" "" "$(cat "$_uv_log")"
+
+# --reinstall → --force passed
+: > "$_uv_log"
+SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 SHDEPS_REINSTALL=1 shdeps_update >/dev/null
+_assert_contains "uv: --reinstall passes --force" "force=1" "$(cat "$_uv_log")"
+
+# Prune
+echo "" > "$_uv_conf/deps.conf"
+SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
+_assert_not_exists "uv: prune removes install dir" "$HOME/.local/share/ruff"
+_assert_not_exists "uv: prune removes symlink"     "$HOME/.local/bin/ruff"
 
 echo ""
-echo "=== list/check for cargo/go ==="
+echo "=== uv failure modes ==="
+
+# Missing uv → warning, dep skipped, no manifest entry.
+_mock_home
+_uv_conf=$(_tmpdir)
+cat > "$_uv_conf/deps.conf" <<'CONF'
+ruff   uv
+CONF
+_uv_missing_out=$(
+  SHDEPS_LOG_LEVEL=1 SHDEPS_CONF_DIR="$_uv_conf" bash -c '
+    command() {
+      if [[ "$1" == -v ]]; then
+        case "$2" in
+          uv|cargo|go) return 1 ;;
+          *) builtin command "$@" ;;
+        esac
+      else
+        builtin command "$@"
+      fi
+    }
+    . '"$SHDEPS_DIR"'/shdeps.sh
+    shdeps_update
+  ' 2>&1
+)
+_uv_warn_count=$(echo "$_uv_missing_out" | grep -cE 'warning: uv not found' || true)
+_assert_eq "uv: missing tool warns exactly once" "1" "$_uv_warn_count"
+_assert_not_exists "uv: no binary when tool missing" "$HOME/.local/share/ruff/bin/ruff"
+
+unset MOCK_CARGO_LOG MOCK_GO_LOG MOCK_UV_LOG
+
+echo ""
+echo "=== list/check for cargo/go/uv ==="
 
 # After install, `list` and `check` should report the binary as installed,
 # with path resolved from the manifest (not from a method-specific rule).
 _mock_home
 _lc_cargo_dir=$(_mock_cargo_setup)
 _lc_go_dir=$(_mock_go_setup)
-PATH="$_lc_cargo_dir:$_lc_go_dir:$PATH"
+_lc_uv_dir=$(_mock_uv_setup)
+PATH="$_lc_cargo_dir:$_lc_go_dir:$_lc_uv_dir:$PATH"
 _lc_conf=$(_tmpdir)
 cat > "$_lc_conf/deps.conf" <<'CONF'
 mytool                    cargo
 github.com/junegunn/fzf   go
+ruff                      uv
 CONF
 
 SHDEPS_CONF_DIR="$_lc_conf" SHDEPS_QUIET=1 "$SHDEPS_DIR/bin/shdeps" update >/dev/null 2>&1
@@ -2814,7 +2893,8 @@ _lc_list=$(SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" list 2>&1)
 _assert_contains "list: shows cargo dep"           "mytool"                   "$_lc_list"
 _assert_contains "list: shows cargo as installed"  "mytool"                   "$_lc_list"
 _assert_contains "list: shows go module"           "github.com/junegunn/fzf"  "$_lc_list"
-# Both rows should be "installed" (not "missing")
+_assert_contains "list: shows uv dep"              "ruff"                     "$_lc_list"
+# All three rows should be "installed" (not "missing")
 _lc_missing=$(echo "$_lc_list" | grep -cE 'missing' || true)
 _assert_eq "list: no missing entries post-install" "0" "$_lc_missing"
 
@@ -2822,6 +2902,8 @@ SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check mytool >/dev/null
 _assert_eq "check: cargo dep returns 0" "0" "$?"
 SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check github.com/junegunn/fzf >/dev/null
 _assert_eq "check: go dep returns 0" "0" "$?"
+SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check ruff >/dev/null
+_assert_eq "check: uv dep returns 0" "0" "$?"
 
 # Empty manifest → missing
 _mock_home
