@@ -2779,6 +2779,45 @@ _assert_not_exists "go: no binary when tool missing" \
 
 unset MOCK_CARGO_LOG MOCK_GO_LOG
 
+echo ""
+echo "=== list/check for cargo/go ==="
+
+# After install, `list` and `check` should report the binary as installed,
+# with path resolved from the manifest (not from a method-specific rule).
+_mock_home
+_lc_cargo_dir=$(_mock_cargo_setup)
+_lc_go_dir=$(_mock_go_setup)
+PATH="$_lc_cargo_dir:$_lc_go_dir:$PATH"
+_lc_conf=$(_tmpdir)
+cat > "$_lc_conf/deps.conf" <<'CONF'
+mytool                    cargo
+github.com/junegunn/fzf   go
+CONF
+
+SHDEPS_CONF_DIR="$_lc_conf" SHDEPS_QUIET=1 "$SHDEPS_DIR/bin/shdeps" update >/dev/null 2>&1
+
+_lc_list=$(SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" list 2>&1)
+_assert_contains "list: shows cargo dep"           "mytool"                   "$_lc_list"
+_assert_contains "list: shows cargo as installed"  "mytool"                   "$_lc_list"
+_assert_contains "list: shows go module"           "github.com/junegunn/fzf"  "$_lc_list"
+# Both rows should be "installed" (not "missing")
+_lc_missing=$(echo "$_lc_list" | grep -cE 'missing' || true)
+_assert_eq "list: no missing entries post-install" "0" "$_lc_missing"
+
+SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check mytool >/dev/null
+_assert_eq "check: cargo dep returns 0" "0" "$?"
+SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check github.com/junegunn/fzf >/dev/null
+_assert_eq "check: go dep returns 0" "0" "$?"
+
+# Empty manifest → missing
+_mock_home
+_lc_empty_conf=$(_tmpdir)
+cat > "$_lc_empty_conf/deps.conf" <<'CONF'
+mytool   cargo
+CONF
+_lc_empty_list=$(SHDEPS_CONF_DIR="$_lc_empty_conf" "$SHDEPS_DIR/bin/shdeps" list 2>&1)
+_assert_contains "list: empty manifest shows missing" "missing" "$_lc_empty_list"
+
 # ===========================================================================
 # Section 10: Integration / end-to-end
 # ===========================================================================

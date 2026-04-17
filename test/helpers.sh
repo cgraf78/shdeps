@@ -261,8 +261,9 @@ while [[ $# -gt 0 ]]; do
     *)       crate="$1"; shift ;;
   esac
 done
-[[ -n "${MOCK_CARGO_LOG:-}" ]] && \
+if [[ -n "${MOCK_CARGO_LOG:-}" ]]; then
   echo "subcmd=$subcmd root=$root force=$force crate=$crate" >> "$MOCK_CARGO_LOG"
+fi
 case "$subcmd" in
   install)
     [[ -n "$root" && -n "$crate" ]] || { echo "mock cargo: missing args" >&2; exit 2; }
@@ -310,8 +311,9 @@ case "$subcmd" in
 echo "mock-$base $ver"
 EOF
     chmod +x "$GOBIN/$base"
-    [[ -n "${MOCK_GO_LOG:-}" ]] && \
+    if [[ -n "${MOCK_GO_LOG:-}" ]]; then
       echo "install module=$module ver=$ver GOBIN=$GOBIN" >> "$MOCK_GO_LOG"
+    fi
     ;;
   env)
     for k in "$@"; do

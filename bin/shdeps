@@ -87,6 +87,7 @@ cmd_self_update() {
 cmd_list() {
   _shdeps_load
   _shdeps_pkg_detect
+  _shdeps_manifest_read
 
   # shellcheck disable=SC2154  # _SHDEPS_DEPS set by _shdeps_load
   if [[ ${#_SHDEPS_DEPS[@]} -eq 0 ]]; then
@@ -145,10 +146,14 @@ cmd_list() {
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
-    github:release)
-      local bin_path
-      bin_path="$(_shdeps_bin_dir)/$_cmd"
-      if [[ -x "$bin_path" ]]; then
+    github:release|cargo|go)
+      # Binary path lives in the manifest's fourth column. Empty manifest
+      # entry → "missing" (install hasn't run yet).
+      local bin_path=""
+      if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
+        bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"
+      fi
+      if [[ -n "$bin_path" && -x "$bin_path" ]]; then
         status="installed"
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
@@ -191,6 +196,7 @@ cmd_check() {
 
   _shdeps_load
   _shdeps_pkg_detect
+  _shdeps_manifest_read
 
   local entry found=0
   for entry in "${_SHDEPS_DEPS[@]}"; do
@@ -231,8 +237,12 @@ cmd_check() {
         return 0
       fi
       ;;
-    github:release)
-      if [[ -x "$(_shdeps_bin_dir)/$_cmd" ]]; then
+    github:release|cargo|go)
+      local bin_path=""
+      if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
+        bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"
+      fi
+      if [[ -n "$bin_path" && -x "$bin_path" ]]; then
         local ver
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
         echo "$_name: installed${ver:+ ($ver)}"
