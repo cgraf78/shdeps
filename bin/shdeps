@@ -147,8 +147,9 @@ cmd_list() {
       fi
       ;;
     github:release|cargo|go)
-      # Binary path lives in the manifest's fourth column. Empty manifest
-      # entry → "missing" (install hasn't run yet).
+      # Manifest entries are stored as "method|cmd|install_path"; ##*|
+      # extracts the trailing install_path field. Empty manifest entry
+      # → "missing" (install hasn't run yet).
       local bin_path=""
       if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
         bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"
