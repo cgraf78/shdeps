@@ -14,7 +14,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 ## Features
 
 - **Declarative config** — one line per dependency in `*.conf` files
-- **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), or fully custom hooks
+- **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), or fully custom hooks
 - **Cross-platform** — Linux, macOS, WSL with `os:` and `host:` filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
@@ -72,7 +72,7 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 | Field     | Required | Description                                                                                                                                 |
 | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`    | yes      | Dependency name (used for hooks, logging, tracking). For `github:repo`/`github:release`: GitHub `owner/repo`. For `go`: full module path.   |
-| `method`  | yes      | Install method: `pkg`, `github:repo`, `github:release`, `cargo`, `go`, or `custom`                                                          |
+| `method`  | yes      | Install method: `pkg`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, or `custom`                                                    |
 | `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` qualifiers for platform-specific command names (e.g., `apt:batcat`). |
 | `aliases` | no       | For `pkg`: per-manager package name overrides (`apt:fd-find,dnf:fd-find`). Use `NONE` to skip a specific manager (e.g., `brew:NONE`).       |
 | `filter`  | no       | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:linux,host:nas`, `os:!wsl`).                |
@@ -158,6 +158,21 @@ github.com/charmbracelet/gum        go    gum
 The `name` field is the full Go module path (including any `cmd/...` subpath). `cmd` defaults to the basename of the module path.
 
 Requires `go` on `$PATH`. If absent, shdeps warns once at startup and skips all go deps.
+
+### `uv` — Python CLI Tools
+
+Installs Python CLI tools from PyPI via `uv tool install`. Each dep gets its own isolated venv under `$SHDEPS_INSTALL_DIR/<name>/tools/` with the binary at `$SHDEPS_INSTALL_DIR/<name>/bin/<cmd>`, symlinked into `$SHDEPS_BIN_DIR`.
+
+```
+ruff      uv
+black     uv
+mypy      uv
+poetry    uv
+```
+
+The `name` field is the PyPI package name. Override `cmd` when the package's executable name differs from the package name. `--reinstall` passes `--force` to `uv tool install`.
+
+Requires `uv` on `$PATH` (install via `pipx install uv`, `brew install uv`, or [Astral's installer](https://docs.astral.sh/uv/getting-started/installation/)). If absent, shdeps warns once at startup and skips all uv deps.
 
 ### `custom` — Hook-Only
 

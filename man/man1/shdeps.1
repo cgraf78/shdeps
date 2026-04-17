@@ -10,8 +10,8 @@ shdeps \- declarative shell dependency manager
 .B shdeps
 reads declarative config files and installs or updates shell tools via
 system package managers, GitHub repos, GitHub release binaries,
-Rust crates (\fBcargo install\fR), Go modules (\fBgo install\fR), or
-fully custom hooks.
+Rust crates (\fBcargo install\fR), Go modules (\fBgo install\fR),
+Python CLI tools (\fBuv tool install\fR), or fully custom hooks.
 Dependencies are declared in
 .B *.conf
 files within a config directory (default:
@@ -96,6 +96,7 @@ cgraf78/ds        github:repo
 neovim/neovim     github:release   nvim
 ripgrep           cargo            rg
 github.com/junegunn/fzf             go
+ruff              uv
 dust              pkg              \-               \-                       os:macos
 htop              pkg              \-               \-                       host:nas
 nerd-fonts        custom
@@ -121,11 +122,14 @@ this is the full module path (e.g.,
 For
 .BR cargo ,
 this is the crate name.
+For
+.BR uv ,
+this is the PyPI package name.
 .TP
 .B method
 Required.
 One of
-.BR pkg ", " github:repo ", " github:release ", " cargo ", " go ", or " custom .
+.BR pkg ", " github:repo ", " github:release ", " cargo ", " go ", " uv ", or " custom .
 .TP
 .B cmd
 Command name to check for.
@@ -203,6 +207,18 @@ field is the full Go module path (e.g.,
 .BR github.com/junegunn/fzf ).
 Requires
 .B go
+on
+.BR $PATH .
+.TP
+.B uv
+Installs Python CLI tools via
+.BR "uv tool install <pkg>"
+into a per-dep venv at
+.IB $SHDEPS_INSTALL_DIR / <name> /tools
+with the binary at
+.IB $SHDEPS_INSTALL_DIR / <name> /bin/ <cmd> .
+Requires
+.B uv
 on
 .BR $PATH .
 .TP
