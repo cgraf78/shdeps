@@ -26,14 +26,15 @@ mkdir -p "$WORK_DIR"/{conf,state,install,bin}
 cat >"$WORK_DIR/conf/deps.conf" <<'CONF'
 # name                    method           cmd          aliases
 jq                        pkg
-fzf                       pkg
-ripgrep                   pkg              rg
 bat                       pkg              apt:batcat
 fd                        pkg              apt:fdfind    apt:fd-find,dnf:fd-find
 neovim/neovim             github:release   nvim
 jesseduffield/lazygit     github:release
 mvdan/sh                  github:release   shfmt
 tmux-plugins/tpm          github:repo
+ripgrep                   cargo            rg
+github.com/junegunn/fzf   go
+ruff                      uv
 CONF
 
 # -- Write the demo script --
@@ -62,14 +63,15 @@ prompt
 type_cmd "cat ~/.config/shdeps/deps.conf"
 printf '\033[2m# name                    method           cmd          aliases\033[0m\n'
 echo "jq                        pkg"
-echo "fzf                       pkg"
-echo "ripgrep                   pkg              rg"
 echo "bat                       pkg              apt:batcat"
 echo "fd                        pkg              apt:fdfind    apt:fd-find,dnf:fd-find"
 echo "neovim/neovim             github:release   nvim"
 echo "jesseduffield/lazygit     github:release"
 echo "mvdan/sh                  github:release   shfmt"
 echo "tmux-plugins/tpm          github:repo"
+echo "ripgrep                   cargo            rg"
+echo "github.com/junegunn/fzf   go"
+echo "ruff                      uv"
 echo
 prompt
 pause 2
