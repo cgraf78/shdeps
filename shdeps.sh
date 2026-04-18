@@ -585,8 +585,9 @@ _shdeps_dep_version() {
   local cmd="${1:-}" output="" ver="" all_output=""
   if [[ -z "$cmd" ]]; then return 1; fi
   # Try --version then -V (tmux, autossh, ssh). Skip -v (grep -v inverts
-  # match, gzip -v compresses stdin) and bare "version" subcommand (curl
-  # fetches http://version, ssh connects to host "version").
+  # match, gzip -v compresses stdin) and bare "version" subcommand (dust
+  # scans a path, nvim signals, sh executes output, curl fetches a URL).
+  # For deps without a command, _shdeps_pkg_version queries the pkg mgr.
   # Merge stderr — some tools (unzip, ssh) write version info there.
   # Search all output lines — some (eza, shellcheck) put it on line 2+.
   # Timeout after 2s — some tools (nano/pico on macOS) hang with --version.
@@ -622,6 +623,55 @@ _shdeps_dep_version() {
   if [[ -n "$ver" ]]; then
     echo "$ver"
   fi
+}
+
+# Populate _SHDEPS_PKG_VERSIONS with all installed package versions.
+# Single batch query per invocation — much faster than per-dep lookups.
+# Call once in the main shell before any _shdeps_pkg_version lookups;
+# associative arrays are not inherited by $() subshells.
+_shdeps_pkg_versions_load() {
+  [[ -n "${_SHDEPS_PKG_VERSIONS_LOADED:-}" ]] && return 0
+  declare -gA _SHDEPS_PKG_VERSIONS=()
+  local name ver _
+  case "${_SHDEPS_PKG_MGR:-}" in
+  brew)
+    while read -r name ver _; do
+      _SHDEPS_PKG_VERSIONS[$name]="$ver"
+    done < <(brew list --versions 2>/dev/null)
+    ;;
+  apt)
+    while IFS=$'\t' read -r name ver; do
+      _SHDEPS_PKG_VERSIONS[$name]="$ver"
+    done < <(dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null)
+    ;;
+  dnf)
+    while IFS=$'\t' read -r name ver; do
+      _SHDEPS_PKG_VERSIONS[$name]="$ver"
+    done < <(rpm -qa --qf '%{NAME}\t%{VERSION}\n' 2>/dev/null)
+    ;;
+  pacman)
+    while read -r name ver; do
+      _SHDEPS_PKG_VERSIONS[$name]="$ver"
+    done < <(pacman -Q 2>/dev/null)
+    ;;
+  esac
+  _SHDEPS_PKG_VERSIONS_LOADED=1
+}
+
+# Look up installed version of a package from the batch cache.
+# Sets REPLY and returns 0 on hit, returns 1 on miss.
+# Lazy-loads the cache on first call (must be in the main shell,
+# not inside $(), since associative arrays don't cross subshells).
+_shdeps_pkg_version() {
+  local pkg="${1:-}"
+  REPLY=""
+  if [[ -z "$pkg" ]]; then return 1; fi
+  _shdeps_pkg_versions_load
+  if [[ -n "${_SHDEPS_PKG_VERSIONS[$pkg]+x}" ]]; then
+    REPLY="${_SHDEPS_PKG_VERSIONS[$pkg]}"
+    return 0
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1982,6 +2032,9 @@ _shdeps_install_dep() {
     if _shdeps_exists "$_cmd" "$resolved_pkg"; then
       local ver=""
       ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+      if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved_pkg"; then
+        ver="$REPLY"
+      fi
       _shdeps_log "  $_name${ver:+ -- $ver}"
       # Package exists but expected command missing — trigger post hook
       if ! _shdeps_exists "$_cmd"; then

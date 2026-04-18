@@ -1868,6 +1868,37 @@ _assert_eq "dep_version: no version available" "" "$result"
 rc=0; _shdeps_dep_version "" || rc=$?
 _assert_exit "dep_version: empty cmd fails" 1 "$rc"
 
+# --- _shdeps_pkg_version: empty pkg → failure ---
+
+rc=0; _shdeps_pkg_version "" || rc=$?
+_assert_exit "pkg_version: empty pkg fails" 1 "$rc"
+
+# --- _shdeps_pkg_version: unknown pkg manager → failure ---
+
+_saved_pkg_mgr="${_SHDEPS_PKG_MGR:-}"
+_SHDEPS_PKG_MGR=""
+unset _SHDEPS_PKG_VERSIONS_LOADED
+declare -gA _SHDEPS_PKG_VERSIONS=()
+rc=0; _shdeps_pkg_version "some-pkg" || rc=$?
+_assert_exit "pkg_version: no pkg manager fails" 1 "$rc"
+_SHDEPS_PKG_MGR="$_saved_pkg_mgr"
+unset _SHDEPS_PKG_VERSIONS_LOADED
+
+# --- _shdeps_pkg_version: returns cached version via REPLY ---
+
+declare -gA _SHDEPS_PKG_VERSIONS=()
+_SHDEPS_PKG_VERSIONS["test-cached-pkg"]="4.2.0"
+_SHDEPS_PKG_VERSIONS_LOADED=1
+_shdeps_pkg_version "test-cached-pkg"
+_assert_eq "pkg_version: returns cached version" "4.2.0" "$REPLY"
+
+# --- _shdeps_pkg_version: missing pkg in cache → failure ---
+
+rc=0; _shdeps_pkg_version "no-such-cached-pkg" || rc=$?
+_assert_exit "pkg_version: missing pkg fails" 1 "$rc"
+_assert_eq "pkg_version: REPLY empty on miss" "" "$REPLY"
+unset _SHDEPS_PKG_VERSIONS_LOADED
+
 # --- _shdeps_exists: finds command in PATH ---
 
 _exists_bin=$(_mock_bin)

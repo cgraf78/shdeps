@@ -133,8 +133,11 @@ cmd_list() {
         details="(pkg manager)"
       elif _shdeps_exists "$_cmd" "$resolved"; then
         status="installed"
-        local ver
+        local ver=""
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+        if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
+          ver="$REPLY"
+        fi
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
@@ -224,8 +227,11 @@ cmd_check() {
         echo "$_name: skipped (pkg manager)"
         return 0
       elif _shdeps_exists "$_cmd" "$resolved"; then
-        local ver
+        local ver=""
         ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+        if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
+          ver="$REPLY"
+        fi
         echo "$_name: installed${ver:+ ($ver)}"
         return 0
       fi
