@@ -249,7 +249,7 @@ _fake_release_json() {
 _mock_cargo_setup() {
   local dir
   dir=$(_tmpdir)
-  cat > "$dir/cargo" <<'SH'
+  cat >"$dir/cargo" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 subcmd="$1"; shift
@@ -294,7 +294,7 @@ SH
 _mock_go_setup() {
   local dir
   dir=$(_tmpdir)
-  cat > "$dir/go" <<'SH'
+  cat >"$dir/go" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 subcmd="$1"; shift
@@ -341,7 +341,7 @@ SH
 _mock_uv_setup() {
   local dir
   dir=$(_tmpdir)
-  cat > "$dir/uv" <<'SH'
+  cat >"$dir/uv" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "${1:-}" == "tool" ]] || { echo "mock uv: expected 'tool' subcommand, got '${1:-}'" >&2; exit 2; }

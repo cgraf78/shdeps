@@ -96,13 +96,14 @@ cmd_list() {
   fi
 
   # Pre-pass: find longest name and method to size columns dynamically.
-  local _ncol=4 _mcol=6  # minimums: "NAME", "METHOD"
+  local _ncol=4 _mcol=6 # minimums: "NAME", "METHOD"
   local _e _n _m
   for _e in "${_SHDEPS_DEPS[@]}"; do
     _n="${_e%%|*}"
-    _m="${_e#*|}"; _m="${_m%%|*}"
-    (( ${#_n} > _ncol )) && _ncol=${#_n}
-    (( ${#_m} > _mcol )) && _mcol=${#_m}
+    _m="${_e#*|}"
+    _m="${_m%%|*}"
+    ((${#_n} > _ncol)) && _ncol=${#_n}
+    ((${#_m} > _mcol)) && _mcol=${#_m}
   done
 
   printf "%-${_ncol}s %-${_mcol}s %-12s %s\n" "NAME" "METHOD" "STATUS" "DETAILS"
@@ -149,7 +150,7 @@ cmd_list() {
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
-    github:release|cargo|go|uv)
+    github:release | cargo | go | uv)
       # Manifest entries are stored as "method|cmd|install_path"; ##*|
       # extracts the trailing install_path field. Empty manifest entry
       # → "missing" (install hasn't run yet).
@@ -244,7 +245,7 @@ cmd_check() {
         return 0
       fi
       ;;
-    github:release|cargo|go|uv)
+    github:release | cargo | go | uv)
       local bin_path=""
       if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
         bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"
@@ -346,7 +347,7 @@ cmd_migrate() {
         local tmp="$manifest.tmp.$$"
         awk -F'|' -v old="$short" \
           '$1 != old || ($2 != "github:repo" && $2 != "github:release" && $2 != "git" && $2 != "binary")' \
-          "$manifest" > "$tmp"
+          "$manifest" >"$tmp"
         mv "$tmp" "$manifest"
       fi
       continue
@@ -383,7 +384,7 @@ cmd_migrate() {
       local tmp="$manifest.tmp.$$"
       awk -F'|' -v old="$short" -v new="$_name" -v olddir="$install_dir/$short" -v newdir="$install_dir/$_name" \
         'BEGIN{OFS="|"} $1==old && ($2=="github:repo" || $2=="github:release" || $2=="git" || $2=="binary"){$1=new; gsub(olddir,newdir)} {print}' \
-        "$manifest" > "$tmp"
+        "$manifest" >"$tmp"
       mv "$tmp" "$manifest"
     fi
   done
@@ -403,17 +404,17 @@ cmd_migrate() {
       # Only target github/git/binary entries with bare names (no slash)
       [[ "$m_name" != */* ]] || continue
       case "$m_method" in
-        github:repo|github:release|git|binary) ;;
-        *) continue ;;
+      github:repo | github:release | git | binary) ;;
+      *) continue ;;
       esac
       # If this bare name isn't in the current config, it's stale
       [[ -z "${config_names[$m_name]+x}" ]] || continue
       swept=$((swept + 1))
-    done < "$manifest"
+    done <"$manifest"
     if [[ $swept -gt 0 ]]; then
       local tmp="$manifest.tmp.$$"
       awk -F'|' '$1 ~ /\// || ($2 != "github:repo" && $2 != "github:release" && $2 != "git" && $2 != "binary")' \
-        "$manifest" > "$tmp"
+        "$manifest" >"$tmp"
       mv "$tmp" "$manifest"
       echo "  cleaned $swept stale manifest entry/entries"
       count=$((count + swept))
@@ -452,29 +453,32 @@ main() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-    -c|--config)
-      [[ $# -lt 2 ]] && { echo "error: --config requires an argument" >&2; exit 2; }
+    -c | --config)
+      [[ $# -lt 2 ]] && {
+        echo "error: --config requires an argument" >&2
+        exit 2
+      }
       config_path="$2"
       shift 2
       ;;
-    -f|--force)
+    -f | --force)
       export SHDEPS_FORCE=1
       shift
       ;;
-    -R|--reinstall)
+    -R | --reinstall)
       export SHDEPS_FORCE=1
       export SHDEPS_REINSTALL=1
       shift
       ;;
-    -q|--quiet)
+    -q | --quiet)
       export SHDEPS_QUIET=1
       shift
       ;;
-    -v|--verbose)
+    -v | --verbose)
       export SHDEPS_LOG_LEVEL=2
       shift
       ;;
-    -h|--help|help)
+    -h | --help | help)
       usage
       exit 0
       ;;
@@ -512,14 +516,14 @@ main() {
   shift || true
 
   case "$cmd" in
-  update)      cmd_update "$@" ;;
+  update) cmd_update "$@" ;;
   self-update) cmd_self_update "$@" ;;
-  list)        cmd_list "$@" ;;
-  check)       cmd_check "$@" ;;
-  prune)       cmd_prune "$@" ;;
-  migrate)     cmd_migrate "$@" ;;
-  version)     shdeps_version ;;
-  help)        usage ;;
+  list) cmd_list "$@" ;;
+  check) cmd_check "$@" ;;
+  prune) cmd_prune "$@" ;;
+  migrate) cmd_migrate "$@" ;;
+  version) shdeps_version ;;
+  help) usage ;;
   *)
     echo "error: unknown command '$cmd'" >&2
     echo "Run 'shdeps help' for usage." >&2

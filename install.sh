@@ -27,7 +27,7 @@ SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
 # Helpers
 # ---------------------------------------------------------------------------
 
-_info()  { printf '%s\n' "$*" >&2; }
+_info() { printf '%s\n' "$*" >&2; }
 _error() { printf 'error: %s\n' "$*" >&2; }
 
 _check_prereqs() {
@@ -35,7 +35,7 @@ _check_prereqs() {
     _error "git is required"
     exit 1
   fi
-  if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+  if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
     _error "bash 4.3+ is required (found ${BASH_VERSION})"
     exit 1
   fi
@@ -133,7 +133,7 @@ _bootstrap() {
   else
     # Not installed — run _install in a subshell so exit doesn't kill caller
     # shellcheck disable=SC2310  # intentional: subshell contains exit
-    if ( _install ) >/dev/null 2>&1; then
+    if (_install) >/dev/null 2>&1; then
       _bs_lib="$SHDEPS_DIR/shdeps.sh"
       _bs_dir="$SHDEPS_DIR"
     else
@@ -189,9 +189,9 @@ _uninstall() {
 # ---------------------------------------------------------------------------
 
 case "${1:-}" in
---uninstall)  _uninstall ;;
---bootstrap)  _bootstrap ;;
-"")           _install ;;
+--uninstall) _uninstall ;;
+--bootstrap) _bootstrap ;;
+"") _install ;;
 *)
   _error "unknown argument: $1"
   _info "Usage: install.sh [--uninstall|--bootstrap]"
