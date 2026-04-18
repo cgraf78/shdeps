@@ -3228,6 +3228,35 @@ _shdeps_manifest_read
 _assert_eq "integ github failure: failed dep not in manifest" "" "${_SHDEPS_MANIFEST[broken/tool]:-}"
 _assert_eq "integ github failure: later dep in manifest" "custom|custom-b|" "${_SHDEPS_MANIFEST[custom-b]:-}"
 
+# --- Integration: github repo failure still runs later deps, then exits 1 ---
+
+rm -f "$_integ_dir"/*.conf
+cat > "$_integ_dir/deps.conf" <<'EOF'
+broken/repo  github:repo
+custom-b     custom
+EOF
+cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+exists() { return 1; }
+install() { echo "custom-b-after-git-fail" >> "$INTEG_LOG"; return 0; }
+HOOK
+
+_source_shdeps "$SHDEPS_DIR"
+# shellcheck disable=SC2329  # test override is invoked indirectly by shdeps_update
+_shdeps_github_repo_install() {
+  echo "github-repo-failed:$1" >> "$INTEG_LOG"
+  return 1
+}
+
+: > "$INTEG_LOG"
+rc=0
+shdeps_update >/dev/null 2>&1 || rc=$?
+integ_output=$(cat "$INTEG_LOG")
+_assert_exit "integ github repo failure: update exits 1" 1 "$rc"
+_assert_contains "integ github repo failure: later dep still runs" "custom-b-after-git-fail" "$integ_output"
+_shdeps_manifest_read
+_assert_eq "integ github repo failure: failed dep not in manifest" "" "${_SHDEPS_MANIFEST[broken/repo]:-}"
+_assert_eq "integ github repo failure: later dep in manifest" "custom|custom-b|" "${_SHDEPS_MANIFEST[custom-b]:-}"
+
 # --- shdeps_version ---
 
 ver=$(shdeps_version)
