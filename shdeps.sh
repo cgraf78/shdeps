@@ -811,7 +811,7 @@ _shdeps_pkg_install_batch() {
     return 0
   fi
 
-  local rc=0
+  local rc=0 any_fail=0
   local log=""
   if ! _shdeps_logfile_create; then
     _shdeps_warn "  warning: failed to create temp log for package install"
@@ -835,7 +835,10 @@ _shdeps_pkg_install_batch() {
     _shdeps_logfile_print "package manager" "$log"
     _shdeps_warn "  warning: batch install failed, retrying individually..."
     local pkg
-    for pkg in "${_SHDEPS_PKG_BATCH[@]}"; do
+    local -a succeeded_pkgs=() succeeded_names=()
+    local _i
+    for _i in "${!_SHDEPS_PKG_BATCH[@]}"; do
+      pkg="${_SHDEPS_PKG_BATCH[$_i]}"
       rc=0
       if [[ -n "$log" ]]; then : >"$log"; fi
       _shdeps_log_status "  ${_SHDEPS_PKG_MGR}: installing $pkg..."
@@ -849,9 +852,14 @@ _shdeps_pkg_install_batch() {
       if [[ $rc -ne 0 ]]; then
         _shdeps_logfile_print "package manager for $pkg" "$log"
         _shdeps_warn "  warning: failed to install $pkg"
-        rc=0
+        any_fail=1
+      else
+        succeeded_pkgs+=("$pkg")
+        succeeded_names+=("${_SHDEPS_PKG_BATCH_NAMES[$_i]}")
       fi
     done
+    _SHDEPS_PKG_BATCH=("${succeeded_pkgs[@]}")
+    _SHDEPS_PKG_BATCH_NAMES=("${succeeded_names[@]}")
   fi
 
   rm -f "$log"
@@ -861,6 +869,7 @@ _shdeps_pkg_install_batch() {
   for _i in "${!_SHDEPS_PKG_BATCH_NAMES[@]}"; do
     _SHDEPS_CHANGED[${_SHDEPS_PKG_BATCH_NAMES[$_i]}]=1
   done
+  [[ $any_fail -eq 0 ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -2114,18 +2123,16 @@ _shdeps_install_dep() {
   cargo)
     local _cargo_install_dir
     _cargo_install_dir="$(_shdeps_install_dir)/$_name"
-    local -a _cargo_argv=(cargo install --root "$_cargo_install_dir" "$_name")
-    if _shdeps_external_install "$_name" cargo "$_cmd" cargo _cargo_argv "--force"; then
-      _shdeps_manifest_upsert "$_name" cargo "$_cmd" "$_cargo_install_dir/bin/$_cmd"
-    fi
+    local -a _cargo_argv=(cargo install --locked --root "$_cargo_install_dir" "$_name")
+    _shdeps_external_install "$_name" cargo "$_cmd" cargo _cargo_argv "--force" || return 1
+    _shdeps_manifest_upsert "$_name" cargo "$_cmd" "$_cargo_install_dir/bin/$_cmd"
     ;;
   go)
     local _go_install_dir
     _go_install_dir="$(_shdeps_install_dir)/$_name"
     local -a _go_argv=(env "GOBIN=$_go_install_dir/bin" go install "$_name@latest")
-    if _shdeps_external_install "$_name" go "$_cmd" go _go_argv ""; then
-      _shdeps_manifest_upsert "$_name" go "$_cmd" "$_go_install_dir/bin/$_cmd"
-    fi
+    _shdeps_external_install "$_name" go "$_cmd" go _go_argv "" || return 1
+    _shdeps_manifest_upsert "$_name" go "$_cmd" "$_go_install_dir/bin/$_cmd"
     ;;
   uv)
     local _uv_install_dir
@@ -2134,9 +2141,8 @@ _shdeps_install_dep() {
       env "UV_TOOL_DIR=$_uv_install_dir/tools" "UV_TOOL_BIN_DIR=$_uv_install_dir/bin"
       uv tool install "$_name"
     )
-    if _shdeps_external_install "$_name" uv "$_cmd" uv _uv_argv "--force"; then
-      _shdeps_manifest_upsert "$_name" uv "$_cmd" "$_uv_install_dir/bin/$_cmd"
-    fi
+    _shdeps_external_install "$_name" uv "$_cmd" uv _uv_argv "--force" || return 1
+    _shdeps_manifest_upsert "$_name" uv "$_cmd" "$_uv_install_dir/bin/$_cmd"
     ;;
   custom)
     # Source hook file and use exists() to gate install().
@@ -2178,6 +2184,8 @@ _shdeps_install_dep() {
         _shdeps_manifest_upsert "$_name" "custom" "$_cmd" ""
       else
         _shdeps_warn "  warning: $_name install failed"
+        unset -f exists version install post uninstall 2>/dev/null
+        return 1
       fi
     fi
     unset -f exists version install post uninstall 2>/dev/null
@@ -2351,14 +2359,14 @@ _shdeps_update() {
 
   # Phase A: system packages first (queue then flush), so tools like git,
   # curl, tar, and language toolchains are available before non-pkg deps.
-  local entry _phase_method
+  local entry _phase_method failed=0
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _phase_method="${entry#*|}"
     _phase_method="${_phase_method%%|*}"
     [[ "$_phase_method" == "pkg" ]] || continue
-    _shdeps_install_dep "$entry" || true
+    _shdeps_install_dep "$entry" || failed=1
   done
-  _shdeps_pkg_install_batch
+  _shdeps_pkg_install_batch || failed=1
 
   # Phase B: non-pkg installs (github:*, cargo, go, uv, custom) now that
   # system prereqs are in place.
@@ -2366,7 +2374,7 @@ _shdeps_update() {
     _phase_method="${entry#*|}"
     _phase_method="${_phase_method%%|*}"
     [[ "$_phase_method" == "pkg" ]] && continue
-    _shdeps_install_dep "$entry" || true
+    _shdeps_install_dep "$entry" || failed=1
   done
 
   # Reinstall mode: mark all deps as changed so all post() hooks run.
@@ -2379,6 +2387,10 @@ _shdeps_update() {
 
   # Post-install phase
   _shdeps_run_post_hooks
+
+  if [[ $failed -ne 0 ]]; then
+    return 1
+  fi
 
   # Notify about orphaned deps (in manifest but no longer in config)
   if _shdeps_detect_orphans; then
