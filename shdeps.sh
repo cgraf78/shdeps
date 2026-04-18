@@ -305,10 +305,8 @@ _shdeps_require_sudo() {
   sudo true
 }
 
-# Scan active deps once to determine install prerequisites:
-#   - sets _SHDEPS_PKG_INSTALL_NEEDED=1 if any pkg dep needs installing
-#     (used to gate sudo priming and metadata refresh)
-#   - emits one warning per missing external tool (cargo, go, uv)
+# Scan active deps once to determine if sudo is needed for pkg installs.
+# Sets _SHDEPS_PKG_INSTALL_NEEDED=1 if any pkg dep needs installing.
 # Idempotent via _SHDEPS_PREREQS_SCANNED. Call after _shdeps_load and
 # _shdeps_pkg_detect.
 _shdeps_check_prereqs() {
@@ -319,32 +317,17 @@ _shdeps_check_prereqs() {
   local pkg_scan_active=1
   [[ "$_SHDEPS_PKG_MGR" == "brew" || -z "$_SHDEPS_PKG_MGR" ]] && pkg_scan_active=0
 
-  local -A ext_tools=()
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
     _shdeps_filter_match "$_filter" || continue
-    case "$_method" in
-    pkg)
-      if [[ $pkg_scan_active -eq 1 && "$_SHDEPS_PKG_INSTALL_NEEDED" -eq 0 ]]; then
-        local resolved_pkg
-        resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
-        [[ "$resolved_pkg" == "NONE" ]] && continue
-        if ! _shdeps_exists "$_cmd" "$resolved_pkg"; then
-          _SHDEPS_PKG_INSTALL_NEEDED=1
-        fi
+    if [[ "$_method" == "pkg" && $pkg_scan_active -eq 1 && "$_SHDEPS_PKG_INSTALL_NEEDED" -eq 0 ]]; then
+      local resolved_pkg
+      resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
+      [[ "$resolved_pkg" == "NONE" ]] && continue
+      if ! _shdeps_exists "$_cmd" "$resolved_pkg"; then
+        _SHDEPS_PKG_INSTALL_NEEDED=1
       fi
-      ;;
-    cargo) ext_tools[cargo]=1 ;;
-    go) ext_tools[go]=1 ;;
-    uv) ext_tools[uv]=1 ;;
-    esac
-  done
-
-  local tool
-  for tool in "${!ext_tools[@]}"; do
-    if ! command -v "$tool" &>/dev/null; then
-      _shdeps_warn "  warning: $tool not found — skipping all $tool deps"
     fi
   done
 }
@@ -2004,9 +1987,11 @@ _shdeps_external_install() {
     return 0
   fi
 
-  # Tool must be present. Pre-scan warns at startup; here we silently
-  # short-circuit with non-zero so the caller does not touch the manifest.
-  command -v "$tool" &>/dev/null || return 1
+  # Tool must be present.
+  if ! command -v "$tool" &>/dev/null; then
+    _shdeps_warn "  warning: $tool not found — skipping $name"
+    return 1
+  fi
 
   local already_installed=0 prev_ver=""
   if [[ -x "$bin_path" ]]; then
