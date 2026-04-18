@@ -33,16 +33,19 @@ SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown
 # sections with _shdeps_ prefixes.
 
 # Core
-shdeps_version()        { echo "shdeps $SHDEPS_VERSION"; }
-shdeps_update()         { _shdeps_update "$@"; }
-shdeps_self_update()    { _shdeps_self_update "$@"; }
-shdeps_load()           { _shdeps_load; echo "${#_SHDEPS_DEPS[@]}"; }
-shdeps_prune()          { _shdeps_prune "$@"; }
+shdeps_version() { echo "shdeps $SHDEPS_VERSION"; }
+shdeps_update() { _shdeps_update "$@"; }
+shdeps_self_update() { _shdeps_self_update "$@"; }
+shdeps_load() {
+  _shdeps_load
+  echo "${#_SHDEPS_DEPS[@]}"
+}
+shdeps_prune() { _shdeps_prune "$@"; }
 
 # Matching
 shdeps_platform_match() { _shdeps_platform_match "$@"; }
-shdeps_host_match()     { _shdeps_host_match "$@"; }
-shdeps_filter_match()   { _shdeps_filter_match "$@"; }
+shdeps_host_match() { _shdeps_host_match "$@"; }
+shdeps_filter_match() { _shdeps_filter_match "$@"; }
 
 # Platform and environment
 shdeps_platform() {
@@ -52,25 +55,25 @@ shdeps_platform() {
   if [[ "$current" == "darwin" ]]; then current="macos"; fi
   echo "$current"
 }
-shdeps_force()          { [[ "$(_shdeps_force)" -eq 1 ]]; }
-shdeps_reinstall()      { [[ "$(_shdeps_reinstall)" -eq 1 ]]; }
-shdeps_pkg_mgr()        { echo "${_SHDEPS_PKG_MGR:-}"; }
-shdeps_require_sudo()   { _shdeps_require_sudo; }
-shdeps_install_dir()    { _shdeps_install_dir; }
-shdeps_git_dev_dir()    { _shdeps_git_dev_dir; }
-shdeps_bin_dir()        { _shdeps_bin_dir; }
+shdeps_force() { [[ "$(_shdeps_force)" -eq 1 ]]; }
+shdeps_reinstall() { [[ "$(_shdeps_reinstall)" -eq 1 ]]; }
+shdeps_pkg_mgr() { echo "${_SHDEPS_PKG_MGR:-}"; }
+shdeps_require_sudo() { _shdeps_require_sudo; }
+shdeps_install_dir() { _shdeps_install_dir; }
+shdeps_git_dev_dir() { _shdeps_git_dev_dir; }
+shdeps_bin_dir() { _shdeps_bin_dir; }
 
 # Extras linking (man pages, shell completions)
-shdeps_link_extras()    { _shdeps_link_extras "$@"; }
-shdeps_unlink_extras()  { _shdeps_unlink_extras "$@"; }
+shdeps_link_extras() { _shdeps_link_extras "$@"; }
+shdeps_unlink_extras() { _shdeps_unlink_extras "$@"; }
 
 # Logging
-shdeps_log()            { _shdeps_log "$@"; }
-shdeps_warn()           { _shdeps_warn "$@"; }
-shdeps_log_warn()       { _shdeps_log_warn "$@"; }
-shdeps_log_ok()         { _shdeps_log_ok "$@"; }
-shdeps_log_dim()        { _shdeps_log_dim "$@"; }
-shdeps_log_header()     { _shdeps_log_header "$@"; }
+shdeps_log() { _shdeps_log "$@"; }
+shdeps_warn() { _shdeps_warn "$@"; }
+shdeps_log_warn() { _shdeps_log_warn "$@"; }
+shdeps_log_ok() { _shdeps_log_ok "$@"; }
+shdeps_log_dim() { _shdeps_log_dim "$@"; }
+shdeps_log_header() { _shdeps_log_header "$@"; }
 
 # ===========================================================================
 # Internal implementation — everything below is private (_shdeps_ prefix)
@@ -89,16 +92,16 @@ _shdeps_conf_dir() {
   echo "$dir"
 }
 
-_shdeps_hooks_dir()  { echo "${SHDEPS_HOOKS_DIR:-$(_shdeps_conf_dir)/hooks.d}"; }
-_shdeps_state_dir()  { echo "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}"; }
-_shdeps_force()      { echo "${SHDEPS_FORCE:-0}"; }
-_shdeps_reinstall()  { echo "${SHDEPS_REINSTALL:-0}"; }
-_shdeps_quiet()      { echo "${SHDEPS_QUIET:-0}"; }
+_shdeps_hooks_dir() { echo "${SHDEPS_HOOKS_DIR:-$(_shdeps_conf_dir)/hooks.d}"; }
+_shdeps_state_dir() { echo "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}"; }
+_shdeps_force() { echo "${SHDEPS_FORCE:-0}"; }
+_shdeps_reinstall() { echo "${SHDEPS_REINSTALL:-0}"; }
+_shdeps_quiet() { echo "${SHDEPS_QUIET:-0}"; }
 _shdeps_remote_ttl() { echo "${SHDEPS_REMOTE_TTL:-3600}"; }
 _shdeps_git_dev_dir() { echo "${SHDEPS_GIT_DEV_DIR:-$HOME/git}"; }
 _shdeps_install_dir() { echo "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"; }
-_shdeps_bin_dir()     { echo "${SHDEPS_BIN_DIR:-$HOME/.local/bin}"; }
-_shdeps_log_level()  { echo "${SHDEPS_LOG_LEVEL:-1}"; }
+_shdeps_bin_dir() { echo "${SHDEPS_BIN_DIR:-$HOME/.local/bin}"; }
+_shdeps_log_level() { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 
 # Target directory accessors for extras linking (man pages, completions).
 # Man pages route to section subdirs: _shdeps_man_dir 1 → .../man/man1/
@@ -107,7 +110,7 @@ _shdeps_man_dir() {
   echo "$(_shdeps_install_dir)/man/man${section}"
 }
 _shdeps_bash_comp_dir() { echo "$(_shdeps_install_dir)/bash-completion/completions"; }
-_shdeps_zsh_comp_dir()  { echo "$(_shdeps_install_dir)/zsh/site-functions"; }
+_shdeps_zsh_comp_dir() { echo "$(_shdeps_install_dir)/zsh/site-functions"; }
 _shdeps_fish_comp_dir() { echo "$(_shdeps_install_dir)/fish/vendor_completions.d"; }
 
 # ---------------------------------------------------------------------------
@@ -117,43 +120,43 @@ _shdeps_fish_comp_dir() { echo "$(_shdeps_install_dir)/fish/vendor_completions.d
 
 _SHDEPS_MAN_PATTERNS=(
   # Structured paths — match all sections (1-8)
-  "share/man/man[0-9]/*.[0-9]"    # FHS prefix tree (neovim, gh)
+  "share/man/man[0-9]/*.[0-9]" # FHS prefix tree (neovim, gh)
   "share/man/man[0-9]/*.[0-9].gz"
-  "man/man[0-9]/*.[0-9]"          # alternate prefix (zoxide)
+  "man/man[0-9]/*.[0-9]" # alternate prefix (zoxide)
   "man/man[0-9]/*.[0-9].gz"
-  "manpages/*.[0-9]"              # goreleaser (gum, chezmoi)
+  "manpages/*.[0-9]" # goreleaser (gum, chezmoi)
   "manpages/*.[0-9].gz"
-  "doc/*.[0-9]"                   # Rust/BurntSushi (ripgrep)
+  "doc/*.[0-9]" # Rust/BurntSushi (ripgrep)
   "doc/*.[0-9].gz"
   # Flat top-level — section 1 only to avoid false positives
-  "*.1"                           # fd, bat, hyperfine
+  "*.1" # fd, bat, hyperfine
   "*.1.gz"
 )
 
 _SHDEPS_BASH_COMP_PATTERNS=(
-  "share/bash-completion/completions/*"  # FHS
-  "completions/*.bash"                   # goreleaser (gum, chezmoi, jj)
-  "completion/*.bash"                    # bottom
-  "complete/*.bash"                      # ripgrep
-  "autocomplete/*.bash"                  # fd, bat, hyperfine
+  "share/bash-completion/completions/*" # FHS
+  "completions/*.bash"                  # goreleaser (gum, chezmoi, jj)
+  "completion/*.bash"                   # bottom
+  "complete/*.bash"                     # ripgrep
+  "autocomplete/*.bash"                 # fd, bat, hyperfine
 )
 
 _SHDEPS_ZSH_COMP_PATTERNS=(
-  "share/zsh/site-functions/_*"   # FHS
-  "completions/_*"                # zoxide, sd
-  "completions/*.zsh"             # goreleaser (gum — needs rename to _<cmd>)
-  "completion/_*"                 # bottom
-  "complete/_*"                   # ripgrep
-  "autocomplete/_*"               # fd, hyperfine
-  "autocomplete/*.zsh"            # bat (non-underscore variant)
+  "share/zsh/site-functions/_*" # FHS
+  "completions/_*"              # zoxide, sd
+  "completions/*.zsh"           # goreleaser (gum — needs rename to _<cmd>)
+  "completion/_*"               # bottom
+  "complete/_*"                 # ripgrep
+  "autocomplete/_*"             # fd, hyperfine
+  "autocomplete/*.zsh"          # bat (non-underscore variant)
 )
 
 _SHDEPS_FISH_COMP_PATTERNS=(
-  "share/fish/vendor_completions.d/*.fish"  # FHS
-  "completions/*.fish"                      # goreleaser (gum, chezmoi, jj)
-  "completion/*.fish"                       # bottom
-  "complete/*.fish"                         # ripgrep
-  "autocomplete/*.fish"                     # fd, bat, hyperfine
+  "share/fish/vendor_completions.d/*.fish" # FHS
+  "completions/*.fish"                     # goreleaser (gum, chezmoi, jj)
+  "completion/*.fish"                      # bottom
+  "complete/*.fish"                        # ripgrep
+  "autocomplete/*.fish"                    # fd, bat, hyperfine
 )
 
 # ---------------------------------------------------------------------------
@@ -333,8 +336,8 @@ _shdeps_check_prereqs() {
       fi
       ;;
     cargo) ext_tools[cargo]=1 ;;
-    go)    ext_tools[go]=1 ;;
-    uv)    ext_tools[uv]=1 ;;
+    go) ext_tools[go]=1 ;;
+    uv) ext_tools[uv]=1 ;;
     esac
   done
 
@@ -539,7 +542,7 @@ _shdeps_filter_match() {
   local IFS=','
   for token in $spec; do
     case "$token" in
-    os:*)   platform_spec+="${platform_spec:+,}${token#os:}" ;;
+    os:*) platform_spec+="${platform_spec:+,}${token#os:}" ;;
     host:*) host_spec+="${host_spec:+,}${token#host:}" ;;
     esac
   done
@@ -570,9 +573,9 @@ _shdeps_exists() {
   # Command not found (or empty) — try the package manager directly.
   if [[ -n "$name" ]]; then
     case "${_SHDEPS_PKG_MGR:-}" in
-    brew)   brew list "$name" &>/dev/null && return 0 ;;
-    apt)    dpkg -s "$name" &>/dev/null && return 0 ;;
-    dnf)    rpm -q "$name" &>/dev/null && return 0 ;;
+    brew) brew list "$name" &>/dev/null && return 0 ;;
+    apt) dpkg -s "$name" &>/dev/null && return 0 ;;
+    dnf) rpm -q "$name" &>/dev/null && return 0 ;;
     pacman) pacman -Q "$name" &>/dev/null && return 0 ;;
     esac
   fi
@@ -603,7 +606,10 @@ _shdeps_dep_version() {
   if [[ "$cmd" == git-* ]] && ! command -v "$cmd" &>/dev/null; then
     output=$(git "${cmd#git-}" --version 2>&1 || true)
     ver=$(echo "$output" | grep -oE '[0-9]+\.[0-9]+[0-9.a-z]*' | head -1)
-    if [[ -n "$ver" ]]; then echo "$ver"; return 0; fi
+    if [[ -n "$ver" ]]; then
+      echo "$ver"
+      return 0
+    fi
   fi
   for flag in --version -V; do
     # shellcheck disable=SC2086  # intentional word splitting on $_timeout
@@ -723,11 +729,11 @@ _shdeps_short_name() {
 _shdeps_pkg_available() {
   local pkg="$1"
   case "$_SHDEPS_PKG_MGR" in
-  brew)   brew info "$pkg" &>/dev/null ;;
-  apt)    apt-cache show "$pkg" &>/dev/null ;;
-  dnf)    dnf info "$pkg" &>/dev/null ;;
+  brew) brew info "$pkg" &>/dev/null ;;
+  apt) apt-cache show "$pkg" &>/dev/null ;;
+  dnf) dnf info "$pkg" &>/dev/null ;;
   pacman) pacman -Si "$pkg" &>/dev/null ;;
-  *)      return 0 ;;
+  *) return 0 ;;
   esac
 }
 
@@ -747,8 +753,8 @@ _shdeps_pkg_refresh_metadata() {
 
   _shdeps_log_status "  refreshing $_SHDEPS_PKG_MGR package metadata..."
   case "$_SHDEPS_PKG_MGR" in
-  apt)    sudo apt-get update -qq >/dev/null 2>&1 || true ;;
-  dnf)    sudo dnf makecache -q &>/dev/null || true ;;
+  apt) sudo apt-get update -qq >/dev/null 2>&1 || true ;;
+  dnf) sudo dnf makecache -q &>/dev/null || true ;;
   pacman) sudo pacman -Sy &>/dev/null || true ;;
   esac
   _SHDEPS_PKG_CACHE_REFRESHED=1
@@ -810,9 +816,9 @@ _shdeps_pkg_install_batch() {
   _shdeps_log_status "  ${_SHDEPS_PKG_MGR}: installing ${#_SHDEPS_PKG_BATCH[@]} packages..."
   # shellcheck disable=SC2024  # sudo output captured in user-owned log
   case "$_SHDEPS_PKG_MGR" in
-  brew)   _shdeps_run_logged brew install "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
-  apt)    _shdeps_run_logged sudo apt-get install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
-  dnf)    _shdeps_run_logged sudo dnf install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+  brew) _shdeps_run_logged brew install "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+  apt) _shdeps_run_logged sudo apt-get install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+  dnf) _shdeps_run_logged sudo dnf install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
   pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
   esac
   _shdeps_log_clear
@@ -828,9 +834,9 @@ _shdeps_pkg_install_batch() {
       _shdeps_log_status "  ${_SHDEPS_PKG_MGR}: installing $pkg..."
       # shellcheck disable=SC2024  # sudo output captured in user-owned log
       case "$_SHDEPS_PKG_MGR" in
-      brew)   _shdeps_run_logged brew install "$pkg" || rc=$? ;;
-      apt)    _shdeps_run_logged sudo apt-get install -y "$pkg" || rc=$? ;;
-      dnf)    _shdeps_run_logged sudo dnf install -y "$pkg" || rc=$? ;;
+      brew) _shdeps_run_logged brew install "$pkg" || rc=$? ;;
+      apt) _shdeps_run_logged sudo apt-get install -y "$pkg" || rc=$? ;;
+      dnf) _shdeps_run_logged sudo dnf install -y "$pkg" || rc=$? ;;
       pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "$pkg" || rc=$? ;;
       esac
       if [[ $rc -ne 0 ]]; then
@@ -1044,7 +1050,7 @@ _shdeps_remove_dep() {
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
-  github:release|cargo|go|uv)
+  github:release | cargo | go | uv)
     _shdeps_unlink_extras "$name"
     rm -f "$(_shdeps_bin_dir)/$cmd"
     local binary_install_dir
@@ -1084,9 +1090,18 @@ _shdeps_prune() {
   local yes=0 dry_run=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-    -y)        yes=1; shift ;;
-    --dry-run) dry_run=1; shift ;;
-    *)         _shdeps_warn "error: unknown prune option '$1'"; return 2 ;;
+    -y)
+      yes=1
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    *)
+      _shdeps_warn "error: unknown prune option '$1'"
+      return 2
+      ;;
     esac
   done
 
@@ -1198,7 +1213,7 @@ _shdeps_unlink_extras() {
   [[ -f "$links_file" ]] || return 0
   while IFS= read -r link; do
     [[ -L "$link" ]] && rm -f "$link"
-  done < "$links_file"
+  done <"$links_file"
   rm -f "$links_file"
 }
 
@@ -1302,7 +1317,7 @@ _shdeps_link_extras() {
   # Write state file for cleanup tracking
   if [[ ${#created_links[@]} -gt 0 ]]; then
     mkdir -p "$(dirname "$state_dir/$name.links")"
-    printf '%s\n' "${created_links[@]}" > "$state_dir/$name.links"
+    printf '%s\n' "${created_links[@]}" >"$state_dir/$name.links"
     _SHDEPS_EXTRAS_LINKED=1
   fi
 }
@@ -1539,16 +1554,16 @@ _shdeps_github_release_find_asset() {
   local os_patterns=("$os")
   case "$os" in
   darwin) os_patterns+=(macos apple osx) ;;
-  linux)  os_patterns+=(linux) ;;
+  linux) os_patterns+=(linux) ;;
   esac
 
   # Normalize arch names
   local arch_patterns=("$arch")
   case "$arch" in
-  x86_64)  arch_patterns+=(amd64 x64) ;;
+  x86_64) arch_patterns+=(amd64 x64) ;;
   aarch64) arch_patterns+=(arm64) ;;
-  amd64)   arch_patterns+=(x86_64 x64) ;;
-  arm64)   arch_patterns+=(aarch64) ;;
+  amd64) arch_patterns+=(x86_64 x64) ;;
+  arm64) arch_patterns+=(aarch64) ;;
   esac
 
   # Extensions to always skip (metadata, packages, installers)
@@ -1583,14 +1598,20 @@ _shdeps_github_release_find_asset() {
           # Must match at least one OS pattern
           os_match=0
           for os_pat in "${os_patterns[@]}"; do
-            [[ "$url_lower" == *"$os_pat"* ]] && { os_match=1; break; }
+            [[ "$url_lower" == *"$os_pat"* ]] && {
+              os_match=1
+              break
+            }
           done
           [[ $os_match -eq 1 ]] || continue
 
           # Skip metadata and package files
           skip=0
           for ext in "${_skip_exts[@]}"; do
-            [[ "$url_lower" == *"$ext" ]] && { skip=1; break; }
+            [[ "$url_lower" == *"$ext" ]] && {
+              skip=1
+              break
+            }
           done
           if [[ $skip -eq 1 ]]; then continue; fi
 
@@ -1598,13 +1619,19 @@ _shdeps_github_release_find_asset() {
           if [[ "$pass" == "plain" ]]; then
             is_archive=0
             for ext in "${_archive_exts[@]}"; do
-              [[ "$url_lower" == *"$ext" ]] && { is_archive=1; break; }
+              [[ "$url_lower" == *"$ext" ]] && {
+                is_archive=1
+                break
+              }
             done
             [[ $is_archive -eq 0 ]] || continue
           elif [[ "$pass" == "tarball" ]]; then
             is_archive=0
             for ext in "${_tar_exts[@]}"; do
-              [[ "$url_lower" == *"$ext" ]] && { is_archive=1; break; }
+              [[ "$url_lower" == *"$ext" ]] && {
+                is_archive=1
+                break
+              }
             done
             [[ $is_archive -eq 1 ]] || continue
           else
@@ -1623,7 +1650,10 @@ _shdeps_github_release_find_asset() {
             suffix="${suffix#[-_.]}"
             # Exact if suffix starts with OS, arch, or version pattern
             for tok in "${os_patterns[@]}" "${arch_patterns[@]}"; do
-              [[ "$suffix" == "$tok"* ]] && { is_exact=1; break; }
+              [[ "$suffix" == "$tok"* ]] && {
+                is_exact=1
+                break
+              }
             done
             if [[ $is_exact -eq 0 && "$suffix" =~ ^v?[0-9] ]]; then is_exact=1; fi
           fi
@@ -1896,7 +1926,7 @@ _shdeps_github_release_install() {
       return 1
     fi
   elif [[ "$asset_lower" == *.gz ]]; then
-    if ! gzip -dc "$tmp_file" > "$bin_path" 2>/dev/null; then
+    if ! gzip -dc "$tmp_file" >"$bin_path" 2>/dev/null; then
       rm -f "$tmp_file" "$bin_path" "$log"
       _shdeps_warn "  warning: failed to decompress $name .gz"
       return 1
@@ -1904,7 +1934,7 @@ _shdeps_github_release_install() {
     rm -f "$tmp_file"
     chmod u+x "$bin_path"
   elif [[ "$asset_lower" == *.bz2 ]]; then
-    if ! bzip2 -dc "$tmp_file" > "$bin_path" 2>/dev/null; then
+    if ! bzip2 -dc "$tmp_file" >"$bin_path" 2>/dev/null; then
       rm -f "$tmp_file" "$bin_path" "$log"
       _shdeps_warn "  warning: failed to decompress $name .bz2"
       return 1
@@ -1948,7 +1978,7 @@ _shdeps_github_release_install() {
 # Install a dep by invoking an external tool. Shared skeleton for cargo/go/uv.
 # $1=name  $2=method  $3=cmd  $4=tool  $5=argv-nameref  $6=force-flag-or-empty
 #
-# Writes _SHDEPS_CHANGED[$name]=1 iff the install command actually ran.
+# Writes _SHDEPS_CHANGED[$name]=1 iff the dep was newly installed or updated.
 # Returns 0 iff the binary exists at the expected path on completion
 # (either fast path or successful install). Returns non-zero on any
 # failure or when the required tool is missing — caller MUST skip
@@ -1978,6 +2008,12 @@ _shdeps_external_install() {
   # short-circuit with non-zero so the caller does not touch the manifest.
   command -v "$tool" &>/dev/null || return 1
 
+  local already_installed=0 prev_ver=""
+  if [[ -x "$bin_path" ]]; then
+    already_installed=1
+    prev_ver=$(_shdeps_dep_version "$cmd" 2>/dev/null || true)
+  fi
+
   mkdir -p "$install_dir/bin" || return 1
 
   local -a argv=("${install_argv[@]}")
@@ -2004,11 +2040,21 @@ _shdeps_external_install() {
 
   _shdeps_link_bin "$cmd" "$bin_path"
   _shdeps_remote_touch "$stamp" || true
-  _SHDEPS_CHANGED[$name]=1
 
   local ver
   ver=$(_shdeps_dep_version "$cmd" 2>/dev/null || true)
-  _shdeps_log_ok "  $name installed${ver:+ -- $ver}"
+  if [[ "$already_installed" -eq 0 ]]; then
+    _SHDEPS_CHANGED[$name]=1
+    _shdeps_log_ok "  $name installed${ver:+ -- $ver}"
+  elif [[ -n "$prev_ver" && -n "$ver" && "$prev_ver" != "$ver" ]]; then
+    _SHDEPS_CHANGED[$name]=1
+    _shdeps_log_ok "  $name updated -- $prev_ver -> $ver"
+  elif [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
+    _SHDEPS_CHANGED[$name]=1
+    _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
+  else
+    _shdeps_log "  $name${ver:+ -- $ver}"
+  fi
   return 0
 }
 
