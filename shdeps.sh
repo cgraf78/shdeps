@@ -2305,6 +2305,16 @@ _shdeps_update() {
     return 1
   fi
 
+  # Ensure the bin directory is on PATH so toolchains installed in
+  # phase A (pkg, github:release) are available for phase B (cargo,
+  # go, uv deps). Needed on fresh machines before shell rc is sourced.
+  local _bin_dir
+  _bin_dir=$(_shdeps_bin_dir)
+  case ":$PATH:" in
+  *":$_bin_dir:"*) ;;
+  *) export PATH="$_bin_dir:$PATH" ;;
+  esac
+
   _shdeps_load
   _shdeps_pkg_detect
   _SHDEPS_PKG_BATCH=()
