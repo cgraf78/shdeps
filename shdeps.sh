@@ -1066,7 +1066,7 @@ _shdeps_remove_dep() {
     _shdeps_remove_stamps "$name"
     _shdeps_log_ok "  $name removed"
     ;;
-  github:release | cargo | go | uv)
+  github:release | cargo | go | uv | npm)
     _shdeps_unlink_extras "$name"
     rm -f "$(_shdeps_bin_dir)/$cmd"
     local binary_install_dir
@@ -1988,10 +1988,10 @@ _shdeps_github_release_install() {
 }
 
 # ---------------------------------------------------------------------------
-# External installers — cargo, go, uv, and future pipx/npm/gem
+# External installers — cargo, go, uv, npm
 # ---------------------------------------------------------------------------
 
-# Install a dep by invoking an external tool. Shared skeleton for cargo/go/uv.
+# Install a dep by invoking an external tool. Shared skeleton for cargo/go/uv/npm.
 # $1=name  $2=method  $3=cmd  $4=tool  $5=argv-nameref  $6=force-flag-or-empty
 #
 # Writes _SHDEPS_CHANGED[$name]=1 iff the dep was newly installed or updated.
@@ -2143,6 +2143,13 @@ _shdeps_install_dep() {
     )
     _shdeps_external_install "$_name" uv "$_cmd" uv _uv_argv "--force" || return 1
     _shdeps_manifest_upsert "$_name" uv "$_cmd" "$_uv_install_dir/bin/$_cmd"
+    ;;
+  npm)
+    local _npm_install_dir
+    _npm_install_dir="$(_shdeps_install_dir)/$_name"
+    local -a _npm_argv=(npm install -g --prefix "$_npm_install_dir" "$_name")
+    _shdeps_external_install "$_name" npm "$_cmd" npm _npm_argv "--force" || return 1
+    _shdeps_manifest_upsert "$_name" npm "$_cmd" "$_npm_install_dir/bin/$_cmd"
     ;;
   custom)
     # Source hook file and use exists() to gate install().
@@ -2313,7 +2320,7 @@ _shdeps_github_release_prefetch() {
 # 2. Phase A: queue and flush `pkg` installs first, so system packages
 #    that other methods depend on (git, curl, tar, language toolchains)
 #    are available before non-pkg deps run
-# 3. Phase B: install everything else (github:*, cargo, go, uv, custom)
+# 3. Phase B: install everything else (github:*, cargo, go, uv, npm, custom)
 #    in config order
 # 4. Run post() hooks for changed deps
 _shdeps_update() {
@@ -2368,7 +2375,7 @@ _shdeps_update() {
   done
   _shdeps_pkg_install_batch || failed=1
 
-  # Phase B: non-pkg installs (github:*, cargo, go, uv, custom) now that
+  # Phase B: non-pkg installs (github:*, cargo, go, uv, npm, custom) now that
   # system prereqs are in place.
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _phase_method="${entry#*|}"

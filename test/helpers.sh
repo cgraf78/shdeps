@@ -239,7 +239,7 @@ _fake_release_json() {
 }
 
 # ---------------------------------------------------------------------------
-# Mocks for external installers (cargo, go, uv)
+# Mocks for external installers (cargo, go, uv, npm)
 # ---------------------------------------------------------------------------
 
 # Install a mock `cargo` on PATH that intercepts `cargo install --root <dir>
@@ -368,6 +368,42 @@ if [[ -n "${MOCK_UV_LOG:-}" ]]; then
 fi
 SH
   chmod +x "$dir/uv"
+  echo "$dir"
+}
+
+# Install a mock `npm` on PATH that intercepts `npm install -g --prefix <dir>
+# <pkg> [--force]` and creates `<dir>/bin/<pkg>`. Records invocations to
+# $MOCK_NPM_LOG (if set). Returns the dir to prepend to PATH.
+_mock_npm_setup() {
+  local dir
+  dir=$(_tmpdir)
+  cat >"$dir/npm" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == "install" ]] || { echo "mock npm: only supports 'install', got '${1:-}'" >&2; exit 2; }
+shift
+prefix=""; pkg=""; force=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -g)       shift ;;
+    --prefix) prefix="$2"; shift 2 ;;
+    --force)  force=1; shift ;;
+    *)        pkg="$1"; shift ;;
+  esac
+done
+: "${prefix:?--prefix must be set}"
+: "${pkg:?package name must be set}"
+mkdir -p "$prefix/bin"
+cat > "$prefix/bin/$pkg" <<EOF
+#!/bin/sh
+echo "mock-$pkg 1.0.0"
+EOF
+chmod +x "$prefix/bin/$pkg"
+if [[ -n "${MOCK_NPM_LOG:-}" ]]; then
+  echo "install prefix=$prefix force=$force pkg=$pkg" >> "$MOCK_NPM_LOG"
+fi
+SH
+  chmod +x "$dir/npm"
   echo "$dir"
 }
 

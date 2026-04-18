@@ -150,7 +150,7 @@ cmd_list() {
         [[ -n "$ver" ]] && details="$ver"
       fi
       ;;
-    github:release | cargo | go | uv)
+    github:release | cargo | go | uv | npm)
       # Manifest entries are stored as "method|cmd|install_path"; ##*|
       # extracts the trailing install_path field. Empty manifest entry
       # → "missing" (install hasn't run yet).
@@ -245,7 +245,7 @@ cmd_check() {
         return 0
       fi
       ;;
-    github:release | cargo | go | uv)
+    github:release | cargo | go | uv | npm)
       local bin_path=""
       if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
         bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"

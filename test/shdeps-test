@@ -2947,7 +2947,85 @@ _assert_not_exists "uv: no binary when tool missing" "$HOME/.local/share/ruff/bi
 unset MOCK_CARGO_LOG MOCK_GO_LOG MOCK_UV_LOG
 
 echo ""
-echo "=== list/check for cargo/go/uv ==="
+echo "=== npm method ==="
+
+# Isolated env with mocked npm on PATH
+_mock_home
+_npm_mock_dir=$(_mock_npm_setup)
+PATH="$_npm_mock_dir:$PATH"
+_npm_log=$(_tmpdir)/npm.log
+export MOCK_NPM_LOG="$_npm_log"
+_source_shdeps "$SHDEPS_DIR"
+
+_npm_conf=$(_tmpdir)
+cat > "$_npm_conf/deps.conf" <<'CONF'
+prettier   npm
+CONF
+SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+
+_assert_file_exists "npm: binary installed" "$HOME/.local/share/prettier/bin/prettier"
+_assert_symlink     "npm: bin symlink created" "$HOME/.local/bin/prettier"
+
+_shdeps_manifest_read
+_assert_contains "npm: manifest records bin path" \
+  "npm|prettier|$HOME/.local/share/prettier/bin/prettier" "${_SHDEPS_MANIFEST[prettier]:-}"
+
+# TTL-fresh re-run → no new install invocation
+: > "$_npm_log"
+SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+_assert_eq "npm: TTL-fresh re-run skips install" "" "$(cat "$_npm_log")"
+
+# Fast-path self-heal
+rm -f "$HOME/.local/bin/prettier"
+: > "$_npm_log"
+SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
+_assert_symlink "npm: fast-path restores deleted bin symlink" "$HOME/.local/bin/prettier"
+_assert_eq "npm: self-heal did not rerun npm" "" "$(cat "$_npm_log")"
+
+# --reinstall → --force passed
+: > "$_npm_log"
+SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 SHDEPS_REINSTALL=1 shdeps_update >/dev/null
+_assert_contains "npm: --reinstall passes --force" "force=1" "$(cat "$_npm_log")"
+
+# Prune
+echo "" > "$_npm_conf/deps.conf"
+SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
+_assert_not_exists "npm: prune removes install dir" "$HOME/.local/share/prettier"
+_assert_not_exists "npm: prune removes symlink"     "$HOME/.local/bin/prettier"
+
+echo ""
+echo "=== npm failure modes ==="
+
+# Missing npm → warning, dep skipped, no manifest entry.
+_mock_home
+_npm_conf=$(_tmpdir)
+cat > "$_npm_conf/deps.conf" <<'CONF'
+prettier   npm
+CONF
+_npm_missing_out=$(
+  SHDEPS_LOG_LEVEL=1 SHDEPS_CONF_DIR="$_npm_conf" bash -c '
+    command() {
+      if [[ "$1" == -v ]]; then
+        case "$2" in
+          npm) return 1 ;;
+          *) builtin command "$@" ;;
+        esac
+      else
+        builtin command "$@"
+      fi
+    }
+    . '"$SHDEPS_DIR"'/shdeps.sh
+    shdeps_update
+  ' 2>&1
+)
+_npm_warn_count=$(echo "$_npm_missing_out" | grep -cE 'warning: npm not found' || true)
+_assert_eq "npm: missing tool warns exactly once" "1" "$_npm_warn_count"
+_assert_not_exists "npm: no binary when tool missing" "$HOME/.local/share/prettier/bin/prettier"
+
+unset MOCK_NPM_LOG
+
+echo ""
+echo "=== list/check for cargo/go/uv/npm ==="
 
 # After install, `list` and `check` should report the binary as installed,
 # with path resolved from the manifest (not from a method-specific rule).
@@ -2955,12 +3033,14 @@ _mock_home
 _lc_cargo_dir=$(_mock_cargo_setup)
 _lc_go_dir=$(_mock_go_setup)
 _lc_uv_dir=$(_mock_uv_setup)
-PATH="$_lc_cargo_dir:$_lc_go_dir:$_lc_uv_dir:$PATH"
+_lc_npm_dir=$(_mock_npm_setup)
+PATH="$_lc_cargo_dir:$_lc_go_dir:$_lc_uv_dir:$_lc_npm_dir:$PATH"
 _lc_conf=$(_tmpdir)
 cat > "$_lc_conf/deps.conf" <<'CONF'
 mytool                    cargo
 github.com/junegunn/fzf   go
 ruff                      uv
+prettier                  npm
 CONF
 
 SHDEPS_CONF_DIR="$_lc_conf" SHDEPS_QUIET=1 "$SHDEPS_DIR/bin/shdeps" update >/dev/null 2>&1
@@ -2970,7 +3050,8 @@ _assert_contains "list: shows cargo dep"           "mytool"                   "$
 _assert_contains "list: shows cargo as installed"  "mytool"                   "$_lc_list"
 _assert_contains "list: shows go module"           "github.com/junegunn/fzf"  "$_lc_list"
 _assert_contains "list: shows uv dep"              "ruff"                     "$_lc_list"
-# All three rows should be "installed" (not "missing")
+_assert_contains "list: shows npm dep"             "prettier"                 "$_lc_list"
+# All rows should be "installed" (not "missing")
 _lc_missing=$(echo "$_lc_list" | grep -cE 'missing' || true)
 _assert_eq "list: no missing entries post-install" "0" "$_lc_missing"
 
@@ -2980,6 +3061,8 @@ SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check github.com/junegunn/f
 _assert_eq "check: go dep returns 0" "0" "$?"
 SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check ruff >/dev/null
 _assert_eq "check: uv dep returns 0" "0" "$?"
+SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check prettier >/dev/null
+_assert_eq "check: npm dep returns 0" "0" "$?"
 
 # Empty manifest → missing
 _mock_home

@@ -33,19 +33,19 @@ changes.
 
 All behavior is controlled via environment variables (no hardcoded paths):
 
-| Variable | Default | Description |
-|---|---|---|
-| `SHDEPS_CONF_DIR` | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded) |
-| `SHDEPS_HOOKS_DIR` | `<conf_dir>/hooks.d` | Post-install hooks |
-| `SHDEPS_STATE_DIR` | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps` | Cache/state dir |
-| `SHDEPS_FORCE` | `0` | Bypass TTL cache |
-| `SHDEPS_REINSTALL` | `0` | Force reinstall all deps |
-| `SHDEPS_QUIET` | `0` | Suppress interactive prompts |
-| `SHDEPS_REMOTE_TTL` | `3600` | Cache TTL in seconds |
-| `SHDEPS_GIT_DEV_DIR` | `~/git` | Dev clone directory for the `github:repo` method |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share` | Base directory for `github:*`, `cargo`, `go`, and `uv` installs (each dep lives in `<dir>/<name>/`) |
-| `SHDEPS_BIN_DIR` | `~/.local/bin` | Directory for binary symlinks |
-| `SHDEPS_LOG_LEVEL` | `1` | Logging: 0=quiet, 1=normal, 2=verbose |
+| Variable             | Default                                            | Description                                                                                                |
+| -------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `SHDEPS_CONF_DIR`    | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded)                                                               |
+| `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                               | Post-install hooks                                                                                         |
+| `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`     | Cache/state dir                                                                                            |
+| `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache                                                                                           |
+| `SHDEPS_REINSTALL`   | `0`                                                | Force reinstall all deps                                                                                   |
+| `SHDEPS_QUIET`       | `0`                                                | Suppress interactive prompts                                                                               |
+| `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                                       |
+| `SHDEPS_GIT_DEV_DIR` | `~/git`                                            | Dev clone directory for the `github:repo` method                                                           |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github:*`, `cargo`, `go`, `uv`, and `npm` installs (each dep lives in `<dir>/<name>/`) |
+| `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                                              |
+| `SHDEPS_LOG_LEVEL`   | `1`                                                | Logging: 0=quiet, 1=normal, 2=verbose                                                                      |
 
 ## Config File Format
 
@@ -64,7 +64,7 @@ openai/codex        github:release   -                -                        h
 dust                pkg              -                -                        os:macos
 ```
 
-Methods: `pkg` (system package manager), `github:repo` (GitHub clone), `github:release` (GitHub release binary), `cargo` (Rust crate), `go` (Go module), `uv` (Python CLI tool), `custom` (hook-only).
+Methods: `pkg` (system package manager), `github:repo` (GitHub clone), `github:release` (GitHub release binary), `cargo` (Rust crate), `go` (Go module), `uv` (Python CLI tool), `npm` (Node.js package), `custom` (hook-only).
 Fields are ordered most-used to least-used. For `github:repo`/`github:release`, the `owner/repo` is the `name` field. For `go`, the full module path (e.g. `github.com/junegunn/fzf`) is the `name`. `cmd` supports `mgr:name` qualifiers (e.g., `apt:batcat`). `aliases` holds per-manager package name overrides for `pkg` deps. `filter` uses `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:!wsl`).
 
 ## State Tracking
@@ -80,15 +80,15 @@ prints an orphan notice. Run `shdeps prune` to remove orphaned artifacts.
 
 shdeps auto-discovers man pages and shell completions from `github`
 installs and symlinks them to XDG user-local directories. `cargo`, `go`,
-and `uv` installs produce single binaries only — users should generate
+`uv`, and `npm` installs produce single binaries only — users should generate
 extras from the tool itself in a `post()` hook:
 
-| Type | Target | Auto-discovered? |
-|------|--------|-----------------|
-| Man pages | `~/.local/share/man/man<N>/` | No — needs `MANPATH` |
-| Bash completions | `~/.local/share/bash-completion/completions/` | Yes |
-| Zsh completions | `~/.local/share/zsh/site-functions/` | No — needs `fpath` |
-| Fish completions | `~/.local/share/fish/vendor_completions.d/` | Yes |
+| Type             | Target                                        | Auto-discovered?     |
+| ---------------- | --------------------------------------------- | -------------------- |
+| Man pages        | `~/.local/share/man/man<N>/`                  | No — needs `MANPATH` |
+| Bash completions | `~/.local/share/bash-completion/completions/` | Yes                  |
+| Zsh completions  | `~/.local/share/zsh/site-functions/`          | No — needs `fpath`   |
+| Fish completions | `~/.local/share/fish/vendor_completions.d/`   | Yes                  |
 
 Discovery uses four pattern arrays (`_SHDEPS_MAN_PATTERNS`, `_SHDEPS_BASH_COMP_PATTERNS`,
 `_SHDEPS_ZSH_COMP_PATTERNS`, `_SHDEPS_FISH_COMP_PATTERNS`) defined near the top of
@@ -124,6 +124,7 @@ and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
 ## Testing
 
 Run the test suite:
+
 ```bash
 ./test/shdeps-test
 ```

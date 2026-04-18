@@ -14,7 +14,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 ## Features
 
 - **Declarative config** — one line per dependency in `*.conf` files
-- **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), or fully custom hooks
+- **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), Node.js CLI tools (`npm install -g`), or fully custom hooks
 - **Cross-platform** — Linux, macOS, WSL with `os:` and `host:` filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
@@ -72,7 +72,7 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 | Field     | Required | Description                                                                                                                                 |
 | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`    | yes      | Dependency name (used for hooks, logging, tracking). For `github:repo`/`github:release`: GitHub `owner/repo`. For `go`: full module path.   |
-| `method`  | yes      | Install method: `pkg`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, or `custom`                                                    |
+| `method`  | yes      | Install method: `pkg`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, `npm`, or `custom`                                             |
 | `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` qualifiers for platform-specific command names (e.g., `apt:batcat`). |
 | `aliases` | no       | For `pkg`: per-manager package name overrides (`apt:fd-find,dnf:fd-find`). Use `NONE` to skip a specific manager (e.g., `brew:NONE`).       |
 | `filter`  | no       | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:linux,host:nas`, `os:!wsl`).                |
@@ -81,19 +81,19 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 
 ### Environment Variables
 
-| Variable             | Default                                            | Description                                                                          |
-| -------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `SHDEPS_CONF_DIR`    | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded)                                         |
-| `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                               | Post-install hooks directory                                                         |
-| `SHDEPS_STATE_DIR`   | `$XDG_STATE_HOME/shdeps`                           | Cache/state directory                                                                |
-| `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache (check for updates now)                                             |
-| `SHDEPS_REINSTALL`   | `0`                                                | Force reinstall all deps                                                             |
-| `SHDEPS_QUIET`       | `0`                                                | Suppress interactive prompts                                                         |
-| `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                 |
-| `SHDEPS_GIT_DEV_DIR` | `~/git`                                            | Dev clone directory for `github:repo` deps (prefers `<dir>/<repo>` over fresh clone) |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github:*`, `cargo`, `go`, and `uv` installs (each dep lives in `<dir>/<name>/`) |
-| `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                        |
-| `SHDEPS_LOG_LEVEL`   | `1`                                                | 0=quiet, 1=normal, 2=verbose                                                         |
+| Variable             | Default                                            | Description                                                                                                |
+| -------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `SHDEPS_CONF_DIR`    | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded)                                                               |
+| `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                               | Post-install hooks directory                                                                               |
+| `SHDEPS_STATE_DIR`   | `$XDG_STATE_HOME/shdeps`                           | Cache/state directory                                                                                      |
+| `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache (check for updates now)                                                                   |
+| `SHDEPS_REINSTALL`   | `0`                                                | Force reinstall all deps                                                                                   |
+| `SHDEPS_QUIET`       | `0`                                                | Suppress interactive prompts                                                                               |
+| `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                                       |
+| `SHDEPS_GIT_DEV_DIR` | `~/git`                                            | Dev clone directory for `github:repo` deps (prefers `<dir>/<repo>` over fresh clone)                       |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github:*`, `cargo`, `go`, `uv`, and `npm` installs (each dep lives in `<dir>/<name>/`) |
+| `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                                              |
+| `SHDEPS_LOG_LEVEL`   | `1`                                                | 0=quiet, 1=normal, 2=verbose                                                                               |
 
 ## Install Methods
 
@@ -194,7 +194,7 @@ Place hook files in `<hooks_dir>/<name>.sh`. For methods whose `name` contains p
 - **`uninstall(name)`** — reverse what `install()` or `post()` created. Optional. Called by `shdeps prune` when removing an orphaned dep (any method). For custom deps, this is the only cleanup. For other methods, runs before the built-in cleanup.
 - **`post(name)`** — optional post-install setup.
 
-**Non-custom dep hooks** (`pkg`, `github:repo`, `github:release`, `cargo`, `go`, `uv`):
+**Non-custom dep hooks** (`pkg`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, `npm`):
 
 - **`post(name)`** — runs after shdeps installs/updates the dep (symlinking, config, etc.).
 
@@ -202,7 +202,7 @@ All [public API functions](#public-api) are available to hook authors. See [exam
 
 ## Man Pages & Completions
 
-shdeps automatically discovers man pages and shell completions bundled inside `github` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking. `cargo`, `go`, and `uv` deps install single binaries without bundled extras — generate completions from the tool itself in a `post()` hook (see [examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh)).
+shdeps automatically discovers man pages and shell completions bundled inside `github` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking. `cargo`, `go`, `uv`, and `npm` deps install single binaries without bundled extras — generate completions from the tool itself in a `post()` hook (see [examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh)).
 
 **What gets linked:**
 
