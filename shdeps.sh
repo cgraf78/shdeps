@@ -2113,11 +2113,11 @@ _shdeps_install_dep() {
   github:repo)
     local _git_install_dir
     _git_install_dir="$(_shdeps_install_dir)/$_name"
-    _shdeps_github_repo_install "$_name" "$_name" "$_git_install_dir"
+    _shdeps_github_repo_install "$_name" "$_name" "$_git_install_dir" || return 1
     _shdeps_manifest_upsert "$_name" "github:repo" "$_cmd" "$_git_install_dir"
     ;;
   github:release)
-    _shdeps_github_release_install "$_name" "$_cmd"
+    _shdeps_github_release_install "$_name" "$_cmd" || return 1
     _shdeps_manifest_upsert "$_name" "github:release" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
     ;;
   cargo)
