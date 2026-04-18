@@ -22,6 +22,7 @@
 #   SHDEPS_INSTALL_DIR  Base dir for github installs (default: ~/.local/share)
 #   SHDEPS_BIN_DIR      Directory for binary symlinks (default: ~/.local/bin)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
+#   SHDEPS_AUTO_EPEL    Auto-install epel-release on dnf (default: 0)
 
 SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
 
@@ -720,6 +721,23 @@ _shdeps_pkg_available() {
   esac
 }
 
+# Auto-enable EPEL repo on dnf systems when SHDEPS_AUTO_EPEL=1.
+# EPEL (Extra Packages for Enterprise Linux) adds many common dev tools
+# not in base CentOS/RHEL repos. Off by default — opt-in via env var
+# so shdeps never adds a package source without explicit consent.
+_shdeps_maybe_enable_epel() {
+  [[ "${SHDEPS_AUTO_EPEL:-0}" -eq 1 ]] || return 0
+  [[ "$_SHDEPS_PKG_MGR" == "dnf" ]] || return 0
+  rpm -q epel-release &>/dev/null && return 0
+
+  _shdeps_log_status "  enabling EPEL repo (SHDEPS_AUTO_EPEL=1)..."
+  sudo dnf install -y epel-release &>/dev/null || {
+    _shdeps_warn "  warning: failed to enable EPEL"
+    return 1
+  }
+  _shdeps_log_dim "  EPEL repo enabled"
+}
+
 # Refresh package manager metadata cache once per update run.
 # Ensures _shdeps_pkg_available sees all available packages, even on
 # a fresh machine where the cache is empty.
@@ -733,6 +751,8 @@ _shdeps_pkg_refresh_metadata() {
     _SHDEPS_PKG_CACHE_REFRESHED=1
     return 0
   fi
+
+  _shdeps_maybe_enable_epel
 
   _shdeps_log_status "  refreshing $_SHDEPS_PKG_MGR package metadata..."
   case "$_SHDEPS_PKG_MGR" in
@@ -757,6 +777,10 @@ _shdeps_pkg_queue() {
   _shdeps_log_status "  $name: checking ${_SHDEPS_PKG_MGR} repos..."
   if ! _shdeps_pkg_available "$resolved"; then
     _shdeps_warn "  warning: $name not available in $_SHDEPS_PKG_MGR repos — skipping"
+    if [[ "$_SHDEPS_PKG_MGR" == "dnf" && "${SHDEPS_AUTO_EPEL:-0}" -ne 1 && "${_SHDEPS_EPEL_HINT_SHOWN:-0}" -ne 1 ]]; then
+      _shdeps_warn "  hint: many missing dnf packages are in EPEL — set SHDEPS_AUTO_EPEL=1"
+      _SHDEPS_EPEL_HINT_SHOWN=1
+    fi
     return 0
   fi
   _SHDEPS_PKG_BATCH+=("$resolved")
