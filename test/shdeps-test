@@ -2507,7 +2507,7 @@ _assert_dir_missing "prune owner/repo: install dir removed" "$_prune_slash_dir"
 _assert_file_missing "prune owner/repo: bin symlink removed" "$HOME/.local/bin/prune-slash-test"
 _assert_file_missing "prune owner/repo: stamp removed" "$_prune_slash_state/testowner/prune-slash-test.repo.stamp"
 _shdeps_manifest_read
-_assert_eq "prune owner/repo: manifest cleared" "" "${_SHDEPS_MANIFEST[testowner/prune-slash-test]:-}"
+_assert_eq "prune owner/repo: manifest cleared" "" "${_SHDEPS_MANIFEST["testowner/prune-slash-test"]:-}"
 
 # custom with uninstall() hook
 _prune_state4=$(_tmpdir)
@@ -2823,7 +2823,7 @@ _assert_symlink "go: bin symlink created" "$HOME/.local/bin/fzf"
 _shdeps_manifest_read
 _assert_contains "go: manifest records go method" \
   "go|fzf|$HOME/.local/share/github.com/junegunn/fzf/bin/fzf" \
-  "${_SHDEPS_MANIFEST[github.com/junegunn/fzf]:-}"
+  "${_SHDEPS_MANIFEST["github.com/junegunn/fzf"]:-}"
 
 # TTL-fresh re-run → no new install invocation
 : > "$_go_log"
@@ -3311,7 +3311,7 @@ integ_output=$(cat "$INTEG_LOG")
 _assert_exit "integ github failure: update exits 1" 1 "$rc"
 _assert_contains "integ github failure: later dep still runs" "custom-b-after-github-fail" "$integ_output"
 _shdeps_manifest_read
-_assert_eq "integ github failure: failed dep not in manifest" "" "${_SHDEPS_MANIFEST[broken/tool]:-}"
+_assert_eq "integ github failure: failed dep not in manifest" "" "${_SHDEPS_MANIFEST["broken/tool"]:-}"
 _assert_eq "integ github failure: later dep in manifest" "custom|custom-b|" "${_SHDEPS_MANIFEST[custom-b]:-}"
 
 # --- Integration: github repo failure still runs later deps, then exits 1 ---
@@ -3340,7 +3340,7 @@ integ_output=$(cat "$INTEG_LOG")
 _assert_exit "integ github repo failure: update exits 1" 1 "$rc"
 _assert_contains "integ github repo failure: later dep still runs" "custom-b-after-git-fail" "$integ_output"
 _shdeps_manifest_read
-_assert_eq "integ github repo failure: failed dep not in manifest" "" "${_SHDEPS_MANIFEST[broken/repo]:-}"
+_assert_eq "integ github repo failure: failed dep not in manifest" "" "${_SHDEPS_MANIFEST["broken/repo"]:-}"
 _assert_eq "integ github repo failure: later dep in manifest" "custom|custom-b|" "${_SHDEPS_MANIFEST[custom-b]:-}"
 
 # --- shdeps_version ---
