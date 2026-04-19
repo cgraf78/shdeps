@@ -93,12 +93,12 @@ _install() {
   local bin_dir
   bin_dir=$(dirname "$SHDEPS_BIN")
   case ":$PATH:" in
-  *":${bin_dir}:"*) ;;
-  *)
-    _info ""
-    _info "Add $bin_dir to your PATH if it isn't already:"
-    _info "  export PATH=\"${bin_dir}:\$PATH\""
-    ;;
+    *":${bin_dir}:"*) ;;
+    *)
+      _info ""
+      _info "Add $bin_dir to your PATH if it isn't already:"
+      _info "  export PATH=\"${bin_dir}:\$PATH\""
+      ;;
   esac
 }
 
@@ -189,12 +189,12 @@ _uninstall() {
 # ---------------------------------------------------------------------------
 
 case "${1:-}" in
---uninstall) _uninstall ;;
---bootstrap) _bootstrap ;;
-"") _install ;;
-*)
-  _error "unknown argument: $1"
-  _info "Usage: install.sh [--uninstall|--bootstrap]"
-  exit 2
-  ;;
+  --uninstall) _uninstall ;;
+  --bootstrap) _bootstrap ;;
+  "") _install ;;
+  *)
+    _error "unknown argument: $1"
+    _info "Usage: install.sh [--uninstall|--bootstrap]"
+    exit 2
+    ;;
 esac

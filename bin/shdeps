@@ -126,64 +126,64 @@ cmd_list() {
 
     local status="missing" details=""
     case "$_method" in
-    pkg)
-      local resolved
-      resolved=$(_shdeps_resolve_override "$_name" "$_aliases")
-      if [[ "$resolved" == "NONE" ]]; then
-        status="skipped"
-        details="(pkg manager)"
-      elif _shdeps_exists "$_cmd" "$resolved"; then
-        status="installed"
-        local ver=""
-        ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
-        if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
-          ver="$REPLY"
-        fi
-        [[ -n "$ver" ]] && details="$ver"
-      fi
-      ;;
-    github:repo)
-      if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
-        status="installed"
-        local ver
-        ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
-        [[ -n "$ver" ]] && details="$ver"
-      fi
-      ;;
-    github:release | cargo | go | uv | npm)
-      # Manifest entries are stored as "method|cmd|install_path"; ##*|
-      # extracts the trailing install_path field. Empty manifest entry
-      # → "missing" (install hasn't run yet).
-      local bin_path=""
-      if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
-        bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"
-      fi
-      if [[ -n "$bin_path" && -x "$bin_path" ]]; then
-        status="installed"
-        local ver
-        ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
-        [[ -n "$ver" ]] && details="$ver"
-      fi
-      ;;
-    custom)
-      local hooks_dir hook_file
-      hooks_dir=$(_shdeps_hooks_dir)
-      hook_file="$hooks_dir/$_name.sh"
-      if [[ -f "$hook_file" ]]; then
-        unset -f exists version install post uninstall 2>/dev/null
-        # shellcheck source=/dev/null
-        . "$hook_file" 2>/dev/null
-        if declare -f exists &>/dev/null && exists "$_name"; then
+      pkg)
+        local resolved
+        resolved=$(_shdeps_resolve_override "$_name" "$_aliases")
+        if [[ "$resolved" == "NONE" ]]; then
+          status="skipped"
+          details="(pkg manager)"
+        elif _shdeps_exists "$_cmd" "$resolved"; then
           status="installed"
-          if declare -f version &>/dev/null; then
-            local ver
-            ver=$(version "$_name" 2>/dev/null) || ver=""
-            [[ -n "$ver" ]] && details="$ver"
+          local ver=""
+          ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+          if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
+            ver="$REPLY"
           fi
+          [[ -n "$ver" ]] && details="$ver"
         fi
-        unset -f exists version install post uninstall 2>/dev/null
-      fi
-      ;;
+        ;;
+      github:repo)
+        if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
+          status="installed"
+          local ver
+          ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
+          [[ -n "$ver" ]] && details="$ver"
+        fi
+        ;;
+      github:release | cargo | go | uv | npm)
+        # Manifest entries are stored as "method|cmd|install_path"; ##*|
+        # extracts the trailing install_path field. Empty manifest entry
+        # → "missing" (install hasn't run yet).
+        local bin_path=""
+        if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
+          bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"
+        fi
+        if [[ -n "$bin_path" && -x "$bin_path" ]]; then
+          status="installed"
+          local ver
+          ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+          [[ -n "$ver" ]] && details="$ver"
+        fi
+        ;;
+      custom)
+        local hooks_dir hook_file
+        hooks_dir=$(_shdeps_hooks_dir)
+        hook_file="$hooks_dir/$_name.sh"
+        if [[ -f "$hook_file" ]]; then
+          unset -f exists version install post uninstall 2>/dev/null
+          # shellcheck source=/dev/null
+          . "$hook_file" 2>/dev/null
+          if declare -f exists &>/dev/null && exists "$_name"; then
+            status="installed"
+            if declare -f version &>/dev/null; then
+              local ver
+              ver=$(version "$_name" 2>/dev/null) || ver=""
+              [[ -n "$ver" ]] && details="$ver"
+            fi
+          fi
+          unset -f exists version install post uninstall 2>/dev/null
+        fi
+        ;;
     esac
 
     printf "%-${_ncol}s %-${_mcol}s %-12s %s\n" "$_name" "$_method" "$status" "$details"
@@ -221,62 +221,62 @@ cmd_check() {
     fi
 
     case "$_method" in
-    pkg)
-      local resolved
-      resolved=$(_shdeps_resolve_override "$_name" "$_aliases")
-      if [[ "$resolved" == "NONE" ]]; then
-        echo "$_name: skipped (pkg manager)"
-        return 0
-      elif _shdeps_exists "$_cmd" "$resolved"; then
-        local ver=""
-        ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
-        if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
-          ver="$REPLY"
-        fi
-        echo "$_name: installed${ver:+ ($ver)}"
-        return 0
-      fi
-      ;;
-    github:repo)
-      if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
-        local ver
-        ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
-        echo "$_name: installed${ver:+ ($ver)}"
-        return 0
-      fi
-      ;;
-    github:release | cargo | go | uv | npm)
-      local bin_path=""
-      if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
-        bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"
-      fi
-      if [[ -n "$bin_path" && -x "$bin_path" ]]; then
-        local ver
-        ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
-        echo "$_name: installed${ver:+ ($ver)}"
-        return 0
-      fi
-      ;;
-    custom)
-      local hooks_dir hook_file
-      hooks_dir=$(_shdeps_hooks_dir)
-      hook_file="$hooks_dir/$_name.sh"
-      if [[ -f "$hook_file" ]]; then
-        unset -f exists version install post uninstall 2>/dev/null
-        # shellcheck source=/dev/null
-        . "$hook_file" 2>/dev/null
-        if declare -f exists &>/dev/null && exists "$_name"; then
+      pkg)
+        local resolved
+        resolved=$(_shdeps_resolve_override "$_name" "$_aliases")
+        if [[ "$resolved" == "NONE" ]]; then
+          echo "$_name: skipped (pkg manager)"
+          return 0
+        elif _shdeps_exists "$_cmd" "$resolved"; then
           local ver=""
-          if declare -f version &>/dev/null; then
-            ver=$(version "$_name" 2>/dev/null) || ver=""
+          ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+          if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
+            ver="$REPLY"
           fi
           echo "$_name: installed${ver:+ ($ver)}"
-          unset -f exists version install post uninstall 2>/dev/null
           return 0
         fi
-        unset -f exists version install post uninstall 2>/dev/null
-      fi
-      ;;
+        ;;
+      github:repo)
+        if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
+          local ver
+          ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
+          echo "$_name: installed${ver:+ ($ver)}"
+          return 0
+        fi
+        ;;
+      github:release | cargo | go | uv | npm)
+        local bin_path=""
+        if [[ -n "${_SHDEPS_MANIFEST[$_name]+x}" ]]; then
+          bin_path="${_SHDEPS_MANIFEST[$_name]##*|}"
+        fi
+        if [[ -n "$bin_path" && -x "$bin_path" ]]; then
+          local ver
+          ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+          echo "$_name: installed${ver:+ ($ver)}"
+          return 0
+        fi
+        ;;
+      custom)
+        local hooks_dir hook_file
+        hooks_dir=$(_shdeps_hooks_dir)
+        hook_file="$hooks_dir/$_name.sh"
+        if [[ -f "$hook_file" ]]; then
+          unset -f exists version install post uninstall 2>/dev/null
+          # shellcheck source=/dev/null
+          . "$hook_file" 2>/dev/null
+          if declare -f exists &>/dev/null && exists "$_name"; then
+            local ver=""
+            if declare -f version &>/dev/null; then
+              ver=$(version "$_name" 2>/dev/null) || ver=""
+            fi
+            echo "$_name: installed${ver:+ ($ver)}"
+            unset -f exists version install post uninstall 2>/dev/null
+            return 0
+          fi
+          unset -f exists version install post uninstall 2>/dev/null
+        fi
+        ;;
     esac
 
     echo "$_name: not installed"
@@ -404,8 +404,8 @@ cmd_migrate() {
       # Only target github/git/binary entries with bare names (no slash)
       [[ "$m_name" != */* ]] || continue
       case "$m_method" in
-      github:repo | github:release | git | binary) ;;
-      *) continue ;;
+        github:repo | github:release | git | binary) ;;
+        *) continue ;;
       esac
       # If this bare name isn't in the current config, it's stale
       [[ -z "${config_names[$m_name]+x}" ]] || continue
@@ -453,43 +453,43 @@ main() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-    -c | --config)
-      [[ $# -lt 2 ]] && {
-        echo "error: --config requires an argument" >&2
+      -c | --config)
+        [[ $# -lt 2 ]] && {
+          echo "error: --config requires an argument" >&2
+          exit 2
+        }
+        config_path="$2"
+        shift 2
+        ;;
+      -f | --force)
+        export SHDEPS_FORCE=1
+        shift
+        ;;
+      -R | --reinstall)
+        export SHDEPS_FORCE=1
+        export SHDEPS_REINSTALL=1
+        shift
+        ;;
+      -q | --quiet)
+        export SHDEPS_QUIET=1
+        shift
+        ;;
+      -v | --verbose)
+        export SHDEPS_LOG_LEVEL=2
+        shift
+        ;;
+      -h | --help | help)
+        usage
+        exit 0
+        ;;
+      -*)
+        echo "error: unknown option '$1'" >&2
+        echo "Run 'shdeps help' for usage." >&2
         exit 2
-      }
-      config_path="$2"
-      shift 2
-      ;;
-    -f | --force)
-      export SHDEPS_FORCE=1
-      shift
-      ;;
-    -R | --reinstall)
-      export SHDEPS_FORCE=1
-      export SHDEPS_REINSTALL=1
-      shift
-      ;;
-    -q | --quiet)
-      export SHDEPS_QUIET=1
-      shift
-      ;;
-    -v | --verbose)
-      export SHDEPS_LOG_LEVEL=2
-      shift
-      ;;
-    -h | --help | help)
-      usage
-      exit 0
-      ;;
-    -*)
-      echo "error: unknown option '$1'" >&2
-      echo "Run 'shdeps help' for usage." >&2
-      exit 2
-      ;;
-    *)
-      break
-      ;;
+        ;;
+      *)
+        break
+        ;;
     esac
   done
 
@@ -516,19 +516,19 @@ main() {
   shift || true
 
   case "$cmd" in
-  update) cmd_update "$@" ;;
-  self-update) cmd_self_update "$@" ;;
-  list) cmd_list "$@" ;;
-  check) cmd_check "$@" ;;
-  prune) cmd_prune "$@" ;;
-  migrate) cmd_migrate "$@" ;;
-  version) shdeps_version ;;
-  help) usage ;;
-  *)
-    echo "error: unknown command '$cmd'" >&2
-    echo "Run 'shdeps help' for usage." >&2
-    exit 2
-    ;;
+    update) cmd_update "$@" ;;
+    self-update) cmd_self_update "$@" ;;
+    list) cmd_list "$@" ;;
+    check) cmd_check "$@" ;;
+    prune) cmd_prune "$@" ;;
+    migrate) cmd_migrate "$@" ;;
+    version) shdeps_version ;;
+    help) usage ;;
+    *)
+      echo "error: unknown command '$cmd'" >&2
+      echo "Run 'shdeps help' for usage." >&2
+      exit 2
+      ;;
   esac
 }
 

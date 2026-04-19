@@ -13,24 +13,24 @@ _shdeps() {
   local i
   for ((i = 1; i < cword; i++)); do
     case "${words[i]}" in
-    -c | --config)
-      ((i++))
-      ;;
-    -*)
-      ;;
-    *)
-      cmd="${words[i]}"
-      break
-      ;;
+      -c | --config)
+        ((i++))
+        ;;
+      -*)
+        ;;
+      *)
+        cmd="${words[i]}"
+        break
+        ;;
     esac
   done
 
   # Complete option arguments
   case "$prev" in
-  -c | --config)
-    _filedir -d
-    return
-    ;;
+    -c | --config)
+      _filedir -d
+      return
+      ;;
   esac
 
   # No subcommand yet — complete commands and global options
@@ -45,19 +45,19 @@ _shdeps() {
 
   # Subcommand-specific completions
   case "$cmd" in
-  check)
-    # Complete with dependency names from config files
-    local conf_dir="${SHDEPS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/shdeps}"
-    if [[ -d "$conf_dir" ]]; then
-      local names
-      names=$(grep -h '^[[:alpha:]]' "$conf_dir"/*.conf 2>/dev/null | awk '{print $1}')
-      COMPREPLY=($(compgen -W "$names" -- "$cur"))
-    fi
-    ;;
-  prune)
-    local prune_opts="-y --dry-run"
-    COMPREPLY=($(compgen -W "$prune_opts" -- "$cur"))
-    ;;
+    check)
+      # Complete with dependency names from config files
+      local conf_dir="${SHDEPS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/shdeps}"
+      if [[ -d "$conf_dir" ]]; then
+        local names
+        names=$(grep -h '^[[:alpha:]]' "$conf_dir"/*.conf 2>/dev/null | awk '{print $1}')
+        COMPREPLY=($(compgen -W "$names" -- "$cur"))
+      fi
+      ;;
+    prune)
+      local prune_opts="-y --dry-run"
+      COMPREPLY=($(compgen -W "$prune_opts" -- "$cur"))
+      ;;
   esac
 }
 

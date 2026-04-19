@@ -526,8 +526,8 @@ _shdeps_filter_match() {
   local IFS=','
   for token in $spec; do
     case "$token" in
-    os:*) platform_spec+="${platform_spec:+,}${token#os:}" ;;
-    host:*) host_spec+="${host_spec:+,}${token#host:}" ;;
+      os:*) platform_spec+="${platform_spec:+,}${token#os:}" ;;
+      host:*) host_spec+="${host_spec:+,}${token#host:}" ;;
     esac
   done
 
@@ -557,10 +557,10 @@ _shdeps_exists() {
   # Command not found (or empty) — try the package manager directly.
   if [[ -n "$name" ]]; then
     case "${_SHDEPS_PKG_MGR:-}" in
-    brew) brew list "$name" &>/dev/null && return 0 ;;
-    apt) dpkg -s "$name" &>/dev/null && return 0 ;;
-    dnf) rpm -q "$name" &>/dev/null && return 0 ;;
-    pacman) pacman -Q "$name" &>/dev/null && return 0 ;;
+      brew) brew list "$name" &>/dev/null && return 0 ;;
+      apt) dpkg -s "$name" &>/dev/null && return 0 ;;
+      dnf) rpm -q "$name" &>/dev/null && return 0 ;;
+      pacman) pacman -Q "$name" &>/dev/null && return 0 ;;
     esac
   fi
   return 1
@@ -624,26 +624,26 @@ _shdeps_pkg_versions_load() {
   declare -gA _SHDEPS_PKG_VERSIONS=()
   local name ver _
   case "${_SHDEPS_PKG_MGR:-}" in
-  brew)
-    while read -r name ver _; do
-      _SHDEPS_PKG_VERSIONS[$name]="$ver"
-    done < <(brew list --versions 2>/dev/null)
-    ;;
-  apt)
-    while IFS=$'\t' read -r name ver; do
-      _SHDEPS_PKG_VERSIONS[$name]="$ver"
-    done < <(dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null)
-    ;;
-  dnf)
-    while IFS=$'\t' read -r name ver; do
-      _SHDEPS_PKG_VERSIONS[$name]="$ver"
-    done < <(rpm -qa --qf '%{NAME}\t%{VERSION}\n' 2>/dev/null)
-    ;;
-  pacman)
-    while read -r name ver; do
-      _SHDEPS_PKG_VERSIONS[$name]="$ver"
-    done < <(pacman -Q 2>/dev/null)
-    ;;
+    brew)
+      while read -r name ver _; do
+        _SHDEPS_PKG_VERSIONS[$name]="$ver"
+      done < <(brew list --versions 2>/dev/null)
+      ;;
+    apt)
+      while IFS=$'\t' read -r name ver; do
+        _SHDEPS_PKG_VERSIONS[$name]="$ver"
+      done < <(dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null)
+      ;;
+    dnf)
+      while IFS=$'\t' read -r name ver; do
+        _SHDEPS_PKG_VERSIONS[$name]="$ver"
+      done < <(rpm -qa --qf '%{NAME}\t%{VERSION}\n' 2>/dev/null)
+      ;;
+    pacman)
+      while read -r name ver; do
+        _SHDEPS_PKG_VERSIONS[$name]="$ver"
+      done < <(pacman -Q 2>/dev/null)
+      ;;
   esac
   _SHDEPS_PKG_VERSIONS_LOADED=1
 }
@@ -713,11 +713,11 @@ _shdeps_short_name() {
 _shdeps_pkg_available() {
   local pkg="$1"
   case "$_SHDEPS_PKG_MGR" in
-  brew) brew info "$pkg" &>/dev/null ;;
-  apt) apt-cache show "$pkg" &>/dev/null ;;
-  dnf) dnf info "$pkg" &>/dev/null ;;
-  pacman) pacman -Si "$pkg" &>/dev/null ;;
-  *) return 0 ;;
+    brew) brew info "$pkg" &>/dev/null ;;
+    apt) apt-cache show "$pkg" &>/dev/null ;;
+    dnf) dnf info "$pkg" &>/dev/null ;;
+    pacman) pacman -Si "$pkg" &>/dev/null ;;
+    *) return 0 ;;
   esac
 }
 
@@ -756,9 +756,9 @@ _shdeps_pkg_refresh_metadata() {
 
   _shdeps_log_status "  refreshing $_SHDEPS_PKG_MGR package metadata..."
   case "$_SHDEPS_PKG_MGR" in
-  apt) sudo apt-get update -qq >/dev/null 2>&1 || true ;;
-  dnf) sudo dnf makecache -q &>/dev/null || true ;;
-  pacman) sudo pacman -Sy &>/dev/null || true ;;
+    apt) sudo apt-get update -qq >/dev/null 2>&1 || true ;;
+    dnf) sudo dnf makecache -q &>/dev/null || true ;;
+    pacman) sudo pacman -Sy &>/dev/null || true ;;
   esac
   _SHDEPS_PKG_CACHE_REFRESHED=1
   _shdeps_log_dim "  $_SHDEPS_PKG_MGR package metadata refreshed"
@@ -823,10 +823,10 @@ _shdeps_pkg_install_batch() {
   _shdeps_log_status "  ${_SHDEPS_PKG_MGR}: installing ${#_SHDEPS_PKG_BATCH[@]} packages..."
   # shellcheck disable=SC2024  # sudo output captured in user-owned log
   case "$_SHDEPS_PKG_MGR" in
-  brew) _shdeps_run_logged brew install "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
-  apt) _shdeps_run_logged sudo apt-get install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
-  dnf) _shdeps_run_logged sudo dnf install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
-  pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+    brew) _shdeps_run_logged brew install "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+    apt) _shdeps_run_logged sudo apt-get install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+    dnf) _shdeps_run_logged sudo dnf install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+    pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
   esac
   _shdeps_log_clear
 
@@ -844,10 +844,10 @@ _shdeps_pkg_install_batch() {
       _shdeps_log_status "  ${_SHDEPS_PKG_MGR}: installing $pkg..."
       # shellcheck disable=SC2024  # sudo output captured in user-owned log
       case "$_SHDEPS_PKG_MGR" in
-      brew) _shdeps_run_logged brew install "$pkg" || rc=$? ;;
-      apt) _shdeps_run_logged sudo apt-get install -y "$pkg" || rc=$? ;;
-      dnf) _shdeps_run_logged sudo dnf install -y "$pkg" || rc=$? ;;
-      pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "$pkg" || rc=$? ;;
+        brew) _shdeps_run_logged brew install "$pkg" || rc=$? ;;
+        apt) _shdeps_run_logged sudo apt-get install -y "$pkg" || rc=$? ;;
+        dnf) _shdeps_run_logged sudo dnf install -y "$pkg" || rc=$? ;;
+        pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "$pkg" || rc=$? ;;
       esac
       if [[ $rc -ne 0 ]]; then
         _shdeps_logfile_print "package manager for $pkg" "$log"
@@ -1051,52 +1051,52 @@ _shdeps_remove_dep() {
 
   # Built-in cleanup per method
   case "$method" in
-  pkg)
-    _shdeps_warn "  $name: pkg dep — remove manually via ${_SHDEPS_PKG_MGR:-system package manager}"
-    ;;
-  github:repo)
-    _shdeps_unlink_extras "$name"
-    if [[ -n "$install_path" ]]; then
-      # install_path may be absolute (current format) or relative to HOME (legacy manifest entries)
-      local rm_path="$install_path"
-      [[ "$rm_path" != /* ]] && rm_path="${HOME:?}/$rm_path"
-      rm -rf "$rm_path"
-    fi
-    rm -f "$(_shdeps_bin_dir)/$(_shdeps_short_name "$name")"
-    _shdeps_remove_stamps "$name"
-    _shdeps_log_ok "  $name removed"
-    ;;
-  github:release | cargo | go | uv | npm)
-    _shdeps_unlink_extras "$name"
-    rm -f "$(_shdeps_bin_dir)/$cmd"
-    local binary_install_dir
-    binary_install_dir="$(_shdeps_install_dir)/$name"
-    if [[ -d "$binary_install_dir" ]]; then
-      rm -rf "$binary_install_dir"
-    fi
-    # For nested names (e.g. go module paths like github.com/owner/repo),
-    # rmdir walks up and removes now-empty parent dirs. rmdir fails on
-    # non-empty dirs so siblings are left intact.
-    local parent base
-    parent=$(dirname "$binary_install_dir")
-    base=$(_shdeps_install_dir)
-    while [[ "$parent" != "$base" && "$parent" != / ]]; do
-      rmdir "$parent" 2>/dev/null || break
-      parent=$(dirname "$parent")
-    done
-    _shdeps_remove_stamps "$name"
-    _shdeps_log_ok "  $name removed"
-    ;;
-  custom)
-    if [[ $_had_uninstall -eq 1 ]]; then
+    pkg)
+      _shdeps_warn "  $name: pkg dep — remove manually via ${_SHDEPS_PKG_MGR:-system package manager}"
+      ;;
+    github:repo)
+      _shdeps_unlink_extras "$name"
+      if [[ -n "$install_path" ]]; then
+        # install_path may be absolute (current format) or relative to HOME (legacy manifest entries)
+        local rm_path="$install_path"
+        [[ "$rm_path" != /* ]] && rm_path="${HOME:?}/$rm_path"
+        rm -rf "$rm_path"
+      fi
+      rm -f "$(_shdeps_bin_dir)/$(_shdeps_short_name "$name")"
+      _shdeps_remove_stamps "$name"
       _shdeps_log_ok "  $name removed"
-    elif [[ ! -f "$hook_file" ]]; then
-      _shdeps_warn "  warning: $name hook file missing — manual cleanup may be needed"
-    else
-      _shdeps_warn "  warning: $name has no uninstall() hook — manual cleanup may be needed"
-    fi
-    _shdeps_remove_stamps "$name"
-    ;;
+      ;;
+    github:release | cargo | go | uv | npm)
+      _shdeps_unlink_extras "$name"
+      rm -f "$(_shdeps_bin_dir)/$cmd"
+      local binary_install_dir
+      binary_install_dir="$(_shdeps_install_dir)/$name"
+      if [[ -d "$binary_install_dir" ]]; then
+        rm -rf "$binary_install_dir"
+      fi
+      # For nested names (e.g. go module paths like github.com/owner/repo),
+      # rmdir walks up and removes now-empty parent dirs. rmdir fails on
+      # non-empty dirs so siblings are left intact.
+      local parent base
+      parent=$(dirname "$binary_install_dir")
+      base=$(_shdeps_install_dir)
+      while [[ "$parent" != "$base" && "$parent" != / ]]; do
+        rmdir "$parent" 2>/dev/null || break
+        parent=$(dirname "$parent")
+      done
+      _shdeps_remove_stamps "$name"
+      _shdeps_log_ok "  $name removed"
+      ;;
+    custom)
+      if [[ $_had_uninstall -eq 1 ]]; then
+        _shdeps_log_ok "  $name removed"
+      elif [[ ! -f "$hook_file" ]]; then
+        _shdeps_warn "  warning: $name hook file missing — manual cleanup may be needed"
+      else
+        _shdeps_warn "  warning: $name has no uninstall() hook — manual cleanup may be needed"
+      fi
+      _shdeps_remove_stamps "$name"
+      ;;
   esac
 }
 
@@ -1106,18 +1106,18 @@ _shdeps_prune() {
   local yes=0 dry_run=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-    -y)
-      yes=1
-      shift
-      ;;
-    --dry-run)
-      dry_run=1
-      shift
-      ;;
-    *)
-      _shdeps_warn "error: unknown prune option '$1'"
-      return 2
-      ;;
+      -y)
+        yes=1
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      *)
+        _shdeps_warn "error: unknown prune option '$1'"
+        return 2
+        ;;
     esac
   done
 
@@ -1569,17 +1569,17 @@ _shdeps_github_release_find_asset() {
   # Normalize OS names (projects use various conventions)
   local os_patterns=("$os")
   case "$os" in
-  darwin) os_patterns+=(macos apple osx) ;;
-  linux) os_patterns+=(linux) ;;
+    darwin) os_patterns+=(macos apple osx) ;;
+    linux) os_patterns+=(linux) ;;
   esac
 
   # Normalize arch names
   local arch_patterns=("$arch")
   case "$arch" in
-  x86_64) arch_patterns+=(amd64 x64) ;;
-  aarch64) arch_patterns+=(arm64) ;;
-  amd64) arch_patterns+=(x86_64 x64) ;;
-  arm64) arch_patterns+=(aarch64) ;;
+    x86_64) arch_patterns+=(amd64 x64) ;;
+    aarch64) arch_patterns+=(arm64) ;;
+    amd64) arch_patterns+=(x86_64 x64) ;;
+    arm64) arch_patterns+=(aarch64) ;;
   esac
 
   # Extensions to always skip (metadata, packages, installers)
@@ -2089,114 +2089,114 @@ _shdeps_install_dep() {
   _shdeps_filter_match "$_filter" || return 0
 
   case "$_method" in
-  pkg)
-    local resolved_pkg=""
-    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
-    if [[ "$resolved_pkg" == "NONE" ]]; then return 0; fi
-    if _shdeps_exists "$_cmd" "$resolved_pkg"; then
-      local ver=""
-      ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
-      if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved_pkg"; then
-        ver="$REPLY"
+    pkg)
+      local resolved_pkg=""
+      resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
+      if [[ "$resolved_pkg" == "NONE" ]]; then return 0; fi
+      if _shdeps_exists "$_cmd" "$resolved_pkg"; then
+        local ver=""
+        ver=$(_shdeps_dep_version "$_cmd" 2>/dev/null || true)
+        if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved_pkg"; then
+          ver="$REPLY"
+        fi
+        _shdeps_log "  $_name${ver:+ -- $ver}"
+        # Package exists but expected command missing — trigger post hook
+        if ! _shdeps_exists "$_cmd"; then
+          _SHDEPS_CHANGED[$_name]=1
+        fi
+        _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
+        return 0
       fi
-      _shdeps_log "  $_name${ver:+ -- $ver}"
-      # Package exists but expected command missing — trigger post hook
-      if ! _shdeps_exists "$_cmd"; then
-        _SHDEPS_CHANGED[$_name]=1
-      fi
+      _shdeps_pkg_queue "$_name" "$_aliases"
       _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
-      return 0
-    fi
-    _shdeps_pkg_queue "$_name" "$_aliases"
-    _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
-    ;;
-  github:repo)
-    local _git_install_dir
-    _git_install_dir="$(_shdeps_install_dir)/$_name"
-    _shdeps_github_repo_install "$_name" "$_name" "$_git_install_dir" || return 1
-    _shdeps_manifest_upsert "$_name" "github:repo" "$_cmd" "$_git_install_dir"
-    ;;
-  github:release)
-    _shdeps_github_release_install "$_name" "$_cmd" || return 1
-    _shdeps_manifest_upsert "$_name" "github:release" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
-    ;;
-  cargo)
-    local _cargo_install_dir
-    _cargo_install_dir="$(_shdeps_install_dir)/$_name"
-    local -a _cargo_argv=(cargo install --locked --root "$_cargo_install_dir" "$_name")
-    _shdeps_external_install "$_name" cargo "$_cmd" cargo _cargo_argv "--force" || return 1
-    _shdeps_manifest_upsert "$_name" cargo "$_cmd" "$_cargo_install_dir/bin/$_cmd"
-    ;;
-  go)
-    local _go_install_dir
-    _go_install_dir="$(_shdeps_install_dir)/$_name"
-    local -a _go_argv=(env "GOBIN=$_go_install_dir/bin" go install "$_name@latest")
-    _shdeps_external_install "$_name" go "$_cmd" go _go_argv "" || return 1
-    _shdeps_manifest_upsert "$_name" go "$_cmd" "$_go_install_dir/bin/$_cmd"
-    ;;
-  uv)
-    local _uv_install_dir
-    _uv_install_dir="$(_shdeps_install_dir)/$_name"
-    local -a _uv_argv=(
-      env "UV_TOOL_DIR=$_uv_install_dir/tools" "UV_TOOL_BIN_DIR=$_uv_install_dir/bin"
-      uv tool install "$_name"
-    )
-    _shdeps_external_install "$_name" uv "$_cmd" uv _uv_argv "--force" || return 1
-    _shdeps_manifest_upsert "$_name" uv "$_cmd" "$_uv_install_dir/bin/$_cmd"
-    ;;
-  npm)
-    local _npm_install_dir
-    _npm_install_dir="$(_shdeps_install_dir)/$_name"
-    local -a _npm_argv=(npm install -g --prefix "$_npm_install_dir" "$_name")
-    _shdeps_external_install "$_name" npm "$_cmd" npm _npm_argv "--force" || return 1
-    _shdeps_manifest_upsert "$_name" npm "$_cmd" "$_npm_install_dir/bin/$_cmd"
-    ;;
-  custom)
-    # Source hook file and use exists() to gate install().
-    local hooks_dir
-    hooks_dir=$(_shdeps_hooks_dir)
-    local hook_file="$hooks_dir/$_name.sh"
-    [[ -f "$hook_file" ]] || return 0
-    unset -f exists version install post uninstall 2>/dev/null
-    # shellcheck source=/dev/null
-    . "$hook_file" || {
-      _shdeps_warn "  warning: failed to source $hook_file"
-      return 0
-    }
-    if ! declare -f exists &>/dev/null; then
-      _shdeps_warn "  warning: $_name hook missing exists() — skipping"
+      ;;
+    github:repo)
+      local _git_install_dir
+      _git_install_dir="$(_shdeps_install_dir)/$_name"
+      _shdeps_github_repo_install "$_name" "$_name" "$_git_install_dir" || return 1
+      _shdeps_manifest_upsert "$_name" "github:repo" "$_cmd" "$_git_install_dir"
+      ;;
+    github:release)
+      _shdeps_github_release_install "$_name" "$_cmd" || return 1
+      _shdeps_manifest_upsert "$_name" "github:release" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
+      ;;
+    cargo)
+      local _cargo_install_dir
+      _cargo_install_dir="$(_shdeps_install_dir)/$_name"
+      local -a _cargo_argv=(cargo install --locked --root "$_cargo_install_dir" "$_name")
+      _shdeps_external_install "$_name" cargo "$_cmd" cargo _cargo_argv "--force" || return 1
+      _shdeps_manifest_upsert "$_name" cargo "$_cmd" "$_cargo_install_dir/bin/$_cmd"
+      ;;
+    go)
+      local _go_install_dir
+      _go_install_dir="$(_shdeps_install_dir)/$_name"
+      local -a _go_argv=(env "GOBIN=$_go_install_dir/bin" go install "$_name@latest")
+      _shdeps_external_install "$_name" go "$_cmd" go _go_argv "" || return 1
+      _shdeps_manifest_upsert "$_name" go "$_cmd" "$_go_install_dir/bin/$_cmd"
+      ;;
+    uv)
+      local _uv_install_dir
+      _uv_install_dir="$(_shdeps_install_dir)/$_name"
+      local -a _uv_argv=(
+        env "UV_TOOL_DIR=$_uv_install_dir/tools" "UV_TOOL_BIN_DIR=$_uv_install_dir/bin"
+        uv tool install "$_name"
+      )
+      _shdeps_external_install "$_name" uv "$_cmd" uv _uv_argv "--force" || return 1
+      _shdeps_manifest_upsert "$_name" uv "$_cmd" "$_uv_install_dir/bin/$_cmd"
+      ;;
+    npm)
+      local _npm_install_dir
+      _npm_install_dir="$(_shdeps_install_dir)/$_name"
+      local -a _npm_argv=(npm install -g --prefix "$_npm_install_dir" "$_name")
+      _shdeps_external_install "$_name" npm "$_cmd" npm _npm_argv "--force" || return 1
+      _shdeps_manifest_upsert "$_name" npm "$_cmd" "$_npm_install_dir/bin/$_cmd"
+      ;;
+    custom)
+      # Source hook file and use exists() to gate install().
+      local hooks_dir
+      hooks_dir=$(_shdeps_hooks_dir)
+      local hook_file="$hooks_dir/$_name.sh"
+      [[ -f "$hook_file" ]] || return 0
       unset -f exists version install post uninstall 2>/dev/null
-      return 0
-    fi
-    local _existed=0 ver=""
-    exists "$_name" && _existed=1
-    if [[ $_existed -eq 1 && "$(_shdeps_reinstall)" -ne 1 ]]; then
-      if declare -f version &>/dev/null; then
-        ver=$(version "$_name" 2>/dev/null) || ver=""
+      # shellcheck source=/dev/null
+      . "$hook_file" || {
+        _shdeps_warn "  warning: failed to source $hook_file"
+        return 0
+      }
+      if ! declare -f exists &>/dev/null; then
+        _shdeps_warn "  warning: $_name hook missing exists() — skipping"
+        unset -f exists version install post uninstall 2>/dev/null
+        return 0
       fi
-      _shdeps_log "  $_name${ver:+ -- $ver}"
-      unset -f exists version install post uninstall 2>/dev/null
-      _shdeps_manifest_upsert "$_name" "custom" "$_cmd" ""
-      return 0
-    fi
-    if declare -f install &>/dev/null; then
-      local action="added"
-      [[ $_existed -eq 1 ]] && action="reinstalled"
-      if install "$_name"; then
-        _SHDEPS_CHANGED[$_name]=1
+      local _existed=0 ver=""
+      exists "$_name" && _existed=1
+      if [[ $_existed -eq 1 && "$(_shdeps_reinstall)" -ne 1 ]]; then
         if declare -f version &>/dev/null; then
           ver=$(version "$_name" 2>/dev/null) || ver=""
         fi
-        _shdeps_log_ok "  $_name $action${ver:+ -- $ver}"
-        _shdeps_manifest_upsert "$_name" "custom" "$_cmd" ""
-      else
-        _shdeps_warn "  warning: $_name install failed"
+        _shdeps_log "  $_name${ver:+ -- $ver}"
         unset -f exists version install post uninstall 2>/dev/null
-        return 1
+        _shdeps_manifest_upsert "$_name" "custom" "$_cmd" ""
+        return 0
       fi
-    fi
-    unset -f exists version install post uninstall 2>/dev/null
-    ;;
+      if declare -f install &>/dev/null; then
+        local action="added"
+        [[ $_existed -eq 1 ]] && action="reinstalled"
+        if install "$_name"; then
+          _SHDEPS_CHANGED[$_name]=1
+          if declare -f version &>/dev/null; then
+            ver=$(version "$_name" 2>/dev/null) || ver=""
+          fi
+          _shdeps_log_ok "  $_name $action${ver:+ -- $ver}"
+          _shdeps_manifest_upsert "$_name" "custom" "$_cmd" ""
+        else
+          _shdeps_warn "  warning: $_name install failed"
+          unset -f exists version install post uninstall 2>/dev/null
+          return 1
+        fi
+      fi
+      unset -f exists version install post uninstall 2>/dev/null
+      ;;
   esac
 }
 
@@ -2335,8 +2335,8 @@ _shdeps_update() {
   local _bin_dir
   _bin_dir=$(_shdeps_bin_dir)
   case ":$PATH:" in
-  *":$_bin_dir:"*) ;;
-  *) export PATH="$_bin_dir:$PATH" ;;
+    *":$_bin_dir:"*) ;;
+    *) export PATH="$_bin_dir:$PATH" ;;
   esac
 
   _shdeps_load

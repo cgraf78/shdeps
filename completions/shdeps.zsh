@@ -36,21 +36,21 @@ _shdeps() {
     '*::arg:->args'
 
   case "$state" in
-  command)
-    _describe -t commands 'shdeps command' commands
-    ;;
-  args)
-    case "${words[1]}" in
-    check)
-      _arguments '1:dependency:_shdeps_dep_names'
+    command)
+      _describe -t commands 'shdeps command' commands
       ;;
-    prune)
-      _arguments \
-        '-y[Skip confirmation prompt]' \
-        '--dry-run[Show what would be removed]'
+    args)
+      case "${words[1]}" in
+        check)
+          _arguments '1:dependency:_shdeps_dep_names'
+          ;;
+        prune)
+          _arguments \
+            '-y[Skip confirmation prompt]' \
+            '--dry-run[Show what would be removed]'
+          ;;
+      esac
       ;;
-    esac
-    ;;
   esac
 }
 
