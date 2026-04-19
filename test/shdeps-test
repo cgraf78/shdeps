@@ -1358,7 +1358,7 @@ post() { echo "post-b" >> "$HOOK_LOG"; }
 HOOK
 
 : > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=([tool-a]=1)
+declare -gA _SHDEPS_CHANGED=(["tool-a"]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
 _assert_contains "post hooks: changed dep ran" "post-a" "$post_output"
@@ -1383,7 +1383,7 @@ exists() { return 0; }
 HOOK
 
 : > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=([tool-a]=1 [tool-b]=1)
+declare -gA _SHDEPS_CHANGED=(["tool-a"]=1 ["tool-b"]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
 _assert_contains "isolation: tool-a post ran" "post-a" "$post_output"
@@ -1400,7 +1400,7 @@ post() { echo "post-b-ok" >> "$HOOK_LOG"; }
 HOOK
 
 : > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=([tool-a]=1 [tool-b]=1)
+declare -gA _SHDEPS_CHANGED=(["tool-a"]=1 ["tool-b"]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
 _assert_contains "error handling: tool-b runs after tool-a fails" "post-b-ok" "$post_output"
@@ -1409,7 +1409,7 @@ _assert_contains "error handling: tool-b runs after tool-a fails" "post-b-ok" "$
 
 rm -f "$_hook_test_dir/tool-b.sh"
 : > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=([tool-b]=1)
+declare -gA _SHDEPS_CHANGED=(["tool-b"]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
 _assert_eq "missing hook file: silently skipped" "" "$post_output"
@@ -1449,7 +1449,7 @@ HOOK
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}"
 _assert_eq "exists=0: install not called" "" "$(cat "$HOOK_LOG")"
-_assert_eq "exists=0: not marked changed" "" "${_SHDEPS_CHANGED[present-tool]:-}"
+_assert_eq "exists=0: not marked changed" "" "${_SHDEPS_CHANGED["present-tool"]:-}"
 
 # --- exists() returns 1 → install called, marked "added" ---
 
@@ -1468,7 +1468,7 @@ HOOK
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}"
 _assert_contains "exists=1: install called" "install-ran" "$(cat "$HOOK_LOG")"
-_assert_eq "exists=1: marked changed" "1" "${_SHDEPS_CHANGED[missing-tool]:-0}"
+_assert_eq "exists=1: marked changed" "1" "${_SHDEPS_CHANGED["missing-tool"]:-0}"
 
 # --- exists() returns 0 + reinstall → install called, marked "reinstalled" ---
 
@@ -1489,7 +1489,7 @@ _shdeps_load
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}"
 _assert_contains "reinstall: install called" "reinstall-ran" "$(cat "$HOOK_LOG")"
-_assert_eq "reinstall: marked changed" "1" "${_SHDEPS_CHANGED[reinstall-tool]:-0}"
+_assert_eq "reinstall: marked changed" "1" "${_SHDEPS_CHANGED["reinstall-tool"]:-0}"
 
 SHDEPS_REINSTALL=0
 _source_shdeps "$SHDEPS_DIR"
@@ -1609,7 +1609,7 @@ post() { echo "post-name=$1" >> "$HOOK_LOG"; }
 HOOK
 
 : > "$HOOK_LOG"
-declare -gA _SHDEPS_CHANGED=([name-tool]=1)
+declare -gA _SHDEPS_CHANGED=(["name-tool"]=1)
 _shdeps_run_post_hooks
 _assert_contains "post: receives name as \$1" "post-name=name-tool" "$(cat "$HOOK_LOG")"
 
@@ -2264,8 +2264,8 @@ _assert_eq "upsert replace: no duplicates" "1" "$_mfst_count"
 
 # read populates associative array
 _shdeps_manifest_read
-_assert_eq "read: tool-a value" "github:repo|tool-a|.local/share/tool-a" "${_SHDEPS_MANIFEST[tool-a]:-}"
-_assert_eq "read: tool-b value" "github:release|tb|.local/bin/tb" "${_SHDEPS_MANIFEST[tool-b]:-}"
+_assert_eq "read: tool-a value" "github:repo|tool-a|.local/share/tool-a" "${_SHDEPS_MANIFEST["tool-a"]:-}"
+_assert_eq "read: tool-b value" "github:release|tb|.local/bin/tb" "${_SHDEPS_MANIFEST["tool-b"]:-}"
 
 # read missing file produces empty array
 _mfst_empty_state=$(_tmpdir)
@@ -2409,7 +2409,7 @@ _assert_file_missing "prune git: stamp removed" "$_prune_state/prune-git-test.re
 _assert_dir_exists "prune git: target dir preserved" "$_prune_git_target"
 # Manifest entry gone
 _shdeps_manifest_read
-_assert_eq "prune git: manifest cleared" "" "${_SHDEPS_MANIFEST[prune-git-test]:-}"
+_assert_eq "prune git: manifest cleared" "" "${_SHDEPS_MANIFEST["prune-git-test"]:-}"
 
 # git real dir removal
 _prune_state2=$(_tmpdir)
@@ -2622,7 +2622,7 @@ EOF
 _shdeps_prune --dry-run 2>/dev/null
 _assert_file_exists "prune dry-run: binary NOT removed" "$HOME/.local/bin/dryrun-cmd"
 _shdeps_manifest_read
-_assert_neq "prune dry-run: manifest NOT cleared" "" "${_SHDEPS_MANIFEST[dryrun-test]:-}"
+_assert_neq "prune dry-run: manifest NOT cleared" "" "${_SHDEPS_MANIFEST["dryrun-test"]:-}"
 
 # Clean up dry-run artifact
 rm -f "$HOME/.local/bin/dryrun-cmd"
@@ -2675,8 +2675,8 @@ HOOK
 
 shdeps_update
 _shdeps_manifest_read
-_assert_neq "integ manifest: custom dep recorded" "" "${_SHDEPS_MANIFEST[mfst-custom]:-}"
-_assert_contains "integ manifest: method is custom" "custom" "${_SHDEPS_MANIFEST[mfst-custom]:-}"
+_assert_neq "integ manifest: custom dep recorded" "" "${_SHDEPS_MANIFEST["mfst-custom"]:-}"
+_assert_contains "integ manifest: method is custom" "custom" "${_SHDEPS_MANIFEST["mfst-custom"]:-}"
 
 # ===========================================================================
 # Section 9c: cargo and go methods (end-to-end via mocked toolchains)
@@ -3312,7 +3312,7 @@ _assert_exit "integ github failure: update exits 1" 1 "$rc"
 _assert_contains "integ github failure: later dep still runs" "custom-b-after-github-fail" "$integ_output"
 _shdeps_manifest_read
 _assert_eq "integ github failure: failed dep not in manifest" "" "${_SHDEPS_MANIFEST["broken/tool"]:-}"
-_assert_eq "integ github failure: later dep in manifest" "custom|custom-b|" "${_SHDEPS_MANIFEST[custom-b]:-}"
+_assert_eq "integ github failure: later dep in manifest" "custom|custom-b|" "${_SHDEPS_MANIFEST["custom-b"]:-}"
 
 # --- Integration: github repo failure still runs later deps, then exits 1 ---
 
@@ -3341,7 +3341,7 @@ _assert_exit "integ github repo failure: update exits 1" 1 "$rc"
 _assert_contains "integ github repo failure: later dep still runs" "custom-b-after-git-fail" "$integ_output"
 _shdeps_manifest_read
 _assert_eq "integ github repo failure: failed dep not in manifest" "" "${_SHDEPS_MANIFEST["broken/repo"]:-}"
-_assert_eq "integ github repo failure: later dep in manifest" "custom|custom-b|" "${_SHDEPS_MANIFEST[custom-b]:-}"
+_assert_eq "integ github repo failure: later dep in manifest" "custom|custom-b|" "${_SHDEPS_MANIFEST["custom-b"]:-}"
 
 # --- shdeps_version ---
 
