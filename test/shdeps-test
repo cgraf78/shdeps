@@ -1997,6 +1997,7 @@ git -C "$_lc_clone" init -q
 git -C "$_lc_clone" commit --allow-empty -m "init" -q
 
 declare -gA _SHDEPS_CHANGED=()
+# shellcheck disable=SC2218  # provided by dynamic _source_shdeps in test helper
 _shdeps_github_repo_install "$_lc_name" "$_lc_name" "$_lc_install"
 
 # Should create a symlink to local clone
@@ -2021,6 +2022,7 @@ git -C "$_lc_clone2" init -q
 git -C "$_lc_clone2" commit --allow-empty -m "init" -q
 
 declare -gA _SHDEPS_CHANGED=()
+# shellcheck disable=SC2218  # provided by dynamic _source_shdeps in test helper
 SHDEPS_GIT_DEV_DIR="$_lc_custom_dev" \
   _shdeps_github_repo_install "$_lc_name2" "$_lc_name2" "$_lc_install2"
 
@@ -2055,6 +2057,7 @@ rm -rf "$_fc_staging"
 _assert_dir_missing "fresh clone pre: owner dir absent" "$_fc_install_base/testowner"
 
 declare -gA _SHDEPS_CHANGED=()
+# shellcheck disable=SC2218  # provided by dynamic _source_shdeps in test helper
 SHDEPS_FRESH_CLONE_TEST_REPO="$_fc_origin" \
   _shdeps_github_repo_install "$_fc_name" "$_fc_name" "$_fc_install" 2>/dev/null
 
@@ -3295,7 +3298,7 @@ install() { echo "custom-b-after-github-fail" >> "$INTEG_LOG"; return 0; }
 HOOK
 
 _source_shdeps "$SHDEPS_DIR"
-# shellcheck disable=SC2329  # test override is invoked indirectly by shdeps_update
+# shellcheck disable=SC2317,SC2329  # test override is invoked indirectly by shdeps_update
 _shdeps_github_release_install() {
   echo "github-release-failed:$1" >> "$INTEG_LOG"
   return 1
@@ -3324,7 +3327,7 @@ install() { echo "custom-b-after-git-fail" >> "$INTEG_LOG"; return 0; }
 HOOK
 
 _source_shdeps "$SHDEPS_DIR"
-# shellcheck disable=SC2329  # test override is invoked indirectly by shdeps_update
+# shellcheck disable=SC2317,SC2329  # test override is invoked indirectly by shdeps_update
 _shdeps_github_repo_install() {
   echo "github-repo-failed:$1" >> "$INTEG_LOG"
   return 1
