@@ -33,7 +33,10 @@ while IFS= read -r _tracked; do
   _f="$SHDEPS_DIR/$_tracked"
   [[ -f "$_f" && ! -L "$_f" ]] || continue
   case "$_tracked" in
-    *.sh | *.bash) _sc_files+=("$_f"); continue ;;
+    *.sh | *.bash)
+      _sc_files+=("$_f")
+      continue
+      ;;
   esac
   IFS= read -r _first <"$_f" || true
   case "$_first" in
@@ -277,10 +280,12 @@ _assert_exit "include: current os matches" 0 $?
 # --- Include list: other platform ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  rc=0; shdeps_platform_match "macos" || rc=$?
+  rc=0
+  shdeps_platform_match "macos" || rc=$?
   _assert_exit "include: other os rejected" 1 "$rc"
 else
-  rc=0; shdeps_platform_match "linux" || rc=$?
+  rc=0
+  shdeps_platform_match "linux" || rc=$?
   _assert_exit "include: other os rejected" 1 "$rc"
 fi
 
@@ -291,12 +296,14 @@ _assert_exit "include multi: linux,macos matches" 0 $?
 
 # --- Include list: none matching ---
 
-rc=0; shdeps_platform_match "freebsd,openbsd" || rc=$?
+rc=0
+shdeps_platform_match "freebsd,openbsd" || rc=$?
 _assert_exit "include: no match rejected" 1 "$rc"
 
 # --- Exclude list: excludes current ---
 
-rc=0; shdeps_platform_match "!${_current_os}" || rc=$?
+rc=0
+shdeps_platform_match "!${_current_os}" || rc=$?
 _assert_exit "exclude: current os excluded" 1 "$rc"
 
 # --- Exclude list: excludes other ---
@@ -321,7 +328,8 @@ fi
 
 # --- Mixed: exclude takes priority ---
 
-rc=0; shdeps_platform_match "${_current_os},!${_current_os}" || rc=$?
+rc=0
+shdeps_platform_match "${_current_os},!${_current_os}" || rc=$?
 _assert_exit "mixed: exclude overrides include" 1 "$rc"
 
 # --- Mixed: included and not excluded ---
@@ -337,10 +345,12 @@ fi
 # --- Mixed: not in include list ---
 
 if [[ "$_current_os" == "linux" ]]; then
-  rc=0; shdeps_platform_match "macos,!freebsd" || rc=$?
+  rc=0
+  shdeps_platform_match "macos,!freebsd" || rc=$?
   _assert_exit "mixed: not in include list" 1 "$rc"
 else
-  rc=0; shdeps_platform_match "linux,!freebsd" || rc=$?
+  rc=0
+  shdeps_platform_match "linux,!freebsd" || rc=$?
   _assert_exit "mixed: not in include list" 1 "$rc"
 fi
 
@@ -367,7 +377,8 @@ _assert_exit "include: current host matches" 0 $?
 
 # --- Include list: other host ---
 
-rc=0; shdeps_host_match "nonexistent-host-xyz" || rc=$?
+rc=0
+shdeps_host_match "nonexistent-host-xyz" || rc=$?
 _assert_exit "include: other host rejected" 1 "$rc"
 
 # --- Include list: multiple hosts ---
@@ -377,12 +388,14 @@ _assert_exit "include multi: current host in list matches" 0 $?
 
 # --- Include list: none matching ---
 
-rc=0; shdeps_host_match "host-a,host-b" || rc=$?
+rc=0
+shdeps_host_match "host-a,host-b" || rc=$?
 _assert_exit "include: no match rejected" 1 "$rc"
 
 # --- Exclude list: excludes current ---
 
-rc=0; shdeps_host_match "!${_current_host}" || rc=$?
+rc=0
+shdeps_host_match "!${_current_host}" || rc=$?
 _assert_exit "exclude: current host excluded" 1 "$rc"
 
 # --- Exclude list: excludes other ---
@@ -397,7 +410,8 @@ _assert_exit "exclude multi: none matching passes" 0 $?
 
 # --- Mixed: exclude takes priority ---
 
-rc=0; shdeps_host_match "${_current_host},!${_current_host}" || rc=$?
+rc=0
+shdeps_host_match "${_current_host},!${_current_host}" || rc=$?
 _assert_exit "mixed: exclude overrides include" 1 "$rc"
 
 # --- Mixed: included and not excluded ---
@@ -407,7 +421,8 @@ _assert_exit "mixed: included and not excluded" 0 $?
 
 # --- Mixed: not in include list ---
 
-rc=0; shdeps_host_match "other-host,!nonexistent" || rc=$?
+rc=0
+shdeps_host_match "other-host,!nonexistent" || rc=$?
 _assert_exit "mixed: not in include list" 1 "$rc"
 
 # --- Case-insensitive matching ---
@@ -416,7 +431,8 @@ _upper_host="${_current_host^^}"
 shdeps_host_match "$_upper_host"
 _assert_exit "case-insensitive: uppercase spec matches" 0 $?
 
-rc=0; shdeps_host_match "!${_upper_host}" || rc=$?
+rc=0
+shdeps_host_match "!${_upper_host}" || rc=$?
 _assert_exit "case-insensitive: uppercase exclude works" 1 "$rc"
 
 # ===========================================================================
@@ -477,12 +493,14 @@ echo "=== Filter matching ==="
 
 # --- Empty filter matches all ---
 
-rc=0; _shdeps_filter_match "" || rc=$?
+rc=0
+_shdeps_filter_match "" || rc=$?
 _assert_eq "filter: empty matches" "0" "$rc"
 
 # --- os: filter ---
 
-rc=0; _shdeps_filter_match "os:$(shdeps_platform)" || rc=$?
+rc=0
+_shdeps_filter_match "os:$(shdeps_platform)" || rc=$?
 _assert_eq "filter: current os matches" "0" "$rc"
 
 if [[ "$(shdeps_platform)" == "macos" ]]; then
@@ -491,7 +509,8 @@ else
   _other_os="macos"
 fi
 
-rc=0; _shdeps_filter_match "os:$_other_os" || rc=$?
+rc=0
+_shdeps_filter_match "os:$_other_os" || rc=$?
 _assert_eq "filter: other os rejected" "1" "$rc"
 
 # --- host: filter ---
@@ -499,35 +518,44 @@ _assert_eq "filter: other os rejected" "1" "$rc"
 _current_host=$(hostname -s 2>/dev/null || hostname 2>/dev/null)
 _current_host="${_current_host,,}"
 
-rc=0; _shdeps_filter_match "host:$_current_host" || rc=$?
+rc=0
+_shdeps_filter_match "host:$_current_host" || rc=$?
 _assert_eq "filter: current host matches" "0" "$rc"
 
-rc=0; _shdeps_filter_match "host:nonexistent-host-xyz" || rc=$?
+rc=0
+_shdeps_filter_match "host:nonexistent-host-xyz" || rc=$?
 _assert_eq "filter: other host rejected" "2" "$rc"
 
 # --- Mixed os + host ---
 
-rc=0; _shdeps_filter_match "os:$(shdeps_platform),host:$_current_host" || rc=$?
+rc=0
+_shdeps_filter_match "os:$(shdeps_platform),host:$_current_host" || rc=$?
 _assert_eq "filter: mixed both match" "0" "$rc"
 
-rc=0; _shdeps_filter_match "os:$_other_os,host:$_current_host" || rc=$?
+rc=0
+_shdeps_filter_match "os:$_other_os,host:$_current_host" || rc=$?
 _assert_eq "filter: mixed os fails" "1" "$rc"
 
-rc=0; _shdeps_filter_match "os:$(shdeps_platform),host:nonexistent-host-xyz" || rc=$?
+rc=0
+_shdeps_filter_match "os:$(shdeps_platform),host:nonexistent-host-xyz" || rc=$?
 _assert_eq "filter: mixed host fails" "2" "$rc"
 
 # --- Negation ---
 
-rc=0; _shdeps_filter_match "os:!$_other_os" || rc=$?
+rc=0
+_shdeps_filter_match "os:!$_other_os" || rc=$?
 _assert_eq "filter: negated other os passes" "0" "$rc"
 
-rc=0; _shdeps_filter_match "os:!$(shdeps_platform)" || rc=$?
+rc=0
+_shdeps_filter_match "os:!$(shdeps_platform)" || rc=$?
 _assert_eq "filter: negated current os fails" "1" "$rc"
 
-rc=0; _shdeps_filter_match "host:!nonexistent-host-xyz" || rc=$?
+rc=0
+_shdeps_filter_match "host:!nonexistent-host-xyz" || rc=$?
 _assert_eq "filter: negated other host passes" "0" "$rc"
 
-rc=0; _shdeps_filter_match "host:!$_current_host" || rc=$?
+rc=0
+_shdeps_filter_match "host:!$_current_host" || rc=$?
 _assert_eq "filter: negated current host fails" "2" "$rc"
 
 # ===========================================================================
@@ -733,10 +761,10 @@ echo "=== Binary asset matching ==="
 _test_os=$(uname -s | tr '[:upper:]' '[:lower:]')
 _test_arch=$(uname -m)
 case "$_test_arch" in
-  x86_64)  _test_arch_alt=amd64 ;;
+  x86_64) _test_arch_alt=amd64 ;;
   aarch64) _test_arch_alt=arm64 ;;
-  arm64)   _test_arch_alt=aarch64 ;;
-  *)       _test_arch_alt="$_test_arch" ;;
+  arm64) _test_arch_alt=aarch64 ;;
+  *) _test_arch_alt="$_test_arch" ;;
 esac
 _test_OS="$(uname -s)"
 
@@ -1017,217 +1045,217 @@ if [[ -z "$_true_bin" ]]; then
   for _i in $(seq 1 20); do _pass "extraction: skipped (no compiled binary)"; done
 else
 
-# Helper: create a tarball, run _shdeps_github_release_install_tarball, check result.
-# $1=desc $2=cmd $3=expected exit  remaining: executable file paths
-_test_tarball() {
-  local desc="$1" cmd="$2" expect_exit="$3"
-  shift 3
-  _test_tarball_with_extras "$desc" "$cmd" "$expect_exit" "" "$@"
-}
+  # Helper: create a tarball, run _shdeps_github_release_install_tarball, check result.
+  # $1=desc $2=cmd $3=expected exit  remaining: executable file paths
+  _test_tarball() {
+    local desc="$1" cmd="$2" expect_exit="$3"
+    shift 3
+    _test_tarball_with_extras "$desc" "$cmd" "$expect_exit" "" "$@"
+  }
 
-# $1=desc $2=cmd $3=expected exit $4=comma-separated non-executable files
-# remaining: executable file paths
-_test_tarball_with_extras() {
-  local desc="$1" cmd="$2" expect_exit="$3" extras="$4"
-  shift 4
-  local staging
-  staging=$(_tmpdir)
-  local f
-  for f in "$@"; do
-    mkdir -p "$staging/$(dirname "$f")"
-    cp "$_true_bin" "$staging/$f"
-  done
-  if [[ -n "$extras" ]]; then
-    local -a _extra_files
-    IFS=',' read -ra _extra_files <<< "$extras"
-    for f in "${_extra_files[@]}"; do
+  # $1=desc $2=cmd $3=expected exit $4=comma-separated non-executable files
+  # remaining: executable file paths
+  _test_tarball_with_extras() {
+    local desc="$1" cmd="$2" expect_exit="$3" extras="$4"
+    shift 4
+    local staging
+    staging=$(_tmpdir)
+    local f
+    for f in "$@"; do
       mkdir -p "$staging/$(dirname "$f")"
-      echo "placeholder" > "$staging/$f"
+      cp "$_true_bin" "$staging/$f"
     done
-  fi
-  local tarball
-  tarball=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
-  tar czf "$tarball" -C "$staging" .
-  local bin_path="$staging/output-bin"
-  local log=""
-  local rc=0
-  _shdeps_github_release_install_tarball "test-pkg" "$cmd" "$tarball" "$bin_path" "$log" >/dev/null 2>&1 || rc=$?
-  _assert_exit "$desc" "$expect_exit" "$rc"
-  if [[ "$expect_exit" -eq 0 ]]; then
-    if [[ -L "$bin_path" || -x "$bin_path" ]]; then
-      _pass "$desc: binary installed"
-    else
-      _fail "$desc: binary not installed at $bin_path"
+    if [[ -n "$extras" ]]; then
+      local -a _extra_files
+      IFS=',' read -ra _extra_files <<<"$extras"
+      for f in "${_extra_files[@]}"; do
+        mkdir -p "$staging/$(dirname "$f")"
+        echo "placeholder" >"$staging/$f"
+      done
     fi
-  fi
-  rm -f "$tarball"
-}
-
-# Exact name match (fzf, lazygit, starship)
-_test_tarball "exact match: flat binary" "mytool" 0 \
-  "mytool"
-
-# Exact match in subdirectory (bat, delta, neovim)
-_test_tarball_with_extras "exact match: in subdir" "mytool" 0 \
-  "mytool-v1.0-linux/README.md" \
-  "mytool-v1.0-linux/mytool"
-
-# Exact match in bin/ subdir
-_test_tarball_with_extras "exact match: in bin subdir" "mytool" 0 \
-  "mytool-v1.0/LICENSE" \
-  "mytool-v1.0/bin/mytool"
-
-# Dash prefix match
-_test_tarball "prefix match: dash separator" "mytool" 0 \
-  "mytool-x86_64-unknown-linux-gnu"
-
-# Underscore prefix match
-_test_tarball "prefix match: underscore separator" "mytool" 0 \
-  "mytool_linux_amd64"
-
-# Sole executable fallback
-_test_tarball "sole executable: unconventional name" "mytool" 0 \
-  "completely-different-name"
-
-# No match: multiple executables with wrong names
-_test_tarball "no match: multiple wrong names" "mytool" 1 \
-  "other-tool" \
-  "another-tool"
-
-# Sole executable fallback ignores shell scripts
-_test_script_staging=$(_tmpdir)
-echo "#!/bin/sh" > "$_test_script_staging/setup.sh"
-chmod +x "$_test_script_staging/setup.sh"
-cp "$_true_bin" "$_test_script_staging/real-binary"
-_test_script_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
-tar czf "$_test_script_tar" -C "$_test_script_staging" .
-_test_script_bin="$_test_script_staging/output-bin"
-_shdeps_github_release_install_tarball "test-pkg" "notfound" "$_test_script_tar" "$_test_script_bin" "" >/dev/null 2>&1 || true
-if [[ -L "$_test_script_bin" ]]; then
-  _target=$(readlink "$_test_script_bin")
-  _assert_contains "sole exe ignores scripts: picks binary" "real-binary" "$_target"
-else
-  _fail "sole exe ignores scripts: no symlink created"
-fi
-rm -f "$_test_script_tar"
-
-# Exact match preferred over prefix match
-_test_exact_staging=$(_tmpdir)
-cp "$_true_bin" "$_test_exact_staging/mytool"
-cp "$_true_bin" "$_test_exact_staging/mytool-extra"
-_test_exact_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
-tar czf "$_test_exact_tar" -C "$_test_exact_staging" .
-_test_exact_bin="$_test_exact_staging/output-bin"
-_shdeps_github_release_install_tarball "test-pkg" "mytool" "$_test_exact_tar" "$_test_exact_bin" "" >/dev/null 2>&1
-if [[ -L "$_test_exact_bin" ]]; then
-  _target=$(readlink "$_test_exact_bin")
-  if [[ "$_target" == *"/mytool" && "$_target" != *"-extra" ]]; then
-    _pass "exact over prefix: symlinks to exact name"
-  else
-    _fail "exact over prefix: symlinks to exact name (got $_target)"
-  fi
-else
-  _fail "exact over prefix: no symlink created"
-fi
-rm -f "$_test_exact_tar"
-
-# --- Zip extraction ---
-
-echo ""
-echo "=== Zip archive extraction ==="
-
-_test_zip() {
-  local desc="$1" cmd="$2" expect_exit="$3"
-  shift 3
-  local staging
-  staging=$(_tmpdir)
-  local f
-  for f in "$@"; do
-    mkdir -p "$staging/$(dirname "$f")"
-    cp "$_true_bin" "$staging/$f"
-  done
-  local zipfile="$staging/test.zip"
-  (cd "$staging" && zip -qr "$zipfile" . -x test.zip)
-  local bin_path="$staging/output-bin"
-  local rc=0
-  _shdeps_github_release_install_zip "test-pkg" "$cmd" "$zipfile" "$bin_path" "" >/dev/null 2>&1 || rc=$?
-  _assert_exit "$desc" "$expect_exit" "$rc"
-  if [[ "$expect_exit" -eq 0 ]]; then
-    if [[ -L "$bin_path" || -x "$bin_path" ]]; then
-      _pass "$desc: binary installed"
-    else
-      _fail "$desc: binary not installed at $bin_path"
+    local tarball
+    tarball=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
+    tar czf "$tarball" -C "$staging" .
+    local bin_path="$staging/output-bin"
+    local log=""
+    local rc=0
+    _shdeps_github_release_install_tarball "test-pkg" "$cmd" "$tarball" "$bin_path" "$log" >/dev/null 2>&1 || rc=$?
+    _assert_exit "$desc" "$expect_exit" "$rc"
+    if [[ "$expect_exit" -eq 0 ]]; then
+      if [[ -L "$bin_path" || -x "$bin_path" ]]; then
+        _pass "$desc: binary installed"
+      else
+        _fail "$desc: binary not installed at $bin_path"
+      fi
     fi
-  fi
-}
+    rm -f "$tarball"
+  }
 
-if command -v zip &>/dev/null && command -v unzip &>/dev/null; then
-  _test_zip "zip: exact match flat" "mytool" 0 "mytool"
-  _test_zip "zip: exact match in subdir" "mytool" 0 "mytool-v1.0/bin/mytool"
-  _test_zip "zip: prefix match" "mytool" 0 "mytool-x86_64-unknown-linux-gnu"
-  _test_zip "zip: sole executable fallback" "mytool" 0 "different-name"
-else
-  _pass "zip: exact match flat: skipped (zip/unzip not installed)"
-  _pass "zip: exact match flat: binary installed: skipped"
-  _pass "zip: exact match in subdir: skipped"
-  _pass "zip: exact match in subdir: binary installed: skipped"
-  _pass "zip: prefix match: skipped"
-  _pass "zip: prefix match: binary installed: skipped"
-  _pass "zip: sole executable fallback: skipped"
-  _pass "zip: sole executable fallback: binary installed: skipped"
-fi
+  # Exact name match (fzf, lazygit, starship)
+  _test_tarball "exact match: flat binary" "mytool" 0 \
+    "mytool"
 
-# --- Single-file decompression ---
+  # Exact match in subdirectory (bat, delta, neovim)
+  _test_tarball_with_extras "exact match: in subdir" "mytool" 0 \
+    "mytool-v1.0-linux/README.md" \
+    "mytool-v1.0-linux/mytool"
 
-echo ""
-echo "=== Single-file decompression ==="
+  # Exact match in bin/ subdir
+  _test_tarball_with_extras "exact match: in bin subdir" "mytool" 0 \
+    "mytool-v1.0/LICENSE" \
+    "mytool-v1.0/bin/mytool"
 
-_test_decompress() {
-  local desc="$1" ext="$2"
-  local staging
-  staging=$(_tmpdir)
-  cp "$_true_bin" "$staging/mytool"
-  local compressed="$staging/mytool.$ext"
-  case "$ext" in
-    gz)  gzip -c "$staging/mytool" > "$compressed" ;;
-    bz2) bzip2 -c "$staging/mytool" > "$compressed" ;;
-    zst) zstd -qf "$staging/mytool" -o "$compressed" ;;
-  esac
-  rm "$staging/mytool"
-  local bin_path="$staging/output-bin"
-  local rc=0
-  case "$ext" in
-    gz)
-      gzip -dc "$compressed" > "$bin_path" 2>/dev/null || rc=1
-      [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
-      ;;
-    bz2)
-      bzip2 -dc "$compressed" > "$bin_path" 2>/dev/null || rc=1
-      [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
-      ;;
-    zst)
-      zstd -df "$compressed" -o "$bin_path" 2>/dev/null || rc=1
-      [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
-      ;;
-  esac
-  _assert_exit "$desc" 0 "$rc"
-  if [[ -x "$bin_path" ]]; then
-    _pass "$desc: binary decompressed"
+  # Dash prefix match
+  _test_tarball "prefix match: dash separator" "mytool" 0 \
+    "mytool-x86_64-unknown-linux-gnu"
+
+  # Underscore prefix match
+  _test_tarball "prefix match: underscore separator" "mytool" 0 \
+    "mytool_linux_amd64"
+
+  # Sole executable fallback
+  _test_tarball "sole executable: unconventional name" "mytool" 0 \
+    "completely-different-name"
+
+  # No match: multiple executables with wrong names
+  _test_tarball "no match: multiple wrong names" "mytool" 1 \
+    "other-tool" \
+    "another-tool"
+
+  # Sole executable fallback ignores shell scripts
+  _test_script_staging=$(_tmpdir)
+  echo "#!/bin/sh" >"$_test_script_staging/setup.sh"
+  chmod +x "$_test_script_staging/setup.sh"
+  cp "$_true_bin" "$_test_script_staging/real-binary"
+  _test_script_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
+  tar czf "$_test_script_tar" -C "$_test_script_staging" .
+  _test_script_bin="$_test_script_staging/output-bin"
+  _shdeps_github_release_install_tarball "test-pkg" "notfound" "$_test_script_tar" "$_test_script_bin" "" >/dev/null 2>&1 || true
+  if [[ -L "$_test_script_bin" ]]; then
+    _target=$(readlink "$_test_script_bin")
+    _assert_contains "sole exe ignores scripts: picks binary" "real-binary" "$_target"
   else
-    _fail "$desc: binary not at $bin_path"
+    _fail "sole exe ignores scripts: no symlink created"
   fi
-}
+  rm -f "$_test_script_tar"
 
-_test_decompress "gz decompression" "gz"
-_test_decompress "bz2 decompression" "bz2"
-if command -v zstd &>/dev/null; then
-  _test_decompress "zst decompression" "zst"
-else
-  _pass "zst decompression: skipped (zstd not installed)"
-  _pass "zst decompression: binary decompressed: skipped"
-fi
+  # Exact match preferred over prefix match
+  _test_exact_staging=$(_tmpdir)
+  cp "$_true_bin" "$_test_exact_staging/mytool"
+  cp "$_true_bin" "$_test_exact_staging/mytool-extra"
+  _test_exact_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar.gz")
+  tar czf "$_test_exact_tar" -C "$_test_exact_staging" .
+  _test_exact_bin="$_test_exact_staging/output-bin"
+  _shdeps_github_release_install_tarball "test-pkg" "mytool" "$_test_exact_tar" "$_test_exact_bin" "" >/dev/null 2>&1
+  if [[ -L "$_test_exact_bin" ]]; then
+    _target=$(readlink "$_test_exact_bin")
+    if [[ "$_target" == *"/mytool" && "$_target" != *"-extra" ]]; then
+      _pass "exact over prefix: symlinks to exact name"
+    else
+      _fail "exact over prefix: symlinks to exact name (got $_target)"
+    fi
+  else
+    _fail "exact over prefix: no symlink created"
+  fi
+  rm -f "$_test_exact_tar"
 
-fi  # end of _true_bin guard
+  # --- Zip extraction ---
+
+  echo ""
+  echo "=== Zip archive extraction ==="
+
+  _test_zip() {
+    local desc="$1" cmd="$2" expect_exit="$3"
+    shift 3
+    local staging
+    staging=$(_tmpdir)
+    local f
+    for f in "$@"; do
+      mkdir -p "$staging/$(dirname "$f")"
+      cp "$_true_bin" "$staging/$f"
+    done
+    local zipfile="$staging/test.zip"
+    (cd "$staging" && zip -qr "$zipfile" . -x test.zip)
+    local bin_path="$staging/output-bin"
+    local rc=0
+    _shdeps_github_release_install_zip "test-pkg" "$cmd" "$zipfile" "$bin_path" "" >/dev/null 2>&1 || rc=$?
+    _assert_exit "$desc" "$expect_exit" "$rc"
+    if [[ "$expect_exit" -eq 0 ]]; then
+      if [[ -L "$bin_path" || -x "$bin_path" ]]; then
+        _pass "$desc: binary installed"
+      else
+        _fail "$desc: binary not installed at $bin_path"
+      fi
+    fi
+  }
+
+  if command -v zip &>/dev/null && command -v unzip &>/dev/null; then
+    _test_zip "zip: exact match flat" "mytool" 0 "mytool"
+    _test_zip "zip: exact match in subdir" "mytool" 0 "mytool-v1.0/bin/mytool"
+    _test_zip "zip: prefix match" "mytool" 0 "mytool-x86_64-unknown-linux-gnu"
+    _test_zip "zip: sole executable fallback" "mytool" 0 "different-name"
+  else
+    _pass "zip: exact match flat: skipped (zip/unzip not installed)"
+    _pass "zip: exact match flat: binary installed: skipped"
+    _pass "zip: exact match in subdir: skipped"
+    _pass "zip: exact match in subdir: binary installed: skipped"
+    _pass "zip: prefix match: skipped"
+    _pass "zip: prefix match: binary installed: skipped"
+    _pass "zip: sole executable fallback: skipped"
+    _pass "zip: sole executable fallback: binary installed: skipped"
+  fi
+
+  # --- Single-file decompression ---
+
+  echo ""
+  echo "=== Single-file decompression ==="
+
+  _test_decompress() {
+    local desc="$1" ext="$2"
+    local staging
+    staging=$(_tmpdir)
+    cp "$_true_bin" "$staging/mytool"
+    local compressed="$staging/mytool.$ext"
+    case "$ext" in
+      gz) gzip -c "$staging/mytool" >"$compressed" ;;
+      bz2) bzip2 -c "$staging/mytool" >"$compressed" ;;
+      zst) zstd -qf "$staging/mytool" -o "$compressed" ;;
+    esac
+    rm "$staging/mytool"
+    local bin_path="$staging/output-bin"
+    local rc=0
+    case "$ext" in
+      gz)
+        gzip -dc "$compressed" >"$bin_path" 2>/dev/null || rc=1
+        [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
+        ;;
+      bz2)
+        bzip2 -dc "$compressed" >"$bin_path" 2>/dev/null || rc=1
+        [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
+        ;;
+      zst)
+        zstd -df "$compressed" -o "$bin_path" 2>/dev/null || rc=1
+        [[ $rc -eq 0 ]] && chmod u+x "$bin_path"
+        ;;
+    esac
+    _assert_exit "$desc" 0 "$rc"
+    if [[ -x "$bin_path" ]]; then
+      _pass "$desc: binary decompressed"
+    else
+      _fail "$desc: binary not at $bin_path"
+    fi
+  }
+
+  _test_decompress "gz decompression" "gz"
+  _test_decompress "bz2 decompression" "bz2"
+  if command -v zstd &>/dev/null; then
+    _test_decompress "zst decompression" "zst"
+  else
+    _pass "zst decompression: skipped (zstd not installed)"
+    _pass "zst decompression: binary decompressed: skipped"
+  fi
+
+fi # end of _true_bin guard
 
 # ===========================================================================
 # Section 7: Cache/stamps
@@ -1265,14 +1293,16 @@ _assert_exit "fresh: just-touched is fresh" 0 $?
 
 # --- Stale stamp beyond TTL ---
 
-echo "1000000000" > "$stamp"
-rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+echo "1000000000" >"$stamp"
+rc=0
+_shdeps_remote_fresh "$stamp" || rc=$?
 _assert_exit "stale: old epoch is stale" 1 "$rc"
 
 # --- Missing stamp is stale ---
 
 rm -f "$stamp"
-rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+rc=0
+_shdeps_remote_fresh "$stamp" || rc=$?
 _assert_exit "missing: no stamp is stale" 1 "$rc"
 
 # --- Force mode bypasses cache ---
@@ -1280,7 +1310,8 @@ _assert_exit "missing: no stamp is stale" 1 "$rc"
 SHDEPS_FORCE=1
 _source_shdeps "$SHDEPS_DIR"
 _shdeps_remote_touch "$stamp"
-rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+rc=0
+_shdeps_remote_fresh "$stamp" || rc=$?
 _assert_exit "force: bypasses fresh stamp" 1 "$rc"
 
 # Reset force
@@ -1292,7 +1323,8 @@ _source_shdeps "$SHDEPS_DIR"
 SHDEPS_REINSTALL=1
 _source_shdeps "$SHDEPS_DIR"
 _shdeps_remote_touch "$stamp"
-rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+rc=0
+_shdeps_remote_fresh "$stamp" || rc=$?
 _assert_exit "reinstall: bypasses fresh stamp" 1 "$rc"
 
 # Reset reinstall
@@ -1301,8 +1333,9 @@ _source_shdeps "$SHDEPS_DIR"
 
 # --- Invalid stamp content is stale ---
 
-echo "not-a-number" > "$stamp"
-rc=0; _shdeps_remote_fresh "$stamp" || rc=$?
+echo "not-a-number" >"$stamp"
+rc=0
+_shdeps_remote_fresh "$stamp" || rc=$?
 _assert_exit "invalid: non-numeric stamp is stale" 1 "$rc"
 
 # --- Rev stamps ---
@@ -1317,7 +1350,8 @@ _assert_eq "rev read: matches written" "abc123def" "$REPLY"
 
 # Missing rev stamp returns failure
 rm -f "$rev_stamp"
-rc=0; _shdeps_rev_read "test-rev" || rc=$?
+rc=0
+_shdeps_rev_read "test-rev" || rc=$?
 _assert_exit "rev read: missing returns 1" 1 "$rc"
 
 # ===========================================================================
@@ -1357,7 +1391,7 @@ exists() { return 0; }
 post() { echo "post-b" >> "$HOOK_LOG"; }
 HOOK
 
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=(["tool-a"]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
@@ -1366,7 +1400,7 @@ _assert_not_contains "post hooks: unchanged dep skipped" "post-b" "$post_output"
 
 # --- No changed deps → no post hooks run ---
 
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
@@ -1382,7 +1416,7 @@ exists() { return 0; }
 # No post() defined
 HOOK
 
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=(["tool-a"]=1 ["tool-b"]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
@@ -1399,7 +1433,7 @@ exists() { return 0; }
 post() { echo "post-b-ok" >> "$HOOK_LOG"; }
 HOOK
 
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=(["tool-a"]=1 ["tool-b"]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
@@ -1408,7 +1442,7 @@ _assert_contains "error handling: tool-b runs after tool-a fails" "post-b-ok" "$
 # --- Missing hook file is silently skipped ---
 
 rm -f "$_hook_test_dir/tool-b.sh"
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=(["tool-b"]=1)
 _shdeps_run_post_hooks
 post_output=$(cat "$HOOK_LOG")
@@ -1445,7 +1479,7 @@ version() { echo "1.2.3"; }
 install() { echo "should-not-run" >> "$HOOK_LOG"; return 0; }
 HOOK
 
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}"
 _assert_eq "exists=0: install not called" "" "$(cat "$HOOK_LOG")"
@@ -1464,7 +1498,7 @@ version() { echo "2.0.0"; }
 install() { echo "install-ran" >> "$HOOK_LOG"; return 0; }
 HOOK
 
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}"
 _assert_contains "exists=1: install called" "install-ran" "$(cat "$HOOK_LOG")"
@@ -1485,7 +1519,7 @@ HOOK
 SHDEPS_REINSTALL=1
 _source_shdeps "$SHDEPS_DIR"
 _shdeps_load
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}"
 _assert_contains "reinstall: install called" "reinstall-ran" "$(cat "$HOOK_LOG")"
@@ -1505,7 +1539,7 @@ cat >"$_cust_hooks_dir/no-exists-tool.sh" <<'HOOK'
 install() { echo "should-not-run" >> "$HOOK_LOG"; return 0; }
 HOOK
 
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}" 2>/dev/null
 _assert_eq "no exists: install not called" "" "$(cat "$HOOK_LOG")"
@@ -1584,7 +1618,7 @@ SHDEPS_INSTALL_DIR="$_cargo_install_dir"
 PATH="$_cargo_bin:$PATH"
 _source_shdeps "$SHDEPS_DIR"
 _shdeps_load
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=()
 _shdeps_install_dep "${_SHDEPS_DEPS[0]}"
 _assert_contains "cargo: uses --locked" "--locked" "$(cat "$HOOK_LOG")"
@@ -1608,7 +1642,7 @@ exists() { return 0; }
 post() { echo "post-name=$1" >> "$HOOK_LOG"; }
 HOOK
 
-: > "$HOOK_LOG"
+: >"$HOOK_LOG"
 declare -gA _SHDEPS_CHANGED=(["name-tool"]=1)
 _shdeps_run_post_hooks
 _assert_contains "post: receives name as \$1" "post-name=name-tool" "$(cat "$HOOK_LOG")"
@@ -1671,7 +1705,8 @@ _assert_exit "shdeps_force: active when SHDEPS_FORCE=1" 0 $?
 
 SHDEPS_FORCE=0
 _source_shdeps "$SHDEPS_DIR"
-rc=0; shdeps_force || rc=$?
+rc=0
+shdeps_force || rc=$?
 _assert_exit "shdeps_force: inactive when SHDEPS_FORCE=0" 1 "$rc"
 
 # --- shdeps_reinstall: returns 0 when reinstall is 1 ---
@@ -1685,7 +1720,8 @@ _assert_exit "shdeps_reinstall: active when SHDEPS_REINSTALL=1" 0 $?
 
 SHDEPS_REINSTALL=0
 _source_shdeps "$SHDEPS_DIR"
-rc=0; shdeps_reinstall || rc=$?
+rc=0
+shdeps_reinstall || rc=$?
 _assert_exit "shdeps_reinstall: inactive when SHDEPS_REINSTALL=0" 1 "$rc"
 
 # --- shdeps_platform: returns a known platform ---
@@ -1709,14 +1745,14 @@ echo "=== Git install helpers ==="
 # --- _shdeps_get_version: VERSION file ---
 
 _ver_dir=$(_tmpdir)
-echo "1.2.3" > "$_ver_dir/VERSION"
+echo "1.2.3" >"$_ver_dir/VERSION"
 result=$(_shdeps_get_version "$_ver_dir")
 _assert_eq "get_version: VERSION file" "1.2.3" "$result"
 
 # --- _shdeps_get_version: VERSION file reported verbatim ---
 
 _ver_dir_v=$(_tmpdir)
-echo "v0.7.1" > "$_ver_dir_v/VERSION"
+echo "v0.7.1" >"$_ver_dir_v/VERSION"
 result=$(_shdeps_get_version "$_ver_dir_v")
 _assert_eq "get_version: VERSION file verbatim" "v0.7.1" "$result"
 
@@ -1749,7 +1785,7 @@ _both_dir=$(_tmpdir)
 git -C "$_both_dir" init -q
 git -C "$_both_dir" commit --allow-empty -m "init" -q
 git -C "$_both_dir" tag "v9.9.9"
-echo "2.0.0" > "$_both_dir/VERSION"
+echo "2.0.0" >"$_both_dir/VERSION"
 result=$(_shdeps_get_version "$_both_dir")
 _assert_eq "get_version: VERSION over git tag" "2.0.0" "$result"
 
@@ -1757,7 +1793,7 @@ _assert_eq "get_version: VERSION over git tag" "2.0.0" "$result"
 
 _prim_dir=$(_tmpdir)
 mkdir -p "$_prim_dir/bin"
-echo "#!/bin/sh" > "$_prim_dir/bin/foo"
+echo "#!/bin/sh" >"$_prim_dir/bin/foo"
 chmod +x "$_prim_dir/bin/foo"
 rm -f "$HOME/.local/bin/foo"
 _shdeps_link_bin "foo" "$_prim_dir/bin/foo"
@@ -1769,7 +1805,7 @@ _assert_eq "link_bin primitive: points to bin_path" "$_prim_dir/bin/foo" "$_prim
 
 _prim_noexec=$(_tmpdir)
 mkdir -p "$_prim_noexec/bin"
-echo "data" > "$_prim_noexec/bin/baz"
+echo "data" >"$_prim_noexec/bin/baz"
 rm -f "$HOME/.local/bin/baz"
 _shdeps_link_bin "baz" "$_prim_noexec/bin/baz"
 _assert_not_exists "link_bin primitive: non-exec, no symlink" "$HOME/.local/bin/baz"
@@ -1785,7 +1821,7 @@ _assert_not_exists "link_bin primitive: missing path, no symlink" "$HOME/.local/
 
 _prim_alias=$(_tmpdir)
 mkdir -p "$_prim_alias/bin"
-echo "#!/bin/sh" > "$_prim_alias/bin/upstream"
+echo "#!/bin/sh" >"$_prim_alias/bin/upstream"
 chmod +x "$_prim_alias/bin/upstream"
 rm -f "$HOME/.local/bin/localname"
 _shdeps_link_bin "localname" "$_prim_alias/bin/upstream"
@@ -1797,7 +1833,7 @@ _assert_eq "link_bin primitive: target is raw bin_path" "$_prim_alias/bin/upstre
 
 _link_dir=$(_tmpdir)
 mkdir -p "$_link_dir/bin"
-echo "#!/bin/sh" > "$_link_dir/bin/mytool"
+echo "#!/bin/sh" >"$_link_dir/bin/mytool"
 chmod +x "$_link_dir/bin/mytool"
 rm -f "$HOME/.local/bin/mytool"
 _shdeps_link_bin_from_dir "mytool" "$_link_dir"
@@ -1809,7 +1845,7 @@ _assert_eq "link_bin_from_dir: points to correct path" "$_link_dir/bin/mytool" "
 
 _link_owner_dir=$(_tmpdir)
 mkdir -p "$_link_owner_dir/bin"
-echo "#!/bin/sh" > "$_link_owner_dir/bin/foo"
+echo "#!/bin/sh" >"$_link_owner_dir/bin/foo"
 chmod +x "$_link_owner_dir/bin/foo"
 rm -f "$HOME/.local/bin/foo"
 _shdeps_link_bin_from_dir "owner/foo" "$_link_owner_dir"
@@ -1828,7 +1864,7 @@ _assert_not_exists "link_bin_from_dir: no bin dir, no symlink" "$HOME/.local/bin
 
 _nonexec_dir=$(_tmpdir)
 mkdir -p "$_nonexec_dir/bin"
-echo "data" > "$_nonexec_dir/bin/noexec-tool"
+echo "data" >"$_nonexec_dir/bin/noexec-tool"
 rm -f "$HOME/.local/bin/noexec-tool"
 _shdeps_link_bin_from_dir "noexec-tool" "$_nonexec_dir"
 _assert_not_exists "link_bin_from_dir: non-exec, no symlink" "$HOME/.local/bin/noexec-tool"
@@ -1836,7 +1872,7 @@ _assert_not_exists "link_bin_from_dir: non-exec, no symlink" "$HOME/.local/bin/n
 # --- _shdeps_dep_version: extracts version from --version output ---
 
 _ver_bin_dir=$(_tmpdir)
-cat > "$_ver_bin_dir/fake-tool" <<'SCRIPT'
+cat >"$_ver_bin_dir/fake-tool" <<'SCRIPT'
 #!/bin/sh
 echo "fake-tool version 3.14.159"
 SCRIPT
@@ -1846,7 +1882,7 @@ _assert_eq "dep_version: extracts version" "3.14.159" "$result"
 
 # --- _shdeps_dep_version: version on line 2 (eza, shellcheck style) ---
 
-cat > "$_ver_bin_dir/line2-tool" <<'SCRIPT'
+cat >"$_ver_bin_dir/line2-tool" <<'SCRIPT'
 #!/bin/sh
 echo "line2-tool - A modern replacement for foo"
 echo "v0.23.4 [+git]"
@@ -1857,7 +1893,7 @@ _assert_eq "dep_version: version on line 2" "0.23.4" "$result"
 
 # --- _shdeps_dep_version: -V fallback (tmux/autossh style) ---
 
-cat > "$_ver_bin_dir/dashV-tool" <<'SCRIPT'
+cat >"$_ver_bin_dir/dashV-tool" <<'SCRIPT'
 #!/bin/sh
 case "$1" in
   --version) echo "unknown option" >&2; exit 1 ;;
@@ -1870,7 +1906,7 @@ _assert_eq "dep_version: falls back to -V" "3.6a" "$result"
 
 # --- _shdeps_dep_version: version on stderr (ssh style) ---
 
-cat > "$_ver_bin_dir/stderr-tool" <<'SCRIPT'
+cat >"$_ver_bin_dir/stderr-tool" <<'SCRIPT'
 #!/bin/sh
 case "$1" in
   --version) echo "illegal option" >&2; exit 1 ;;
@@ -1883,7 +1919,7 @@ _assert_eq "dep_version: captures stderr" "10.2p1" "$result"
 
 # --- _shdeps_dep_version: non-zero exit with valid output (unzip style) ---
 
-cat > "$_ver_bin_dir/exitfail-tool" <<'SCRIPT'
+cat >"$_ver_bin_dir/exitfail-tool" <<'SCRIPT'
 #!/bin/sh
 echo "ExitFail 6.00 of 20 April 2009" >&2
 exit 10
@@ -1894,7 +1930,7 @@ _assert_eq "dep_version: non-zero exit still captured" "6.00" "$result"
 
 # --- _shdeps_dep_version: integer-only version (less style) ---
 
-cat > "$_ver_bin_dir/intver-tool" <<'SCRIPT'
+cat >"$_ver_bin_dir/intver-tool" <<'SCRIPT'
 #!/bin/sh
 echo "intver-tool 668 (POSIX regular expressions)"
 SCRIPT
@@ -1904,7 +1940,7 @@ _assert_eq "dep_version: integer-only version" "668" "$result"
 
 # --- _shdeps_dep_version: --version noise doesn't shadow -V result ---
 
-cat > "$_ver_bin_dir/noisy-tool" <<'SCRIPT'
+cat >"$_ver_bin_dir/noisy-tool" <<'SCRIPT'
 #!/bin/sh
 case "$1" in
   --version) echo "usage: noisy-tool [-46AaCf] destination" >&2; exit 255 ;;
@@ -1917,7 +1953,7 @@ _assert_eq "dep_version: --version noise skipped for -V" "10.2p1" "$result"
 
 # --- _shdeps_dep_version: no version flag works → empty ---
 
-cat > "$_ver_bin_dir/nover-tool" <<'SCRIPT'
+cat >"$_ver_bin_dir/nover-tool" <<'SCRIPT'
 #!/bin/sh
 echo "no version here" >&2; exit 1
 SCRIPT
@@ -1927,12 +1963,14 @@ _assert_eq "dep_version: no version available" "" "$result"
 
 # --- _shdeps_dep_version: empty cmd → failure ---
 
-rc=0; _shdeps_dep_version "" || rc=$?
+rc=0
+_shdeps_dep_version "" || rc=$?
 _assert_exit "dep_version: empty cmd fails" 1 "$rc"
 
 # --- _shdeps_pkg_version: empty pkg → failure ---
 
-rc=0; _shdeps_pkg_version "" || rc=$?
+rc=0
+_shdeps_pkg_version "" || rc=$?
 _assert_exit "pkg_version: empty pkg fails" 1 "$rc"
 
 # --- _shdeps_pkg_version: unknown pkg manager → failure ---
@@ -1941,7 +1979,8 @@ _saved_pkg_mgr="${_SHDEPS_PKG_MGR:-}"
 _SHDEPS_PKG_MGR=""
 unset _SHDEPS_PKG_VERSIONS_LOADED
 declare -gA _SHDEPS_PKG_VERSIONS=()
-rc=0; _shdeps_pkg_version "some-pkg" || rc=$?
+rc=0
+_shdeps_pkg_version "some-pkg" || rc=$?
 _assert_exit "pkg_version: no pkg manager fails" 1 "$rc"
 _SHDEPS_PKG_MGR="$_saved_pkg_mgr"
 unset _SHDEPS_PKG_VERSIONS_LOADED
@@ -1956,7 +1995,8 @@ _assert_eq "pkg_version: returns cached version" "4.2.0" "$REPLY"
 
 # --- _shdeps_pkg_version: missing pkg in cache → failure ---
 
-rc=0; _shdeps_pkg_version "no-such-cached-pkg" || rc=$?
+rc=0
+_shdeps_pkg_version "no-such-cached-pkg" || rc=$?
 _assert_exit "pkg_version: missing pkg fails" 1 "$rc"
 _assert_eq "pkg_version: REPLY empty on miss" "" "$REPLY"
 unset _SHDEPS_PKG_VERSIONS_LOADED
@@ -1964,7 +2004,7 @@ unset _SHDEPS_PKG_VERSIONS_LOADED
 # --- _shdeps_exists: finds command in PATH ---
 
 _exists_bin=$(_mock_bin)
-echo '#!/bin/sh' > "$_exists_bin/test-exists-cmd"
+echo '#!/bin/sh' >"$_exists_bin/test-exists-cmd"
 chmod +x "$_exists_bin/test-exists-cmd"
 export PATH="$_exists_bin:$PATH"
 _shdeps_exists "test-exists-cmd" ""
@@ -1972,12 +2012,14 @@ _assert_exit "exists: finds cmd in PATH" 0 $?
 
 # --- _shdeps_exists: falls back to pkg manager check ---
 
-rc=0; _shdeps_exists "nonexistent-primary" "test-exists-cmd" || rc=$?
+rc=0
+_shdeps_exists "nonexistent-primary" "test-exists-cmd" || rc=$?
 _assert_exit "exists: cmd missing, tries name" 0 $?
 
 # --- _shdeps_exists: both missing → failure ---
 
-rc=0; _shdeps_exists "no-such-cmd-aaa" "no-such-name-bbb" || rc=$?
+rc=0
+_shdeps_exists "no-such-cmd-aaa" "no-such-name-bbb" || rc=$?
 _assert_exit "exists: both missing fails" 1 "$rc"
 
 # --- Local clone detection: ~/git/<name> is preferred ---
@@ -2077,7 +2119,7 @@ unset SHDEPS_INSTALL_DIR
 _el_state=$(_tmpdir)
 _el_install=$(_tmpdir)/elowner/el-test
 mkdir -p "$_el_install/share/man/man1"
-echo ".TH TEST 1" > "$_el_install/share/man/man1/el-test.1"
+echo ".TH TEST 1" >"$_el_install/share/man/man1/el-test.1"
 SHDEPS_STATE_DIR="$_el_state"
 _source_shdeps "$SHDEPS_DIR"
 
@@ -2097,7 +2139,7 @@ echo "=== _shdeps_external_install ==="
 
 _ext_fake_dir=$(_tmpdir)
 _ext_log="$_ext_fake_dir/invocations.log"
-cat > "$_ext_fake_dir/faketool" <<SH
+cat >"$_ext_fake_dir/faketool" <<SH
 #!/usr/bin/env bash
 set -e
 echo "invoked: \$*" >> "$_ext_log"
@@ -2165,7 +2207,7 @@ _assert_eq "external_install: no changed entry when tool missing" "" "${_SHDEPS_
 # --- Tool runs but produces no binary: rc=1, warning, no changed, no link ---
 
 _ext_noop_dir=$(_tmpdir)
-cat > "$_ext_noop_dir/noop-tool" <<'SH'
+cat >"$_ext_noop_dir/noop-tool" <<'SH'
 #!/usr/bin/env bash
 exit 0
 SH
@@ -2205,7 +2247,7 @@ _source_shdeps "$SHDEPS_DIR"
 echo "=== _shdeps_check_prereqs (external tools) ==="
 
 _cet_conf=$(_tmpdir)
-cat > "$_cet_conf/deps.conf" <<'CONF'
+cat >"$_cet_conf/deps.conf" <<'CONF'
 ripgrep                  cargo  rg
 github.com/foo/bar       go
 CONF
@@ -2313,7 +2355,8 @@ _assert_contains "manifest slash: jq kept" "jq|pkg" "$_mfst_slash_content"
 # remove from missing file is no-op
 SHDEPS_STATE_DIR="$_mfst_empty_state"
 _source_shdeps "$SHDEPS_DIR"
-rc=0; _shdeps_manifest_remove "nonexistent" || rc=$?
+rc=0
+_shdeps_manifest_remove "nonexistent" || rc=$?
 _assert_eq "remove missing file: no error" "0" "$rc"
 
 # --- Orphan detection ---
@@ -2336,7 +2379,8 @@ owner/dep-b  github:release  dep-b
 EOF
 _shdeps_load
 
-rc=0; _shdeps_detect_orphans || rc=$?
+rc=0
+_shdeps_detect_orphans || rc=$?
 _assert_eq "orphan: found" "0" "$rc"
 _assert_eq "orphan: count" "1" "${#_SHDEPS_ORPHANS[@]}"
 _assert_contains "orphan: dep-c is orphaned" "owner/dep-c" "${_SHDEPS_ORPHANS[0]}"
@@ -2346,7 +2390,8 @@ cat >>"$_orp_conf/deps.conf" <<'EOF'
 owner/dep-c  github:repo
 EOF
 _shdeps_load
-rc=0; _shdeps_detect_orphans || rc=$?
+rc=0
+_shdeps_detect_orphans || rc=$?
 _assert_eq "orphan: none when matching" "1" "$rc"
 _assert_eq "orphan: empty array" "0" "${#_SHDEPS_ORPHANS[@]}"
 
@@ -2355,7 +2400,8 @@ SHDEPS_STATE_DIR="$_mfst_empty_state"
 _source_shdeps "$SHDEPS_DIR"
 SHDEPS_CONF_DIR="$_orp_conf"
 _shdeps_load
-rc=0; _shdeps_detect_orphans || rc=$?
+rc=0
+_shdeps_detect_orphans || rc=$?
 _assert_eq "orphan: none with empty manifest" "1" "$rc"
 
 # platform-filtered config dep is NOT an orphan
@@ -2376,7 +2422,8 @@ cat >"$_orp_plat_conf/deps.conf" <<EOF
 dep-x  pkg  -  -  os:$_skip_plat
 EOF
 _shdeps_load
-rc=0; _shdeps_detect_orphans || rc=$?
+rc=0
+_shdeps_detect_orphans || rc=$?
 _assert_eq "orphan: platform-filtered is NOT orphan" "1" "$rc"
 
 # --- Prune per method ---
@@ -2694,41 +2741,41 @@ export MOCK_CARGO_LOG="$_cargo_log"
 _source_shdeps "$SHDEPS_DIR"
 
 _cargo_conf=$(_tmpdir)
-cat > "$_cargo_conf/deps.conf" <<'CONF'
+cat >"$_cargo_conf/deps.conf" <<'CONF'
 mytool   cargo
 CONF
 SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 
 _assert_file_exists "cargo: binary installed" "$HOME/.local/share/mytool/bin/mytool"
-_assert_symlink     "cargo: bin symlink created"  "$HOME/.local/bin/mytool"
+_assert_symlink "cargo: bin symlink created" "$HOME/.local/bin/mytool"
 
 _shdeps_manifest_read
 _assert_contains "cargo: manifest records bin path" \
   "cargo|mytool|$HOME/.local/share/mytool/bin/mytool" "${_SHDEPS_MANIFEST[mytool]:-}"
 
 # TTL-fresh re-run → no new install invocation
-: > "$_cargo_log"
+: >"$_cargo_log"
 SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 _assert_eq "cargo: TTL-fresh re-run skips install" "" "$(cat "$_cargo_log")"
 
 # Fast-path self-heal: if the user deletes the public bin symlink, the next
 # TTL-fresh run should re-create it without re-invoking the tool.
 rm -f "$HOME/.local/bin/mytool"
-: > "$_cargo_log"
+: >"$_cargo_log"
 SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 _assert_symlink "cargo: fast-path restores deleted bin symlink" "$HOME/.local/bin/mytool"
 _assert_eq "cargo: self-heal did not rerun cargo" "" "$(cat "$_cargo_log")"
 
 # --reinstall → --force passed
-: > "$_cargo_log"
+: >"$_cargo_log"
 SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 SHDEPS_REINSTALL=1 shdeps_update >/dev/null
 _assert_contains "cargo: --reinstall passes --force" "force=1" "$(cat "$_cargo_log")"
 
 # Prune: remove from config, run prune
-echo "" > "$_cargo_conf/deps.conf"
+echo "" >"$_cargo_conf/deps.conf"
 SHDEPS_CONF_DIR="$_cargo_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
 _assert_not_exists "cargo: prune removes install dir" "$HOME/.local/share/mytool"
-_assert_not_exists "cargo: prune removes symlink"     "$HOME/.local/bin/mytool"
+_assert_not_exists "cargo: prune removes symlink" "$HOME/.local/bin/mytool"
 
 # cmd overrides name (e.g. the 'ripgrep' crate installs 'rg'); cargo mock names
 # its output after the crate, so here we only verify the symlink name follows
@@ -2743,7 +2790,7 @@ echo "=== cargo failure modes ==="
 # Missing cargo → single warning, dep skipped, no manifest entry.
 _mock_home
 _cargo_conf=$(_tmpdir)
-cat > "$_cargo_conf/deps.conf" <<'CONF'
+cat >"$_cargo_conf/deps.conf" <<'CONF'
 mytool   cargo
 CONF
 _cargo_missing_out=$(
@@ -2776,13 +2823,13 @@ _assert_eq "cargo: no manifest entry when tool missing" "0" "$_cargo_mfst"
 # Tool exits clean but writes no binary → warning, no manifest entry.
 _mock_home
 _cargo_broken_dir=$(_tmpdir)
-cat > "$_cargo_broken_dir/cargo" <<'SH'
+cat >"$_cargo_broken_dir/cargo" <<'SH'
 #!/usr/bin/env bash
 exit 0
 SH
 chmod +x "$_cargo_broken_dir/cargo"
 _cargo_conf=$(_tmpdir)
-cat > "$_cargo_conf/deps.conf" <<'CONF'
+cat >"$_cargo_conf/deps.conf" <<'CONF'
 brokentool   cargo
 CONF
 PATH="$_cargo_broken_dir:$PATH"
@@ -2811,7 +2858,7 @@ export MOCK_GO_LOG="$_go_log"
 _source_shdeps "$SHDEPS_DIR"
 
 _go_conf=$(_tmpdir)
-cat > "$_go_conf/deps.conf" <<'CONF'
+cat >"$_go_conf/deps.conf" <<'CONF'
 github.com/junegunn/fzf   go
 CONF
 SHDEPS_CONF_DIR="$_go_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
@@ -2826,18 +2873,18 @@ _assert_contains "go: manifest records go method" \
   "${_SHDEPS_MANIFEST["github.com/junegunn/fzf"]:-}"
 
 # TTL-fresh re-run → no new install invocation
-: > "$_go_log"
+: >"$_go_log"
 SHDEPS_CONF_DIR="$_go_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 _assert_eq "go: TTL-fresh re-run skips install" "" "$(cat "$_go_log")"
 
 # Prune
-echo "" > "$_go_conf/deps.conf"
+echo "" >"$_go_conf/deps.conf"
 SHDEPS_CONF_DIR="$_go_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
 _assert_not_exists "go: prune removes nested install dir" "$HOME/.local/share/github.com/junegunn/fzf"
 _assert_not_exists "go: prune removes symlink" "$HOME/.local/bin/fzf"
 # Empty parent dirs under SHDEPS_INSTALL_DIR should be cleaned up too.
 _assert_not_exists "go: prune removes empty parent (owner)" "$HOME/.local/share/github.com/junegunn"
-_assert_not_exists "go: prune removes empty parent (host)"  "$HOME/.local/share/github.com"
+_assert_not_exists "go: prune removes empty parent (host)" "$HOME/.local/share/github.com"
 _assert_dir_exists "go: prune leaves SHDEPS_INSTALL_DIR intact" "$HOME/.local/share"
 
 echo ""
@@ -2846,7 +2893,7 @@ echo "=== go failure modes ==="
 # Missing go → warning, dep skipped, no manifest entry
 _mock_home
 _go_conf=$(_tmpdir)
-cat > "$_go_conf/deps.conf" <<'CONF'
+cat >"$_go_conf/deps.conf" <<'CONF'
 github.com/junegunn/fzf   go
 CONF
 _go_missing_out=$(
@@ -2882,41 +2929,41 @@ export MOCK_UV_LOG="$_uv_log"
 _source_shdeps "$SHDEPS_DIR"
 
 _uv_conf=$(_tmpdir)
-cat > "$_uv_conf/deps.conf" <<'CONF'
+cat >"$_uv_conf/deps.conf" <<'CONF'
 ruff   uv
 CONF
 SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 
 _assert_file_exists "uv: binary installed" "$HOME/.local/share/ruff/bin/ruff"
-_assert_symlink     "uv: bin symlink created" "$HOME/.local/bin/ruff"
-_assert_dir_exists  "uv: tools dir created"   "$HOME/.local/share/ruff/tools"
+_assert_symlink "uv: bin symlink created" "$HOME/.local/bin/ruff"
+_assert_dir_exists "uv: tools dir created" "$HOME/.local/share/ruff/tools"
 
 _shdeps_manifest_read
 _assert_contains "uv: manifest records bin path" \
   "uv|ruff|$HOME/.local/share/ruff/bin/ruff" "${_SHDEPS_MANIFEST[ruff]:-}"
 
 # TTL-fresh re-run → no new install invocation
-: > "$_uv_log"
+: >"$_uv_log"
 SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 _assert_eq "uv: TTL-fresh re-run skips install" "" "$(cat "$_uv_log")"
 
 # Fast-path self-heal
 rm -f "$HOME/.local/bin/ruff"
-: > "$_uv_log"
+: >"$_uv_log"
 SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 _assert_symlink "uv: fast-path restores deleted bin symlink" "$HOME/.local/bin/ruff"
 _assert_eq "uv: self-heal did not rerun uv" "" "$(cat "$_uv_log")"
 
 # --reinstall → --force passed
-: > "$_uv_log"
+: >"$_uv_log"
 SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 SHDEPS_REINSTALL=1 shdeps_update >/dev/null
 _assert_contains "uv: --reinstall passes --force" "force=1" "$(cat "$_uv_log")"
 
 # Prune
-echo "" > "$_uv_conf/deps.conf"
+echo "" >"$_uv_conf/deps.conf"
 SHDEPS_CONF_DIR="$_uv_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
 _assert_not_exists "uv: prune removes install dir" "$HOME/.local/share/ruff"
-_assert_not_exists "uv: prune removes symlink"     "$HOME/.local/bin/ruff"
+_assert_not_exists "uv: prune removes symlink" "$HOME/.local/bin/ruff"
 
 echo ""
 echo "=== uv failure modes ==="
@@ -2924,7 +2971,7 @@ echo "=== uv failure modes ==="
 # Missing uv → warning, dep skipped, no manifest entry.
 _mock_home
 _uv_conf=$(_tmpdir)
-cat > "$_uv_conf/deps.conf" <<'CONF'
+cat >"$_uv_conf/deps.conf" <<'CONF'
 ruff   uv
 CONF
 _uv_missing_out=$(
@@ -2961,40 +3008,40 @@ export MOCK_NPM_LOG="$_npm_log"
 _source_shdeps "$SHDEPS_DIR"
 
 _npm_conf=$(_tmpdir)
-cat > "$_npm_conf/deps.conf" <<'CONF'
+cat >"$_npm_conf/deps.conf" <<'CONF'
 prettier   npm
 CONF
 SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 
 _assert_file_exists "npm: binary installed" "$HOME/.local/share/prettier/bin/prettier"
-_assert_symlink     "npm: bin symlink created" "$HOME/.local/bin/prettier"
+_assert_symlink "npm: bin symlink created" "$HOME/.local/bin/prettier"
 
 _shdeps_manifest_read
 _assert_contains "npm: manifest records bin path" \
   "npm|prettier|$HOME/.local/share/prettier/bin/prettier" "${_SHDEPS_MANIFEST[prettier]:-}"
 
 # TTL-fresh re-run → no new install invocation
-: > "$_npm_log"
+: >"$_npm_log"
 SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 _assert_eq "npm: TTL-fresh re-run skips install" "" "$(cat "$_npm_log")"
 
 # Fast-path self-heal
 rm -f "$HOME/.local/bin/prettier"
-: > "$_npm_log"
+: >"$_npm_log"
 SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 shdeps_update >/dev/null
 _assert_symlink "npm: fast-path restores deleted bin symlink" "$HOME/.local/bin/prettier"
 _assert_eq "npm: self-heal did not rerun npm" "" "$(cat "$_npm_log")"
 
 # --reinstall → --force passed
-: > "$_npm_log"
+: >"$_npm_log"
 SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 SHDEPS_REINSTALL=1 shdeps_update >/dev/null
 _assert_contains "npm: --reinstall passes --force" "force=1" "$(cat "$_npm_log")"
 
 # Prune
-echo "" > "$_npm_conf/deps.conf"
+echo "" >"$_npm_conf/deps.conf"
 SHDEPS_CONF_DIR="$_npm_conf" SHDEPS_QUIET=1 shdeps_prune -y >/dev/null
 _assert_not_exists "npm: prune removes install dir" "$HOME/.local/share/prettier"
-_assert_not_exists "npm: prune removes symlink"     "$HOME/.local/bin/prettier"
+_assert_not_exists "npm: prune removes symlink" "$HOME/.local/bin/prettier"
 
 echo ""
 echo "=== npm failure modes ==="
@@ -3002,7 +3049,7 @@ echo "=== npm failure modes ==="
 # Missing npm → warning, dep skipped, no manifest entry.
 _mock_home
 _npm_conf=$(_tmpdir)
-cat > "$_npm_conf/deps.conf" <<'CONF'
+cat >"$_npm_conf/deps.conf" <<'CONF'
 prettier   npm
 CONF
 _npm_missing_out=$(
@@ -3039,7 +3086,7 @@ _lc_uv_dir=$(_mock_uv_setup)
 _lc_npm_dir=$(_mock_npm_setup)
 PATH="$_lc_cargo_dir:$_lc_go_dir:$_lc_uv_dir:$_lc_npm_dir:$PATH"
 _lc_conf=$(_tmpdir)
-cat > "$_lc_conf/deps.conf" <<'CONF'
+cat >"$_lc_conf/deps.conf" <<'CONF'
 mytool                    cargo
 github.com/junegunn/fzf   go
 ruff                      uv
@@ -3049,11 +3096,11 @@ CONF
 SHDEPS_CONF_DIR="$_lc_conf" SHDEPS_QUIET=1 "$SHDEPS_DIR/bin/shdeps" update >/dev/null 2>&1
 
 _lc_list=$(SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" list 2>&1)
-_assert_contains "list: shows cargo dep"           "mytool"                   "$_lc_list"
-_assert_contains "list: shows cargo as installed"  "mytool"                   "$_lc_list"
-_assert_contains "list: shows go module"           "github.com/junegunn/fzf"  "$_lc_list"
-_assert_contains "list: shows uv dep"              "ruff"                     "$_lc_list"
-_assert_contains "list: shows npm dep"             "prettier"                 "$_lc_list"
+_assert_contains "list: shows cargo dep" "mytool" "$_lc_list"
+_assert_contains "list: shows cargo as installed" "mytool" "$_lc_list"
+_assert_contains "list: shows go module" "github.com/junegunn/fzf" "$_lc_list"
+_assert_contains "list: shows uv dep" "ruff" "$_lc_list"
+_assert_contains "list: shows npm dep" "prettier" "$_lc_list"
 # All rows should be "installed" (not "missing")
 _lc_missing=$(echo "$_lc_list" | grep -cE 'missing' || true)
 _assert_eq "list: no missing entries post-install" "0" "$_lc_missing"
@@ -3070,7 +3117,7 @@ _assert_eq "check: npm dep returns 0" "0" "$?"
 # Empty manifest → missing
 _mock_home
 _lc_empty_conf=$(_tmpdir)
-cat > "$_lc_empty_conf/deps.conf" <<'CONF'
+cat >"$_lc_empty_conf/deps.conf" <<'CONF'
 mytool   cargo
 CONF
 _lc_empty_list=$(SHDEPS_CONF_DIR="$_lc_empty_conf" "$SHDEPS_DIR/bin/shdeps" list 2>&1)
@@ -3091,12 +3138,12 @@ _mock_home
 _pf_conf=$(_tmpdir)
 _pf_hooks=$(_tmpdir)/hooks.d
 mkdir -p "$_pf_hooks"
-cat > "$_pf_conf/deps.conf" <<'CONF'
+cat >"$_pf_conf/deps.conf" <<'CONF'
 pf-a-probe               custom
 pf-z-pkg                 pkg    bash
 CONF
 # Probe records whether it observed the pkg manifest entry at install() time.
-cat > "$_pf_hooks/pf-a-probe.sh" <<'HOOK'
+cat >"$_pf_hooks/pf-a-probe.sh" <<'HOOK'
 exists() { [[ -f "$HOME/pf-probe-ran" ]]; }
 install() {
   : > "$HOME/pf-probe-ran"
@@ -3113,7 +3160,7 @@ export SHDEPS_HOOKS_DIR="$_pf_hooks"
 export SHDEPS_QUIET=1
 _source_shdeps "$SHDEPS_DIR"
 shdeps_update >/dev/null 2>&1
-_assert_file_exists "pkg-first: custom probe ran"      "$HOME/pf-probe-ran"
+_assert_file_exists "pkg-first: custom probe ran" "$HOME/pf-probe-ran"
 _assert_file_exists "pkg-first: probe saw pkg manifest" "$HOME/pf-probe-saw-pkg"
 unset SHDEPS_CONF_DIR SHDEPS_HOOKS_DIR SHDEPS_QUIET
 
@@ -3134,18 +3181,18 @@ _integ_state=$(_tmpdir)
 _integ_hooks="$_integ_dir/hooks.d"
 mkdir -p "$_integ_hooks"
 
-cat > "$_integ_dir/deps.conf" <<'EOF'
+cat >"$_integ_dir/deps.conf" <<'EOF'
 custom-a  custom
 custom-b  custom
 EOF
 
 # Hook for custom-a: exists returns 1 (missing) so install runs
-cat > "$_integ_hooks/custom-a.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-a.sh" <<'HOOK'
 exists() { return 1; }
 install() { echo "custom-a-install" >> "$INTEG_LOG"; return 0; }
 HOOK
 # Hook for custom-b: same
-cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-b.sh" <<'HOOK'
 exists() { return 1; }
 install() { echo "custom-b-install" >> "$INTEG_LOG"; return 0; }
 HOOK
@@ -3159,7 +3206,7 @@ _source_shdeps "$SHDEPS_DIR"
 
 INTEG_LOG="$_integ_dir/integ.log"
 export INTEG_LOG
-: > "$INTEG_LOG"
+: >"$INTEG_LOG"
 
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
@@ -3170,7 +3217,7 @@ _assert_contains "integ: custom-b install ran" "custom-b-install" "$integ_output
 
 # --- Second run: exists still returns 1, install runs again ---
 
-: > "$INTEG_LOG"
+: >"$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
 _assert_contains "integ2: install still runs (exists=1)" "custom-a-install" "$integ_output"
@@ -3178,11 +3225,11 @@ _assert_contains "integ2: install still runs (exists=1)" "custom-a-install" "$in
 # --- Reinstall mode: exists=0 hooks still get install called ---
 
 # Make hooks report as present
-cat > "$_integ_hooks/custom-a.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-a.sh" <<'HOOK'
 exists() { return 0; }
 install() { echo "custom-a-reinstall" >> "$INTEG_LOG"; return 0; }
 HOOK
-cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-b.sh" <<'HOOK'
 exists() { return 0; }
 install() { echo "custom-b-reinstall" >> "$INTEG_LOG"; return 0; }
 HOOK
@@ -3190,7 +3237,7 @@ HOOK
 # Without reinstall: exists=0 → skip
 SHDEPS_REINSTALL=0
 _source_shdeps "$SHDEPS_DIR"
-: > "$INTEG_LOG"
+: >"$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
 _assert_not_contains "integ present: install skipped" "reinstall" "$integ_output"
@@ -3199,7 +3246,7 @@ _assert_not_contains "integ present: install skipped" "reinstall" "$integ_output
 SHDEPS_FORCE=1
 SHDEPS_REINSTALL=1
 _source_shdeps "$SHDEPS_DIR"
-: > "$INTEG_LOG"
+: >"$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
 _assert_contains "integ reinstall: custom-a install ran" "custom-a-reinstall" "$integ_output"
@@ -3214,31 +3261,31 @@ _source_shdeps "$SHDEPS_DIR"
 
 # Create a fake command so _shdeps_exists finds it
 _integ_bin=$(_mock_bin)
-echo '#!/bin/sh' > "$_integ_bin/fake-installed"
+echo '#!/bin/sh' >"$_integ_bin/fake-installed"
 chmod +x "$_integ_bin/fake-installed"
 export PATH="$_integ_bin:$PATH"
 
 # --- Integration with multiple conf files ---
 
 # Restore hooks with exists=1 for multi-file test
-cat > "$_integ_hooks/custom-a.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-a.sh" <<'HOOK'
 exists() { return 1; }
 install() { echo "custom-a-install" >> "$INTEG_LOG"; return 0; }
 HOOK
-cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-b.sh" <<'HOOK'
 exists() { return 1; }
 install() { echo "custom-b-install" >> "$INTEG_LOG"; return 0; }
 HOOK
 
 rm -f "$_integ_dir"/*.conf
-cat > "$_integ_dir/deps.conf" <<'EOF'
+cat >"$_integ_dir/deps.conf" <<'EOF'
 custom-a  custom
 EOF
-cat > "$_integ_dir/extra.conf" <<'EOF'
+cat >"$_integ_dir/extra.conf" <<'EOF'
 custom-b  custom
 EOF
 
-: > "$INTEG_LOG"
+: >"$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
 _assert_contains "integ multi-file: custom-a from deps.conf" "custom-a-install" "$integ_output"
@@ -3254,7 +3301,7 @@ else
 fi
 
 rm -f "$_integ_dir"/*.conf
-cat > "$_integ_dir/deps.conf" <<EOF
+cat >"$_integ_dir/deps.conf" <<EOF
 custom-a  custom  -  -  os:$_skip_plat
 custom-b  custom
 EOF
@@ -3262,7 +3309,7 @@ EOF
 # Platform-filtered custom-a should not run; custom-b should.
 SHDEPS_FORCE=0
 _source_shdeps "$SHDEPS_DIR"
-: > "$INTEG_LOG"
+: >"$INTEG_LOG"
 shdeps_update
 integ_output=$(cat "$INTEG_LOG")
 _assert_not_contains "integ platform: wrong platform skipped" "custom-a-install" "$integ_output"
@@ -3271,10 +3318,10 @@ _assert_contains "integ platform: right platform runs" "custom-b" "$integ_output
 # --- Integration: failed dep install makes update fail ---
 
 rm -f "$_integ_dir"/*.conf
-cat > "$_integ_dir/deps.conf" <<'EOF'
+cat >"$_integ_dir/deps.conf" <<'EOF'
 custom-fail  custom
 EOF
-cat > "$_integ_hooks/custom-fail.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-fail.sh" <<'HOOK'
 exists() { return 1; }
 install() { return 1; }
 HOOK
@@ -3288,11 +3335,11 @@ _assert_exit "integ failure: update exits 1" 1 "$rc"
 # --- Integration: github failure still runs later deps, then exits 1 ---
 
 rm -f "$_integ_dir"/*.conf
-cat > "$_integ_dir/deps.conf" <<'EOF'
+cat >"$_integ_dir/deps.conf" <<'EOF'
 broken/tool  github:release  broken-tool
 custom-b     custom
 EOF
-cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-b.sh" <<'HOOK'
 exists() { return 1; }
 install() { echo "custom-b-after-github-fail" >> "$INTEG_LOG"; return 0; }
 HOOK
@@ -3300,11 +3347,11 @@ HOOK
 _source_shdeps "$SHDEPS_DIR"
 # shellcheck disable=SC2317,SC2329  # test override is invoked indirectly by shdeps_update
 _shdeps_github_release_install() {
-  echo "github-release-failed:$1" >> "$INTEG_LOG"
+  echo "github-release-failed:$1" >>"$INTEG_LOG"
   return 1
 }
 
-: > "$INTEG_LOG"
+: >"$INTEG_LOG"
 rc=0
 shdeps_update >/dev/null 2>&1 || rc=$?
 integ_output=$(cat "$INTEG_LOG")
@@ -3317,11 +3364,11 @@ _assert_eq "integ github failure: later dep in manifest" "custom|custom-b|" "${_
 # --- Integration: github repo failure still runs later deps, then exits 1 ---
 
 rm -f "$_integ_dir"/*.conf
-cat > "$_integ_dir/deps.conf" <<'EOF'
+cat >"$_integ_dir/deps.conf" <<'EOF'
 broken/repo  github:repo
 custom-b     custom
 EOF
-cat > "$_integ_hooks/custom-b.sh" <<'HOOK'
+cat >"$_integ_hooks/custom-b.sh" <<'HOOK'
 exists() { return 1; }
 install() { echo "custom-b-after-git-fail" >> "$INTEG_LOG"; return 0; }
 HOOK
@@ -3329,11 +3376,11 @@ HOOK
 _source_shdeps "$SHDEPS_DIR"
 # shellcheck disable=SC2317,SC2329  # test override is invoked indirectly by shdeps_update
 _shdeps_github_repo_install() {
-  echo "github-repo-failed:$1" >> "$INTEG_LOG"
+  echo "github-repo-failed:$1" >>"$INTEG_LOG"
   return 1
 }
 
-: > "$INTEG_LOG"
+: >"$INTEG_LOG"
 rc=0
 shdeps_update >/dev/null 2>&1 || rc=$?
 integ_output=$(cat "$INTEG_LOG")
@@ -3378,7 +3425,7 @@ _assert_exit "install idempotent: succeeds" 0 $?
 
 # --- Dirty working tree skips pull ---
 
-echo "dirty" >> "$_inst_dir/shdeps.sh"
+echo "dirty" >>"$_inst_dir/shdeps.sh"
 result=$(SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
   SHDEPS_REPO="$_install_repo" "$_install_script" 2>&1)
 _assert_contains "install dirty: skips update" "dirty" "$result"
@@ -3388,7 +3435,7 @@ git -C "$_inst_dir" checkout -- shdeps.sh
 
 _nongit_dir=$(_tmpdir)/shdeps-nongit
 mkdir -p "$_nongit_dir"
-echo "not a repo" > "$_nongit_dir/file"
+echo "not a repo" >"$_nongit_dir/file"
 rc=0
 SHDEPS_DIR="$_nongit_dir" "$_install_script" >/dev/null 2>&1 || rc=$?
 _assert_exit "install non-git dir: exits 1" 1 "$rc"
@@ -3550,7 +3597,7 @@ _assert_neq "self-update: pulled new commit" "$_su_head_before" "$_su_head_after
 
 # --- Dirty working tree skips pull ---
 
-echo "dirty" >> "$_su_dir/shdeps.sh"
+echo "dirty" >>"$_su_dir/shdeps.sh"
 _su_head_before=$(git -C "$_su_dir" rev-parse HEAD)
 _shdeps_self_update "$_su_dir" 2>/dev/null
 _su_head_after=$(git -C "$_su_dir" rev-parse HEAD)
@@ -3690,9 +3737,9 @@ _idem_dir=$(_tmpdir)
 mkdir -p "$_idem_dir/share/man/man1"
 touch "$_idem_dir/share/man/man1/idem.1"
 _shdeps_link_extras "idem-tool" "$_idem_dir"
-_idem_count1=$(wc -l < "$(_shdeps_state_dir)/idem-tool.links")
+_idem_count1=$(wc -l <"$(_shdeps_state_dir)/idem-tool.links")
 _shdeps_link_extras "idem-tool" "$_idem_dir"
-_idem_count2=$(wc -l < "$(_shdeps_state_dir)/idem-tool.links")
+_idem_count2=$(wc -l <"$(_shdeps_state_dir)/idem-tool.links")
 
 _assert_symlink "idempotent: symlink still exists" "$HOME/.local/share/man/man1/idem.1"
 _assert_eq "idempotent: .links line count unchanged" "$_idem_count1" "$_idem_count2"
