@@ -214,11 +214,11 @@ _shdeps_log() {
   return 0
 }
 
-# Warning (red, always to stderr).
+# Warning (yellow, always to stderr). Red is reserved for hard errors.
 _shdeps_warn() {
   _shdeps_log_clear
   if _shdeps_should_log; then
-    printf '%s%s%s\n' "${_SHDEPS_C_RED}" "$*" "${_SHDEPS_C_RESET}" >&2
+    printf '%s%s%s\n' "${_SHDEPS_C_YELLOW}" "$*" "${_SHDEPS_C_RESET}" >&2
   fi
   return 0
 }
