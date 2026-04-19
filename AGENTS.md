@@ -49,7 +49,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 
 ## Config File Format
 
-```
+```text
 # name              method           [cmd]            [aliases]                [filter]
 jq                  pkg
 bat                 pkg              apt:batcat

@@ -1,0 +1,10 @@
+{
+  // Rules tuned for README-style docs with shield badges and
+  // wide table/URL lines. Keep MD040 (code-fence language) enabled
+  // since it materially helps syntax highlighting on GitHub.
+  "config": {
+    "MD013": false, // line-length — badges/URLs/tables regularly exceed
+    "MD033": false, // inline HTML — shield badges need <p>/<img>
+    "MD042": false  // empty links — [![badge](img)]() is a common idiom
+  }
+}

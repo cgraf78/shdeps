@@ -65,7 +65,7 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 
 ### Config File Format
 
-```
+```text
 # name    method    [cmd]  [aliases]  [filter]
 ```
 
@@ -101,7 +101,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 
 Installs via the detected package manager (brew, apt, dnf, or pacman). Packages are batched into a single install command for speed.
 
-```
+```text
 jq        pkg
 bat       pkg    apt:batcat
 fd        pkg    apt:fdfind       apt:fd-find,dnf:fd-find
@@ -115,7 +115,7 @@ Use `aliases` to map names across package managers. Use `NONE` to skip a dep on 
 
 Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<owner>/<repo>` (default `~/.local/share/<owner>/<repo>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<repo>` (default `~/git/<repo>`, symlinked for live development). Falls back to a shallow clone for fresh installs.
 
-```
+```text
 cgraf78/ds.git    github:repo
 ```
 
@@ -125,7 +125,7 @@ The `owner/repo` is the `name` field. Override the repo URL with `SHDEPS_<NAME>_
 
 Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries.
 
-```
+```text
 neovim/neovim    github:release    nvim
 mvdan/sh         github:release
 ```
@@ -136,7 +136,7 @@ The `owner/repo` is the `name` field.
 
 Installs crates from crates.io via `cargo install --root "$SHDEPS_INSTALL_DIR/<name>" <name>`. Binaries land in a per-dep install directory and are symlinked into `$SHDEPS_BIN_DIR`.
 
-```
+```text
 ripgrep   cargo    rg
 tokei     cargo
 ```
@@ -149,7 +149,7 @@ Requires `cargo` on `$PATH`. If absent, shdeps warns once at startup and skips a
 
 Installs Go binaries via `GOBIN=... go install <module>@latest`. Supports any module host (github.com, golang.org, k8s.io, private registries).
 
-```
+```text
 github.com/junegunn/fzf             go
 golang.org/x/tools/cmd/goimports    go
 github.com/charmbracelet/gum        go    gum
@@ -163,7 +163,7 @@ Requires `go` on `$PATH`. If absent, shdeps warns once at startup and skips all 
 
 Installs Python CLI tools from PyPI via `uv tool install`. Each dep gets its own isolated venv under `$SHDEPS_INSTALL_DIR/<name>/tools/` with the binary at `$SHDEPS_INSTALL_DIR/<name>/bin/<cmd>`, symlinked into `$SHDEPS_BIN_DIR`.
 
-```
+```text
 ruff      uv
 black     uv
 mypy      uv
@@ -178,7 +178,7 @@ Requires `uv` on `$PATH` (install via `pipx install uv`, `brew install uv`, or [
 
 No built-in install logic. Entirely managed by a post-install hook file.
 
-```
+```text
 nerd-fonts    custom
 ```
 
@@ -227,7 +227,7 @@ Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdep
 
 ## CLI Usage
 
-```
+```text
 Usage: shdeps [options] <command> [args]
 
 Commands:
