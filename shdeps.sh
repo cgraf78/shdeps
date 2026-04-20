@@ -104,6 +104,35 @@ _shdeps_install_dir() { echo "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"; }
 _shdeps_bin_dir() { echo "${SHDEPS_BIN_DIR:-$HOME/.local/bin}"; }
 _shdeps_log_level() { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 
+# Resolve env-var-backed config into _SHDEPS_C_* globals so hot paths can
+# read variables directly instead of forking a subshell per accessor call.
+# Also captures the current epoch in _SHDEPS_CFG_NOW via a bash builtin so TTL
+# checks and stamp writes avoid forking `date`. Idempotent — safe to call
+# repeatedly; re-runs pick up any env changes (e.g. CLI flags toggling
+# SHDEPS_FORCE between commands).
+_shdeps_init_cache() {
+  _SHDEPS_CFG_STATE_DIR="${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}"
+  _SHDEPS_CFG_INSTALL_DIR="${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"
+  _SHDEPS_CFG_BIN_DIR="${SHDEPS_BIN_DIR:-$HOME/.local/bin}"
+  _SHDEPS_CFG_GIT_DEV_DIR="${SHDEPS_GIT_DEV_DIR:-$HOME/git}"
+  _SHDEPS_CFG_FORCE="${SHDEPS_FORCE:-0}"
+  _SHDEPS_CFG_REINSTALL="${SHDEPS_REINSTALL:-0}"
+  _SHDEPS_CFG_QUIET="${SHDEPS_QUIET:-0}"
+  _SHDEPS_CFG_REMOTE_TTL="${SHDEPS_REMOTE_TTL:-3600}"
+  _SHDEPS_CFG_LOG_LEVEL="${SHDEPS_LOG_LEVEL:-1}"
+  # Conf dir needs absolute-path normalization; only fork when relative so
+  # the common (absolute-path) case stays fork-free.
+  local _conf="${SHDEPS_CONF_DIR:-./shdeps}"
+  if [[ "$_conf" != /* ]]; then
+    _conf="$(cd "$_conf" 2>/dev/null && pwd)" || _conf="$PWD/$_conf"
+  fi
+  _SHDEPS_CFG_CONF_DIR="$_conf"
+  _SHDEPS_CFG_HOOKS_DIR="${SHDEPS_HOOKS_DIR:-$_conf/hooks.d}"
+  # Bash 4.2+ builtin — no fork. Fall back to `date` on older bash.
+  printf -v _SHDEPS_CFG_NOW '%(%s)T' -1 2>/dev/null \
+    || _SHDEPS_CFG_NOW=$(date +%s 2>/dev/null || echo 0)
+}
+
 # Target directory accessors for extras linking (man pages, completions).
 # Man pages route to section subdirs: _shdeps_man_dir 1 → .../man/man1/
 _shdeps_man_dir() {
@@ -354,9 +383,9 @@ _shdeps_maybe_prime_sudo() {
 # Each non-blank, non-comment line becomes a pipe-delimited entry via
 # word splitting.
 _shdeps_load() {
+  _shdeps_init_cache
   _SHDEPS_DEPS=()
-  local conf_dir
-  conf_dir=$(_shdeps_conf_dir)
+  local conf_dir="$_SHDEPS_CFG_CONF_DIR"
 
   # Collect sorted *.conf files
   local -a conf_files=()
@@ -879,42 +908,42 @@ _shdeps_pkg_install_batch() {
 # Return path for a dep's cache stamp file.
 # $1=name $2=kind (repo, release, etc.)
 _shdeps_remote_stamp() {
+  _shdeps_init_cache
   local name="$1" kind="$2"
-  echo "$(_shdeps_state_dir)/${name}.${kind}.stamp"
+  printf '%s\n' "$_SHDEPS_CFG_STATE_DIR/${name}.${kind}.stamp"
 }
 
 # Check if a stamp is still fresh (within TTL). Returns 0 if fresh.
 # Force or reinstall mode always returns 1 (stale).
 _shdeps_remote_fresh() {
+  _shdeps_init_cache
   local stamp="$1"
-  if [[ "$(_shdeps_force)" -eq 1 || "$(_shdeps_reinstall)" -eq 1 ]]; then return 1; fi
+  if [[ "$_SHDEPS_CFG_FORCE" -eq 1 || "$_SHDEPS_CFG_REINSTALL" -eq 1 ]]; then return 1; fi
   [[ -f "$stamp" ]] || return 1
 
-  local cached="" now="" ttl=""
+  local cached=""
   read -r cached <"$stamp" || return 1
-  now=$(date +%s 2>/dev/null || true)
-  ttl=$(_shdeps_remote_ttl)
 
   [[ "$cached" =~ ^[0-9]+$ ]] || return 1
-  [[ "$now" =~ ^[0-9]+$ ]] || return 1
-  [[ "$ttl" =~ ^[0-9]+$ ]] || return 1
+  [[ "$_SHDEPS_CFG_NOW" =~ ^[0-9]+$ ]] || return 1
+  [[ "$_SHDEPS_CFG_REMOTE_TTL" =~ ^[0-9]+$ ]] || return 1
 
-  ((now - cached < ttl))
+  ((_SHDEPS_CFG_NOW - cached < _SHDEPS_CFG_REMOTE_TTL))
 }
 
 # Touch (update) a stamp with the current epoch time.
 _shdeps_remote_touch() {
+  _shdeps_init_cache
   local stamp="$1"
-  local stamp_dir
-  stamp_dir=$(dirname "$stamp")
-  mkdir -p "$stamp_dir" || return 1
-  date +%s >"$stamp"
+  mkdir -p "${stamp%/*}" || return 1
+  printf '%s\n' "$_SHDEPS_CFG_NOW" >"$stamp"
 }
 
 # Return path for a dep's git revision stamp.
 _shdeps_rev_stamp() {
+  _shdeps_init_cache
   local name="$1"
-  echo "$(_shdeps_state_dir)/${name}.rev"
+  printf '%s\n' "$_SHDEPS_CFG_STATE_DIR/${name}.rev"
 }
 
 # Read the cached git revision for a dep. Sets REPLY.
@@ -931,9 +960,7 @@ _shdeps_rev_touch() {
   local name="$1" rev="$2"
   local stamp
   stamp=$(_shdeps_rev_stamp "$name")
-  local stamp_dir
-  stamp_dir=$(dirname "$stamp")
-  mkdir -p "$stamp_dir" || return 1
+  mkdir -p "${stamp%/*}" || return 1
   printf '%s\n' "$rev" >"$stamp"
 }
 
@@ -943,7 +970,8 @@ _shdeps_rev_touch() {
 
 # Return path to the manifest file.
 _shdeps_manifest_path() {
-  echo "$(_shdeps_state_dir)/manifest"
+  _shdeps_init_cache
+  printf '%s\n' "$_SHDEPS_CFG_STATE_DIR/manifest"
 }
 
 # Read the manifest file into _SHDEPS_MANIFEST associative array.
@@ -960,15 +988,42 @@ _shdeps_manifest_read() {
   done <"$manifest"
 }
 
+# Rewrite the manifest file from the in-memory _SHDEPS_MANIFEST array.
+# Batch endpoint: _shdeps_update / _shdeps_prune accumulate upserts and
+# removes in memory, then call this once to persist. Single atomic write
+# replaces the previous O(N) per-dep rewrites.
+_shdeps_manifest_flush() {
+  local manifest
+  manifest=$(_shdeps_manifest_path)
+  mkdir -p "${manifest%/*}" || return 1
+  local tmp="$manifest.tmp.$$"
+  : >"$tmp" || return 1
+  # ${var+x} is unreliable for assoc arrays; test element count instead.
+  if ((${#_SHDEPS_MANIFEST[@]} > 0)); then
+    local name
+    for name in "${!_SHDEPS_MANIFEST[@]}"; do
+      printf '%s|%s\n' "$name" "${_SHDEPS_MANIFEST[$name]}" >>"$tmp"
+    done
+  fi
+  mv "$tmp" "$manifest"
+}
+
 # Add or update a manifest entry.
+# In batch mode (_SHDEPS_MANIFEST_BATCH=1), updates the in-memory
+# _SHDEPS_MANIFEST array only; _shdeps_manifest_flush persists to disk.
+# Outside batch mode, writes directly to disk (preserves original
+# semantics for callers that don't bracket work with read/flush).
 # $1=name $2=method $3=cmd $4=install_path
 _shdeps_manifest_upsert() {
   local name="$1" method="$2" cmd="$3" install_path="${4:-}"
+  if [[ "${_SHDEPS_MANIFEST_BATCH:-0}" -eq 1 ]]; then
+    declare -gA _SHDEPS_MANIFEST
+    _SHDEPS_MANIFEST[$name]="$method|$cmd|$install_path"
+    return 0
+  fi
   local manifest
   manifest=$(_shdeps_manifest_path)
-  local manifest_dir
-  manifest_dir=$(dirname "$manifest")
-  mkdir -p "$manifest_dir" || return 1
+  mkdir -p "${manifest%/*}" || return 1
   # Remove existing entry (awk handles / in owner/repo names safely)
   if [[ -f "$manifest" ]]; then
     local tmp="$manifest.tmp.$$"
@@ -978,9 +1033,14 @@ _shdeps_manifest_upsert() {
   printf '%s\n' "$name|$method|$cmd|$install_path" >>"$manifest"
 }
 
-# Remove a manifest entry by name.
+# Remove a manifest entry by name. Mirrors _shdeps_manifest_upsert's
+# batch-mode semantics.
 _shdeps_manifest_remove() {
   local name="$1"
+  if [[ "${_SHDEPS_MANIFEST_BATCH:-0}" -eq 1 ]]; then
+    unset "_SHDEPS_MANIFEST[$name]" 2>/dev/null
+    return 0
+  fi
   local manifest
   manifest=$(_shdeps_manifest_path)
   [[ -f "$manifest" ]] || return 0
@@ -1018,10 +1078,9 @@ _shdeps_detect_orphans() {
 
 # Remove state stamps for a dep.
 _shdeps_remove_stamps() {
+  _shdeps_init_cache
   local name="$1"
-  local state_dir
-  state_dir=$(_shdeps_state_dir)
-  rm -f "$state_dir/$name".*.stamp "$state_dir/$name.rev"
+  rm -f "$_SHDEPS_CFG_STATE_DIR/$name".*.stamp "$_SHDEPS_CFG_STATE_DIR/$name.rev"
 }
 
 # Remove artifacts for one orphaned dep.
@@ -1029,12 +1088,12 @@ _shdeps_remove_stamps() {
 # built-in cleanup per method.
 # $1=name $2=method $3=cmd $4=install_path
 _shdeps_remove_dep() {
+  _shdeps_init_cache
   local name="$1" method="$2" cmd="$3" install_path="$4"
 
   # Run uninstall() hook if present (reverses what post()/install() created)
-  local hooks_dir hook_file _had_uninstall=0
-  hooks_dir=$(_shdeps_hooks_dir)
-  hook_file="$hooks_dir/$name.sh"
+  local hook_file _had_uninstall=0
+  hook_file="$_SHDEPS_CFG_HOOKS_DIR/$name.sh"
   if [[ -f "$hook_file" ]]; then
     unset -f exists version install post uninstall 2>/dev/null
     # shellcheck source=/dev/null
@@ -1062,27 +1121,25 @@ _shdeps_remove_dep() {
         [[ "$rm_path" != /* ]] && rm_path="${HOME:?}/$rm_path"
         rm -rf "$rm_path"
       fi
-      rm -f "$(_shdeps_bin_dir)/$(_shdeps_short_name "$name")"
+      rm -f "$_SHDEPS_CFG_BIN_DIR/${name##*/}"
       _shdeps_remove_stamps "$name"
       _shdeps_log_ok "  $name removed"
       ;;
     github:release | cargo | go | uv | npm)
       _shdeps_unlink_extras "$name"
-      rm -f "$(_shdeps_bin_dir)/$cmd"
-      local binary_install_dir
-      binary_install_dir="$(_shdeps_install_dir)/$name"
+      rm -f "$_SHDEPS_CFG_BIN_DIR/$cmd"
+      local binary_install_dir="$_SHDEPS_CFG_INSTALL_DIR/$name"
       if [[ -d "$binary_install_dir" ]]; then
         rm -rf "$binary_install_dir"
       fi
       # For nested names (e.g. go module paths like github.com/owner/repo),
       # rmdir walks up and removes now-empty parent dirs. rmdir fails on
       # non-empty dirs so siblings are left intact.
-      local parent base
-      parent=$(dirname "$binary_install_dir")
-      base=$(_shdeps_install_dir)
+      local parent base="$_SHDEPS_CFG_INSTALL_DIR"
+      parent="${binary_install_dir%/*}"
       while [[ "$parent" != "$base" && "$parent" != / ]]; do
         rmdir "$parent" 2>/dev/null || break
-        parent=$(dirname "$parent")
+        parent="${parent%/*}"
       done
       _shdeps_remove_stamps "$name"
       _shdeps_log_ok "  $name removed"
@@ -1103,6 +1160,7 @@ _shdeps_remove_dep() {
 # Remove all orphaned deps (in manifest but not in config).
 # Flags: -y (skip confirmation), --dry-run (show what would be removed).
 _shdeps_prune() {
+  _shdeps_init_cache
   local yes=0 dry_run=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1170,12 +1228,16 @@ _shdeps_prune() {
     fi
   fi
 
-  # Remove each orphan
+  # Remove each orphan. Defer manifest writes until the loop is done —
+  # one flush instead of N rewrites of the file.
+  _SHDEPS_MANIFEST_BATCH=1
   for orphan in "${_SHDEPS_ORPHANS[@]}"; do
     IFS='|' read -r o_name o_method o_cmd o_install_path <<<"$orphan"
     _shdeps_remove_dep "$o_name" "$o_method" "$o_cmd" "$o_install_path" || true
     _shdeps_manifest_remove "$o_name"
   done
+  _SHDEPS_MANIFEST_BATCH=0
+  _shdeps_manifest_flush
 }
 
 # ---------------------------------------------------------------------------
@@ -1204,10 +1266,11 @@ _shdeps_get_version() {
 # Symlink an executable at $bin_path into $SHDEPS_BIN_DIR as $cmd.
 # Primitive used by callers that already know the absolute bin path.
 _shdeps_link_bin() {
+  _shdeps_init_cache
   local cmd="$1" bin_path="$2"
   [[ -x "$bin_path" ]] || return 0
-  mkdir -p "$(_shdeps_bin_dir)"
-  ln -sf "$bin_path" "$(_shdeps_bin_dir)/$cmd"
+  mkdir -p "$_SHDEPS_CFG_BIN_DIR"
+  ln -sf "$bin_path" "$_SHDEPS_CFG_BIN_DIR/$cmd"
 }
 
 # Legacy wrapper: derive cmd from short_name(name) and bin path from
@@ -1222,10 +1285,9 @@ _shdeps_link_bin_from_dir() {
 
 # Remove symlinks tracked in a dep's .links state file.
 _shdeps_unlink_extras() {
+  _shdeps_init_cache
   local name="$1"
-  local state_dir
-  state_dir=$(_shdeps_state_dir)
-  local links_file="$state_dir/$name.links"
+  local links_file="$_SHDEPS_CFG_STATE_DIR/$name.links"
   [[ -f "$links_file" ]] || return 0
   while IFS= read -r link; do
     [[ -L "$link" ]] && rm -f "$link"
@@ -1241,7 +1303,7 @@ _shdeps_extras_add() {
   seen[$tgt]=1
   # Create parent dirs with 0755 regardless of umask so zsh compaudit
   # doesn't flag them as insecure (group/other-writable).
-  (umask 022 && mkdir -p "$(dirname "$tgt")")
+  (umask 022 && mkdir -p "${tgt%/*}")
   ln -sf "$src" "$tgt"
   created_links+=("$tgt")
 }
@@ -1249,14 +1311,15 @@ _shdeps_extras_add() {
 # Discover man pages and shell completions in a dep's install dir and
 # symlink them to XDG user-local directories for discoverability.
 _shdeps_link_extras() {
+  _shdeps_init_cache
   local name="$1" install_dir="$2"
   [[ -d "$install_dir" ]] || return 0
 
   # Clean stale symlinks from previous version before re-linking
   _shdeps_unlink_extras "$name"
 
-  local state_dir
-  state_dir=$(_shdeps_state_dir)
+  local state_dir="$_SHDEPS_CFG_STATE_DIR"
+  local man_base="$_SHDEPS_CFG_INSTALL_DIR/man"
   local -a created_links=()
   local -A seen=()
   local pattern file base section tgt_dir comp_dir name_nogz tgt_name
@@ -1267,46 +1330,46 @@ _shdeps_link_extras() {
     if [[ "$pattern" != */* ]]; then
       while IFS= read -r -d '' file; do
         [[ -f "$file" ]] || continue
-        base=$(basename "$file")
+        base="${file##*/}"
         name_nogz="$base"
         [[ "$name_nogz" == *.gz ]] && name_nogz="${name_nogz%.gz}"
         section="${name_nogz##*.}"
-        tgt_dir=$(_shdeps_man_dir "$section")
+        tgt_dir="$man_base/man${section}"
         _shdeps_extras_add "$file" "$tgt_dir/$base"
       done < <(find "$install_dir" -maxdepth 1 -name "$pattern" -print0 2>/dev/null)
     else
       # shellcheck disable=SC2086
       for file in "$install_dir"/$pattern; do
         [[ -f "$file" ]] || continue
-        base=$(basename "$file")
+        base="${file##*/}"
         name_nogz="$base"
         [[ "$name_nogz" == *.gz ]] && name_nogz="${name_nogz%.gz}"
         section="${name_nogz##*.}"
-        tgt_dir=$(_shdeps_man_dir "$section")
+        tgt_dir="$man_base/man${section}"
         _shdeps_extras_add "$file" "$tgt_dir/$base"
       done
     fi
   done
 
   # --- Bash completions ---
-  comp_dir=$(_shdeps_bash_comp_dir)
+  comp_dir="$_SHDEPS_CFG_INSTALL_DIR/bash-completion/completions"
   for pattern in "${_SHDEPS_BASH_COMP_PATTERNS[@]}"; do
     # shellcheck disable=SC2086
     for file in "$install_dir"/$pattern; do
       [[ -f "$file" ]] || continue
-      base=$(basename "$file")
+      base="${file##*/}"
       tgt_name="${base%.bash}"
       _shdeps_extras_add "$file" "$comp_dir/$tgt_name"
     done
   done
 
   # --- Zsh completions ---
-  comp_dir=$(_shdeps_zsh_comp_dir)
+  comp_dir="$_SHDEPS_CFG_INSTALL_DIR/zsh/site-functions"
   for pattern in "${_SHDEPS_ZSH_COMP_PATTERNS[@]}"; do
     # shellcheck disable=SC2086
     for file in "$install_dir"/$pattern; do
       [[ -f "$file" ]] || continue
-      base=$(basename "$file")
+      base="${file##*/}"
       # .zsh files need renaming to _<cmd> for fpath discovery
       if [[ "$base" == *.zsh ]]; then
         tgt_name="_${base%.zsh}"
@@ -1320,20 +1383,21 @@ _shdeps_link_extras() {
   done
 
   # --- Fish completions ---
-  comp_dir=$(_shdeps_fish_comp_dir)
+  comp_dir="$_SHDEPS_CFG_INSTALL_DIR/fish/vendor_completions.d"
   for pattern in "${_SHDEPS_FISH_COMP_PATTERNS[@]}"; do
     # shellcheck disable=SC2086
     for file in "$install_dir"/$pattern; do
       [[ -f "$file" ]] || continue
-      base=$(basename "$file")
+      base="${file##*/}"
       _shdeps_extras_add "$file" "$comp_dir/$base"
     done
   done
 
   # Write state file for cleanup tracking
   if [[ ${#created_links[@]} -gt 0 ]]; then
-    mkdir -p "$(dirname "$state_dir/$name.links")"
-    printf '%s\n' "${created_links[@]}" >"$state_dir/$name.links"
+    local links_file="$state_dir/$name.links"
+    mkdir -p "${links_file%/*}"
+    printf '%s\n' "${created_links[@]}" >"$links_file"
     _SHDEPS_EXTRAS_LINKED=1
   fi
 }
@@ -1342,8 +1406,7 @@ _shdeps_link_extras() {
 # Called at the end of _shdeps_update to avoid interrupting the dep list.
 _shdeps_extras_hint() {
   [[ "${_SHDEPS_EXTRAS_LINKED:-0}" -eq 1 ]] || return 0
-  local state_dir
-  state_dir=$(_shdeps_state_dir)
+  local state_dir="$_SHDEPS_CFG_STATE_DIR"
   local stamp="$state_dir/extras-hint.shown"
   [[ -f "$stamp" ]] && return 0
   mkdir -p "$state_dir"
@@ -1413,7 +1476,7 @@ _shdeps_github_repo_install_local() {
   elif [[ "$rev_before" != "$rev_after" ]]; then
     _SHDEPS_CHANGED[$name]=1
     _shdeps_log_ok "  $name updated${ver:+ -- $ver} (local clone)"
-  elif [[ "$dirty_after" -eq 1 || "$(_shdeps_reinstall)" -eq 1 ]]; then
+  elif [[ "$dirty_after" -eq 1 || "$_SHDEPS_CFG_REINSTALL" -eq 1 ]]; then
     _SHDEPS_CHANGED[$name]=1
     _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver} (local clone)"
   else
@@ -1449,7 +1512,7 @@ _shdeps_github_repo_install_pull() {
     if [[ "$head_before" != "$head_after" ]]; then
       _SHDEPS_CHANGED[$name]=1
       _shdeps_log_ok "  $name updated${ver:+ -- $ver}"
-    elif [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
+    elif [[ "$_SHDEPS_CFG_REINSTALL" -eq 1 ]]; then
       _SHDEPS_CHANGED[$name]=1
       _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
     else
@@ -1498,7 +1561,7 @@ _shdeps_github_repo_install_fresh() {
   local ver
   ver=$(_shdeps_get_version "$install_dir")
 
-  if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$(_shdeps_reinstall)" -ne 1 ]]; then
+  if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$_SHDEPS_CFG_REINSTALL" -ne 1 ]]; then
     _shdeps_log "  $name${ver:+ -- $ver}"
   else
     _SHDEPS_CHANGED[$name]=1
@@ -1514,6 +1577,7 @@ _shdeps_github_repo_install_fresh() {
 # Priority: $SHDEPS_GIT_DEV_DIR/<short_name> (symlink) > existing clone (pull) > fresh clone.
 # Env var override: SHDEPS_<NAME>_REPO overrides the repo URL.
 _shdeps_github_repo_install() {
+  _shdeps_init_cache
   local name="$1" default_repo="$2" install_dir="$3"
   local short
   short=$(_shdeps_short_name "$name")
@@ -1522,7 +1586,7 @@ _shdeps_github_repo_install() {
   local env_var="SHDEPS_${upper}_REPO"
   local repo="${!env_var:-https://github.com/$default_repo}"
   local local_clone
-  local_clone="$(_shdeps_git_dev_dir)/$short"
+  local_clone="$_SHDEPS_CFG_GIT_DEV_DIR/$short"
   local stamp
   stamp=$(_shdeps_remote_stamp "$name" repo)
   local log=""
@@ -1766,7 +1830,7 @@ _shdeps_github_release_install_from_extracted() {
 
   # Move extracted contents to $SHDEPS_INSTALL_DIR/<name>
   local install_dir
-  install_dir="$(_shdeps_install_dir)/$name"
+  install_dir="$_SHDEPS_CFG_INSTALL_DIR/$name"
   rm -rf "$install_dir"
   mkdir -p "$(dirname "$install_dir")"
   mv "$extract_dir" "$install_dir"
@@ -1829,9 +1893,10 @@ _shdeps_github_release_install_zip() {
 # Handles tarballs, zips, compressed singles (.gz/.bz2/.zst), and raw binaries.
 # $1=name (owner/repo) $2=cmd
 _shdeps_github_release_install() {
+  _shdeps_init_cache
   local name="$1" cmd="$2" gh_repo="$1"
   local bin_path
-  bin_path="$(_shdeps_bin_dir)/$cmd"
+  bin_path="$_SHDEPS_CFG_BIN_DIR/$cmd"
   local current_ver="" latest_ver=""
   local log=""
   local stamp
@@ -1841,7 +1906,7 @@ _shdeps_github_release_install() {
   # Avoids temp file creation, API calls, and asset matching.
   if [[ -x "$bin_path" ]] && _shdeps_remote_fresh "$stamp"; then
     local install_dir
-    install_dir="$(_shdeps_install_dir)/$name"
+    install_dir="$_SHDEPS_CFG_INSTALL_DIR/$name"
     _shdeps_link_extras "$name" "$install_dir"
     current_ver=$(_shdeps_dep_version "$cmd")
     _shdeps_log "  $name -- $current_ver"
@@ -1889,11 +1954,11 @@ _shdeps_github_release_install() {
   latest_ver_num=$(echo "$latest_ver" | grep -oE '[0-9]+\.[0-9]+[0-9.]*' | head -1)
 
   # Skip if already at latest (unless reinstall mode)
-  if [[ "$(_shdeps_reinstall)" -ne 1 && -n "$current_ver" && -n "$latest_ver_num" && "$current_ver" == "$latest_ver_num" ]]; then
+  if [[ "$_SHDEPS_CFG_REINSTALL" -ne 1 && -n "$current_ver" && -n "$latest_ver_num" && "$current_ver" == "$latest_ver_num" ]]; then
     rm -f "$tmp_file" "$log"
     _shdeps_remote_touch "$stamp" || true
     local install_dir
-    install_dir="$(_shdeps_install_dir)/$name"
+    install_dir="$_SHDEPS_CFG_INSTALL_DIR/$name"
     _shdeps_link_extras "$name" "$install_dir"
     _shdeps_log "  $name -- $current_ver"
     return 0
@@ -1929,7 +1994,7 @@ _shdeps_github_release_install() {
     return 1
   fi
 
-  mkdir -p "$(_shdeps_bin_dir)"
+  mkdir -p "$_SHDEPS_CFG_BIN_DIR"
 
   # Install based on asset type: archive, compressed single, or direct binary
   local asset_lower="${asset_url,,}"
@@ -2000,12 +2065,13 @@ _shdeps_github_release_install() {
 # failure or when the required tool is missing — caller MUST skip
 # manifest upsert so we never claim success for a broken install.
 _shdeps_external_install() {
+  _shdeps_init_cache
   local name="$1" method="$2" cmd="$3" tool="$4"
   local -n install_argv="$5"
   local force_flag="${6:-}"
 
   local install_dir bin_path stamp
-  install_dir="$(_shdeps_install_dir)/$name"
+  install_dir="$_SHDEPS_CFG_INSTALL_DIR/$name"
   bin_path="$install_dir/bin/$cmd"
   stamp=$(_shdeps_remote_stamp "$name" "$method")
 
@@ -2035,7 +2101,7 @@ _shdeps_external_install() {
   mkdir -p "$install_dir/bin" || return 1
 
   local -a argv=("${install_argv[@]}")
-  if [[ -n "$force_flag" && "$(_shdeps_reinstall)" -eq 1 ]]; then
+  if [[ -n "$force_flag" && "$_SHDEPS_CFG_REINSTALL" -eq 1 ]]; then
     argv+=("$force_flag")
   fi
 
@@ -2067,7 +2133,7 @@ _shdeps_external_install() {
   elif [[ -n "$prev_ver" && -n "$ver" && "$prev_ver" != "$ver" ]]; then
     _SHDEPS_CHANGED[$name]=1
     _shdeps_log_ok "  $name updated -- $prev_ver -> $ver"
-  elif [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
+  elif [[ "$_SHDEPS_CFG_REINSTALL" -eq 1 ]]; then
     _SHDEPS_CHANGED[$name]=1
     _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
   else
@@ -2082,6 +2148,7 @@ _shdeps_external_install() {
 
 # Route a dep registry entry to the appropriate install method.
 _shdeps_install_dep() {
+  _shdeps_init_cache
   local entry="$1"
   _shdeps_parse "$entry"
 
@@ -2112,31 +2179,31 @@ _shdeps_install_dep() {
       ;;
     github:repo)
       local _git_install_dir
-      _git_install_dir="$(_shdeps_install_dir)/$_name"
+      _git_install_dir="$_SHDEPS_CFG_INSTALL_DIR/$_name"
       _shdeps_github_repo_install "$_name" "$_name" "$_git_install_dir" || return 1
       _shdeps_manifest_upsert "$_name" "github:repo" "$_cmd" "$_git_install_dir"
       ;;
     github:release)
       _shdeps_github_release_install "$_name" "$_cmd" || return 1
-      _shdeps_manifest_upsert "$_name" "github:release" "$_cmd" "$(_shdeps_bin_dir)/$_cmd"
+      _shdeps_manifest_upsert "$_name" "github:release" "$_cmd" "$_SHDEPS_CFG_BIN_DIR/$_cmd"
       ;;
     cargo)
       local _cargo_install_dir
-      _cargo_install_dir="$(_shdeps_install_dir)/$_name"
+      _cargo_install_dir="$_SHDEPS_CFG_INSTALL_DIR/$_name"
       local -a _cargo_argv=(cargo install --locked --root "$_cargo_install_dir" "$_name")
       _shdeps_external_install "$_name" cargo "$_cmd" cargo _cargo_argv "--force" || return 1
       _shdeps_manifest_upsert "$_name" cargo "$_cmd" "$_cargo_install_dir/bin/$_cmd"
       ;;
     go)
       local _go_install_dir
-      _go_install_dir="$(_shdeps_install_dir)/$_name"
+      _go_install_dir="$_SHDEPS_CFG_INSTALL_DIR/$_name"
       local -a _go_argv=(env "GOBIN=$_go_install_dir/bin" go install "$_name@latest")
       _shdeps_external_install "$_name" go "$_cmd" go _go_argv "" || return 1
       _shdeps_manifest_upsert "$_name" go "$_cmd" "$_go_install_dir/bin/$_cmd"
       ;;
     uv)
       local _uv_install_dir
-      _uv_install_dir="$(_shdeps_install_dir)/$_name"
+      _uv_install_dir="$_SHDEPS_CFG_INSTALL_DIR/$_name"
       local -a _uv_argv=(
         env "UV_TOOL_DIR=$_uv_install_dir/tools" "UV_TOOL_BIN_DIR=$_uv_install_dir/bin"
         uv tool install "$_name"
@@ -2146,16 +2213,14 @@ _shdeps_install_dep() {
       ;;
     npm)
       local _npm_install_dir
-      _npm_install_dir="$(_shdeps_install_dir)/$_name"
+      _npm_install_dir="$_SHDEPS_CFG_INSTALL_DIR/$_name"
       local -a _npm_argv=(npm install -g --prefix "$_npm_install_dir" "$_name")
       _shdeps_external_install "$_name" npm "$_cmd" npm _npm_argv "--force" || return 1
       _shdeps_manifest_upsert "$_name" npm "$_cmd" "$_npm_install_dir/bin/$_cmd"
       ;;
     custom)
       # Source hook file and use exists() to gate install().
-      local hooks_dir
-      hooks_dir=$(_shdeps_hooks_dir)
-      local hook_file="$hooks_dir/$_name.sh"
+      local hook_file="$_SHDEPS_CFG_HOOKS_DIR/$_name.sh"
       [[ -f "$hook_file" ]] || return 0
       unset -f exists version install post uninstall 2>/dev/null
       # shellcheck source=/dev/null
@@ -2170,7 +2235,7 @@ _shdeps_install_dep() {
       fi
       local _existed=0 ver=""
       exists "$_name" && _existed=1
-      if [[ $_existed -eq 1 && "$(_shdeps_reinstall)" -ne 1 ]]; then
+      if [[ $_existed -eq 1 && "$_SHDEPS_CFG_REINSTALL" -ne 1 ]]; then
         if declare -f version &>/dev/null; then
           ver=$(version "$_name" 2>/dev/null) || ver=""
         fi
@@ -2203,10 +2268,9 @@ _shdeps_install_dep() {
 # Run post() hooks for changed deps (post-install setup).
 # install() already ran during _shdeps_install_dep for custom deps.
 _shdeps_run_post_hooks() {
-  local hooks_dir
-  hooks_dir=$(_shdeps_hooks_dir)
-
   if [[ ${#_SHDEPS_CHANGED[@]} -eq 0 ]]; then return 0; fi
+  _shdeps_init_cache
+  local hooks_dir="$_SHDEPS_CFG_HOOKS_DIR"
 
   local entry
   for entry in "${_SHDEPS_DEPS[@]}"; do
@@ -2287,7 +2351,7 @@ _shdeps_github_release_prefetch() {
     _shdeps_filter_match "$_filter" || continue
 
     local bin_path
-    bin_path="$(_shdeps_bin_dir)/$_cmd"
+    bin_path="$_SHDEPS_CFG_BIN_DIR/$_cmd"
     local stamp
     stamp=$(_shdeps_remote_stamp "$_name" release)
 
@@ -2329,11 +2393,12 @@ _shdeps_update() {
     return 1
   fi
 
+  _shdeps_init_cache
+
   # Ensure the bin directory is on PATH so toolchains installed in
   # phase A (pkg, github:release) are available for phase B (cargo,
   # go, uv deps). Needed on fresh machines before shell rc is sourced.
-  local _bin_dir
-  _bin_dir=$(_shdeps_bin_dir)
+  local _bin_dir="$_SHDEPS_CFG_BIN_DIR"
   case ":$PATH:" in
     *":$_bin_dir:"*) ;;
     *) export PATH="$_bin_dir:$PATH" ;;
@@ -2344,6 +2409,12 @@ _shdeps_update() {
   _SHDEPS_PKG_BATCH=()
   _SHDEPS_PKG_BATCH_NAMES=()
   declare -gA _SHDEPS_CHANGED=()
+
+  # Batch manifest writes: upserts go into _SHDEPS_MANIFEST in memory and
+  # land on disk via a single _shdeps_manifest_flush below. Avoids an
+  # O(N²) per-dep awk+mv rewrite of the manifest file.
+  _shdeps_manifest_read
+  _SHDEPS_MANIFEST_BATCH=1
 
   _shdeps_log_header "==> Installing/upgrading tools..."
 
@@ -2375,6 +2446,11 @@ _shdeps_update() {
   done
   _shdeps_pkg_install_batch || failed=1
 
+  # Persist Phase A upserts so Phase B custom hooks that read the manifest
+  # (e.g. to gate on a prereq pkg having been installed) see the pkg
+  # entries on disk before their install() runs.
+  _shdeps_manifest_flush
+
   # Phase B: non-pkg installs (github:*, cargo, go, uv, npm, custom) now that
   # system prereqs are in place.
   for entry in "${_SHDEPS_DEPS[@]}"; do
@@ -2386,11 +2462,17 @@ _shdeps_update() {
 
   # Reinstall mode: mark all deps as changed so all post() hooks run.
   # (Install methods already checked shdeps_reinstall individually during step 2.)
-  if [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
+  if [[ "$_SHDEPS_CFG_REINSTALL" -eq 1 ]]; then
     for entry in "${_SHDEPS_DEPS[@]}"; do
       _SHDEPS_CHANGED["${entry%%|*}"]=1
     done
   fi
+
+  # Persist all manifest upserts accumulated during phases A and B before
+  # post-install hooks run (hooks may read the manifest) and before orphan
+  # detection re-reads it from disk.
+  _SHDEPS_MANIFEST_BATCH=0
+  _shdeps_manifest_flush
 
   # Post-install phase
   _shdeps_run_post_hooks

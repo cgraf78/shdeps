@@ -85,6 +85,7 @@ cmd_self_update() {
 
 # shellcheck disable=SC2154  # _name, _method, _cmd, _aliases, _filter set by _shdeps_parse
 cmd_list() {
+  _shdeps_init_cache
   _shdeps_load
   _shdeps_pkg_detect
   _shdeps_manifest_read
@@ -143,10 +144,11 @@ cmd_list() {
         fi
         ;;
       github:repo)
-        if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
+        local _gr_dir="$_SHDEPS_CFG_INSTALL_DIR/$_name"
+        if [[ -d "$_gr_dir" ]]; then
           status="installed"
           local ver
-          ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
+          ver=$(_shdeps_get_version "$_gr_dir")
           [[ -n "$ver" ]] && details="$ver"
         fi
         ;;
@@ -166,9 +168,7 @@ cmd_list() {
         fi
         ;;
       custom)
-        local hooks_dir hook_file
-        hooks_dir=$(_shdeps_hooks_dir)
-        hook_file="$hooks_dir/$_name.sh"
+        local hook_file="$_SHDEPS_CFG_HOOKS_DIR/$_name.sh"
         if [[ -f "$hook_file" ]]; then
           unset -f exists version install post uninstall 2>/dev/null
           # shellcheck source=/dev/null
@@ -199,6 +199,7 @@ cmd_check() {
     return 2
   fi
 
+  _shdeps_init_cache
   _shdeps_load
   _shdeps_pkg_detect
   _shdeps_manifest_read
@@ -238,9 +239,10 @@ cmd_check() {
         fi
         ;;
       github:repo)
-        if [[ -d "$(_shdeps_install_dir)/$_name" ]]; then
+        local _gr_dir="$_SHDEPS_CFG_INSTALL_DIR/$_name"
+        if [[ -d "$_gr_dir" ]]; then
           local ver
-          ver=$(_shdeps_get_version "$(_shdeps_install_dir)/$_name")
+          ver=$(_shdeps_get_version "$_gr_dir")
           echo "$_name: installed${ver:+ ($ver)}"
           return 0
         fi
@@ -258,9 +260,7 @@ cmd_check() {
         fi
         ;;
       custom)
-        local hooks_dir hook_file
-        hooks_dir=$(_shdeps_hooks_dir)
-        hook_file="$hooks_dir/$_name.sh"
+        local hook_file="$_SHDEPS_CFG_HOOKS_DIR/$_name.sh"
         if [[ -f "$hook_file" ]]; then
           unset -f exists version install post uninstall 2>/dev/null
           # shellcheck source=/dev/null
@@ -302,12 +302,15 @@ cmd_migrate() {
   local dry_run=0
   [[ "${1:-}" == "--dry-run" ]] && dry_run=1
 
+  _shdeps_init_cache
   _shdeps_load
   _shdeps_pkg_detect
 
-  local install_dir state_dir manifest
-  install_dir=$(_shdeps_install_dir)
-  state_dir=$(_shdeps_state_dir)
+  # shellcheck disable=SC2154  # set by _shdeps_init_cache
+  local install_dir="$_SHDEPS_CFG_INSTALL_DIR"
+  # shellcheck disable=SC2154  # set by _shdeps_init_cache
+  local state_dir="$_SHDEPS_CFG_STATE_DIR"
+  local manifest
   manifest=$(_shdeps_manifest_path)
 
   local count=0
