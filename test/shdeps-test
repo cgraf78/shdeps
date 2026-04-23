@@ -18,12 +18,9 @@ SHDEPS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=helpers.sh
 . "$(dirname "$0")/helpers.sh"
 
-# Set up isolated environment
-_mock_home
-_source_shdeps "$SHDEPS_DIR"
-
 # ===========================================================================
-# Section 0: Static analysis
+# Section 0: Static analysis (runs before _mock_home so shim-managed
+#            tools like shellcheck can find their real install dirs)
 # ===========================================================================
 
 echo "=== ShellCheck ==="
@@ -54,6 +51,10 @@ else
     printf '    %s\n' "$_line" >&2
   done <<<"$_sc_output"
 fi
+
+# Set up isolated environment for functional tests
+_mock_home
+_source_shdeps "$SHDEPS_DIR"
 
 # ===========================================================================
 # Section 1: Config parsing
