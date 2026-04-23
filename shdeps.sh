@@ -68,6 +68,14 @@ shdeps_bin_dir() { _shdeps_bin_dir; }
 shdeps_link_extras() { _shdeps_link_extras "$@"; }
 shdeps_unlink_extras() { _shdeps_unlink_extras "$@"; }
 
+# Install methods — for use in custom hooks that need built-in install logic
+#   shdeps_github_release_install <name> <cmd> <owner/repo>
+#     Download a prebuilt binary from a GitHub release.
+#     name:  dependency name (used for logging, TTL stamps, manifest)
+#     cmd:   binary name on PATH (e.g. "tree-sitter")
+#     repo:  GitHub owner/repo (e.g. "tree-sitter/tree-sitter")
+shdeps_github_release_install() { _shdeps_github_release_install "$@"; }
+
 # Logging
 shdeps_log() { _shdeps_log "$@"; }
 shdeps_warn() { _shdeps_warn "$@"; }
@@ -1827,9 +1835,9 @@ _shdeps_github_release_install_zip() {
 # Install or upgrade a tool via GitHub release binary.
 # Searches release assets for an executable matching the current OS/arch.
 # Handles tarballs, zips, compressed singles (.gz/.bz2/.zst), and raw binaries.
-# $1=name (owner/repo) $2=cmd
+# $1=name  $2=cmd  $3=repo (optional, defaults to $1)
 _shdeps_github_release_install() {
-  local name="$1" cmd="$2" gh_repo="$1"
+  local name="$1" cmd="$2" gh_repo="${3:-$1}"
   local bin_path
   bin_path="$(_shdeps_bin_dir)/$cmd"
   local current_ver="" latest_ver=""
