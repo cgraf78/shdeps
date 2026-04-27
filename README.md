@@ -5,7 +5,7 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.3-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-Declare your shell tools in one config file. shdeps installs and updates them everywhere — brew, apt, dnf, pacman, GitHub repos, or GitHub release binaries. One manifest, any machine.
+Declare your shell tools in one config file. shdeps installs and updates them everywhere — brew, apt, dnf, pacman, zypper, apk, GitHub repos, or GitHub release binaries. One manifest, any machine.
 
 <p align="center">
   <img src="demo/demo.gif" alt="shdeps demo">
@@ -14,7 +14,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 ## Features
 
 - **Declarative config** — one line per dependency in `*.conf` files
-- **Multiple install methods** — system packages (brew/apt/dnf/pacman), GitHub repos, GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), Node.js CLI tools (`npm install -g`), or fully custom hooks
+- **Multiple install methods** — system packages (brew/apt/dnf/pacman/zypper/apk), GitHub repos, GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), Node.js CLI tools (`npm install -g`), or fully custom hooks
 - **Cross-platform** — Linux, macOS, WSL with `os:` and `host:` filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
@@ -99,7 +99,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 
 ### `pkg` — System Packages
 
-Installs via the detected package manager (brew, apt, dnf, or pacman). Packages are batched into a single install command for speed.
+Installs via the detected package manager (brew, apt, dnf, pacman, zypper, or apk). Packages are batched into a single install command for speed.
 
 ```text
 jq        pkg
@@ -321,7 +321,7 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | `shdeps_platform`                 | Print normalized platform name (`linux`, `macos`, `wsl`)                                    |
 | `shdeps_force`                    | Return 0 if force mode is active (TTL bypass)                                               |
 | `shdeps_reinstall`                | Return 0 if reinstall mode is active                                                        |
-| `shdeps_pkg_mgr`                  | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, or empty)                   |
+| `shdeps_pkg_mgr`                  | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, `zypper`, `apk`, or empty)                   |
 | `shdeps_install_dir`              | Print base install directory (`$SHDEPS_INSTALL_DIR`, default `~/.local/share`)              |
 | `shdeps_git_dev_dir`              | Print git dev clone directory (`$SHDEPS_GIT_DEV_DIR`, default `~/git`)                      |
 | `shdeps_bin_dir`                  | Print binary symlink directory (`$SHDEPS_BIN_DIR`, default `~/.local/bin`)                  |

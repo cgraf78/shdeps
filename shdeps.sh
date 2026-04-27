@@ -2,7 +2,7 @@
 # shdeps — standalone shell dependency manager.
 #
 # Reads declarative config files (*.conf) from a config directory and
-# installs/updates tools via system package managers (brew/apt/dnf/pacman),
+# installs/updates tools via system package managers (brew/apt/dnf/pacman/zypper/apk),
 # GitHub repos, or GitHub release binaries. Post-install hooks run
 # arbitrary setup after changes.
 #
@@ -686,6 +686,10 @@ _shdeps_pkg_detect() {
     _SHDEPS_PKG_MGR="dnf"
   elif command -v pacman &>/dev/null; then
     _SHDEPS_PKG_MGR="pacman"
+  elif command -v zypper &>/dev/null; then
+    _SHDEPS_PKG_MGR="zypper"
+  elif command -v apk &>/dev/null; then
+    _SHDEPS_PKG_MGR="apk"
   else
     _SHDEPS_PKG_MGR=""
   fi
@@ -725,6 +729,8 @@ _shdeps_pkg_available() {
     apt) apt-cache show "$pkg" &>/dev/null ;;
     dnf) dnf info "$pkg" &>/dev/null ;;
     pacman) pacman -Si "$pkg" &>/dev/null ;;
+    zypper) zypper info "$pkg" &>/dev/null ;;
+    apk) apk search -e "$pkg" 2>/dev/null | grep -q . ;;
     *) return 0 ;;
   esac
 }
@@ -767,6 +773,8 @@ _shdeps_pkg_refresh_metadata() {
     apt) sudo apt-get update -qq >/dev/null 2>&1 || true ;;
     dnf) sudo dnf makecache -q &>/dev/null || true ;;
     pacman) sudo pacman -Sy &>/dev/null || true ;;
+    zypper) sudo zypper -q refresh &>/dev/null || true ;;
+    apk) sudo apk update &>/dev/null || true ;;
   esac
   _SHDEPS_PKG_CACHE_REFRESHED=1
   _shdeps_log_dim "  $_SHDEPS_PKG_MGR package metadata refreshed"
@@ -835,6 +843,8 @@ _shdeps_pkg_install_batch() {
     apt) _shdeps_run_logged sudo apt-get install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
     dnf) _shdeps_run_logged sudo dnf install -y "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
     pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+    zypper) _shdeps_run_logged sudo zypper -n install "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
+    apk) _shdeps_run_logged sudo apk add "${_SHDEPS_PKG_BATCH[@]}" || rc=$? ;;
   esac
   _shdeps_log_clear
 
@@ -856,6 +866,8 @@ _shdeps_pkg_install_batch() {
         apt) _shdeps_run_logged sudo apt-get install -y "$pkg" || rc=$? ;;
         dnf) _shdeps_run_logged sudo dnf install -y "$pkg" || rc=$? ;;
         pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "$pkg" || rc=$? ;;
+        zypper) _shdeps_run_logged sudo zypper -n install "$pkg" || rc=$? ;;
+        apk) _shdeps_run_logged sudo apk add "$pkg" || rc=$? ;;
       esac
       if [[ $rc -ne 0 ]]; then
         _shdeps_logfile_print "package manager for $pkg" "$log"

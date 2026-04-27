@@ -574,6 +574,39 @@ export PATH="$_mock_bin_dir:$PATH"
 # Mock brew on Darwin-like detection: _shdeps_pkg_detect checks uname first
 # so we test the resolution and queuing logic directly instead.
 
+# --- _shdeps_pkg_detect: mock zypper ---
+# Use an isolated PATH with only the mock binary so real apt/dnf/pacman
+# don't shadow zypper (which has lower priority in the detect chain).
+
+_zypper_mock_dir=$(_mock_bin)
+cat >"$_zypper_mock_dir/zypper" <<'MOCK'
+#!/bin/bash
+exit 0
+MOCK
+chmod +x "$_zypper_mock_dir/zypper"
+_saved_path="$PATH"
+PATH="$_zypper_mock_dir"
+_shdeps_pkg_detect
+_assert_eq "pkg_detect: finds zypper" "zypper" "$_SHDEPS_PKG_MGR"
+PATH="$_saved_path"
+
+# --- _shdeps_pkg_detect: mock apk ---
+
+_apk_mock_dir=$(_mock_bin)
+cat >"$_apk_mock_dir/apk" <<'MOCK'
+#!/bin/bash
+exit 0
+MOCK
+chmod +x "$_apk_mock_dir/apk"
+_saved_path="$PATH"
+PATH="$_apk_mock_dir"
+_shdeps_pkg_detect
+_assert_eq "pkg_detect: finds apk" "apk" "$_SHDEPS_PKG_MGR"
+PATH="$_saved_path"
+
+# Restore pkg manager for remaining tests
+_shdeps_pkg_detect
+
 # --- _shdeps_resolve_override: no overrides → returns name ---
 
 _SHDEPS_PKG_MGR="apt"
@@ -608,6 +641,28 @@ _assert_eq "resolve: brew override" "font-hack-nerd-font" "$result"
 _SHDEPS_PKG_MGR="dnf"
 result=$(_shdeps_resolve_override "bat" "apt:bat,dnf:bat-extra,pacman:bat")
 _assert_eq "resolve: dnf gets its override" "bat-extra" "$result"
+
+# --- _shdeps_resolve_override: zypper override ---
+
+_SHDEPS_PKG_MGR="zypper"
+result=$(_shdeps_resolve_override "fd" "zypper:fd,apt:fd-find")
+_assert_eq "resolve: zypper override" "fd" "$result"
+
+# --- _shdeps_resolve_override: apk override ---
+
+_SHDEPS_PKG_MGR="apk"
+result=$(_shdeps_resolve_override "bat" "apk:bat-extra,apt:bat")
+_assert_eq "resolve: apk override" "bat-extra" "$result"
+
+# --- _shdeps_resolve_override: zypper/apk fallback to name ---
+
+_SHDEPS_PKG_MGR="zypper"
+result=$(_shdeps_resolve_override "jq" "apt:jq-tools")
+_assert_eq "resolve: zypper no match returns name" "jq" "$result"
+
+_SHDEPS_PKG_MGR="apk"
+result=$(_shdeps_resolve_override "jq" "apt:jq-tools")
+_assert_eq "resolve: apk no match returns name" "jq" "$result"
 
 # --- _shdeps_pkg_queue: NONE skips silently ---
 
@@ -651,7 +706,7 @@ _source_shdeps "$SHDEPS_DIR"
 # Just verify it sets something (or empty on unusual systems)
 
 _shdeps_pkg_detect
-_assert_match "pkg_detect: sets a known value" "^(brew|apt|dnf|pacman)?$" "$_SHDEPS_PKG_MGR"
+_assert_match "pkg_detect: sets a known value" "^(brew|apt|dnf|pacman|zypper|apk)?$" "$_SHDEPS_PKG_MGR"
 
 # --- _shdeps_check_prereqs: all pkg deps installed → NEEDED=0 ---
 
