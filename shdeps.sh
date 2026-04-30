@@ -916,6 +916,76 @@ _shdeps_pkg_install_batch() {
   [[ $any_fail -eq 0 ]]
 }
 
+# Check all pkg deps in parallel, printing only changed deps at normal log
+# level and a single summary line for unchanged ones. Verbose (level 2)
+# prints every dep. Queues missing deps for batch install as before.
+_shdeps_pkg_check_parallel() {
+  # Must load in the parent — associative arrays don't cross subshell boundaries
+  _shdeps_pkg_versions_load
+
+  local resultbase
+  resultbase=$(mktemp -d) || return 1
+
+  local -a names=() cmds=() resolved_pkgs=() pids=()
+  local entry
+
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    _shdeps_parse "$entry"
+    [[ "$_method" == "pkg" ]] || continue
+    _shdeps_filter_match "$_filter" || continue
+
+    local resolved_pkg
+    resolved_pkg=$(_shdeps_resolve_override "$_name" "$_aliases")
+    [[ "$resolved_pkg" == "NONE" ]] && continue
+
+    if _shdeps_exists "$_cmd" "$resolved_pkg"; then
+      (_shdeps_dep_version "$_cmd" 2>/dev/null || true) >"$resultbase/$_name.ver" &
+      pids+=($!)
+      names+=("$_name")
+      cmds+=("$_cmd")
+      resolved_pkgs+=("$resolved_pkg")
+    else
+      _shdeps_pkg_queue "$_name" "$_aliases"
+      _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
+    fi
+  done
+
+  local pid
+  for pid in "${pids[@]+"${pids[@]}"}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  local verbose=0
+  [[ "$(_shdeps_log_level)" -ge 2 ]] && verbose=1
+  local n_ok=0 i
+
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    local name="${names[$i]}" cmd="${cmds[$i]}" resolved="${resolved_pkgs[$i]}"
+    local ver=""
+    [[ -s "$resultbase/$name.ver" ]] && ver=$(<"$resultbase/$name.ver")
+    # Subshell can't access _SHDEPS_PKG_VERSIONS — fall back to parent's cache
+    if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
+      ver="$REPLY"
+    fi
+
+    # Package installed but command missing from PATH — trigger post hook
+    if ! _shdeps_exists "$cmd"; then
+      _shdeps_mark_changed "$name"
+    else
+      n_ok=$((n_ok + 1))
+    fi
+    if [[ $verbose -eq 1 ]]; then
+      _shdeps_log "  $name${ver:+ -- $ver}"
+    fi
+
+    _shdeps_manifest_upsert "$name" "pkg" "$cmd" ""
+  done
+
+  _SHDEPS_N_UP_TO_DATE=$((_SHDEPS_N_UP_TO_DATE + n_ok))
+
+  rm -rf "$resultbase"
+}
+
 # ---------------------------------------------------------------------------
 # Remote-check cache — TTL-based stamps to avoid redundant network calls
 # ---------------------------------------------------------------------------
@@ -2370,6 +2440,7 @@ _shdeps_github_release_prefetch() {
 _shdeps_job_worker() {
   local entry="$1" resultdir="$2"
 
+  # log appends (full history); display truncates (latest status only)
   _shdeps_log() {
     printf '%s\n' "$*" >>"$resultdir/log"
     printf '%s\n' "$*" >"$resultdir/display"
@@ -2395,6 +2466,7 @@ _shdeps_job_worker() {
   # shellcheck disable=SC2329
   _shdeps_log_clear() { :; }
 
+  # Truncates — each install method calls upsert at most once; last call wins
   _shdeps_manifest_upsert() {
     printf '%s\n' "$1|$2|$3|${4:-}" >"$resultdir/manifest"
   }
@@ -2435,11 +2507,14 @@ _shdeps_job_collect() {
     REPLY="  $name"
   fi
 
+  # Default rc=1: if worker was killed before writing rc, treat as failure
   local rc=1
   [[ -f "$resultdir/rc" ]] && rc=$(<"$resultdir/rc")
   if [[ "$rc" -ne 0 ]]; then
     _SHDEPS_JOBS_ANY_FAILED=1
     if [[ -s "$resultdir/log" ]]; then
+      # Only dump logs with >1 line — single-line logs duplicate the
+      # display line (e.g. "tool not found") already shown to the user
       local _log_lc
       _log_lc=$(wc -l <"$resultdir/log")
       if [[ $_log_lc -gt 1 ]]; then
@@ -2479,6 +2554,7 @@ _shdeps_display_stopped() {
 # $1=job result base directory (for reading status files)
 _shdeps_display_refresh() {
   local resultbase="$1"
+  # Quiet mode suppresses parallel display, matching sequential behavior
   _shdeps_should_log || return 0
 
   if [[ $_SHDEPS_DISP_TERM -ne 1 ]]; then
@@ -2571,9 +2647,17 @@ _shdeps_jobs_run() {
   trap '_shdeps_jobs_cleanup; trap - INT; kill -s INT $$' INT
   trap '_shdeps_jobs_cleanup; trap - TERM; kill -s TERM $$' TERM
 
-  _shdeps_display_init
   _SHDEPS_JOBS_ANY_FAILED=0
   _SHDEPS_JOBS_ERROR_LOGS=()
+  local _n_unchanged=0
+  local _verbose=0
+  [[ "$(_shdeps_log_level)" -ge 2 ]] && _verbose=1
+
+  # Display manager only in verbose mode — collapsed mode prints changed/failed
+  # deps directly, avoiding in-place terminal rendering artifacts
+  if [[ $_verbose -eq 1 ]]; then
+    _shdeps_display_init
+  fi
 
   local -a slot_pids=() slot_names=()
   local qi=0 n_active=0
@@ -2587,7 +2671,9 @@ _shdeps_jobs_run() {
     (_shdeps_job_worker "${queue[$qi]}" "$resultbase/$name") &
     slot_pids[slot]=$!
     slot_names[slot]="$name"
-    _shdeps_display_started "$name"
+    if [[ $_verbose -eq 1 ]]; then
+      _shdeps_display_started "$name"
+    fi
     ((n_active++))
     ((qi++))
   done
@@ -2604,8 +2690,16 @@ _shdeps_jobs_run() {
 
       local cname="${slot_names[slot]}"
       _shdeps_job_collect "$cname" "$resultbase"
-      _shdeps_display_completed "$REPLY"
-      _shdeps_display_stopped "$cname"
+      local _crc=0
+      [[ -f "$resultbase/$cname/rc" ]] && _crc=$(<"$resultbase/$cname/rc")
+      if [[ $_verbose -eq 1 ]]; then
+        _shdeps_display_completed "$REPLY"
+        _shdeps_display_stopped "$cname"
+      elif [[ -f "$resultbase/$cname/changed" || "$_crc" -ne 0 ]]; then
+        _shdeps_log "$REPLY"
+      else
+        _n_unchanged=$((_n_unchanged + 1))
+      fi
       ((n_active--))
 
       slot_pids[slot]=""
@@ -2619,16 +2713,24 @@ _shdeps_jobs_run() {
         (_shdeps_job_worker "${queue[$qi]}" "$resultbase/$next_name") &
         slot_pids[slot]=$!
         slot_names[slot]="$next_name"
-        _shdeps_display_started "$next_name"
+        if [[ $_verbose -eq 1 ]]; then
+          _shdeps_display_started "$next_name"
+        fi
         ((n_active++))
         ((qi++))
       fi
     done
 
-    _shdeps_display_refresh "$resultbase"
+    if [[ $_verbose -eq 1 ]]; then
+      _shdeps_display_refresh "$resultbase"
+    fi
   done
 
-  _shdeps_display_finish
+  if [[ $_verbose -eq 1 ]]; then
+    _shdeps_display_finish
+  fi
+
+  _SHDEPS_N_UP_TO_DATE=$((_SHDEPS_N_UP_TO_DATE + _n_unchanged))
 
   local err_log
   for err_log in "${_SHDEPS_JOBS_ERROR_LOGS[@]+"${_SHDEPS_JOBS_ERROR_LOGS[@]}"}"; do
@@ -2694,12 +2796,8 @@ _shdeps_update() {
   # Phase A: system packages first (queue then flush), so tools like git,
   # curl, tar, and language toolchains are available before non-pkg deps.
   local entry _phase_method failed=0
-  for entry in "${_SHDEPS_DEPS[@]}"; do
-    _phase_method="${entry#*|}"
-    _phase_method="${_phase_method%%|*}"
-    [[ "$_phase_method" == "pkg" ]] || continue
-    _shdeps_install_dep "$entry" || failed=1
-  done
+  _SHDEPS_N_UP_TO_DATE=0 # accumulated across all phases, printed once at the end
+  _shdeps_pkg_check_parallel
   _shdeps_pkg_install_batch || failed=1
 
   # Phase B: non-pkg installs (github:*, cargo, go, uv, npm, custom) now that
@@ -2707,19 +2805,55 @@ _shdeps_update() {
   local _max_jobs
   _max_jobs=$(_shdeps_jobs_max)
 
+  local _b_verbose=0 _b_unchanged=0
+  [[ "$(_shdeps_log_level)" -ge 2 ]] && _b_verbose=1
+
   if [[ "$_max_jobs" -gt 1 ]]; then
     _shdeps_jobs_run "$_max_jobs" || failed=1
     for entry in "${_SHDEPS_CUSTOM_ENTRIES[@]+"${_SHDEPS_CUSTOM_ENTRIES[@]}"}"; do
-      _shdeps_install_dep "$entry" || failed=1
+      _shdeps_parse "$entry"
+      local _cname="$_name"
+      if [[ $_b_verbose -eq 1 ]]; then
+        _shdeps_install_dep "$entry" || failed=1
+      else
+        # Capture stdout only — stderr (_shdeps_warn) should always print
+        local _cout _crc=0
+        _cout=$(mktemp)
+        _shdeps_install_dep "$entry" >"$_cout" || _crc=$?
+        if [[ $_crc -ne 0 ]]; then failed=1; fi
+        if [[ -n "${_SHDEPS_CHANGED[$_cname]+x}" || $_crc -ne 0 ]]; then
+          cat "$_cout"
+        else
+          _b_unchanged=$((_b_unchanged + 1))
+        fi
+        rm -f "$_cout"
+      fi
     done
   else
     for entry in "${_SHDEPS_DEPS[@]}"; do
       _phase_method="${entry#*|}"
       _phase_method="${_phase_method%%|*}"
       [[ "$_phase_method" == "pkg" ]] && continue
-      _shdeps_install_dep "$entry" || failed=1
+      _shdeps_parse "$entry"
+      local _sname="$_name"
+      if [[ $_b_verbose -eq 1 ]]; then
+        _shdeps_install_dep "$entry" || failed=1
+      else
+        local _sout _src=0
+        _sout=$(mktemp)
+        _shdeps_install_dep "$entry" >"$_sout" || _src=$?
+        if [[ $_src -ne 0 ]]; then failed=1; fi
+        if [[ -n "${_SHDEPS_CHANGED[$_sname]+x}" || $_src -ne 0 ]]; then
+          cat "$_sout"
+        else
+          _b_unchanged=$((_b_unchanged + 1))
+        fi
+        rm -f "$_sout"
+      fi
     done
   fi
+
+  _SHDEPS_N_UP_TO_DATE=$((_SHDEPS_N_UP_TO_DATE + _b_unchanged))
 
   # Reinstall mode: mark all deps as changed so all post() hooks run.
   # (Install methods already checked shdeps_reinstall individually during step 2.)
@@ -2727,6 +2861,10 @@ _shdeps_update() {
     for entry in "${_SHDEPS_DEPS[@]}"; do
       _shdeps_mark_changed "${entry%%|*}"
     done
+  fi
+
+  if [[ $_SHDEPS_N_UP_TO_DATE -gt 0 && "$(_shdeps_log_level)" -lt 2 ]]; then
+    _shdeps_log_dim "  $_SHDEPS_N_UP_TO_DATE deps up to date"
   fi
 
   # Post-install phase
