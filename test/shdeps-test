@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2154,SC2034
+# shellcheck disable=SC1091,SC2154,SC2034
+# SC1091: sourced files not passed as shellcheck input (resolved via -x flag)
 # SC2154: variables set by sourced shdeps.sh (_name, _method, _SHDEPS_DEPS, etc.)
 # SC2034: variables read by sourced shdeps.sh (SHDEPS_CONF_DIR, SHDEPS_FORCE, etc.)
 #
@@ -3867,6 +3868,245 @@ _assert_symlink "umask: zsh completion created" "$HOME/.local/share/zsh/site-fun
 _assert_perms "umask: zsh site-functions is 755" "755" "$HOME/.local/share/zsh/site-functions"
 _assert_perms "umask: zsh parent dir is 755" "755" "$HOME/.local/share/zsh"
 _shdeps_unlink_extras "umask-tool"
+
+# ===========================================================================
+# Section: Parallel job runner
+# ===========================================================================
+
+echo "=== Parallel job runner ==="
+
+# --- _shdeps_jobs_max ---
+
+SHDEPS_JOBS=3
+_assert_eq "jobs_max: explicit" "3" "$(_shdeps_jobs_max)"
+
+SHDEPS_JOBS=0
+_auto_jobs=$(_shdeps_jobs_max)
+if [[ "$_auto_jobs" -ge 1 && "$_auto_jobs" -le 8 ]]; then
+  _pass "jobs_max: auto in [1,8] (got $_auto_jobs)"
+else
+  _fail "jobs_max: auto=$_auto_jobs not in [1,8]"
+fi
+
+SHDEPS_JOBS=1
+_assert_eq "jobs_max: sequential" "1" "$(_shdeps_jobs_max)"
+unset SHDEPS_JOBS
+
+# --- Worker subprocess ---
+
+_mock_home
+_source_shdeps "$SHDEPS_DIR"
+
+_jw_conf=$(_tmpdir)
+cat >"$_jw_conf/deps.conf" <<'EOF'
+widget   cargo
+EOF
+SHDEPS_CONF_DIR="$_jw_conf"
+_shdeps_load
+_shdeps_pkg_detect
+declare -gA _SHDEPS_CHANGED=()
+
+_jw_mock=$(_mock_cargo_setup)
+_jw_saved_path="$PATH"
+PATH="$_jw_mock:$PATH"
+
+_jw_resultdir=$(_tmpdir)/widget_result
+mkdir -p "$_jw_resultdir"
+
+(_shdeps_job_worker "${_SHDEPS_DEPS[0]}" "$_jw_resultdir")
+
+_assert_file_exists "worker: rc file" "$_jw_resultdir/rc"
+_assert_eq "worker: rc=0" "0" "$(cat "$_jw_resultdir/rc")"
+_assert_file_exists "worker: display file" "$_jw_resultdir/display"
+_assert_file_exists "worker: manifest file" "$_jw_resultdir/manifest"
+_assert_contains "worker: manifest has widget" "widget" "$(cat "$_jw_resultdir/manifest")"
+_assert_file_exists "worker: changed file" "$_jw_resultdir/changed"
+_assert_eq "worker: changed=1" "1" "$(cat "$_jw_resultdir/changed")"
+_assert_eq "worker: parent unchanged" "" "${_SHDEPS_CHANGED[widget]:-}"
+
+PATH="$_jw_saved_path"
+
+# --- Result collector (success) ---
+
+# Use underscore names to avoid formatter mangling hyphens in array subscripts
+_rc_base=$(_tmpdir)
+mkdir -p "$_rc_base/testdep"
+printf '0\n' >"$_rc_base/testdep/rc"
+printf '1\n' >"$_rc_base/testdep/changed"
+printf '1\n' >"$_rc_base/testdep/extras_linked"
+printf 'testdep|cargo|td|/p/td\n' >"$_rc_base/testdep/manifest"
+printf '  testdep installed -- 1.0.0\n' >"$_rc_base/testdep/display"
+
+declare -gA _SHDEPS_CHANGED=()
+_SHDEPS_EXTRAS_LINKED=0
+_SHDEPS_JOBS_ANY_FAILED=0
+_SHDEPS_JOBS_ERROR_LOGS=()
+
+_shdeps_job_collect "testdep" "$_rc_base"
+
+_assert_eq "collect: changed" "1" "${_SHDEPS_CHANGED[testdep]:-0}"
+_assert_eq "collect: extras_linked" "1" "${_SHDEPS_EXTRAS_LINKED:-0}"
+_assert_eq "collect: no failure" "0" "$_SHDEPS_JOBS_ANY_FAILED"
+_assert_contains "collect: display line" "installed" "$REPLY"
+
+_rc_mfst=$(_shdeps_manifest_path)
+_assert_file_exists "collect: manifest written" "$_rc_mfst"
+_assert_contains "collect: manifest content" "testdep|cargo|td" "$(cat "$_rc_mfst")"
+
+# --- Result collector (failure with detail) ---
+
+mkdir -p "$_rc_base/faildep"
+printf '1\n' >"$_rc_base/faildep/rc"
+printf 'error line 1\nerror line 2\n' >"$_rc_base/faildep/log"
+printf '  faildep\n' >"$_rc_base/faildep/display"
+
+_shdeps_job_collect "faildep" "$_rc_base"
+_assert_eq "collect: failure tracked" "1" "$_SHDEPS_JOBS_ANY_FAILED"
+_assert_eq "collect: error log saved" "1" "${#_SHDEPS_JOBS_ERROR_LOGS[@]}"
+
+# --- Result collector (single-line failure — no redundant dump) ---
+
+_SHDEPS_JOBS_ANY_FAILED=0
+_SHDEPS_JOBS_ERROR_LOGS=()
+
+mkdir -p "$_rc_base/simpledep"
+printf '1\n' >"$_rc_base/simpledep/rc"
+printf 'warning: tool not found\n' >"$_rc_base/simpledep/log"
+printf 'warning: tool not found\n' >"$_rc_base/simpledep/display"
+
+_shdeps_job_collect "simpledep" "$_rc_base"
+_assert_eq "collect: single-line failure tracked" "1" "$_SHDEPS_JOBS_ANY_FAILED"
+_assert_eq "collect: single-line log skipped" "0" "${#_SHDEPS_JOBS_ERROR_LOGS[@]}"
+
+# --- Result collector (missing rc defaults to failure) ---
+
+_SHDEPS_JOBS_ANY_FAILED=0
+_SHDEPS_JOBS_ERROR_LOGS=()
+
+mkdir -p "$_rc_base/norcdep"
+printf '  norcdep\n' >"$_rc_base/norcdep/display"
+
+_shdeps_job_collect "norcdep" "$_rc_base"
+_assert_eq "collect: missing rc = failure" "1" "$_SHDEPS_JOBS_ANY_FAILED"
+
+# --- Display manager ---
+
+SHDEPS_LOG_LEVEL=1
+
+_shdeps_display_init
+_SHDEPS_DISP_TERM=0
+
+_shdeps_display_started "alpha"
+_shdeps_display_started "bravo"
+_assert_eq "display: 2 active" "2" "${#_SHDEPS_DISP_ACTIVE[@]}"
+
+_shdeps_display_completed "  alpha -- 1.0"
+_shdeps_display_stopped "alpha"
+_assert_eq "display: 1 active after stop" "1" "${#_SHDEPS_DISP_ACTIVE[@]}"
+_assert_eq "display: 1 completed queued" "1" "${#_SHDEPS_DISP_COMPLETED[@]}"
+
+_disp_tmp=$(_tmpdir)/refresh_out
+_shdeps_display_refresh "/nonexistent" >"$_disp_tmp" 2>/dev/null
+_assert_contains "display: refresh prints completed" "alpha" "$(cat "$_disp_tmp")"
+_assert_eq "display: completed queue cleared" "0" "${#_SHDEPS_DISP_COMPLETED[@]}"
+
+# --- Display quiet mode ---
+
+SHDEPS_LOG_LEVEL=0
+_shdeps_display_init
+_shdeps_display_completed "  should be suppressed"
+_disp_quiet_tmp=$(_tmpdir)/quiet_out
+_shdeps_display_refresh "/nonexistent" >"$_disp_quiet_tmp" 2>/dev/null
+_assert_eq "display quiet: output suppressed" "" "$(cat "$_disp_quiet_tmp")"
+_assert_eq "display quiet: completed not drained" "1" "${#_SHDEPS_DISP_COMPLETED[@]}"
+SHDEPS_LOG_LEVEL=1
+_SHDEPS_DISP_COMPLETED=()
+
+# --- Job runner (3 cargo deps, 2 slots) ---
+
+_mock_home
+_source_shdeps "$SHDEPS_DIR"
+
+_jr_conf=$(_tmpdir)
+cat >"$_jr_conf/deps.conf" <<'EOF'
+alpha    cargo
+bravo    cargo
+charlie  cargo
+EOF
+SHDEPS_CONF_DIR="$_jr_conf"
+_shdeps_load
+_shdeps_pkg_detect
+declare -gA _SHDEPS_CHANGED=()
+
+_jr_mock=$(_mock_cargo_setup)
+_jr_saved_path="$PATH"
+PATH="$_jr_mock:$PATH"
+
+_shdeps_jobs_run 2
+
+_assert_eq "runner: alpha changed" "1" "${_SHDEPS_CHANGED[alpha]:-0}"
+_assert_eq "runner: bravo changed" "1" "${_SHDEPS_CHANGED[bravo]:-0}"
+_assert_eq "runner: charlie changed" "1" "${_SHDEPS_CHANGED[charlie]:-0}"
+
+_assert_file_exists "runner: alpha bin" "$(_shdeps_install_dir)/alpha/bin/alpha"
+_assert_file_exists "runner: bravo bin" "$(_shdeps_install_dir)/bravo/bin/bravo"
+_assert_file_exists "runner: charlie bin" "$(_shdeps_install_dir)/charlie/bin/charlie"
+
+_assert_symlink "runner: alpha link" "$(_shdeps_bin_dir)/alpha"
+_assert_symlink "runner: bravo link" "$(_shdeps_bin_dir)/bravo"
+_assert_symlink "runner: charlie link" "$(_shdeps_bin_dir)/charlie"
+
+_jr_mfst=$(_shdeps_manifest_path)
+_assert_contains "runner: manifest alpha" "alpha|cargo" "$(cat "$_jr_mfst")"
+_assert_contains "runner: manifest bravo" "bravo|cargo" "$(cat "$_jr_mfst")"
+_assert_contains "runner: manifest charlie" "charlie|cargo" "$(cat "$_jr_mfst")"
+
+PATH="$_jr_saved_path"
+
+# --- Job runner (1 dep, 4 slots — fewer deps than slots) ---
+
+_jr2_conf=$(_tmpdir)
+cat >"$_jr2_conf/deps.conf" <<'EOF'
+solo    cargo
+EOF
+SHDEPS_CONF_DIR="$_jr2_conf"
+_shdeps_load
+_shdeps_pkg_detect
+declare -gA _SHDEPS_CHANGED=()
+
+_jr2_mock=$(_mock_cargo_setup)
+_jr2_saved_path="$PATH"
+PATH="$_jr2_mock:$PATH"
+
+_shdeps_jobs_run 4
+
+_assert_eq "runner single: solo changed" "1" "${_SHDEPS_CHANGED[solo]:-0}"
+_assert_file_exists "runner single: solo bin" "$(_shdeps_install_dir)/solo/bin/solo"
+
+PATH="$_jr2_saved_path"
+
+# --- Custom dep separation ---
+
+_jr3_conf=$(_tmpdir)
+cat >"$_jr3_conf/deps.conf" <<'EOF'
+alpha     cargo
+nerdfonts custom
+EOF
+SHDEPS_CONF_DIR="$_jr3_conf"
+_shdeps_load
+_shdeps_pkg_detect
+declare -gA _SHDEPS_CHANGED=()
+
+_jr3_mock=$(_mock_cargo_setup)
+_jr3_saved_path="$PATH"
+PATH="$_jr3_mock:$PATH"
+
+_shdeps_jobs_run 2
+
+_assert_eq "runner: custom separated" "1" "${#_SHDEPS_CUSTOM_ENTRIES[@]}"
+_assert_contains "runner: custom entry" "nerdfonts" "${_SHDEPS_CUSTOM_ENTRIES[0]}"
+
+PATH="$_jr3_saved_path"
 
 # ===========================================================================
 

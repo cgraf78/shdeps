@@ -22,6 +22,7 @@
 #   SHDEPS_INSTALL_DIR  Base dir for github installs (default: ~/.local/share)
 #   SHDEPS_BIN_DIR      Directory for binary symlinks (default: ~/.local/bin)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
+#   SHDEPS_JOBS         Max parallel jobs          (default: auto/nproc, max 8)
 #   SHDEPS_AUTO_EPEL    Auto-install epel-release on dnf (default: 0)
 
 SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
@@ -84,6 +85,9 @@ shdeps_log_ok() { _shdeps_log_ok "$@"; }
 shdeps_log_dim() { _shdeps_log_dim "$@"; }
 shdeps_log_header() { _shdeps_log_header "$@"; }
 
+# State mutation
+shdeps_mark_changed() { _shdeps_mark_changed "$@"; }
+
 # ===========================================================================
 # Internal implementation — everything below is private (_shdeps_ prefix)
 # ===========================================================================
@@ -111,6 +115,16 @@ _shdeps_git_dev_dir() { echo "${SHDEPS_GIT_DEV_DIR:-$HOME/git}"; }
 _shdeps_install_dir() { echo "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"; }
 _shdeps_bin_dir() { echo "${SHDEPS_BIN_DIR:-$HOME/.local/bin}"; }
 _shdeps_log_level() { echo "${SHDEPS_LOG_LEVEL:-1}"; }
+
+# Max parallel jobs for Phase B installs.
+_shdeps_jobs_max() {
+  local jobs="${SHDEPS_JOBS:-0}"
+  if [[ "$jobs" -le 0 ]]; then
+    jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    ((jobs > 8)) && jobs=8
+  fi
+  echo "$jobs"
+}
 
 # Target directory accessors for extras linking (man pages, completions).
 # Man pages route to section subdirs: _shdeps_man_dir 1 → .../man/man1/
@@ -266,6 +280,16 @@ _shdeps_log_header() {
   fi
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# State mutation helpers — overridden in worker subshells for parallel mode
+# ---------------------------------------------------------------------------
+
+# Mark a dep as changed (triggers post-install hooks).
+_shdeps_mark_changed() { _SHDEPS_CHANGED[$1]=1; }
+
+# Mark that extras (man pages, completions) were linked.
+_shdeps_mark_extras_linked() { _SHDEPS_EXTRAS_LINKED=1; }
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -887,7 +911,7 @@ _shdeps_pkg_install_batch() {
   # Mark all batch-installed deps as changed
   local _i
   for _i in "${!_SHDEPS_PKG_BATCH_NAMES[@]}"; do
-    _SHDEPS_CHANGED[${_SHDEPS_PKG_BATCH_NAMES[$_i]}]=1
+    _shdeps_mark_changed "${_SHDEPS_PKG_BATCH_NAMES[$_i]}"
   done
   [[ $any_fail -eq 0 ]]
 }
@@ -1354,7 +1378,7 @@ _shdeps_link_extras() {
   if [[ ${#created_links[@]} -gt 0 ]]; then
     mkdir -p "$(dirname "$state_dir/$name.links")"
     printf '%s\n' "${created_links[@]}" >"$state_dir/$name.links"
-    _SHDEPS_EXTRAS_LINKED=1
+    _shdeps_mark_extras_linked
   fi
 }
 
@@ -1428,13 +1452,13 @@ _shdeps_github_repo_install_local() {
   fi
 
   if [[ "$link_before" != "$local_clone" ]]; then
-    _SHDEPS_CHANGED[$name]=1
+    _shdeps_mark_changed "$name"
     _shdeps_log_ok "  $name added${ver:+ -- $ver} (local clone)"
   elif [[ "$rev_before" != "$rev_after" ]]; then
-    _SHDEPS_CHANGED[$name]=1
+    _shdeps_mark_changed "$name"
     _shdeps_log_ok "  $name updated${ver:+ -- $ver} (local clone)"
   elif [[ "$dirty_after" -eq 1 || "$(_shdeps_reinstall)" -eq 1 ]]; then
-    _SHDEPS_CHANGED[$name]=1
+    _shdeps_mark_changed "$name"
     _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver} (local clone)"
   else
     _shdeps_log "  $name${ver:+ -- $ver} (local clone)"
@@ -1467,10 +1491,10 @@ _shdeps_github_repo_install_pull() {
     ver=$(_shdeps_get_version "$install_dir")
     _shdeps_remote_touch "$stamp" || true
     if [[ "$head_before" != "$head_after" ]]; then
-      _SHDEPS_CHANGED[$name]=1
+      _shdeps_mark_changed "$name"
       _shdeps_log_ok "  $name updated${ver:+ -- $ver}"
     elif [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
-      _SHDEPS_CHANGED[$name]=1
+      _shdeps_mark_changed "$name"
       _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
     else
       _shdeps_log "  $name${ver:+ -- $ver}"
@@ -1521,7 +1545,7 @@ _shdeps_github_repo_install_fresh() {
   if [[ -n "$ver_before" && "$ver_before" == "$ver" ]] && [[ "$(_shdeps_reinstall)" -ne 1 ]]; then
     _shdeps_log "  $name${ver:+ -- $ver}"
   else
-    _SHDEPS_CHANGED[$name]=1
+    _shdeps_mark_changed "$name"
     if [[ -n "$ver_before" && "$ver_before" == "$ver" ]]; then
       _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
     else
@@ -1997,7 +2021,7 @@ _shdeps_github_release_install() {
   rm -f "$log"
   _shdeps_remote_touch "$stamp" || true
 
-  _SHDEPS_CHANGED[$name]=1
+  _shdeps_mark_changed "$name"
   if [[ -z "$current_ver" ]]; then
     _shdeps_log_ok "  $name added -- $latest_ver"
   elif [[ "$current_ver" == "$latest_ver_num" ]]; then
@@ -2014,7 +2038,7 @@ _shdeps_github_release_install() {
 # Install a dep by invoking an external tool. Shared skeleton for cargo/go/uv/npm.
 # $1=name  $2=method  $3=cmd  $4=tool  $5=argv-nameref  $6=force-flag-or-empty
 #
-# Writes _SHDEPS_CHANGED[$name]=1 iff the dep was newly installed or updated.
+# Calls _shdeps_mark_changed iff the dep was newly installed or updated.
 # Returns 0 iff the binary exists at the expected path on completion
 # (either fast path or successful install). Returns non-zero on any
 # failure or when the required tool is missing — caller MUST skip
@@ -2082,13 +2106,13 @@ _shdeps_external_install() {
   local ver
   ver=$(_shdeps_dep_version "$cmd" 2>/dev/null || true)
   if [[ "$already_installed" -eq 0 ]]; then
-    _SHDEPS_CHANGED[$name]=1
+    _shdeps_mark_changed "$name"
     _shdeps_log_ok "  $name installed${ver:+ -- $ver}"
   elif [[ -n "$prev_ver" && -n "$ver" && "$prev_ver" != "$ver" ]]; then
-    _SHDEPS_CHANGED[$name]=1
+    _shdeps_mark_changed "$name"
     _shdeps_log_ok "  $name updated -- $prev_ver -> $ver"
   elif [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
-    _SHDEPS_CHANGED[$name]=1
+    _shdeps_mark_changed "$name"
     _shdeps_log_ok "  $name reinstalled${ver:+ -- $ver}"
   else
     _shdeps_log "  $name${ver:+ -- $ver}"
@@ -2122,7 +2146,7 @@ _shdeps_install_dep() {
         _shdeps_log "  $_name${ver:+ -- $ver}"
         # Package exists but expected command missing — trigger post hook
         if ! _shdeps_exists "$_cmd"; then
-          _SHDEPS_CHANGED[$_name]=1
+          _shdeps_mark_changed "$_name"
         fi
         _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
         return 0
@@ -2203,7 +2227,7 @@ _shdeps_install_dep() {
         local action="added"
         [[ $_existed -eq 1 ]] && action="reinstalled"
         if install "$_name"; then
-          _SHDEPS_CHANGED[$_name]=1
+          _shdeps_mark_changed "$_name"
           if declare -f version &>/dev/null; then
             ver=$(version "$_name" 2>/dev/null) || ver=""
           fi
@@ -2335,6 +2359,289 @@ _shdeps_github_release_prefetch() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# Parallel job runner — concurrent Phase B installs with live display
+# ---------------------------------------------------------------------------
+
+# Run one dep install in a worker subprocess. Overrides the I/O boundary
+# so logging, manifest writes, and changed-marking go to per-job files
+# instead of stdout/globals. Called inside ( ... ) &.
+# $1=entry (pipe-delimited dep spec)  $2=job result directory
+_shdeps_job_worker() {
+  local entry="$1" resultdir="$2"
+
+  _shdeps_log() {
+    printf '%s\n' "$*" >>"$resultdir/log"
+    printf '%s\n' "$*" >"$resultdir/display"
+  }
+  _shdeps_log_ok() {
+    printf '%s%s%s\n' "${_SHDEPS_C_GREEN}" "$*" "${_SHDEPS_C_RESET}" >>"$resultdir/log"
+    printf '%s%s%s\n' "${_SHDEPS_C_GREEN}" "$*" "${_SHDEPS_C_RESET}" >"$resultdir/display"
+  }
+  _shdeps_warn() {
+    printf '%s%s%s\n' "${_SHDEPS_C_YELLOW}" "$*" "${_SHDEPS_C_RESET}" >>"$resultdir/log"
+    printf '%s%s%s\n' "${_SHDEPS_C_YELLOW}" "$*" "${_SHDEPS_C_RESET}" >"$resultdir/display"
+  }
+  # shellcheck disable=SC2329 # overrides invoked indirectly by install methods
+  _shdeps_log_warn() { _shdeps_warn "$@"; }
+  # shellcheck disable=SC2329
+  _shdeps_log_dim() {
+    printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >>"$resultdir/log"
+    printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >"$resultdir/display"
+  }
+  # shellcheck disable=SC2329
+  _shdeps_log_header() { printf '%s\n' "$*" >>"$resultdir/log"; }
+  _shdeps_log_status() { printf '%s' "$*" >"$resultdir/status"; }
+  # shellcheck disable=SC2329
+  _shdeps_log_clear() { :; }
+
+  _shdeps_manifest_upsert() {
+    printf '%s\n' "$1|$2|$3|${4:-}" >"$resultdir/manifest"
+  }
+  _shdeps_mark_changed() { printf '1\n' >"$resultdir/changed"; }
+  _shdeps_mark_extras_linked() { printf '1\n' >"$resultdir/extras_linked"; }
+
+  local rc=0
+  _shdeps_install_dep "$entry" || rc=$?
+  printf '%d\n' "$rc" >"$resultdir/rc"
+  return "$rc"
+}
+
+# Collect results from a completed worker. Reads the result directory,
+# updates parent state (_SHDEPS_CHANGED, manifest, extras flag).
+# Sets REPLY to the display line for the caller to render.
+# $1=dep name  $2=result base directory
+_shdeps_job_collect() {
+  local name="$1" resultbase="$2"
+  local resultdir="$resultbase/$name"
+
+  if [[ -f "$resultdir/changed" ]]; then
+    _shdeps_mark_changed "$name"
+  fi
+
+  if [[ -f "$resultdir/extras_linked" ]]; then
+    _shdeps_mark_extras_linked
+  fi
+
+  if [[ -f "$resultdir/manifest" ]]; then
+    local m_name m_method m_cmd m_path
+    IFS='|' read -r m_name m_method m_cmd m_path <"$resultdir/manifest"
+    _shdeps_manifest_upsert "$m_name" "$m_method" "$m_cmd" "$m_path"
+  fi
+
+  if [[ -f "$resultdir/display" ]]; then
+    REPLY=$(<"$resultdir/display")
+  else
+    REPLY="  $name"
+  fi
+
+  local rc=1
+  [[ -f "$resultdir/rc" ]] && rc=$(<"$resultdir/rc")
+  if [[ "$rc" -ne 0 ]]; then
+    _SHDEPS_JOBS_ANY_FAILED=1
+    if [[ -s "$resultdir/log" ]]; then
+      local _log_lc
+      _log_lc=$(wc -l <"$resultdir/log")
+      if [[ $_log_lc -gt 1 ]]; then
+        _SHDEPS_JOBS_ERROR_LOGS+=("$resultdir/log")
+      fi
+    fi
+  fi
+}
+
+# Initialize display state.
+_shdeps_display_init() {
+  _SHDEPS_DISP_N=0
+  _SHDEPS_DISP_COMPLETED=()
+  _SHDEPS_DISP_ACTIVE=()
+  _SHDEPS_DISP_TERM=0
+  [[ -t 1 && -n "${_SHDEPS_C_CLEARLN:-}" ]] && _SHDEPS_DISP_TERM=1
+}
+
+# Register a job as active.
+_shdeps_display_started() { _SHDEPS_DISP_ACTIVE+=("$1"); }
+
+# Queue a completed job's display line.
+_shdeps_display_completed() { _SHDEPS_DISP_COMPLETED+=("$1"); }
+
+# Remove a job from the active list.
+_shdeps_display_stopped() {
+  local name="$1"
+  local -a new=()
+  local n
+  for n in "${_SHDEPS_DISP_ACTIVE[@]}"; do
+    [[ "$n" != "$name" ]] && new+=("$n")
+  done
+  _SHDEPS_DISP_ACTIVE=("${new[@]+"${new[@]}"}")
+}
+
+# Redraw the display. Call at ~10Hz.
+# $1=job result base directory (for reading status files)
+_shdeps_display_refresh() {
+  local resultbase="$1"
+  _shdeps_should_log || return 0
+
+  if [[ $_SHDEPS_DISP_TERM -ne 1 ]]; then
+    local line
+    for line in "${_SHDEPS_DISP_COMPLETED[@]+"${_SHDEPS_DISP_COMPLETED[@]}"}"; do
+      printf '%s\n' "$line"
+    done
+    _SHDEPS_DISP_COMPLETED=()
+    return 0
+  fi
+
+  if [[ $_SHDEPS_DISP_N -gt 0 ]]; then
+    printf '\033[%dA' "$_SHDEPS_DISP_N"
+  fi
+
+  local line
+  for line in "${_SHDEPS_DISP_COMPLETED[@]+"${_SHDEPS_DISP_COMPLETED[@]}"}"; do
+    printf '\033[2K%s\n' "$line"
+  done
+  _SHDEPS_DISP_COMPLETED=()
+
+  local new_n=0 name st
+  for name in "${_SHDEPS_DISP_ACTIVE[@]+"${_SHDEPS_DISP_ACTIVE[@]}"}"; do
+    [[ -n "$name" ]] || continue
+    st=$(<"$resultbase/$name/status" 2>/dev/null) || st="$name: working..."
+    printf '\033[2K  %s%s%s\n' "${_SHDEPS_C_DIM}" "$st" "${_SHDEPS_C_RESET}"
+    ((new_n++))
+  done
+
+  _SHDEPS_DISP_N=$new_n
+}
+
+# Final cleanup — flush remaining completed lines, clear active block.
+_shdeps_display_finish() {
+  if [[ ${#_SHDEPS_DISP_COMPLETED[@]} -gt 0 ]]; then
+    _shdeps_display_refresh ""
+  fi
+  if [[ $_SHDEPS_DISP_TERM -eq 1 && $_SHDEPS_DISP_N -gt 0 ]]; then
+    printf '\033[%dA' "$_SHDEPS_DISP_N"
+    local i
+    for ((i = 0; i < _SHDEPS_DISP_N; i++)); do
+      printf '\033[2K\n'
+    done
+    printf '\033[%dA' "$_SHDEPS_DISP_N"
+    _SHDEPS_DISP_N=0
+  fi
+}
+
+# Run Phase B deps in parallel using a worker pool.
+# Skips pkg and custom deps. Custom deps are returned via
+# _SHDEPS_CUSTOM_ENTRIES for the caller to run sequentially.
+# $1=max concurrent jobs
+_shdeps_jobs_run() {
+  local max_jobs="$1"
+  local resultbase
+  resultbase=$(mktemp -d) || return 1
+
+  local -a queue=()
+  _SHDEPS_CUSTOM_ENTRIES=()
+  local entry method
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    method="${entry#*|}"
+    method="${method%%|*}"
+    case "$method" in
+      pkg) continue ;;
+      custom) _SHDEPS_CUSTOM_ENTRIES+=("$entry") ;;
+      *)
+        _shdeps_parse "$entry"
+        _shdeps_filter_match "$_filter" || continue
+        queue+=("$entry")
+        ;;
+    esac
+  done
+
+  if [[ ${#queue[@]} -eq 0 ]]; then
+    rm -rf "$resultbase"
+    return 0
+  fi
+
+  # Clean up temp dir and kill workers on signal
+  # shellcheck disable=SC2329 # invoked via trap
+  _shdeps_jobs_cleanup() {
+    local s
+    for s in "${slot_pids[@]+"${slot_pids[@]}"}"; do
+      [[ -n "$s" ]] && kill "$s" 2>/dev/null
+    done
+    wait 2>/dev/null
+    rm -rf "$resultbase"
+  }
+  trap '_shdeps_jobs_cleanup; trap - INT; kill -s INT $$' INT
+  trap '_shdeps_jobs_cleanup; trap - TERM; kill -s TERM $$' TERM
+
+  _shdeps_display_init
+  _SHDEPS_JOBS_ANY_FAILED=0
+  _SHDEPS_JOBS_ERROR_LOGS=()
+
+  local -a slot_pids=() slot_names=()
+  local qi=0 n_active=0
+
+  local slot
+  for ((slot = 0; slot < max_jobs && qi < ${#queue[@]}; slot++)); do
+    _shdeps_parse "${queue[$qi]}"
+    local name="$_name"
+    mkdir -p "$resultbase/$name"
+
+    (_shdeps_job_worker "${queue[$qi]}" "$resultbase/$name") &
+    slot_pids[slot]=$!
+    slot_names[slot]="$name"
+    _shdeps_display_started "$name"
+    ((n_active++))
+    ((qi++))
+  done
+
+  while [[ $n_active -gt 0 ]]; do
+    sleep 0.1
+
+    for ((slot = 0; slot < max_jobs; slot++)); do
+      local pid="${slot_pids[slot]:-}"
+      [[ -n "$pid" ]] || continue
+
+      kill -0 "$pid" 2>/dev/null && continue
+      wait "$pid" 2>/dev/null || true
+
+      local cname="${slot_names[slot]}"
+      _shdeps_job_collect "$cname" "$resultbase"
+      _shdeps_display_completed "$REPLY"
+      _shdeps_display_stopped "$cname"
+      ((n_active--))
+
+      slot_pids[slot]=""
+      slot_names[slot]=""
+
+      if [[ $qi -lt ${#queue[@]} ]]; then
+        _shdeps_parse "${queue[$qi]}"
+        local next_name="$_name"
+        mkdir -p "$resultbase/$next_name"
+
+        (_shdeps_job_worker "${queue[$qi]}" "$resultbase/$next_name") &
+        slot_pids[slot]=$!
+        slot_names[slot]="$next_name"
+        _shdeps_display_started "$next_name"
+        ((n_active++))
+        ((qi++))
+      fi
+    done
+
+    _shdeps_display_refresh "$resultbase"
+  done
+
+  _shdeps_display_finish
+
+  local err_log
+  for err_log in "${_SHDEPS_JOBS_ERROR_LOGS[@]+"${_SHDEPS_JOBS_ERROR_LOGS[@]}"}"; do
+    local err_name
+    err_name=$(basename "$(dirname "$err_log")")
+    _shdeps_logfile_print "$err_name install" "$err_log"
+  done
+
+  trap - INT TERM
+  rm -rf "$resultbase"
+  [[ "$_SHDEPS_JOBS_ANY_FAILED" -eq 0 ]]
+}
+
 # Install or upgrade all managed dependencies. Orchestrates:
 # 1. Load config and detect package manager
 # 2. Phase A: queue and flush `pkg` installs first, so system packages
@@ -2397,18 +2704,28 @@ _shdeps_update() {
 
   # Phase B: non-pkg installs (github:*, cargo, go, uv, npm, custom) now that
   # system prereqs are in place.
-  for entry in "${_SHDEPS_DEPS[@]}"; do
-    _phase_method="${entry#*|}"
-    _phase_method="${_phase_method%%|*}"
-    [[ "$_phase_method" == "pkg" ]] && continue
-    _shdeps_install_dep "$entry" || failed=1
-  done
+  local _max_jobs
+  _max_jobs=$(_shdeps_jobs_max)
+
+  if [[ "$_max_jobs" -gt 1 ]]; then
+    _shdeps_jobs_run "$_max_jobs" || failed=1
+    for entry in "${_SHDEPS_CUSTOM_ENTRIES[@]+"${_SHDEPS_CUSTOM_ENTRIES[@]}"}"; do
+      _shdeps_install_dep "$entry" || failed=1
+    done
+  else
+    for entry in "${_SHDEPS_DEPS[@]}"; do
+      _phase_method="${entry#*|}"
+      _phase_method="${_phase_method%%|*}"
+      [[ "$_phase_method" == "pkg" ]] && continue
+      _shdeps_install_dep "$entry" || failed=1
+    done
+  fi
 
   # Reinstall mode: mark all deps as changed so all post() hooks run.
   # (Install methods already checked shdeps_reinstall individually during step 2.)
   if [[ "$(_shdeps_reinstall)" -eq 1 ]]; then
     for entry in "${_SHDEPS_DEPS[@]}"; do
-      _SHDEPS_CHANGED["${entry%%|*}"]=1
+      _shdeps_mark_changed "${entry%%|*}"
     done
   fi
 

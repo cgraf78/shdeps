@@ -94,6 +94,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github:*`, `cargo`, `go`, `uv`, and `npm` installs (each dep lives in `<dir>/<name>/`) |
 | `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                                              |
 | `SHDEPS_LOG_LEVEL`   | `1`                                                | 0=quiet, 1=normal, 2=verbose                                                                               |
+| `SHDEPS_JOBS`        | auto (`nproc`, max 8)                              | Max concurrent installs for non-pkg deps. `1` = sequential.                                                |
 
 ## Install Methods
 
