@@ -55,7 +55,11 @@ jobs:
               pacman-key --init && pacman-key --populate
               pacman -Syu --noconfirm git curl sudo shellcheck
               ;;
-            CentOS* | Fedora)
+            CentOS*)
+              dnf install -y --allowerasing git curl sudo epel-release
+              dnf install -y --allowerasing ShellCheck
+              ;;
+            Fedora)
               dnf install -y --allowerasing git curl sudo ShellCheck
               ;;
             Alpine)

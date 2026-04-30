@@ -266,8 +266,7 @@ echo ""
 echo "=== Platform matching ==="
 
 # Detect current platform for assertions (normalized like shdeps does)
-_current_os=$(uname -s | tr '[:upper:]' '[:lower:]')
-if [[ "$_current_os" == "darwin" ]]; then _current_os="macos"; fi
+_current_os=$(shdeps_platform)
 
 # --- Empty spec matches all ---
 

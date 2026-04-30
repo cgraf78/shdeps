@@ -2453,17 +2453,17 @@ _shdeps_job_worker() {
     printf '%s%s%s\n' "${_SHDEPS_C_YELLOW}" "$*" "${_SHDEPS_C_RESET}" >>"$resultdir/log"
     printf '%s%s%s\n' "${_SHDEPS_C_YELLOW}" "$*" "${_SHDEPS_C_RESET}" >"$resultdir/display"
   }
-  # shellcheck disable=SC2329 # overrides invoked indirectly by install methods
+  # shellcheck disable=SC2317,SC2329 # overrides invoked indirectly by install methods
   _shdeps_log_warn() { _shdeps_warn "$@"; }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   _shdeps_log_dim() {
     printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >>"$resultdir/log"
     printf '%s%s%s\n' "${_SHDEPS_C_DIM}" "$*" "${_SHDEPS_C_RESET}" >"$resultdir/display"
   }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   _shdeps_log_header() { printf '%s\n' "$*" >>"$resultdir/log"; }
   _shdeps_log_status() { printf '%s' "$*" >"$resultdir/status"; }
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   _shdeps_log_clear() { :; }
 
   # Truncates — each install method calls upsert at most once; last call wins
@@ -2635,7 +2635,7 @@ _shdeps_jobs_run() {
   fi
 
   # Clean up temp dir and kill workers on signal
-  # shellcheck disable=SC2329 # invoked via trap
+  # shellcheck disable=SC2317,SC2329 # invoked via trap
   _shdeps_jobs_cleanup() {
     local s
     for s in "${slot_pids[@]+"${slot_pids[@]}"}"; do
