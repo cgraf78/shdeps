@@ -1736,7 +1736,7 @@ _assert_exit "shdeps_log_dim: no error" 0 $?
 
 _shdeps_pkg_detect
 result=$(shdeps_pkg_mgr)
-_assert_match "shdeps_pkg_mgr: known value" "^(brew|apt|dnf|pacman)?$" "$result"
+_assert_match "shdeps_pkg_mgr: known value" "^(brew|apt|dnf|pacman|zypper|apk)?$" "$result"
 
 # --- shdeps_pkg_mgr reflects _SHDEPS_PKG_MGR ---
 

@@ -46,22 +46,26 @@ jobs:
         run: |
           case "${{ matrix.name }}" in
             macOS)
-              brew install bash
+              brew install bash shellcheck
               ;;
             Debian)
-              apt-get update && apt-get install -y git curl sudo
+              apt-get update && apt-get install -y git curl sudo shellcheck
               ;;
             Arch)
               pacman-key --init && pacman-key --populate
-              pacman -Syu --noconfirm git curl sudo
+              pacman -Syu --noconfirm git curl sudo shellcheck
               ;;
             CentOS* | Fedora)
-              dnf install -y --allowerasing git curl sudo
+              dnf install -y --allowerasing git curl sudo ShellCheck
               ;;
             Alpine)
               apk add --no-cache git curl sudo bash coreutils shellcheck
               ;;
           esac
+
+      - name: Install shellcheck (Ubuntu/WSL)
+        if: "!matrix.container && matrix.name != 'macOS'"
+        run: sudo apt-get install -y shellcheck
 
       - uses: actions/checkout@v4
 
