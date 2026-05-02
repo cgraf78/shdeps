@@ -825,7 +825,9 @@ _shdeps_pkg_install() {
   local pkg="$1"
   if [[ -z "$pkg" ]]; then return 1; fi
 
-  _shdeps_pkg_detect
+  if [[ -z "${_SHDEPS_PKG_MGR:-}" ]]; then
+    _shdeps_pkg_detect
+  fi
   if [[ -z "${_SHDEPS_PKG_MGR:-}" ]]; then
     _shdeps_warn "  warning: no package manager found — cannot install $pkg"
     return 1
@@ -850,7 +852,9 @@ _shdeps_pkg_install() {
 # Specs use the same mgr:name shape as config aliases, e.g.
 # `brew:foo apt:foo-cli dnf:python3-foo`.
 _shdeps_pkg_install_for_mgr() {
-  _shdeps_pkg_detect
+  if [[ -z "${_SHDEPS_PKG_MGR:-}" ]]; then
+    _shdeps_pkg_detect
+  fi
   local mgr="${_SHDEPS_PKG_MGR:-}" spec pkg
   [[ -n "$mgr" ]] || return 1
 
