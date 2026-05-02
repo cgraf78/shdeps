@@ -1719,6 +1719,139 @@ _assert_eq "shdeps_pkg_mgr: returns empty" "" "$result"
 # Reset to real value
 _shdeps_pkg_detect
 
+# --- shdeps_pkg_install: installs an available package via current manager ---
+
+_pkg_api_bin=$(_mock_bin)
+_pkg_api_log=$(_tmpdir)/apt.log
+cat >"$_pkg_api_bin/apt-cache" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$1" == "show" && "$2" == "available-tool" ]]
+MOCK
+cat >"$_pkg_api_bin/apt-get" <<'MOCK'
+#!/usr/bin/env bash
+echo "$*" >>"$MOCK_APT_LOG"
+exit 0
+MOCK
+cat >"$_pkg_api_bin/sudo" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "-n" && "$2" == "true" ]]; then
+  exit 0
+fi
+if [[ "$1" == "true" ]]; then
+  exit 0
+fi
+exec "$@"
+MOCK
+chmod +x "$_pkg_api_bin/apt-cache" "$_pkg_api_bin/apt-get" "$_pkg_api_bin/sudo"
+_saved_path="$PATH"
+PATH="$_pkg_api_bin:$PATH"
+MOCK_APT_LOG="$_pkg_api_log" _SHDEPS_PKG_MGR="apt" _SHDEPS_PKG_CACHE_REFRESHED=1 shdeps_pkg_install "available-tool"
+_assert_exit "shdeps_pkg_install: available package installs" 0 $?
+_assert_file_content "shdeps_pkg_install: uses apt install command" "install -y available-tool" "$_pkg_api_log"
+PATH="$_saved_path"
+
+# --- shdeps_pkg_install: refreshes metadata for explicit package attempts ---
+
+_pkg_api_bin=$(_mock_bin)
+_pkg_api_log=$(_tmpdir)/apt.log
+cat >"$_pkg_api_bin/apt-cache" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$1" == "show" && "$2" == "available-tool" ]]
+MOCK
+cat >"$_pkg_api_bin/apt-get" <<'MOCK'
+#!/usr/bin/env bash
+echo "$*" >>"$MOCK_APT_LOG"
+exit 0
+MOCK
+cat >"$_pkg_api_bin/sudo" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "-n" && "$2" == "true" ]]; then
+  exit 0
+fi
+if [[ "$1" == "true" ]]; then
+  exit 0
+fi
+exec "$@"
+MOCK
+chmod +x "$_pkg_api_bin/apt-cache" "$_pkg_api_bin/apt-get" "$_pkg_api_bin/sudo"
+_saved_path="$PATH"
+PATH="$_pkg_api_bin:$PATH"
+MOCK_APT_LOG="$_pkg_api_log" _SHDEPS_PKG_MGR="apt" shdeps_pkg_install "available-tool"
+_assert_exit "shdeps_pkg_install: refresh path installs" 0 $?
+_assert_file_content "shdeps_pkg_install: refreshes before install" $'update -qq\ninstall -y available-tool' "$_pkg_api_log"
+PATH="$_saved_path"
+
+# --- shdeps_pkg_install: unavailable package returns failure for fallback ---
+
+_pkg_api_bin=$(_mock_bin)
+_pkg_api_log=$(_tmpdir)/apt.log
+cat >"$_pkg_api_bin/apt-cache" <<'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+cat >"$_pkg_api_bin/apt-get" <<'MOCK'
+#!/usr/bin/env bash
+echo "$*" >>"$MOCK_APT_LOG"
+exit 0
+MOCK
+cat >"$_pkg_api_bin/sudo" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "-n" && "$2" == "true" ]]; then
+  exit 0
+fi
+if [[ "$1" == "true" ]]; then
+  exit 0
+fi
+exec "$@"
+MOCK
+chmod +x "$_pkg_api_bin/apt-cache" "$_pkg_api_bin/apt-get" "$_pkg_api_bin/sudo"
+_saved_path="$PATH"
+PATH="$_pkg_api_bin:$PATH"
+rc=0
+MOCK_APT_LOG="$_pkg_api_log" _SHDEPS_PKG_MGR="apt" _SHDEPS_PKG_CACHE_REFRESHED=1 shdeps_pkg_install "missing-tool" || rc=$?
+_assert_exit "shdeps_pkg_install: unavailable package fails" 1 "$rc"
+_assert_not_exists "shdeps_pkg_install: unavailable package does not install" "$_pkg_api_log"
+PATH="$_saved_path"
+
+# --- shdeps_pkg_install_for_mgr: resolves current manager spec ---
+
+_pkg_api_bin=$(_mock_bin)
+_pkg_api_log=$(_tmpdir)/dnf.log
+cat >"$_pkg_api_bin/dnf" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+  info)
+    [[ "$2" == "dnf-tool" ]]
+    ;;
+  install)
+    echo "$*" >>"$MOCK_DNF_LOG"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+MOCK
+cat >"$_pkg_api_bin/sudo" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "-n" && "$2" == "true" ]]; then
+  exit 0
+fi
+if [[ "$1" == "true" ]]; then
+  exit 0
+fi
+exec "$@"
+MOCK
+chmod +x "$_pkg_api_bin/dnf" "$_pkg_api_bin/sudo"
+_saved_path="$PATH"
+PATH="$_pkg_api_bin:$PATH"
+MOCK_DNF_LOG="$_pkg_api_log" _SHDEPS_PKG_MGR="dnf" _SHDEPS_PKG_CACHE_REFRESHED=1 shdeps_pkg_install_for_mgr \
+  brew:brew-tool \
+  dnf:dnf-tool
+_assert_exit "shdeps_pkg_install_for_mgr: matching manager installs" 0 $?
+_assert_file_content "shdeps_pkg_install_for_mgr: installs resolved package" "install -y dnf-tool" "$_pkg_api_log"
+PATH="$_saved_path"
+
 # --- shdeps_force: returns 0 when force is 1 ---
 
 SHDEPS_FORCE=1

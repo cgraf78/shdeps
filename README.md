@@ -322,7 +322,9 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | `shdeps_platform`                 | Print normalized platform name (`linux`, `macos`, `wsl`)                                    |
 | `shdeps_force`                    | Return 0 if force mode is active (TTL bypass)                                               |
 | `shdeps_reinstall`                | Return 0 if reinstall mode is active                                                        |
-| `shdeps_pkg_mgr`                  | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, `zypper`, `apk`, or empty)                   |
+| `shdeps_pkg_mgr`                  | Print detected package manager (`brew`, `apt`, `dnf`, `pacman`, `zypper`, `apk`, or empty)  |
+| `shdeps_pkg_install <package>`    | Install one package immediately via the detected package manager                            |
+| `shdeps_pkg_install_for_mgr <mgr:package>...` | Install the package spec matching the detected package manager                    |
 | `shdeps_install_dir`              | Print base install directory (`$SHDEPS_INSTALL_DIR`, default `~/.local/share`)              |
 | `shdeps_git_dev_dir`              | Print git dev clone directory (`$SHDEPS_GIT_DEV_DIR`, default `~/git`)                      |
 | `shdeps_bin_dir`                  | Print binary symlink directory (`$SHDEPS_BIN_DIR`, default `~/.local/bin`)                  |

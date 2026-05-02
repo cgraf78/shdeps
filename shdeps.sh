@@ -60,6 +60,8 @@ shdeps_platform() {
 shdeps_force() { [[ "$(_shdeps_force)" -eq 1 ]]; }
 shdeps_reinstall() { [[ "$(_shdeps_reinstall)" -eq 1 ]]; }
 shdeps_pkg_mgr() { echo "${_SHDEPS_PKG_MGR:-}"; }
+shdeps_pkg_install() { _shdeps_pkg_install "$@"; }
+shdeps_pkg_install_for_mgr() { _shdeps_pkg_install_for_mgr "$@"; }
 shdeps_require_sudo() { _shdeps_require_sudo; }
 shdeps_install_dir() { _shdeps_install_dir; }
 shdeps_git_dev_dir() { _shdeps_git_dev_dir; }
@@ -70,6 +72,12 @@ shdeps_link_extras() { _shdeps_link_extras "$@"; }
 shdeps_unlink_extras() { _shdeps_unlink_extras "$@"; }
 
 # Install methods — for use in custom hooks that need built-in install logic
+#   shdeps_pkg_install <package>
+#     Install one package via the detected system package manager.
+#     Returns non-zero when unavailable or install fails so hooks can fall back.
+#   shdeps_pkg_install_for_mgr <mgr:package>...
+#     Try the package spec matching the detected manager. Useful when package
+#     names differ across brew/apt/dnf/pacman/zypper/apk.
 #   shdeps_github_release_install <name> <cmd> <owner/repo>
 #     Download a prebuilt binary from a GitHub release.
 #     name:  dependency name (used for logging, TTL stamps, manifest)
@@ -759,6 +767,101 @@ _shdeps_pkg_available() {
   esac
 }
 
+# Install one package immediately via the current package manager.
+#
+# Custom hooks run after the normal pkg batch phase, so they need a synchronous
+# primitive: try a native package now, return success/failure, and let the hook
+# decide whether to fall back to an upstream installer. Normal `pkg` deps still
+# use the queued batch path for efficiency.
+_shdeps_pkg_install_one() {
+  local pkg="$1"
+  if [[ -z "$pkg" ]]; then return 1; fi
+
+  if [[ -z "${_SHDEPS_PKG_MGR:-}" ]]; then
+    _shdeps_warn "  warning: no package manager found — cannot install $pkg"
+    return 1
+  fi
+
+  if [[ "$(_shdeps_quiet)" -eq 1 && "$_SHDEPS_PKG_MGR" != "brew" && "$(id -u)" -ne 0 ]]; then
+    return 1
+  fi
+
+  if [[ "$_SHDEPS_PKG_MGR" != "brew" ]] && ! _shdeps_require_sudo; then
+    _shdeps_warn "  warning: sudo not available — cannot install $pkg"
+    return 1
+  fi
+
+  local rc=0 log=""
+  if ! _shdeps_logfile_create; then
+    _shdeps_warn "  warning: failed to create temp log for package install"
+  else
+    log="$REPLY"
+  fi
+
+  _shdeps_log_status "  ${_SHDEPS_PKG_MGR}: installing $pkg..."
+  # shellcheck disable=SC2024  # sudo output captured in user-owned log
+  case "$_SHDEPS_PKG_MGR" in
+    brew) _shdeps_run_logged brew install "$pkg" || rc=$? ;;
+    apt) _shdeps_run_logged sudo apt-get install -y "$pkg" || rc=$? ;;
+    dnf) _shdeps_run_logged sudo dnf install -y "$pkg" || rc=$? ;;
+    pacman) _shdeps_run_logged sudo pacman -Sy --needed --noconfirm "$pkg" || rc=$? ;;
+    zypper) _shdeps_run_logged sudo zypper -n install "$pkg" || rc=$? ;;
+    apk) _shdeps_run_logged sudo apk add "$pkg" || rc=$? ;;
+    *) rc=1 ;;
+  esac
+  _shdeps_log_clear
+
+  if [[ $rc -ne 0 ]]; then
+    _shdeps_logfile_print "package manager for $pkg" "$log"
+    _shdeps_warn "  warning: failed to install $pkg"
+  fi
+  rm -f "$log"
+  [[ $rc -eq 0 ]]
+}
+
+# Public package install primitive for custom hooks.
+# Returns 0 only when the named package was installed successfully.
+_shdeps_pkg_install() {
+  local pkg="$1"
+  if [[ -z "$pkg" ]]; then return 1; fi
+
+  _shdeps_pkg_detect
+  if [[ -z "${_SHDEPS_PKG_MGR:-}" ]]; then
+    _shdeps_warn "  warning: no package manager found — cannot install $pkg"
+    return 1
+  fi
+
+  _shdeps_pkg_refresh_metadata_now
+
+  _shdeps_log_status "  $pkg: checking ${_SHDEPS_PKG_MGR} repos..."
+  if ! _shdeps_pkg_available "$pkg"; then
+    _shdeps_warn "  warning: $pkg not available in $_SHDEPS_PKG_MGR repos"
+    if [[ "$_SHDEPS_PKG_MGR" == "dnf" && "${SHDEPS_AUTO_EPEL:-0}" -ne 1 && "${_SHDEPS_EPEL_HINT_SHOWN:-0}" -ne 1 ]]; then
+      _shdeps_warn "  hint: many missing dnf packages are in EPEL — set SHDEPS_AUTO_EPEL=1"
+      _SHDEPS_EPEL_HINT_SHOWN=1
+    fi
+    return 1
+  fi
+
+  _shdeps_pkg_install_one "$pkg"
+}
+
+# Try the package spec matching the detected manager.
+# Specs use the same mgr:name shape as config aliases, e.g.
+# `brew:foo apt:foo-cli dnf:python3-foo`.
+_shdeps_pkg_install_for_mgr() {
+  _shdeps_pkg_detect
+  local mgr="${_SHDEPS_PKG_MGR:-}" spec pkg
+  [[ -n "$mgr" ]] || return 1
+
+  for spec in "$@"; do
+    [[ "$spec" == "$mgr:"* ]] || continue
+    pkg="${spec#*:}"
+    _shdeps_pkg_install "$pkg" && return 0
+  done
+  return 1
+}
+
 # Auto-enable EPEL repo on dnf systems when SHDEPS_AUTO_EPEL=1.
 # EPEL (Extra Packages for Enterprise Linux) adds many common dev tools
 # not in base CentOS/RHEL repos. Off by default — opt-in via env var
@@ -776,12 +879,12 @@ _shdeps_maybe_enable_epel() {
   _shdeps_log_dim "  EPEL repo enabled"
 }
 
-# Refresh package manager metadata cache once per update run.
-# Ensures _shdeps_pkg_available sees all available packages, even on
-# a fresh machine where the cache is empty.
-_shdeps_pkg_refresh_metadata() {
-  _shdeps_check_prereqs
-  [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-0}" -eq 1 ]] || return 0
+# Refresh package manager metadata cache once.
+#
+# The normal update flow gates this on missing declarative `pkg` deps. Public
+# package installs from custom hooks call this directly because their package
+# need is explicit and may not be represented in config.
+_shdeps_pkg_refresh_metadata_now() {
   [[ "${_SHDEPS_PKG_CACHE_REFRESHED:-}" != 1 ]] || return 0
 
   # apt/dnf/pacman write to root-owned cache dirs — require sudo.
@@ -802,6 +905,15 @@ _shdeps_pkg_refresh_metadata() {
   esac
   _SHDEPS_PKG_CACHE_REFRESHED=1
   _shdeps_log_dim "  $_SHDEPS_PKG_MGR package metadata refreshed"
+}
+
+# Refresh package manager metadata cache once per update run.
+# Ensures _shdeps_pkg_available sees all available packages, even on
+# a fresh machine where the cache is empty.
+_shdeps_pkg_refresh_metadata() {
+  _shdeps_check_prereqs
+  [[ "${_SHDEPS_PKG_INSTALL_NEEDED:-0}" -eq 1 ]] || return 0
+  _shdeps_pkg_refresh_metadata_now
 }
 
 # Queue a package for batched install.
