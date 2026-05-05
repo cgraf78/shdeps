@@ -1695,6 +1695,22 @@ _shdeps_github_repo_install_pull() {
 # Strategy: no existing install — shallow clone from GitHub.
 # Clones to a temp dir first so a failed clone doesn't destroy an
 # existing install (e.g. network unreachable).
+_shdeps_github_repo_ssh_fallback_url() {
+  local repo="$1" path
+  case "$repo" in
+    https://github.com/*)
+      path="${repo#https://github.com/}"
+      path="${path%/}"
+      path="${path%.git}"
+      [[ "$path" == */* && "$path" != *:* && "$path" != *" "* ]] || return 1
+      printf 'git@github.com:%s.git' "$path"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 _shdeps_github_repo_install_fresh() {
   local name="$1" repo="$2" install_dir="$3" stamp="$4" log="$5"
 
@@ -1711,7 +1727,29 @@ _shdeps_github_repo_install_fresh() {
   rm -rf "$clone_tmp"
   if [[ -n "${log:-}" ]]; then : >"$log"; fi
   _shdeps_log_status "  $name: cloning repository..."
+  local fallback_repo=""
   if ! _shdeps_run_logged git clone --depth 1 "$repo" "$clone_tmp"; then
+    rm -rf "$clone_tmp"
+    if fallback_repo="$(_shdeps_github_repo_ssh_fallback_url "$repo")"; then
+      # Private GitHub repos fail anonymous HTTPS clones with the same shape as
+      # network/auth failures. Retrying the normal SSH form keeps public repos
+      # fast while allowing private repos to use the user's GitHub SSH account.
+      _shdeps_log_status "  $name: HTTPS clone failed, retrying SSH..."
+      if ! _shdeps_run_logged git clone --depth 1 "$fallback_repo" "$clone_tmp"; then
+        rm -rf "$clone_tmp"
+        _shdeps_logfile_print "$name clone" "$log"
+        rm -f "$log"
+        _shdeps_warn "  warning: failed to clone $name (network unreachable?)"
+        return 1
+      fi
+    else
+      _shdeps_logfile_print "$name clone" "$log"
+      rm -f "$log"
+      _shdeps_warn "  warning: failed to clone $name (network unreachable?)"
+      return 1
+    fi
+  fi
+  if [[ ! -d "$clone_tmp" ]]; then
     rm -rf "$clone_tmp"
     _shdeps_logfile_print "$name clone" "$log"
     rm -f "$log"

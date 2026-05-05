@@ -2272,6 +2272,66 @@ _assert_file_exists "fresh clone: stamp in owner subdir" "$_fc_state/testowner/f
 rm -rf "$_fc_install" "$_fc_origin"
 unset SHDEPS_INSTALL_DIR
 
+# --- Fresh clone falls back from public HTTPS to normal GitHub SSH ---
+
+_assert_eq "github ssh fallback: normalizes HTTPS URL" \
+  "git@github.com:owner/repo.git" \
+  "$(_shdeps_github_repo_ssh_fallback_url "https://github.com/owner/repo")"
+_assert_eq "github ssh fallback: normalizes HTTPS .git URL" \
+  "git@github.com:owner/repo.git" \
+  "$(_shdeps_github_repo_ssh_fallback_url "https://github.com/owner/repo.git")"
+if _shdeps_github_repo_ssh_fallback_url "https://example.com/owner/repo" >/dev/null; then
+  _fail "github ssh fallback: ignores non-GitHub URL"
+else
+  _pass "github ssh fallback: ignores non-GitHub URL"
+fi
+
+_fc_fb_state=$(_tmpdir)
+_fc_fb_install_base=$(_tmpdir)
+_fc_fb_name="private/repo"
+_fc_fb_install="$_fc_fb_install_base/$_fc_fb_name"
+_fc_fb_bin=$(_mock_bin)
+_fc_fb_log=$(_tmpdir)/git.log
+cat >"$_fc_fb_bin/git" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SHDEPS_TEST_GIT_LOG"
+if [[ "$1" = clone && "$2" = --depth && "$3" = 1 ]]; then
+  case "$4" in
+    https://github.com/private/repo)
+      exit 128
+      ;;
+    git@github.com:private/repo.git)
+      mkdir -p "$5/.git"
+      printf '%s\n' '1.0.0' >"$5/VERSION"
+      exit 0
+      ;;
+  esac
+fi
+if [[ "$1" = -C ]]; then
+  exit 1
+fi
+exit 1
+SH
+chmod +x "$_fc_fb_bin/git"
+SHDEPS_STATE_DIR="$_fc_fb_state"
+SHDEPS_INSTALL_DIR="$_fc_fb_install_base"
+_source_shdeps "$SHDEPS_DIR"
+declare -gA _SHDEPS_CHANGED=()
+PATH="$_fc_fb_bin:$PATH" \
+  SHDEPS_TEST_GIT_LOG="$_fc_fb_log" \
+  _shdeps_github_repo_install "$_fc_fb_name" "$_fc_fb_name" "$_fc_fb_install" 2>/dev/null
+
+_fc_fb_calls=$(cat "$_fc_fb_log")
+_assert_contains "fresh clone SSH fallback: tries HTTPS first" \
+  "clone --depth 1 https://github.com/private/repo" "$_fc_fb_calls"
+_assert_contains "fresh clone SSH fallback: retries normal SSH URL" \
+  "clone --depth 1 git@github.com:private/repo.git" "$_fc_fb_calls"
+_assert_dir_exists "fresh clone SSH fallback: install dir created" "$_fc_fb_install"
+_assert_eq "fresh clone SSH fallback: marked changed" "1" "${_SHDEPS_CHANGED[$_fc_fb_name]:-0}"
+
+rm -rf "$_fc_fb_install"
+unset SHDEPS_INSTALL_DIR
+
 # --- Extras linking creates owner/ subdir for .links file ---
 
 _el_state=$(_tmpdir)
