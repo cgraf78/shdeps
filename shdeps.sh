@@ -1668,7 +1668,20 @@ _shdeps_github_repo_install_pull() {
   local head_before
   head_before=$(git -C "$install_dir" rev-parse HEAD 2>/dev/null || true)
   _shdeps_log_status "  $name: pulling latest..."
+  local pulled=0
   if _shdeps_run_logged git -C "$install_dir" pull --ff-only --quiet; then
+    pulled=1
+  elif _shdeps_github_repo_prefer_ssh_origin "$install_dir"; then
+    # Repos that were public when first installed may become private later.
+    # Retry once after switching only a GitHub HTTPS origin to the normal SSH
+    # form; arbitrary remotes and user dev clones stay under caller control.
+    _shdeps_log_status "  $name: HTTPS pull failed, retrying SSH..."
+    if _shdeps_run_logged git -C "$install_dir" pull --ff-only --quiet; then
+      pulled=1
+    fi
+  fi
+
+  if [[ "$pulled" -eq 1 ]]; then
     _shdeps_link_bin_from_dir "$name" "$install_dir"
     _shdeps_link_extras "$name" "$install_dir"
     local head_after
@@ -1709,6 +1722,13 @@ _shdeps_github_repo_ssh_fallback_url() {
       return 1
       ;;
   esac
+}
+
+_shdeps_github_repo_prefer_ssh_origin() {
+  local install_dir="$1" origin fallback
+  origin=$(git -C "$install_dir" remote get-url origin 2>/dev/null) || return 1
+  fallback=$(_shdeps_github_repo_ssh_fallback_url "$origin") || return 1
+  git -C "$install_dir" remote set-url origin "$fallback" 2>/dev/null
 }
 
 _shdeps_github_repo_install_fresh() {
