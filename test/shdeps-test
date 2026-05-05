@@ -2292,6 +2292,7 @@ _fc_fb_name="private/repo"
 _fc_fb_install="$_fc_fb_install_base/$_fc_fb_name"
 _fc_fb_bin=$(_mock_bin)
 _fc_fb_log=$(_tmpdir)/git.log
+_fc_fb_push_remote=$(_tmpdir)/push-remote.txt
 cat >"$_fc_fb_bin/git" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SHDEPS_TEST_GIT_LOG"
@@ -2307,6 +2308,10 @@ if [[ "$1" = clone && "$2" = --depth && "$3" = 1 ]]; then
       ;;
   esac
 fi
+if [[ "$1" = -C && "$3" = remote && "$4" = set-url && "$5" = --push && "$6" = origin ]]; then
+  printf '%s\n' "$7" >"$SHDEPS_TEST_PUSH_REMOTE_FILE"
+  exit 0
+fi
 if [[ "$1" = -C ]]; then
   exit 1
 fi
@@ -2320,6 +2325,7 @@ declare -gA _SHDEPS_CHANGED=()
 # shellcheck disable=SC2218  # provided by dynamic _source_shdeps in test helper
 PATH="$_fc_fb_bin:$PATH" \
   SHDEPS_TEST_GIT_LOG="$_fc_fb_log" \
+  SHDEPS_TEST_PUSH_REMOTE_FILE="$_fc_fb_push_remote" \
   _shdeps_github_repo_install "$_fc_fb_name" "$_fc_fb_name" "$_fc_fb_install" 2>/dev/null
 
 _fc_fb_calls=$(cat "$_fc_fb_log")
@@ -2327,8 +2333,12 @@ _assert_contains "fresh clone SSH fallback: tries HTTPS first" \
   "clone --depth 1 https://github.com/private/repo" "$_fc_fb_calls"
 _assert_contains "fresh clone SSH fallback: retries normal SSH URL" \
   "clone --depth 1 git@github.com:private/repo.git" "$_fc_fb_calls"
+_assert_contains "fresh clone SSH fallback: sets push URL" \
+  "-C $_fc_fb_install remote set-url --push origin git@github.com:private/repo.git" "$_fc_fb_calls"
 _assert_dir_exists "fresh clone SSH fallback: install dir created" "$_fc_fb_install"
 _assert_eq "fresh clone SSH fallback: marked changed" "1" "${_SHDEPS_CHANGED[$_fc_fb_name]:-0}"
+_assert_eq "fresh clone SSH fallback: push URL persisted" \
+  "git@github.com:private/repo.git" "$(cat "$_fc_fb_push_remote")"
 
 rm -rf "$_fc_fb_install"
 unset SHDEPS_INSTALL_DIR
@@ -2340,9 +2350,11 @@ _pull_fb_install=$(_tmpdir)/private/repo
 _pull_fb_bin=$(_mock_bin)
 _pull_fb_log=$(_tmpdir)/git.log
 _pull_fb_remote=$(_tmpdir)/remote.txt
+_pull_fb_push_remote=$(_tmpdir)/push-remote.txt
 mkdir -p "$_pull_fb_install/.git"
 printf '%s\n' '1.0.0' >"$_pull_fb_install/VERSION"
 printf '%s\n' 'https://github.com/private/repo.git' >"$_pull_fb_remote"
+printf '%s\n' 'https://github.com/private/repo.git' >"$_pull_fb_push_remote"
 cat >"$_pull_fb_bin/git" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SHDEPS_TEST_GIT_LOG"
@@ -2356,6 +2368,10 @@ if [[ "$1" = -C && "$3" = remote && "$4" = get-url && "$5" = origin ]]; then
 fi
 if [[ "$1" = -C && "$3" = remote && "$4" = set-url && "$5" = origin ]]; then
   printf '%s\n' "$6" >"$SHDEPS_TEST_REMOTE_FILE"
+  exit 0
+fi
+if [[ "$1" = -C && "$3" = remote && "$4" = set-url && "$5" = --push && "$6" = origin ]]; then
+  printf '%s\n' "$7" >"$SHDEPS_TEST_PUSH_REMOTE_FILE"
   exit 0
 fi
 if [[ "$1" = -C && "$3" = pull ]]; then
@@ -2374,6 +2390,7 @@ declare -gA _SHDEPS_CHANGED=()
 PATH="$_pull_fb_bin:$PATH" \
   SHDEPS_TEST_GIT_LOG="$_pull_fb_log" \
   SHDEPS_TEST_REMOTE_FILE="$_pull_fb_remote" \
+  SHDEPS_TEST_PUSH_REMOTE_FILE="$_pull_fb_push_remote" \
   _shdeps_github_repo_install "private/repo" "private/repo" "$_pull_fb_install" 2>/dev/null
 
 _pull_fb_calls=$(cat "$_pull_fb_log")
@@ -2383,8 +2400,12 @@ _assert_contains "existing clone SSH fallback: reads HTTPS origin" \
   "-C $_pull_fb_install remote get-url origin" "$_pull_fb_calls"
 _assert_contains "existing clone SSH fallback: rewrites to normal SSH URL" \
   "-C $_pull_fb_install remote set-url origin git@github.com:private/repo.git" "$_pull_fb_calls"
+_assert_contains "existing clone SSH fallback: rewrites push URL" \
+  "-C $_pull_fb_install remote set-url --push origin git@github.com:private/repo.git" "$_pull_fb_calls"
 _assert_eq "existing clone SSH fallback: remote file updated" \
   "git@github.com:private/repo.git" "$(cat "$_pull_fb_remote")"
+_assert_eq "existing clone SSH fallback: push remote file updated" \
+  "git@github.com:private/repo.git" "$(cat "$_pull_fb_push_remote")"
 
 # --- Extras linking creates owner/ subdir for .links file ---
 

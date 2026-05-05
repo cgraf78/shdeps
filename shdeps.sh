@@ -1655,6 +1655,7 @@ _shdeps_github_repo_install_local() {
 # Strategy: install_dir/.git exists — pull to update.
 _shdeps_github_repo_install_pull() {
   local name="$1" install_dir="$2" stamp="$3" log="$4"
+  _shdeps_github_repo_sync_ssh_push_url "$install_dir"
   if _shdeps_remote_fresh "$stamp"; then
     _shdeps_link_bin_from_dir "$name" "$install_dir"
     _shdeps_link_extras "$name" "$install_dir"
@@ -1728,7 +1729,25 @@ _shdeps_github_repo_prefer_ssh_origin() {
   local install_dir="$1" origin fallback
   origin=$(git -C "$install_dir" remote get-url origin 2>/dev/null) || return 1
   fallback=$(_shdeps_github_repo_ssh_fallback_url "$origin") || return 1
-  git -C "$install_dir" remote set-url origin "$fallback" 2>/dev/null
+  git -C "$install_dir" remote set-url origin "$fallback" 2>/dev/null || return 1
+  git -C "$install_dir" remote set-url --push origin "$fallback" 2>/dev/null || true
+}
+
+_shdeps_github_repo_sync_ssh_push_url() {
+  local install_dir="$1" origin fallback
+  origin=$(git -C "$install_dir" remote get-url origin 2>/dev/null) || return 0
+  case "$origin" in
+    git@github.com:*) fallback="$origin" ;;
+    https://github.com/*) fallback=$(_shdeps_github_repo_ssh_fallback_url "$origin") || return 0 ;;
+    *) return 0 ;;
+  esac
+  git -C "$install_dir" remote set-url --push origin "$fallback" 2>/dev/null || true
+}
+
+_shdeps_github_repo_set_ssh_push_url() {
+  local install_dir="$1" repo="$2" fallback
+  fallback=$(_shdeps_github_repo_ssh_fallback_url "$repo") || return 0
+  git -C "$install_dir" remote set-url --push origin "$fallback" 2>/dev/null || true
 }
 
 _shdeps_github_repo_install_fresh() {
@@ -1778,6 +1797,7 @@ _shdeps_github_repo_install_fresh() {
   fi
   rm -rf "$install_dir"
   mv "$clone_tmp" "$install_dir"
+  _shdeps_github_repo_set_ssh_push_url "$install_dir" "$repo"
 
   _shdeps_link_bin_from_dir "$name" "$install_dir"
   _shdeps_link_extras "$name" "$install_dir"
