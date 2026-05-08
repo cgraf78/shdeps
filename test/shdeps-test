@@ -941,6 +941,14 @@ _json=$(_fake_release_json \
 result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
 _assert_contains "asset match: .zst matches plain pass" ".zst" "$result"
 
+# --- .tar.zst archive ---
+
+_json=$(_fake_release_json \
+  "tool-${_test_arch}-unknown-${_test_os}.tar.zst" \
+  "tool-${_test_arch}-unknown-${_test_os}.zip")
+result=$(_shdeps_github_release_find_asset "tool" "test/tool" "v1.0.0" "$_json")
+_assert_contains "asset match: .tar.zst is archive" ".tar.zst" "$result"
+
 # --- Libc preference (linux-only) ---
 
 echo ""
@@ -1275,9 +1283,31 @@ else
   _test_decompress "bz2 decompression" "bz2"
   if command -v zstd &>/dev/null; then
     _test_decompress "zst decompression" "zst"
+
+    _test_tarzst_staging=$(_tmpdir)
+    cp "$_true_bin" "$_test_tarzst_staging/mytool"
+    mkdir -p "$_test_tarzst_staging/mytool-resources"
+    cp "$_true_bin" "$_test_tarzst_staging/mytool-resources/helper"
+    _test_tarzst_tar=$(mktemp "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX.tar")
+    _test_tarzst_archive="$_test_tarzst_tar.zst"
+    tar cf "$_test_tarzst_tar" -C "$_test_tarzst_staging" .
+    zstd -qf "$_test_tarzst_tar" -o "$_test_tarzst_archive"
+    _test_tarzst_bin="$_test_tarzst_staging/output-bin"
+    rc=0
+    _shdeps_github_release_install_tar_zst "test-pkg" "mytool" "$_test_tarzst_archive" "$_test_tarzst_bin" "" >/dev/null 2>&1 || rc=$?
+    _assert_exit "tar.zst extraction" 0 "$rc"
+    if [[ -L "$_test_tarzst_bin" ]]; then
+      _target=$(readlink "$_test_tarzst_bin")
+      _assert_contains "tar.zst extraction: symlinks inner binary" "/mytool" "$_target"
+    else
+      _fail "tar.zst extraction: no symlink created"
+    fi
+    rm -f "$_test_tarzst_tar" "$_test_tarzst_archive"
   else
     _pass "zst decompression: skipped (zstd not installed)"
     _pass "zst decompression: binary decompressed: skipped"
+    _pass "tar.zst extraction: skipped (zstd not installed)"
+    _pass "tar.zst extraction: symlinks inner binary: skipped"
   fi
 
 fi # end of _true_bin guard

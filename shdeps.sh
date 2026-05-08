@@ -1898,7 +1898,7 @@ _shdeps_github_release_find_asset() {
   )
 
   # Archive extensions recognized for extraction
-  local -a _tar_exts=(.tar.gz .tar.xz .tar.bz2 .tgz)
+  local -a _tar_exts=(.tar.gz .tar.xz .tar.bz2 .tar.zst .tgz .tzst)
   local -a _archive_exts=("${_tar_exts[@]}" .zip)
 
   # Try matching from the API asset list.
@@ -2108,6 +2108,30 @@ _shdeps_github_release_install_tarball() {
   _shdeps_github_release_install_from_extracted "$name" "$cmd" "$extract_dir" "$extract_dir" "$bin_path"
 }
 
+# Decompress a zstd-compressed tarball, then install from the inner tar.
+# $1=name $2=cmd $3=tmp_file $4=bin_path $5=log
+_shdeps_github_release_install_tar_zst() {
+  local name="$1" cmd="$2" tmp_file="$3" bin_path="$4" log="$5"
+  if ! command -v zstd &>/dev/null; then
+    rm -f "$tmp_file" "$log"
+    _shdeps_warn "  warning: zstd not found — cannot install $name"
+    return 1
+  fi
+  local tar_file
+  tar_file=$(mktemp) || {
+    rm -f "$tmp_file" "$log"
+    _shdeps_warn "  warning: failed to create tar file for $name"
+    return 1
+  }
+  if ! zstd -dc "$tmp_file" >"$tar_file" 2>/dev/null; then
+    rm -f "$tmp_file" "$tar_file" "$log"
+    _shdeps_warn "  warning: failed to decompress $name .tar.zst"
+    return 1
+  fi
+  rm -f "$tmp_file"
+  _shdeps_github_release_install_tarball "$name" "$cmd" "$tar_file" "$bin_path" "$log"
+}
+
 # Extract a zip, find the binary, install to $SHDEPS_INSTALL_DIR/<name>.
 # $1=name $2=cmd $3=tmp_file $4=bin_path $5=log
 _shdeps_github_release_install_zip() {
@@ -2241,7 +2265,11 @@ _shdeps_github_release_install() {
 
   # Install based on asset type: archive, compressed single, or direct binary
   local asset_lower="${asset_url,,}"
-  if [[ "$asset_lower" == *.tar.gz || "$asset_lower" == *.tar.xz || "$asset_lower" == *.tar.bz2 || "$asset_lower" == *.tgz ]]; then
+  if [[ "$asset_lower" == *.tar.zst || "$asset_lower" == *.tzst ]]; then
+    if ! _shdeps_github_release_install_tar_zst "$name" "$cmd" "$tmp_file" "$bin_path" "$log"; then
+      return 1
+    fi
+  elif [[ "$asset_lower" == *.tar.gz || "$asset_lower" == *.tar.xz || "$asset_lower" == *.tar.bz2 || "$asset_lower" == *.tgz ]]; then
     if ! _shdeps_github_release_install_tarball "$name" "$cmd" "$tmp_file" "$bin_path" "$log"; then
       return 1
     fi
