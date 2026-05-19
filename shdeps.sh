@@ -1044,6 +1044,8 @@ _shdeps_pkg_check_parallel() {
 
   local -a names=() cmds=() resolved_pkgs=() pids=()
   local entry
+  local verbose=0
+  [[ "$(_shdeps_log_level)" -ge 2 ]] && verbose=1
 
   for entry in "${_SHDEPS_DEPS[@]}"; do
     _shdeps_parse "$entry"
@@ -1055,8 +1057,14 @@ _shdeps_pkg_check_parallel() {
     [[ "$resolved_pkg" == "NONE" ]] && continue
 
     if _shdeps_exists "$_cmd" "$resolved_pkg"; then
-      (_shdeps_dep_version "$_cmd" 2>/dev/null || true) >"$resultbase/$_name.ver" &
-      pids+=($!)
+      # Version commands are surprisingly expensive across a large pkg set:
+      # many tools spawn runtimes, inspect plugins, or try multiple flags.
+      # Collapsed/quiet updates only print the final up-to-date count, so defer
+      # that work to verbose mode where the per-dep version text is visible.
+      if [[ $verbose -eq 1 ]]; then
+        (_shdeps_dep_version "$_cmd" 2>/dev/null || true) >"$resultbase/$_name.ver" &
+        pids+=($!)
+      fi
       names+=("$_name")
       cmds+=("$_cmd")
       resolved_pkgs+=("$resolved_pkg")
@@ -1071,16 +1079,14 @@ _shdeps_pkg_check_parallel() {
     wait "$pid" 2>/dev/null || true
   done
 
-  local verbose=0
-  [[ "$(_shdeps_log_level)" -ge 2 ]] && verbose=1
   local n_ok=0 i
 
   for ((i = 0; i < ${#names[@]}; i++)); do
     local name="${names[$i]}" cmd="${cmds[$i]}" resolved="${resolved_pkgs[$i]}"
     local ver=""
-    [[ -s "$resultbase/$name.ver" ]] && ver=$(<"$resultbase/$name.ver")
+    [[ $verbose -eq 1 && -s "$resultbase/$name.ver" ]] && ver=$(<"$resultbase/$name.ver")
     # Subshell can't access _SHDEPS_PKG_VERSIONS — fall back to parent's cache
-    if [[ -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
+    if [[ $verbose -eq 1 && -z "$ver" ]] && _shdeps_pkg_version "$resolved"; then
       ver="$REPLY"
     fi
 

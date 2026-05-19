@@ -771,6 +771,41 @@ _SHDEPS_PKG_CACHE_REFRESHED=1
 _shdeps_pkg_refresh_metadata
 _assert_eq "refresh_metadata: idempotent" "1" "$_SHDEPS_PKG_CACHE_REFRESHED"
 
+# --- _shdeps_pkg_check_parallel: collapsed output skips version probes ---
+
+_pkg_check_bin=$(_mock_bin)
+_pkg_check_log=$(_tmpdir)/pkg-version.log
+printf '#!/bin/sh\n' >"$_pkg_check_bin/tool-a" && chmod +x "$_pkg_check_bin/tool-a"
+printf '#!/bin/sh\n' >"$_pkg_check_bin/tool-b" && chmod +x "$_pkg_check_bin/tool-b"
+_saved_path="$PATH"
+export PATH="$_pkg_check_bin:$PATH"
+_SHDEPS_DEPS=("tool-a|pkg|tool-a||" "tool-b|pkg|tool-b||")
+_SHDEPS_PKG_MGR="apt"
+_SHDEPS_PKG_BATCH=()
+_SHDEPS_PKG_BATCH_NAMES=()
+_SHDEPS_N_UP_TO_DATE=0
+SHDEPS_LOG_LEVEL=1
+_shdeps_dep_version() {
+  printf '%s\n' "$1" >>"$_pkg_check_log"
+  printf '1.0\n'
+}
+: >"$_pkg_check_log"
+_shdeps_pkg_check_parallel >/dev/null
+_assert_file_content "pkg_check: collapsed output skips version probes" "" "$_pkg_check_log"
+_assert_eq "pkg_check: collapsed output still counts installed packages" \
+  "2" "$_SHDEPS_N_UP_TO_DATE"
+
+# --- _shdeps_pkg_check_parallel: verbose output keeps version probes ---
+
+SHDEPS_LOG_LEVEL=2
+_SHDEPS_N_UP_TO_DATE=0
+: >"$_pkg_check_log"
+_pkg_check_verbose=$(_shdeps_pkg_check_parallel)
+_assert_contains "pkg_check: verbose probes tool-a version" "tool-a" "$(cat "$_pkg_check_log")"
+_assert_contains "pkg_check: verbose prints version" "tool-a -- 1.0" "$_pkg_check_verbose"
+export PATH="$_saved_path"
+SHDEPS_LOG_LEVEL=0
+
 # Restore state
 unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PKG_CACHE_REFRESHED
 _source_shdeps "$SHDEPS_DIR"
