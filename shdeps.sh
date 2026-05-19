@@ -1182,17 +1182,59 @@ _shdeps_manifest_path() {
   echo "$(_shdeps_state_dir)/manifest"
 }
 
+# Manifest upserts sit on the quiet `dot update` hot path: every installed
+# system package records that it is still present, and historically each record
+# rewrote the whole manifest through a temp file. Keep one in-process view so
+# repeated current entries can be proven no-ops without re-reading or rewriting
+# the manifest for each dependency. This is deliberately only a process-local
+# cache; the on-disk manifest remains the source of truth across invocations.
+_SHDEPS_MANIFEST_CACHE_LOADED=0
+_SHDEPS_MANIFEST_CACHE_PATH=""
+_SHDEPS_MANIFEST_CACHE_FINGERPRINT=""
+
+_shdeps_manifest_fingerprint() {
+  local manifest="$1"
+  [[ -e "$manifest" ]] || {
+    printf 'missing\n'
+    return 0
+  }
+  # This fingerprint is only an invalidation guard for the process-local
+  # manifest cache, not a content-authenticity check. Stat metadata is cheap
+  # enough to run before each upsert, while hashing the manifest would bring
+  # back much of the per-dependency I/O cost this cache is avoiding. If some
+  # hook or helper rewrites the manifest under us, the inode/size/mtime change
+  # makes the next upsert reload from disk before deciding whether it is a no-op.
+  stat -c '%Y:%s:%i' "$manifest" 2>/dev/null && return 0
+  stat -f '%m:%z:%i' "$manifest"
+}
+
+_shdeps_manifest_cache_current() {
+  local manifest="$1" fingerprint
+  [[ "${_SHDEPS_MANIFEST_CACHE_LOADED:-0}" -eq 1 ]] || return 1
+  [[ "${_SHDEPS_MANIFEST_CACHE_PATH:-}" == "$manifest" ]] || return 1
+  fingerprint=$(_shdeps_manifest_fingerprint "$manifest")
+  [[ "$fingerprint" == "${_SHDEPS_MANIFEST_CACHE_FINGERPRINT:-}" ]]
+}
+
 # Read the manifest file into _SHDEPS_MANIFEST associative array.
 # Each entry: _SHDEPS_MANIFEST[$name]="method|cmd|install_path"
 _shdeps_manifest_read() {
   declare -gA _SHDEPS_MANIFEST=()
+  declare -gA _SHDEPS_MANIFEST_COUNTS=()
   local manifest
   manifest=$(_shdeps_manifest_path)
+  _SHDEPS_MANIFEST_CACHE_LOADED=1
+  _SHDEPS_MANIFEST_CACHE_PATH="$manifest"
+  _SHDEPS_MANIFEST_CACHE_FINGERPRINT=$(_shdeps_manifest_fingerprint "$manifest")
   [[ -f "$manifest" ]] || return 0
   local m_name m_rest
   while IFS='|' read -r m_name m_rest || [[ -n "$m_name" ]]; do
     [[ -n "$m_name" ]] || continue
     _SHDEPS_MANIFEST[$m_name]="$m_rest"
+    # Counts are correctness state, not just bookkeeping. A duplicate entry with
+    # the same current value should still flow through the rewrite path so the
+    # manifest gets normalized back to one canonical row for that dep.
+    _SHDEPS_MANIFEST_COUNTS[$m_name]=$(( ${_SHDEPS_MANIFEST_COUNTS[$m_name]:-0} + 1 ))
   done <"$manifest"
 }
 
@@ -1200,8 +1242,25 @@ _shdeps_manifest_read() {
 # $1=name $2=method $3=cmd $4=install_path
 _shdeps_manifest_upsert() {
   local name="$1" method="$2" cmd="$3" install_path="${4:-}"
-  local manifest
+  local manifest desired
   manifest=$(_shdeps_manifest_path)
+  desired="$method|$cmd|$install_path"
+
+  if ! _shdeps_manifest_cache_current "$manifest"; then
+    _shdeps_manifest_read
+  fi
+
+  # Quiet `pkg` checks call this for every already-installed dependency on
+  # every update. Most entries are already current, so avoid rewriting the
+  # manifest unless this name is missing, duplicated, or has different content.
+  # The count guard preserves the historical cleanup behavior for corrupted
+  # manifests with duplicate names; those still fall through to the rewrite
+  # path, which removes all old entries before appending the canonical one.
+  if [[ "${_SHDEPS_MANIFEST[$name]:-}" == "$desired" &&
+    "${_SHDEPS_MANIFEST_COUNTS[$name]:-0}" -eq 1 ]]; then
+    return 0
+  fi
+
   local manifest_dir
   manifest_dir=$(dirname "$manifest")
   mkdir -p "$manifest_dir" || return 1
@@ -1211,7 +1270,12 @@ _shdeps_manifest_upsert() {
     awk -F'|' -v n="$name" '$1 != n' "$manifest" >"$tmp" 2>/dev/null || true
     mv "$tmp" "$manifest"
   fi
-  printf '%s\n' "$name|$method|$cmd|$install_path" >>"$manifest"
+  printf '%s\n' "$name|$desired" >>"$manifest"
+  _SHDEPS_MANIFEST[$name]="$desired"
+  _SHDEPS_MANIFEST_COUNTS[$name]=1
+  _SHDEPS_MANIFEST_CACHE_LOADED=1
+  _SHDEPS_MANIFEST_CACHE_PATH="$manifest"
+  _SHDEPS_MANIFEST_CACHE_FINGERPRINT=$(_shdeps_manifest_fingerprint "$manifest")
 }
 
 # Remove a manifest entry by name.
@@ -1223,6 +1287,15 @@ _shdeps_manifest_remove() {
   local tmp="$manifest.tmp.$$"
   awk -F'|' -v n="$name" '$1 != n' "$manifest" >"$tmp" 2>/dev/null || true
   mv "$tmp" "$manifest"
+  # Removal is another manifest rewrite inside the same shell process. When the
+  # cache is loaded for this manifest, update it eagerly so a later upsert does
+  # not make a no-op decision from stale pre-remove state.
+  if [[ "${_SHDEPS_MANIFEST_CACHE_LOADED:-0}" -eq 1 &&
+    "${_SHDEPS_MANIFEST_CACHE_PATH:-}" == "$manifest" ]]; then
+    unset '_SHDEPS_MANIFEST[$name]'
+    unset '_SHDEPS_MANIFEST_COUNTS[$name]'
+    _SHDEPS_MANIFEST_CACHE_FINGERPRINT=$(_shdeps_manifest_fingerprint "$manifest")
+  fi
 }
 
 # Detect orphaned deps: in manifest but not in config.

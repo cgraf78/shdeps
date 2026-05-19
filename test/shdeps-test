@@ -2654,6 +2654,27 @@ _mfst_content=$(cat "$_mfst_path")
 _assert_contains "upsert: has tool-a" "tool-a|pkg|tool-a|" "$_mfst_content"
 _assert_contains "upsert: has tool-b" "tool-b|github:release|tb|.local/bin/tb" "$_mfst_content"
 
+# No-op upserts happen once per already-installed pkg during every quiet
+# update. Preserve the manifest file when the exact entry is already current so
+# the common path does not pay for a temp file, full manifest rewrite, and mv.
+if [[ "$(uname)" == "Darwin" ]]; then
+  _mfst_inode_before=$(stat -f '%i' "$_mfst_path")
+else
+  _mfst_inode_before=$(stat -c '%i' "$_mfst_path")
+fi
+_shdeps_manifest_upsert "tool-b" "github:release" "tb" ".local/bin/tb"
+if [[ "$(uname)" == "Darwin" ]]; then
+  _mfst_inode_after=$(stat -f '%i' "$_mfst_path")
+else
+  _mfst_inode_after=$(stat -c '%i' "$_mfst_path")
+fi
+_assert_eq "upsert noop: preserves manifest file" "$_mfst_inode_before" "$_mfst_inode_after"
+
+printf '%s\n' "tool-b|github:release|tb|.local/bin/tb" >>"$_mfst_path"
+_shdeps_manifest_upsert "tool-b" "github:release" "tb" ".local/bin/tb"
+_mfst_count=$(grep -c "^tool-b|" "$_mfst_path")
+_assert_eq "upsert noop: repairs duplicate current entries" "1" "$_mfst_count"
+
 # upsert replaces existing (no duplicates)
 _shdeps_manifest_upsert "tool-a" "github:repo" "tool-a" ".local/share/tool-a"
 _mfst_content=$(cat "$_mfst_path")
