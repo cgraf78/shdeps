@@ -124,6 +124,12 @@ _shdeps_install_dir() { echo "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}"; }
 _shdeps_bin_dir() { echo "${SHDEPS_BIN_DIR:-$HOME/.local/bin}"; }
 _shdeps_log_level() { echo "${SHDEPS_LOG_LEVEL:-1}"; }
 
+_shdeps_host_name() {
+  local current
+  current=$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)
+  echo "${current,,}"
+}
+
 # Max parallel jobs for Phase B installs.
 _shdeps_jobs_max() {
   local jobs="${SHDEPS_JOBS:-0}"
@@ -520,8 +526,7 @@ _shdeps_host_match() {
   if [[ -z "$spec" ]]; then return 0; fi
 
   local current
-  current=$(hostname -s 2>/dev/null || hostname 2>/dev/null)
-  current="${current,,}"
+  current=$(_shdeps_host_name)
 
   local item has_include=0 has_exclude=0
   local IFS=','
@@ -720,6 +725,261 @@ _shdeps_pkg_version() {
     return 0
   fi
   return 1
+}
+
+_shdeps_pkg_check_cache_file() {
+  echo "$(_shdeps_state_dir)/pkg-check-cache-v3"
+}
+
+_shdeps_pkg_check_command_path() {
+  local cmd="$1"
+  if [[ -z "$cmd" ]]; then
+    return 0
+  fi
+  if command -v "$cmd" 2>/dev/null; then
+    return 0
+  fi
+  if [[ "$cmd" == git-* ]] && git "${cmd#git-}" --version &>/dev/null; then
+    printf 'git:%s\n' "${cmd#git-}"
+  fi
+}
+
+_shdeps_path_fingerprint() {
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    stat -c '%n:%Y:%s:%i' "$path" 2>/dev/null && return 0
+    stat -f '%N:%m:%z:%i' "$path" 2>/dev/null && return 0
+    # The normal Linux/BSD stat paths include inode, mtime, and size. The
+    # fallback is intentionally weaker, but it must remain tab-free because the
+    # package cache stores fingerprints in tab-delimited records.
+    printf 'present:%s\n' "$path"
+  else
+    printf 'missing:%s\n' "$path"
+  fi
+}
+
+_shdeps_file_content_fingerprint() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    printf 'file:%s:%s\n' "$path" "$(cksum <"$path" 2>/dev/null || printf 'unreadable 0')"
+  elif [[ -e "$path" || -L "$path" ]]; then
+    _shdeps_path_fingerprint "$path"
+  else
+    printf 'missing:%s\n' "$path"
+  fi
+}
+
+_shdeps_pkg_db_fingerprint() {
+  local pkg="$1"
+  case "${_SHDEPS_PKG_MGR:-}" in
+    brew)
+      local brew_prefix="${HOMEBREW_PREFIX:-}"
+      if [[ -z "$brew_prefix" ]] && command -v brew &>/dev/null; then
+        brew_prefix=$(brew --prefix 2>/dev/null || true)
+      fi
+      _shdeps_path_fingerprint "$brew_prefix/Cellar/$pkg"
+      _shdeps_path_fingerprint "$brew_prefix/Caskroom/$pkg"
+      ;;
+    apt)
+      # dpkg maintains one status database for installed package names and
+      # versions. Fingerprinting that file is much cheaper than running
+      # dpkg-query on every warm update, and any apt/dpkg install, remove, or
+      # upgrade rewrites it before the next shdeps run.
+      _shdeps_path_fingerprint /var/lib/dpkg/status
+      ;;
+    dnf | zypper)
+      local rpmdb_dir
+      for rpmdb_dir in /usr/lib/sysimage/rpm /var/lib/rpm; do
+        _shdeps_path_fingerprint "$rpmdb_dir"
+        local rpmdb_file
+        for rpmdb_file in "$rpmdb_dir"/*; do
+          [[ -e "$rpmdb_file" || -L "$rpmdb_file" ]] || continue
+          # SQLite-backed rpmdb creates -shm/-wal sidecars whose metadata can
+          # change merely because rpm/dnf opened the database for a read. Include
+          # the stable database files and skip those read-side-effect artifacts so
+          # cache validation does not invalidate itself.
+          case "$rpmdb_file" in
+            *-shm | *-wal) continue ;;
+          esac
+          _shdeps_path_fingerprint "$rpmdb_file"
+        done
+      done
+      ;;
+    pacman)
+      local pacman_entry matched=0
+      # Pacman stores installed package version in the local database directory
+      # name, so a package upgrade changes the glob target even if no command path
+      # moves. The exact package directory is cheaper and less noisy than hashing
+      # the whole local package database.
+      for pacman_entry in /var/lib/pacman/local/"$pkg"-*; do
+        [[ -e "$pacman_entry" || -L "$pacman_entry" ]] || continue
+        matched=1
+        _shdeps_path_fingerprint "$pacman_entry"
+      done
+      [[ "$matched" -eq 1 ]] || printf 'missing-pacman\t%s\n' "$pkg"
+      ;;
+    apk)
+      _shdeps_path_fingerprint /lib/apk/db/installed
+      ;;
+    *)
+      printf 'unknown-manager\t%s\t%s\n' "${_SHDEPS_PKG_MGR:-}" "$pkg"
+      ;;
+  esac
+}
+
+_shdeps_pkg_db_signature() {
+  _shdeps_pkg_db_fingerprint "$1" | cksum | awk '{ print $1 ":" $2 }'
+}
+
+_shdeps_pkg_db_cache_key() {
+  local pkg="$1"
+  case "${_SHDEPS_PKG_MGR:-}" in
+    apt) printf 'apt\n' ;;
+    dnf | zypper) printf 'rpm\n' ;;
+    apk) printf 'apk\n' ;;
+    *) printf '%s:%s\n' "${_SHDEPS_PKG_MGR:-unknown}" "$pkg" ;;
+  esac
+}
+
+_shdeps_pkg_check_cache_current() {
+  [[ "$(_shdeps_force)" -eq 0 && "$(_shdeps_reinstall)" -eq 0 ]] || return 1
+  [[ "$(_shdeps_log_level)" -lt 2 ]] || return 1
+
+  local cache key first second cached_count=""
+  local saw_version=0 saw_pkg_mgr=0 saw_platform=0 saw_host=0 saw_confdir=0 saw_manifest=0
+  cache=$(_shdeps_pkg_check_cache_file)
+  [[ -f "$cache" ]] || return 1
+
+  # Read only the cache's proof obligations on the warm path. Re-parsing the
+  # registry and querying package versions was nearly as expensive as the full
+  # package scan. The cache therefore records the concrete things that can make a
+  # previous clean package pass stale: config content, package DB state, command
+  # paths, package manager choice, manifest metadata, ambient filter context, and
+  # package hook content for missing-command repair decisions.
+  while IFS=$'\t' read -r key first second; do
+    case "$key" in
+      version)
+        [[ "$first" == "shdeps-pkg-check-cache-v3" ]] || return 1
+        saw_version=1
+        ;;
+      count)
+        cached_count="$first"
+        ;;
+      pkg_mgr)
+        [[ "$first" == "${_SHDEPS_PKG_MGR:-}" ]] || return 1
+        saw_pkg_mgr=1
+        ;;
+      platform)
+        [[ "$first" == "$(shdeps_platform)" ]] || return 1
+        saw_platform=1
+        ;;
+      host)
+        [[ "$first" == "$(_shdeps_host_name)" ]] || return 1
+        saw_host=1
+        ;;
+      confdir)
+        [[ "$first" == "$(_shdeps_path_fingerprint "$second")" ]] || return 1
+        saw_confdir=1
+        ;;
+      conf)
+        [[ "$first" == "$(_shdeps_file_content_fingerprint "$second")" ]] || return 1
+        ;;
+      manifest)
+        [[ "$first" == "$(_shdeps_manifest_fingerprint "$(_shdeps_manifest_path)")" ]] || return 1
+        saw_manifest=1
+        ;;
+      db)
+        [[ "$second" == "$(_shdeps_pkg_db_signature "$first")" ]] || return 1
+        ;;
+      cmd)
+        [[ "$second" == "$(_shdeps_pkg_check_command_path "$first" 2>/dev/null || true)" ]] || return 1
+        ;;
+      hook)
+        [[ "$second" == "$(_shdeps_file_content_fingerprint "$(_shdeps_hooks_dir)/$first.sh")" ]] || return 1
+        ;;
+    esac
+  done <"$cache"
+
+  [[ "$saw_version" -eq 1 ]] || return 1
+  # A cache hit is only safe when the structural proof fields are present. The
+  # file is written via temp+rename, but rejecting incomplete/manual cache files
+  # keeps the fast path from becoming an implicit "trust this count" shortcut.
+  [[ "$saw_pkg_mgr" -eq 1 && "$saw_platform" -eq 1 && "$saw_host" -eq 1 ]] || return 1
+  [[ "$saw_confdir" -eq 1 && "$saw_manifest" -eq 1 ]] || return 1
+  [[ "$cached_count" =~ ^[0-9]+$ ]] || return 1
+
+  _SHDEPS_N_UP_TO_DATE=$((_SHDEPS_N_UP_TO_DATE + cached_count))
+}
+
+_shdeps_pkg_check_cache_write() {
+  local count="$1" cache tmp
+  [[ "$(_shdeps_force)" -eq 0 && "$(_shdeps_reinstall)" -eq 0 ]] || return 0
+  [[ "$(_shdeps_log_level)" -lt 2 ]] || return 0
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+
+  cache=$(_shdeps_pkg_check_cache_file)
+  mkdir -p "$(dirname "$cache")" || return 1
+  tmp="$cache.tmp.$$"
+  {
+    printf 'version\t%s\n' "shdeps-pkg-check-cache-v3"
+    printf 'count\t%s\n' "$count"
+    printf 'pkg_mgr\t%s\n' "${_SHDEPS_PKG_MGR:-}"
+    # os:/host: filters are evaluated from ambient machine context, not config
+    # content. Recording both values prevents a cache produced on one host or
+    # platform from silently skipping a different active package set elsewhere.
+    printf 'platform\t%s\n' "$(shdeps_platform)"
+    printf 'host\t%s\n' "$(_shdeps_host_name)"
+
+    local conf_dir conf
+    conf_dir=$(_shdeps_conf_dir)
+    printf 'confdir\t%s\t%s\n' "$(_shdeps_path_fingerprint "$conf_dir")" "$conf_dir"
+    for conf in "$conf_dir"/*.conf; do
+      [[ -f "$conf" ]] || continue
+      printf 'conf\t%s\t%s\n' "$(_shdeps_file_content_fingerprint "$conf")" "$conf"
+    done
+
+    printf 'manifest\t%s\n' "$(_shdeps_manifest_fingerprint "$(_shdeps_manifest_path)")"
+
+    local entry resolved cmd_path db_key
+    local -A db_seen=()
+    for entry in "${_SHDEPS_DEPS[@]}"; do
+      _shdeps_parse "$entry"
+      [[ "$_method" == "pkg" ]] || continue
+      _shdeps_filter_match "$_filter" || continue
+      resolved=$(_shdeps_resolve_override "$_name" "$_aliases")
+      [[ "$resolved" == "NONE" ]] && continue
+
+      db_key=$(_shdeps_pkg_db_cache_key "$resolved")
+      if [[ -z "${db_seen[$db_key]+x}" ]]; then
+        db_seen[$db_key]=1
+        printf 'db\t%s\t%s\n' "$resolved" "$(_shdeps_pkg_db_signature "$resolved")"
+      fi
+
+      cmd_path=$(_shdeps_pkg_check_command_path "$_cmd" 2>/dev/null || true)
+      printf 'cmd\t%s\t%s\n' "$_cmd" "$cmd_path"
+      # Missing-command repair depends on whether a package-specific post hook
+      # exists. Track hook content for every active pkg dep so adding, removing,
+      # or editing hooks re-enters the full scan before deciding whether a dep
+      # should be marked changed and handed to _shdeps_run_post_hooks.
+      printf 'hook\t%s\t%s\n' "$_name" "$(_shdeps_file_content_fingerprint "$(_shdeps_hooks_dir)/$_name.sh")"
+    done
+  } >"$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv "$tmp" "$cache"
+}
+
+_shdeps_pkg_missing_command_needs_repair() {
+  local name="$1"
+  # Some system packages intentionally provide data, completions, headers, or
+  # toolchain components rather than a command with the package name. If the
+  # package manager proves the package is installed and there is no hook that can
+  # repair a missing command, repeatedly marking the dep as changed only forces
+  # every no-op update down the post-hook path and prevents the package cohort
+  # from being cached. A hook file is enough to keep the old repair behavior:
+  # _shdeps_run_post_hooks will source it and call post() only when present.
+  [[ -f "$(_shdeps_hooks_dir)/$name.sh" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +1314,10 @@ _shdeps_pkg_install_batch() {
 # level and a single summary line for unchanged ones. Verbose (level 2)
 # prints every dep. Queues missing deps for batch install as before.
 _shdeps_pkg_check_parallel() {
+  if _shdeps_pkg_check_cache_current; then
+    return 0
+  fi
+
   # Must load in the parent — associative arrays don't cross subshell boundaries
   _shdeps_pkg_versions_load
 
@@ -1098,6 +1362,7 @@ _shdeps_pkg_check_parallel() {
   done
 
   local n_ok=0 i
+  local pkg_changed=0
 
   for ((i = 0; i < ${#names[@]}; i++)); do
     local name="${names[$i]}" cmd="${cmds[$i]}" resolved="${resolved_pkgs[$i]}"
@@ -1110,7 +1375,12 @@ _shdeps_pkg_check_parallel() {
 
     # Package installed but command missing from PATH — trigger post hook
     if ! _shdeps_exists "$cmd"; then
-      _shdeps_mark_changed "$name"
+      if _shdeps_pkg_missing_command_needs_repair "$name"; then
+        _shdeps_mark_changed "$name"
+        pkg_changed=1
+      else
+        n_ok=$((n_ok + 1))
+      fi
     else
       n_ok=$((n_ok + 1))
     fi
@@ -1122,6 +1392,13 @@ _shdeps_pkg_check_parallel() {
   done
 
   _SHDEPS_N_UP_TO_DATE=$((_SHDEPS_N_UP_TO_DATE + n_ok))
+  if [[ "$pkg_changed" -eq 0 && ${#_SHDEPS_PKG_BATCH[@]} -eq 0 ]]; then
+    # Only cache a clean package pass. If a package was queued for install or a
+    # package-owned command was missing from PATH, the rest of this update needs
+    # the normal repair/post-hook behavior and the next run should re-prove the
+    # package state from scratch.
+    _shdeps_pkg_check_cache_write "$n_ok" || true
+  fi
 
   rm -rf "$resultbase"
 }
@@ -2535,7 +2812,7 @@ _shdeps_install_dep() {
         _shdeps_log "  $_name${ver:+ -- $ver}"
         # Package exists but expected command missing — trigger post hook
         if ! _shdeps_exists "$_cmd"; then
-          _shdeps_mark_changed "$_name"
+          _shdeps_pkg_missing_command_needs_repair "$_name" && _shdeps_mark_changed "$_name"
         fi
         _shdeps_manifest_upsert "$_name" "pkg" "$_cmd" ""
         return 0

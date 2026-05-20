@@ -806,6 +806,117 @@ _assert_contains "pkg_check: verbose prints version" "tool-a -- 1.0" "$_pkg_chec
 export PATH="$_saved_path"
 SHDEPS_LOG_LEVEL=0
 
+# --- _shdeps_pkg_check_parallel: clean collapsed pass writes and reuses cache ---
+
+_pkg_cache_state=$(_tmpdir)
+_pkg_cache_bin=$(_mock_bin)
+_pkg_cache_hooks=$(_tmpdir)
+_pkg_cache_log=$(_tmpdir)/pkg-cache.log
+printf '#!/bin/sh\n' >"$_pkg_cache_bin/cache-tool-a" && chmod +x "$_pkg_cache_bin/cache-tool-a"
+printf '#!/bin/sh\n' >"$_pkg_cache_bin/cache-tool-b" && chmod +x "$_pkg_cache_bin/cache-tool-b"
+cat >"$_pkg_cache_bin/hostname" <<'MOCK'
+#!/bin/sh
+printf '%s\n' "$SHDEPS_TEST_HOST"
+MOCK
+cat >"$_pkg_cache_bin/dpkg" <<'MOCK'
+#!/bin/sh
+case "$*" in
+  "-s cache-data") exit 0 ;;
+esac
+exit 1
+MOCK
+chmod +x "$_pkg_cache_bin/hostname" "$_pkg_cache_bin/dpkg"
+_saved_path="$PATH"
+export PATH="$_pkg_cache_bin:$PATH"
+SHDEPS_STATE_DIR="$_pkg_cache_state"
+SHDEPS_HOOKS_DIR="$_pkg_cache_hooks"
+SHDEPS_TEST_HOST="cache-host-a"
+SHDEPS_TEST_PLATFORM="cache-platform-a"
+export SHDEPS_TEST_HOST SHDEPS_TEST_PLATFORM
+shdeps_platform() {
+  printf '%s\n' "$SHDEPS_TEST_PLATFORM"
+}
+_SHDEPS_DEPS=(
+  "cache-tool-a|pkg|cache-tool-a||"
+  "cache-tool-b|pkg|cache-tool-b||"
+  "cache-data|pkg|cache-data||"
+)
+_SHDEPS_PKG_MGR="apt"
+_SHDEPS_PKG_BATCH=()
+_SHDEPS_PKG_BATCH_NAMES=()
+declare -gA _SHDEPS_CHANGED=()
+declare -gA _SHDEPS_PKG_VERSIONS=(
+  ["cache-tool-a"]="1.0"
+  ["cache-tool-b"]="1.0"
+  ["cache-data"]="1.0"
+)
+_SHDEPS_PKG_VERSIONS_LOADED=1
+_SHDEPS_N_UP_TO_DATE=0
+_shdeps_pkg_check_parallel >/dev/null
+_assert_file_exists "pkg_check cache: clean pass writes cache" \
+  "$_pkg_cache_state/pkg-check-cache-v3"
+
+_shdeps_exists() {
+  printf '%s|%s\n' "${1:-}" "${2:-}" >>"$_pkg_cache_log"
+  if [[ "${1:-}" == "cache-data" && -z "${2:-}" ]]; then
+    return 1
+  fi
+  return 0
+}
+: >"$_pkg_cache_log"
+_SHDEPS_N_UP_TO_DATE=0
+_shdeps_pkg_check_parallel >/dev/null
+_assert_file_content "pkg_check cache: warm pass skips exists probes" "" "$_pkg_cache_log"
+_assert_eq "pkg_check cache: warm pass preserves up-to-date count" \
+  "3" "$_SHDEPS_N_UP_TO_DATE"
+
+{
+  printf 'version\t%s\n' "shdeps-pkg-check-cache-v3"
+  printf 'count\t%s\n' "3"
+  printf 'platform\t%s\n' "$SHDEPS_TEST_PLATFORM"
+  printf 'host\t%s\n' "$SHDEPS_TEST_HOST"
+} >"$_pkg_cache_state/pkg-check-cache-v3"
+: >"$_pkg_cache_log"
+_SHDEPS_N_UP_TO_DATE=0
+_shdeps_pkg_check_parallel >/dev/null
+_assert_contains "pkg_check cache: incomplete cache invalidates cache" \
+  "cache-tool-a|" "$(cat "$_pkg_cache_log")"
+
+SHDEPS_TEST_HOST="cache-host-b"
+: >"$_pkg_cache_log"
+_SHDEPS_N_UP_TO_DATE=0
+_shdeps_pkg_check_parallel >/dev/null
+_assert_contains "pkg_check cache: host change invalidates cache" \
+  "cache-tool-a|" "$(cat "$_pkg_cache_log")"
+
+SHDEPS_TEST_PLATFORM="cache-platform-b"
+: >"$_pkg_cache_log"
+_SHDEPS_N_UP_TO_DATE=0
+_shdeps_pkg_check_parallel >/dev/null
+_assert_contains "pkg_check cache: platform change invalidates cache" \
+  "cache-tool-a|" "$(cat "$_pkg_cache_log")"
+
+printf 'post() { :; }\n' >"$_pkg_cache_hooks/cache-data.sh"
+: >"$_pkg_cache_log"
+declare -gA _SHDEPS_CHANGED=()
+_SHDEPS_N_UP_TO_DATE=0
+_shdeps_pkg_check_parallel >/dev/null
+_assert_contains "pkg_check cache: hook change invalidates cache" \
+  "cache-data|" "$(cat "$_pkg_cache_log")"
+_assert_eq "pkg_check cache: hook repairs missing command" \
+  "1" "${_SHDEPS_CHANGED["cache-data"]:-}"
+
+rm -f "$_pkg_cache_bin/cache-tool-b"
+: >"$_pkg_cache_log"
+_SHDEPS_N_UP_TO_DATE=0
+_shdeps_pkg_check_parallel >/dev/null
+_assert_contains "pkg_check cache: command path change invalidates cache" \
+  "cache-tool-b" "$(cat "$_pkg_cache_log")"
+
+export PATH="$_saved_path"
+unset SHDEPS_STATE_DIR SHDEPS_HOOKS_DIR SHDEPS_TEST_HOST SHDEPS_TEST_PLATFORM
+unset _SHDEPS_PKG_VERSIONS_LOADED
+
 # Restore state
 unset _SHDEPS_PKG_INSTALL_NEEDED _SHDEPS_PKG_CACHE_REFRESHED
 _source_shdeps "$SHDEPS_DIR"
