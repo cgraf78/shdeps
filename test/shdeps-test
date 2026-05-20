@@ -2151,6 +2151,18 @@ chmod +x "$_ver_bin_dir/exitfail-tool"
 result=$(_shdeps_dep_version "$_ver_bin_dir/exitfail-tool")
 _assert_eq "dep_version: non-zero exit still captured" "6.00" "$result"
 
+# --- _shdeps_dep_version: dynamic loader errors are not tool versions ---
+
+cat >"$_ver_bin_dir/loader-error-tool" <<'SCRIPT'
+#!/bin/sh
+echo "loader-error-tool: /lib64/libm.so.6: version \`GLIBC_2.35' not found" >&2
+echo "loader-error-tool: /lib64/libc.so.6: version \`GLIBC_2.39' not found" >&2
+exit 1
+SCRIPT
+chmod +x "$_ver_bin_dir/loader-error-tool"
+result=$(_shdeps_dep_version "$_ver_bin_dir/loader-error-tool")
+_assert_eq "dep_version: dynamic loader error ignored" "" "$result"
+
 # --- _shdeps_dep_version: integer-only version (less style) ---
 
 cat >"$_ver_bin_dir/intver-tool" <<'SCRIPT'

@@ -606,6 +606,21 @@ _shdeps_exists() {
   return 1
 }
 
+_shdeps_dep_version_probe_failed_to_load() {
+  local output="$1"
+
+  # Version probes intentionally read stderr because real tools such as ssh and
+  # unzip put useful version banners there, sometimes with non-zero exits. The
+  # dynamic linker also writes to stderr, but those messages describe the host
+  # ABI mismatch, not the tool. If we parse GLIBC_2.35 out of "not found",
+  # shdeps believes the installed tool version is 2.35 and can reinstall the
+  # same incompatible binary forever.
+  [[ "$output" == *"GLIBC_"*"not found"* ]] ||
+    [[ "$output" == *"GLIBCXX_"*"not found"* ]] ||
+    [[ "$output" == *"CXXABI_"*"not found"* ]] ||
+    [[ "$output" == *"error while loading shared libraries"* ]]
+}
+
 # Get installed version of a command.
 # Extracts the first version-like token (digits+dots) from --version output.
 _shdeps_dep_version() {
@@ -638,6 +653,9 @@ _shdeps_dep_version() {
   for flag in --version -V; do
     # shellcheck disable=SC2086  # intentional word splitting on $_timeout
     output=$($_timeout "$cmd" "$flag" 2>&1 || true)
+    if _shdeps_dep_version_probe_failed_to_load "$output"; then
+      continue
+    fi
     ver=$(echo "$output" | grep -oE '[0-9]+\.[0-9]+[0-9.a-z]*' | head -1)
     if [[ -n "$ver" ]]; then
       echo "$ver"
@@ -1234,7 +1252,7 @@ _shdeps_manifest_read() {
     # Counts are correctness state, not just bookkeeping. A duplicate entry with
     # the same current value should still flow through the rewrite path so the
     # manifest gets normalized back to one canonical row for that dep.
-    _SHDEPS_MANIFEST_COUNTS[$m_name]=$(( ${_SHDEPS_MANIFEST_COUNTS[$m_name]:-0} + 1 ))
+    _SHDEPS_MANIFEST_COUNTS[$m_name]=$((${_SHDEPS_MANIFEST_COUNTS[$m_name]:-0} + 1))
   done <"$manifest"
 }
 
