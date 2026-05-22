@@ -114,7 +114,7 @@ Use `aliases` to map names across package managers. Use `NONE` to skip a dep on 
 
 ### `github:repo` — GitHub Repos
 
-Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<owner>/<repo>` (default `~/.local/share/<owner>/<repo>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<repo>` (default `~/git/<repo>`, symlinked for live development). Falls back to a shallow clone for fresh installs.
+Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<owner>/<repo>` (default `~/.local/share/<owner>/<repo>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<repo>` (default `~/git/<repo>`, symlinked for live development). Falls back to a shallow clone for fresh installs. Every executable directly under the repo's `bin/` directory is symlinked into `$SHDEPS_BIN_DIR`; existing regular files in `$SHDEPS_BIN_DIR` are preserved so shdeps never overwrites a user-owned command.
 
 ```text
 cgraf78/ds.git    github:repo
@@ -236,6 +236,11 @@ Commands:
   self-update     Update shdeps itself (git pull, skips dirty trees)
   list            List all configured dependencies with status
   check <name>    Check if a specific dependency is installed
+  dep-root <name> Print a configured dependency root directory
+  dep-path <name> <rel>
+                  Print a path below a configured dependency root
+  dep-file <name> <rel>
+                  Print an existing file below a configured dependency root
   prune           Remove orphaned deps no longer in config
   version         Print shdeps version
   help            Show this help message
@@ -328,6 +333,10 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | `shdeps_install_dir`              | Print base install directory (`$SHDEPS_INSTALL_DIR`, default `~/.local/share`)              |
 | `shdeps_git_dev_dir`              | Print git dev clone directory (`$SHDEPS_GIT_DEV_DIR`, default `~/git`)                      |
 | `shdeps_bin_dir`                  | Print binary symlink directory (`$SHDEPS_BIN_DIR`, default `~/.local/bin`)                  |
+| `shdeps_dep_root <name>`          | Print a configured dependency root when shdeps owns one                                     |
+| `shdeps_dep_path <name> <rel>`    | Print a path below a dependency root; rejects absolute and parent-traversal paths           |
+| `shdeps_dep_file <name> <rel>`    | Print a dependency asset path only when it is a readable regular file                       |
+| `shdeps_dep_source <name> <rel>`  | Source an existing dependency asset into the current Bash process                           |
 | `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir                          |
 | `shdeps_unlink_extras <name>`     | Remove all extras symlinks tracked for a dep                                                |
 | `shdeps_require_sudo`             | Acquire sudo; returns 0 if root or sudo obtained                                            |
@@ -336,6 +345,13 @@ All `shdeps_` functions are defined in a single section at the top of `shdeps.sh
 | `shdeps_log_ok`                   | Success highlight                                                                           |
 | `shdeps_log_dim`                  | Dimmed / low-importance line                                                                |
 | `shdeps_log_header`               | Section header                                                                              |
+
+`shdeps_dep_root` follows the same ownership rules as installation. For
+`github:repo`, it prefers `$SHDEPS_GIT_DEV_DIR/<repo>` when a local development
+clone exists, then falls back to `$SHDEPS_INSTALL_DIR/<owner>/<repo>`. For
+methods with per-dependency install directories (`github:release`, `cargo`,
+`go`, `uv`, and `npm`), it returns `$SHDEPS_INSTALL_DIR/<name>` when present.
+Package-manager deps do not have shdeps-owned roots.
 
 ## Testing
 

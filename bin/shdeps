@@ -39,6 +39,11 @@ Commands:
   self-update     Update shdeps itself (git pull, skips dirty trees)
   list            List all configured dependencies with status
   check <name>    Check if a specific dependency is installed
+  dep-root <name> Print a configured dependency root directory
+  dep-path <name> <rel>
+                  Print a path below a configured dependency root
+  dep-file <name> <rel>
+                  Print a readable regular file below a dependency root
   prune           Remove orphaned deps no longer in config
   version         Print shdeps version
   help            Show this help message
@@ -293,6 +298,36 @@ cmd_prune() {
   shdeps_prune "$@"
 }
 
+cmd_dep_root() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    echo "error: dep-root requires a dependency name" >&2
+    echo "Usage: shdeps dep-root <name>" >&2
+    return 2
+  fi
+  shdeps_dep_root "$target"
+}
+
+cmd_dep_path() {
+  local target="${1:-}" rel="${2:-}"
+  if [[ -z "$target" || -z "$rel" ]]; then
+    echo "error: dep-path requires a dependency name and relative path" >&2
+    echo "Usage: shdeps dep-path <name> <relative-path>" >&2
+    return 2
+  fi
+  shdeps_dep_path "$target" "$rel"
+}
+
+cmd_dep_file() {
+  local target="${1:-}" rel="${2:-}"
+  if [[ -z "$target" || -z "$rel" ]]; then
+    echo "error: dep-file requires a dependency name and relative path" >&2
+    echo "Usage: shdeps dep-file <name> <relative-path>" >&2
+    return 2
+  fi
+  shdeps_dep_file "$target" "$rel"
+}
+
 # ---------------------------------------------------------------------------
 # Migrate — one-off command to move state from bare-name to owner/repo paths.
 # Delete this function and its case branch after migration is complete.
@@ -520,6 +555,9 @@ main() {
     self-update) cmd_self_update "$@" ;;
     list) cmd_list "$@" ;;
     check) cmd_check "$@" ;;
+    dep-root) cmd_dep_root "$@" ;;
+    dep-path) cmd_dep_path "$@" ;;
+    dep-file) cmd_dep_file "$@" ;;
     prune) cmd_prune "$@" ;;
     migrate) cmd_migrate "$@" ;;
     version) shdeps_version ;;

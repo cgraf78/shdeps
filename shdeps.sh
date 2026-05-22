@@ -67,6 +67,12 @@ shdeps_install_dir() { _shdeps_install_dir; }
 shdeps_git_dev_dir() { _shdeps_git_dev_dir; }
 shdeps_bin_dir() { _shdeps_bin_dir; }
 
+# Dependency paths
+shdeps_dep_root() { _shdeps_dep_root "$@"; }
+shdeps_dep_path() { _shdeps_dep_path "$@"; }
+shdeps_dep_file() { _shdeps_dep_file "$@"; }
+shdeps_dep_source() { _shdeps_dep_source "$@"; }
+
 # Extras linking (man pages, shell completions)
 shdeps_link_extras() { _shdeps_link_extras "$@"; }
 shdeps_unlink_extras() { _shdeps_unlink_extras "$@"; }
@@ -1031,6 +1037,106 @@ _shdeps_short_name() {
   echo "${1##*/}"
 }
 
+# Validate a dependency name before using it as an install path suffix.
+_shdeps_dep_name_valid() {
+  local name="${1:-}"
+  case "$name" in
+    "" | /* | .. | ../* | */.. | */../*)
+      return 2
+      ;;
+  esac
+  if [[ "$name" =~ [[:space:]\|] ]]; then
+    return 2
+  fi
+}
+
+# Validate a caller-supplied path relative to a dependency root.
+_shdeps_dep_rel_valid() {
+  local rel="${1:-}"
+  case "$rel" in
+    "" | /* | .. | ../* | */.. | */../*)
+      return 2
+      ;;
+  esac
+}
+
+# Print a physical path when a candidate dependency root exists.
+_shdeps_dep_existing_root() {
+  local root="${1:-}"
+  [[ -d "$root" ]] || return 1
+  cd -P -- "$root" 2>/dev/null && pwd
+}
+
+# Resolve the root for a github:repo dependency using normal install priority.
+_shdeps_github_repo_root() {
+  local name="${1:-}" short local_clone install_root
+  _shdeps_dep_name_valid "$name" || return $?
+
+  short=$(_shdeps_short_name "$name")
+  local_clone="$(_shdeps_git_dev_dir)/$short"
+  install_root="$(_shdeps_install_dir)/$name"
+
+  _shdeps_dep_existing_root "$local_clone" && return 0
+  _shdeps_dep_existing_root "$install_root"
+}
+
+# Print the root directory for a configured dependency when shdeps owns one.
+_shdeps_dep_root() {
+  local target="${1:-}" entry name method _cmd _aliases filter install_root
+  _shdeps_dep_name_valid "$target" || return $?
+
+  _shdeps_load
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    IFS='|' read -r name method _cmd _aliases filter <<<"$entry"
+    [[ "$name" == "$target" ]] || continue
+    [[ "$filter" == "-" ]] && filter=""
+    _shdeps_filter_match "$filter" || continue
+
+    case "$method" in
+      github:repo)
+        _shdeps_github_repo_root "$name"
+        return $?
+        ;;
+      github:release | cargo | go | uv | npm)
+        install_root="$(_shdeps_install_dir)/$name"
+        _shdeps_dep_existing_root "$install_root"
+        return $?
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+# Print a path below a configured dependency root. The path need not exist.
+_shdeps_dep_path() {
+  local target="${1:-}" rel="${2:-}" root
+  _shdeps_dep_name_valid "$target" || return $?
+  _shdeps_dep_rel_valid "$rel" || return $?
+
+  root=$(_shdeps_dep_root "$target") || return $?
+  printf '%s/%s\n' "$root" "$rel"
+}
+
+# Print a dependency path only when it is a readable regular file.
+_shdeps_dep_file() {
+  local path
+  path=$(_shdeps_dep_path "$@") || return $?
+  [[ -f "$path" && -r "$path" ]] || return 1
+  printf '%s\n' "$path"
+}
+
+# Source an existing dependency asset into the current Bash process.
+_shdeps_dep_source() {
+  local path
+  path=$(_shdeps_dep_file "$@") || return $?
+  # shellcheck disable=SC1090 # dependency asset resolved at runtime.
+  . "$path"
+}
+
 # Check if a package is available in the current package manager's repos.
 _shdeps_pkg_available() {
   local pkg="$1"
@@ -1659,6 +1765,7 @@ _shdeps_remove_dep() {
       _shdeps_warn "  $name: pkg dep — remove manually via ${_SHDEPS_PKG_MGR:-system package manager}"
       ;;
     github:repo)
+      _shdeps_unlink_bin_links "$name"
       _shdeps_unlink_extras "$name"
       if [[ -n "$install_path" ]]; then
         # install_path may be absolute (current format) or relative to HOME (legacy manifest entries)
@@ -1811,17 +1918,55 @@ _shdeps_link_bin() {
   local cmd="$1" bin_path="$2"
   [[ -x "$bin_path" ]] || return 0
   mkdir -p "$(_shdeps_bin_dir)"
-  ln -sf "$bin_path" "$(_shdeps_bin_dir)/$cmd"
+  local target
+  target="$(_shdeps_bin_dir)/$cmd"
+  if [[ -e "$target" && ! -L "$target" ]]; then
+    _shdeps_log "  $cmd: preserving existing command at $target"
+    return 0
+  fi
+  ln -sf "$bin_path" "$target"
 }
 
-# Legacy wrapper: derive cmd from short_name(name) and bin path from
-# $install_dir/bin/<cmd>. Used by github:repo call sites that pass the
-# install directory rather than the absolute binary path.
-_shdeps_link_bin_from_dir() {
+# Return the state file that tracks public command symlinks for a repo dep.
+_shdeps_bin_links_file() {
+  local name="$1"
+  echo "$(_shdeps_state_dir)/$name.binlinks"
+}
+
+# Remove symlinks tracked in a dep's .binlinks state file.
+_shdeps_unlink_bin_links() {
+  local name="$1" links_file
+  links_file=$(_shdeps_bin_links_file "$name")
+  [[ -f "$links_file" ]] || return 0
+  while IFS= read -r link; do
+    [[ -L "$link" ]] && rm -f "$link"
+  done <"$links_file"
+  rm -f "$links_file"
+}
+
+# Link every executable directly under $install_dir/bin. Repo deps often expose
+# several public commands; deriving a single command from the repo name would
+# leave multi-command repos half-installed.
+_shdeps_link_bins_from_dir() {
   local name="$1" install_dir="$2"
-  local cmd
-  cmd=$(_shdeps_short_name "$name")
-  _shdeps_link_bin "$cmd" "$install_dir/bin/$cmd"
+  local bin_dir="$install_dir/bin" bin_path cmd target links_file
+  local -a created_links=()
+
+  _shdeps_unlink_bin_links "$name"
+  [[ -d "$bin_dir" ]] || return 0
+
+  for bin_path in "$bin_dir"/*; do
+    [[ -f "$bin_path" && -x "$bin_path" ]] || continue
+    cmd=$(basename "$bin_path")
+    _shdeps_link_bin "$cmd" "$bin_path"
+    target="$(_shdeps_bin_dir)/$cmd"
+    [[ -L "$target" ]] && created_links+=("$target")
+  done
+
+  [[ ${#created_links[@]} -gt 0 ]] || return 0
+  links_file=$(_shdeps_bin_links_file "$name")
+  mkdir -p "$(dirname "$links_file")"
+  printf '%s\n' "${created_links[@]}" >"$links_file"
 }
 
 # Remove symlinks tracked in a dep's .links state file.
@@ -1982,14 +2127,21 @@ _shdeps_github_repo_install_local() {
   # Pull if TTL expired (or --force) and the clone is clean
   if ! _shdeps_remote_fresh "$stamp"; then
     if [[ -z "$_status_output" ]]; then
-      _shdeps_log_status "  $name: pulling latest..."
-      if _shdeps_run_logged git -C "$local_clone" pull --ff-only --quiet; then
-        _shdeps_remote_touch "$stamp" || true
+      if git -C "$local_clone" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+        _shdeps_log_status "  $name: pulling latest..."
+        if _shdeps_run_logged git -C "$local_clone" pull --ff-only --quiet; then
+          _shdeps_remote_touch "$stamp" || true
+        else
+          _shdeps_logfile_print "$name update" "$log"
+          _shdeps_warn "  warning: $name update failed"
+        fi
       else
-        _shdeps_logfile_print "$name update" "$log"
-        _shdeps_warn "  warning: $name update failed"
+        # Local development repos may intentionally have no remote yet. Treat
+        # that as a valid local-only dependency instead of warning on every
+        # update run.
+        _shdeps_remote_touch "$stamp" || true
       fi
-      # Re-check status only if pull ran (it may have introduced changes)
+      # Re-check after the update decision; a pull may have introduced changes.
       _status_output=$(git -C "$local_clone" status --porcelain --untracked-files=normal 2>/dev/null || true)
     fi
   fi
@@ -2002,7 +2154,7 @@ _shdeps_github_repo_install_local() {
   rm -rf "$install_dir"
   mkdir -p "$(dirname "$install_dir")"
   ln -sfn "$local_clone" "$install_dir"
-  _shdeps_link_bin_from_dir "$name" "$install_dir"
+  _shdeps_link_bins_from_dir "$name" "$install_dir"
   _shdeps_link_extras "$name" "$install_dir"
 
   local ver
@@ -2031,7 +2183,7 @@ _shdeps_github_repo_install_pull() {
   local name="$1" install_dir="$2" stamp="$3" log="$4"
   _shdeps_github_repo_sync_ssh_push_url "$install_dir"
   if _shdeps_remote_fresh "$stamp"; then
-    _shdeps_link_bin_from_dir "$name" "$install_dir"
+    _shdeps_link_bins_from_dir "$name" "$install_dir"
     _shdeps_link_extras "$name" "$install_dir"
     local ver
     ver=$(_shdeps_get_version "$install_dir")
@@ -2057,7 +2209,7 @@ _shdeps_github_repo_install_pull() {
   fi
 
   if [[ "$pulled" -eq 1 ]]; then
-    _shdeps_link_bin_from_dir "$name" "$install_dir"
+    _shdeps_link_bins_from_dir "$name" "$install_dir"
     _shdeps_link_extras "$name" "$install_dir"
     local head_after
     head_after=$(git -C "$install_dir" rev-parse HEAD 2>/dev/null || true)
@@ -2173,7 +2325,7 @@ _shdeps_github_repo_install_fresh() {
   mv "$clone_tmp" "$install_dir"
   _shdeps_github_repo_set_ssh_push_url "$install_dir" "$repo"
 
-  _shdeps_link_bin_from_dir "$name" "$install_dir"
+  _shdeps_link_bins_from_dir "$name" "$install_dir"
   _shdeps_link_extras "$name" "$install_dir"
   rm -f "$log"
   _shdeps_remote_touch "$stamp" || true

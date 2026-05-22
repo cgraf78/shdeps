@@ -455,7 +455,73 @@ result=$(_shdeps_short_name "zsh-users/zsh-autosuggestions")
 _assert_eq "short_name: hyphenated" "zsh-autosuggestions" "$result"
 
 # ===========================================================================
-# Section 3c: Filter matching
+# Section 3c: Dependency path API
+# ===========================================================================
+
+echo ""
+echo "=== Dependency path API ==="
+
+_mock_home
+_dep_api_conf=$(_tmpdir)
+cat >"$_dep_api_conf/deps.conf" <<'EOF'
+bat           pkg             apt:batcat
+cgraf78/sley  github:repo
+mytool        cargo
+jq            pkg
+EOF
+SHDEPS_CONF_DIR="$_dep_api_conf"
+
+mkdir -p "$HOME/.local/share/cgraf78/sley/share/sley"
+printf 'SLEY_SHELL_LOADED=installed\n' >"$HOME/.local/share/cgraf78/sley/share/sley/shell.sh"
+
+result=$(shdeps_dep_root cgraf78/sley)
+expected=$(cd -P -- "$HOME/.local/share/cgraf78/sley" && pwd)
+_assert_eq "dep root: github repo installed clone" "$expected" "$result"
+
+mkdir -p "$HOME/git/sley/share/sley"
+printf 'SLEY_SHELL_LOADED=dev\n' >"$HOME/git/sley/share/sley/shell.sh"
+result=$(shdeps_dep_root cgraf78/sley)
+expected=$(cd -P -- "$HOME/git/sley" && pwd)
+_assert_eq "dep root: github repo prefers dev clone" "$expected" "$result"
+
+result=$(shdeps_dep_path cgraf78/sley share/sley/shell.sh)
+_assert_eq "dep path: appends relative asset path" "$expected/share/sley/shell.sh" "$result"
+
+result=$(shdeps_dep_file cgraf78/sley share/sley/shell.sh)
+_assert_eq "dep file: returns existing asset path" "$expected/share/sley/shell.sh" "$result"
+
+unset SLEY_SHELL_LOADED
+shdeps_dep_source cgraf78/sley share/sley/shell.sh
+_assert_eq "dep source: sources existing asset file" "dev" "$SLEY_SHELL_LOADED"
+
+rc=0
+shdeps_dep_file cgraf78/sley share/sley/missing.sh >/dev/null || rc=$?
+_assert_exit "dep file: missing asset returns 1" 1 "$rc"
+
+mkdir -p "$HOME/git/sley/share/sley/dir-asset"
+rc=0
+shdeps_dep_file cgraf78/sley share/sley/dir-asset >/dev/null || rc=$?
+_assert_exit "dep file: directory asset returns 1" 1 "$rc"
+
+rc=0
+shdeps_dep_path cgraf78/sley ../shell.sh >/dev/null || rc=$?
+_assert_exit "dep path: rejects parent traversal" 2 "$rc"
+
+mkdir -p "$HOME/.local/share/mytool/share/mytool"
+result=$(shdeps_dep_root mytool)
+expected=$(cd -P -- "$HOME/.local/share/mytool" && pwd)
+_assert_eq "dep root: non-repo install directory" "$expected" "$result"
+
+rc=0
+shdeps_dep_root jq >/dev/null || rc=$?
+_assert_exit "dep root: package deps have no managed root" 1 "$rc"
+
+result=$(SHDEPS_CONF_DIR="$_dep_api_conf" "$SHDEPS_DIR/bin/shdeps" dep-file cgraf78/sley share/sley/shell.sh)
+expected=$(cd -P -- "$HOME/git/sley" && pwd)
+_assert_eq "dep file CLI: returns existing asset path" "$expected/share/sley/shell.sh" "$result"
+
+# ===========================================================================
+# Section 3d: Filter matching
 # ===========================================================================
 
 echo ""
@@ -2163,45 +2229,74 @@ _assert_symlink "link_bin primitive: honors cmd for symlink name" "$HOME/.local/
 _alias_target=$(readlink "$HOME/.local/bin/localname")
 _assert_eq "link_bin primitive: target is raw bin_path" "$_prim_alias/bin/upstream" "$_alias_target"
 
-# --- _shdeps_link_bin_from_dir: derives cmd + bin_path from name + install_dir ---
+# --- _shdeps_link_bin primitive: existing regular command is preserved ---
+
+_prim_preserve=$(_tmpdir)
+mkdir -p "$_prim_preserve/bin"
+echo "#!/bin/sh" >"$_prim_preserve/bin/keep"
+chmod +x "$_prim_preserve/bin/keep"
+echo "dotfiles shim" >"$HOME/.local/bin/keep"
+chmod +x "$HOME/.local/bin/keep"
+_shdeps_link_bin "keep" "$_prim_preserve/bin/keep"
+_assert_file_content "link_bin primitive: preserves regular file command" \
+  "dotfiles shim" "$HOME/.local/bin/keep"
+
+# --- _shdeps_link_bins_from_dir: links every executable under bin/ ---
 
 _link_dir=$(_tmpdir)
 mkdir -p "$_link_dir/bin"
 echo "#!/bin/sh" >"$_link_dir/bin/mytool"
 chmod +x "$_link_dir/bin/mytool"
+echo "#!/bin/sh" >"$_link_dir/bin/extra-tool"
+chmod +x "$_link_dir/bin/extra-tool"
 rm -f "$HOME/.local/bin/mytool"
-_shdeps_link_bin_from_dir "mytool" "$_link_dir"
-_assert_symlink "link_bin_from_dir: symlink created" "$HOME/.local/bin/mytool"
+rm -f "$HOME/.local/bin/extra-tool"
+_shdeps_link_bins_from_dir "mytool" "$_link_dir"
+_assert_symlink "link_bins_from_dir: repo-name command linked" "$HOME/.local/bin/mytool"
 _link_target=$(readlink "$HOME/.local/bin/mytool")
-_assert_eq "link_bin_from_dir: points to correct path" "$_link_dir/bin/mytool" "$_link_target"
+_assert_eq "link_bins_from_dir: repo-name command target" "$_link_dir/bin/mytool" "$_link_target"
+_assert_symlink "link_bins_from_dir: extra command linked" "$HOME/.local/bin/extra-tool"
+_extra_target=$(readlink "$HOME/.local/bin/extra-tool")
+_assert_eq "link_bins_from_dir: extra command target" "$_link_dir/bin/extra-tool" "$_extra_target"
 
-# --- _shdeps_link_bin_from_dir: owner/repo name → short-name lookup ---
+# --- _shdeps_link_bins_from_dir: owner/repo name does not hide extra bins ---
 
 _link_owner_dir=$(_tmpdir)
 mkdir -p "$_link_owner_dir/bin"
 echo "#!/bin/sh" >"$_link_owner_dir/bin/foo"
 chmod +x "$_link_owner_dir/bin/foo"
+echo "#!/bin/sh" >"$_link_owner_dir/bin/foo-helper"
+chmod +x "$_link_owner_dir/bin/foo-helper"
 rm -f "$HOME/.local/bin/foo"
-_shdeps_link_bin_from_dir "owner/foo" "$_link_owner_dir"
-_assert_symlink "link_bin_from_dir: owner/repo resolves to short name" "$HOME/.local/bin/foo"
+rm -f "$HOME/.local/bin/foo-helper"
+_shdeps_link_bins_from_dir "owner/foo" "$_link_owner_dir"
+_assert_symlink "link_bins_from_dir: owner/repo short command linked" "$HOME/.local/bin/foo"
 _owner_target=$(readlink "$HOME/.local/bin/foo")
-_assert_eq "link_bin_from_dir: owner/repo points to bin/<short>" "$_link_owner_dir/bin/foo" "$_owner_target"
+_assert_eq "link_bins_from_dir: owner/repo short command target" "$_link_owner_dir/bin/foo" "$_owner_target"
+_assert_symlink "link_bins_from_dir: owner/repo extra command linked" "$HOME/.local/bin/foo-helper"
 
-# --- _shdeps_link_bin_from_dir: no bin/<name> → no symlink ---
+# --- _shdeps_link_bins_from_dir: stale symlinks removed on relink ---
+
+rm -f "$_link_owner_dir/bin/foo-helper"
+_shdeps_link_bins_from_dir "owner/foo" "$_link_owner_dir"
+_assert_file_missing "link_bins_from_dir: stale extra command removed" "$HOME/.local/bin/foo-helper"
+_assert_symlink "link_bins_from_dir: remaining command stays linked" "$HOME/.local/bin/foo"
+
+# --- _shdeps_link_bins_from_dir: no bin dir → no symlink ---
 
 _nobin_dir=$(_tmpdir)
 rm -f "$HOME/.local/bin/nobin-tool"
-_shdeps_link_bin_from_dir "nobin-tool" "$_nobin_dir"
-_assert_not_exists "link_bin_from_dir: no bin dir, no symlink" "$HOME/.local/bin/nobin-tool"
+_shdeps_link_bins_from_dir "nobin-tool" "$_nobin_dir"
+_assert_not_exists "link_bins_from_dir: no bin dir, no symlink" "$HOME/.local/bin/nobin-tool"
 
-# --- _shdeps_link_bin_from_dir: non-executable bin/<name> → no symlink ---
+# --- _shdeps_link_bins_from_dir: non-executable bin file → no symlink ---
 
 _nonexec_dir=$(_tmpdir)
 mkdir -p "$_nonexec_dir/bin"
 echo "data" >"$_nonexec_dir/bin/noexec-tool"
 rm -f "$HOME/.local/bin/noexec-tool"
-_shdeps_link_bin_from_dir "noexec-tool" "$_nonexec_dir"
-_assert_not_exists "link_bin_from_dir: non-exec, no symlink" "$HOME/.local/bin/noexec-tool"
+_shdeps_link_bins_from_dir "noexec-tool" "$_nonexec_dir"
+_assert_not_exists "link_bins_from_dir: non-exec, no symlink" "$HOME/.local/bin/noexec-tool"
 
 # --- _shdeps_dep_version: extracts version from --version output ---
 
@@ -2393,6 +2488,8 @@ _assert_symlink "local clone: install dir is symlink" "$_lc_install"
 _lc_target=$(readlink "$_lc_install")
 _assert_eq "local clone: points to ~/git/<short_name>" "$_lc_clone" "$_lc_target"
 _assert_eq "local clone: marked as changed" "1" "${_SHDEPS_CHANGED[$_lc_name]:-0}"
+_assert_file_exists "local clone: no upstream is treated as fresh local dependency" \
+  "$(_shdeps_remote_stamp "$_lc_name" repo)"
 
 # Cleanup
 rm -rf "$_lc_clone" "$_lc_install"
@@ -2943,6 +3040,11 @@ mkdir -p "$(dirname "$_prune_git_link")"
 ln -sfn "$_prune_git_target" "$_prune_git_link"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$_prune_git_link/bin/prune-git-test" "$HOME/.local/bin/prune-git-test"
+ln -sf "$_prune_git_link/bin/prune-git-extra" "$HOME/.local/bin/prune-git-extra"
+printf '%s\n' \
+  "$HOME/.local/bin/prune-git-test" \
+  "$HOME/.local/bin/prune-git-extra" \
+  >"$_prune_state/prune-git-test.binlinks"
 date +%s >"$_prune_state/prune-git-test.repo.stamp"
 _shdeps_manifest_upsert "prune-git-test" "github:repo" "prune-git-test" ".local/share/prune-git-test"
 
@@ -2953,6 +3055,8 @@ EOF
 _shdeps_prune -y
 _assert_file_missing "prune git: symlink removed" "$_prune_git_link"
 _assert_file_missing "prune git: bin symlink removed" "$HOME/.local/bin/prune-git-test"
+_assert_file_missing "prune git: extra bin symlink removed" "$HOME/.local/bin/prune-git-extra"
+_assert_file_missing "prune git: binlinks state removed" "$_prune_state/prune-git-test.binlinks"
 _assert_file_missing "prune git: stamp removed" "$_prune_state/prune-git-test.repo.stamp"
 # Target dir should still exist (we only removed the symlink)
 _assert_dir_exists "prune git: target dir preserved" "$_prune_git_target"
@@ -3043,7 +3147,12 @@ mkdir -p "$_prune_slash_dir"
 echo "content" >"$_prune_slash_dir/file"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$_prune_slash_dir/bin/prune-slash-test" "$HOME/.local/bin/prune-slash-test"
+ln -sf "$_prune_slash_dir/bin/prune-slash-extra" "$HOME/.local/bin/prune-slash-extra"
 mkdir -p "$_prune_slash_state/testowner"
+printf '%s\n' \
+  "$HOME/.local/bin/prune-slash-test" \
+  "$HOME/.local/bin/prune-slash-extra" \
+  >"$_prune_slash_state/testowner/prune-slash-test.binlinks"
 date +%s >"$_prune_slash_state/testowner/prune-slash-test.repo.stamp"
 _shdeps_manifest_upsert "testowner/prune-slash-test" "github:repo" "prune-slash-test" "$HOME/.local/share/testowner/prune-slash-test"
 
@@ -3054,7 +3163,9 @@ EOF
 _shdeps_prune -y
 _assert_dir_missing "prune owner/repo: install dir removed" "$_prune_slash_dir"
 _assert_file_missing "prune owner/repo: bin symlink removed" "$HOME/.local/bin/prune-slash-test"
+_assert_file_missing "prune owner/repo: extra bin symlink removed" "$HOME/.local/bin/prune-slash-extra"
 _assert_file_missing "prune owner/repo: stamp removed" "$_prune_slash_state/testowner/prune-slash-test.repo.stamp"
+_assert_file_missing "prune owner/repo: binlinks state removed" "$_prune_slash_state/testowner/prune-slash-test.binlinks"
 _shdeps_manifest_read
 _assert_eq "prune owner/repo: manifest cleared" "" "${_SHDEPS_MANIFEST["testowner/prune-slash-test"]:-}"
 
