@@ -2713,6 +2713,9 @@ _gr_custom_src=$(_tmpdir)
 _gr_custom_tar=$(_tmpdir)/release.tar.gz
 _gr_custom_bin=$(_mock_bin)
 _gr_custom_link="$_gr_custom_root/launcher-owned/bin/mytool"
+_gr_custom_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+_gr_custom_arch=$(uname -m)
+_gr_custom_asset="mytool-$_gr_custom_os-$_gr_custom_arch.tar.gz"
 mkdir -p "$_gr_custom_src/mytool-v1.0/bin" "$(dirname "$_gr_custom_link")"
 cat >"$_gr_custom_src/mytool-v1.0/bin/mytool" <<'SH'
 #!/bin/sh
@@ -2744,13 +2747,9 @@ SHDEPS_STATE_DIR=$(_tmpdir)
 _source_shdeps "$SHDEPS_DIR"
 declare -gA _SHDEPS_CHANGED=()
 declare -gA _SHDEPS_PREFETCHED=(
-  ["owner/mytool"]='{"tag_name":"v1.0.0"}'
+  ["owner/mytool"]='{"tag_name":"v1.0.0","assets":[{"browser_download_url":"https://example.invalid/'"$_gr_custom_asset"'"}]}'
 )
 _SHDEPS_PREFETCH_READY=1
-# shellcheck disable=SC2329  # test override is invoked indirectly by release install.
-_shdeps_github_release_find_asset() {
-  printf '%s\n' 'https://example.invalid/mytool-linux-x86_64.tar.gz'
-}
 PATH="$_gr_custom_bin:$PATH" \
   SHDEPS_TEST_RELEASE_TARBALL="$_gr_custom_tar" \
   _shdeps_github_release_install "owner/mytool" "mytool" "owner/mytool" "$_gr_custom_link" >/dev/null
