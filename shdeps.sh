@@ -84,11 +84,15 @@ shdeps_unlink_extras() { _shdeps_unlink_extras "$@"; }
 #   shdeps_pkg_install_for_mgr <mgr:package>...
 #     Try the package spec matching the detected manager. Useful when package
 #     names differ across brew/apt/dnf/pacman/zypper/apk.
-#   shdeps_github_release_install <name> <cmd> <owner/repo>
+#   shdeps_github_release_install <name> <cmd> [owner/repo] [bin_path]
 #     Download a prebuilt binary from a GitHub release.
 #     name:  dependency name (used for logging, TTL stamps, manifest)
 #     cmd:   binary name on PATH (e.g. "tree-sitter")
-#     repo:  GitHub owner/repo (e.g. "tree-sitter/tree-sitter")
+#     repo:  GitHub owner/repo (defaults to name)
+#     bin_path: optional final executable link/path. Defaults to
+#               $SHDEPS_BIN_DIR/$cmd. Hooks for launcher-owned commands can use
+#               this to keep the public launcher path separate from the real
+#               binary that the launcher delegates to.
 shdeps_github_release_install() { _shdeps_github_release_install "$@"; }
 
 # Logging
@@ -2686,10 +2690,11 @@ _shdeps_github_release_install_zip() {
 # Searches release assets for an executable matching the current OS/arch.
 # Handles tarballs, zips, compressed singles (.gz/.bz2/.zst), and raw binaries.
 # $1=name  $2=cmd  $3=repo (optional, defaults to $1)
+# $4=bin_path (optional, defaults to $SHDEPS_BIN_DIR/$cmd)
 _shdeps_github_release_install() {
-  local name="$1" cmd="$2" gh_repo="${3:-$1}"
+  local name="$1" cmd="$2" gh_repo="${3:-$1}" requested_bin_path="${4:-}"
   local bin_path
-  bin_path="$(_shdeps_bin_dir)/$cmd"
+  bin_path="${requested_bin_path:-$(_shdeps_bin_dir)/$cmd}"
   local current_ver="" latest_ver=""
   local log=""
   local stamp
@@ -2787,7 +2792,7 @@ _shdeps_github_release_install() {
     return 1
   fi
 
-  mkdir -p "$(_shdeps_bin_dir)"
+  mkdir -p "$(dirname "$bin_path")"
 
   # Install based on asset type: archive, compressed single, or direct binary
   local asset_lower="${asset_url,,}"

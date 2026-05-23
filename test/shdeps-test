@@ -2706,6 +2706,64 @@ _assert_file_exists "extras link: .links file in owner subdir" "$_el_state/elown
 
 rm -rf "$_el_install"
 
+# --- github:release can link to a caller-owned target path ---
+
+_gr_custom_root=$(_tmpdir)
+_gr_custom_src=$(_tmpdir)
+_gr_custom_tar=$(_tmpdir)/release.tar.gz
+_gr_custom_bin=$(_mock_bin)
+_gr_custom_link="$_gr_custom_root/launcher-owned/bin/mytool"
+mkdir -p "$_gr_custom_src/mytool-v1.0/bin" "$(dirname "$_gr_custom_link")"
+cat >"$_gr_custom_src/mytool-v1.0/bin/mytool" <<'SH'
+#!/bin/sh
+printf '%s\n' 'mytool 1.0.0'
+SH
+chmod +x "$_gr_custom_src/mytool-v1.0/bin/mytool"
+tar czf "$_gr_custom_tar" -C "$_gr_custom_src" mytool-v1.0
+cat >"$_gr_custom_bin/curl" <<'SH'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o)
+      out="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+[[ -n "$out" ]] || exit 1
+cp "$SHDEPS_TEST_RELEASE_TARBALL" "$out"
+SH
+chmod +x "$_gr_custom_bin/curl"
+SHDEPS_INSTALL_DIR=$(_tmpdir)
+SHDEPS_BIN_DIR=$(_tmpdir)
+SHDEPS_STATE_DIR=$(_tmpdir)
+_source_shdeps "$SHDEPS_DIR"
+declare -gA _SHDEPS_CHANGED=()
+declare -gA _SHDEPS_PREFETCHED=(
+  ["owner/mytool"]='{"tag_name":"v1.0.0"}'
+)
+_SHDEPS_PREFETCH_READY=1
+# shellcheck disable=SC2329  # test override is invoked indirectly by release install.
+_shdeps_github_release_find_asset() {
+  printf '%s\n' 'https://example.invalid/mytool-linux-x86_64.tar.gz'
+}
+PATH="$_gr_custom_bin:$PATH" \
+  SHDEPS_TEST_RELEASE_TARBALL="$_gr_custom_tar" \
+  _shdeps_github_release_install "owner/mytool" "mytool" "owner/mytool" "$_gr_custom_link" >/dev/null
+_assert_symlink "github release: custom link path created" "$_gr_custom_link"
+_assert_file_missing "github release: default bin link untouched" "$SHDEPS_BIN_DIR/mytool"
+_assert_eq "github release: custom link points inside install root" \
+  "$SHDEPS_INSTALL_DIR/owner/mytool/bin/mytool" "$(readlink "$_gr_custom_link")"
+_assert_eq "github release: custom link marks dep changed" \
+  "1" "${_SHDEPS_CHANGED["owner/mytool"]:-}"
+_source_shdeps "$SHDEPS_DIR"
+unset _SHDEPS_PREFETCH_READY
+unset SHDEPS_INSTALL_DIR SHDEPS_BIN_DIR SHDEPS_STATE_DIR
+
 # ===========================================================================
 # Section 9a: _shdeps_external_install
 # ===========================================================================
