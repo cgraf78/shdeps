@@ -3120,27 +3120,127 @@ _assert_not_contains "upsert replace: old value gone" "tool-a|pkg|tool-a|" "$_mf
 _mfst_count=$(grep -c "^tool-a|" "$_mfst_path")
 _assert_eq "upsert replace: no duplicates" "1" "$_mfst_count"
 
-# method transitions remove artifacts before the new method installs
+# Method transitions remove old managed artifacts before the new method
+# installs. This is cleanup, not an in-place move: the old manifest row must
+# disappear so the new method cannot inherit stale TTL/bin state, and old files
+# must get out of the way so, for example, a release-installed real binary does
+# not block a repo-installed symlink. The deliberate exception is `pkg`: shdeps
+# may stop tracking a package-manager dependency, but it must not uninstall a
+# system package as a side effect of switching methods.
 _mt_state=$(_tmpdir)
 _mt_home=$(_tmpdir)
+_mt_conf=$(_tmpdir)
 _mt_saved_home="$HOME"
 SHDEPS_STATE_DIR="$_mt_state"
+SHDEPS_CONF_DIR="$_mt_conf"
+SHDEPS_HOOKS_DIR="$_mt_conf/hooks.d"
 HOME="$_mt_home"
 _source_shdeps "$SHDEPS_DIR"
-mkdir -p "$(_shdeps_bin_dir)"
-printf '%s\n' old-release >"$(_shdeps_bin_dir)/ds"
-chmod +x "$(_shdeps_bin_dir)/ds"
-_shdeps_manifest_upsert "cgraf78/ds" "github:release" "ds" "$(_shdeps_bin_dir)/ds"
-_shdeps_remote_touch "$(_shdeps_remote_stamp "cgraf78/ds" release)"
-_SHDEPS_DEPS=("cgraf78/ds|github:repo|ds||")
+mkdir -p "$(_shdeps_bin_dir)" "$(_shdeps_install_dir)" "$SHDEPS_HOOKS_DIR"
+_SHDEPS_DEPS=()
+
+_mt_repo_name="owner/transition-repo"
+_mt_repo_cmd="transition-repo"
+_mt_repo_install="$(_shdeps_install_dir)/$_mt_repo_name"
+mkdir -p "$_mt_repo_install/bin"
+printf '%s\n' repo-bin >"$_mt_repo_install/bin/$_mt_repo_cmd"
+chmod +x "$_mt_repo_install/bin/$_mt_repo_cmd"
+ln -sf "$_mt_repo_install/bin/$_mt_repo_cmd" "$(_shdeps_bin_dir)/$_mt_repo_cmd"
+_mt_repo_extra_bin="$(_shdeps_bin_dir)/transition-repo-extra"
+ln -sf "$_mt_repo_install/bin/$_mt_repo_cmd" "$_mt_repo_extra_bin"
+mkdir -p "$(dirname "$(_shdeps_bin_links_file "$_mt_repo_name")")"
+printf '%s\n' "$_mt_repo_extra_bin" >"$(_shdeps_bin_links_file "$_mt_repo_name")"
+_mt_repo_extra_link="$HOME/.local/share/man/man1/transition-repo.1"
+mkdir -p "$(dirname "$_mt_repo_extra_link")" "$(dirname "$(_shdeps_state_dir)/$_mt_repo_name.links")"
+ln -sf "$_mt_repo_install/bin/$_mt_repo_cmd" "$_mt_repo_extra_link"
+printf '%s\n' "$_mt_repo_extra_link" >"$(_shdeps_state_dir)/$_mt_repo_name.links"
+_shdeps_manifest_upsert "$_mt_repo_name" "github:repo" "$_mt_repo_cmd" "$_mt_repo_install"
+_shdeps_remote_touch "$(_shdeps_remote_stamp "$_mt_repo_name" repo)"
+_SHDEPS_DEPS+=("$_mt_repo_name|custom|$_mt_repo_cmd||")
+
+for _mt_old_method in github:release cargo go uv npm; do
+  _mt_suffix="${_mt_old_method//:/-}"
+  _mt_name="owner/transition-$_mt_suffix"
+  _mt_cmd="transition-$_mt_suffix"
+  _mt_install="$(_shdeps_install_dir)/$_mt_name"
+  _mt_bin="$(_shdeps_bin_dir)/$_mt_cmd"
+  mkdir -p "$_mt_install"
+  printf '%s\n' "$_mt_old_method install" >"$_mt_install/artifact"
+  printf '%s\n' "$_mt_old_method bin" >"$_mt_bin"
+  chmod +x "$_mt_bin"
+  _mt_extra_link="$HOME/.local/share/man/man1/$_mt_cmd.1"
+  mkdir -p "$(dirname "$_mt_extra_link")" "$(dirname "$(_shdeps_state_dir)/$_mt_name.links")"
+  ln -sf "$_mt_bin" "$_mt_extra_link"
+  printf '%s\n' "$_mt_extra_link" >"$(_shdeps_state_dir)/$_mt_name.links"
+  _shdeps_manifest_upsert "$_mt_name" "$_mt_old_method" "$_mt_cmd" "$_mt_bin"
+  _shdeps_remote_touch "$(_shdeps_remote_stamp "$_mt_name" "$_mt_old_method")"
+  _SHDEPS_DEPS+=("$_mt_name|custom|$_mt_cmd||")
+done
+
+_mt_custom_name="owner/transition-custom"
+_mt_custom_cmd="transition-custom"
+_mt_custom_artifact="$HOME/transition-custom-artifact"
+_mt_custom_marker="$HOME/transition-custom-uninstalled"
+mkdir -p "$(dirname "$SHDEPS_HOOKS_DIR/$_mt_custom_name.sh")"
+printf '%s\n' custom-artifact >"$_mt_custom_artifact"
+cat >"$SHDEPS_HOOKS_DIR/$_mt_custom_name.sh" <<'SH'
+uninstall() {
+  rm -f "$SHDEPS_TEST_CUSTOM_ARTIFACT"
+  : >"$SHDEPS_TEST_CUSTOM_MARKER"
+}
+SH
+SHDEPS_TEST_CUSTOM_ARTIFACT="$_mt_custom_artifact"
+SHDEPS_TEST_CUSTOM_MARKER="$_mt_custom_marker"
+_shdeps_manifest_upsert "$_mt_custom_name" "custom" "$_mt_custom_cmd" ""
+_shdeps_remote_touch "$(_shdeps_remote_stamp "$_mt_custom_name" custom)"
+_SHDEPS_DEPS+=("$_mt_custom_name|github:repo|$_mt_custom_cmd||")
+
+_mt_pkg_name="transition-pkg"
+_mt_pkg_cmd="transition-pkg"
+_mt_pkg_bin="$(_shdeps_bin_dir)/$_mt_pkg_cmd"
+printf '%s\n' pkg-owned-command >"$_mt_pkg_bin"
+chmod +x "$_mt_pkg_bin"
+_shdeps_manifest_upsert "$_mt_pkg_name" "pkg" "$_mt_pkg_cmd" ""
+_SHDEPS_DEPS+=("$_mt_pkg_name|github:repo|$_mt_pkg_cmd||")
+
 _shdeps_prepare_method_transitions
 _shdeps_manifest_read
-_assert_file_missing "method transition: removes old release binary" "$(_shdeps_bin_dir)/ds"
-_assert_file_missing "method transition: removes old release stamp" "$_mt_state/cgraf78/ds.release.stamp"
-_assert_eq "method transition: clears old manifest entry" "" "${_SHDEPS_MANIFEST["cgraf78/ds"]:-}"
+_assert_not_exists "method transition repo: removes install dir" "$_mt_repo_install"
+_assert_not_exists "method transition repo: removes short bin link" "$(_shdeps_bin_dir)/$_mt_repo_cmd"
+_assert_not_exists "method transition repo: removes tracked extra bin link" "$_mt_repo_extra_bin"
+_assert_not_exists "method transition repo: removes binlinks state" "$(_shdeps_bin_links_file "$_mt_repo_name")"
+_assert_not_exists "method transition repo: removes extras link" "$_mt_repo_extra_link"
+_assert_not_exists "method transition repo: removes extras state" "$(_shdeps_state_dir)/$_mt_repo_name.links"
+_assert_file_missing "method transition repo: removes stamp" "$(_shdeps_remote_stamp "$_mt_repo_name" repo)"
+_assert_eq "method transition repo: clears manifest entry" "" "${_SHDEPS_MANIFEST["$_mt_repo_name"]:-}"
+
+for _mt_old_method in github:release cargo go uv npm; do
+  _mt_suffix="${_mt_old_method//:/-}"
+  _mt_name="owner/transition-$_mt_suffix"
+  _mt_cmd="transition-$_mt_suffix"
+  _mt_install="$(_shdeps_install_dir)/$_mt_name"
+  _mt_bin="$(_shdeps_bin_dir)/$_mt_cmd"
+  _mt_extra_link="$HOME/.local/share/man/man1/$_mt_cmd.1"
+  _assert_not_exists "method transition $_mt_old_method: removes install dir" "$_mt_install"
+  _assert_not_exists "method transition $_mt_old_method: removes bin" "$_mt_bin"
+  _assert_not_exists "method transition $_mt_old_method: removes extras link" "$_mt_extra_link"
+  _assert_not_exists "method transition $_mt_old_method: removes extras state" "$(_shdeps_state_dir)/$_mt_name.links"
+  _assert_file_missing "method transition $_mt_old_method: removes stamp" \
+    "$(_shdeps_remote_stamp "$_mt_name" "$_mt_old_method")"
+  _assert_eq "method transition $_mt_old_method: clears manifest entry" "" "${_SHDEPS_MANIFEST["$_mt_name"]:-}"
+done
+
+_assert_file_exists "method transition custom: runs uninstall hook" "$_mt_custom_marker"
+_assert_not_exists "method transition custom: hook removed artifact" "$_mt_custom_artifact"
+_assert_file_missing "method transition custom: removes stamp" "$(_shdeps_remote_stamp "$_mt_custom_name" custom)"
+_assert_eq "method transition custom: clears manifest entry" "" "${_SHDEPS_MANIFEST["$_mt_custom_name"]:-}"
+
+_assert_file_exists "method transition pkg: leaves system command" "$_mt_pkg_bin"
+_assert_eq "method transition pkg: clears manifest entry" "" "${_SHDEPS_MANIFEST["$_mt_pkg_name"]:-}"
 
 HOME="$_mt_saved_home"
 SHDEPS_STATE_DIR="$_mfst_state"
+unset SHDEPS_HOOKS_DIR SHDEPS_TEST_CUSTOM_ARTIFACT SHDEPS_TEST_CUSTOM_MARKER
 _source_shdeps "$SHDEPS_DIR"
 
 # read populates associative array
