@@ -25,6 +25,16 @@
 #   SHDEPS_JOBS         Max parallel jobs          (default: auto/nproc, max 8)
 #   SHDEPS_AUTO_EPEL    Auto-configure CRB/EPEL on dnf (default: 0)
 
+_shdeps_git_head() {
+  local dir="$1"
+  if command -v git >/dev/null 2>&1; then
+    # CI container mounts can make a checkout look dubious after HOME changes.
+    # The caller is already executing code from this path, so treat only this
+    # rev-parse as safe rather than depending on ambient global git config.
+    git -c "safe.directory=$dir" -C "$dir" rev-parse --short HEAD 2>/dev/null || true
+  fi
+}
+
 _shdeps_self_version() {
   local src dir hash
   src="${BASH_SOURCE[0]}"
@@ -32,21 +42,16 @@ _shdeps_self_version() {
     */*) dir="${src%/*}" ;;
     *) dir="." ;;
   esac
-  dir=$(cd -P -- "$dir" && pwd) || {
-    echo unknown
+  dir=$(cd -P -- "$dir" && pwd) || return 1
+  hash=$(_shdeps_git_head "$dir")
+  if [[ -n "$hash" ]]; then
+    echo "commit $hash"
     return 0
-  }
-  if command -v git >/dev/null 2>&1; then
-    hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)
-    if [[ -n "$hash" ]]; then
-      echo "commit $hash"
-      return 0
-    fi
   fi
-  echo unknown
+  return 1
 }
 
-SHDEPS_VERSION="$(_shdeps_self_version)"
+SHDEPS_VERSION="$(_shdeps_self_version || true)"
 
 # ---------------------------------------------------------------------------
 # Public API — stable interface for callers and hook authors
@@ -56,7 +61,16 @@ SHDEPS_VERSION="$(_shdeps_self_version)"
 # sections with _shdeps_ prefixes.
 
 # Core
-shdeps_version() { echo "shdeps $SHDEPS_VERSION"; }
+shdeps_version() {
+  local version="${SHDEPS_VERSION:-}"
+  if [[ -z "$version" ]]; then
+    version=$(_shdeps_self_version) || {
+      printf '%s\n' "shdeps: failed to resolve git commit version" >&2
+      return 1
+    }
+  fi
+  echo "shdeps $version"
+}
 shdeps_update() { _shdeps_update "$@"; }
 shdeps_self_update() { _shdeps_self_update "$@"; }
 shdeps_load() {
@@ -1969,9 +1983,9 @@ _shdeps_get_version() {
   if [[ -f "$dir/VERSION" ]]; then
     # Report verbatim — preserve the upstream's own versioning convention.
     cat "$dir/VERSION"
-  elif command -v git >/dev/null 2>&1; then
+  else
     local hash
-    hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)
+    hash=$(_shdeps_git_head "$dir")
     if [[ -n "$hash" ]]; then echo "commit $hash"; fi
   fi
 }
