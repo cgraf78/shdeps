@@ -2261,14 +2261,14 @@ echo "v0.7.1" >"$_ver_dir_v/VERSION"
 result=$(_shdeps_get_version "$_ver_dir_v")
 _assert_eq "get_version: VERSION file verbatim" "v0.7.1" "$result"
 
-# --- _shdeps_get_version: git describe tag ---
+# --- _shdeps_get_version: git commit hash with tag present ---
 
 _git_dir=$(_tmpdir)
 git -C "$_git_dir" init -q
 git -C "$_git_dir" commit --allow-empty -m "init" -q
 git -C "$_git_dir" tag "v0.5.0"
 result=$(_shdeps_get_version "$_git_dir")
-_assert_eq "get_version: git tag" "v0.5.0" "$result"
+_assert_match "get_version: tagged repo uses commit hash" "^commit [0-9a-f]+" "$result"
 
 # --- _shdeps_get_version: git commit hash fallback ---
 
@@ -2284,7 +2284,7 @@ _empty_dir=$(_tmpdir)
 result=$(_shdeps_get_version "$_empty_dir")
 _assert_eq "get_version: empty dir" "" "$result"
 
-# --- _shdeps_get_version: VERSION file takes precedence over git ---
+# --- _shdeps_get_version: VERSION file takes precedence over git commit ---
 
 _both_dir=$(_tmpdir)
 git -C "$_both_dir" init -q
@@ -2292,7 +2292,7 @@ git -C "$_both_dir" commit --allow-empty -m "init" -q
 git -C "$_both_dir" tag "v9.9.9"
 echo "2.0.0" >"$_both_dir/VERSION"
 result=$(_shdeps_get_version "$_both_dir")
-_assert_eq "get_version: VERSION over git tag" "2.0.0" "$result"
+_assert_eq "get_version: VERSION over git commit" "2.0.0" "$result"
 
 # --- _shdeps_link_bin primitive: symlinks bin_path to $SHDEPS_BIN_DIR/$cmd ---
 
@@ -3065,6 +3065,29 @@ _assert_contains "upsert replace: new value" "tool-a|github:repo|tool-a|.local/s
 _assert_not_contains "upsert replace: old value gone" "tool-a|pkg|tool-a|" "$_mfst_content"
 _mfst_count=$(grep -c "^tool-a|" "$_mfst_path")
 _assert_eq "upsert replace: no duplicates" "1" "$_mfst_count"
+
+# method transitions remove artifacts before the new method installs
+_mt_state=$(_tmpdir)
+_mt_home=$(_tmpdir)
+_mt_saved_home="$HOME"
+SHDEPS_STATE_DIR="$_mt_state"
+HOME="$_mt_home"
+_source_shdeps "$SHDEPS_DIR"
+mkdir -p "$(_shdeps_bin_dir)"
+printf '%s\n' old-release >"$(_shdeps_bin_dir)/ds"
+chmod +x "$(_shdeps_bin_dir)/ds"
+_shdeps_manifest_upsert "cgraf78/ds" "github:release" "ds" "$(_shdeps_bin_dir)/ds"
+_shdeps_remote_touch "$(_shdeps_remote_stamp "cgraf78/ds" release)"
+_SHDEPS_DEPS=("cgraf78/ds|github:repo|ds||")
+_shdeps_prepare_method_transitions
+_shdeps_manifest_read
+_assert_file_missing "method transition: removes old release binary" "$(_shdeps_bin_dir)/ds"
+_assert_file_missing "method transition: removes old release stamp" "$_mt_state/cgraf78/ds.release.stamp"
+_assert_eq "method transition: clears old manifest entry" "" "${_SHDEPS_MANIFEST["cgraf78/ds"]:-}"
+
+HOME="$_mt_saved_home"
+SHDEPS_STATE_DIR="$_mfst_state"
+_source_shdeps "$SHDEPS_DIR"
 
 # read populates associative array
 _shdeps_manifest_read
@@ -4169,7 +4192,7 @@ _assert_eq "integ github repo failure: later dep in manifest" "custom|custom-b|"
 # --- shdeps_version ---
 
 ver=$(shdeps_version)
-_assert_match "shdeps_version: format" "^shdeps [0-9]+\.[0-9]+\.[0-9]+" "$ver"
+_assert_match "shdeps_version: format" "^shdeps commit [0-9a-f]+" "$ver"
 
 # ===========================================================================
 # Section 11: install.sh

@@ -25,7 +25,28 @@
 #   SHDEPS_JOBS         Max parallel jobs          (default: auto/nproc, max 8)
 #   SHDEPS_AUTO_EPEL    Auto-configure CRB/EPEL on dnf (default: 0)
 
-SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
+_shdeps_self_version() {
+  local src dir hash
+  src="${BASH_SOURCE[0]}"
+  case "$src" in
+    */*) dir="${src%/*}" ;;
+    *) dir="." ;;
+  esac
+  dir=$(cd -P -- "$dir" && pwd) || {
+    echo unknown
+    return 0
+  }
+  if [[ -d "$dir/.git" ]] && command -v git >/dev/null 2>&1; then
+    hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)
+    if [[ -n "$hash" ]]; then
+      echo "commit $hash"
+      return 0
+    fi
+  fi
+  echo unknown
+}
+
+SHDEPS_VERSION="$(_shdeps_self_version)"
 
 # ---------------------------------------------------------------------------
 # Public API — stable interface for callers and hook authors
@@ -1724,6 +1745,29 @@ _shdeps_manifest_remove() {
   fi
 }
 
+# Remove artifacts for dependencies whose configured method changed.
+_shdeps_prepare_method_transitions() {
+  _shdeps_manifest_read
+  [[ ${#_SHDEPS_MANIFEST[@]} -gt 0 ]] || return 0
+
+  local entry old_entry old_method old_cmd old_path
+  for entry in "${_SHDEPS_DEPS[@]}"; do
+    _shdeps_parse "$entry"
+    _shdeps_filter_match "$_filter" || continue
+    old_entry="${_SHDEPS_MANIFEST[$_name]:-}"
+    [[ -n "$old_entry" ]] || continue
+    IFS='|' read -r old_method old_cmd old_path <<<"$old_entry"
+    [[ "$old_method" != "$_method" ]] || continue
+
+    # Method changes are not orphans, but they need the same artifact cleanup.
+    # In particular, a release-installed real binary in SHDEPS_BIN_DIR would
+    # otherwise prevent a repo-installed symlink from replacing it.
+    _shdeps_log "  $_name: switching $old_method -> $_method"
+    _shdeps_remove_dep "$_name" "$old_method" "$old_cmd" "$old_path" || true
+    _shdeps_manifest_remove "$_name"
+  done
+}
+
 # Detect orphaned deps: in manifest but not in config.
 # Sets _SHDEPS_ORPHANS array with "name|method|cmd|install_path" entries.
 # Returns 0 if orphans found, 1 if none.
@@ -1919,21 +1963,16 @@ _shdeps_prune() {
 # ---------------------------------------------------------------------------
 
 # Get version string for an installed tool.
-# Checks: VERSION file, git describe, git log hash.
+# Checks: VERSION file, then the checked-out git commit.
 _shdeps_get_version() {
   local dir="$1"
   if [[ -f "$dir/VERSION" ]]; then
     # Report verbatim — preserve the upstream's own versioning convention.
     cat "$dir/VERSION"
   elif [[ -d "$dir/.git" ]]; then
-    local ver
-    ver=$(git -C "$dir" describe --tags --abbrev=0 2>/dev/null || true)
-    if [[ -z "$ver" ]]; then
-      local hash
-      hash=$(git -C "$dir" log -1 --format='%h' 2>/dev/null || true)
-      if [[ -n "$hash" ]]; then ver="commit $hash"; fi
-    fi
-    echo "$ver"
+    local hash
+    hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)
+    if [[ -n "$hash" ]]; then echo "commit $hash"; fi
   fi
 }
 
@@ -3571,6 +3610,7 @@ _shdeps_update() {
   # curl, tar, and language toolchains are available before non-pkg deps.
   local entry _phase_method failed=0
   _SHDEPS_N_UP_TO_DATE=0 # accumulated across all phases, printed once at the end
+  _shdeps_prepare_method_transitions
   _shdeps_pkg_check_parallel
   _shdeps_pkg_install_batch || failed=1
 
