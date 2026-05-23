@@ -36,7 +36,7 @@ _shdeps_self_version() {
     echo unknown
     return 0
   }
-  if [[ -d "$dir/.git" ]] && command -v git >/dev/null 2>&1; then
+  if command -v git >/dev/null 2>&1; then
     hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)
     if [[ -n "$hash" ]]; then
       echo "commit $hash"
@@ -1969,7 +1969,7 @@ _shdeps_get_version() {
   if [[ -f "$dir/VERSION" ]]; then
     # Report verbatim — preserve the upstream's own versioning convention.
     cat "$dir/VERSION"
-  elif [[ -d "$dir/.git" ]]; then
+  elif command -v git >/dev/null 2>&1; then
     local hash
     hash=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)
     if [[ -n "$hash" ]]; then echo "commit $hash"; fi
