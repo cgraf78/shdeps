@@ -117,7 +117,7 @@ Use `aliases` to map names across package managers. Use `NONE` to skip a dep on 
 Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<owner>/<repo>` (default `~/.local/share/<owner>/<repo>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<repo>` (default `~/git/<repo>`, symlinked for live development). Falls back to a shallow clone for fresh installs. Every executable directly under the repo's `bin/` directory is symlinked into `$SHDEPS_BIN_DIR`; existing regular files in `$SHDEPS_BIN_DIR` are preserved so shdeps never overwrites a user-owned command.
 
 ```text
-cgraf78/ds.git    github:repo
+cgraf78/ds    github:repo
 ```
 
 The `owner/repo` is the `name` field. Override the repo URL with `SHDEPS_<NAME>_REPO` env vars.

@@ -196,6 +196,22 @@ SHDEPS_CONF_DIR="$_test_conf_dir"
 _shdeps_load
 _assert_contains "dash fields: preserved in entry" "cgraf78/ds|github:repo|-|-" "${_SHDEPS_DEPS[0]}"
 
+# --- GitHub names tolerate a pasted .git clone suffix ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+cgraf78/ds.git  github:repo
+owner/tool.git  github:release  tool
+plain.git       pkg
+EOF
+SHDEPS_CONF_DIR="$_test_conf_dir"
+_shdeps_load
+_assert_contains "github name suffix: repo canonicalized" \
+  "cgraf78/ds|github:repo" "${_SHDEPS_DEPS[0]}"
+_assert_contains "github name suffix: release canonicalized" \
+  "owner/tool|github:release|tool" "${_SHDEPS_DEPS[1]}"
+_assert_contains "github name suffix: pkg left alone" \
+  "plain.git|pkg" "${_SHDEPS_DEPS[2]}"
+
 # ===========================================================================
 # Section 2: Entry parsing
 # ===========================================================================
@@ -226,6 +242,14 @@ _shdeps_parse "neovim/neovim|github:release|nvim|-|os:linux,os:macos"
 _assert_eq "parse github:release: name" "neovim/neovim" "$_name"
 _assert_eq "parse github:release: cmd" "nvim" "$_cmd"
 _assert_eq "parse github:release: filter" "os:linux,os:macos" "$_filter"
+
+_shdeps_parse "cgraf78/ds.git|github:repo"
+_assert_eq "parse github .git suffix: name" "cgraf78/ds" "$_name"
+_assert_eq "parse github .git suffix: cmd" "ds" "$_cmd"
+
+_shdeps_parse "owner/tool.git|github:release|tool"
+_assert_eq "parse release .git suffix: name" "owner/tool" "$_name"
+_assert_eq "parse release .git suffix: cmd" "tool" "$_cmd"
 
 # --- Dash fields normalize to empty ---
 
@@ -2598,6 +2622,36 @@ _assert_file_exists "local clone: no upstream is treated as fresh local dependen
 
 # Cleanup
 rm -rf "$_lc_clone" "$_lc_install"
+
+# --- owner/repo.git config spelling uses the same repo identity ---
+
+_lc_suffix_conf=$(_tmpdir)
+_lc_suffix_short="shdeps-lc-suffix-test"
+_lc_suffix_name="owner/$_lc_suffix_short"
+_lc_suffix_clone="$HOME/git/$_lc_suffix_short"
+_lc_suffix_install="$HOME/.local/share/$_lc_suffix_name"
+_lc_suffix_state=$(_tmpdir)
+mkdir -p "$_lc_suffix_clone"
+git -C "$_lc_suffix_clone" init -q
+git -C "$_lc_suffix_clone" commit --allow-empty -m "init" -q
+cat >"$_lc_suffix_conf/deps.conf" <<EOF
+$_lc_suffix_name.git  github:repo
+EOF
+SHDEPS_CONF_DIR="$_lc_suffix_conf"
+SHDEPS_STATE_DIR="$_lc_suffix_state"
+_source_shdeps "$SHDEPS_DIR"
+_shdeps_load
+declare -gA _SHDEPS_CHANGED=()
+_shdeps_install_dep "${_SHDEPS_DEPS[0]}"
+
+_assert_symlink "github .git suffix: install dir is canonical symlink" "$_lc_suffix_install"
+_lc_suffix_target=$(readlink "$_lc_suffix_install")
+_assert_eq "github .git suffix: points to ~/git/<short_name>" "$_lc_suffix_clone" "$_lc_suffix_target"
+_assert_file_missing "github .git suffix: no .git-suffixed install dir" "$HOME/.local/share/$_lc_suffix_name.git"
+_assert_file_exists "github .git suffix: canonical stamp" \
+  "$(_shdeps_remote_stamp "$_lc_suffix_name" repo)"
+
+rm -rf "$_lc_suffix_clone" "$_lc_suffix_install"
 
 # --- SHDEPS_GIT_DEV_DIR overrides dev clone location ---
 

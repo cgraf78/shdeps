@@ -440,6 +440,28 @@ _shdeps_maybe_prime_sudo() {
 # Config parsing
 # ---------------------------------------------------------------------------
 
+_shdeps_canonical_github_name() {
+  local name="$1" method="${2:-}"
+  case "$method" in
+    github:repo | github:release)
+      # Configs use owner/repo names, but humans naturally paste clone-shaped
+      # owner/repo.git values from GitHub. Treat that suffix as spelling noise
+      # instead of identity. Otherwise a fleet update can split one dependency
+      # into two worlds: ~/.local/share/owner/repo versus repo.git, two manifest
+      # keys, two stamp/link files, different hook paths, and missed ~/git/repo
+      # dev-clone discovery. Canonicalizing at parse/load time keeps old and new
+      # spelling converged before any path or state key is derived.
+      case "$name" in
+        */*.git) echo "${name%.git}" ;;
+        *) echo "$name" ;;
+      esac
+      ;;
+    *)
+      echo "$name"
+      ;;
+  esac
+}
+
 # Parse config files into _SHDEPS_DEPS array.
 # Loads all *.conf files from SHDEPS_CONF_DIR (sorted alphabetically).
 # Each non-blank, non-comment line becomes a pipe-delimited entry via
@@ -473,6 +495,12 @@ _shdeps_load() {
       local fields
       # shellcheck disable=SC2086  # intentional word splitting
       set -- $line
+      if [[ $# -ge 2 ]]; then
+        local dep_name
+        dep_name=$(_shdeps_canonical_github_name "$1" "$2")
+        shift
+        set -- "$dep_name" "$@"
+      fi
       fields="$*"
       _SHDEPS_DEPS+=("${fields// /|}")
     done <"$f"
@@ -500,6 +528,7 @@ _shdeps_load() {
 _shdeps_parse() {
   local entry="$1"
   IFS='|' read -r _name _method _cmd _aliases _filter <<<"$entry"
+  _name=$(_shdeps_canonical_github_name "$_name" "$_method")
   # Dash means "use default" / "not specified"
   if [[ "$_cmd" == "-" ]]; then _cmd=""; fi
   if [[ "$_aliases" == "-" ]]; then _aliases=""; fi
@@ -2427,6 +2456,8 @@ _shdeps_github_repo_install_fresh() {
 # Env var override: SHDEPS_<NAME>_REPO overrides the repo URL.
 _shdeps_github_repo_install() {
   local name="$1" default_repo="$2" install_dir="$3"
+  name=$(_shdeps_canonical_github_name "$name" github:repo)
+  default_repo=$(_shdeps_canonical_github_name "$default_repo" github:repo)
   local short
   short=$(_shdeps_short_name "$name")
   local upper="${short^^}"
@@ -2767,6 +2798,8 @@ _shdeps_github_release_install_zip() {
 # $4=bin_path (optional, defaults to $SHDEPS_BIN_DIR/$cmd)
 _shdeps_github_release_install() {
   local name="$1" cmd="$2" gh_repo="${3:-$1}" requested_bin_path="${4:-}"
+  name=$(_shdeps_canonical_github_name "$name" github:release)
+  gh_repo=$(_shdeps_canonical_github_name "$gh_repo" github:release)
   local bin_path
   bin_path="${requested_bin_path:-$(_shdeps_bin_dir)/$cmd}"
   local current_ver="" latest_ver=""
