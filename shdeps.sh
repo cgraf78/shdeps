@@ -23,7 +23,7 @@
 #   SHDEPS_BIN_DIR      Directory for binary symlinks (default: ~/.local/bin)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
 #   SHDEPS_JOBS         Max parallel jobs          (default: auto/nproc, max 8)
-#   SHDEPS_AUTO_EPEL    Auto-install epel-release on dnf (default: 0)
+#   SHDEPS_AUTO_EPEL    Auto-configure CRB/EPEL on dnf (default: 0)
 
 SHDEPS_VERSION="$(cat "${BASH_SOURCE[0]%/*}/VERSION" 2>/dev/null || echo unknown)"
 
@@ -1254,6 +1254,26 @@ _shdeps_pkg_install_for_mgr() {
   return 1
 }
 
+# Enable the CRB/PowerTools repo when it exists on dnf systems.
+#
+# EPEL 10's CentOS Stream instructions require CRB before epel-release:
+# many EPEL packages build against or depend on packages from CRB. This is
+# harmless on systems where the repo alias does not exist because dnf returns
+# non-zero and we leave the platform-specific setup to the caller (for example,
+# RHEL's CodeReady Builder subscription-manager flow). Try `powertools` after
+# `crb` so older EL8-family systems keep the old repository naming covered.
+_shdeps_maybe_enable_crb() {
+  [[ "${SHDEPS_AUTO_EPEL:-0}" -eq 1 ]] || return 0
+  [[ "$_SHDEPS_PKG_MGR" == "dnf" ]] || return 0
+
+  local repo
+  for repo in crb powertools; do
+    sudo dnf config-manager --set-enabled "$repo" &>/dev/null || continue
+    _shdeps_log_dim "  $repo repo enabled"
+    return 0
+  done
+}
+
 # Auto-enable EPEL repo on dnf systems when SHDEPS_AUTO_EPEL=1.
 # EPEL (Extra Packages for Enterprise Linux) adds many common dev tools
 # not in base CentOS/RHEL repos. Off by default — opt-in via env var
@@ -1261,6 +1281,7 @@ _shdeps_pkg_install_for_mgr() {
 _shdeps_maybe_enable_epel() {
   [[ "${SHDEPS_AUTO_EPEL:-0}" -eq 1 ]] || return 0
   [[ "$_SHDEPS_PKG_MGR" == "dnf" ]] || return 0
+  _shdeps_maybe_enable_crb
   rpm -q epel-release &>/dev/null && return 0
 
   _shdeps_log_status "  enabling EPEL repo (SHDEPS_AUTO_EPEL=1)..."

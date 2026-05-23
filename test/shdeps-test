@@ -837,6 +837,111 @@ _SHDEPS_PKG_CACHE_REFRESHED=1
 _shdeps_pkg_refresh_metadata
 _assert_eq "refresh_metadata: idempotent" "1" "$_SHDEPS_PKG_CACHE_REFRESHED"
 
+# --- _shdeps_maybe_enable_epel: dnf enables CRB before EPEL ---
+
+_epel_bin=$(_mock_bin)
+_epel_log=$(_tmpdir)/epel.log
+cat >"$_epel_bin/rpm" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$1" == "-q" && "$2" == "epel-release" ]] && exit 1
+exit 1
+MOCK
+cat >"$_epel_bin/dnf" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_EPEL_LOG"
+case "$*" in
+  "config-manager --set-enabled crb") exit 0 ;;
+  "install -y epel-release") exit 0 ;;
+  *) exit 1 ;;
+esac
+MOCK
+cat >"$_epel_bin/sudo" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "-n" && "$2" == "true" ]]; then
+  exit 0
+fi
+if [[ "$1" == "true" ]]; then
+  exit 0
+fi
+exec "$@"
+MOCK
+chmod +x "$_epel_bin/rpm" "$_epel_bin/dnf" "$_epel_bin/sudo"
+_saved_path="$PATH"
+PATH="$_epel_bin:$PATH"
+MOCK_EPEL_LOG="$_epel_log" _SHDEPS_PKG_MGR="dnf" SHDEPS_AUTO_EPEL=1 _shdeps_maybe_enable_epel
+_assert_file_content "epel: enables CRB before installing epel-release" \
+  $'config-manager --set-enabled crb\ninstall -y epel-release' "$_epel_log"
+PATH="$_saved_path"
+
+# --- _shdeps_maybe_enable_epel: dnf falls back to PowerTools alias ---
+
+_epel_bin=$(_mock_bin)
+_epel_log=$(_tmpdir)/epel-powertools.log
+cat >"$_epel_bin/rpm" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$1" == "-q" && "$2" == "epel-release" ]] && exit 1
+exit 1
+MOCK
+cat >"$_epel_bin/dnf" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_EPEL_LOG"
+case "$*" in
+  "config-manager --set-enabled crb") exit 1 ;;
+  "config-manager --set-enabled powertools") exit 0 ;;
+  "install -y epel-release") exit 0 ;;
+  *) exit 1 ;;
+esac
+MOCK
+cat >"$_epel_bin/sudo" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "-n" && "$2" == "true" ]]; then
+  exit 0
+fi
+if [[ "$1" == "true" ]]; then
+  exit 0
+fi
+exec "$@"
+MOCK
+chmod +x "$_epel_bin/rpm" "$_epel_bin/dnf" "$_epel_bin/sudo"
+_saved_path="$PATH"
+PATH="$_epel_bin:$PATH"
+MOCK_EPEL_LOG="$_epel_log" _SHDEPS_PKG_MGR="dnf" SHDEPS_AUTO_EPEL=1 _shdeps_maybe_enable_epel
+_assert_file_content "epel: falls back to powertools when crb is absent" \
+  $'config-manager --set-enabled crb\nconfig-manager --set-enabled powertools\ninstall -y epel-release' \
+  "$_epel_log"
+PATH="$_saved_path"
+
+# --- _shdeps_maybe_enable_epel: existing EPEL still repairs CRB ---
+
+_epel_bin=$(_mock_bin)
+_epel_log=$(_tmpdir)/epel-existing.log
+cat >"$_epel_bin/rpm" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$1" == "-q" && "$2" == "epel-release" ]]
+MOCK
+cat >"$_epel_bin/dnf" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_EPEL_LOG"
+[[ "$*" == "config-manager --set-enabled crb" ]]
+MOCK
+cat >"$_epel_bin/sudo" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "-n" && "$2" == "true" ]]; then
+  exit 0
+fi
+if [[ "$1" == "true" ]]; then
+  exit 0
+fi
+exec "$@"
+MOCK
+chmod +x "$_epel_bin/rpm" "$_epel_bin/dnf" "$_epel_bin/sudo"
+_saved_path="$PATH"
+PATH="$_epel_bin:$PATH"
+MOCK_EPEL_LOG="$_epel_log" _SHDEPS_PKG_MGR="dnf" SHDEPS_AUTO_EPEL=1 _shdeps_maybe_enable_epel
+_assert_file_content "epel: enables CRB even when epel-release exists" \
+  "config-manager --set-enabled crb" "$_epel_log"
+PATH="$_saved_path"
+
 # --- _shdeps_pkg_check_parallel: collapsed output skips version probes ---
 
 _pkg_check_bin=$(_mock_bin)
