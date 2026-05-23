@@ -2750,6 +2750,7 @@ declare -gA _SHDEPS_PREFETCHED=(
   ["owner/mytool"]='{"tag_name":"v1.0.0","assets":[{"browser_download_url":"https://example.invalid/'"$_gr_custom_asset"'"}]}'
 )
 _SHDEPS_PREFETCH_READY=1
+# shellcheck disable=SC2218  # provided by dynamic _source_shdeps in test helper
 PATH="$_gr_custom_bin:$PATH" \
   SHDEPS_TEST_RELEASE_TARBALL="$_gr_custom_tar" \
   _shdeps_github_release_install "owner/mytool" "mytool" "owner/mytool" "$_gr_custom_link" >/dev/null
