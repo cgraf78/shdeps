@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::link_state::{self, Kind};
 use crate::Result;
 
 /// Result of trying to expose one binary in the public bin directory.
@@ -46,6 +47,43 @@ pub fn one(bin_dir: &Path, cmd: &str, source: &Path) -> Result<Link> {
     }
 
     Ok(Link::Linked(target))
+}
+
+/// Links every executable directly under `install_dir/bin`.
+///
+/// Repo dependencies may expose several public commands. Tracking the created
+/// symlinks lets a later update remove stale commands when the repo changes
+/// its bin directory contents.
+pub fn from_dir(
+    state_dir: &Path,
+    bin_dir: &Path,
+    name: &str,
+    install_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let state_path = link_state::path(state_dir, name, Kind::Bin);
+    link_state::unlink_tracked(&state_path)?;
+
+    let source_dir = install_dir.join("bin");
+    let Ok(entries) = fs::read_dir(&source_dir) else {
+        return Ok(Vec::new());
+    };
+
+    let mut created = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !crate::process::executable_path(&path) {
+            continue;
+        }
+        let Some(cmd) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Link::Linked(link) = one(bin_dir, cmd, &path)? {
+            created.push(link);
+        }
+    }
+
+    link_state::write(&state_path, &created)?;
+    Ok(created)
 }
 
 #[cfg(test)]
@@ -117,6 +155,37 @@ mod tests {
             one(&dir.join("bin"), "tool", &source).unwrap(),
             Link::MissingSource
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_from_dir_tracks_multiple_repo_commands_and_removes_stale_links() {
+        let dir = temp_dir("from-dir");
+        let install = dir.join("share/repo");
+        let bin_dir = dir.join("bin");
+        write_executable(&install.join("bin/tool-a"));
+        write_executable(&install.join("bin/tool-b"));
+        write_executable(&install.join("bin/not-direct/nested"));
+
+        let created =
+            super::from_dir(&dir.join("state"), &bin_dir, "owner/repo", &install).unwrap();
+
+        assert_eq!(created.len(), 2);
+        assert_eq!(
+            fs::read_link(bin_dir.join("tool-a")).unwrap(),
+            install.join("bin/tool-a")
+        );
+        assert_eq!(
+            fs::read_link(bin_dir.join("tool-b")).unwrap(),
+            install.join("bin/tool-b")
+        );
+
+        fs::remove_file(install.join("bin/tool-b")).unwrap();
+        let created =
+            super::from_dir(&dir.join("state"), &bin_dir, "owner/repo", &install).unwrap();
+
+        assert_eq!(created, [bin_dir.join("tool-a")]);
+        assert!(fs::symlink_metadata(bin_dir.join("tool-b")).is_err());
     }
 
     fn write_executable(path: &PathBuf) {
