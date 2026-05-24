@@ -37,6 +37,9 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Smoke Rust compatibility wrapper
+        run: SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-wrapper-test
+
       - name: Check Rust docs
         run: RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
 

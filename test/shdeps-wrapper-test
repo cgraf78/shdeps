@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1091
+# Focused smoke tests for the Rust-era sourceable compatibility wrapper.
+#
+# The full shell parity suite still exercises many legacy `_shdeps_*` internals
+# while the Bash reference exists. This file targets the final public surface:
+# source `shdeps.sh`/wrapper, call public `shdeps_*` functions, and verify the
+# wrapper delegates to the Rust binary without requiring callers to change.
+
+set -uo pipefail
+
+SHDEPS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SHDEPS_RUST_CLI="${SHDEPS_RUST_CLI:-$SHDEPS_DIR/target/debug/shdeps}"
+
+# shellcheck source=helpers.sh
+. "$(dirname "$0")/helpers.sh"
+
+echo "=== Rust wrapper ==="
+
+if [[ ! -x "$SHDEPS_RUST_CLI" ]]; then
+  printf 'error: %s is not executable; run cargo build or set SHDEPS_RUST_CLI\n' "$SHDEPS_RUST_CLI" >&2
+  exit 2
+fi
+
+_mock_home
+
+_conf=$(_tmpdir)
+_state=$(_tmpdir)
+_install=$(_tmpdir)
+_bin=$(_tmpdir)
+_git_dev=$(_tmpdir)
+
+cat >"$_conf/deps.conf" <<'EOF'
+owner/tool github:repo
+EOF
+mkdir -p "$_install/owner/tool/share"
+cat >"$_install/owner/tool/share/env.sh" <<'EOF'
+SHDEPS_WRAPPER_SOURCED=1
+EOF
+
+export SHDEPS_RUST_CLI
+export SHDEPS_CONF_DIR="$_conf"
+export SHDEPS_STATE_DIR="$_state"
+export SHDEPS_INSTALL_DIR="$_install"
+export SHDEPS_BIN_DIR="$_bin"
+export SHDEPS_GIT_DEV_DIR="$_git_dev"
+export SHDEPS_LOG_LEVEL=0
+
+# shellcheck source=../shdeps-wrapper.sh
+. "$SHDEPS_DIR/shdeps-wrapper.sh" || {
+  _fail "wrapper: source succeeds"
+  _test_summary
+}
+_pass "wrapper: source succeeds"
+
+if declare -f shdeps_update >/dev/null; then
+  _pass "wrapper: defines shdeps_update"
+else
+  _fail "wrapper: defines shdeps_update"
+fi
+
+if declare -f shdeps_dep_source >/dev/null; then
+  _pass "wrapper: defines shdeps_dep_source"
+else
+  _fail "wrapper: defines shdeps_dep_source"
+fi
+
+_version=$(shdeps_version)
+_assert_match "wrapper: version delegates to Rust binary" '^shdeps commit [0-9a-f]{7,12}$' "$_version"
+
+_assert_eq "wrapper: install dir cached from Rust env" "$_install" "$(shdeps_install_dir)"
+_assert_eq "wrapper: bin dir cached from Rust env" "$_bin" "$(shdeps_bin_dir)"
+_assert_eq "wrapper: git dev dir cached from Rust env" "$_git_dev" "$(shdeps_git_dev_dir)"
+_assert_match "wrapper: platform available" '^(linux|macos|wsl)$' "$(shdeps_platform)"
+
+_assert_eq "wrapper: pkg mgr starts as cached empty read" "" "$(shdeps_pkg_mgr)"
+_SHDEPS_PKG_MGR=apt
+_assert_eq "wrapper: pkg mgr honors already-detected shell cache" "apt" "$(shdeps_pkg_mgr)"
+
+export SHDEPS_FORCE=1
+if shdeps_force; then
+  _pass "wrapper: force predicate returns shell success"
+else
+  _fail "wrapper: force predicate returns shell success"
+fi
+export SHDEPS_FORCE=0
+if shdeps_force; then
+  _fail "wrapper: force predicate returns shell failure"
+else
+  _pass "wrapper: force predicate returns shell failure"
+fi
+
+unset SHDEPS_WRAPPER_SOURCED
+shdeps_dep_source owner/tool share/env.sh
+_assert_eq "wrapper: dep-source sources into current shell" "1" "${SHDEPS_WRAPPER_SOURCED:-}"
+
+SHDEPS_UPDATE_TXN_ID=txn123 shdeps_mark_changed owner/tool
+_assert_file_exists "wrapper: mark-changed writes txn sentinel" "$_state/.changed-markers/txn123/owner/tool"
+
+_fake=$(_tmpdir)/shdeps
+cat >"$_fake" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "__api" && "${2:-}" == "version" ]]; then
+  printf 'abi:999\n'
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$_fake"
+
+_abi_output=$(SHDEPS_RUST_CLI="$_fake" bash -c '. "$1"' bash "$SHDEPS_DIR/shdeps-wrapper.sh" 2>&1)
+_abi_rc=$?
+_assert_exit "wrapper: ABI mismatch refuses source" 1 "$_abi_rc"
+_assert_contains "wrapper: ABI mismatch explains refusal" "unsupported wrapper ABI" "$_abi_output"
+
+_bash=$(command -v bash)
+_missing_output=$(PATH=/nonexistent SHDEPS_RUST_CLI='' "$_bash" -c ". \"\$1\"" bash "$SHDEPS_DIR/shdeps-wrapper.sh" 2>&1)
+_missing_rc=$?
+_assert_exit "wrapper: missing binary refuses source" 1 "$_missing_rc"
+_assert_contains "wrapper: missing binary explains refusal" "could not find the Rust shdeps binary" "$_missing_output"
+
+_test_summary
