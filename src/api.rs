@@ -7,7 +7,6 @@
 //! read-only commands and path helpers; mutating bridge calls land with the Rust
 //! modules that own those side effects.
 
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -230,29 +229,5 @@ fn flag(value: bool) -> &'static str {
 }
 
 fn load_count(conf_dir: &Path) -> Result<usize> {
-    let Ok(entries) = fs::read_dir(conf_dir) else {
-        return Ok(0);
-    };
-    let mut files = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "conf")
-        {
-            files.push(path);
-        }
-    }
-    files.sort();
-
-    // Use the same config parser as install/list paths instead of counting raw
-    // lines here. That preserves canonical `.git` suffix handling and comment
-    // rules for the Bash wrapper's `shdeps_load` bridge without making the
-    // bridge run package detection or any install-side work.
-    let mut entries = Vec::new();
-    for file in files {
-        let content = fs::read_to_string(file)?;
-        entries.extend(config::parse_config_texts([content.as_str()]));
-    }
-    Ok(entries.len())
+    Ok(config::load_dir(conf_dir)?.len())
 }

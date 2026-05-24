@@ -91,22 +91,7 @@ pub fn file(target: &str, rel: &str, roots: &Roots, env: &RuntimeEnv) -> Result<
 /// is often used during shell/editor startup where compatibility bugs are more
 /// painful than the small cost of sorting a few config lines.
 pub fn find_entry(target: &str, conf_dir: &Path, env: &RuntimeEnv) -> Result<Option<Entry>> {
-    let mut files = conf_files(conf_dir)?;
-    files.sort();
-
-    let mut entries = Vec::new();
-    for file in files {
-        let content = fs::read_to_string(file)?;
-        for line in content.lines() {
-            let Some(raw) = config::parse_config_line(line) else {
-                continue;
-            };
-            entries.push(raw);
-        }
-    }
-    config::sort_entries(&mut entries);
-
-    for raw in entries {
+    for raw in config::load_dir(conf_dir)? {
         let entry = config::parse_entry(&raw, None);
         if entry.name != target {
             continue;
@@ -143,24 +128,6 @@ fn existing_root(path: &Path) -> Option<PathBuf> {
     } else {
         None
     }
-}
-
-fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
-    let Ok(entries) = fs::read_dir(conf_dir) else {
-        return Ok(Vec::new());
-    };
-
-    let mut files = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "conf")
-        {
-            files.push(path);
-        }
-    }
-    Ok(files)
 }
 
 fn valid_relative(rel: &str) -> bool {

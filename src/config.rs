@@ -6,6 +6,11 @@
 //! `.git`, another uses the raw config spelling, and cleanup logic later looks
 //! in the wrong path.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::Result;
+
 /// Parsed dependency entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -139,6 +144,26 @@ pub fn parse_config_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<S
     entries
 }
 
+/// Loads all direct `*.conf` files from a config directory into sorted entries.
+///
+/// This mirrors the Bash loader's durable behavior: missing config dirs are an
+/// empty dependency set, files are read in lexical path order, and the final
+/// registry is sorted by dependency name. Keeping directory loading here means
+/// `update`, `list`, `dep-file`, and bridge APIs cannot accidentally disagree
+/// about `.git` canonicalization or comment handling.
+pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
+    let mut files = conf_files(conf_dir)?;
+    files.sort();
+
+    let mut entries = Vec::new();
+    for file in files {
+        let content = fs::read_to_string(file)?;
+        entries.extend(content.lines().filter_map(parse_config_line));
+    }
+    sort_entries(&mut entries);
+    Ok(entries)
+}
+
 /// Returns whether a dependency name is safe to use as a managed path suffix.
 #[must_use]
 pub fn valid_dep_name(name: &str) -> bool {
@@ -161,11 +186,32 @@ fn entry_name(entry: &str) -> &str {
     entry.split('|').next().unwrap_or(entry)
 }
 
+fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
+    let Ok(entries) = fs::read_dir(conf_dir) else {
+        return Ok(Vec::new());
+    };
+
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "conf")
+        {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
     use super::{
-        canonical_name, parse_config_line, parse_config_texts, parse_entry, resolve_override,
-        short_name, sort_entries, valid_dep_name,
+        canonical_name, load_dir, parse_config_line, parse_config_texts, parse_entry,
+        resolve_override, short_name, sort_entries, valid_dep_name,
     };
 
     #[test]
@@ -310,6 +356,31 @@ mod tests {
     }
 
     #[test]
+    fn load_dir_reads_direct_conf_files_and_sorts_loaded_entries() {
+        let dir = temp_dir("load-dir");
+        write(
+            &dir.join("b.conf"),
+            "tool-b  pkg\nowner/tool.git github:repo\n",
+        );
+        write(&dir.join("a.conf"), "# comment\ntool-a  cargo\n");
+        write(&dir.join("ignored.txt"), "ignored pkg\n");
+
+        let entries = load_dir(&dir).unwrap();
+
+        assert_eq!(
+            entries,
+            vec!["owner/tool|github:repo", "tool-a|cargo", "tool-b|pkg"]
+        );
+    }
+
+    #[test]
+    fn load_dir_treats_missing_directory_as_empty_config() {
+        let dir = temp_dir("missing-dir");
+
+        assert!(load_dir(&dir.join("missing")).unwrap().is_empty());
+    }
+
+    #[test]
     fn sort_entries_uses_case_insensitive_name_key() {
         let mut entries = vec![
             "tool-b|pkg".to_owned(),
@@ -347,5 +418,20 @@ mod tests {
         assert!(!valid_dep_name("tool/../other"));
         assert!(!valid_dep_name("bad name"));
         assert!(!valid_dep_name("bad|name"));
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shdeps-config-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: &Path, content: &str) {
+        fs::write(path, content).unwrap();
     }
 }
