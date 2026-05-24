@@ -258,6 +258,109 @@ fn check_reports_installed_skipped_missing_and_unknown() {
 }
 
 #[test]
+fn update_reports_empty_config_without_touching_installers() {
+    let fixture = Fixture::new("update-empty");
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn update_installs_custom_dep_runs_post_and_records_manifest() {
+    let fixture = Fixture::new("update-custom");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() {
+  mkdir -p "$SHDEPS_STATE_DIR"
+  printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"
+  printf '1.2.3\n'
+}
+post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-post"; }
+"#,
+    );
+
+    let first = run(&mut fixture.command(["update"]));
+
+    assert_success(&first);
+    assert_eq!(text(&first.stdout), "  tool: 1.2.3\n");
+    assert_eq!(text(&first.stderr), "");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/tool-post")).unwrap(),
+        "tool:post\n"
+    );
+
+    let second = run(&mut fixture.command(["update"]));
+
+    assert_success(&second);
+    assert_eq!(text(&second.stdout), "");
+    assert_eq!(text(&second.stderr), "");
+}
+
+#[test]
+fn update_fails_when_custom_install_fails() {
+    let fixture = Fixture::new("update-custom-fail");
+    fixture.write("conf/deps.conf", "broken custom\n");
+    fixture.write(
+        "conf/hooks.d/broken.sh",
+        "exists() { return 1; }\ninstall() { return 42; }\n",
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        "  broken failed: custom install failed\n"
+    );
+    assert!(!fixture.dir.join("state/manifest").exists());
+}
+
+#[test]
+fn update_reports_orphans_without_pruning_them() {
+    let fixture = Fixture::new("update-orphans");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "old|github:release|old|{}\n",
+            fixture.dir.join("bin/old").display()
+        ),
+    );
+    fixture.write_executable("bin/old", "#!/bin/sh\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() { printf 'installed\n'; }
+"#,
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "  tool: installed\n");
+    assert_eq!(
+        text(&output.stderr),
+        "==> 1 orphaned dep(s) no longer in config:\n  old (github:release)\nRun `shdeps prune` to remove orphaned artifacts.\n"
+    );
+    assert!(fixture.dir.join("bin/old").exists());
+    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
+        .unwrap()
+        .contains("old|github:release|old|"));
+}
+
+#[test]
 fn prune_lists_dry_runs_and_removes_orphans() {
     let fixture = Fixture::new("prune");
     fixture.write("conf/deps.conf", "current github:repo\n");

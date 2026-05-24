@@ -20,7 +20,8 @@ use crate::process::{self, Process};
 use crate::prune::{self, Options as PruneOptions};
 use crate::runtime::{self, Overrides, ProcessEnv};
 use crate::self_update::{self, Outcome, ReleaseArchiveOutcome, Target};
-use crate::status::{self, Context, DependencyStatus, SkipReason, State};
+use crate::status::{self, Context as StatusContext, DependencyStatus, SkipReason, State};
+use crate::update::{self, Context as UpdateContext, Options as UpdateOptions};
 use crate::version;
 use crate::Result;
 
@@ -121,7 +122,7 @@ where
         }
         "prune" => prune_cmd(rest, &parsed, stdout, stderr),
         "self-update" => self_update_cmd(rest, stdout, stderr),
-        "update" => not_implemented(command, rest, stderr),
+        "update" => update_cmd(rest, &parsed, stdout, stderr),
         other => {
             writeln!(stderr, "error: unknown command '{other}'")?;
             writeln!(stderr, "Run 'shdeps help' for usage.")?;
@@ -294,7 +295,7 @@ where
     };
     let custom = custom_probe();
     let env = runtime::runtime_env(&ProcessEnv);
-    let context = Context {
+    let context = StatusContext {
         roots: &roots,
         env: &env,
         manifest: &manifest,
@@ -357,7 +358,7 @@ where
     };
     let custom = custom_probe();
     let env = runtime::runtime_env(&ProcessEnv);
-    let context = Context {
+    let context = StatusContext {
         roots: &roots,
         env: &env,
         manifest: &manifest,
@@ -370,6 +371,67 @@ where
 
     write_check(&dependency, stdout)?;
     Ok(check_exit_code(&dependency.state))
+}
+
+fn update_cmd<W, E>(
+    args: &[String],
+    options: &ParsedOptions,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    if let Some(arg) = args.first() {
+        writeln!(stderr, "error: unknown update argument '{arg}'")?;
+        return Ok(2);
+    }
+
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    ensure_bin_dir_on_path(&roots.bin_dir);
+
+    let pkg_mgr = process::detect_package_manager(&Process);
+    let raw_entries = config::load_dir(&roots.conf_dir)?;
+    let entries = parse_entries(&raw_entries, &pkg_mgr);
+    if entries.is_empty() {
+        writeln!(stdout, "No dependencies configured.")?;
+        return Ok(0);
+    }
+
+    let manifest_path = manifest::path(&roots.state_dir);
+    let manifest = manifest::read(&manifest_path)?;
+    let hooks = custom_probe();
+    let env = runtime::runtime_env(&ProcessEnv);
+    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let context = UpdateContext {
+        manifest_path: &manifest_path,
+        roots: &roots,
+        env: &env,
+        hooks: &hooks,
+        runner: &Process,
+        pkg_mgr: &pkg_mgr,
+        env_vars: &env_vars,
+        client: &Curl,
+    };
+    let update_options = UpdateOptions {
+        reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
+        force: runtime::force(&ProcessEnv, &options.overrides),
+        remote_ttl: remote_ttl(),
+        ..UpdateOptions::default()
+    };
+
+    let summary = update::run(&entries, &manifest, &context, update_options)?;
+    write_update_summary(&summary, options.quiet, stdout, stderr)?;
+
+    let manifest = manifest::read(&manifest_path)?;
+    let orphans = manifest.orphans(&entries);
+    if !orphans.is_empty() && !options.quiet {
+        write_prune_orphans(&orphans, stderr)?;
+        writeln!(stderr, "Run `shdeps prune` to remove orphaned artifacts.")?;
+    }
+
+    Ok(if summary.has_errors() { 1 } else { 0 })
 }
 
 fn prune_cmd<W, E>(
@@ -634,6 +696,42 @@ where
     Ok(())
 }
 
+fn write_update_summary<W, E>(
+    summary: &update::Summary,
+    quiet: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<()>
+where
+    W: Write,
+    E: Write,
+{
+    let mut item_failures = std::collections::BTreeSet::new();
+    for item in &summary.items {
+        if item.failed {
+            item_failures.insert(item.name.as_str());
+            writeln!(stderr, "  {} failed: {}", item.name, item.detail)?;
+        } else if item.changed && !quiet {
+            writeln!(stdout, "  {}: {}", item.name, item.detail)?;
+        }
+    }
+
+    for name in &summary.failed {
+        if !item_failures.contains(name.as_str()) {
+            writeln!(stderr, "  {name} post hook failed")?;
+        }
+    }
+
+    for name in &summary.leftovers {
+        writeln!(
+            stderr,
+            "  warning: {name} old-method cleanup left artifacts behind"
+        )?;
+    }
+
+    Ok(())
+}
+
 fn write_prune_orphans<W>(orphans: &[manifest::ManifestEntry], stdout: &mut W) -> Result<()>
 where
     W: Write,
@@ -772,6 +870,38 @@ fn check_exit_code(state: &State) -> i32 {
     }
 }
 
+fn ensure_bin_dir_on_path(bin_dir: &Path) {
+    let current = env::var_os("PATH").unwrap_or_else(default_path);
+    let mut paths = vec![bin_dir.to_path_buf()];
+    paths.extend(env::split_paths(&current).filter(|path| path != bin_dir));
+
+    if let Ok(joined) = env::join_paths(paths) {
+        // Bash prepends SHDEPS_BIN_DIR before update so newly installed tools
+        // are immediately visible to later install methods and hooks in the
+        // same run. The Rust CLI mutates only this process environment, right
+        // before spawning those subprocess-backed phases, to preserve that
+        // behavior without making every runner call rebuild PATH by hand.
+        env::set_var("PATH", joined);
+    }
+}
+
+fn default_path() -> std::ffi::OsString {
+    // Real interactive shells virtually always provide PATH, but the test
+    // harness intentionally starts commands with a scrubbed environment. Bash's
+    // hook runner still has to find `bash`, `git`, package managers, and
+    // language tools after shdeps prepends SHDEPS_BIN_DIR, so use the standard
+    // Unix command locations as the compatibility fallback instead of turning
+    // an absent PATH into "only SHDEPS_BIN_DIR".
+    std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin")
+}
+
+fn remote_ttl() -> u64 {
+    env::var("SHDEPS_REMOTE_TTL")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3600)
+}
+
 fn custom_probe() -> BashCustomProbe {
     BashCustomProbe::new(shdeps_lib_path().unwrap_or_else(missing_shdeps_lib))
 }
@@ -823,17 +953,6 @@ where
         Err(Error::Resolve(error)) => Ok(error.exit_code()),
         Err(error) => Err(error),
     }
-}
-
-fn not_implemented<E>(command: &str, _rest: &[String], stderr: &mut E) -> Result<i32>
-where
-    E: Write,
-{
-    writeln!(
-        stderr,
-        "error: Rust command '{command}' is not implemented yet; use the Bash reference CLI"
-    )?;
-    Ok(1)
 }
 
 #[cfg(test)]
