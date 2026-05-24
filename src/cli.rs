@@ -1057,15 +1057,14 @@ mod tests {
     }
 
     #[test]
-    fn api_mutating_registry_names_fail_as_unimplemented_not_unknown() {
-        let (code, stdout, stderr) =
-            run_capture(["__api", "github-release-install", "tool", "tool"]);
+    fn api_github_release_install_validates_required_arguments() {
+        let (code, stdout, stderr) = run_capture(["__api", "github-release-install", "tool"]);
 
-        assert_eq!(code, 1);
+        assert_eq!(code, 2);
         assert!(stdout.is_empty());
         assert_eq!(
             stderr,
-            "error: __api github-release-install is not implemented yet\n"
+            "error: __api github-release-install requires a name and command\n"
         );
     }
 

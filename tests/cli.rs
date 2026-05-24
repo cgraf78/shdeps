@@ -249,6 +249,121 @@ fn mutating_api_require_sudo_matches_quiet_prompt_rules() {
 }
 
 #[test]
+fn mutating_api_installs_github_release_to_custom_path() {
+    let fixture = Fixture::new("api-github-release");
+    let fakebin = fixture.dir.join("fakebin");
+    let archive = fixture.dir.join("release.tar.gz");
+    let curl_log = fixture.dir.join("curl.log");
+    let custom_bin = fixture.dir.join("launcher-owned/bin/mytool");
+    let arch = host_arch();
+    let asset = format!("mytool-v1.0.0-linux-{arch}.tar.gz");
+    write_tar_gz(
+        &archive,
+        &[
+            (
+                "mytool-v1.0.0/bin/mytool",
+                "#!/bin/sh\nprintf 'ok\\n'\n",
+                0o755,
+            ),
+            (
+                "mytool-v1.0.0/share/man/man1/mytool.1",
+                ".TH MYTOOL 1\n",
+                0o644,
+            ),
+        ],
+    );
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+set -e
+config=$(cat)
+printf '%s\n---\n' "$config" >>"$SHDEPS_TEST_CURL_LOG"
+case "$config" in
+  *'url = "https://api.github.com/repos/owner/mytool/releases"'*)
+    printf '[{"tag_name":"v1.0.0","assets":[{"name":"%s","browser_download_url":"https://downloads.example/%s"}]}]\n' \
+      "$SHDEPS_TEST_ASSET" "$SHDEPS_TEST_ASSET"
+    ;;
+  *'url = "https://downloads.example/'"$SHDEPS_TEST_ASSET"'"'*)
+    cat "$SHDEPS_TEST_ARCHIVE"
+    ;;
+  *)
+    printf 'unexpected curl config\n%s\n' "$config" >&2
+    exit 22
+    ;;
+esac
+"#,
+    );
+
+    let mut command = fixture.command([
+        "__api",
+        "github-release-install",
+        "owner/mytool.git",
+        "mytool",
+        "owner/mytool.git",
+        custom_bin.to_str().unwrap(),
+    ]);
+    command
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("GH_TOKEN", "bridge-token")
+        .env("SHDEPS_TEST_ARCHIVE", &archive)
+        .env("SHDEPS_TEST_ASSET", &asset)
+        .env("SHDEPS_TEST_CURL_LOG", &curl_log)
+        .env("SHDEPS_UPDATE_TXN_ID", "txn123");
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "  owner/mytool installed -- v1.0.0\n");
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(
+        fs::read_link(&custom_bin).unwrap(),
+        fixture.dir.join("share/owner/mytool/bin/mytool")
+    );
+    assert!(!fixture.dir.join("bin/mytool").exists());
+    assert_eq!(
+        fs::read_link(fixture.dir.join("share/man/man1/mytool.1")).unwrap(),
+        fixture
+            .dir
+            .join("share/owner/mytool/share/man/man1/mytool.1")
+    );
+    assert!(fixture
+        .dir
+        .join("state/.changed-markers/txn123/owner/mytool")
+        .exists());
+
+    let log = fs::read_to_string(curl_log).unwrap();
+    assert!(log.contains("url = \"https://api.github.com/repos/owner/mytool/releases\""));
+    assert!(!log.contains("owner/mytool.git/releases"));
+    assert_eq!(log.matches("Authorization: Bearer bridge-token").count(), 2);
+}
+
+#[test]
+fn mutating_api_github_release_reports_selection_failures() {
+    let fixture = Fixture::new("api-github-release-missing");
+    let fakebin = fixture.dir.join("fakebin");
+    fixture.write_executable(
+        "fakebin/curl",
+        "#!/bin/sh\nprintf '[{\"tag_name\":\"v1.0.0\",\"assets\":[]}]\\n'\n",
+    );
+
+    let mut command = fixture.command([
+        "__api",
+        "github-release-install",
+        "owner/missing",
+        "missing",
+    ]);
+    command.env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()));
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        "warning: owner/missing github release install failed: no matching release asset\n"
+    );
+    assert!(!fixture.dir.join("bin/missing").exists());
+}
+
+#[test]
 fn dep_file_stays_fast_with_many_configured_dependencies() {
     let fixture = Fixture::new("dep-file-perf");
     let mut config = String::new();
@@ -569,6 +684,31 @@ fn assert_success(output: &Output) {
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).expect("command output should be UTF-8")
+}
+
+fn host_arch() -> String {
+    let output = Command::new("uname")
+        .arg("-m")
+        .output()
+        .expect("uname should be available in CLI tests");
+    text(&output.stdout).trim().to_owned()
+}
+
+fn write_tar_gz(path: &Path, entries: &[(&str, &str, u32)]) {
+    let file = fs::File::create(path).unwrap();
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    for (name, body, mode) in entries {
+        let bytes = body.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name).unwrap();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(*mode);
+        header.set_cksum();
+        builder.append(&header, bytes).unwrap();
+    }
+    let encoder = builder.into_inner().unwrap();
+    encoder.finish().unwrap();
 }
 
 struct Fixture {

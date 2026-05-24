@@ -19,9 +19,15 @@ use crate::Result;
 
 /// Installs a raw standalone release binary into `SHDEPS_BIN_DIR`.
 pub fn install_plain(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
-    fs::create_dir_all(bin_dir)?;
-    let target = bin_dir.join(cmd);
-    let tmp = temp_path(&target);
+    install_plain_to(&bin_dir.join(cmd), bytes)
+}
+
+/// Installs a raw standalone release binary to an exact caller-owned path.
+pub(crate) fn install_plain_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = temp_path(target);
 
     fs::write(&tmp, bytes)?;
     make_executable(&tmp)?;
@@ -31,12 +37,17 @@ pub fn install_plain(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf>
     // selected asset directly to the requested bin path, so preserve that
     // replacement behavior here and keep it isolated from the safer symlink
     // helpers used by repo, cargo, go, uv, and npm installs.
-    fs::rename(&tmp, &target)?;
-    Ok(target)
+    fs::rename(&tmp, target)?;
+    Ok(target.to_path_buf())
 }
 
 /// Installs a gzip-compressed standalone release binary.
 pub fn install_gz(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
+    install_gz_to(&bin_dir.join(cmd), bytes)
+}
+
+/// Installs a gzip-compressed standalone release binary to an exact path.
+pub(crate) fn install_gz_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let mut decoder = flate2::read::GzDecoder::new(bytes);
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded)?;
@@ -44,11 +55,16 @@ pub fn install_gz(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
     // Bash treats `.gz` release assets as compressed singles, not archives.
     // Reuse the plain-binary path after decompression so replacement and
     // executable-bit behavior stay identical to uncompressed release assets.
-    install_plain(bin_dir, cmd, &decoded)
+    install_plain_to(target, &decoded)
 }
 
 /// Installs a bzip2-compressed standalone release binary.
 pub fn install_bz2(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
+    install_bz2_to(&bin_dir.join(cmd), bytes)
+}
+
+/// Installs a bzip2-compressed standalone release binary to an exact path.
+pub(crate) fn install_bz2_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let mut decoder = bzip2::read::BzDecoder::new(bytes);
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded)?;
@@ -56,17 +72,22 @@ pub fn install_bz2(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
     // Like `.gz`, Bash treats `.bz2` assets as compressed single binaries.
     // Keep the decompression-only difference isolated so raw release ownership
     // behavior has one implementation in `install_plain`.
-    install_plain(bin_dir, cmd, &decoded)
+    install_plain_to(target, &decoded)
 }
 
 /// Installs a zstd-compressed standalone release binary.
 pub fn install_zst(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
+    install_zst_to(&bin_dir.join(cmd), bytes)
+}
+
+/// Installs a zstd-compressed standalone release binary to an exact path.
+pub(crate) fn install_zst_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let decoded = zstd::stream::decode_all(bytes)?;
 
     // `.zst` completes the Bash compressed-single behavior. Keep all public
     // bin ownership in `install_plain` so adding formats does not accidentally
     // drift from the raw release replacement contract.
-    install_plain(bin_dir, cmd, &decoded)
+    install_plain_to(target, &decoded)
 }
 
 /// Installs a gzip-compressed tar release archive.
@@ -78,7 +99,26 @@ pub fn install_tar_gz(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+    install_tar_gz_to(
+        state_dir,
+        install_base,
+        &bin_dir.join(cmd),
+        name,
+        cmd,
+        bytes,
+    )
+}
+
+/// Installs a gzip-compressed tar archive and links to an exact public path.
+pub(crate) fn install_tar_gz_to(
+    state_dir: &Path,
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, public, name, cmd, |dest| {
         archive::unpack_tar_gz(bytes, dest).map(|_| ())
     })
 }
@@ -92,7 +132,26 @@ pub fn install_tar_bz2(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+    install_tar_bz2_to(
+        state_dir,
+        install_base,
+        &bin_dir.join(cmd),
+        name,
+        cmd,
+        bytes,
+    )
+}
+
+/// Installs a bzip2-compressed tar archive and links to an exact public path.
+pub(crate) fn install_tar_bz2_to(
+    state_dir: &Path,
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, public, name, cmd, |dest| {
         archive::unpack_tar_bz2(bytes, dest).map(|_| ())
     })
 }
@@ -106,7 +165,26 @@ pub fn install_tar_zst(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+    install_tar_zst_to(
+        state_dir,
+        install_base,
+        &bin_dir.join(cmd),
+        name,
+        cmd,
+        bytes,
+    )
+}
+
+/// Installs a zstd-compressed tar archive and links to an exact public path.
+pub(crate) fn install_tar_zst_to(
+    state_dir: &Path,
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, public, name, cmd, |dest| {
         archive::unpack_tar_zst(bytes, dest).map(|_| ())
     })
 }
@@ -120,7 +198,26 @@ pub fn install_tar_xz(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+    install_tar_xz_to(
+        state_dir,
+        install_base,
+        &bin_dir.join(cmd),
+        name,
+        cmd,
+        bytes,
+    )
+}
+
+/// Installs an xz-compressed tar archive and links to an exact public path.
+pub(crate) fn install_tar_xz_to(
+    state_dir: &Path,
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, public, name, cmd, |dest| {
         archive::unpack_tar_xz(bytes, dest).map(|_| ())
     })
 }
@@ -134,7 +231,26 @@ pub fn install_zip(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+    install_zip_to(
+        state_dir,
+        install_base,
+        &bin_dir.join(cmd),
+        name,
+        cmd,
+        bytes,
+    )
+}
+
+/// Installs a zip archive and links to an exact public path.
+pub(crate) fn install_zip_to(
+    state_dir: &Path,
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, public, name, cmd, |dest| {
         archive::unpack_zip(bytes, dest).map(|_| ())
     })
 }
@@ -142,7 +258,7 @@ pub fn install_zip(
 fn install_archive(
     state_dir: &Path,
     install_base: &Path,
-    bin_dir: &Path,
+    public: &Path,
     name: &str,
     cmd: &str,
     extract: impl FnOnce(&Path) -> io::Result<()>,
@@ -181,13 +297,12 @@ fn install_archive(
     }
 
     let source = install_dir.join(relative_binary);
-    let public = bin_dir.join(cmd);
-    replace_symlink(&source, &public)?;
+    replace_symlink(&source, public)?;
     // Release archives commonly carry completions or man pages beside the
     // binary. Reusing the shared extras linker keeps those secondary artifacts
     // tracked and prunable exactly like repo-based installs.
     extras::link(state_dir, install_base, name, &install_dir)?;
-    Ok(public)
+    Ok(public.to_path_buf())
 }
 
 fn temp_path(target: &Path) -> PathBuf {

@@ -6,15 +6,17 @@
 //! install, stamp, and manifest repair.
 
 use std::ffi::OsString;
+use std::path::Path;
 
 use crate::config::Entry;
 use crate::github;
 use crate::github_release;
 use crate::github_release_install;
+use crate::http::Client;
 use crate::manifest::{self, ManifestEntry};
 use crate::platform::RuntimeEnv;
 use crate::process::{self, Runner};
-use crate::runtime::Env;
+use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::update::{Context, Item, Options};
 use crate::Result;
@@ -25,12 +27,71 @@ pub(crate) fn install(
     options: Options,
 ) -> Result<Item> {
     let bin_path = context.roots.bin_dir.join(&entry.cmd);
-    let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "release");
-    if process::executable_path(&bin_path) && stamp::remote_fresh(&stamp_path, options.freshness())
-    {
+    let request = ReleaseRequest {
+        name: &entry.name,
+        cmd: &entry.cmd,
+        repo: &entry.name,
+        public_bin: &bin_path,
+    };
+    let outcome = install_request(
+        &request,
+        context.roots,
+        context.env,
+        context.env_vars,
+        context.runner,
+        context.client,
+        options,
+    )?;
+    if !outcome.failed {
         write_manifest(entry, context)?;
-        return Ok(Item {
-            name: entry.name.clone(),
+    }
+
+    Ok(Item {
+        name: entry.name.clone(),
+        changed: outcome.changed,
+        failed: outcome.failed,
+        detail: outcome.detail,
+    })
+}
+
+pub(crate) struct ReleaseRequest<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) cmd: &'a str,
+    pub(crate) repo: &'a str,
+    pub(crate) public_bin: &'a Path,
+}
+
+pub(crate) struct ReleaseOutcome {
+    pub(crate) changed: bool,
+    pub(crate) failed: bool,
+    pub(crate) detail: String,
+}
+
+pub(crate) fn install_request(
+    request: &ReleaseRequest<'_>,
+    roots: &Roots,
+    runtime_env: &RuntimeEnv,
+    env_vars: &std::collections::BTreeMap<String, String>,
+    runner: &impl Runner,
+    client: &dyn Client,
+    options: Options,
+) -> Result<ReleaseOutcome> {
+    let stamp_path = stamp::remote_path(&roots.state_dir, request.name, "release");
+    if process::executable_path(request.public_bin)
+        && stamp::remote_fresh(&stamp_path, options.freshness())
+    {
+        // Bash relinks extras even on the TTL fast path. That idempotent repair
+        // matters when a user prunes a completion/manpage symlink by hand while
+        // keeping the binary; a fresh stamp should skip the network, not leave
+        // related shell integration broken until the next forced reinstall.
+        let install_dir = roots.install_dir.join(request.name);
+        crate::extras::link(
+            &roots.state_dir,
+            &roots.install_dir,
+            request.name,
+            &install_dir,
+        )?;
+        return Ok(ReleaseOutcome {
             changed: false,
             failed: false,
             detail: "fresh".to_owned(),
@@ -38,97 +99,94 @@ pub(crate) fn install(
     }
 
     let env = EnvVars {
-        vars: context.env_vars,
-        runtime: context.env,
+        vars: env_vars,
+        runtime: runtime_env,
     };
-    let releases = match github::fetch_releases(&entry.name, &env, context.runner, context.client) {
+    let releases = match github::fetch_releases(request.repo, &env, runner, client) {
         Ok(releases) => releases,
         Err(_) => {
-            return Ok(failed(entry, "release metadata fetch failed"));
+            return Ok(failed("release metadata fetch failed"));
         }
     };
-    let Some(selection) =
-        github_release::select(&entry.cmd, &releases, context.env, context.runner)
+    let Some(selection) = github_release::select(request.cmd, &releases, runtime_env, runner)
     else {
-        return Ok(failed(entry, "no matching release asset"));
+        return Ok(failed("no matching release asset"));
     };
-    let token = github::token(&env, context.runner);
-    let bytes = match context.client.get(&selection.url, token.as_deref()) {
+    let token = github::token(&env, runner);
+    let bytes = match client.get(&selection.url, token.as_deref()) {
         Ok(bytes) => bytes,
-        Err(_) => return Ok(failed(entry, "release asset download failed")),
+        Err(_) => return Ok(failed("release asset download failed")),
     };
     match asset_kind(&selection.url) {
         AssetKind::Plain => {
-            github_release_install::install_plain(&context.roots.bin_dir, &entry.cmd, &bytes)?;
+            github_release_install::install_plain_to(request.public_bin, &bytes)?;
         }
         AssetKind::Gz => {
-            github_release_install::install_gz(&context.roots.bin_dir, &entry.cmd, &bytes)?;
+            github_release_install::install_gz_to(request.public_bin, &bytes)?;
         }
         AssetKind::Bz2 => {
-            github_release_install::install_bz2(&context.roots.bin_dir, &entry.cmd, &bytes)?;
+            github_release_install::install_bz2_to(request.public_bin, &bytes)?;
         }
         AssetKind::Zst => {
-            github_release_install::install_zst(&context.roots.bin_dir, &entry.cmd, &bytes)?;
+            github_release_install::install_zst_to(request.public_bin, &bytes)?;
         }
         AssetKind::TarGz => {
-            github_release_install::install_tar_gz(
-                &context.roots.state_dir,
-                &context.roots.install_dir,
-                &context.roots.bin_dir,
-                &entry.name,
-                &entry.cmd,
+            github_release_install::install_tar_gz_to(
+                &roots.state_dir,
+                &roots.install_dir,
+                request.public_bin,
+                request.name,
+                request.cmd,
                 &bytes,
             )?;
         }
         AssetKind::TarBz2 => {
-            github_release_install::install_tar_bz2(
-                &context.roots.state_dir,
-                &context.roots.install_dir,
-                &context.roots.bin_dir,
-                &entry.name,
-                &entry.cmd,
+            github_release_install::install_tar_bz2_to(
+                &roots.state_dir,
+                &roots.install_dir,
+                request.public_bin,
+                request.name,
+                request.cmd,
                 &bytes,
             )?;
         }
         AssetKind::TarZst => {
-            github_release_install::install_tar_zst(
-                &context.roots.state_dir,
-                &context.roots.install_dir,
-                &context.roots.bin_dir,
-                &entry.name,
-                &entry.cmd,
+            github_release_install::install_tar_zst_to(
+                &roots.state_dir,
+                &roots.install_dir,
+                request.public_bin,
+                request.name,
+                request.cmd,
                 &bytes,
             )?;
         }
         AssetKind::TarXz => {
-            github_release_install::install_tar_xz(
-                &context.roots.state_dir,
-                &context.roots.install_dir,
-                &context.roots.bin_dir,
-                &entry.name,
-                &entry.cmd,
+            github_release_install::install_tar_xz_to(
+                &roots.state_dir,
+                &roots.install_dir,
+                request.public_bin,
+                request.name,
+                request.cmd,
                 &bytes,
             )?;
         }
         AssetKind::Zip => {
-            github_release_install::install_zip(
-                &context.roots.state_dir,
-                &context.roots.install_dir,
-                &context.roots.bin_dir,
-                &entry.name,
-                &entry.cmd,
+            github_release_install::install_zip_to(
+                &roots.state_dir,
+                &roots.install_dir,
+                request.public_bin,
+                request.name,
+                request.cmd,
                 &bytes,
             )?;
         }
         AssetKind::Unsupported => {
-            return Ok(failed(entry, "release asset type is not implemented yet"))
+            return Ok(failed("release asset type is not implemented yet"));
         }
     }
     stamp::remote_touch(&stamp_path, options.now)?;
-    write_manifest(entry, context)?;
 
-    Ok(Item {
-        name: entry.name.clone(),
+    Ok(ReleaseOutcome {
         changed: true,
         failed: false,
         detail: selection.tag,
@@ -147,9 +205,8 @@ fn write_manifest(entry: &Entry, context: &Context<'_, impl Runner>) -> Result<(
     )
 }
 
-fn failed(entry: &Entry, detail: &str) -> Item {
-    Item {
-        name: entry.name.clone(),
+fn failed(detail: &str) -> ReleaseOutcome {
+    ReleaseOutcome {
         changed: false,
         failed: true,
         detail: detail.to_owned(),

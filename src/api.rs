@@ -15,11 +15,14 @@ use crate::config;
 use crate::dep_path;
 use crate::errors::Error;
 use crate::extras;
+use crate::http::Curl;
 use crate::link_state::{self, Kind};
 use crate::pkg::{self, CommandSpec};
 use crate::platform;
 use crate::process::{self, Process, Runner};
 use crate::runtime::{self, Overrides, ProcessEnv};
+use crate::update::Options;
+use crate::update_release::{self, ReleaseRequest};
 use crate::Result;
 
 /// Runs one hidden bridge command.
@@ -188,19 +191,130 @@ where
         }
         "require-sudo" => require_sudo(),
         "github-release-install" => {
-            // These names are part of the wrapper ABI, so recognize them now
-            // instead of letting callers see "unknown command" and infer that
-            // the bridge surface changed. They remain explicit runtime
-            // failures until the package, extras-linking, and GitHub release
-            // owners land with their real side-effect implementations.
-            writeln!(stderr, "error: __api {command} is not implemented yet")?;
-            Ok(1)
+            let (Some(name), Some(cmd)) = (rest.first(), rest.get(1)) else {
+                writeln!(
+                    stderr,
+                    "error: __api github-release-install requires a name and command"
+                )?;
+                return Ok(2);
+            };
+            github_release_install(
+                name,
+                cmd,
+                rest.get(2).map(String::as_str),
+                rest.get(3).map(Path::new),
+                overrides,
+                stdout,
+                stderr,
+            )
         }
         other => {
             writeln!(stderr, "error: unknown __api command '{other}'")?;
             Ok(2)
         }
     }
+}
+
+fn github_release_install<W, E>(
+    name: &str,
+    cmd: &str,
+    repo: Option<&str>,
+    bin_path: Option<&Path>,
+    overrides: &Overrides,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    let roots = runtime::roots(&ProcessEnv, overrides);
+    let runtime_env = runtime::runtime_env(&ProcessEnv);
+    let name = config::canonical_name(name, "github:release");
+    let repo = config::canonical_name(repo.unwrap_or(&name), "github:release");
+    if !config::valid_dep_name(&name) || !config::valid_dep_name(&repo) || cmd.is_empty() {
+        writeln!(stderr, "error: invalid github-release-install arguments")?;
+        return Ok(2);
+    }
+
+    let public_bin = bin_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| roots.bin_dir.join(cmd));
+    let default_options = Options::default();
+    let options = Options {
+        // The bridge is used by hook code as an API function, so it must obey
+        // the same force/reinstall knobs as a top-level update. Otherwise a
+        // custom hook could see different freshness behavior depending on
+        // whether the caller used Bash shdeps or the Rust prelude.
+        force: runtime::force(&ProcessEnv, overrides),
+        reinstall: runtime::reinstall(&ProcessEnv, overrides),
+        now: default_options.now,
+        remote_ttl: default_options.remote_ttl,
+    };
+    let env_vars = std::env::vars().collect();
+    let request = ReleaseRequest {
+        name: &name,
+        cmd,
+        repo: &repo,
+        public_bin: &public_bin,
+    };
+    let outcome = update_release::install_request(
+        &request,
+        &roots,
+        &runtime_env,
+        &env_vars,
+        &Process,
+        &Curl,
+        options,
+    )?;
+
+    if outcome.failed {
+        writeln!(
+            stderr,
+            "warning: {name} github release install failed: {}",
+            outcome.detail
+        )?;
+        return Ok(1);
+    }
+    if outcome.changed {
+        mark_changed(&roots.state_dir, &name)?;
+        writeln!(stdout, "  {name} installed -- {}", outcome.detail)?;
+    } else {
+        writeln!(stdout, "  {name} -- {}", outcome.detail)?;
+    }
+    Ok(0)
+}
+
+fn mark_changed(state_dir: &Path, name: &str) -> Result<()> {
+    let Some(txn_id) = std::env::var("SHDEPS_UPDATE_TXN_ID")
+        .ok()
+        .filter(|value| valid_marker_component(value))
+    else {
+        return Ok(());
+    };
+    if !config::valid_dep_name(name) {
+        return Ok(());
+    }
+
+    let marker = state_dir.join(".changed-markers").join(txn_id).join(name);
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Hooks run in subprocesses, so changed-state has to cross the process
+    // boundary through a tiny durable marker. Using the dependency name as a
+    // relative path preserves owner/repo grouping while `valid_dep_name` above
+    // prevents path traversal from a malicious hook argument.
+    std::fs::write(marker, b"")?;
+    Ok(())
+}
+
+fn valid_marker_component(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value != "."
+        && value != ".."
+        && !value.chars().any(char::is_whitespace)
 }
 
 fn dep_root<W>(target: &str, overrides: &Overrides, stdout: &mut W) -> Result<i32>
