@@ -7,6 +7,7 @@
 //! This module owns the small JSON contract that lets those paths make explicit
 //! decisions instead of guessing.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +34,18 @@ pub enum Method {
     SourceBuild,
     /// A user-managed install; automatic release self-update is not safe.
     Manual,
+}
+
+impl fmt::Display for Method {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Git => "git",
+            Self::Release => "release",
+            Self::SourceBuild => "source-build",
+            Self::Manual => "manual",
+        };
+        formatter.write_str(value)
+    }
 }
 
 /// Previous install that was converted into the current install.

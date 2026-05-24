@@ -8,8 +8,23 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::install_metadata::{self, Metadata, Method, Read};
 use crate::process::Runner;
 use crate::Result;
+
+/// Self-update target selected from checkout shape and install metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The install is a git checkout and should use source-checkout behavior.
+    SourceCheckout,
+    /// The install metadata identifies a release archive install.
+    ReleaseArchive(Metadata),
+    /// The install cannot be updated safely by this implementation.
+    Unsupported {
+        /// Clear diagnostic explaining why automatic self-update is unsafe.
+        reason: String,
+    },
+}
 
 /// Outcome of a self-update attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +58,40 @@ impl Summary {
             Outcome::Unsupported => 1,
             Outcome::DirtySkipped | Outcome::Pulled | Outcome::PullFailed => 0,
         }
+    }
+}
+
+/// Selects the self-update mode for an install directory.
+pub fn target(dir: &Path) -> Result<Target> {
+    if dir.join(".git").is_dir() {
+        // A real checkout wins over metadata because dirty-tree preservation is
+        // an active development safety rule. A developer checkout may have
+        // stale metadata from conversion experiments; treating `.git` as
+        // authoritative avoids accidentally replacing a working tree with a
+        // release archive.
+        return Ok(Target::SourceCheckout);
+    }
+
+    match install_metadata::read(dir)? {
+        Read::Missing => Ok(Target::Unsupported {
+            reason: "shdeps: not a git clone and no install metadata; rerun install.sh".to_owned(),
+        }),
+        Read::Invalid { reason } => Ok(Target::Unsupported {
+            reason: format!("shdeps: invalid install metadata: {reason}; rerun install.sh"),
+        }),
+        Read::Valid(metadata) => match metadata.method {
+            Method::Release => Ok(Target::ReleaseArchive(metadata)),
+            Method::Git => Ok(Target::Unsupported {
+                reason: "shdeps: install metadata says git but .git is missing; rerun install.sh"
+                    .to_owned(),
+            }),
+            Method::SourceBuild | Method::Manual => Ok(Target::Unsupported {
+                reason: format!(
+                    "shdeps: {} installs are not self-updatable; rerun install.sh",
+                    metadata.method
+                ),
+            }),
+        },
     }
 }
 
@@ -109,7 +158,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{source_checkout, Outcome};
+    use super::{source_checkout, target, Outcome, Target};
+    use crate::install_metadata::{write, Metadata, Method};
     use crate::process::{Output, Runner};
 
     #[derive(Debug, Default)]
@@ -265,6 +315,60 @@ mod tests {
         assert_eq!(summary.outcome, Outcome::PullFailed);
         assert_eq!(summary.exit_code(), 0);
         assert!(summary.relink_extras);
+    }
+
+    #[test]
+    fn target_prefers_git_checkout_over_metadata() {
+        let dir = checkout("target-git");
+        write(&dir, &Metadata::new(Method::Release)).unwrap();
+
+        assert_eq!(target(&dir).unwrap(), Target::SourceCheckout);
+    }
+
+    #[test]
+    fn target_uses_release_metadata_for_archive_installs() {
+        let dir = temp_dir("target-release");
+        let mut metadata = Metadata::new(Method::Release);
+        metadata.tag = Some("v2026.05.23".to_owned());
+        write(&dir, &metadata).unwrap();
+
+        assert_eq!(target(&dir).unwrap(), Target::ReleaseArchive(metadata));
+    }
+
+    #[test]
+    fn target_reports_missing_and_invalid_metadata_clearly() {
+        let missing = target(&temp_dir("target-missing")).unwrap();
+        assert!(
+            matches!(missing, Target::Unsupported { reason } if reason.contains("no install metadata"))
+        );
+
+        let invalid = temp_dir("target-invalid");
+        fs::write(
+            invalid.join(".shdeps-install.json"),
+            r#"{"schema":2,"method":"release"}"#,
+        )
+        .unwrap();
+        let invalid_target = target(&invalid).unwrap();
+        assert!(
+            matches!(invalid_target, Target::Unsupported { reason } if reason.contains("invalid install metadata"))
+        );
+    }
+
+    #[test]
+    fn target_rejects_metadata_methods_without_safe_update_path() {
+        let git = temp_dir("target-metadata-git");
+        write(&git, &Metadata::new(Method::Git)).unwrap();
+        let git_target = target(&git).unwrap();
+        assert!(
+            matches!(git_target, Target::Unsupported { reason } if reason.contains(".git is missing"))
+        );
+
+        let manual = temp_dir("target-manual");
+        write(&manual, &Metadata::new(Method::Manual)).unwrap();
+        let manual_target = target(&manual).unwrap();
+        assert!(
+            matches!(manual_target, Target::Unsupported { reason } if reason.contains("manual installs are not self-updatable"))
+        );
     }
 
     fn checkout(name: &str) -> PathBuf {
