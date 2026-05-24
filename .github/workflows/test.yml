@@ -37,6 +37,9 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Run shell parity against Rust binary
+        run: SHDEPS_IMPL=rust SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-test
+
       - name: Smoke Rust compatibility wrapper
         run: SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-wrapper-test
 
