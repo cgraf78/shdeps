@@ -42,11 +42,10 @@ trap cleanup EXIT
 cargo build --release --locked --target "$target"
 
 install -m 0755 "target/${target}/release/shdeps" "$staging/shdeps"
-# Release archives should expose the Rust-era compatibility wrapper, not the
-# legacy Bash implementation. Source checkouts keep `shdeps.sh` as the Bash
-# reference until the final cutover, while packaged installs prove that sourced
-# callers can already delegate through the Rust binary shipped beside them.
-install -m 0644 shdeps-wrapper.sh "$staging/shdeps.sh"
+# `shdeps.sh` is now the Rust-era sourceable wrapper. Keep release archives
+# pointed at that single public wrapper path so source checkouts and packaged
+# installs expose the same Bash API surface.
+install -m 0644 shdeps.sh "$staging/shdeps.sh"
 install -m 0755 install.sh "$staging/install.sh"
 install -m 0644 README.md "$staging/README.md"
 install -m 0644 LICENSE "$staging/LICENSE"

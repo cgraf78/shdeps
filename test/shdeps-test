@@ -20,11 +20,11 @@ SHDEPS_IMPL="${SHDEPS_IMPL:-bash}"
 case "$SHDEPS_IMPL" in
   bash)
     SHDEPS_CLI="${SHDEPS_CLI:-$SHDEPS_DIR/bin/shdeps}"
-    SHDEPS_TEST_LIB="$SHDEPS_DIR/shdeps.sh"
+    SHDEPS_TEST_LIB="$SHDEPS_DIR/shdeps-legacy.sh"
     ;;
   rust)
     SHDEPS_CLI="${SHDEPS_RUST_CLI:-$SHDEPS_DIR/target/debug/shdeps}"
-    SHDEPS_TEST_LIB="${SHDEPS_RUST_LIB:-$SHDEPS_DIR/shdeps.sh}"
+    SHDEPS_TEST_LIB="${SHDEPS_RUST_LIB:-$SHDEPS_DIR/shdeps-legacy.sh}"
     if [[ ! -x "$SHDEPS_CLI" ]]; then
       printf 'error: SHDEPS_IMPL=rust requested but %s is not executable\n' "$SHDEPS_CLI" >&2
       printf '       build the Rust binary first or set SHDEPS_RUST_CLI\n' >&2
@@ -36,7 +36,13 @@ case "$SHDEPS_IMPL" in
     exit 2
     ;;
 esac
-export SHDEPS_IMPL SHDEPS_CLI SHDEPS_TEST_LIB
+# This suite still contains legacy-internal assertions for `_shdeps_*` helpers
+# and arrays, so the sourceable half intentionally points at the preserved Bash
+# reference. The Rust implementation is covered here through SHDEPS_CLI plus
+# Rust-native integration tests, while `test/shdeps-wrapper-test` owns the new
+# sourceable wrapper surface.
+SHDEPS_LEGACY_LIB="$SHDEPS_TEST_LIB"
+export SHDEPS_IMPL SHDEPS_CLI SHDEPS_TEST_LIB SHDEPS_LEGACY_LIB
 
 # shellcheck source=helpers.sh
 . "$(dirname "$0")/helpers.sh"
@@ -45,12 +51,78 @@ _copy_bootstrap_fixture() {
   local dest="$1"
   mkdir -p "$dest"
   cp "$SHDEPS_DIR/install.sh" "$dest/install.sh"
-  cp "$SHDEPS_DIR/shdeps.sh" "$dest/shdeps.sh"
+  cp "$SHDEPS_DIR/shdeps-legacy.sh" "$dest/shdeps.sh"
+  cp "$SHDEPS_DIR/shdeps-legacy.sh" "$dest/shdeps-legacy.sh"
   cp "$SHDEPS_DIR/README.md" "$dest/README.md"
   cp "$SHDEPS_DIR/LICENSE" "$dest/LICENSE"
   cp -R "$SHDEPS_DIR/bin" "$dest/"
   cp -R "$SHDEPS_DIR/man" "$dest/"
   cp -R "$SHDEPS_DIR/completions" "$dest/"
+}
+
+_write_fake_release_shdeps() {
+  local path="$1" commit="$2"
+
+  cat >"$path" <<SH
+#!/usr/bin/env bash
+_commit="$commit"
+case "\${1:-}" in
+  version)
+    printf '%s\n' "shdeps commit \$_commit"
+    ;;
+  __api)
+    case "\${2:-}" in
+      version)
+        printf '%s\n' "abi:1"
+        ;;
+      env-snapshot)
+        # These release-install tests source the real Rust-era wrapper, so the
+        # fake binary must speak just enough of the hidden wrapper ABI for
+        # activation. The values are deliberately plain because install.sh only
+        # needs a clean source plus no-op extras linking here; behavioral API
+        # coverage lives in the Rust and wrapper-specific suites.
+        printf '%s\n' \\
+          "install_dir=\${SHDEPS_INSTALL_DIR:-\$HOME/.local/share}" \\
+          "bin_dir=\${SHDEPS_BIN_DIR:-\$HOME/.local/bin}" \\
+          "git_dev_dir=\${SHDEPS_GIT_DEV_DIR:-\$HOME/git}" \\
+          "platform=linux" \\
+          "pkg_mgr=" \\
+          "force=\${SHDEPS_FORCE:-0}" \\
+          "reinstall=\${SHDEPS_REINSTALL:-0}"
+        ;;
+      link-extras | unlink-extras)
+        ;;
+      *)
+        ;;
+    esac
+    ;;
+esac
+SH
+  chmod +x "$path"
+}
+
+_write_fake_cargo_build() {
+  local path="$1"
+
+  cat >"$path" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" != build ]]; then
+  printf 'mock cargo: unsupported subcmd %s\n' "${1:-}" >&2
+  exit 2
+fi
+
+# Source-checkout install tests should not spend time compiling the whole Rust
+# crate, but they must still prove install.sh links a real executable before it
+# sources the cutover wrapper. Copying a wrapper-ABI-capable fake keeps the test
+# focused on installer behavior instead of Cargo performance or host toolchain
+# availability.
+: "${SHDEPS_TEST_FAKE_RELEASE_SHDEPS:?missing fake shdeps binary template}"
+mkdir -p target/release
+cp "$SHDEPS_TEST_FAKE_RELEASE_SHDEPS" target/release/shdeps
+chmod +x target/release/shdeps
+SH
+  chmod +x "$path"
 }
 
 # ===========================================================================
@@ -3095,7 +3167,7 @@ _cet_out=$(SHDEPS_LOG_LEVEL=1 SHDEPS_CONF_DIR="$_cet_conf" bash -c '
       builtin command "$@"
     fi
   }
-  . '"$SHDEPS_DIR"'/shdeps.sh
+  . '"$SHDEPS_DIR"'/shdeps-legacy.sh
   _shdeps_load
   _shdeps_check_prereqs
 ' 2>&1)
@@ -3796,7 +3868,7 @@ _cargo_missing_out=$(
         builtin command "$@"
       fi
     }
-    . '"$SHDEPS_DIR"'/shdeps.sh
+    . '"$SHDEPS_DIR"'/shdeps-legacy.sh
     shdeps_update
   ' 2>&1
 )
@@ -3899,7 +3971,7 @@ _go_missing_out=$(
         builtin command "$@"
       fi
     }
-    . '"$SHDEPS_DIR"'/shdeps.sh
+    . '"$SHDEPS_DIR"'/shdeps-legacy.sh
     shdeps_update
   ' 2>&1
 )
@@ -3977,7 +4049,7 @@ _uv_missing_out=$(
         builtin command "$@"
       fi
     }
-    . '"$SHDEPS_DIR"'/shdeps.sh
+    . '"$SHDEPS_DIR"'/shdeps-legacy.sh
     shdeps_update
   ' 2>&1
 )
@@ -4055,7 +4127,7 @@ _npm_missing_out=$(
         builtin command "$@"
       fi
     }
-    . '"$SHDEPS_DIR"'/shdeps.sh
+    . '"$SHDEPS_DIR"'/shdeps-legacy.sh
     shdeps_update
   ' 2>&1
 )
@@ -4385,7 +4457,7 @@ _assert_eq "integ github repo failure: later dep in manifest" "custom|custom-b|"
 
 ver=$(shdeps_version)
 _assert_match "shdeps_version: format" "^shdeps commit [0-9a-f]+" "$ver"
-packaged_ver=$(SHDEPS_PACKAGED_COMMIT=abcdef1234567890 bash -c '. "$1"; shdeps_version' bash "$SHDEPS_DIR/shdeps.sh")
+packaged_ver=$(SHDEPS_PACKAGED_COMMIT=abcdef1234567890 bash -c '. "$1"; shdeps_version' bash "$SHDEPS_DIR/shdeps-legacy.sh")
 _assert_eq "shdeps_version: packaged commit" "shdeps commit abcdef123456" "$packaged_ver"
 
 # ===========================================================================
@@ -4397,13 +4469,19 @@ echo "=== install.sh ==="
 
 _install_script="$SHDEPS_DIR/install.sh"
 _install_repo="$SHDEPS_DIR"
+_install_build_bin=$(_mock_bin)
+_install_fake_shdeps="$_install_build_bin/shdeps-built"
+_write_fake_release_shdeps "$_install_fake_shdeps" "sourcebuild123456"
+_write_fake_cargo_build "$_install_build_bin/cargo"
 
 # --- Fresh install into empty dir ---
 
 _inst_dir=$(_tmpdir)/shdeps-fresh
 _inst_bin=$(_tmpdir)/bin
 mkdir -p "$_inst_bin"
-SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
+PATH="$_install_build_bin:/usr/bin:/bin" \
+  SHDEPS_TEST_FAKE_RELEASE_SHDEPS="$_install_fake_shdeps" \
+  SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
   SHDEPS_REPO="$_install_repo" "$_install_script" >/dev/null 2>&1
 _assert_dir_exists "install fresh: clone dir created" "$_inst_dir"
 _assert_file_exists "install fresh: shdeps.sh present" "$_inst_dir/shdeps.sh"
@@ -4415,13 +4493,7 @@ _bundle_dir=$(_tmpdir)/shdeps-bundle
 _bundle_inst=$(_tmpdir)/shdeps-bundle-install
 _bundle_bin=$(_tmpdir)/bundle-bin
 mkdir -p "$_bundle_dir" "$_bundle_bin" "$_bundle_dir/man/man1" "$_bundle_dir/completions"
-cat >"$_bundle_dir/shdeps" <<'SH'
-#!/usr/bin/env bash
-if [[ "${1:-}" == version ]]; then
-  printf '%s\n' "shdeps commit abcdef123456"
-fi
-SH
-chmod +x "$_bundle_dir/shdeps"
+_write_fake_release_shdeps "$_bundle_dir/shdeps" "abcdef123456"
 printf '%s\n' "SHDEPS_PACKAGED_COMMIT=abcdef123456" >"$_bundle_dir/shdeps.sh"
 cat "$SHDEPS_DIR/shdeps.sh" >>"$_bundle_dir/shdeps.sh"
 cp "$SHDEPS_DIR/install.sh" "$_bundle_dir/install.sh"
@@ -4449,13 +4521,7 @@ _assert_eq "install bundle: CLI points at release binary" "$_bundle_inst/shdeps"
 _bundle_update_dir=$(_tmpdir)/shdeps-bundle-update
 mkdir -p "$_bundle_update_dir"
 cp -R "$_bundle_dir/." "$_bundle_update_dir/"
-cat >"$_bundle_update_dir/shdeps" <<'SH'
-#!/usr/bin/env bash
-if [[ "${1:-}" == version ]]; then
-  printf '%s\n' "shdeps commit 222222222222"
-fi
-SH
-chmod +x "$_bundle_update_dir/shdeps"
+_write_fake_release_shdeps "$_bundle_update_dir/shdeps" "222222222222"
 cat >"$_bundle_update_dir/.shdeps-install.json" <<'JSON'
 {"schema":1,"method":"release","artifact_platform":"test","tag":"dev-test-2","commit":"222222222222","repo":"cgraf78/shdeps"}
 JSON
@@ -4533,13 +4599,7 @@ if [[ -n "$_release_platform" ]]; then
   _release_fakebin=$(_mock_bin)
   mkdir -p "$_release_dir" "$_release_payload/man/man1" "$_release_payload/completions" \
     "$_release_installer" "$_release_bin"
-  cat >"$_release_payload/shdeps" <<'SH'
-#!/usr/bin/env bash
-if [[ "${1:-}" == version ]]; then
-  printf '%s\n' "shdeps commit fedcba987654"
-fi
-SH
-  chmod +x "$_release_payload/shdeps"
+  _write_fake_release_shdeps "$_release_payload/shdeps" "fedcba987654"
   printf '%s\n' "SHDEPS_PACKAGED_COMMIT=fedcba987654" >"$_release_payload/shdeps.sh"
   cat "$SHDEPS_DIR/shdeps.sh" >>"$_release_payload/shdeps.sh"
   cp "$SHDEPS_DIR/install.sh" "$_release_payload/install.sh"
@@ -4703,7 +4763,9 @@ fi
 
 # --- Idempotent re-run on existing clean clone ---
 
-SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
+PATH="$_install_build_bin:/usr/bin:/bin" \
+  SHDEPS_TEST_FAKE_RELEASE_SHDEPS="$_install_fake_shdeps" \
+  SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
   SHDEPS_REPO="$_install_repo" "$_install_script" >/dev/null 2>&1
 _assert_dir_exists "install idempotent: clone still exists" "$_inst_dir"
 _assert_exit "install idempotent: succeeds" 0 $?
@@ -4711,7 +4773,9 @@ _assert_exit "install idempotent: succeeds" 0 $?
 # --- Dirty working tree skips pull ---
 
 echo "dirty" >>"$_inst_dir/shdeps.sh"
-result=$(SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
+result=$(PATH="$_install_build_bin:/usr/bin:/bin" \
+  SHDEPS_TEST_FAKE_RELEASE_SHDEPS="$_install_fake_shdeps" \
+  SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
   SHDEPS_REPO="$_install_repo" "$_install_script" 2>&1)
 _assert_contains "install dirty: skips update" "dirty" "$result"
 git -C "$_inst_dir" checkout -- shdeps.sh
@@ -4838,9 +4902,13 @@ mkdir -p "$_bs_fresh_bin"
 
 # Use the original SHDEPS_DIR (a git repo) as SHDEPS_REPO so _install
 # can clone without network access
-SHDEPS_DIR="$_bs_fresh_dir" SHDEPS_BIN="$_bs_fresh_bin/shdeps" \
+_bs_saved_path="$PATH"
+PATH="$_install_build_bin:/usr/bin:/bin"
+SHDEPS_TEST_FAKE_RELEASE_SHDEPS="$_install_fake_shdeps" \
+  SHDEPS_DIR="$_bs_fresh_dir" SHDEPS_BIN="$_bs_fresh_bin/shdeps" \
   SHDEPS_REPO="$_bs_fresh_repo" SHDEPS_GIT_DEV_DIR="/nonexistent" \
   . "$_bs_dir/install.sh" --bootstrap
+PATH="$_bs_saved_path"
 if declare -f shdeps_update &>/dev/null; then
   _pass "bootstrap fresh: shdeps_update defined"
 else
@@ -4908,7 +4976,7 @@ _source_shdeps "$SHDEPS_DIR"
 _SHDEPS_C_RESET=$'\033[0m'
 _SHDEPS_C_CLEARLN=$'\r\033[2K'
 # Re-source under stdout redirection (simulates self-update path)
-. "$SHDEPS_DIR/shdeps.sh" >/dev/null
+. "$SHDEPS_DIR/shdeps-legacy.sh" >/dev/null
 _assert_eq "re-source: ANSI codes preserved under >/dev/null" $'\033[0m' "$_SHDEPS_C_RESET"
 _assert_eq "re-source: CLEARLN preserved under >/dev/null" $'\r\033[2K' "$_SHDEPS_C_CLEARLN"
 

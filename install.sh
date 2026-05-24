@@ -370,6 +370,53 @@ JSON
   _info "shdeps: installed from source"
 }
 
+_ensure_source_checkout_binary() {
+  local shdeps_dir="$1"
+
+  if [[ -x "$shdeps_dir/shdeps" ]]; then
+    return 0
+  fi
+
+  if [[ -x "$shdeps_dir/target/release/shdeps" ]]; then
+    ln -sf "target/release/shdeps" "$shdeps_dir/shdeps"
+    return 0
+  fi
+
+  if [[ -x "$shdeps_dir/target/debug/shdeps" ]]; then
+    # Developer activation often happens immediately after `cargo build`.
+    # Accepting that existing debug binary keeps local bootstrap snappy; fresh
+    # clones with no binary still build release below, and fleet installs use
+    # release archives rather than this source-checkout path.
+    ln -sf "target/debug/shdeps" "$shdeps_dir/shdeps"
+    return 0
+  fi
+
+  if [[ ! -f "$shdeps_dir/Cargo.toml" ]]; then
+    _error "$shdeps_dir is missing a Rust binary and Cargo.toml"
+    return 1
+  fi
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    _error "cargo is required to activate source checkout installs"
+    return 1
+  fi
+
+  # Source-checkout mode is now a developer/explicit-repo path: normal fleet
+  # installs use prebuilt release archives and do not need Rust. When a caller
+  # explicitly asks install.sh to use a checkout, build the Rust binary before
+  # sourcing `shdeps.sh`; otherwise the wrapper could accidentally delegate to
+  # an older `shdeps` on PATH or fail after the clone already succeeded.
+  if ! (cd "$shdeps_dir" && cargo build --release --locked); then
+    _error "failed to build shdeps source checkout"
+    return 1
+  fi
+  if [[ ! -x "$shdeps_dir/target/release/shdeps" ]]; then
+    _error "source checkout build did not produce target/release/shdeps"
+    return 1
+  fi
+  ln -sf "target/release/shdeps" "$shdeps_dir/shdeps"
+}
+
 # Symlink CLI into PATH and link man page + shell completions.
 #
 # During the Rust transition, `shdeps.sh` may be either the legacy Bash library
@@ -468,6 +515,8 @@ _install() {
     _info "shdeps: installed"
   fi
 
+  _ensure_source_checkout_binary "$SHDEPS_DIR" || exit 1
+
   # Source the library and set up all symlinks (CLI, man, completions).
   _activate_installed_tree "$SHDEPS_DIR"
 
@@ -521,6 +570,13 @@ _bootstrap() {
     else
       return 1
     fi
+  fi
+
+  # Bootstrap may discover a dev checkout that has not gone through install.sh
+  # yet. Create the root binary link first so sourcing the Rust wrapper and
+  # linking the CLI both target this checkout instead of an older PATH command.
+  if [[ -n "$_bs_dir" && -d "$_bs_dir/.git" && -f "$_bs_dir/Cargo.toml" ]]; then
+    _ensure_source_checkout_binary "$_bs_dir" || return 1
   fi
 
   # Source the library

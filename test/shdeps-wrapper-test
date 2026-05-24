@@ -46,8 +46,8 @@ export SHDEPS_BIN_DIR="$_bin"
 export SHDEPS_GIT_DEV_DIR="$_git_dev"
 export SHDEPS_LOG_LEVEL=0
 
-# shellcheck source=../shdeps-wrapper.sh
-. "$SHDEPS_DIR/shdeps-wrapper.sh" || {
+# shellcheck source=../shdeps.sh
+. "$SHDEPS_DIR/shdeps.sh" || {
   _fail "wrapper: source succeeds"
   _test_summary
 }
@@ -108,13 +108,15 @@ exit 1
 SH
 chmod +x "$_fake"
 
-_abi_output=$(SHDEPS_RUST_CLI="$_fake" bash -c '. "$1"' bash "$SHDEPS_DIR/shdeps-wrapper.sh" 2>&1)
+_abi_output=$(SHDEPS_RUST_CLI="$_fake" bash -c '. "$1"' bash "$SHDEPS_DIR/shdeps.sh" 2>&1)
 _abi_rc=$?
 _assert_exit "wrapper: ABI mismatch refuses source" 1 "$_abi_rc"
 _assert_contains "wrapper: ABI mismatch explains refusal" "unsupported wrapper ABI" "$_abi_output"
 
 _bash=$(command -v bash)
-_missing_output=$(PATH=/nonexistent SHDEPS_RUST_CLI='' "$_bash" -c ". \"\$1\"" bash "$SHDEPS_DIR/shdeps-wrapper.sh" 2>&1)
+_missing_dir=$(_tmpdir)
+cp "$SHDEPS_DIR/shdeps.sh" "$_missing_dir/shdeps.sh"
+_missing_output=$(PATH=/nonexistent SHDEPS_RUST_CLI='' "$_bash" -c ". \"\$1\"" bash "$_missing_dir/shdeps.sh" 2>&1)
 _missing_rc=$?
 _assert_exit "wrapper: missing binary refuses source" 1 "$_missing_rc"
 _assert_contains "wrapper: missing binary explains refusal" "could not find the Rust shdeps binary" "$_missing_output"
@@ -125,7 +127,7 @@ _bootstrap_share=$(_tmpdir)
 _bootstrap_bin_dir=$(_tmpdir)
 _bootstrap_dev=$(_tmpdir)
 cp "$SHDEPS_RUST_CLI" "$_bootstrap_release/shdeps"
-cp "$SHDEPS_DIR/shdeps-wrapper.sh" "$_bootstrap_release/shdeps.sh"
+cp "$SHDEPS_DIR/shdeps.sh" "$_bootstrap_release/shdeps.sh"
 mkdir -p "$_bootstrap_release/man/man1" "$_bootstrap_release/completions"
 printf '.TH SHDEPS 1\n' >"$_bootstrap_release/man/man1/shdeps.1"
 printf '# completion\n' >"$_bootstrap_release/completions/shdeps.bash"

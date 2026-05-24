@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shdeps — CLI wrapper for the shdeps shell dependency manager.
+# shdeps — legacy Bash CLI wrapper for the shdeps shell dependency manager.
 #
 # Finds and sources shdeps.sh relative to its own location, then dispatches
 # to the requested subcommand.
@@ -19,10 +19,10 @@ _shdeps_cli_realpath() {
 }
 
 SHDEPS_CLI_DIR=$(_shdeps_cli_realpath "${BASH_SOURCE[0]}")
-SHDEPS_LIB="$SHDEPS_CLI_DIR/../shdeps.sh"
+SHDEPS_LIB="${SHDEPS_LEGACY_LIB:-$SHDEPS_CLI_DIR/../shdeps-legacy.sh}"
 
 if [[ ! -f "$SHDEPS_LIB" ]]; then
-  echo "error: cannot find shdeps.sh at $SHDEPS_LIB" >&2
+  echo "error: cannot find shdeps legacy library at $SHDEPS_LIB" >&2
   exit 1
 fi
 
