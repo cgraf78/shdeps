@@ -31,12 +31,17 @@ SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
 _info() { printf '%s\n' "$*" >&2; }
 _error() { printf 'error: %s\n' "$*" >&2; }
 
-_check_git_prereqs() {
+_bash_supports_legacy_library() {
+  ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3)))
+}
+
+_check_source_prereqs() {
   if ! command -v git >/dev/null 2>&1; then
     _error "git is required"
     exit 1
   fi
-  if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+
+  if ! _bash_supports_legacy_library; then
     _error "bash 4.3+ is required (found ${BASH_VERSION})"
     exit 1
   fi
@@ -261,6 +266,33 @@ _setup_links() {
   fi
 }
 
+_source_installed_library_for_extras() {
+  local shdeps_dir="$1"
+
+  if [[ ! -f "$shdeps_dir/shdeps.sh" ]]; then
+    return 0
+  fi
+
+  # `install.sh` is the bootstrap script users run before shdeps is installed,
+  # so it must stay usable with stock macOS Bash 3.2. The sourceable legacy
+  # library still needs Bash 4.3+ until the Rust wrapper cutover. Release
+  # installs can still activate the Rust binary and CLI symlink under Bash 3.2;
+  # they only skip optional extras linking that depends on sourcing shdeps.sh.
+  if ! _bash_supports_legacy_library; then
+    return 0
+  fi
+
+  # shellcheck source=/dev/null
+  . "$shdeps_dir/shdeps.sh"
+}
+
+_activate_installed_tree() {
+  local shdeps_dir="$1"
+
+  _source_installed_library_for_extras "$shdeps_dir"
+  _setup_links "$shdeps_dir"
+}
+
 # ---------------------------------------------------------------------------
 # Install / update
 # ---------------------------------------------------------------------------
@@ -271,25 +303,17 @@ _install() {
 
   if _is_bundle_dir "$script_dir"; then
     _install_bundle "$script_dir"
-    if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
-      # shellcheck source=/dev/null
-      . "$SHDEPS_DIR/shdeps.sh"
-      _setup_links "$SHDEPS_DIR"
-    fi
+    _activate_installed_tree "$SHDEPS_DIR"
     return
   fi
 
   if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" ]] && ! _is_source_checkout_dir "$script_dir"; then
     _install_release
-    if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
-      # shellcheck source=/dev/null
-      . "$SHDEPS_DIR/shdeps.sh"
-      _setup_links "$SHDEPS_DIR"
-    fi
+    _activate_installed_tree "$SHDEPS_DIR"
     return
   fi
 
-  _check_git_prereqs
+  _check_source_prereqs
 
   if [[ -d "$SHDEPS_DIR/.git" ]]; then
     # Already installed — pull latest if clean
@@ -310,12 +334,8 @@ _install() {
     _info "shdeps: installed"
   fi
 
-  # Source the library and set up all symlinks (CLI, man, completions)
-  if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
-    # shellcheck source=/dev/null
-    . "$SHDEPS_DIR/shdeps.sh"
-    _setup_links "$SHDEPS_DIR"
-  fi
+  # Source the library and set up all symlinks (CLI, man, completions).
+  _activate_installed_tree "$SHDEPS_DIR"
 
   # Hint if the bin directory isn't on PATH
   local bin_dir

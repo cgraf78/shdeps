@@ -1617,10 +1617,9 @@ D21); the rest live here as the authoritative list for implementers.
   (binary sibling + `.shdeps-install.json` → skip download); source-checkout
   (sibling `.git` → preserve git pull); curl-pipe (else → download release).
   Fixture per mode in Phase 7 acceptance.
-- **D7 — `macos-13` runner.** Replaces `macos-15-intel` in the release
-  matrix. macos-13 is the last fully-supported Intel-default runner. Add a
-  TODO to drop `x86_64-apple-darwin` entirely once GitHub retires Intel
-  runners.
+- **D7 — Intel macOS runner.** Use the current repo-accepted Intel macOS
+  runner label for x86_64 release and installer smoke jobs. Add a TODO to drop
+  `x86_64-apple-darwin` entirely once GitHub retires Intel runners.
 
 ### Code Quality (D8–D13)
 
@@ -1900,8 +1899,8 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Surfaced by: D6
   - Files: `install.sh`
   - Verify: one fixture per mode passes
-- [ ] **T7 (P2, human: ~30min / CC: ~5min)** — CI — Switch macOS x86_64
-  runner to `macos-13`; add TODO to drop Intel target
+- [ ] **T7 (P2, human: ~30min / CC: ~5min)** — CI — Keep macOS x86_64
+  jobs on a repo-accepted Intel runner; add TODO to drop Intel target
   - Surfaced by: D7
   - Files: `.github/workflows/release.yml`
 - [ ] **T8 (P1, human: ~3h / CC: ~25min)** — install — Define

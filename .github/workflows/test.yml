@@ -40,6 +40,21 @@ jobs:
       - name: Check Rust docs
         run: RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
 
+  install-bash32:
+    runs-on: macos-15-intel
+    name: install.sh Bash 3.2
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Smoke test release installer with stock macOS Bash
+        shell: /bin/bash {0}
+        run: |
+          /bin/bash --version
+          /bin/bash scripts/smoke-install-bash32.sh
+
   test:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@main # zizmor: ignore[unpinned-uses]
     with:
