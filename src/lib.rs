@@ -23,6 +23,7 @@ pub mod dep_path;
 pub mod errors;
 pub mod github;
 pub mod hooks;
+pub mod http;
 pub mod install_metadata;
 pub mod link_state;
 pub mod manifest;
