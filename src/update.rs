@@ -13,7 +13,9 @@ use crate::config::Entry;
 use crate::hooks::{BashCustomProbe, Install, Post};
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::platform::{self, RuntimeEnv};
+use crate::process::Runner;
 use crate::runtime::Roots;
+use crate::update_pkg;
 use crate::Result;
 
 /// Options controlling one update run.
@@ -57,6 +59,31 @@ pub struct Summary {
     pub leftovers: Vec<String>,
 }
 
+/// Shared inputs for one update run.
+///
+/// `update` is the first command that touches every expensive boundary:
+/// package managers, hooks, manifests, and filesystem cleanup. Keep those
+/// dependencies explicit so tests can run without a host package manager and
+/// future CLI wiring can hold the state lock only around the mutations that
+/// actually need it.
+pub struct Context<'a, R>
+where
+    R: Runner,
+{
+    /// Manifest path to mutate.
+    pub manifest_path: &'a std::path::Path,
+    /// Runtime filesystem roots.
+    pub roots: &'a Roots,
+    /// Runtime platform/host identity.
+    pub env: &'a RuntimeEnv,
+    /// Bash hook subprocess runner.
+    pub hooks: &'a BashCustomProbe,
+    /// Host subprocess runner for package-manager work.
+    pub runner: &'a R,
+    /// Detected package manager, or empty when none is available.
+    pub pkg_mgr: &'a str,
+}
+
 impl Summary {
     /// Returns whether the update had any failure.
     #[must_use]
@@ -69,21 +96,34 @@ impl Summary {
 pub fn run(
     entries: &[Entry],
     manifest: &Manifest,
-    manifest_path: &std::path::Path,
-    roots: &Roots,
-    env: &RuntimeEnv,
-    hooks: &BashCustomProbe,
+    context: &Context<'_, impl Runner>,
     options: Options,
 ) -> Result<Summary> {
     let transitions = transitions_by_name(manifest, entries);
 
     let mut summary = Summary::default();
     let mut changed = Vec::new();
+    let mut queued = Vec::new();
+
     for entry in entries {
-        if !matches!(
-            platform::filter_match(&entry.filter, env),
-            platform::FilterMatch::Match
-        ) {
+        if entry.method != "pkg" || !active(entry, context.env) {
+            continue;
+        }
+
+        let item = update_pkg::install(entry, context, &mut queued)?;
+        if item.changed {
+            changed.push(entry.name.clone());
+        }
+        if item.failed {
+            summary.failed.push(entry.name.clone());
+        }
+        summary.items.push(item);
+    }
+
+    update_pkg::flush(&queued, context, &mut changed, &mut summary)?;
+
+    for entry in entries {
+        if entry.method == "pkg" || !active(entry, context.env) {
             continue;
         }
 
@@ -91,9 +131,9 @@ pub fn run(
             "custom" => {
                 let outcome = install_custom(
                     entry,
-                    manifest_path,
-                    roots,
-                    hooks,
+                    context.manifest_path,
+                    context.roots,
+                    context.hooks,
                     options,
                     transitions.get(&entry.name),
                 )?;
@@ -125,8 +165,15 @@ pub fn run(
     // inline with each method. Many hooks repair shell completions, symlinks,
     // or dependent tools, so they should see the final state for the full
     // update pass instead of an intermediate per-method view.
-    run_post_hooks(&changed, roots, hooks, &mut summary)?;
+    run_post_hooks(&changed, context.roots, context.hooks, &mut summary)?;
     Ok(summary)
+}
+
+fn active(entry: &Entry, env: &RuntimeEnv) -> bool {
+    matches!(
+        platform::filter_match(&entry.filter, env),
+        platform::FilterMatch::Match
+    )
 }
 
 fn transitions_by_name(manifest: &Manifest, entries: &[Entry]) -> HashMap<String, ManifestEntry> {
@@ -246,15 +293,18 @@ fn cleanup_roots(roots: &Roots) -> cleanup::Roots {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{run, Options};
+    use super::{run, Context, Options};
     use crate::config::parse_entry;
     use crate::hooks::BashCustomProbe;
     use crate::manifest::{self, ManifestEntry};
     use crate::platform::RuntimeEnv;
+    use crate::process::{Output, Runner};
     use crate::runtime::Roots;
 
     #[test]
@@ -275,10 +325,7 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
         let summary = run(
             &[parse_entry("tool|custom|tool|-|-", None)],
             &manifest::Manifest::default(),
-            &manifest_path,
-            &fixture.roots,
-            &RuntimeEnv::new("linux", "host"),
-            &fixture.hooks,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
             Options::default(),
         )
         .unwrap();
@@ -325,10 +372,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         run(
             &[parse_entry("tool|custom|tool|-|-", None)],
             &manifest,
-            &manifest_path,
-            &fixture.roots,
-            &RuntimeEnv::new("linux", "host"),
-            &fixture.hooks,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
             Options::default(),
         )
         .unwrap();
@@ -371,10 +415,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         let summary = run(
             &[parse_entry("tool|custom|tool|-|-", None)],
             &manifest,
-            &manifest_path,
-            &fixture.roots,
-            &RuntimeEnv::new("linux", "host"),
-            &fixture.hooks,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
             Options::default(),
         )
         .unwrap();
@@ -409,10 +450,7 @@ install() { return 42; }
         let summary = run(
             &[parse_entry("tool|custom|tool|-|-", None)],
             &manifest::Manifest::default(),
-            &manifest_path,
-            &fixture.roots,
-            &RuntimeEnv::new("linux", "host"),
-            &fixture.hooks,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
             Options::default(),
         )
         .unwrap();
@@ -426,9 +464,173 @@ install() { return 42; }
             .is_none());
     }
 
+    #[test]
+    fn update_records_existing_package_without_installing() {
+        let fixture = Fixture::new("pkg-existing");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_command("jq");
+
+        let summary = run(
+            &[parse_entry("jq|pkg|jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].detail, "installed");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("jq"),
+            Some(&ManifestEntry::new("jq", "pkg", "jq", ""))
+        );
+    }
+
+    #[test]
+    fn update_skips_none_package_override_without_manifest_row() {
+        let fixture = Fixture::new("pkg-none");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("tool|pkg|tool|apt:NONE|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            summary.items[0].detail,
+            "skipped by package-manager override"
+        );
+        assert!(manifest::read(&manifest_path)
+            .unwrap()
+            .get("tool")
+            .is_none());
+    }
+
+    #[test]
+    fn update_records_unavailable_package_as_compatibility_skip() {
+        let fixture = Fixture::new("pkg-unavailable");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_failure("apt-cache", ["show", "missing"]);
+
+        let summary = run(
+            &[parse_entry("missing|pkg|missing|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].detail, "not available");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("missing"),
+            Some(&ManifestEntry::new("missing", "pkg", "missing", ""))
+        );
+    }
+
+    #[test]
+    fn update_batches_missing_packages_and_runs_post_hooks() {
+        let fixture = Fixture::new("pkg-batch");
+        fixture.write_lib();
+        fixture.write_hook(
+            "jq",
+            r#"
+post() { printf 'post\n' > "$SHDEPS_STATE_DIR/jq-post"; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("apt-cache", ["show", "jq"], "Package: jq\n")
+            .with_success("sudo", ["apt-get", "install", "-y", "jq"], "");
+
+        let summary = run(
+            &[parse_entry("jq|pkg|jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("jq"),
+            Some(&ManifestEntry::new("jq", "pkg", "jq", ""))
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("jq-post")).unwrap(),
+            "post\n"
+        );
+    }
+
+    #[test]
+    fn update_processes_packages_before_custom_hooks() {
+        let fixture = Fixture::new("pkg-first");
+        fixture.write_lib();
+        fixture.write_hook(
+            "custom",
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/manifest" ]] && grep -q '^jq|pkg|' "$SHDEPS_STATE_DIR/manifest"; }
+version() { printf 'saw-pkg\n'; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_command("jq");
+
+        let summary = run(
+            &[
+                parse_entry("custom|custom|custom|-|-", None),
+                parse_entry("jq|pkg|jq|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].name, "jq");
+        assert_eq!(summary.items[1].name, "custom");
+        assert_eq!(summary.items[1].detail, "saw-pkg");
+    }
+
+    #[test]
+    fn update_retries_package_batch_failures_individually() {
+        let fixture = Fixture::new("pkg-retry");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("apt-cache", ["show", "jq"], "Package: jq\n")
+            .with_success("apt-cache", ["show", "fd"], "Package: fd\n")
+            .with_failure("sudo", ["apt-get", "install", "-y", "jq", "fd"])
+            .with_success("sudo", ["apt-get", "install", "-y", "jq"], "")
+            .with_failure("sudo", ["apt-get", "install", "-y", "fd"]);
+
+        let summary = run(
+            &[
+                parse_entry("jq|pkg|jq|-|-", None),
+                parse_entry("fd|pkg|fd|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["fd"]);
+    }
+
     struct Fixture {
         roots: Roots,
         hooks: BashCustomProbe,
+        env: RuntimeEnv,
     }
 
     impl Fixture {
@@ -447,7 +649,11 @@ install() { return 42; }
             fs::create_dir_all(&roots.state_dir).unwrap();
             fs::create_dir_all(&roots.install_dir).unwrap();
             let hooks = BashCustomProbe::new(home.join("shdeps.sh"));
-            Self { roots, hooks }
+            Self {
+                roots,
+                hooks,
+                env: RuntimeEnv::new("linux", "host"),
+            }
         }
 
         fn write_lib(&self) {
@@ -461,6 +667,103 @@ install() { return 42; }
             perms.set_mode(0o755);
             fs::set_permissions(path, perms).unwrap();
         }
+
+        fn context<'a>(
+            &'a self,
+            manifest_path: &'a std::path::Path,
+            runner: &'a FakeRunner,
+            pkg_mgr: &'a str,
+        ) -> Context<'a, FakeRunner> {
+            Context {
+                manifest_path,
+                roots: &self.roots,
+                env: &self.env,
+                hooks: &self.hooks,
+                runner,
+                pkg_mgr,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FakeRunner {
+        commands: std::collections::BTreeSet<String>,
+        outputs: std::collections::BTreeMap<String, Output>,
+    }
+
+    impl FakeRunner {
+        fn with_command(mut self, command: &str) -> Self {
+            self.commands.insert(command.to_owned());
+            self
+        }
+
+        fn with_success(
+            mut self,
+            program: &str,
+            args: impl IntoIterator<Item = impl AsRef<str>>,
+            stdout: &str,
+        ) -> Self {
+            self.outputs.insert(
+                key(program, args),
+                Output {
+                    success: true,
+                    timed_out: false,
+                    stdout: stdout.to_owned(),
+                    stderr: String::new(),
+                },
+            );
+            self
+        }
+
+        fn with_failure(
+            mut self,
+            program: &str,
+            args: impl IntoIterator<Item = impl AsRef<str>>,
+        ) -> Self {
+            self.outputs.insert(
+                key(program, args),
+                Output {
+                    success: false,
+                    timed_out: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+            self
+        }
+    }
+
+    impl Runner for FakeRunner {
+        fn exists(&self, command: &str) -> bool {
+            self.commands.contains(command)
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            _timeout: Option<Duration>,
+        ) -> io::Result<Output> {
+            Ok(self
+                .outputs
+                .get(&key(program, args))
+                .cloned()
+                .unwrap_or(Output {
+                    success: false,
+                    timed_out: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }))
+        }
+    }
+
+    fn key(program: &str, args: impl IntoIterator<Item = impl AsRef<str>>) -> String {
+        let mut key = program.to_owned();
+        for arg in args {
+            key.push('\0');
+            key.push_str(arg.as_ref());
+        }
+        key
     }
 
     fn temp_dir(name: &str) -> PathBuf {

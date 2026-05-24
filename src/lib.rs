@@ -44,6 +44,7 @@ pub mod state;
 pub mod status;
 pub mod tool_version;
 pub mod update;
+mod update_pkg;
 pub mod version;
 
 pub use errors::{Error, Result};

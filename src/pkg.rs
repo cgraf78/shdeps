@@ -41,6 +41,20 @@ pub fn available(mgr: &str, package: &str) -> Option<CommandSpec> {
     }
 }
 
+/// Interprets package availability probe output.
+///
+/// Most managers communicate availability through the exit status. `apk` is
+/// different in the Bash reference because `apk search -e` is piped through
+/// `grep -q .`; an empty successful search is still treated as unavailable.
+#[must_use]
+pub fn available_ok(mgr: &str, success: bool, stdout: &str) -> bool {
+    if mgr == "apk" {
+        success && !stdout.trim().is_empty()
+    } else {
+        success
+    }
+}
+
 /// Builds the metadata refresh command for managers with mutable repo caches.
 #[must_use]
 pub fn refresh(mgr: &str) -> Option<CommandSpec> {
@@ -117,6 +131,14 @@ mod tests {
             Some(cmd("apk", ["search", "-e", "jq"]))
         );
         assert_eq!(available("unknown", "jq"), None);
+    }
+
+    #[test]
+    fn availability_success_preserves_apk_non_empty_output_requirement() {
+        assert!(super::available_ok("apt", true, ""));
+        assert!(!super::available_ok("apt", false, "Package: jq\n"));
+        assert!(super::available_ok("apk", true, "jq-1.7-r0\n"));
+        assert!(!super::available_ok("apk", true, ""));
     }
 
     #[test]
