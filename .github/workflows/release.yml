@@ -1,0 +1,19 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*.*.*
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@main # zizmor: ignore[unpinned-uses]
+    permissions:
+      contents: write
+    with:
+      version-command: scripts/release-tag.sh
+      package-command: scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+      smoke-command: scripts/smoke-release.sh "$ASSET_PLATFORM"

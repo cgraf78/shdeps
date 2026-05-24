@@ -4373,6 +4373,8 @@ _assert_eq "integ github repo failure: later dep in manifest" "custom|custom-b|"
 
 ver=$(shdeps_version)
 _assert_match "shdeps_version: format" "^shdeps commit [0-9a-f]+" "$ver"
+packaged_ver=$(SHDEPS_PACKAGED_COMMIT=abcdef1234567890 bash -c '. "$1"; shdeps_version' bash "$SHDEPS_DIR/shdeps.sh")
+_assert_eq "shdeps_version: packaged commit" "shdeps commit abcdef123456" "$packaged_ver"
 
 # ===========================================================================
 # Section 11: install.sh

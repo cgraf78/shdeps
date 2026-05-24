@@ -25,6 +25,22 @@
 #   SHDEPS_JOBS         Max parallel jobs          (default: auto/nproc, max 8)
 #   SHDEPS_AUTO_EPEL    Auto-configure CRB/EPEL on dnf (default: 0)
 
+_shdeps_valid_commit() {
+  [[ "$1" =~ ^[0-9a-fA-F]{7,}$ ]]
+}
+
+_shdeps_commit_version() {
+  local hash="$1"
+  if _shdeps_valid_commit "$hash"; then
+    # Release archives do not carry a `.git` directory. The packaging script
+    # can prepend SHDEPS_PACKAGED_COMMIT to this file so sourced callers still
+    # see the same concrete commit identity as the Rust binary.
+    echo "commit ${hash:0:12}"
+    return 0
+  fi
+  return 1
+}
+
 _shdeps_git_head() {
   local dir="$1"
   if command -v git >/dev/null 2>&1; then
@@ -37,6 +53,10 @@ _shdeps_git_head() {
 
 _shdeps_self_version() {
   local src dir hash
+  _shdeps_commit_version "${SHDEPS_PACKAGED_COMMIT:-}" && return 0
+  _shdeps_commit_version "${SHDEPS_BUILD_COMMIT:-}" && return 0
+  _shdeps_commit_version "${GITHUB_SHA:-}" && return 0
+
   src="${BASH_SOURCE[0]}"
   case "$src" in
     */*) dir="${src%/*}" ;;
@@ -44,11 +64,7 @@ _shdeps_self_version() {
   esac
   dir=$(cd -P -- "$dir" && pwd) || return 1
   hash=$(_shdeps_git_head "$dir")
-  if [[ -n "$hash" ]]; then
-    echo "commit $hash"
-    return 0
-  fi
-  return 1
+  _shdeps_commit_version "$hash"
 }
 
 SHDEPS_VERSION="$(_shdeps_self_version || true)"
