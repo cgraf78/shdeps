@@ -21,6 +21,7 @@ zip = { version = "2.4.2", default-features = false, features = [
     "flate2",
 ] }
 bzip2 = "0.5.2"
+zstd = { version = "0.13.3", default-features = false }
 
 [[bin]]
 name = "shdeps"

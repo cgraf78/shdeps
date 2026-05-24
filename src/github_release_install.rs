@@ -59,6 +59,16 @@ pub fn install_bz2(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
     install_plain(bin_dir, cmd, &decoded)
 }
 
+/// Installs a zstd-compressed standalone release binary.
+pub fn install_zst(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let decoded = zstd::stream::decode_all(bytes)?;
+
+    // `.zst` completes the Bash compressed-single behavior. Keep all public
+    // bin ownership in `install_plain` so adding formats does not accidentally
+    // drift from the raw release replacement contract.
+    install_plain(bin_dir, cmd, &decoded)
+}
+
 /// Installs a gzip-compressed tar release archive.
 pub fn install_tar_gz(
     state_dir: &Path,
@@ -84,6 +94,20 @@ pub fn install_tar_bz2(
 ) -> Result<PathBuf> {
     install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
         archive::unpack_tar_bz2(bytes, dest).map(|_| ())
+    })
+}
+
+/// Installs a zstd-compressed tar release archive.
+pub fn install_tar_zst(
+    state_dir: &Path,
+    install_base: &Path,
+    bin_dir: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+        archive::unpack_tar_zst(bytes, dest).map(|_| ())
     })
 }
 
@@ -349,6 +373,19 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn zst_install_decompresses_single_binary_and_marks_executable() {
+        let dir = temp_dir("zst-single");
+        let bytes = zstd(b"binary");
+
+        let target = super::install_zst(&dir, "tool", &bytes).unwrap();
+
+        assert_eq!(target, dir.join("tool"));
+        assert_eq!(fs::read(&target).unwrap(), b"binary");
+        assert!(fs::metadata(&target).unwrap().permissions().mode() & 0o111 != 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn tar_gz_install_descends_single_root_links_binary_and_extras() {
         let dir = temp_dir("tar-gz");
         let bytes = tar_gz(&[
@@ -434,6 +471,36 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn tar_zst_install_descends_single_root_links_binary_and_extras() {
+        let dir = temp_dir("tar-zst");
+        let bytes = tar_zst(&[
+            ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
+        ]);
+
+        let public = super::install_tar_zst(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(public, dir.join("bin/tool"));
+        assert_eq!(
+            fs::read_link(dir.join("bin/tool")).unwrap(),
+            dir.join("share/owner/tool/bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
+            dir.join("share/owner/tool/share/man/man1/tool.1")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn zip_install_descends_single_root_links_binary_and_extras() {
         let dir = temp_dir("zip");
         let bytes = zip(&[
@@ -478,6 +545,10 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn zstd(bytes: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(bytes, 0).unwrap()
+    }
+
     fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let tar = tar(entries);
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -487,6 +558,10 @@ mod tests {
 
     fn tar_bz2(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         bzip2(&tar(entries))
+    }
+
+    fn tar_zst(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        zstd(&tar(entries))
     }
 
     fn tar(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {

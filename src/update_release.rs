@@ -67,6 +67,9 @@ pub(crate) fn install(
         AssetKind::Bz2 => {
             github_release_install::install_bz2(&context.roots.bin_dir, &entry.cmd, &bytes)?;
         }
+        AssetKind::Zst => {
+            github_release_install::install_zst(&context.roots.bin_dir, &entry.cmd, &bytes)?;
+        }
         AssetKind::TarGz => {
             github_release_install::install_tar_gz(
                 &context.roots.state_dir,
@@ -79,6 +82,16 @@ pub(crate) fn install(
         }
         AssetKind::TarBz2 => {
             github_release_install::install_tar_bz2(
+                &context.roots.state_dir,
+                &context.roots.install_dir,
+                &context.roots.bin_dir,
+                &entry.name,
+                &entry.cmd,
+                &bytes,
+            )?;
+        }
+        AssetKind::TarZst => {
+            github_release_install::install_tar_zst(
                 &context.roots.state_dir,
                 &context.roots.install_dir,
                 &context.roots.bin_dir,
@@ -138,8 +151,10 @@ enum AssetKind {
     Plain,
     Gz,
     Bz2,
+    Zst,
     TarGz,
     TarBz2,
+    TarZst,
     Zip,
     Unsupported,
 }
@@ -152,20 +167,26 @@ fn asset_kind(url: &str) -> AssetKind {
     if lower.ends_with(".tar.bz2") {
         return AssetKind::TarBz2;
     }
+    if lower.ends_with(".tar.zst") || lower.ends_with(".tzst") {
+        return AssetKind::TarZst;
+    }
     if lower.ends_with(".gz") {
         return AssetKind::Gz;
     }
     if lower.ends_with(".bz2") {
         return AssetKind::Bz2;
     }
+    if lower.ends_with(".zst") {
+        return AssetKind::Zst;
+    }
     if lower.ends_with(".zip") {
         return AssetKind::Zip;
     }
-    // Plain `.zst` single-file compression and other archive formats need
-    // format-specific handling before they are safe drop-in replacements for
-    // Bash. Treat them as explicit unsupported matches instead of accidentally
-    // writing compressed bytes into SHDEPS_BIN_DIR as a "plain" executable.
-    if [".tar.xz", ".tar.zst", ".tzst", ".zst"]
+    // XZ needs its own decompressor before it is a safe drop-in replacement
+    // for Bash. Treat it as an explicit unsupported match instead of
+    // accidentally writing compressed bytes into SHDEPS_BIN_DIR as a "plain"
+    // executable.
+    if [".tar.xz"]
         .iter()
         .any(|extension| lower.ends_with(extension))
     {
@@ -230,14 +251,21 @@ mod tests {
     }
 
     #[test]
+    fn asset_kind_accepts_zstd_tar_archives() {
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64.tar.zst"),
+            AssetKind::TarZst
+        );
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64.tzst"),
+            AssetKind::TarZst
+        );
+    }
+
+    #[test]
     fn asset_kind_rejects_known_archives_and_compressed_singles_until_supported() {
-        for url in [
-            "https://example.com/tool.tar.xz",
-            "https://example.com/tool.tar.zst",
-            "https://example.com/tool.zst",
-        ] {
-            assert_eq!(asset_kind(url), AssetKind::Unsupported, "{url}");
-        }
+        let url = "https://example.com/tool.tar.xz";
+        assert_eq!(asset_kind(url), AssetKind::Unsupported, "{url}");
     }
 
     #[test]
@@ -253,6 +281,14 @@ mod tests {
         assert_eq!(
             asset_kind("https://example.com/tool-linux-x86_64.bz2"),
             AssetKind::Bz2
+        );
+    }
+
+    #[test]
+    fn asset_kind_accepts_zstd_compressed_singles() {
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64.zst"),
+            AssetKind::Zst
         );
     }
 

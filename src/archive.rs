@@ -27,6 +27,11 @@ pub fn unpack_tar_bz2(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
     unpack_tar(BzDecoder::new(Cursor::new(bytes)), dest)
 }
 
+/// Extracts a zstd-compressed tar archive into `dest`.
+pub fn unpack_tar_zst(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
+    unpack_tar(zstd::stream::read::Decoder::new(Cursor::new(bytes))?, dest)
+}
+
 fn unpack_tar(reader: impl Read, dest: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(dest)?;
     let mut archive = Archive::new(reader);
@@ -179,7 +184,7 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
-    use super::{safe_entry_path, unpack_tar_bz2, unpack_tar_gz, unpack_zip};
+    use super::{safe_entry_path, unpack_tar_bz2, unpack_tar_gz, unpack_tar_zst, unpack_zip};
 
     #[test]
     fn unpack_tar_gz_extracts_safe_files() {
@@ -206,6 +211,22 @@ mod tests {
         ]);
 
         let extracted = unpack_tar_bz2(&bytes, &dest).unwrap();
+
+        assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
+        assert_eq!(fs::read(dest.join("man/man1/shdeps.1")).unwrap(), b"man");
+        assert!(extracted.contains(&PathBuf::from("shdeps")));
+        assert!(extracted.contains(&PathBuf::from("man/man1/shdeps.1")));
+    }
+
+    #[test]
+    fn unpack_tar_zst_extracts_safe_files() {
+        let dest = temp_dir("zst-safe");
+        let bytes = tar_zst(&[
+            Entry::file("shdeps", b"binary"),
+            Entry::file("man/man1/shdeps.1", b"man"),
+        ]);
+
+        let extracted = unpack_tar_zst(&bytes, &dest).unwrap();
 
         assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
         assert_eq!(fs::read(dest.join("man/man1/shdeps.1")).unwrap(), b"man");
@@ -329,6 +350,11 @@ mod tests {
         let mut encoder = BzEncoder::new(Vec::new(), BzCompression::default());
         encoder.write_all(&tar).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn tar_zst(entries: &[Entry<'_>]) -> Vec<u8> {
+        let tar = tar(entries);
+        zstd::stream::encode_all(tar.as_slice(), 0).unwrap()
     }
 
     fn tar(entries: &[Entry<'_>]) -> Vec<u8> {
