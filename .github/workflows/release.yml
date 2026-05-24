@@ -15,5 +15,13 @@ jobs:
       contents: write
     with:
       version-command: scripts/release-tag.sh
+      setup-command: |
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          # shdeps links native compression crates into static Linux release
+          # binaries. The reusable workflow owns the matrix, but this repo
+          # owns the linker/toolchain prerequisite those musl targets need.
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+        fi
       package-command: scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
       smoke-command: scripts/smoke-release.sh "$ASSET_PLATFORM"

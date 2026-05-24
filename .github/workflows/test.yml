@@ -37,6 +37,20 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Install Linux release target
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Smoke release archive packaging
+        run: |
+          # Release archives are the fleet bootstrap contract, so regular CI
+          # should exercise the same Linux musl label that tagged releases
+          # publish instead of waiting until a tag push discovers drift.
+          scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
+          scripts/smoke-release.sh linux-x86_64-musl
+
       - name: Run shell parity against Rust binary
         run: SHDEPS_IMPL=rust SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-test
 
