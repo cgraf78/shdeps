@@ -15,6 +15,7 @@
 //! this API as semver-stable yet.
 
 pub mod api;
+pub mod checksum;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
