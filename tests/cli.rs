@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use shdeps::hooks::prelude;
-
 fn shdeps() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shdeps"))
 }
@@ -368,7 +366,6 @@ fn mutating_api_github_release_reports_selection_failures() {
 #[test]
 fn rust_hook_prelude_delegates_link_extras_during_update() {
     let fixture = Fixture::new("hook-prelude-link-extras");
-    fixture.write("prelude.sh", prelude::source());
     fixture.write("conf/deps.conf", "tool custom\n");
     fixture.write(
         "conf/hooks.d/tool.sh",
@@ -384,12 +381,10 @@ install() {
     );
 
     let mut command = fixture.command(["update"]);
-    command
-        .env("SHDEPS_RUST_LIB", fixture.dir.join("prelude.sh"))
-        .env(
-            "PATH",
-            format!("{}:/usr/bin:/bin", shdeps_exe_dir().display()),
-        );
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", shdeps_exe_dir().display()),
+    );
     let output = run(&mut command);
 
     assert_success(&output);

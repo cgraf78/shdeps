@@ -24,7 +24,12 @@ lib=$2
 hook=$3
 
 unset -f exists version install post uninstall 2>/dev/null || true
-. "$lib" 2>/dev/null || exit 1
+if [[ "$lib" == "__shdeps_inline_prelude__" ]]; then
+  [[ -n "${SHDEPS_HOOK_PRELUDE_SOURCE:-}" ]] || exit 1
+  eval "$SHDEPS_HOOK_PRELUDE_SOURCE" || exit 1
+else
+  . "$lib" 2>/dev/null || exit 1
+fi
 . "$hook" 2>/dev/null || exit 1
 
 declare -f exists >/dev/null 2>&1 || exit 1
@@ -41,7 +46,12 @@ lib=$2
 hook=$3
 
 unset -f exists version install post uninstall 2>/dev/null || true
-. "$lib" 2>/dev/null || exit 11
+if [[ "$lib" == "__shdeps_inline_prelude__" ]]; then
+  [[ -n "${SHDEPS_HOOK_PRELUDE_SOURCE:-}" ]] || exit 11
+  eval "$SHDEPS_HOOK_PRELUDE_SOURCE" || exit 11
+else
+  . "$lib" 2>/dev/null || exit 11
+fi
 . "$hook" 2>/dev/null || exit 12
 
 declare -f uninstall >/dev/null 2>&1 || exit 10
@@ -55,7 +65,12 @@ hook=$3
 reinstall=$4
 
 unset -f exists version install post uninstall 2>/dev/null || true
-. "$lib" 2>/dev/null || exit 11
+if [[ "$lib" == "__shdeps_inline_prelude__" ]]; then
+  [[ -n "${SHDEPS_HOOK_PRELUDE_SOURCE:-}" ]] || exit 11
+  eval "$SHDEPS_HOOK_PRELUDE_SOURCE" || exit 11
+else
+  . "$lib" 2>/dev/null || exit 11
+fi
 . "$hook" 2>/dev/null || exit 12
 
 declare -f exists >/dev/null 2>&1 || exit 10
@@ -79,7 +94,12 @@ lib=$2
 hook=$3
 
 unset -f exists version install post uninstall 2>/dev/null || true
-. "$lib" 2>/dev/null || exit 11
+if [[ "$lib" == "__shdeps_inline_prelude__" ]]; then
+  [[ -n "${SHDEPS_HOOK_PRELUDE_SOURCE:-}" ]] || exit 11
+  eval "$SHDEPS_HOOK_PRELUDE_SOURCE" || exit 11
+else
+  . "$lib" 2>/dev/null || exit 11
+fi
 . "$hook" 2>/dev/null || exit 12
 
 declare -f post >/dev/null 2>&1 || exit 10
@@ -143,6 +163,7 @@ pub enum Post {
 #[derive(Debug, Clone)]
 pub struct BashCustomProbe {
     shdeps_lib: PathBuf,
+    inline_source: Option<&'static str>,
 }
 
 /// Per-update hook coordination marker directory.
@@ -195,6 +216,16 @@ impl BashCustomProbe {
     pub fn new(shdeps_lib: impl Into<PathBuf>) -> Self {
         Self {
             shdeps_lib: shdeps_lib.into(),
+            inline_source: None,
+        }
+    }
+
+    /// Creates a probe backed by the Rust-generated hook prelude.
+    #[must_use]
+    pub fn rust_prelude() -> Self {
+        Self {
+            shdeps_lib: PathBuf::from("__shdeps_inline_prelude__"),
+            inline_source: Some(prelude::source()),
         }
     }
 
@@ -210,7 +241,7 @@ impl BashCustomProbe {
         if !hook.is_file() {
             return Ok(Uninstall::MissingHook);
         }
-        if !self.shdeps_lib.is_file() {
+        if !self.available() {
             return Ok(Uninstall::SourceFailed);
         }
 
@@ -243,7 +274,7 @@ impl BashCustomProbe {
         if !hook.is_file() {
             return Ok(Install::MissingHook);
         }
-        if !self.shdeps_lib.is_file() {
+        if !self.available() {
             return Ok(Install::SourceFailed);
         }
 
@@ -280,7 +311,7 @@ impl BashCustomProbe {
         if !hook.is_file() {
             return Ok(Post::MissingHook);
         }
-        if !self.shdeps_lib.is_file() {
+        if !self.available() {
             return Ok(Post::SourceFailed);
         }
 
@@ -305,7 +336,18 @@ impl BashCustomProbe {
             .arg(name)
             .arg(&self.shdeps_lib)
             .arg(hook);
+        if let Some(source) = self.inline_source {
+            // The generated prelude is not a real file in dev/test builds. Pass
+            // it through the environment so the tiny Bash runner can `eval`
+            // the same source text without creating temp files that would need
+            // cleanup or survive a crashed hook subprocess.
+            command.env("SHDEPS_HOOK_PRELUDE_SOURCE", source);
+        }
         command
+    }
+
+    fn available(&self) -> bool {
+        self.inline_source.is_some() || self.shdeps_lib.is_file()
     }
 }
 
@@ -366,7 +408,7 @@ fn txn_id() -> String {
 impl CustomProbe for BashCustomProbe {
     fn installed_detail(&self, entry: &Entry, roots: &Roots) -> Result<Option<String>> {
         let hook = roots.hooks_dir.join(format!("{}.sh", entry.name));
-        if !hook.is_file() || !self.shdeps_lib.is_file() {
+        if !hook.is_file() || !self.available() {
             return Ok(None);
         }
 

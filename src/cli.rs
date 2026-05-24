@@ -903,7 +903,9 @@ fn remote_ttl() -> u64 {
 }
 
 fn custom_probe() -> BashCustomProbe {
-    BashCustomProbe::new(shdeps_lib_path().unwrap_or_else(missing_shdeps_lib))
+    shdeps_lib_path()
+        .map(BashCustomProbe::new)
+        .unwrap_or_else(BashCustomProbe::rust_prelude)
 }
 
 fn shdeps_lib_path() -> Option<PathBuf> {
@@ -923,14 +925,12 @@ fn shdeps_lib_path() -> Option<PathBuf> {
         }
     }
 
-    let exe = env::current_exe().ok()?;
-    exe.ancestors()
-        .map(|ancestor| ancestor.join("shdeps.sh"))
-        .find(|candidate| candidate.is_file())
-}
-
-fn missing_shdeps_lib() -> PathBuf {
-    Path::new("/__shdeps_missing__").join("shdeps.sh")
+    // The normal Rust path uses the generated hook prelude, not a nearby
+    // checkout's `shdeps.sh`. That distinction matters for migration testing:
+    // cargo integration-test binaries live under the repo and would otherwise
+    // accidentally keep exercising the legacy Bash library simply because it is
+    // discoverable from the executable path.
+    None
 }
 
 fn shdeps_install_dir() -> Result<PathBuf> {
