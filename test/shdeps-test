@@ -4558,6 +4558,32 @@ SH
   _release_link=$(readlink "$_release_bin/shdeps")
   _assert_eq "install release: CLI points at release binary" "$_release_inst/shdeps" "$_release_link"
   _assert_contains "install release: sends GitHub token" "Authorization: Bearer release-token" "$(cat "$_release_log")"
+
+  _release_bad_dir=$(_tmpdir)/release-bad
+  _release_bad_installer=$(_tmpdir)/curl-install-bad
+  _release_bad_inst=$(_tmpdir)/shdeps-release-bad-install
+  _release_bad_bin=$(_tmpdir)/release-bad-bin
+  _release_bad_tmp=$(_tmpdir)/release-bad-tmp
+  mkdir -p "$_release_bad_dir" "$_release_bad_installer" "$_release_bad_bin" "$_release_bad_tmp"
+  cp "$_release_dir/$_release_archive" "$_release_bad_dir/$_release_archive"
+  printf '%s\n' "bad  $_release_archive" >"$_release_bad_dir/${_release_archive}.sha256"
+  cp "$_release_dir/latest.json" "$_release_bad_dir/latest.json"
+  cp "$SHDEPS_DIR/install.sh" "$_release_bad_installer/install.sh"
+  chmod +x "$_release_bad_installer/install.sh"
+  rc=0
+  PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_bad_dir" \
+    SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-bad.log" TMPDIR="$_release_bad_tmp" \
+    SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+    SHDEPS_DIR="$_release_bad_inst" SHDEPS_BIN="$_release_bad_bin/shdeps" \
+    "$_release_bad_installer/install.sh" >/dev/null 2>&1 || rc=$?
+  _assert_exit "install release checksum failure: exits 1" 1 "$rc"
+  _assert_dir_missing "install release checksum failure: no live install dir" "$_release_bad_inst"
+  _assert_not_exists "install release checksum failure: no CLI symlink" "$_release_bad_bin/shdeps"
+  if compgen -G "$_release_bad_tmp/*" >/dev/null; then
+    _fail "install release checksum failure: staging cleaned"
+  else
+    _pass "install release checksum failure: staging cleaned"
+  fi
 else
   _pass "install release: unsupported host platform skipped"
 fi

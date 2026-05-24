@@ -146,12 +146,25 @@ _verify_checksum() {
   fi
 }
 
+_install_release_fail() {
+  local tmp="$1" message="$2"
+
+  # Release downloads happen before any live install is touched. Clean the
+  # scratch tree on every pre-activation failure so repeated curl-pipe attempts
+  # do not accumulate stale archives or make a later diagnostic ambiguous.
+  if [[ -n "$tmp" ]]; then
+    rm -rf "$tmp"
+  fi
+  _error "$message"
+  return 1
+}
+
 _install_bundle() {
   local src_dir="$1" parent staging
 
   if [[ -e "$SHDEPS_DIR" ]]; then
     _error "$SHDEPS_DIR exists but is not a git repo"
-    exit 1
+    return 1
   fi
 
   parent=$(dirname "$SHDEPS_DIR")
@@ -197,25 +210,28 @@ _install_bundle() {
 
 _install_release() {
   local platform repo api_url token tmp json tag archive checksum archive_url checksum_url bundle
-  platform=$(_release_platform) || exit 1
+  platform=$(_release_platform) || return 1
   repo=$(_repo_slug)
   api_url="${SHDEPS_RELEASE_API_URL:-https://api.github.com/repos/$repo/releases/latest}"
   token=$(_github_token)
-  tmp=$(mktemp -d)
+  tmp=$(mktemp -d) || {
+    _error "failed to create release staging directory"
+    return 1
+  }
   json="$tmp/release.json"
 
   # curl-pipe installs have no trusted local checkout. Use the GitHub release
   # contract instead of cloning source so fresh machines do not need a Rust
   # toolchain, and so WSL/Linux avoid host glibc drift by consuming musl assets.
-  _curl_get "$api_url" "$json" "$token" || {
-    _error "failed to fetch shdeps release metadata"
-    exit 1
-  }
+  if ! _curl_get "$api_url" "$json" "$token"; then
+    _install_release_fail "$tmp" "failed to fetch shdeps release metadata"
+    return 1
+  fi
 
   tag=$(_json_string "$json" "tag_name")
   if [[ -z "$tag" ]]; then
-    _error "release metadata did not contain tag_name"
-    exit 1
+    _install_release_fail "$tmp" "release metadata did not contain tag_name"
+    return 1
   fi
 
   archive="shdeps-${tag}-${platform}.tar.gz"
@@ -223,27 +239,37 @@ _install_release() {
   archive_url=$(_asset_url "$json" "$archive")
   checksum_url=$(_asset_url "$json" "$checksum")
   if [[ -z "$archive_url" || -z "$checksum_url" ]]; then
-    _error "release $tag does not contain assets for $platform"
-    exit 1
+    _install_release_fail "$tmp" "release $tag does not contain assets for $platform"
+    return 1
   fi
 
-  _curl_get "$archive_url" "$tmp/$archive" "$token" || {
-    _error "failed to download $archive"
-    exit 1
-  }
-  _curl_get "$checksum_url" "$tmp/$checksum" "$token" || {
-    _error "failed to download $checksum"
-    exit 1
-  }
-  _verify_checksum "$tmp" "$archive" "$checksum" >/dev/null || {
-    _error "checksum verification failed for $archive"
-    exit 1
-  }
+  if ! _curl_get "$archive_url" "$tmp/$archive" "$token"; then
+    _install_release_fail "$tmp" "failed to download $archive"
+    return 1
+  fi
+  if ! _curl_get "$checksum_url" "$tmp/$checksum" "$token"; then
+    _install_release_fail "$tmp" "failed to download $checksum"
+    return 1
+  fi
+  if ! _verify_checksum "$tmp" "$archive" "$checksum" >/dev/null; then
+    _install_release_fail "$tmp" "checksum verification failed for $archive"
+    return 1
+  fi
 
   bundle="$tmp/bundle"
-  mkdir -p "$bundle"
-  tar -xzf "$tmp/$archive" -C "$bundle"
-  _install_bundle "$bundle"
+  if ! mkdir -p "$bundle"; then
+    _install_release_fail "$tmp" "failed to create release bundle directory"
+    return 1
+  fi
+  if ! tar -xzf "$tmp/$archive" -C "$bundle"; then
+    _install_release_fail "$tmp" "failed to extract $archive"
+    return 1
+  fi
+  if ! _install_bundle "$bundle"; then
+    _install_release_fail "$tmp" "failed to install $archive"
+    return 1
+  fi
+  rm -rf "$tmp"
 }
 
 # Symlink CLI into PATH and link man page + shell completions.
@@ -302,13 +328,13 @@ _install() {
   script_dir=$(_script_dir) || exit 1
 
   if _is_bundle_dir "$script_dir"; then
-    _install_bundle "$script_dir"
+    _install_bundle "$script_dir" || exit 1
     _activate_installed_tree "$SHDEPS_DIR"
     return
   fi
 
   if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" ]] && ! _is_source_checkout_dir "$script_dir"; then
-    _install_release
+    _install_release || exit 1
     _activate_installed_tree "$SHDEPS_DIR"
     return
   fi
