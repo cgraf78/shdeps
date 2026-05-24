@@ -17,6 +17,7 @@
 pub mod cli;
 pub mod config;
 pub mod errors;
+pub mod link_state;
 pub mod manifest;
 pub mod platform;
 pub mod release_asset;
