@@ -20,6 +20,8 @@ pub mod errors;
 pub mod manifest;
 pub mod platform;
 pub mod release_asset;
+pub mod stamp;
+pub mod state;
 pub mod tool_version;
 pub mod version;
 

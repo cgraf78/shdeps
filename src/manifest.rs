@@ -7,12 +7,11 @@
 //! mistaken for valid install state.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Entry;
+use crate::state;
 use crate::Result;
 
 /// One manifest row: `name|method|cmd|install_path`.
@@ -204,7 +203,7 @@ pub fn upsert(path: &Path, entry: ManifestEntry) -> Result<()> {
     }
 
     manifest.upsert(entry);
-    write_atomic(path, &manifest.content())
+    state::write_atomic(path, &manifest.content())
 }
 
 /// Removes all rows for a manifest key. Missing files are a successful no-op.
@@ -215,47 +214,7 @@ pub fn remove(path: &Path, name: &str) -> Result<()> {
     }
 
     manifest.remove(name);
-    write_atomic(path, &manifest.content())
-}
-
-fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let temp = temp_path(path);
-    let write_result = (|| -> Result<()> {
-        // Create the temp file beside the manifest so rename stays within the
-        // same filesystem. That gives readers either the old complete manifest
-        // or the new complete manifest, never a half-written row.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, path)?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    write_result
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("manifest");
-
-    path.with_file_name(format!(".{name}.tmp.{}.{stamp}", std::process::id()))
+    state::write_atomic(path, &manifest.content())
 }
 
 #[cfg(test)]
