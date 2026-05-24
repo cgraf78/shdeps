@@ -9,6 +9,11 @@
 dist/
 target/
 
+# Source-checkout bootstrap creates this root symlink so the sourceable wrapper
+# can find the freshly built Rust CLI before an installed PATH entry. Keep it
+# out of git because release archives replace it with a real packaged binary.
+/shdeps
+
 # OS files
 .DS_Store
 Thumbs.db
