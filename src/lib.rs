@@ -20,6 +20,7 @@ pub mod cli;
 pub mod config;
 pub mod dep_path;
 pub mod errors;
+pub mod hooks;
 pub mod link_state;
 pub mod manifest;
 pub mod package_cache;
