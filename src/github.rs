@@ -59,7 +59,7 @@ pub fn fetch_releases(
     repo: &str,
     env: &impl Env,
     runner: &impl Runner,
-    client: &impl Client,
+    client: &(impl Client + ?Sized),
 ) -> Result<Vec<Release>> {
     let url = releases_url(repo);
     let token = token(env, runner);

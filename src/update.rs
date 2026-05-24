@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::cleanup;
 use crate::config::Entry;
 use crate::hooks::{BashCustomProbe, Install, Post};
+use crate::http::Client;
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
@@ -18,6 +19,7 @@ use crate::runtime::Roots;
 use crate::stamp;
 use crate::update_external;
 use crate::update_pkg;
+use crate::update_release;
 use crate::update_repo;
 use crate::Result;
 
@@ -121,6 +123,12 @@ where
     /// but making them an explicit input keeps `update` deterministic in tests
     /// and prevents method code from reaching around the runtime boundary.
     pub env_vars: &'a BTreeMap<String, String>,
+    /// HTTP client used for release metadata and asset downloads.
+    ///
+    /// Network access is an install-method boundary, not global ambient state.
+    /// Keeping it injectable lets release update tests cover GitHub behavior
+    /// without live requests or local curl configuration.
+    pub client: &'a dyn Client,
 }
 
 impl Summary {
@@ -167,6 +175,16 @@ pub fn run(
         }
 
         match entry.method.as_str() {
+            "github:release" => {
+                let item = update_release::install(entry, context, options)?;
+                if item.failed {
+                    summary.failed.push(entry.name.clone());
+                }
+                if item.changed {
+                    changed.push(entry.name.clone());
+                }
+                summary.items.push(item);
+            }
             "github:repo" => {
                 let item = update_repo::install(entry, context, options)?;
                 if item.failed {
@@ -362,6 +380,7 @@ mod tests {
     use super::{run, Context, Options};
     use crate::config::parse_entry;
     use crate::hooks::BashCustomProbe;
+    use crate::http::Client;
     use crate::manifest::{self, ManifestEntry};
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
@@ -832,6 +851,103 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_installs_plain_binary_and_records_manifest() {
+        let mut fixture = Fixture::new("release-plain");
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-linux-x86_64",
+                        "browser_download_url":"https://example/tool-linux-x86_64"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://example/tool-linux-x86_64", b"binary".to_vec());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "v1.2.3");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"binary");
+        assert_eq!(
+            fs::read_to_string(crate::stamp::remote_path(
+                &fixture.roots.state_dir,
+                "owner/tool",
+                "release"
+            ))
+            .unwrap(),
+            "1700000000\n"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn update_github_release_fast_path_repairs_manifest_without_network() {
+        let fixture = Fixture::new("release-fast");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release"),
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_100,
+                remote_ttl: 3600,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "fresh");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_github_repo_uses_local_dev_clone_first() {
         let fixture = Fixture::new("repo-local");
         fixture.write_lib();
@@ -1178,6 +1294,7 @@ version() { printf 'saw-pkg\n'; }
         hooks: BashCustomProbe,
         env: RuntimeEnv,
         env_vars: BTreeMap<String, String>,
+        client: FakeClient,
     }
 
     impl Fixture {
@@ -1201,6 +1318,7 @@ version() { printf 'saw-pkg\n'; }
                 hooks,
                 env: RuntimeEnv::new("linux", "host"),
                 env_vars: BTreeMap::new(),
+                client: FakeClient::default(),
             }
         }
 
@@ -1230,7 +1348,28 @@ version() { printf 'saw-pkg\n'; }
                 runner,
                 pkg_mgr,
                 env_vars: &self.env_vars,
+                client: &self.client,
             }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FakeClient {
+        responses: std::collections::BTreeMap<String, Vec<u8>>,
+    }
+
+    impl FakeClient {
+        fn with(mut self, url: &str, bytes: impl Into<Vec<u8>>) -> Self {
+            self.responses.insert(url.to_owned(), bytes.into());
+            self
+        }
+    }
+
+    impl Client for FakeClient {
+        fn get(&self, url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+            self.responses.get(url).cloned().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
+            })
         }
     }
 
