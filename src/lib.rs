@@ -26,6 +26,7 @@ pub mod manifest;
 pub mod package_cache;
 pub mod platform;
 pub mod process;
+pub mod prune;
 pub mod release_asset;
 pub mod runtime;
 pub mod stamp;

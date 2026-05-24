@@ -257,6 +257,79 @@ fn check_reports_installed_skipped_missing_and_unknown() {
     );
 }
 
+#[test]
+fn prune_lists_dry_runs_and_removes_orphans() {
+    let fixture = Fixture::new("prune");
+    fixture.write("conf/deps.conf", "current github:repo\n");
+    fixture.write(
+        "state/manifest",
+        "old|github:release|old|/tmp/old\ncurrent|github:repo|current|/tmp/current\n",
+    );
+    fixture.write_executable("bin/old", "#!/bin/sh\n");
+    fixture.write("share/old/artifact", "artifact\n");
+    fixture.write(
+        "conf/hooks.d/old.sh",
+        "uninstall() { printf '%s\\n' \"$1\" > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+    );
+
+    let dry = run(&mut fixture.command(["prune", "--dry-run"]));
+    assert_success(&dry);
+    assert_eq!(
+        text(&dry.stdout),
+        "==> 1 orphaned dep(s) no longer in config:\n  old (github:release)\nDry run — nothing removed.\n"
+    );
+    assert_eq!(text(&dry.stderr), "");
+    assert!(fixture.dir.join("bin/old").exists());
+    assert!(text(&fs::read(fixture.dir.join("state/manifest")).unwrap()).contains("old|"));
+
+    let removed = run(&mut fixture.command(["prune", "-y"]));
+    assert_success(&removed);
+    assert_eq!(
+        text(&removed.stdout),
+        "==> 1 orphaned dep(s) no longer in config:\n  old (github:release)\n  old removed\n"
+    );
+    assert_eq!(text(&removed.stderr), "");
+    assert!(!fixture.dir.join("bin/old").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/hook-ran")).unwrap(),
+        "old\n"
+    );
+    assert!(!fs::read_to_string(fixture.dir.join("state/manifest"))
+        .unwrap()
+        .contains("old|"));
+}
+
+#[test]
+fn prune_preserves_packages_and_guards_empty_config() {
+    let fixture = Fixture::new("prune-pkg");
+    fixture.write("state/manifest", "pkg-tool|pkg|pkg-tool|\n");
+
+    let guarded = run(&mut fixture.command(["prune"]));
+    assert_eq!(guarded.status.code(), Some(1));
+    assert_eq!(text(&guarded.stdout), "");
+    assert_eq!(
+        text(&guarded.stderr),
+        "warning: no deps in config but 1 in manifest — all would be orphaned\n  If intentional, re-run with -y\n"
+    );
+    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
+        .unwrap()
+        .contains("pkg-tool|"));
+
+    let removed_tracking = run(&mut fixture.command(["prune", "-y"]));
+    assert_success(&removed_tracking);
+    assert_eq!(
+        text(&removed_tracking.stdout),
+        "==> 1 orphaned dep(s) no longer in config:\n  pkg-tool (pkg)\n"
+    );
+    assert_eq!(
+        text(&removed_tracking.stderr),
+        "  pkg-tool: pkg dep — remove manually via system package manager\n"
+    );
+    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
+        .unwrap()
+        .is_empty());
+}
+
 fn run(command: &mut Command) -> Output {
     command.output().expect("shdeps command should run")
 }

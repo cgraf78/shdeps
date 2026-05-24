@@ -13,9 +13,10 @@ use crate::api;
 use crate::config::{self, Entry};
 use crate::dep_path;
 use crate::errors::Error;
-use crate::hooks::BashCustomProbe;
+use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::manifest;
 use crate::process::{self, Process};
+use crate::prune::{self, Options as PruneOptions};
 use crate::runtime::{self, Overrides, ProcessEnv};
 use crate::status::{self, Context, DependencyStatus, SkipReason, State};
 use crate::version;
@@ -116,7 +117,8 @@ where
             writeln!(stderr, "Run 'shdeps help' for usage.")?;
             Ok(2)
         }
-        "update" | "self-update" | "prune" => not_implemented(command, rest, stderr),
+        "prune" => prune_cmd(rest, &parsed, stdout, stderr),
+        "update" | "self-update" => not_implemented(command, rest, stderr),
         other => {
             writeln!(stderr, "error: unknown command '{other}'")?;
             writeln!(stderr, "Run 'shdeps help' for usage.")?;
@@ -134,6 +136,7 @@ enum ParseOutcome {
 struct ParsedOptions {
     command_index: usize,
     overrides: Overrides,
+    quiet: bool,
 }
 
 fn parse_options<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<ParseOutcome>
@@ -143,6 +146,7 @@ where
 {
     let mut index = 0;
     let mut overrides = Overrides::default();
+    let mut quiet = false;
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
             "-c" | "--config" => {
@@ -163,6 +167,15 @@ where
                 index += 1;
             }
             "-q" | "--quiet" | "-v" | "--verbose" | "-y" | "--dry-run" => {
+                match arg.as_str() {
+                    "-q" | "--quiet" => quiet = true,
+                    "-v" | "--verbose" => {}
+                    _ => {
+                        writeln!(stderr, "error: unknown option '{arg}'")?;
+                        writeln!(stderr, "Run 'shdeps help' for usage.")?;
+                        return Ok(ParseOutcome::Exit(2));
+                    }
+                }
                 index += 1;
             }
             "-h" | "--help" | "help" => {
@@ -178,6 +191,7 @@ where
                 return Ok(ParseOutcome::Command(ParsedOptions {
                     command_index: index,
                     overrides,
+                    quiet,
                 }));
             }
         }
@@ -355,6 +369,96 @@ where
     Ok(check_exit_code(&dependency.state))
 }
 
+fn prune_cmd<W, E>(
+    args: &[String],
+    options: &ParsedOptions,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    let mut prune_options = PruneOptions {
+        quiet: options.quiet,
+        ..PruneOptions::default()
+    };
+    for arg in args {
+        match arg.as_str() {
+            "-y" => prune_options.yes = true,
+            "--dry-run" => prune_options.dry_run = true,
+            other => {
+                writeln!(stderr, "error: unknown prune option '{other}'")?;
+                return Ok(2);
+            }
+        }
+    }
+
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    let raw_entries = config::load_dir(&roots.conf_dir)?;
+    let entries = parse_entries(&raw_entries, "");
+    let manifest_path = manifest::path(&roots.state_dir);
+    let manifest = manifest::read(&manifest_path)?;
+    let hooks = custom_probe();
+    let detected = prune::run(
+        &entries,
+        &manifest,
+        &manifest_path,
+        &roots,
+        &hooks,
+        PruneOptions {
+            dry_run: true,
+            ..prune_options
+        },
+    )?;
+
+    if detected.guarded_all_orphans {
+        writeln!(
+            stderr,
+            "warning: no deps in config but {} in manifest — all would be orphaned",
+            detected.orphans.len()
+        )?;
+        writeln!(stderr, "  If intentional, re-run with -y")?;
+        return Ok(1);
+    }
+    if detected.orphans.is_empty() {
+        if !prune_options.quiet {
+            writeln!(stdout, "No orphaned deps found.")?;
+        }
+        return Ok(0);
+    }
+    if prune_options.quiet && !prune_options.yes {
+        return Ok(0);
+    }
+
+    write_prune_orphans(&detected.orphans, stdout)?;
+    if prune_options.dry_run {
+        writeln!(stdout, "Dry run — nothing removed.")?;
+        return Ok(0);
+    }
+
+    if !prune_options.yes && !confirm_prune(stdout)? {
+        writeln!(stdout, "Aborted.")?;
+        return Ok(0);
+    }
+
+    let manifest = manifest::read(&manifest_path)?;
+    let summary = prune::run(
+        &entries,
+        &manifest,
+        &manifest_path,
+        &roots,
+        &hooks,
+        PruneOptions {
+            yes: true,
+            dry_run: false,
+            quiet: false,
+        },
+    )?;
+    write_prune_results(&summary.removed, stdout, stderr)?;
+    Ok(if summary.has_errors() { 1 } else { 0 })
+}
+
 fn dep_root<W>(target: &str, options: &ParsedOptions, stdout: &mut W) -> Result<i32>
 where
     W: Write,
@@ -489,6 +593,86 @@ where
         }
     }
     Ok(())
+}
+
+fn write_prune_orphans<W>(orphans: &[manifest::ManifestEntry], stdout: &mut W) -> Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        stdout,
+        "==> {} orphaned dep(s) no longer in config:",
+        orphans.len()
+    )?;
+    for orphan in orphans {
+        writeln!(stdout, "  {} ({})", orphan.name, orphan.method)?;
+    }
+    Ok(())
+}
+
+fn write_prune_results<W, E>(items: &[prune::Item], stdout: &mut W, stderr: &mut E) -> Result<()>
+where
+    W: Write,
+    E: Write,
+{
+    for item in items {
+        match item.hook {
+            Uninstall::MissingHook if item.entry.method == "custom" => writeln!(
+                stderr,
+                "  warning: {} hook file missing — manual cleanup may be needed",
+                item.entry.name
+            )?,
+            Uninstall::MissingFunction if item.entry.method == "custom" => writeln!(
+                stderr,
+                "  warning: {} has no uninstall() hook — manual cleanup may be needed",
+                item.entry.name
+            )?,
+            Uninstall::SourceFailed => writeln!(
+                stderr,
+                "  warning: failed to source hook for {}",
+                item.entry.name
+            )?,
+            Uninstall::Failed => {
+                writeln!(
+                    stderr,
+                    "  warning: {} uninstall hook failed",
+                    item.entry.name
+                )?;
+            }
+            Uninstall::MissingHook | Uninstall::MissingFunction | Uninstall::Removed => {}
+        }
+
+        if let Some(cleanup) = &item.cleanup {
+            if cleanup.preserved_package {
+                writeln!(
+                    stderr,
+                    "  {}: pkg dep — remove manually via system package manager",
+                    item.entry.name
+                )?;
+            } else if item.cleanup_error.is_none() {
+                writeln!(stdout, "  {} removed", item.entry.name)?;
+            }
+        }
+        if let Some(error) = &item.cleanup_error {
+            writeln!(
+                stderr,
+                "  warning: {} cleanup failed: {error}",
+                item.entry.name
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn confirm_prune<W>(stdout: &mut W) -> Result<bool>
+where
+    W: Write,
+{
+    write!(stdout, "Remove? [y/N] ")?;
+    stdout.flush()?;
+    let mut reply = String::new();
+    std::io::stdin().read_line(&mut reply)?;
+    Ok(reply.trim().eq_ignore_ascii_case("y"))
 }
 
 fn check_exit_code(state: &State) -> i32 {

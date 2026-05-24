@@ -30,6 +30,34 @@ if declare -f version >/dev/null 2>&1; then
 fi
 "#;
 
+const UNINSTALL_SCRIPT: &str = r#"
+name=$1
+lib=$2
+hook=$3
+
+unset -f exists version install post uninstall 2>/dev/null || true
+. "$lib" 2>/dev/null || exit 11
+. "$hook" 2>/dev/null || exit 12
+
+declare -f uninstall >/dev/null 2>&1 || exit 10
+uninstall "$name"
+"#;
+
+/// Result of attempting an optional hook `uninstall(name)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uninstall {
+    /// The hook file does not exist.
+    MissingHook,
+    /// The hook file exists but has no `uninstall` function.
+    MissingFunction,
+    /// The hook file or compatibility layer failed to source.
+    SourceFailed,
+    /// `uninstall(name)` exists but returned non-zero.
+    Failed,
+    /// `uninstall(name)` ran successfully.
+    Removed,
+}
+
 /// Custom-status probe that evaluates hook `exists`/`version` in Bash.
 #[derive(Debug, Clone)]
 pub struct BashCustomProbe {
@@ -50,6 +78,48 @@ impl BashCustomProbe {
     pub fn shdeps_lib(&self) -> &Path {
         &self.shdeps_lib
     }
+
+    /// Runs the optional `uninstall(name)` hook for prune and method cleanup.
+    pub fn uninstall(&self, name: &str, roots: &Roots) -> Result<Uninstall> {
+        let hook = roots.hooks_dir.join(format!("{name}.sh"));
+        if !hook.is_file() {
+            return Ok(Uninstall::MissingHook);
+        }
+        if !self.shdeps_lib.is_file() {
+            return Ok(Uninstall::SourceFailed);
+        }
+
+        let output = self
+            .command(UNINSTALL_SCRIPT, name, &hook)
+            .env("SHDEPS_CONF_DIR", &roots.conf_dir)
+            .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
+            .env("SHDEPS_STATE_DIR", &roots.state_dir)
+            .env("SHDEPS_GIT_DEV_DIR", &roots.git_dev_dir)
+            .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
+            .env("SHDEPS_BIN_DIR", &roots.bin_dir)
+            .env("SHDEPS_CURRENT_DEP", name)
+            .env("SHDEPS_HOOK_PHASE", "uninstall")
+            .output()?;
+
+        Ok(match output.status.code() {
+            Some(0) => Uninstall::Removed,
+            Some(10) => Uninstall::MissingFunction,
+            Some(11 | 12) => Uninstall::SourceFailed,
+            _ => Uninstall::Failed,
+        })
+    }
+
+    fn command(&self, script: &'static str, name: &str, hook: &Path) -> Command {
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("shdeps-hook")
+            .arg(name)
+            .arg(&self.shdeps_lib)
+            .arg(hook);
+        command
+    }
 }
 
 impl CustomProbe for BashCustomProbe {
@@ -59,13 +129,8 @@ impl CustomProbe for BashCustomProbe {
             return Ok(None);
         }
 
-        let output = Command::new("bash")
-            .arg("-c")
-            .arg(STATUS_SCRIPT)
-            .arg("shdeps-custom-status")
-            .arg(&entry.name)
-            .arg(&self.shdeps_lib)
-            .arg(&hook)
+        let output = self
+            .command(STATUS_SCRIPT, &entry.name, &hook)
             .env("SHDEPS_CONF_DIR", &roots.conf_dir)
             .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
             .env("SHDEPS_STATE_DIR", &roots.state_dir)
@@ -96,7 +161,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::BashCustomProbe;
+    use super::{BashCustomProbe, Uninstall};
     use crate::config::parse_entry;
     use crate::runtime::Roots;
     use crate::status::CustomProbe;
@@ -105,6 +170,7 @@ mod tests {
     fn custom_probe_returns_version_when_exists_succeeds() {
         let roots = roots();
         fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
         let lib = roots.home.join("shdeps.sh");
         fs::write(&lib, "shdeps_version() { :; }\n").unwrap();
         write_hook(
@@ -172,7 +238,67 @@ version() { printf '%s\n' "$SHDEPS_BIN_DIR"; }
         assert_eq!(detail.as_deref(), Some(roots.bin_dir.to_str().unwrap()));
     }
 
+    #[test]
+    fn uninstall_runs_optional_hook_with_context() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let lib = roots.home.join("shdeps.sh");
+        fs::write(&lib, "shdeps_version() { :; }\n").unwrap();
+        write_hook(
+            &roots.hooks_dir.join("tool.sh"),
+            r#"
+uninstall() {
+  [[ "$SHDEPS_CURRENT_DEP" == tool ]] || return 1
+  [[ "$SHDEPS_HOOK_PHASE" == uninstall ]] || return 1
+  printf '%s\n' "$1" > "$SHDEPS_STATE_DIR/uninstalled"
+}
+"#,
+        );
+
+        let probe = BashCustomProbe::new(&lib);
+        let result = probe.uninstall("tool", &roots).unwrap();
+
+        assert_eq!(result, Uninstall::Removed);
+        assert_eq!(
+            fs::read_to_string(roots.state_dir.join("uninstalled")).unwrap(),
+            "tool\n"
+        );
+    }
+
+    #[test]
+    fn uninstall_classifies_missing_and_failed_hooks() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        let lib = roots.home.join("shdeps.sh");
+        fs::write(&lib, "shdeps_version() { :; }\n").unwrap();
+        write_hook(&roots.hooks_dir.join("no-fn.sh"), "exists() { :; }\n");
+        write_hook(
+            &roots.hooks_dir.join("fails.sh"),
+            "uninstall() { return 7; }\n",
+        );
+
+        let probe = BashCustomProbe::new(&lib);
+
+        assert_eq!(
+            probe.uninstall("missing", &roots).unwrap(),
+            Uninstall::MissingHook
+        );
+        assert_eq!(
+            probe.uninstall("no-fn", &roots).unwrap(),
+            Uninstall::MissingFunction
+        );
+        assert_eq!(probe.uninstall("fails", &roots).unwrap(), Uninstall::Failed);
+        assert_eq!(
+            BashCustomProbe::new(roots.home.join("missing-shdeps.sh"))
+                .uninstall("fails", &roots)
+                .unwrap(),
+            Uninstall::SourceFailed
+        );
+    }
+
     fn write_hook(path: &PathBuf, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
         let mut perms = fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
