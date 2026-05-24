@@ -1,0 +1,15 @@
+[package]
+name = "shdeps"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Standalone dependency manager for shell-oriented development environments"
+build = "build.rs"
+
+[lib]
+name = "shdeps"
+
+[[bin]]
+name = "shdeps"
+path = "src/main.rs"

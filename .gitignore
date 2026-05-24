@@ -6,6 +6,7 @@
 
 # Temp files
 /tmp/
+target/
 
 # OS files
 .DS_Store
