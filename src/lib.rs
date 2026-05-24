@@ -16,6 +16,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod dep_path;
 pub mod errors;
 pub mod link_state;
 pub mod manifest;

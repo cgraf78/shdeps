@@ -7,6 +7,8 @@
 use std::fmt;
 use std::io;
 
+use crate::dep_path::ResolveError;
+
 /// Crate-wide result type used by the Rust implementation.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -20,12 +22,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// A standard I/O operation failed.
     Io(io::Error),
+    /// Dependency path resolution failed with a Bash-compatible class.
+    Resolve(ResolveError),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
+            Self::Resolve(error) => write!(formatter, "{error:?}"),
         }
     }
 }
