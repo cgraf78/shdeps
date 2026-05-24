@@ -46,6 +46,7 @@ pub mod state;
 pub mod status;
 pub mod tool_version;
 pub mod update;
+mod update_external;
 mod update_pkg;
 pub mod version;
 

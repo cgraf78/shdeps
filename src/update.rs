@@ -15,14 +15,46 @@ use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
 use crate::runtime::Roots;
+use crate::stamp;
+use crate::update_external;
 use crate::update_pkg;
 use crate::Result;
 
 /// Options controlling one update run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     /// Force reinstall of dependencies that already appear installed.
     pub reinstall: bool,
+    /// Bypass remote freshness stamps.
+    pub force: bool,
+    /// Current epoch seconds used when checking and writing stamps.
+    pub now: u64,
+    /// Remote freshness TTL in seconds.
+    pub remote_ttl: u64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            reinstall: false,
+            force: false,
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs()),
+            remote_ttl: 3600,
+        }
+    }
+}
+
+impl Options {
+    pub(crate) fn freshness(self) -> stamp::Freshness {
+        stamp::Freshness {
+            now: self.now,
+            ttl: self.remote_ttl,
+            force: self.force,
+            reinstall: self.reinstall,
+        }
+    }
 }
 
 /// Per-dependency update result.
@@ -128,6 +160,16 @@ pub fn run(
         }
 
         match entry.method.as_str() {
+            "cargo" | "go" | "uv" | "npm" => {
+                let item = update_external::install(entry, context, options)?;
+                if item.failed {
+                    summary.failed.push(entry.name.clone());
+                }
+                if item.changed {
+                    changed.push(entry.name.clone());
+                }
+                summary.items.push(item);
+            }
             "custom" => {
                 let outcome = install_custom(
                     entry,
@@ -627,6 +669,150 @@ version() { printf 'saw-pkg\n'; }
         assert_eq!(summary.failed, ["fd"]);
     }
 
+    #[test]
+    fn update_installs_external_tool_and_records_manifest() {
+        let fixture = Fixture::new("external-install");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.install_dir.join("ripgrep/bin/rg");
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_created_binary(
+                "cargo",
+                [
+                    "install",
+                    "--locked",
+                    "--root",
+                    fixture.roots.install_dir.join("ripgrep").to_str().unwrap(),
+                    "ripgrep",
+                ],
+                bin_path.clone(),
+            );
+
+        let summary = run(
+            &[parse_entry("ripgrep|cargo|rg|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("rg")).unwrap(),
+            bin_path
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("ripgrep"),
+            Some(&ManifestEntry::new(
+                "ripgrep",
+                "cargo",
+                "rg",
+                fixture
+                    .roots
+                    .install_dir
+                    .join("ripgrep/bin/rg")
+                    .display()
+                    .to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn update_external_fast_path_repairs_missing_public_symlink() {
+        let fixture = Fixture::new("external-fast");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.install_dir.join("ripgrep/bin/rg");
+        write_executable(&bin_path);
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "ripgrep", "cargo"),
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let summary = run(
+            &[parse_entry("ripgrep|cargo|rg|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_100,
+                remote_ttl: 3600,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "fresh");
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("rg")).unwrap(),
+            bin_path
+        );
+    }
+
+    #[test]
+    fn update_external_reports_missing_tool_without_manifest_row() {
+        let fixture = Fixture::new("external-missing-tool");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("ripgrep|cargo|rg|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["ripgrep"]);
+        assert!(manifest::read(&manifest_path)
+            .unwrap()
+            .get("ripgrep")
+            .is_none());
+    }
+
+    #[test]
+    fn update_external_reinstall_uses_force_argument() {
+        let fixture = Fixture::new("external-reinstall");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.install_dir.join("ripgrep/bin/rg");
+        write_executable(&bin_path);
+        let runner = FakeRunner::default().with_command("cargo").with_success(
+            "cargo",
+            [
+                "install",
+                "--locked",
+                "--root",
+                fixture.roots.install_dir.join("ripgrep").to_str().unwrap(),
+                "ripgrep",
+                "--force",
+            ],
+            "",
+        );
+
+        let summary = run(
+            &[parse_entry("ripgrep|cargo|rg|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+    }
+
     struct Fixture {
         roots: Roots,
         hooks: BashCustomProbe,
@@ -689,6 +875,7 @@ version() { printf 'saw-pkg\n'; }
     struct FakeRunner {
         commands: std::collections::BTreeSet<String>,
         outputs: std::collections::BTreeMap<String, Output>,
+        creates: std::collections::BTreeMap<String, Vec<PathBuf>>,
     }
 
     impl FakeRunner {
@@ -712,6 +899,26 @@ version() { printf 'saw-pkg\n'; }
                     stderr: String::new(),
                 },
             );
+            self
+        }
+
+        fn with_created_binary(
+            mut self,
+            program: &str,
+            args: impl IntoIterator<Item = impl AsRef<str>>,
+            path: PathBuf,
+        ) -> Self {
+            let key = key(program, args);
+            self.outputs.insert(
+                key.clone(),
+                Output {
+                    success: true,
+                    timed_out: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+            self.creates.entry(key).or_default().push(path);
             self
         }
 
@@ -744,16 +951,16 @@ version() { printf 'saw-pkg\n'; }
             args: &[&str],
             _timeout: Option<Duration>,
         ) -> io::Result<Output> {
-            Ok(self
-                .outputs
-                .get(&key(program, args))
-                .cloned()
-                .unwrap_or(Output {
-                    success: false,
-                    timed_out: false,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                }))
+            let key = key(program, args);
+            for path in self.creates.get(&key).into_iter().flatten() {
+                write_executable(path);
+            }
+            Ok(self.outputs.get(&key).cloned().unwrap_or(Output {
+                success: false,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: String::new(),
+            }))
         }
     }
 
@@ -764,6 +971,14 @@ version() { printf 'saw-pkg\n'; }
             key.push_str(arg.as_ref());
         }
         key
+    }
+
+    fn write_executable(path: &PathBuf) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
     }
 
     fn temp_dir(name: &str) -> PathBuf {
