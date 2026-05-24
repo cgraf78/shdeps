@@ -1769,6 +1769,58 @@ The Rust implementation is not complete until:
   hooks still work
 - release/install smoke tests pass on every supported platform artifact
 
+### Test Harness Implementation Selection
+
+`test/shdeps-test` MUST select the implementation under test through
+`SHDEPS_IMPL`.
+
+Supported values:
+
+| Value | Meaning |
+| --- | --- |
+| `bash` | Run against the Bash reference implementation. This is the default until Rust parity is complete. |
+| `rust` | Run against the Rust binary plus the Rust-era Bash compatibility wrapper. |
+
+Selection variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `SHDEPS_IMPL` | Implementation selector: `bash` or `rust`. |
+| `SHDEPS_CLI` | Test harness path to the selected `shdeps` command. |
+| `SHDEPS_TEST_LIB` | Test harness path to the selected sourceable `shdeps.sh` API layer. |
+| `SHDEPS_RUST_CLI` | Optional override for the Rust binary path before the release layout exists. |
+| `SHDEPS_RUST_LIB` | Optional override for the Rust compatibility wrapper path before the release layout exists. |
+
+The harness MUST fail clearly for unsupported selectors or for `SHDEPS_IMPL=rust`
+before the Rust binary is built. Silent fallback to Bash would make parity
+results meaningless.
+
+The harness MUST NOT reuse the installer-facing `SHDEPS_LIB` variable for test
+implementation selection. `install.sh --bootstrap` already treats `SHDEPS_LIB`
+as a public override, and the shell parity suite sources the installer in the
+current process. Reusing that name would test a mutated bootstrap environment
+instead of the real user-facing behavior.
+
+### Current Test-only Environment Knobs
+
+The following variables are test fixtures, not user-facing API. They are
+documented here so the Rust port can preserve useful test seams without
+accidentally freezing private Bash internals as product behavior.
+
+| Variable | Current use | Rust-port classification |
+| --- | --- | --- |
+| `SHDEPS_TEST_HOST` | Package-cache tests force host fingerprint changes. | Re-spec as a `RuntimeEnv` test override. |
+| `SHDEPS_TEST_PLATFORM` | Package-cache tests force platform fingerprint changes. | Re-spec as a `RuntimeEnv` test override. |
+| `SHDEPS_TEST_GIT_LOG` | Mock `git` records clone/pull/fallback arguments. | Keep as shell fixture state; not read by Rust production code. |
+| `SHDEPS_TEST_REMOTE_FILE` | Mock `git` stores simulated remote URL state. | Keep as shell fixture state; not read by Rust production code. |
+| `SHDEPS_TEST_PUSH_REMOTE_FILE` | Mock `git` stores simulated push URL state. | Keep as shell fixture state; not read by Rust production code. |
+| `SHDEPS_TEST_RELEASE_TARBALL` | Mock `curl` serves a local release tarball. | Replace over time with Rust integration fixtures or keep as shell fixture. |
+| `SHDEPS_TEST_CUSTOM_ARTIFACT` | Custom method-transition hook removes a fixture artifact. | Keep as hook fixture input; not public API. |
+| `SHDEPS_TEST_CUSTOM_MARKER` | Custom method-transition hook records fixture cleanup. | Keep as hook fixture output; not public API. |
+
+No variable in this table may become stable user API without being moved to the
+environment contract above and covered by user-facing compatibility tests.
+
 ## Spec-To-Test Mapping
 
 | Spec area | Required coverage |

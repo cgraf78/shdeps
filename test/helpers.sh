@@ -207,10 +207,18 @@ _mock_bin() {
   echo "$d"
 }
 
-# Source shdeps.sh with test-friendly defaults.
-# Call after _mock_home to isolate state.
+# Source the selected shdeps library with test-friendly defaults.
+#
+# The Rust port keeps this helper as the single handoff point between the shell
+# parity suite and the implementation under test. Most tests exercise sourced
+# Bash APIs, so callers still pass the repo root for legacy clarity, but the
+# actual library path comes from SHDEPS_TEST_LIB once the Rust compatibility
+# wrapper is available. Do not use the public SHDEPS_LIB bootstrap knob here:
+# this suite sources install.sh in-process, and a global SHDEPS_LIB would change
+# installer behavior instead of only selecting the implementation under test.
 _source_shdeps() {
   local shdeps_dir="${1:-$SHDEPS_DIR}"
+  local shdeps_lib="${SHDEPS_TEST_LIB:-$shdeps_dir/shdeps.sh}"
   # Reset any previously defined functions/vars
   unset -f _shdeps_log _shdeps_warn _shdeps_log_ok _shdeps_log_dim _shdeps_log_header 2>/dev/null
   unset _SHDEPS_DEPS _SHDEPS_PKG_MGR _SHDEPS_PKG_BATCH _SHDEPS_PKG_BATCH_NAMES 2>/dev/null
@@ -218,7 +226,7 @@ _source_shdeps() {
   # Suppress all output during tests
   export SHDEPS_LOG_LEVEL=0
   # shellcheck source=/dev/null
-  . "$shdeps_dir/shdeps.sh"
+  . "$shdeps_lib"
 }
 
 # ---------------------------------------------------------------------------

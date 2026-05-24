@@ -15,6 +15,28 @@
 set -uo pipefail
 
 SHDEPS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SHDEPS_IMPL="${SHDEPS_IMPL:-bash}"
+
+case "$SHDEPS_IMPL" in
+  bash)
+    SHDEPS_CLI="${SHDEPS_CLI:-$SHDEPS_DIR/bin/shdeps}"
+    SHDEPS_TEST_LIB="$SHDEPS_DIR/shdeps.sh"
+    ;;
+  rust)
+    SHDEPS_CLI="${SHDEPS_RUST_CLI:-$SHDEPS_DIR/target/debug/shdeps}"
+    SHDEPS_TEST_LIB="${SHDEPS_RUST_LIB:-$SHDEPS_DIR/shdeps.sh}"
+    if [[ ! -x "$SHDEPS_CLI" ]]; then
+      printf 'error: SHDEPS_IMPL=rust requested but %s is not executable\n' "$SHDEPS_CLI" >&2
+      printf '       build the Rust binary first or set SHDEPS_RUST_CLI\n' >&2
+      exit 2
+    fi
+    ;;
+  *)
+    printf 'error: unsupported SHDEPS_IMPL=%s (expected bash or rust)\n' "$SHDEPS_IMPL" >&2
+    exit 2
+    ;;
+esac
+export SHDEPS_IMPL SHDEPS_CLI SHDEPS_TEST_LIB
 
 # shellcheck source=helpers.sh
 . "$(dirname "$0")/helpers.sh"
@@ -25,6 +47,10 @@ SHDEPS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # ===========================================================================
 
 echo "=== ShellCheck ==="
+
+_pass "implementation harness: selected $SHDEPS_IMPL"
+_assert_file_exists "implementation harness: library exists" "$SHDEPS_TEST_LIB"
+_assert_file_exists "implementation harness: CLI exists" "$SHDEPS_CLI"
 
 _sc_files=()
 while IFS= read -r _tracked; do
@@ -540,7 +566,7 @@ rc=0
 shdeps_dep_root jq >/dev/null || rc=$?
 _assert_exit "dep root: package deps have no managed root" 1 "$rc"
 
-result=$(SHDEPS_CONF_DIR="$_dep_api_conf" "$SHDEPS_DIR/bin/shdeps" dep-file cgraf78/sley share/sley/shell.sh)
+result=$(SHDEPS_CONF_DIR="$_dep_api_conf" "$SHDEPS_CLI" dep-file cgraf78/sley share/sley/shell.sh)
 expected=$(cd -P -- "$HOME/git/sley" && pwd)
 _assert_eq "dep file CLI: returns existing asset path" "$expected/share/sley/shell.sh" "$result"
 
@@ -4046,9 +4072,9 @@ ruff                      uv
 prettier                  npm
 CONF
 
-SHDEPS_CONF_DIR="$_lc_conf" SHDEPS_QUIET=1 "$SHDEPS_DIR/bin/shdeps" update >/dev/null 2>&1
+SHDEPS_CONF_DIR="$_lc_conf" SHDEPS_QUIET=1 "$SHDEPS_CLI" update >/dev/null 2>&1
 
-_lc_list=$(SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" list 2>&1)
+_lc_list=$(SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_CLI" list 2>&1)
 _assert_contains "list: shows cargo dep" "mytool" "$_lc_list"
 _assert_contains "list: shows cargo as installed" "mytool" "$_lc_list"
 _assert_contains "list: shows go module" "github.com/junegunn/fzf" "$_lc_list"
@@ -4058,13 +4084,13 @@ _assert_contains "list: shows npm dep" "prettier" "$_lc_list"
 _lc_missing=$(echo "$_lc_list" | grep -cE 'missing' || true)
 _assert_eq "list: no missing entries post-install" "0" "$_lc_missing"
 
-SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check mytool >/dev/null
+SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_CLI" check mytool >/dev/null
 _assert_eq "check: cargo dep returns 0" "0" "$?"
-SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check github.com/junegunn/fzf >/dev/null
+SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_CLI" check github.com/junegunn/fzf >/dev/null
 _assert_eq "check: go dep returns 0" "0" "$?"
-SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check ruff >/dev/null
+SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_CLI" check ruff >/dev/null
 _assert_eq "check: uv dep returns 0" "0" "$?"
-SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_DIR/bin/shdeps" check prettier >/dev/null
+SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_CLI" check prettier >/dev/null
 _assert_eq "check: npm dep returns 0" "0" "$?"
 
 # Empty manifest → missing
@@ -4073,7 +4099,7 @@ _lc_empty_conf=$(_tmpdir)
 cat >"$_lc_empty_conf/deps.conf" <<'CONF'
 mytool   cargo
 CONF
-_lc_empty_list=$(SHDEPS_CONF_DIR="$_lc_empty_conf" "$SHDEPS_DIR/bin/shdeps" list 2>&1)
+_lc_empty_list=$(SHDEPS_CONF_DIR="$_lc_empty_conf" "$SHDEPS_CLI" list 2>&1)
 _assert_contains "list: empty manifest shows missing" "missing" "$_lc_empty_list"
 
 echo ""
