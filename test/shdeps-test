@@ -4444,6 +4444,29 @@ _assert_symlink "install bundle: CLI symlinked" "$_bundle_bin/shdeps"
 _bundle_link=$(readlink "$_bundle_bin/shdeps")
 _assert_eq "install bundle: CLI points at release binary" "$_bundle_inst/shdeps" "$_bundle_link"
 
+# --- Failed bundled install does not expose a partial live directory ---
+
+_bad_bundle_dir=$(_tmpdir)/shdeps-bad-bundle
+_bad_bundle_inst=$(_tmpdir)/shdeps-bad-install
+_bad_bundle_bin=$(_tmpdir)/bad-bundle-bin
+mkdir -p "$_bad_bundle_dir" "$_bad_bundle_bin"
+cat >"$_bad_bundle_dir/shdeps" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$_bad_bundle_dir/shdeps"
+cat >"$_bad_bundle_dir/.shdeps-install.json" <<'JSON'
+{"schema":1,"method":"release"}
+JSON
+cp "$SHDEPS_DIR/install.sh" "$_bad_bundle_dir/install.sh"
+chmod +x "$_bad_bundle_dir/install.sh"
+rc=0
+SHDEPS_DIR="$_bad_bundle_inst" SHDEPS_BIN="$_bad_bundle_bin/shdeps" \
+  "$_bad_bundle_dir/install.sh" >/dev/null 2>&1 || rc=$?
+_assert_exit "install bundle failure: exits 1" 1 "$rc"
+_assert_dir_missing "install bundle failure: no live install dir" "$_bad_bundle_inst"
+_assert_not_exists "install bundle failure: no CLI symlink" "$_bad_bundle_bin/shdeps"
+
 # --- Curl-pipe mode downloads and installs latest release archive ---
 
 case "$(uname -s | tr '[:upper:]' '[:lower:]'):$(uname -m | tr '[:upper:]' '[:lower:]')" in

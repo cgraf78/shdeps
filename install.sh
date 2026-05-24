@@ -142,25 +142,51 @@ _verify_checksum() {
 }
 
 _install_bundle() {
-  local src_dir="$1"
+  local src_dir="$1" parent staging
 
   if [[ -e "$SHDEPS_DIR" ]]; then
     _error "$SHDEPS_DIR exists but is not a git repo"
     exit 1
   fi
 
+  parent=$(dirname "$SHDEPS_DIR")
+  mkdir -p "$parent"
+  staging=$(mktemp -d "$parent/.shdeps-install.XXXXXX")
+
   # Release archives are already verified before users run their bundled
-  # installer. Copy the exact archive payload into SHDEPS_DIR so this mode does
-  # not need git, network, or a Rust toolchain just to activate a local bundle.
-  mkdir -p "$SHDEPS_DIR"
-  cp -p "$src_dir/shdeps" "$SHDEPS_DIR/shdeps"
-  cp -p "$src_dir/shdeps.sh" "$SHDEPS_DIR/shdeps.sh"
-  cp -p "$src_dir/install.sh" "$SHDEPS_DIR/install.sh"
-  cp -p "$src_dir/.shdeps-install.json" "$SHDEPS_DIR/.shdeps-install.json"
-  [[ -f "$src_dir/README.md" ]] && cp -p "$src_dir/README.md" "$SHDEPS_DIR/README.md"
-  [[ -f "$src_dir/LICENSE" ]] && cp -p "$src_dir/LICENSE" "$SHDEPS_DIR/LICENSE"
-  [[ -d "$src_dir/man" ]] && cp -R "$src_dir/man" "$SHDEPS_DIR/"
-  [[ -d "$src_dir/completions" ]] && cp -R "$src_dir/completions" "$SHDEPS_DIR/"
+  # installer, but filesystem activation can still fail. Copy into a sibling
+  # staging directory first so an interrupted or full-disk install does not
+  # leave SHDEPS_DIR looking usable while missing the wrapper or metadata.
+  #
+  # Keep the copy in a subshell so required-file failures are contained and can
+  # be cleaned up before activation. Do not rely on `set -e` here: Bash disables
+  # errexit in several conditional contexts, and this subshell is intentionally
+  # tested by `if ! (...)`. Explicit exits keep Bash 3.2-era installers honest.
+  if ! (
+    cp -p "$src_dir/shdeps" "$staging/shdeps" || exit 1
+    cp -p "$src_dir/shdeps.sh" "$staging/shdeps.sh" || exit 1
+    cp -p "$src_dir/install.sh" "$staging/install.sh" || exit 1
+    cp -p "$src_dir/.shdeps-install.json" "$staging/.shdeps-install.json" || exit 1
+    if [[ -f "$src_dir/README.md" ]]; then
+      cp -p "$src_dir/README.md" "$staging/README.md" || exit 1
+    fi
+    if [[ -f "$src_dir/LICENSE" ]]; then
+      cp -p "$src_dir/LICENSE" "$staging/LICENSE" || exit 1
+    fi
+    if [[ -d "$src_dir/man" ]]; then
+      cp -R "$src_dir/man" "$staging/" || exit 1
+    fi
+    if [[ -d "$src_dir/completions" ]]; then
+      cp -R "$src_dir/completions" "$staging/" || exit 1
+    fi
+  ); then
+    rm -rf "$staging"
+    return 1
+  fi
+  if ! mv "$staging" "$SHDEPS_DIR"; then
+    rm -rf "$staging"
+    return 1
+  fi
   _info "shdeps: installed"
 }
 
