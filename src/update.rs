@@ -1434,6 +1434,68 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
+    fn update_github_release_installs_tar_xz_archive_and_links_extras() {
+        let mut fixture = Fixture::new("release-tar-xz");
+        fixture.write_lib();
+        let archive = tar_xz(&[
+            ("tool-v1.2.3/bin/tool", b"binary".as_slice(), 0o755),
+            (
+                "tool-v1.2.3/share/man/man1/tool.1",
+                b"man".as_slice(),
+                0o644,
+            ),
+        ]);
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-v1.2.3-linux-x86_64.tar.xz",
+                        "browser_download_url":"https://example/tool-v1.2.3-linux-x86_64.tar.xz"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://example/tool-v1.2.3-linux-x86_64.tar.xz", archive);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read_link(&bin_path).unwrap(),
+            install_dir.join("bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.install_dir.join("man/man1/tool.1")).unwrap(),
+            install_dir.join("share/man/man1/tool.1")
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_github_release_installs_zip_archive_and_links_extras() {
         let mut fixture = Fixture::new("release-zip");
         fixture.write_lib();
@@ -2090,6 +2152,20 @@ version() { printf 'saw-pkg\n'; }
     }
 
     fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let tar = tar(entries);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn tar_xz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let tar = tar(entries);
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn tar(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let mut tar = Vec::new();
         {
             let mut builder = Builder::new(&mut tar);
@@ -2103,9 +2179,7 @@ version() { printf 'saw-pkg\n'; }
             }
             builder.finish().unwrap();
         }
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&tar).unwrap();
-        encoder.finish().unwrap()
+        tar
     }
 
     fn zip(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
