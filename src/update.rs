@@ -372,12 +372,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{run, Context, Options};
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
+
     use crate::config::parse_entry;
     use crate::hooks::BashCustomProbe;
     use crate::http::Client;
@@ -936,6 +941,68 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert!(!summary.items[0].changed);
         assert_eq!(summary.items[0].detail, "fresh");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_installs_tar_gz_archive_and_links_extras() {
+        let mut fixture = Fixture::new("release-tar-gz");
+        fixture.write_lib();
+        let archive = tar_gz(&[
+            ("tool-v1.2.3/bin/tool", b"binary".as_slice(), 0o755),
+            (
+                "tool-v1.2.3/share/man/man1/tool.1",
+                b"man".as_slice(),
+                0o644,
+            ),
+        ]);
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-v1.2.3-linux-x86_64.tar.gz",
+                        "browser_download_url":"https://example/tool-v1.2.3-linux-x86_64.tar.gz"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://example/tool-v1.2.3-linux-x86_64.tar.gz", archive);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read_link(&bin_path).unwrap(),
+            install_dir.join("bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.install_dir.join("man/man1/tool.1")).unwrap(),
+            install_dir.join("share/man/man1/tool.1")
+        );
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("owner/tool"),
             Some(&ManifestEntry::new(
@@ -1528,6 +1595,25 @@ version() { printf 'saw-pkg\n'; }
         let mut perms = fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar);
+            for (path, body, mode) in entries {
+                let mut header = Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(*mode);
+                header.set_cksum();
+                builder.append(&header, *body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn temp_dir(name: &str) -> PathBuf {

@@ -1,9 +1,9 @@
 //! `github:release` update execution.
 //!
-//! This module starts with the raw standalone binary path. Archives and
-//! compressed singles intentionally stay outside this first slice, but the
-//! flow already matches the full update shape: TTL fast path, release metadata
-//! fetch, host asset selection, asset download, install, stamp, and manifest.
+//! This module keeps the network/update orchestration separate from the
+//! filesystem installer helpers. The flow mirrors Bash's public contract: TTL
+//! fast path, release metadata fetch, host asset selection, asset download,
+//! install, stamp, and manifest repair.
 
 use std::ffi::OsString;
 
@@ -52,16 +52,29 @@ pub(crate) fn install(
     else {
         return Ok(failed(entry, "no matching release asset"));
     };
-    if !plain_asset(&selection.url) {
-        return Ok(failed(entry, "release asset type is not implemented yet"));
-    }
-
     let token = github::token(&env, context.runner);
     let bytes = match context.client.get(&selection.url, token.as_deref()) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(failed(entry, "release asset download failed")),
     };
-    github_release_install::install_plain(&context.roots.bin_dir, &entry.cmd, &bytes)?;
+    match asset_kind(&selection.url) {
+        AssetKind::Plain => {
+            github_release_install::install_plain(&context.roots.bin_dir, &entry.cmd, &bytes)?;
+        }
+        AssetKind::TarGz => {
+            github_release_install::install_tar_gz(
+                &context.roots.state_dir,
+                &context.roots.install_dir,
+                &context.roots.bin_dir,
+                &entry.name,
+                &entry.cmd,
+                &bytes,
+            )?;
+        }
+        AssetKind::Unsupported => {
+            return Ok(failed(entry, "release asset type is not implemented yet"))
+        }
+    }
     stamp::remote_touch(&stamp_path, options.now)?;
     write_manifest(entry, context)?;
 
@@ -94,14 +107,31 @@ fn failed(entry: &Entry, detail: &str) -> Item {
     }
 }
 
-fn plain_asset(url: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssetKind {
+    Plain,
+    TarGz,
+    Unsupported,
+}
+
+fn asset_kind(url: &str) -> AssetKind {
     let lower = url.to_ascii_lowercase();
-    ![
-        ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".tzst", ".zip", ".gz", ".bz2",
-        ".zst",
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        return AssetKind::TarGz;
+    }
+    // Plain `.gz`/`.zst` single-file compression and other archive formats need
+    // format-specific handling before they are safe drop-in replacements for
+    // Bash. Treat them as explicit unsupported matches instead of accidentally
+    // writing compressed bytes into SHDEPS_BIN_DIR as a "plain" executable.
+    if [
+        ".tar.xz", ".tar.bz2", ".tar.zst", ".tzst", ".zip", ".gz", ".bz2", ".zst",
     ]
     .iter()
     .any(|extension| lower.ends_with(extension))
+    {
+        return AssetKind::Unsupported;
+    }
+    AssetKind::Plain
 }
 
 struct EnvVars<'a> {
@@ -124,5 +154,45 @@ impl Env for EnvVars<'_> {
 
     fn read_to_string(&self, _path: &std::path::Path) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{asset_kind, AssetKind};
+
+    #[test]
+    fn asset_kind_accepts_raw_binary_urls() {
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64"),
+            AssetKind::Plain
+        );
+    }
+
+    #[test]
+    fn asset_kind_accepts_gzip_tar_archives() {
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64.tar.gz"),
+            AssetKind::TarGz
+        );
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64.tgz"),
+            AssetKind::TarGz
+        );
+    }
+
+    #[test]
+    fn asset_kind_rejects_known_archives_and_compressed_singles_until_supported() {
+        for url in [
+            "https://example.com/tool.zip",
+            "https://example.com/tool.tar.xz",
+            "https://example.com/tool.tar.bz2",
+            "https://example.com/tool.tar.zst",
+            "https://example.com/tool.gz",
+            "https://example.com/tool.bz2",
+            "https://example.com/tool.zst",
+        ] {
+            assert_eq!(asset_kind(url), AssetKind::Unsupported, "{url}");
+        }
     }
 }

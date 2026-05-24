@@ -3,12 +3,17 @@
 //! This module owns the filesystem side of release installs. It is deliberately
 //! separate from GitHub fetching and asset selection so tests can pin down
 //! compatibility-sensitive ownership behavior without constructing fake HTTP
-//! clients. The first supported asset shape is the Bash fast path: a raw
-//! standalone binary downloaded directly into the public bin directory.
+//! clients. Raw binaries intentionally preserve the historical Bash behavior
+//! of writing directly to the public bin path; archive installs use a staged
+//! directory because they own more than one filesystem object.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::archive;
+use crate::extras;
+use crate::process;
 use crate::Result;
 
 /// Installs a raw standalone release binary into `SHDEPS_BIN_DIR`.
@@ -29,6 +34,58 @@ pub fn install_plain(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf>
     Ok(target)
 }
 
+/// Installs a gzip-compressed tar release archive.
+pub fn install_tar_gz(
+    state_dir: &Path,
+    install_base: &Path,
+    bin_dir: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    let install_dir = install_base.join(name);
+    let extract_dir = temp_install_path(&install_dir);
+    remove_any(&extract_dir)?;
+    archive::unpack_tar_gz(bytes, &extract_dir)?;
+
+    // Most GitHub release archives wrap their payload in a versioned top-level
+    // directory. shdeps stores installs at a stable dependency path, so peel
+    // that wrapper when it is unambiguous and leave multi-root archives intact.
+    let content_root = content_root(&extract_dir)?;
+    let binary = find_binary(&content_root, cmd).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{cmd} binary not found in release archive"),
+        )
+    })?;
+    let relative_binary = binary
+        .strip_prefix(&content_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| PathBuf::from(cmd));
+
+    // The archive is fully extracted and validated before replacing the live
+    // install. That keeps a bad download from destroying the currently working
+    // tool, while still matching Bash's "latest install wins" behavior once we
+    // know the new payload can provide the requested command.
+    if let Some(parent) = install_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_any(&install_dir)?;
+    fs::rename(&content_root, &install_dir)?;
+    if content_root != extract_dir {
+        remove_any(&extract_dir)?;
+    }
+
+    let source = install_dir.join(relative_binary);
+    let public = bin_dir.join(cmd);
+    replace_symlink(&source, &public)?;
+    // Release archives commonly carry completions or man pages beside the
+    // binary. Reusing the shared extras linker keeps those secondary artifacts
+    // tracked and prunable exactly like repo-based installs.
+    extras::link(state_dir, install_base, name, &install_dir)?;
+    Ok(public)
+}
+
 fn temp_path(target: &Path) -> PathBuf {
     let mut tmp = target.to_path_buf();
     let name = target
@@ -37,6 +94,109 @@ fn temp_path(target: &Path) -> PathBuf {
         .unwrap_or("release-bin");
     tmp.set_file_name(format!(".{name}.tmp.{}", std::process::id()));
     tmp
+}
+
+fn temp_install_path(target: &Path) -> PathBuf {
+    let mut tmp = target.to_path_buf();
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("release-install");
+    tmp.set_file_name(format!(".{name}.tmp.{}", std::process::id()));
+    tmp
+}
+
+fn content_root(extract_dir: &Path) -> Result<PathBuf> {
+    let entries = fs::read_dir(extract_dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    if entries.len() == 1 {
+        let path = entries[0].path();
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+    Ok(extract_dir.to_path_buf())
+}
+
+fn find_binary(root: &Path, cmd: &str) -> Option<PathBuf> {
+    let mut prefixed = None;
+    for path in walk_files(root) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !process::executable_path(&path) {
+            continue;
+        }
+        if name == cmd {
+            return Some(path);
+        }
+        // Some projects ship platform-suffixed binaries inside a generic
+        // archive. Prefer the exact command when present, but keep the first
+        // executable `cmd-*`/`cmd_*` fallback to preserve the useful part of
+        // Bash's looser archive probing without guessing unrelated filenames.
+        if prefixed.is_none()
+            && (name.starts_with(&format!("{cmd}-")) || name.starts_with(&format!("{cmd}_")))
+        {
+            prefixed = Some(path);
+        }
+    }
+    prefixed
+}
+
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // The archive extractor rejects symlinks and hardlinks before this
+            // walk runs, so recursive descent cannot escape the staged tree.
+            files.extend(walk_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn remove_any(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_symlink(source: &Path, target: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::remove_file(target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    symlink(source, target)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn replace_symlink(source: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, target)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -57,9 +217,14 @@ fn make_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
 
     #[test]
     fn plain_install_writes_executable_binary() {
@@ -83,6 +248,80 @@ mod tests {
         super::install_plain(&dir.join("bin"), "tool", b"release").unwrap();
 
         assert_eq!(fs::read(target).unwrap(), b"release");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tar_gz_install_descends_single_root_links_binary_and_extras() {
+        let dir = temp_dir("tar-gz");
+        let bytes = tar_gz(&[
+            ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
+        ]);
+
+        let public = super::install_tar_gz(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(public, dir.join("bin/tool"));
+        assert_eq!(
+            fs::read_link(dir.join("bin/tool")).unwrap(),
+            dir.join("share/owner/tool/bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
+            dir.join("share/owner/tool/share/man/man1/tool.1")
+        );
+        assert!(fs::read_dir(dir.join("share/owner"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")));
+    }
+
+    #[test]
+    fn tar_gz_install_rejects_archives_without_matching_binary() {
+        let dir = temp_dir("missing");
+        let bytes = tar_gz(&[("tool-v1.0/README.md", b"readme".as_slice(), 0o644)]);
+
+        let error = super::install_tar_gz(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("tool binary not found"));
+    }
+
+    fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar);
+            for (path, body, mode) in entries {
+                let mut header = Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(*mode);
+                header.set_cksum();
+                builder.append(&header, *body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn temp_dir(name: &str) -> PathBuf {
