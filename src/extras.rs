@@ -1,0 +1,351 @@
+//! Man page and shell completion linking for GitHub-style installs.
+//!
+//! GitHub repo and release installs often unpack useful files outside `bin/`.
+//! shdeps makes those discoverable by symlinking known man/completion layouts
+//! into the same XDG-style directories the Bash implementation uses. The
+//! important ownership boundary is the `.links` state file: relink and prune
+//! remove only paths recorded there, so stale generated links disappear without
+//! treating the whole user-local share tree as shdeps-owned.
+
+use std::collections::BTreeSet;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use crate::link_state::{self, Kind};
+use crate::Result;
+
+const MAN_PATTERNS: &[&str] = &[
+    "share/man/man[0-9]/*.[0-9]",
+    "share/man/man[0-9]/*.[0-9].gz",
+    "man/man[0-9]/*.[0-9]",
+    "man/man[0-9]/*.[0-9].gz",
+    "manpages/*.[0-9]",
+    "manpages/*.[0-9].gz",
+    "doc/*.[0-9]",
+    "doc/*.[0-9].gz",
+    "*.1",
+    "*.1.gz",
+];
+
+const BASH_PATTERNS: &[&str] = &[
+    "share/bash-completion/completions/*",
+    "completions/*.bash",
+    "completion/*.bash",
+    "complete/*.bash",
+    "autocomplete/*.bash",
+];
+
+const ZSH_PATTERNS: &[&str] = &[
+    "share/zsh/site-functions/_*",
+    "completions/_*",
+    "completions/*.zsh",
+    "completion/_*",
+    "complete/_*",
+    "autocomplete/_*",
+    "autocomplete/*.zsh",
+];
+
+const FISH_PATTERNS: &[&str] = &[
+    "share/fish/vendor_completions.d/*.fish",
+    "completions/*.fish",
+    "completion/*.fish",
+    "complete/*.fish",
+    "autocomplete/*.fish",
+];
+
+/// Links discoverable extras from one dependency install directory.
+pub fn link(
+    state_dir: &Path,
+    install_base: &Path,
+    name: &str,
+    install_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    if !install_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let state_path = link_state::path(state_dir, name, Kind::Extras);
+    link_state::unlink_tracked(&state_path)?;
+
+    let mut linker = Linker {
+        install_base,
+        created: Vec::new(),
+        seen: BTreeSet::new(),
+    };
+    linker.man_pages(install_dir)?;
+    linker.bash(install_dir)?;
+    linker.zsh(install_dir)?;
+    linker.fish(install_dir)?;
+
+    link_state::write(&state_path, &linker.created)?;
+    Ok(linker.created)
+}
+
+struct Linker<'a> {
+    install_base: &'a Path,
+    created: Vec<PathBuf>,
+    seen: BTreeSet<PathBuf>,
+}
+
+impl Linker<'_> {
+    fn man_pages(&mut self, install_dir: &Path) -> Result<()> {
+        for source in expand_patterns(install_dir, MAN_PATTERNS)? {
+            let Some(base) = source.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let name_no_gz = base.strip_suffix(".gz").unwrap_or(base);
+            let section = name_no_gz.rsplit('.').next().unwrap_or("1");
+            self.add(
+                &source,
+                self.install_base.join(format!("man/man{section}/{base}")),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn bash(&mut self, install_dir: &Path) -> Result<()> {
+        let target_dir = self.install_base.join("bash-completion/completions");
+        for source in expand_patterns(install_dir, BASH_PATTERNS)? {
+            let Some(base) = source.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let target_name = base.strip_suffix(".bash").unwrap_or(base);
+            self.add(&source, target_dir.join(target_name))?;
+        }
+        Ok(())
+    }
+
+    fn zsh(&mut self, install_dir: &Path) -> Result<()> {
+        let target_dir = self.install_base.join("zsh/site-functions");
+        for source in expand_patterns(install_dir, ZSH_PATTERNS)? {
+            let Some(base) = source.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            // zsh's `fpath` discovery requires underscore-prefixed function
+            // names. Some upstream archives already ship `_tool`, while
+            // GoReleaser-style `tool.zsh` files need the compatibility rename.
+            let target_name = if let Some(name) = base.strip_suffix(".zsh") {
+                format!("_{name}")
+            } else if base.starts_with('_') {
+                base.to_owned()
+            } else {
+                format!("_{base}")
+            };
+            self.add(&source, target_dir.join(target_name))?;
+        }
+        Ok(())
+    }
+
+    fn fish(&mut self, install_dir: &Path) -> Result<()> {
+        let target_dir = self.install_base.join("fish/vendor_completions.d");
+        for source in expand_patterns(install_dir, FISH_PATTERNS)? {
+            let Some(base) = source.file_name() else {
+                continue;
+            };
+            self.add(&source, target_dir.join(base))?;
+        }
+        Ok(())
+    }
+
+    fn add(&mut self, source: &Path, target: PathBuf) -> Result<()> {
+        if !self.seen.insert(target.clone()) {
+            return Ok(());
+        }
+        ensure_public_parent(&target)?;
+        replace_symlink(source, &target)?;
+        self.created.push(target);
+        Ok(())
+    }
+}
+
+fn expand_patterns(root: &Path, patterns: &[&str]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for pattern in patterns {
+        expand_segments(root, &segments(pattern), &mut paths)?;
+    }
+    Ok(paths
+        .into_iter()
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>())
+}
+
+fn expand_segments(root: &Path, segments: &[&str], paths: &mut Vec<PathBuf>) -> Result<()> {
+    let Some((segment, rest)) = segments.split_first() else {
+        paths.push(root.to_path_buf());
+        return Ok(());
+    };
+
+    if !has_pattern(segment) {
+        expand_segments(&root.join(segment), rest, paths)?;
+        return Ok(());
+    }
+
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if pattern_match(segment, name) {
+            expand_segments(&path, rest, paths)?;
+        }
+    }
+    Ok(())
+}
+
+fn segments(pattern: &str) -> Vec<&str> {
+    pattern.split('/').collect()
+}
+
+fn has_pattern(segment: &str) -> bool {
+    segment.contains('*') || segment.contains("[0-9]")
+}
+
+fn pattern_match(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            if !name.starts_with(prefix) || !suffix_match(suffix, name) {
+                return false;
+            }
+            name.len() >= prefix.len() + suffix_min_len(suffix)
+        }
+        None => segment_match(pattern, name),
+    }
+}
+
+fn suffix_match(pattern: &str, name: &str) -> bool {
+    if let Some((before_digit, after_digit)) = pattern.split_once("[0-9]") {
+        let Some(tail) = name.strip_suffix(after_digit) else {
+            return false;
+        };
+        let Some((index, digit)) = tail.char_indices().next_back() else {
+            return false;
+        };
+        digit.is_ascii_digit() && tail[..index].ends_with(before_digit)
+    } else {
+        name.ends_with(pattern)
+    }
+}
+
+fn suffix_min_len(pattern: &str) -> usize {
+    pattern.replace("[0-9]", "0").len()
+}
+
+fn segment_match(pattern: &str, name: &str) -> bool {
+    if let Some((prefix, suffix)) = pattern.split_once("[0-9]") {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_suffix(suffix) else {
+            return false;
+        };
+        rest.len() == 1 && rest.chars().all(|ch| ch.is_ascii_digit())
+    } else {
+        pattern == name
+    }
+}
+
+fn ensure_public_parent(target: &Path) -> Result<()> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        // The Bash helper creates completion directories under `umask 022` so
+        // zsh `compaudit` does not reject them as insecure. Rust inherits the
+        // process umask, so explicitly normalize the final directory mode.
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_symlink(source: &Path, target: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    match fs::remove_file(target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    symlink(source, target)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use crate::link_state::{self, Kind};
+
+    #[test]
+    #[cfg(unix)]
+    fn links_man_pages_and_completions_with_bash_names() {
+        let dir = temp_dir("link");
+        let install = dir.join("share/owner/tool");
+        fs::create_dir_all(install.join("share/man/man1")).unwrap();
+        fs::create_dir_all(install.join("completions")).unwrap();
+        fs::write(install.join("share/man/man1/tool.1"), ".TH TOOL 1\n").unwrap();
+        fs::write(install.join("completions/tool.bash"), "complete\n").unwrap();
+        fs::write(install.join("completions/tool.zsh"), "compdef\n").unwrap();
+        fs::write(install.join("completions/tool.fish"), "complete\n").unwrap();
+
+        let created =
+            super::link(&dir.join("state"), &dir.join("xdg"), "owner/tool", &install).unwrap();
+
+        assert_eq!(created.len(), 4);
+        assert_eq!(
+            fs::read_link(dir.join("xdg/man/man1/tool.1")).unwrap(),
+            install.join("share/man/man1/tool.1")
+        );
+        assert_eq!(
+            fs::read_link(dir.join("xdg/bash-completion/completions/tool")).unwrap(),
+            install.join("completions/tool.bash")
+        );
+        assert_eq!(
+            fs::read_link(dir.join("xdg/zsh/site-functions/_tool")).unwrap(),
+            install.join("completions/tool.zsh")
+        );
+        assert_eq!(
+            fs::read_link(dir.join("xdg/fish/vendor_completions.d/tool.fish")).unwrap(),
+            install.join("completions/tool.fish")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_state_uses_nested_dependency_name_and_removes_stale_links() {
+        let dir = temp_dir("state");
+        let install = dir.join("install");
+        fs::create_dir_all(install.join("doc")).unwrap();
+        fs::write(install.join("doc/tool.1"), ".TH TOOL 1\n").unwrap();
+
+        super::link(&dir.join("state"), &dir.join("xdg"), "owner/tool", &install).unwrap();
+        let state_path = link_state::path(&dir.join("state"), "owner/tool", Kind::Extras);
+        assert!(state_path.exists());
+        assert!(dir.join("xdg/man/man1/tool.1").is_symlink());
+
+        fs::remove_file(install.join("doc/tool.1")).unwrap();
+        super::link(&dir.join("state"), &dir.join("xdg"), "owner/tool", &install).unwrap();
+
+        assert!(!dir.join("xdg/man/man1/tool.1").exists());
+        assert!(!state_path.exists());
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shdeps-extras-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}

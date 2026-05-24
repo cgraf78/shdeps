@@ -837,6 +837,8 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         let local_clone = fixture.roots.git_dev_dir.join("ds");
         write_executable(&local_clone.join("bin/ds"));
+        fs::create_dir_all(local_clone.join("share/man/man1")).unwrap();
+        fs::write(local_clone.join("share/man/man1/ds.1"), ".TH DS 1\n").unwrap();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
 
         let summary = run(
@@ -855,6 +857,10 @@ version() { printf 'saw-pkg\n'; }
         assert_eq!(
             fs::read_link(fixture.roots.bin_dir.join("ds")).unwrap(),
             install_link.join("bin/ds")
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.install_dir.join("man/man1/ds.1")).unwrap(),
+            install_link.join("share/man/man1/ds.1")
         );
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("cgraf78/ds"),

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bin_link;
 use crate::config::Entry;
+use crate::extras;
 use crate::manifest::{self, ManifestEntry};
 use crate::process::Runner;
 use crate::repo;
@@ -189,6 +190,12 @@ fn record_success(
     bin_link::from_dir(
         &context.roots.state_dir,
         &context.roots.bin_dir,
+        &entry.name,
+        install_dir,
+    )?;
+    extras::link(
+        &context.roots.state_dir,
+        &context.roots.install_dir,
         &entry.name,
         install_dir,
     )?;

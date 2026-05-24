@@ -24,6 +24,7 @@ pub mod config;
 pub mod dep_path;
 pub mod errors;
 pub mod external;
+pub mod extras;
 pub mod github;
 pub mod hooks;
 pub mod http;
