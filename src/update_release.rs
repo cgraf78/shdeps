@@ -100,6 +100,16 @@ pub(crate) fn install(
                 &bytes,
             )?;
         }
+        AssetKind::TarXz => {
+            github_release_install::install_tar_xz(
+                &context.roots.state_dir,
+                &context.roots.install_dir,
+                &context.roots.bin_dir,
+                &entry.name,
+                &entry.cmd,
+                &bytes,
+            )?;
+        }
         AssetKind::Zip => {
             github_release_install::install_zip(
                 &context.roots.state_dir,
@@ -155,6 +165,7 @@ enum AssetKind {
     TarGz,
     TarBz2,
     TarZst,
+    TarXz,
     Zip,
     Unsupported,
 }
@@ -170,6 +181,16 @@ fn asset_kind(url: &str) -> AssetKind {
     if lower.ends_with(".tar.zst") || lower.ends_with(".tzst") {
         return AssetKind::TarZst;
     }
+    if lower.ends_with(".tar.xz") {
+        return AssetKind::TarXz;
+    }
+    // The Bash reference supports xz only as a tar archive. Treating a bare
+    // `.xz` asset as a plain executable would publish compressed bytes into
+    // `SHDEPS_BIN`, so keep this explicitly unsupported until single-file xz
+    // installs are added to both implementations.
+    if lower.ends_with(".xz") {
+        return AssetKind::Unsupported;
+    }
     if lower.ends_with(".gz") {
         return AssetKind::Gz;
     }
@@ -181,16 +202,6 @@ fn asset_kind(url: &str) -> AssetKind {
     }
     if lower.ends_with(".zip") {
         return AssetKind::Zip;
-    }
-    // XZ needs its own decompressor before it is a safe drop-in replacement
-    // for Bash. Treat it as an explicit unsupported match instead of
-    // accidentally writing compressed bytes into SHDEPS_BIN_DIR as a "plain"
-    // executable.
-    if [".tar.xz"]
-        .iter()
-        .any(|extension| lower.ends_with(extension))
-    {
-        return AssetKind::Unsupported;
     }
     AssetKind::Plain
 }
@@ -263,9 +274,19 @@ mod tests {
     }
 
     #[test]
-    fn asset_kind_rejects_known_archives_and_compressed_singles_until_supported() {
-        let url = "https://example.com/tool.tar.xz";
-        assert_eq!(asset_kind(url), AssetKind::Unsupported, "{url}");
+    fn asset_kind_accepts_xz_tar_archives() {
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64.tar.xz"),
+            AssetKind::TarXz
+        );
+    }
+
+    #[test]
+    fn asset_kind_rejects_xz_compressed_singles_until_reference_supports_them() {
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64.xz"),
+            AssetKind::Unsupported
+        );
     }
 
     #[test]

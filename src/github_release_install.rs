@@ -111,6 +111,20 @@ pub fn install_tar_zst(
     })
 }
 
+/// Installs an xz-compressed tar release archive.
+pub fn install_tar_xz(
+    state_dir: &Path,
+    install_base: &Path,
+    bin_dir: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+        archive::unpack_tar_xz(bytes, dest).map(|_| ())
+    })
+}
+
 /// Installs a zip release archive.
 pub fn install_zip(
     state_dir: &Path,
@@ -501,6 +515,36 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn tar_xz_install_descends_single_root_links_binary_and_extras() {
+        let dir = temp_dir("tar-xz");
+        let bytes = tar_xz(&[
+            ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
+        ]);
+
+        let public = super::install_tar_xz(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(public, dir.join("bin/tool"));
+        assert_eq!(
+            fs::read_link(dir.join("bin/tool")).unwrap(),
+            dir.join("share/owner/tool/bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
+            dir.join("share/owner/tool/share/man/man1/tool.1")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn zip_install_descends_single_root_links_binary_and_extras() {
         let dir = temp_dir("zip");
         let bytes = zip(&[
@@ -562,6 +606,13 @@ mod tests {
 
     fn tar_zst(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         zstd(&tar(entries))
+    }
+
+    fn tar_xz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let tar = tar(entries);
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn tar(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {

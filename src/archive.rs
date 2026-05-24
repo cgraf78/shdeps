@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use tar::{Archive, EntryType};
+use xz2::read::XzDecoder;
 use zip::ZipArchive;
 
 /// Extracts a gzip-compressed tar archive into `dest`.
@@ -30,6 +31,11 @@ pub fn unpack_tar_bz2(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
 /// Extracts a zstd-compressed tar archive into `dest`.
 pub fn unpack_tar_zst(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
     unpack_tar(zstd::stream::read::Decoder::new(Cursor::new(bytes))?, dest)
+}
+
+/// Extracts an xz-compressed tar archive into `dest`.
+pub fn unpack_tar_xz(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
+    unpack_tar(XzDecoder::new(Cursor::new(bytes)), dest)
 }
 
 fn unpack_tar(reader: impl Read, dest: &Path) -> io::Result<Vec<PathBuf>> {
@@ -184,7 +190,9 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
-    use super::{safe_entry_path, unpack_tar_bz2, unpack_tar_gz, unpack_tar_zst, unpack_zip};
+    use super::{
+        safe_entry_path, unpack_tar_bz2, unpack_tar_gz, unpack_tar_xz, unpack_tar_zst, unpack_zip,
+    };
 
     #[test]
     fn unpack_tar_gz_extracts_safe_files() {
@@ -227,6 +235,22 @@ mod tests {
         ]);
 
         let extracted = unpack_tar_zst(&bytes, &dest).unwrap();
+
+        assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
+        assert_eq!(fs::read(dest.join("man/man1/shdeps.1")).unwrap(), b"man");
+        assert!(extracted.contains(&PathBuf::from("shdeps")));
+        assert!(extracted.contains(&PathBuf::from("man/man1/shdeps.1")));
+    }
+
+    #[test]
+    fn unpack_tar_xz_extracts_safe_files() {
+        let dest = temp_dir("xz-safe");
+        let bytes = tar_xz(&[
+            Entry::file("shdeps", b"binary"),
+            Entry::file("man/man1/shdeps.1", b"man"),
+        ]);
+
+        let extracted = unpack_tar_xz(&bytes, &dest).unwrap();
 
         assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
         assert_eq!(fs::read(dest.join("man/man1/shdeps.1")).unwrap(), b"man");
@@ -355,6 +379,13 @@ mod tests {
     fn tar_zst(entries: &[Entry<'_>]) -> Vec<u8> {
         let tar = tar(entries);
         zstd::stream::encode_all(tar.as_slice(), 0).unwrap()
+    }
+
+    fn tar_xz(entries: &[Entry<'_>]) -> Vec<u8> {
+        let tar = tar(entries);
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn tar(entries: &[Entry<'_>]) -> Vec<u8> {
