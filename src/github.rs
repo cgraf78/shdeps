@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::http::Client;
 use crate::process::Runner;
 use crate::runtime::Env;
 use crate::Result;
@@ -51,6 +52,26 @@ pub fn parse_releases(json: &str) -> Result<Vec<Release>> {
         .into_iter()
         .filter_map(ApiRelease::into_release)
         .collect())
+}
+
+/// Fetches and parses releases for an `owner/repo` GitHub repository.
+pub fn fetch_releases(
+    repo: &str,
+    env: &impl Env,
+    runner: &impl Runner,
+    client: &impl Client,
+) -> Result<Vec<Release>> {
+    let url = releases_url(repo);
+    let token = token(env, runner);
+    let bytes = client.get(&url, token.as_deref())?;
+    let json = String::from_utf8_lossy(&bytes);
+    parse_releases(&json)
+}
+
+/// Returns the GitHub API releases URL for `owner/repo`.
+#[must_use]
+pub fn releases_url(repo: &str) -> String {
+    format!("https://api.github.com/repos/{repo}/releases")
 }
 
 /// Resolves the runtime token used for GitHub API calls.
@@ -148,7 +169,8 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{parse_releases, token, Asset, Release};
+    use super::{fetch_releases, parse_releases, releases_url, token, Asset, Release};
+    use crate::http::Client;
     use crate::process::{Output, Runner};
     use crate::runtime::Env;
 
@@ -194,6 +216,21 @@ mod tests {
         let error = parse_releases(r#"{"message":"rate limited"}"#).unwrap_err();
 
         assert!(error.to_string().contains("invalid type"));
+    }
+
+    #[test]
+    fn fetch_releases_uses_repo_url_and_resolved_token() {
+        let env = FakeEnv::new().with_var("GH_TOKEN", "token");
+        let runner = PanicRunner;
+        let client = FakeClient {
+            expected_url: releases_url("cgraf78/shdeps"),
+            expected_token: Some("token".to_owned()),
+            body: br#"[{"tag_name":"v2026.05.24","assets":[]}]"#.to_vec(),
+        };
+
+        let releases = fetch_releases("cgraf78/shdeps", &env, &runner, &client).unwrap();
+
+        assert_eq!(releases, vec![release("v2026.05.24")]);
     }
 
     #[test]
@@ -320,6 +357,29 @@ mod tests {
             _timeout: Option<Duration>,
         ) -> io::Result<Output> {
             panic!("environment tokens must short-circuit gh credential probing");
+        }
+    }
+
+    struct FakeClient {
+        expected_url: String,
+        expected_token: Option<String>,
+        body: Vec<u8>,
+    }
+
+    impl Client for FakeClient {
+        fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+            assert_eq!(url, self.expected_url);
+            assert_eq!(token, self.expected_token.as_deref());
+            Ok(self.body.clone())
+        }
+    }
+
+    fn release(tag: &str) -> Release {
+        Release {
+            tag: tag.to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: Vec::new(),
         }
     }
 }
