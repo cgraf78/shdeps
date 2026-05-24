@@ -4444,6 +4444,101 @@ _assert_symlink "install bundle: CLI symlinked" "$_bundle_bin/shdeps"
 _bundle_link=$(readlink "$_bundle_bin/shdeps")
 _assert_eq "install bundle: CLI points at release binary" "$_bundle_inst/shdeps" "$_bundle_link"
 
+# --- Curl-pipe mode downloads and installs latest release archive ---
+
+case "$(uname -s | tr '[:upper:]' '[:lower:]'):$(uname -m | tr '[:upper:]' '[:lower:]')" in
+  linux:x86_64 | linux:amd64) _release_platform="linux-x86_64-musl" ;;
+  linux:aarch64 | linux:arm64) _release_platform="linux-aarch64-musl" ;;
+  darwin:x86_64 | darwin:amd64) _release_platform="macos-x86_64" ;;
+  darwin:aarch64 | darwin:arm64) _release_platform="macos-aarch64" ;;
+  *) _release_platform="" ;;
+esac
+
+if [[ -n "$_release_platform" ]]; then
+  _release_tag="v2099.01.01"
+  _release_archive="shdeps-${_release_tag}-${_release_platform}.tar.gz"
+  _release_dir=$(_tmpdir)/release
+  _release_payload=$(_tmpdir)/release-payload
+  _release_installer=$(_tmpdir)/curl-install
+  _release_inst=$(_tmpdir)/shdeps-release-install
+  _release_bin=$(_tmpdir)/release-bin
+  _release_fakebin=$(_mock_bin)
+  mkdir -p "$_release_dir" "$_release_payload/man/man1" "$_release_payload/completions" \
+    "$_release_installer" "$_release_bin"
+  cat >"$_release_payload/shdeps" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == version ]]; then
+  printf '%s\n' "shdeps commit fedcba987654"
+fi
+SH
+  chmod +x "$_release_payload/shdeps"
+  printf '%s\n' "SHDEPS_PACKAGED_COMMIT=fedcba987654" >"$_release_payload/shdeps.sh"
+  cat "$SHDEPS_DIR/shdeps.sh" >>"$_release_payload/shdeps.sh"
+  cp "$SHDEPS_DIR/install.sh" "$_release_payload/install.sh"
+  chmod +x "$_release_payload/install.sh"
+  cp "$SHDEPS_DIR/README.md" "$_release_payload/README.md"
+  cp "$SHDEPS_DIR/LICENSE" "$_release_payload/LICENSE"
+  cp "$SHDEPS_DIR/man/man1/shdeps.1" "$_release_payload/man/man1/shdeps.1"
+  cp "$SHDEPS_DIR/completions/shdeps.bash" "$_release_payload/completions/shdeps.bash"
+  cp "$SHDEPS_DIR/completions/shdeps.zsh" "$_release_payload/completions/shdeps.zsh"
+  cp "$SHDEPS_DIR/completions/shdeps.fish" "$_release_payload/completions/shdeps.fish"
+  cat >"$_release_payload/.shdeps-install.json" <<JSON
+{"schema":1,"method":"release","artifact_platform":"$_release_platform","tag":"$_release_tag","commit":"fedcba987654","repo":"cgraf78/shdeps"}
+JSON
+  tar -C "$_release_payload" -czf "$_release_dir/$_release_archive" .
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$_release_dir" && sha256sum "$_release_archive") >"$_release_dir/${_release_archive}.sha256"
+  else
+    (cd "$_release_dir" && shasum -a 256 "$_release_archive") >"$_release_dir/${_release_archive}.sha256"
+  fi
+  cat >"$_release_dir/latest.json" <<JSON
+{
+  "tag_name": "$_release_tag",
+  "assets": [
+    {"name": "$_release_archive", "browser_download_url": "https://example.test/$_release_archive"},
+    {"name": "${_release_archive}.sha256", "browser_download_url": "https://example.test/${_release_archive}.sha256"}
+  ]
+}
+JSON
+  cat >"$_release_fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+out=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -H) printf '%s\n' "$2" >>"$SHDEPS_TEST_CURL_LOG"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+case "$url" in
+  */latest) cp "$SHDEPS_TEST_RELEASE_DIR/latest.json" "$out" ;;
+  *.tar.gz) cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out" ;;
+  *.sha256) cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out" ;;
+  *) printf 'unexpected url: %s\n' "$url" >&2; exit 1 ;;
+esac
+SH
+  chmod +x "$_release_fakebin/curl"
+  cp "$SHDEPS_DIR/install.sh" "$_release_installer/install.sh"
+  chmod +x "$_release_installer/install.sh"
+  _release_log=$(_tmpdir)/curl.log
+  PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_CURL_LOG="$_release_log" GH_TOKEN="release-token" \
+    SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+    SHDEPS_DIR="$_release_inst" SHDEPS_BIN="$_release_bin/shdeps" \
+    "$_release_installer/install.sh" >/dev/null 2>&1
+  _assert_file_exists "install release: root binary installed" "$_release_inst/shdeps"
+  _assert_file_exists "install release: metadata installed" "$_release_inst/.shdeps-install.json"
+  _assert_symlink "install release: CLI symlinked" "$_release_bin/shdeps"
+  _release_link=$(readlink "$_release_bin/shdeps")
+  _assert_eq "install release: CLI points at release binary" "$_release_inst/shdeps" "$_release_link"
+  _assert_contains "install release: sends GitHub token" "Authorization: Bearer release-token" "$(cat "$_release_log")"
+else
+  _pass "install release: unsupported host platform skipped"
+fi
+
 # --- Idempotent re-run on existing clean clone ---
 
 SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \

@@ -19,8 +19,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   set -euo pipefail
 fi
 
+_SHDEPS_DEFAULT_REPO="https://github.com/cgraf78/shdeps.git"
 SHDEPS_DIR="${SHDEPS_DIR:-$HOME/.local/share/shdeps}"
-SHDEPS_REPO="${SHDEPS_REPO:-https://github.com/cgraf78/shdeps.git}"
+SHDEPS_REPO="${SHDEPS_REPO:-$_SHDEPS_DEFAULT_REPO}"
 SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
 
 # ---------------------------------------------------------------------------
@@ -30,8 +31,8 @@ SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
 _info() { printf '%s\n' "$*" >&2; }
 _error() { printf 'error: %s\n' "$*" >&2; }
 
-_check_prereqs() {
-  if ! command -v git &>/dev/null; then
+_check_git_prereqs() {
+  if ! command -v git >/dev/null 2>&1; then
     _error "git is required"
     exit 1
   fi
@@ -56,6 +57,90 @@ _is_bundle_dir() {
   [[ -x "$dir/shdeps" && -f "$dir/.shdeps-install.json" ]]
 }
 
+_is_source_checkout_dir() {
+  local dir="$1"
+  [[ -d "$dir/.git" ]]
+}
+
+_github_token() {
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    printf '%s\n' "$GH_TOKEN"
+  elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf '%s\n' "$GITHUB_TOKEN"
+  elif command -v gh >/dev/null 2>&1; then
+    gh auth token 2>/dev/null || true
+  fi
+}
+
+_curl_get() {
+  local url="$1" out="$2" token="${3:-}"
+  if [[ -n "$token" ]]; then
+    curl -fsSL -H "Authorization: Bearer $token" -o "$out" "$url"
+  else
+    curl -fsSL -o "$out" "$url"
+  fi
+}
+
+_repo_slug() {
+  local repo="$SHDEPS_REPO"
+  repo="${repo#https://github.com/}"
+  repo="${repo#git@github.com:}"
+  repo="${repo%.git}"
+  printf '%s\n' "$repo"
+}
+
+_release_platform() {
+  local os arch
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m | tr '[:upper:]' '[:lower:]')
+  case "$arch" in
+    amd64) arch="x86_64" ;;
+    arm64) arch="aarch64" ;;
+  esac
+
+  case "$os:$arch" in
+    linux:x86_64) printf '%s\n' "linux-x86_64-musl" ;;
+    linux:aarch64) printf '%s\n' "linux-aarch64-musl" ;;
+    darwin:x86_64) printf '%s\n' "macos-x86_64" ;;
+    darwin:aarch64) printf '%s\n' "macos-aarch64" ;;
+    *)
+      _error "unsupported shdeps release platform: $os/$arch"
+      return 1
+      ;;
+  esac
+}
+
+_json_string() {
+  local file="$1" key="$2"
+  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
+}
+
+_asset_url() {
+  local file="$1" name="$2"
+  awk -v wanted="$name" '
+    $0 ~ "\"name\"[[:space:]]*:[[:space:]]*\"" wanted "\"" { in_asset = 1 }
+    in_asset && /"browser_download_url"[[:space:]]*:/ {
+      sub(/^.*"browser_download_url"[[:space:]]*:[[:space:]]*"/, "")
+      sub(/".*$/, "")
+      print
+      exit
+    }
+    $0 ~ /^[[:space:]]*\}/ { in_asset = 0 }
+  ' "$file"
+}
+
+_verify_checksum() {
+  local dir="$1" archive="$2" checksum="$3"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$dir" && sha256sum -c "$checksum")
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$dir" && shasum -a 256 -c "$checksum")
+  else
+    _error "sha256sum or shasum is required to verify release archives"
+    return 1
+  fi
+}
+
 _install_bundle() {
   local src_dir="$1"
 
@@ -77,6 +162,57 @@ _install_bundle() {
   [[ -d "$src_dir/man" ]] && cp -R "$src_dir/man" "$SHDEPS_DIR/"
   [[ -d "$src_dir/completions" ]] && cp -R "$src_dir/completions" "$SHDEPS_DIR/"
   _info "shdeps: installed"
+}
+
+_install_release() {
+  local platform repo api_url token tmp json tag archive checksum archive_url checksum_url bundle
+  platform=$(_release_platform) || exit 1
+  repo=$(_repo_slug)
+  api_url="${SHDEPS_RELEASE_API_URL:-https://api.github.com/repos/$repo/releases/latest}"
+  token=$(_github_token)
+  tmp=$(mktemp -d)
+  json="$tmp/release.json"
+
+  # curl-pipe installs have no trusted local checkout. Use the GitHub release
+  # contract instead of cloning source so fresh machines do not need a Rust
+  # toolchain, and so WSL/Linux avoid host glibc drift by consuming musl assets.
+  _curl_get "$api_url" "$json" "$token" || {
+    _error "failed to fetch shdeps release metadata"
+    exit 1
+  }
+
+  tag=$(_json_string "$json" "tag_name")
+  if [[ -z "$tag" ]]; then
+    _error "release metadata did not contain tag_name"
+    exit 1
+  fi
+
+  archive="shdeps-${tag}-${platform}.tar.gz"
+  checksum="${archive}.sha256"
+  archive_url=$(_asset_url "$json" "$archive")
+  checksum_url=$(_asset_url "$json" "$checksum")
+  if [[ -z "$archive_url" || -z "$checksum_url" ]]; then
+    _error "release $tag does not contain assets for $platform"
+    exit 1
+  fi
+
+  _curl_get "$archive_url" "$tmp/$archive" "$token" || {
+    _error "failed to download $archive"
+    exit 1
+  }
+  _curl_get "$checksum_url" "$tmp/$checksum" "$token" || {
+    _error "failed to download $checksum"
+    exit 1
+  }
+  _verify_checksum "$tmp" "$archive" "$checksum" >/dev/null || {
+    _error "checksum verification failed for $archive"
+    exit 1
+  }
+
+  bundle="$tmp/bundle"
+  mkdir -p "$bundle"
+  tar -xzf "$tmp/$archive" -C "$bundle"
+  _install_bundle "$bundle"
 }
 
 # Symlink CLI into PATH and link man page + shell completions.
@@ -117,7 +253,17 @@ _install() {
     return
   fi
 
-  _check_prereqs
+  if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" ]] && ! _is_source_checkout_dir "$script_dir"; then
+    _install_release
+    if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
+      # shellcheck source=/dev/null
+      . "$SHDEPS_DIR/shdeps.sh"
+      _setup_links "$SHDEPS_DIR"
+    fi
+    return
+  fi
+
+  _check_git_prereqs
 
   if [[ -d "$SHDEPS_DIR/.git" ]]; then
     # Already installed — pull latest if clean
