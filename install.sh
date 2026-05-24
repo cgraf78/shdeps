@@ -419,12 +419,10 @@ _ensure_source_checkout_binary() {
 
 # Symlink CLI into PATH and link man page + shell completions.
 #
-# During the Rust transition, `shdeps.sh` may be either the legacy Bash library
-# or the Rust compatibility wrapper. Prefer the old private helper when present
-# so source checkouts keep their historical behavior, but fall back to the
-# public helper exported by release wrappers. This is intentionally the only
-# place install.sh knows about the helper split; callers still just source
-# `install.sh --bootstrap` and get the same activation contract.
+# Modern installs source the Rust compatibility wrapper, but old checkouts and
+# rollback fixtures may still expose the legacy Bash helper names. Keep this
+# helper bilingual so installer/bootstrap activation is tolerant during fleet
+# migration without spreading the legacy/private helper split to callers.
 _setup_links() {
   local shdeps_dir="$1"
   local cli="$shdeps_dir/bin/shdeps"

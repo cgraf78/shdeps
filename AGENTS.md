@@ -12,22 +12,39 @@ changes.
 
 ## Architecture
 
-- **`shdeps.sh`** — the core library. Sourceable by any bash script.
-  Caller does: `source shdeps.sh; shdeps_update`
-- **`bin/shdeps`** — CLI wrapper. Parses args, sources `shdeps.sh`, dispatches
-  to subcommands (`update`, `self-update`, `list`, `check`, `prune`, `version`).
-- **`install.sh`** — curl-pipeable installer and bootstrap script. Clones the
-  repo, symlinks the CLI into `~/.local/bin`. Idempotent (re-run updates).
-  Supports `--uninstall` and `--bootstrap` (sourceable mode for client
-  integration — finds shdeps, sources it, symlinks CLI, runs self-update).
-- **`test/shdeps-test`** — test runner. Run with: `./test/shdeps-test`
+- **Rust crate and binary (`src/`)** — the behavior owner for the CLI,
+  install/update logic, state handling, hook execution, and hidden `__api`
+  bridge used by shell callers.
+- **`shdeps.sh`** — sourceable Bash compatibility wrapper for the Rust
+  implementation. Existing callers still do:
+  `source shdeps.sh; shdeps_update`.
+- **`shdeps-legacy.sh`** — preserved Bash reference implementation. Keep it
+  available for parity tests and emergency comparison, but do not add new
+  behavior here unless a test explicitly needs to pin legacy behavior.
+- **`bin/shdeps`** — legacy Bash CLI wrapper that sources
+  `shdeps-legacy.sh`. Release archives and normal installs should use the
+  Rust `shdeps` binary instead.
+- **`install.sh`** — curl-pipeable installer and bootstrap script. It installs
+  release archives when available, can build explicit source checkouts, symlinks
+  the CLI into `~/.local/bin`, and supports `--uninstall` plus sourceable
+  `--bootstrap` for client integration.
+- **`test/shdeps-test`** — parity test runner. Run Bash reference coverage with
+  `./test/shdeps-test` and Rust CLI parity with
+  `SHDEPS_IMPL=rust ./test/shdeps-test`.
+- **`test/shdeps-wrapper-test`** — focused tests for the sourceable Rust-era
+  wrapper API.
 
 ## Code Organization
 
-- **Public API section** at the top of `shdeps.sh` contains every `shdeps_` function — the complete public contract in one place. Most are thin wrappers that delegate to internal `_shdeps_` implementations.
-- **Internal sections** below are organized by concern (config parsing, platform matching, package management, etc.) and use `_shdeps_` prefixes.
-- **Internal global variables** use `_SHDEPS_` prefix.
-- When adding new public functions, define the implementation as `_shdeps_` in the appropriate internal section, then add a `shdeps_` wrapper to the public API section.
+- `shdeps.sh` must stay small: public `shdeps_*` functions should be one-line
+  delegating shims unless the helper genuinely must affect the caller's current
+  shell, such as `shdeps_dep_source` or changed-marker coordination.
+- Hidden `shdeps __api ...` commands are the contract between the Bash wrapper
+  and Rust. Keep that bridge narrow, documented, and covered by wrapper tests.
+- Rust modules should own real behavior. Prefer adding Rust APIs and CLI/API
+  tests over growing Bash wrapper logic.
+- Legacy Bash internals still use `_shdeps_` and `_SHDEPS_` names, but those are
+  reference implementation details, not new public API.
 
 ## Configuration
 
