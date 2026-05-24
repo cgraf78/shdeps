@@ -22,6 +22,30 @@ if [[ ! -x "$SHDEPS_RUST_CLI" ]]; then
   exit 2
 fi
 
+_wrapper_lint=$(
+  awk '
+    /^shdeps_[A-Za-z0-9_]+\(\)[[:space:]]*\{/ {
+      name = $1
+      sub(/\(\).*/, "", name)
+      if ($0 ~ /\{.*\}/) {
+        next
+      }
+      if (name == "shdeps_dep_source" || name == "shdeps_mark_changed") {
+        next
+      }
+      print name " is not a one-line public shim"
+    }
+  ' "$SHDEPS_DIR/shdeps.sh"
+)
+if [[ -z "$_wrapper_lint" ]]; then
+  _pass "wrapper lint: public shims stay one-line"
+else
+  _fail "wrapper lint: public shims stay one-line"
+  while IFS= read -r _line; do
+    printf '    %s\n' "$_line" >&2
+  done <<<"$_wrapper_lint"
+fi
+
 _mock_home
 
 _conf=$(_tmpdir)
@@ -97,6 +121,57 @@ _assert_eq "wrapper: dep-source sources into current shell" "1" "${SHDEPS_WRAPPE
 SHDEPS_UPDATE_TXN_ID=txn123 shdeps_mark_changed owner/tool
 _assert_file_exists "wrapper: mark-changed writes txn sentinel" "$_state/.changed-markers/txn123/owner/tool"
 
+_cache_fake=$(_tmpdir)/shdeps
+cat >"$_cache_fake" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${SHDEPS_WRAPPER_CACHE_LOG:?missing cache log}"
+case "${1:-}:${2:-}" in
+  __api:version)
+    printf '%s\n' "abi:1"
+    ;;
+  __api:env-snapshot)
+    printf '%s\n' \
+      "install_dir=/cache/install" \
+      "bin_dir=/cache/bin" \
+      "git_dev_dir=/cache/git" \
+      "platform=linux" \
+      "pkg_mgr=" \
+      "force=0" \
+      "reinstall=0"
+    ;;
+  *)
+    printf 'unexpected wrapper cache call: %s\n' "$*" >&2
+    exit 9
+    ;;
+esac
+SH
+chmod +x "$_cache_fake"
+_cache_log=$(_tmpdir)/wrapper-cache.log
+_cache_output=$(
+  SHDEPS_RUST_CLI="$_cache_fake" \
+    SHDEPS_WRAPPER_CACHE_LOG="$_cache_log" \
+    bash -c '
+      unset SHDEPS_INSTALL_DIR SHDEPS_BIN_DIR SHDEPS_GIT_DEV_DIR
+      . "$1"
+      shdeps_install_dir
+      shdeps_bin_dir
+      shdeps_git_dev_dir
+      shdeps_platform
+      shdeps_install_dir >/dev/null
+      shdeps_pkg_mgr >/dev/null
+    ' \
+    bash "$SHDEPS_DIR/shdeps.sh"
+)
+_assert_eq "wrapper cache: cached helper output" $'/cache/install\n/cache/bin\n/cache/git\nlinux' "$_cache_output"
+_cache_log_content=$(cat "$_cache_log")
+_cache_env_count=$(grep -c '^__api env-snapshot$' "$_cache_log" || true)
+_assert_eq "wrapper cache: env snapshot called once" "1" "$_cache_env_count"
+_assert_not_contains "wrapper cache: install-dir not refetched" "__api install-dir" "$_cache_log_content"
+_assert_not_contains "wrapper cache: bin-dir not refetched" "__api bin-dir" "$_cache_log_content"
+_assert_not_contains "wrapper cache: git-dev-dir not refetched" "__api git-dev-dir" "$_cache_log_content"
+_assert_not_contains "wrapper cache: platform not refetched" "__api platform" "$_cache_log_content"
+
 _fake=$(_tmpdir)/shdeps
 cat >"$_fake" <<'SH'
 #!/usr/bin/env bash
@@ -120,6 +195,35 @@ _missing_output=$(PATH=/nonexistent SHDEPS_RUST_CLI='' "$_bash" -c ". \"\$1\"" b
 _missing_rc=$?
 _assert_exit "wrapper: missing binary refuses source" 1 "$_missing_rc"
 _assert_contains "wrapper: missing binary explains refusal" "could not find the Rust shdeps binary" "$_missing_output"
+
+_old_bash=""
+for _candidate in "${SHDEPS_BASH32:-}" /bin/bash bash3.2 bash32; do
+  [[ -n "$_candidate" ]] || continue
+  if command -v "$_candidate" >/dev/null 2>&1; then
+    _candidate_path=$(command -v "$_candidate")
+    # shellcheck disable=SC2016  # evaluated by the candidate shell, not here
+    _candidate_major=$("$_candidate_path" -c 'printf "%s\n" "${BASH_VERSINFO[0]}"' 2>/dev/null || printf '99')
+    # shellcheck disable=SC2016  # evaluated by the candidate shell, not here
+    _candidate_minor=$("$_candidate_path" -c 'printf "%s\n" "${BASH_VERSINFO[1]}"' 2>/dev/null || printf '99')
+    if ((_candidate_major < 4 || (_candidate_major == 4 && _candidate_minor < 3))); then
+      _old_bash="$_candidate_path"
+      break
+    fi
+  fi
+done
+if [[ -n "$_old_bash" ]]; then
+  # shellcheck disable=SC2016  # `$1` is intentionally expanded by old Bash
+  _old_bash_output=$(SHDEPS_RUST_CLI="$_fake" "$_old_bash" -c '. "$1"' bash "$SHDEPS_DIR/shdeps.sh" 2>&1)
+  _old_bash_rc=$?
+  _assert_exit "wrapper: old Bash refuses source" 1 "$_old_bash_rc"
+  _assert_contains "wrapper: old Bash explains version floor" "requires Bash 4.3 or newer" "$_old_bash_output"
+else
+  # CI usually runs the wrapper suite under a modern Linux Bash. Keep this as
+  # an explicit skip/pass so macOS or local Bash-3.2 fixtures automatically
+  # exercise the real source-time refusal without making Linux CI depend on an
+  # extra legacy shell package.
+  _pass "wrapper: old Bash refusal skipped (no Bash <4.3 found)"
+fi
 
 _bootstrap_release=$(_tmpdir)
 _bootstrap_state=$(_tmpdir)
