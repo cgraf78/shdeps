@@ -6,7 +6,7 @@
 //! run post hooks only for dependencies that actually changed. Keeping those
 //! rules here avoids each install method learning partial transaction policy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::cleanup;
 use crate::config::Entry;
@@ -115,6 +115,12 @@ where
     pub runner: &'a R,
     /// Detected package manager, or empty when none is available.
     pub pkg_mgr: &'a str,
+    /// Environment overrides that affect install decisions.
+    ///
+    /// Repo URL overrides are process environment in the Bash implementation,
+    /// but making them an explicit input keeps `update` deterministic in tests
+    /// and prevents method code from reaching around the runtime boundary.
+    pub env_vars: &'a BTreeMap<String, String>,
 }
 
 impl Summary {
@@ -345,6 +351,7 @@ fn cleanup_roots(roots: &Roots) -> cleanup::Roots {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io;
     use std::os::unix::fs::PermissionsExt;
@@ -930,20 +937,241 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(summary.has_errors());
         assert_eq!(summary.failed, ["cgraf78/ds"]);
-        assert_eq!(
-            summary.items[0].detail,
-            "github:repo network update is not implemented yet"
-        );
+        assert_eq!(summary.items[0].detail, "git not available");
         assert!(manifest::read(&manifest_path)
             .unwrap()
             .get("cgraf78/ds")
             .is_none());
     }
 
+    #[test]
+    fn update_github_repo_clones_fresh_repo_and_sets_ssh_push_url() {
+        let mut fixture = Fixture::new("repo-fresh-clone");
+        fixture.write_lib();
+        fixture.env_vars.insert(
+            "SHDEPS_PRIVATE_TOOL_REPO".to_owned(),
+            "https://github.com/private/tool".to_owned(),
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("private/tool");
+        let clone_tmp = fixture
+            .roots
+            .install_dir
+            .join(format!("private/tool.tmp.{}", std::process::id()));
+        let runner = FakeRunner::default()
+            .with_command("git")
+            .with_created_dir(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/private/tool",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join(".git"),
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "git@github.com:private/tool.git",
+                ],
+                "",
+            );
+
+        let summary = run(
+            &[parse_entry("private/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert!(install_dir.join(".git").is_dir());
+        assert_eq!(summary.items[0].detail, "cloned");
+        assert_eq!(
+            fs::read_to_string(crate::stamp::remote_path(
+                &fixture.roots.state_dir,
+                "private/tool",
+                "repo"
+            ))
+            .unwrap(),
+            "1700000000\n"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("private/tool"),
+            Some(&ManifestEntry::new(
+                "private/tool",
+                "github:repo",
+                "tool",
+                install_dir.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn update_github_repo_fresh_clone_retries_github_https_as_ssh() {
+        let fixture = Fixture::new("repo-fresh-fallback");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("private/tool");
+        let clone_tmp = fixture
+            .roots
+            .install_dir
+            .join(format!("private/tool.tmp.{}", std::process::id()));
+        let runner = FakeRunner::default()
+            .with_command("git")
+            .with_failure(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/private/tool",
+                    clone_tmp.to_str().unwrap(),
+                ],
+            )
+            .with_created_dir(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "git@github.com:private/tool.git",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join(".git"),
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "git@github.com:private/tool.git",
+                ],
+                "",
+            );
+
+        let summary = run(
+            &[parse_entry("private/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(install_dir.join(".git").is_dir());
+        assert_eq!(summary.items[0].detail, "cloned");
+    }
+
+    #[test]
+    fn update_github_repo_existing_clone_retries_pull_with_ssh_origin() {
+        let fixture = Fixture::new("repo-pull-fallback");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("private/tool");
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        let runner = FakeRunner::default()
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "get-url",
+                    "origin",
+                ],
+                "https://github.com/private/tool.git\n",
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "git@github.com:private/tool.git",
+                ],
+                "",
+            )
+            .with_success(
+                "git",
+                ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"],
+                "old-head\n",
+            )
+            .with_failure(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "git@github.com:private/tool.git",
+                ],
+                "",
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+                "",
+            );
+
+        let summary = run(
+            &[parse_entry("private/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "updated");
+    }
+
     struct Fixture {
         roots: Roots,
         hooks: BashCustomProbe,
         env: RuntimeEnv,
+        env_vars: BTreeMap<String, String>,
     }
 
     impl Fixture {
@@ -966,6 +1194,7 @@ version() { printf 'saw-pkg\n'; }
                 roots,
                 hooks,
                 env: RuntimeEnv::new("linux", "host"),
+                env_vars: BTreeMap::new(),
             }
         }
 
@@ -994,6 +1223,7 @@ version() { printf 'saw-pkg\n'; }
                 hooks: &self.hooks,
                 runner,
                 pkg_mgr,
+                env_vars: &self.env_vars,
             }
         }
     }
@@ -1001,8 +1231,9 @@ version() { printf 'saw-pkg\n'; }
     #[derive(Debug, Clone, Default)]
     struct FakeRunner {
         commands: std::collections::BTreeSet<String>,
-        outputs: std::collections::BTreeMap<String, Output>,
+        outputs: std::collections::BTreeMap<String, QueuedOutputs>,
         creates: std::collections::BTreeMap<String, Vec<PathBuf>>,
+        creates_dirs: std::collections::BTreeMap<String, Vec<PathBuf>>,
     }
 
     impl FakeRunner {
@@ -1017,7 +1248,7 @@ version() { printf 'saw-pkg\n'; }
             args: impl IntoIterator<Item = impl AsRef<str>>,
             stdout: &str,
         ) -> Self {
-            self.outputs.insert(
+            self.push_output(
                 key(program, args),
                 Output {
                     success: true,
@@ -1036,7 +1267,7 @@ version() { printf 'saw-pkg\n'; }
             path: PathBuf,
         ) -> Self {
             let key = key(program, args);
-            self.outputs.insert(
+            self.push_output(
                 key.clone(),
                 Output {
                     success: true,
@@ -1049,12 +1280,32 @@ version() { printf 'saw-pkg\n'; }
             self
         }
 
+        fn with_created_dir(
+            mut self,
+            program: &str,
+            args: impl IntoIterator<Item = impl AsRef<str>>,
+            path: PathBuf,
+        ) -> Self {
+            let key = key(program, args);
+            self.push_output(
+                key.clone(),
+                Output {
+                    success: true,
+                    timed_out: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+            self.creates_dirs.entry(key).or_default().push(path);
+            self
+        }
+
         fn with_failure(
             mut self,
             program: &str,
             args: impl IntoIterator<Item = impl AsRef<str>>,
         ) -> Self {
-            self.outputs.insert(
+            self.push_output(
                 key(program, args),
                 Output {
                     success: false,
@@ -1064,6 +1315,14 @@ version() { printf 'saw-pkg\n'; }
                 },
             );
             self
+        }
+
+        fn push_output(&mut self, key: String, output: Output) {
+            self.outputs
+                .entry(key)
+                .or_default()
+                .borrow_mut()
+                .push_back(output);
         }
     }
 
@@ -1082,12 +1341,30 @@ version() { printf 'saw-pkg\n'; }
             for path in self.creates.get(&key).into_iter().flatten() {
                 write_executable(path);
             }
-            Ok(self.outputs.get(&key).cloned().unwrap_or(Output {
+            for path in self.creates_dirs.get(&key).into_iter().flatten() {
+                fs::create_dir_all(path).unwrap();
+            }
+            Ok(self.outputs.get(&key).map(next_output).unwrap_or(Output {
                 success: false,
                 timed_out: false,
                 stdout: String::new(),
                 stderr: String::new(),
             }))
+        }
+    }
+
+    type QueuedOutputs = std::cell::RefCell<std::collections::VecDeque<Output>>;
+
+    fn next_output(outputs: &QueuedOutputs) -> Output {
+        // Some install flows intentionally run the same command twice, for
+        // example `git pull` before and after rewriting an HTTPS origin to SSH.
+        // Keep a tiny queue per command key so tests can model those retries
+        // without shell scripts or global PATH mutation.
+        let mut outputs = outputs.borrow_mut();
+        if outputs.len() > 1 {
+            outputs.pop_front().unwrap()
+        } else {
+            outputs.front().cloned().unwrap()
         }
     }
 
