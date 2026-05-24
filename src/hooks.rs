@@ -43,6 +43,44 @@ declare -f uninstall >/dev/null 2>&1 || exit 10
 uninstall "$name"
 "#;
 
+const INSTALL_SCRIPT: &str = r#"
+name=$1
+lib=$2
+hook=$3
+reinstall=$4
+
+unset -f exists version install post uninstall 2>/dev/null || true
+. "$lib" 2>/dev/null || exit 11
+. "$hook" 2>/dev/null || exit 12
+
+declare -f exists >/dev/null 2>&1 || exit 10
+if exists "$name" >/dev/null 2>&1 && [[ "$reinstall" != 1 ]]; then
+  if declare -f version >/dev/null 2>&1; then
+    version "$name" 2>/dev/null || true
+  fi
+  exit 20
+fi
+
+declare -f install >/dev/null 2>&1 || exit 13
+install "$name" || exit 14
+if declare -f version >/dev/null 2>&1; then
+  version "$name" 2>/dev/null || true
+fi
+"#;
+
+const POST_SCRIPT: &str = r#"
+name=$1
+lib=$2
+hook=$3
+
+unset -f exists version install post uninstall 2>/dev/null || true
+. "$lib" 2>/dev/null || exit 11
+. "$hook" 2>/dev/null || exit 12
+
+declare -f post >/dev/null 2>&1 || exit 10
+post "$name"
+"#;
+
 /// Result of attempting an optional hook `uninstall(name)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Uninstall {
@@ -56,6 +94,44 @@ pub enum Uninstall {
     Failed,
     /// `uninstall(name)` ran successfully.
     Removed,
+}
+
+/// Result of running `install(name)` for a custom dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Install {
+    /// Hook file does not exist.
+    MissingHook,
+    /// Hook exists but cannot be used because a required function is missing.
+    MissingFunction,
+    /// Hook file or compatibility layer failed to source.
+    SourceFailed,
+    /// `exists(name)` reported the dependency was already installed.
+    Already {
+        /// Optional version output from `version(name)`.
+        detail: String,
+    },
+    /// `install(name)` failed.
+    Failed,
+    /// `install(name)` ran successfully.
+    Installed {
+        /// Optional version output after install.
+        detail: String,
+    },
+}
+
+/// Result of running optional `post(name)` after a dependency changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Post {
+    /// Hook file does not exist.
+    MissingHook,
+    /// Hook file exists but has no `post` function.
+    MissingFunction,
+    /// Hook file or compatibility layer failed to source.
+    SourceFailed,
+    /// `post(name)` returned non-zero.
+    Failed,
+    /// `post(name)` ran successfully.
+    Ran,
 }
 
 /// Custom-status probe that evaluates hook `exists`/`version` in Bash.
@@ -106,6 +182,71 @@ impl BashCustomProbe {
             Some(10) => Uninstall::MissingFunction,
             Some(11 | 12) => Uninstall::SourceFailed,
             _ => Uninstall::Failed,
+        })
+    }
+
+    /// Runs `install(name)` for a custom dependency hook.
+    pub fn install(&self, name: &str, roots: &Roots, reinstall: bool) -> Result<Install> {
+        let hook = roots.hooks_dir.join(format!("{name}.sh"));
+        if !hook.is_file() {
+            return Ok(Install::MissingHook);
+        }
+        if !self.shdeps_lib.is_file() {
+            return Ok(Install::SourceFailed);
+        }
+
+        let output = self
+            .command(INSTALL_SCRIPT, name, &hook)
+            .arg(if reinstall { "1" } else { "0" })
+            .env("SHDEPS_CONF_DIR", &roots.conf_dir)
+            .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
+            .env("SHDEPS_STATE_DIR", &roots.state_dir)
+            .env("SHDEPS_GIT_DEV_DIR", &roots.git_dev_dir)
+            .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
+            .env("SHDEPS_BIN_DIR", &roots.bin_dir)
+            .env("SHDEPS_CURRENT_DEP", name)
+            .env("SHDEPS_HOOK_PHASE", "install")
+            .output()?;
+
+        let detail = String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        Ok(match output.status.code() {
+            Some(0) => Install::Installed { detail },
+            Some(20) => Install::Already { detail },
+            Some(10 | 13) => Install::MissingFunction,
+            Some(11 | 12) => Install::SourceFailed,
+            _ => Install::Failed,
+        })
+    }
+
+    /// Runs optional `post(name)` for a dependency that changed.
+    pub fn post(&self, name: &str, roots: &Roots) -> Result<Post> {
+        let hook = roots.hooks_dir.join(format!("{name}.sh"));
+        if !hook.is_file() {
+            return Ok(Post::MissingHook);
+        }
+        if !self.shdeps_lib.is_file() {
+            return Ok(Post::SourceFailed);
+        }
+
+        let output = self
+            .command(POST_SCRIPT, name, &hook)
+            .env("SHDEPS_CONF_DIR", &roots.conf_dir)
+            .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
+            .env("SHDEPS_STATE_DIR", &roots.state_dir)
+            .env("SHDEPS_GIT_DEV_DIR", &roots.git_dev_dir)
+            .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
+            .env("SHDEPS_BIN_DIR", &roots.bin_dir)
+            .env("SHDEPS_CURRENT_DEP", name)
+            .env("SHDEPS_HOOK_PHASE", "post")
+            .output()?;
+
+        Ok(match output.status.code() {
+            Some(0) => Post::Ran,
+            Some(10) => Post::MissingFunction,
+            Some(11 | 12) => Post::SourceFailed,
+            _ => Post::Failed,
         })
     }
 
@@ -161,7 +302,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{BashCustomProbe, Uninstall};
+    use super::{BashCustomProbe, Install, Post, Uninstall};
     use crate::config::parse_entry;
     use crate::runtime::Roots;
     use crate::status::CustomProbe;
@@ -263,6 +404,98 @@ uninstall() {
         assert_eq!(
             fs::read_to_string(roots.state_dir.join("uninstalled")).unwrap(),
             "tool\n"
+        );
+    }
+
+    #[test]
+    fn install_runs_custom_hook_and_reports_change() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let lib = roots.home.join("shdeps.sh");
+        fs::write(&lib, "shdeps_version() { :; }\n").unwrap();
+        write_hook(
+            &roots.hooks_dir.join("tool.sh"),
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/tool-installed" ]]; }
+install() { printf '1\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
+version() { printf '2.0.0\n'; }
+"#,
+        );
+
+        let probe = BashCustomProbe::new(&lib);
+        let result = probe.install("tool", &roots, false).unwrap();
+
+        assert_eq!(
+            result,
+            Install::Installed {
+                detail: "2.0.0".to_owned()
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(roots.state_dir.join("tool-installed")).unwrap(),
+            "1\n"
+        );
+    }
+
+    #[test]
+    fn install_skips_existing_custom_hook_unless_reinstalling() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        fs::write(roots.state_dir.join("tool-installed"), "old\n").unwrap();
+        let lib = roots.home.join("shdeps.sh");
+        fs::write(&lib, "shdeps_version() { :; }\n").unwrap();
+        write_hook(
+            &roots.hooks_dir.join("tool.sh"),
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/tool-installed" ]]; }
+install() { printf 'new\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
+version() { printf 'old-version\n'; }
+"#,
+        );
+
+        let probe = BashCustomProbe::new(&lib);
+
+        assert_eq!(
+            probe.install("tool", &roots, false).unwrap(),
+            Install::Already {
+                detail: "old-version".to_owned()
+            }
+        );
+        assert_eq!(
+            probe.install("tool", &roots, true).unwrap(),
+            Install::Installed {
+                detail: "old-version".to_owned()
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(roots.state_dir.join("tool-installed")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn post_runs_optional_hook_with_context() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let lib = roots.home.join("shdeps.sh");
+        fs::write(&lib, "shdeps_version() { :; }\n").unwrap();
+        write_hook(
+            &roots.hooks_dir.join("tool.sh"),
+            r#"
+post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" > "$SHDEPS_STATE_DIR/post-ran"; }
+"#,
+        );
+
+        let probe = BashCustomProbe::new(&lib);
+        let result = probe.post("tool", &roots).unwrap();
+
+        assert_eq!(result, Post::Ran);
+        assert_eq!(
+            fs::read_to_string(roots.state_dir.join("post-ran")).unwrap(),
+            "tool:post\n"
         );
     }
 
