@@ -702,6 +702,109 @@ fn self_update_reports_unsupported_non_checkout_installs() {
     assert!(text(&output.stderr).contains("no install metadata"));
 }
 
+#[test]
+fn self_update_release_archive_install_updates_through_cli() {
+    let fixture = Fixture::new("self-update-release-cli");
+    let fakebin = fixture.dir.join("fakebin");
+    let install = fixture.dir.join("release-install");
+    let archive = fixture.dir.join("shdeps-release.tar.gz");
+    let checksum = fixture.dir.join("shdeps-release.tar.gz.sha256");
+    let arch = host_arch();
+    let platform = format!("linux-{arch}-musl");
+    fs::create_dir_all(&install).unwrap();
+    fixture.write("release-install/shdeps", "old binary\n");
+    fixture.write("release-install/shdeps.sh", "old shim\n");
+    // Release self-update is intentionally driven from the installed metadata,
+    // not from the current working tree. That is the important migration case
+    // for fleet machines after install.sh has replaced the Bash checkout with a
+    // standalone release bundle.
+    fixture.write(
+        "release-install/.shdeps-install.json",
+        &format!(
+            r#"{{"schema":1,"method":"release","artifact_platform":"{platform}","tag":"v2026.05.23","repo":"cgraf78/shdeps"}}"#
+        ),
+    );
+
+    let archive_name = format!("shdeps-v2026.05.24-{platform}.tar.gz");
+    let checksum_name = format!("{archive_name}.sha256");
+    write_tar_gz(
+        &archive,
+        &[
+            (
+                "shdeps",
+                "#!/bin/sh\nprintf 'shdeps commit cliupdate\\n'\n",
+                0o755,
+            ),
+            ("shdeps.sh", "shdeps_version() { :; }\n", 0o644),
+            ("install.sh", "#!/bin/sh\nexit 0\n", 0o755),
+            ("README.md", "readme\n", 0o644),
+            ("LICENSE", "license\n", 0o644),
+            ("man/man1/shdeps.1", ".TH SHDEPS 1\n", 0o644),
+        ],
+    );
+    fs::write(
+        &checksum,
+        format!(
+            "{}  {archive_name}\n",
+            shdeps::checksum::sha256_hex(&fs::read(&archive).unwrap())
+        ),
+    )
+    .unwrap();
+
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+set -e
+config=$(cat)
+# Production sends URLs through curl's stdin config so tokens never appear in
+# process argv. The fake keeps that contract visible instead of accepting argv
+# shortcuts that the real transport does not use.
+case "$config" in
+  *'url = "https://api.github.com/repos/cgraf78/shdeps/releases"'*)
+    printf '[{"tag_name":"v2026.05.24","draft":false,"prerelease":false,"assets":[{"name":"%s","browser_download_url":"https://downloads.example/%s"},{"name":"%s","browser_download_url":"https://downloads.example/%s"}]}]\n' \
+      "$SHDEPS_TEST_ARCHIVE_NAME" "$SHDEPS_TEST_ARCHIVE_NAME" \
+      "$SHDEPS_TEST_CHECKSUM_NAME" "$SHDEPS_TEST_CHECKSUM_NAME"
+    ;;
+  *'url = "https://downloads.example/'"$SHDEPS_TEST_ARCHIVE_NAME"'"'*)
+    cat "$SHDEPS_TEST_ARCHIVE"
+    ;;
+  *'url = "https://downloads.example/'"$SHDEPS_TEST_CHECKSUM_NAME"'"'*)
+    cat "$SHDEPS_TEST_CHECKSUM"
+    ;;
+  *)
+    printf 'unexpected curl config\n%s\n' "$config" >&2
+    exit 22
+    ;;
+esac
+"#,
+    );
+
+    let mut command = fixture.command(["self-update"]);
+    command
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_ARCHIVE", &archive)
+        .env("SHDEPS_TEST_CHECKSUM", &checksum)
+        .env("SHDEPS_TEST_ARCHIVE_NAME", &archive_name)
+        .env("SHDEPS_TEST_CHECKSUM_NAME", &checksum_name);
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "shdeps: updated to v2026.05.24\n");
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(
+        fs::read_to_string(install.join("shdeps")).unwrap(),
+        "#!/bin/sh\nprintf 'shdeps commit cliupdate\\n'\n"
+    );
+    let metadata = shdeps::install_metadata::read(&install).unwrap();
+    assert!(
+        matches!(metadata, shdeps::install_metadata::Read::Valid(metadata)
+            if metadata.tag.as_deref() == Some("v2026.05.24")
+                && metadata.artifact_platform.as_deref() == Some(platform.as_str())
+                && metadata.repo.as_deref() == Some("cgraf78/shdeps"))
+    );
+}
+
 fn run(command: &mut Command) -> Output {
     command.output().expect("shdeps command should run")
 }
