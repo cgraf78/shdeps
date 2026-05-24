@@ -21,6 +21,7 @@ pub mod config;
 pub mod dep_path;
 pub mod errors;
 pub mod hooks;
+pub mod install_metadata;
 pub mod link_state;
 pub mod manifest;
 pub mod package_cache;
