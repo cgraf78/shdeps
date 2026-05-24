@@ -49,6 +49,7 @@ pub mod tool_version;
 pub mod update;
 mod update_external;
 mod update_pkg;
+mod update_repo;
 pub mod version;
 
 pub use errors::{Error, Result};

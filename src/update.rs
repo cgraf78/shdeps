@@ -18,6 +18,7 @@ use crate::runtime::Roots;
 use crate::stamp;
 use crate::update_external;
 use crate::update_pkg;
+use crate::update_repo;
 use crate::Result;
 
 /// Options controlling one update run.
@@ -160,6 +161,16 @@ pub fn run(
         }
 
         match entry.method.as_str() {
+            "github:repo" => {
+                let item = update_repo::install(entry, context, options)?;
+                if item.failed {
+                    summary.failed.push(entry.name.clone());
+                }
+                if item.changed {
+                    changed.push(entry.name.clone());
+                }
+                summary.items.push(item);
+            }
             "cargo" | "go" | "uv" | "npm" => {
                 let item = update_external::install(entry, context, options)?;
                 if item.failed {
@@ -811,6 +822,122 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(!summary.has_errors());
         assert!(summary.items[0].changed);
+    }
+
+    #[test]
+    fn update_github_repo_uses_local_dev_clone_first() {
+        let fixture = Fixture::new("repo-local");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let install_link = fixture.roots.install_dir.join("cgraf78/ds");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "local clone");
+        assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("ds")).unwrap(),
+            install_link.join("bin/ds")
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("cgraf78/ds"),
+            Some(&ManifestEntry::new(
+                "cgraf78/ds",
+                "github:repo",
+                "ds",
+                install_link.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_repo_reuses_existing_local_clone_symlink() {
+        let fixture = Fixture::new("repo-local-unchanged");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        let install_link = fixture.roots.install_dir.join("cgraf78/ds");
+        fs::create_dir_all(install_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&local_clone, &install_link).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+    }
+
+    #[test]
+    fn update_github_repo_canonicalizes_git_suffix_before_installing() {
+        let fixture = Fixture::new("repo-git-suffix");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds.git|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(fixture.roots.install_dir.join("cgraf78/ds").is_symlink());
+        assert!(!fixture.roots.install_dir.join("cgraf78/ds.git").exists());
+        assert!(manifest::read(&manifest_path)
+            .unwrap()
+            .get("cgraf78/ds")
+            .is_some());
+        assert!(manifest::read(&manifest_path)
+            .unwrap()
+            .get("cgraf78/ds.git")
+            .is_none());
+    }
+
+    #[test]
+    fn update_github_repo_without_local_clone_fails_without_manifest_row() {
+        let fixture = Fixture::new("repo-network-unimplemented");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["cgraf78/ds"]);
+        assert_eq!(
+            summary.items[0].detail,
+            "github:repo network update is not implemented yet"
+        );
+        assert!(manifest::read(&manifest_path)
+            .unwrap()
+            .get("cgraf78/ds")
+            .is_none());
     }
 
     struct Fixture {
