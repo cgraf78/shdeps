@@ -22,6 +22,7 @@ pub mod cli;
 pub mod config;
 pub mod dep_path;
 pub mod errors;
+pub mod external;
 pub mod github;
 pub mod hooks;
 pub mod http;
