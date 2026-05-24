@@ -1224,6 +1224,32 @@ Use hive-memory's checkout/auth pattern:
 - minimal job permissions
 - explicit credentials only where release upload requires them
 
+## Implementation Workflow
+
+Implement the Rust port as a series of granular, progressive local commits.
+Each commit should leave the repository in a coherent state and should include
+the focused tests for the behavior it introduces or changes.
+
+Commit rules for the port:
+
+- Commit after each logical slice, such as the Rust skeleton, pure parser
+  logic, manifest state, one install method, hook runner mechanics, wrapper
+  cutover, installer migration, and release packaging.
+- Keep structural and behavioral changes separate when practical. For example,
+  add the module skeleton and public types before filling in install-method
+  behavior that depends on them.
+- Run the relevant local checks before each commit. At minimum, run the current
+  shell parity suite for Bash-facing behavior and the Rust fmt/clippy/test
+  checks once the Rust crate exists.
+- Use the repository commit-message style from the agent rules, with `Summary`
+  and `Testing` sections, so each commit can stand alone in review.
+- Do not push this work to the remote GitHub repository during implementation
+  unless the user explicitly asks for a push. Local commits are expected; remote
+  publication is a separate user decision.
+- If a later phase reveals a previous local commit needs adjustment and that
+  commit has not been pushed, amend or use a local fixup/rebase workflow rather
+  than adding noisy corrective commits.
+
 ## Implementation Phases
 
 ### Phase 0: Freeze The Reference
@@ -1783,7 +1809,7 @@ The phased plan is mostly sequential by dependency. Within phases, some work
 can parallelize across worktrees:
 
 | Phase | Modules touched | Depends on |
-|------|----------------|------------|
+| --- | --- | --- |
 | 0 — Freeze | `test/`, `docs/` | — |
 | 1 — Skeleton | `Cargo.toml`, `src/`, `build.rs`, CI | 0 |
 | 2 — Pure logic | `src/config`, `src/platform`, `src/version` | 1 |
@@ -1817,7 +1843,7 @@ Coordinate or sequence those edits.
 ## Failure Modes (one per new codepath)
 
 | Codepath | Realistic failure | Test? | Error handling? | Silent? |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `build.rs` version resolution | Neither env nor git available at build | Required (D7-adjacent gap G7) | Build fails hard | No |
 | Advisory lock acquisition | Lock held by orphaned process | D4 timeout test | Structured error after timeout | No |
 | `__api` ABI mismatch | Wrapper sourced from older shdeps | D2 negotiation test | Wrapper refuses on source | No |
@@ -1977,7 +2003,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
-|--------|---------|-----|------|--------|----------|
+| --- | --- | --- | --- | --- | --- |
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | 26 decisions (D1–D26), 0 unresolved, 0 critical gaps |

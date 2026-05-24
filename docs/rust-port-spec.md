@@ -17,6 +17,29 @@ tests. If this document and the current Bash implementation disagree before the
 Rust port is complete, treat the Bash implementation and existing tests as the
 source of truth, then update this spec or the tests intentionally.
 
+## Implementation Workflow Contract
+
+This spec defines behavior, not a release branch policy, but the Rust port is
+large enough that implementation workflow is part of compatibility risk
+control. The port MUST be implemented through granular, progressive local
+commits that each preserve a coherent repository state and carry their relevant
+tests.
+
+Local commit expectations:
+
+- Commit each logical slice independently: skeleton, parser/domain types,
+  state/manifest, package cache, one install method at a time, hook runner,
+  Bash wrapper, installer migration, and release packaging.
+- Keep behavior changes close to their tests. A commit that changes public CLI,
+  Bash API, state format, hook behavior, installer behavior, or performance
+  contract MUST include or update the matching test coverage in the same local
+  commit.
+- Prefer local amend/fixup/rebase for unpushed corrections so the final history
+  remains readable.
+- Do not push Rust port implementation commits to the remote GitHub repository
+  unless the user explicitly requests a push. Local commits are allowed and
+  expected; remote publication is a separate decision.
+
 ## Terminology
 
 - **Dependency**: one configured tool or asset line in a `*.conf` file.
