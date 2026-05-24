@@ -160,11 +160,18 @@ _install_release_fail() {
 }
 
 _install_bundle() {
-  local src_dir="$1" parent staging
+  local src_dir="$1" parent staging backup=""
 
   if [[ -e "$SHDEPS_DIR" ]]; then
-    _error "$SHDEPS_DIR exists but is not a git repo"
-    return 1
+    if [[ -d "$SHDEPS_DIR/.git" ]]; then
+      _error "$SHDEPS_DIR is a git checkout; refusing to replace it with a release archive"
+      return 1
+    fi
+    if ! grep -q '"method"[[:space:]]*:[[:space:]]*"release"' "$SHDEPS_DIR/.shdeps-install.json" 2>/dev/null; then
+      _error "$SHDEPS_DIR exists but is not a shdeps release install"
+      return 1
+    fi
+    backup="${SHDEPS_DIR}.shdeps-backup.$$"
   fi
 
   parent=$(dirname "$SHDEPS_DIR")
@@ -201,9 +208,26 @@ _install_bundle() {
     rm -rf "$staging"
     return 1
   fi
+  if [[ -n "$backup" ]]; then
+    # Existing release installs are owned by shdeps, but still treat
+    # replacement as a transaction. Move the old tree aside only after the new
+    # payload is complete, then restore it if the final activation rename
+    # fails. Git checkouts and unknown/manual dirs are rejected above because
+    # automatic release conversion needs a separate migration path.
+    if ! mv "$SHDEPS_DIR" "$backup"; then
+      rm -rf "$staging"
+      return 1
+    fi
+  fi
   if ! mv "$staging" "$SHDEPS_DIR"; then
+    if [[ -n "$backup" ]]; then
+      mv "$backup" "$SHDEPS_DIR" 2>/dev/null || true
+    fi
     rm -rf "$staging"
     return 1
+  fi
+  if [[ -n "$backup" ]]; then
+    rm -rf "$backup"
   fi
   _info "shdeps: installed"
 }

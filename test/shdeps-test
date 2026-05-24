@@ -4444,6 +4444,29 @@ _assert_symlink "install bundle: CLI symlinked" "$_bundle_bin/shdeps"
 _bundle_link=$(readlink "$_bundle_bin/shdeps")
 _assert_eq "install bundle: CLI points at release binary" "$_bundle_inst/shdeps" "$_bundle_link"
 
+# --- Bundled release archive replaces an existing release-owned install ---
+
+_bundle_update_dir=$(_tmpdir)/shdeps-bundle-update
+mkdir -p "$_bundle_update_dir"
+cp -R "$_bundle_dir/." "$_bundle_update_dir/"
+cat >"$_bundle_update_dir/shdeps" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == version ]]; then
+  printf '%s\n' "shdeps commit 222222222222"
+fi
+SH
+chmod +x "$_bundle_update_dir/shdeps"
+cat >"$_bundle_update_dir/.shdeps-install.json" <<'JSON'
+{"schema":1,"method":"release","artifact_platform":"test","tag":"dev-test-2","commit":"222222222222","repo":"cgraf78/shdeps"}
+JSON
+SHDEPS_DIR="$_bundle_inst" SHDEPS_BIN="$_bundle_bin/shdeps" \
+  "$_bundle_update_dir/install.sh" >/dev/null 2>&1
+_assert_eq "install bundle replace: binary updated" \
+  "shdeps commit 222222222222" "$("$_bundle_inst/shdeps" version)"
+_assert_symlink "install bundle replace: CLI symlink preserved" "$_bundle_bin/shdeps"
+_bundle_link=$(readlink "$_bundle_bin/shdeps")
+_assert_eq "install bundle replace: CLI still points at release binary" "$_bundle_inst/shdeps" "$_bundle_link"
+
 # --- Failed bundled install does not expose a partial live directory ---
 
 _bad_bundle_dir=$(_tmpdir)/shdeps-bad-bundle
@@ -4466,6 +4489,28 @@ SHDEPS_DIR="$_bad_bundle_inst" SHDEPS_BIN="$_bad_bundle_bin/shdeps" \
 _assert_exit "install bundle failure: exits 1" 1 "$rc"
 _assert_dir_missing "install bundle failure: no live install dir" "$_bad_bundle_inst"
 _assert_not_exists "install bundle failure: no CLI symlink" "$_bad_bundle_bin/shdeps"
+
+# --- Failed bundled replacement preserves the prior release install ---
+
+_bad_replace_dir=$(_tmpdir)/shdeps-bad-replace
+mkdir -p "$_bad_replace_dir"
+cat >"$_bad_replace_dir/shdeps" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$_bad_replace_dir/shdeps"
+cat >"$_bad_replace_dir/.shdeps-install.json" <<'JSON'
+{"schema":1,"method":"release"}
+JSON
+cp "$SHDEPS_DIR/install.sh" "$_bad_replace_dir/install.sh"
+chmod +x "$_bad_replace_dir/install.sh"
+rc=0
+SHDEPS_DIR="$_bundle_inst" SHDEPS_BIN="$_bundle_bin/shdeps" \
+  "$_bad_replace_dir/install.sh" >/dev/null 2>&1 || rc=$?
+_assert_exit "install bundle replace failure: exits 1" 1 "$rc"
+_assert_eq "install bundle replace failure: old binary preserved" \
+  "shdeps commit 222222222222" "$("$_bundle_inst/shdeps" version)"
+_assert_symlink "install bundle replace failure: CLI symlink preserved" "$_bundle_bin/shdeps"
 
 # --- Curl-pipe mode downloads and installs latest release archive ---
 
