@@ -16,6 +16,7 @@
 
 pub mod cli;
 pub mod errors;
+pub mod platform;
 pub mod version;
 
 pub use errors::{Error, Result};
