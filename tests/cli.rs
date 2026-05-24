@@ -2,7 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn shdeps() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shdeps"))
@@ -432,6 +432,116 @@ fn dep_file_stays_fast_with_many_configured_dependencies() {
 }
 
 #[test]
+fn cheap_path_and_status_commands_stay_within_ci_budget() {
+    let fixture = Fixture::new("cheap-path-status-perf");
+    let mut config = String::new();
+    for index in 0..100 {
+        config.push_str(&format!("owner/tool-{index:03}  github:repo\n"));
+    }
+    config.push_str("cgraf78/sley  github:repo\n");
+    config.push_str("asset github:release asset\n");
+    fixture.write("conf/deps.conf", &config);
+    fixture.write("share/cgraf78/sley/share/sley/shell.sh", "SLEY=installed\n");
+    fixture.write_executable("bin/asset", "#!/bin/sh\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "asset|github:release|asset|{}\n",
+            fixture.dir.join("bin/asset").display()
+        ),
+    );
+
+    // Warm the binary once, then time real subprocess invocations. These
+    // commands sit on editor and shell-integration paths, so the guard is about
+    // catching obvious startup/config-load regressions rather than claiming a
+    // precise benchmark number.
+    assert_success(&run(&mut fixture.command(["version"])));
+
+    let (dep_root, root_elapsed) = timed(&mut fixture.command(["dep-root", "cgraf78/sley"]));
+    assert_success(&dep_root);
+    assert!(
+        root_elapsed <= Duration::from_millis(200),
+        "dep-root should stay under the CI cheap-command budget; elapsed={root_elapsed:?}, stdout={:?}, stderr={:?}",
+        text(&dep_root.stdout),
+        text(&dep_root.stderr)
+    );
+
+    let (dep_path, path_elapsed) =
+        timed(&mut fixture.command(["dep-path", "cgraf78/sley", "share/sley/shell.sh"]));
+    assert_success(&dep_path);
+    assert!(
+        path_elapsed <= Duration::from_millis(200),
+        "dep-path should stay under the CI cheap-command budget; elapsed={path_elapsed:?}, stdout={:?}, stderr={:?}",
+        text(&dep_path.stdout),
+        text(&dep_path.stderr)
+    );
+
+    let (check, check_elapsed) = timed(&mut fixture.command(["check", "asset"]));
+    assert_success(&check);
+    assert_eq!(text(&check.stdout), "asset: installed\n");
+    assert!(
+        check_elapsed <= Duration::from_millis(300),
+        "manifest-backed check should stay under the CI budget; elapsed={check_elapsed:?}, stdout={:?}, stderr={:?}",
+        text(&check.stdout),
+        text(&check.stderr)
+    );
+}
+
+#[test]
+fn no_op_manifest_backed_update_stays_fast_and_skips_network_and_tools() {
+    let fixture = Fixture::new("noop-update-perf");
+    fixture.write(
+        "conf/deps.conf",
+        "owner/tool github:release tool\nripgrep cargo rg\ngithub.com/junegunn/fzf go fzf\nruff uv\nprettier npm\n",
+    );
+    fixture.write_executable("bin/tool", "#!/bin/sh\n");
+    fixture.write_executable("share/ripgrep/bin/rg", "#!/bin/sh\n");
+    fixture.write_executable("share/github.com/junegunn/fzf/bin/fzf", "#!/bin/sh\n");
+    fixture.write_executable("share/ruff/bin/ruff", "#!/bin/sh\n");
+    fixture.write_executable("share/prettier/bin/prettier", "#!/bin/sh\n");
+    for (name, kind) in [
+        ("owner/tool", "release"),
+        ("ripgrep", "cargo"),
+        ("github.com/junegunn/fzf", "go"),
+        ("ruff", "uv"),
+        ("prettier", "npm"),
+    ] {
+        fixture.write_fresh_stamp(name, kind);
+    }
+
+    let fakebin = fixture.dir.join("fakebin");
+    for command in ["curl", "cargo", "go", "uv", "npm"] {
+        fixture.write_executable(
+            fakebin.join(command).strip_prefix(&fixture.dir).unwrap(),
+            "#!/bin/sh\nprintf 'unexpected warm-path command: %s\\n' \"$0\" >&2\nexit 99\n",
+        );
+    }
+    let path = format!("{}:/usr/bin:/bin", fakebin.display());
+
+    // Warm once with the same network/tool-denying PATH. If a future change
+    // accidentally makes a fresh manifest-backed update touch GitHub or a
+    // language installer, the fake command fails deterministically instead of
+    // only showing up as a slow benchmark.
+    let mut warm = fixture.command(["update"]);
+    warm.env("PATH", &path);
+    assert_success(&run(&mut warm));
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &path);
+    let (output, elapsed) = timed(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(text(&output.stderr), "");
+    assert!(
+        elapsed <= Duration::from_secs(1),
+        "warm manifest-backed update should stay under the CI budget; elapsed={elapsed:?}, stdout={:?}, stderr={:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+}
+
+#[test]
 fn list_reports_configured_dependency_statuses() {
     let fixture = Fixture::new("list-status");
     fixture.write(
@@ -809,6 +919,12 @@ fn run(command: &mut Command) -> Output {
     command.output().expect("shdeps command should run")
 }
 
+fn timed(command: &mut Command) -> (Output, Duration) {
+    let started = Instant::now();
+    let output = run(command);
+    (output, started.elapsed())
+}
+
 fn assert_success(output: &Output) {
     assert_eq!(
         output.status.code(),
@@ -900,5 +1016,15 @@ impl Fixture {
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn write_fresh_stamp(&self, name: &str, kind: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_secs();
+        let path = shdeps::stamp::remote_path(&self.dir.join("state"), name, kind);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("{now}\n")).unwrap();
     }
 }
