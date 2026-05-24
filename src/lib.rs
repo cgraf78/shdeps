@@ -29,6 +29,7 @@ pub mod install_metadata;
 pub mod link_state;
 pub mod manifest;
 pub mod package_cache;
+pub mod pkg;
 pub mod platform;
 pub mod process;
 pub mod prune;
