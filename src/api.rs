@@ -137,6 +137,20 @@ where
             };
             dep_file(target, rel, overrides, stdout)
         }
+        "pkg-install"
+        | "pkg-install-for-mgr"
+        | "require-sudo"
+        | "link-extras"
+        | "unlink-extras"
+        | "github-release-install" => {
+            // These names are part of the wrapper ABI, so recognize them now
+            // instead of letting callers see "unknown command" and infer that
+            // the bridge surface changed. They remain explicit runtime
+            // failures until the package, extras-linking, and GitHub release
+            // owners land with their real side-effect implementations.
+            writeln!(stderr, "error: __api {command} is not implemented yet")?;
+            Ok(1)
+        }
         other => {
             writeln!(stderr, "error: unknown __api command '{other}'")?;
             Ok(2)

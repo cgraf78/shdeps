@@ -120,6 +120,14 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert_eq!(text(&count.stdout), "2\n");
     assert_eq!(text(&count.stderr), "");
 
+    let pending = run(&mut fixture.command(["__api", "link-extras", "tool", "/tmp/tool"]));
+    assert_eq!(pending.status.code(), Some(1));
+    assert_eq!(text(&pending.stdout), "");
+    assert_eq!(
+        text(&pending.stderr),
+        "error: __api link-extras is not implemented yet\n"
+    );
+
     let snapshot = run(&mut fixture.command(["--force", "__api", "env-snapshot"]));
     assert_success(&snapshot);
     let stdout = text(&snapshot.stdout);
