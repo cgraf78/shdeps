@@ -372,6 +372,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io;
+    use std::io::Cursor;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -382,6 +383,8 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use tar::{Builder, Header};
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
 
     use crate::config::parse_entry;
     use crate::hooks::BashCustomProbe;
@@ -1061,6 +1064,64 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    #[cfg(unix)]
+    fn update_github_release_installs_zip_archive_and_links_extras() {
+        let mut fixture = Fixture::new("release-zip");
+        fixture.write_lib();
+        let archive = zip(&[
+            ("tool-v1.2.3/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.2.3/share/zsh/site-functions/_tool", b"comp", 0o644),
+        ]);
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-v1.2.3-linux-x86_64.zip",
+                        "browser_download_url":"https://example/tool-v1.2.3-linux-x86_64.zip"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://example/tool-v1.2.3-linux-x86_64.zip", archive);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read_link(&bin_path).unwrap(),
+            install_dir.join("bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.install_dir.join("zsh/site-functions/_tool")).unwrap(),
+            install_dir.join("share/zsh/site-functions/_tool")
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_github_repo_uses_local_dev_clone_first() {
         let fixture = Fixture::new("repo-local");
         fixture.write_lib();
@@ -1666,6 +1727,21 @@ version() { printf 'saw-pkg\n'; }
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn zip(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let cursor = Cursor::new(&mut bytes);
+            let mut writer = ZipWriter::new(cursor);
+            for (path, body, mode) in entries {
+                let options = SimpleFileOptions::default().unix_permissions(*mode);
+                writer.start_file(path, options).unwrap();
+                writer.write_all(body).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        bytes
     }
 
     fn temp_dir(name: &str) -> PathBuf {

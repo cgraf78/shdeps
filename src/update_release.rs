@@ -74,6 +74,16 @@ pub(crate) fn install(
                 &bytes,
             )?;
         }
+        AssetKind::Zip => {
+            github_release_install::install_zip(
+                &context.roots.state_dir,
+                &context.roots.install_dir,
+                &context.roots.bin_dir,
+                &entry.name,
+                &entry.cmd,
+                &bytes,
+            )?;
+        }
         AssetKind::Unsupported => {
             return Ok(failed(entry, "release asset type is not implemented yet"))
         }
@@ -115,6 +125,7 @@ enum AssetKind {
     Plain,
     Gz,
     TarGz,
+    Zip,
     Unsupported,
 }
 
@@ -126,16 +137,17 @@ fn asset_kind(url: &str) -> AssetKind {
     if lower.ends_with(".gz") {
         return AssetKind::Gz;
     }
+    if lower.ends_with(".zip") {
+        return AssetKind::Zip;
+    }
     // Plain `.bz2`/`.zst` single-file compression and other archive formats
     // need format-specific handling before they are safe drop-in replacements
     // for Bash. Treat them as explicit unsupported matches instead of
     // accidentally writing compressed bytes into SHDEPS_BIN_DIR as a "plain"
     // executable.
-    if [
-        ".tar.xz", ".tar.bz2", ".tar.zst", ".tzst", ".zip", ".bz2", ".zst",
-    ]
-    .iter()
-    .any(|extension| lower.ends_with(extension))
+    if [".tar.xz", ".tar.bz2", ".tar.zst", ".tzst", ".bz2", ".zst"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
     {
         return AssetKind::Unsupported;
     }
@@ -192,7 +204,6 @@ mod tests {
     #[test]
     fn asset_kind_rejects_known_archives_and_compressed_singles_until_supported() {
         for url in [
-            "https://example.com/tool.zip",
             "https://example.com/tool.tar.xz",
             "https://example.com/tool.tar.bz2",
             "https://example.com/tool.tar.zst",
@@ -208,6 +219,14 @@ mod tests {
         assert_eq!(
             asset_kind("https://example.com/tool-linux-x86_64.gz"),
             AssetKind::Gz
+        );
+    }
+
+    #[test]
+    fn asset_kind_accepts_zip_archives() {
+        assert_eq!(
+            asset_kind("https://example.com/tool-linux-x86_64.zip"),
+            AssetKind::Zip
         );
     }
 }

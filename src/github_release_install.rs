@@ -56,10 +56,37 @@ pub fn install_tar_gz(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+        archive::unpack_tar_gz(bytes, dest).map(|_| ())
+    })
+}
+
+/// Installs a zip release archive.
+pub fn install_zip(
+    state_dir: &Path,
+    install_base: &Path,
+    bin_dir: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+        archive::unpack_zip(bytes, dest).map(|_| ())
+    })
+}
+
+fn install_archive(
+    state_dir: &Path,
+    install_base: &Path,
+    bin_dir: &Path,
+    name: &str,
+    cmd: &str,
+    extract: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<PathBuf> {
     let install_dir = install_base.join(name);
     let extract_dir = temp_install_path(&install_dir);
     remove_any(&extract_dir)?;
-    archive::unpack_tar_gz(bytes, &extract_dir)?;
+    extract(&extract_dir)?;
 
     // Most GitHub release archives wrap their payload in a versioned top-level
     // directory. shdeps stores installs at a stable dependency path, so peel
@@ -230,6 +257,7 @@ fn make_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Cursor;
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -238,6 +266,8 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use tar::{Builder, Header};
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
 
     #[test]
     fn plain_install_writes_executable_binary() {
@@ -331,6 +361,40 @@ mod tests {
         assert!(error.to_string().contains("tool binary not found"));
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn zip_install_descends_single_root_links_binary_and_extras() {
+        let dir = temp_dir("zip");
+        let bytes = zip(&[
+            ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+            (
+                "tool-v1.0/share/zsh/site-functions/_tool",
+                b"comp".as_slice(),
+                0o644,
+            ),
+        ]);
+
+        let public = super::install_zip(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(public, dir.join("bin/tool"));
+        assert_eq!(
+            fs::read_link(dir.join("bin/tool")).unwrap(),
+            dir.join("share/owner/tool/bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(dir.join("share/zsh/site-functions/_tool")).unwrap(),
+            dir.join("share/owner/tool/share/zsh/site-functions/_tool")
+        );
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
@@ -354,6 +418,21 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn zip(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let cursor = Cursor::new(&mut bytes);
+            let mut writer = ZipWriter::new(cursor);
+            for (path, body, mode) in entries {
+                let options = SimpleFileOptions::default().unix_permissions(*mode);
+                writer.start_file(path, options).unwrap();
+                writer.write_all(body).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        bytes
     }
 
     fn temp_dir(name: &str) -> PathBuf {
