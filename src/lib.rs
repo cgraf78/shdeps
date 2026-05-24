@@ -16,6 +16,7 @@
 
 pub mod api;
 pub mod archive;
+pub mod bin_link;
 pub mod checksum;
 pub mod cleanup;
 pub mod cli;
