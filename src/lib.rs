@@ -18,6 +18,7 @@ pub mod cli;
 pub mod config;
 pub mod errors;
 pub mod platform;
+pub mod tool_version;
 pub mod version;
 
 pub use errors::{Error, Result};
