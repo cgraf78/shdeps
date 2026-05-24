@@ -11,6 +11,11 @@ set -uo pipefail
 
 SHDEPS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SHDEPS_RUST_CLI="${SHDEPS_RUST_CLI:-$SHDEPS_DIR/target/debug/shdeps}"
+# CI builds embed the full GITHUB_SHA while local builds usually embed
+# `git rev-parse --short HEAD`. The wrapper contract is "a concrete commit",
+# not a particular abbreviation length, so keep the assertion aligned with the
+# build.rs validator and future SHA-256-sized repositories.
+_commit_line_re='^shdeps commit [0-9a-fA-F]{7,64}$'
 
 # shellcheck source=helpers.sh
 . "$(dirname "$0")/helpers.sh"
@@ -90,7 +95,7 @@ else
 fi
 
 _version=$(shdeps_version)
-_assert_match "wrapper: version delegates to Rust binary" '^shdeps commit [0-9a-f]{7,12}$' "$_version"
+_assert_match "wrapper: version delegates to Rust binary" "$_commit_line_re" "$_version"
 
 _assert_eq "wrapper: install dir cached from Rust env" "$_install" "$(shdeps_install_dir)"
 _assert_eq "wrapper: bin dir cached from Rust env" "$_bin" "$(shdeps_bin_dir)"
@@ -253,7 +258,7 @@ _bootstrap_output=$(
 )
 _bootstrap_rc=$?
 _assert_exit "bootstrap release wrapper: succeeds" 0 "$_bootstrap_rc"
-_assert_match "bootstrap release wrapper: sourced Rust API" '^shdeps commit [0-9a-f]{7,12}$' "$_bootstrap_output"
+_assert_match "bootstrap release wrapper: sourced Rust API" "$_commit_line_re" "$_bootstrap_output"
 _assert_symlink "bootstrap release wrapper: CLI linked" "$_bootstrap_bin"
 _assert_eq "bootstrap release wrapper: CLI points at sibling binary" "$_bootstrap_release/shdeps" "$(readlink "$_bootstrap_bin")"
 _assert_symlink "bootstrap release wrapper: man page linked through public helper" "$_bootstrap_share/man/man1/shdeps.1"

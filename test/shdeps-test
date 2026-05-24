@@ -4462,12 +4462,11 @@ _assert_eq "shdeps_version: packaged commit" "shdeps commit abcdef123456" "$pack
 
 # --- release-tag.sh ---
 
-_release_commit=$(git -C "$SHDEPS_DIR" rev-parse --short HEAD)
 _release_tag=$(
   cd "$SHDEPS_DIR" || exit 1
-  env -u SHDEPS_RELEASE_TAG GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
+  env -u SHDEPS_RELEASE_TAG SHDEPS_BUILD_COMMIT=abcdef123456 GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
 )
-_assert_eq "release tag: branch ref uses commit identity" "dev-${_release_commit}" "$_release_tag"
+_assert_eq "release tag: branch ref uses commit identity" "dev-abcdef1" "$_release_tag"
 
 _release_tag=$(
   cd "$SHDEPS_DIR" || exit 1

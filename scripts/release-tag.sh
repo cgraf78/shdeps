@@ -23,6 +23,17 @@ if [[ -z "$tag" ]]; then
   tag=$(git describe --tags --exact-match 2>/dev/null || true)
 fi
 
+if [[ -z "$tag" && -n "${SHDEPS_BUILD_COMMIT:-}" ]]; then
+  # Containerized CI can run a checkout owned by a different uid than the shell
+  # user, which makes Git refuse even read-only metadata queries unless the
+  # caller also wires safe.directory into that exact HOME. Release workflows
+  # already know the concrete build commit, so accept that hash directly for dev
+  # smoke archives and keep Git as the fallback for local convenience.
+  if [[ "$SHDEPS_BUILD_COMMIT" =~ ^[0-9a-fA-F]{7,}$ ]]; then
+    tag="dev-${SHDEPS_BUILD_COMMIT:0:7}"
+  fi
+fi
+
 if [[ -z "$tag" ]]; then
   commit=$(git rev-parse --short HEAD)
   tag="dev-${commit}"
