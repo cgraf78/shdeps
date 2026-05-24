@@ -27,6 +27,7 @@ pub mod external;
 pub mod extras;
 pub mod github;
 pub mod github_release;
+pub mod github_release_install;
 pub mod hooks;
 pub mod http;
 pub mod install_metadata;
