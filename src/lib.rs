@@ -20,6 +20,7 @@ pub mod dep_path;
 pub mod errors;
 pub mod link_state;
 pub mod manifest;
+pub mod package_cache;
 pub mod platform;
 pub mod release_asset;
 pub mod stamp;
