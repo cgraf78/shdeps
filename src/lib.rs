@@ -15,6 +15,7 @@
 //! this API as semver-stable yet.
 
 pub mod cli;
+pub mod config;
 pub mod errors;
 pub mod platform;
 pub mod version;
