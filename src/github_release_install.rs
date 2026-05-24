@@ -47,6 +47,18 @@ pub fn install_gz(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
     install_plain(bin_dir, cmd, &decoded)
 }
 
+/// Installs a bzip2-compressed standalone release binary.
+pub fn install_bz2(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let mut decoder = bzip2::read::BzDecoder::new(bytes);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded)?;
+
+    // Like `.gz`, Bash treats `.bz2` assets as compressed single binaries.
+    // Keep the decompression-only difference isolated so raw release ownership
+    // behavior has one implementation in `install_plain`.
+    install_plain(bin_dir, cmd, &decoded)
+}
+
 /// Installs a gzip-compressed tar release archive.
 pub fn install_tar_gz(
     state_dir: &Path,
@@ -58,6 +70,20 @@ pub fn install_tar_gz(
 ) -> Result<PathBuf> {
     install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
         archive::unpack_tar_gz(bytes, dest).map(|_| ())
+    })
+}
+
+/// Installs a bzip2-compressed tar release archive.
+pub fn install_tar_bz2(
+    state_dir: &Path,
+    install_base: &Path,
+    bin_dir: &Path,
+    name: &str,
+    cmd: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    install_archive(state_dir, install_base, bin_dir, name, cmd, |dest| {
+        archive::unpack_tar_bz2(bytes, dest).map(|_| ())
     })
 }
 
@@ -263,6 +289,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    use bzip2::write::BzEncoder;
+    use bzip2::Compression as BzCompression;
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use tar::{Builder, Header};
@@ -300,6 +328,19 @@ mod tests {
         let bytes = gzip(b"binary");
 
         let target = super::install_gz(&dir, "tool", &bytes).unwrap();
+
+        assert_eq!(target, dir.join("tool"));
+        assert_eq!(fs::read(&target).unwrap(), b"binary");
+        assert!(fs::metadata(&target).unwrap().permissions().mode() & 0o111 != 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bz2_install_decompresses_single_binary_and_marks_executable() {
+        let dir = temp_dir("bz2-single");
+        let bytes = bzip2(b"binary");
+
+        let target = super::install_bz2(&dir, "tool", &bytes).unwrap();
 
         assert_eq!(target, dir.join("tool"));
         assert_eq!(fs::read(&target).unwrap(), b"binary");
@@ -363,6 +404,36 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn tar_bz2_install_descends_single_root_links_binary_and_extras() {
+        let dir = temp_dir("tar-bz2");
+        let bytes = tar_bz2(&[
+            ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
+        ]);
+
+        let public = super::install_tar_bz2(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(public, dir.join("bin/tool"));
+        assert_eq!(
+            fs::read_link(dir.join("bin/tool")).unwrap(),
+            dir.join("share/owner/tool/bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
+            dir.join("share/owner/tool/share/man/man1/tool.1")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn zip_install_descends_single_root_links_binary_and_extras() {
         let dir = temp_dir("zip");
         let bytes = zip(&[
@@ -401,7 +472,24 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn bzip2(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = BzEncoder::new(Vec::new(), BzCompression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
     fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let tar = tar(entries);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn tar_bz2(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        bzip2(&tar(entries))
+    }
+
+    fn tar(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let mut tar = Vec::new();
         {
             let mut builder = Builder::new(&mut tar);
@@ -415,9 +503,7 @@ mod tests {
             }
             builder.finish().unwrap();
         }
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&tar).unwrap();
-        encoder.finish().unwrap()
+        tar
     }
 
     fn zip(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {

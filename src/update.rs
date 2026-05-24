@@ -465,6 +465,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{run, Context, Options};
+    use bzip2::write::BzEncoder;
+    use bzip2::Compression as BzCompression;
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use tar::{Builder, Header};
@@ -1238,6 +1240,52 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_decompresses_bzip2_single_binary() {
+        let mut fixture = Fixture::new("release-bz2-single");
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-linux-x86_64.bz2",
+                        "browser_download_url":"https://example/tool-linux-x86_64.bz2"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://example/tool-linux-x86_64.bz2", bzip2(b"binary"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "v1.2.3");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"binary");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_github_release_fast_path_repairs_manifest_without_network() {
         let fixture = Fixture::new("release-fast");
         fixture.write_lib();
@@ -1981,6 +2029,12 @@ version() { printf 'saw-pkg\n'; }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn bzip2(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = BzEncoder::new(Vec::new(), BzCompression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
     }

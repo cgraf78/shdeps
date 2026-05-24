@@ -7,20 +7,29 @@
 //! shdeps release tarballs still extract with their executable bits intact.
 
 use std::fs;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Read};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
+use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use tar::{Archive, EntryType};
 use zip::ZipArchive;
 
 /// Extracts a gzip-compressed tar archive into `dest`.
 pub fn unpack_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
+    unpack_tar(GzDecoder::new(Cursor::new(bytes)), dest)
+}
+
+/// Extracts a bzip2-compressed tar archive into `dest`.
+pub fn unpack_tar_bz2(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
+    unpack_tar(BzDecoder::new(Cursor::new(bytes)), dest)
+}
+
+fn unpack_tar(reader: impl Read, dest: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(dest)?;
-    let decoder = GzDecoder::new(Cursor::new(bytes));
-    let mut archive = Archive::new(decoder);
+    let mut archive = Archive::new(reader);
     let mut extracted = Vec::new();
 
     for entry in archive.entries()? {
@@ -162,13 +171,15 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use bzip2::write::BzEncoder;
+    use bzip2::Compression as BzCompression;
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use tar::{Builder, EntryType, Header};
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
-    use super::{safe_entry_path, unpack_tar_gz, unpack_zip};
+    use super::{safe_entry_path, unpack_tar_bz2, unpack_tar_gz, unpack_zip};
 
     #[test]
     fn unpack_tar_gz_extracts_safe_files() {
@@ -179,6 +190,22 @@ mod tests {
         ]);
 
         let extracted = unpack_tar_gz(&bytes, &dest).unwrap();
+
+        assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
+        assert_eq!(fs::read(dest.join("man/man1/shdeps.1")).unwrap(), b"man");
+        assert!(extracted.contains(&PathBuf::from("shdeps")));
+        assert!(extracted.contains(&PathBuf::from("man/man1/shdeps.1")));
+    }
+
+    #[test]
+    fn unpack_tar_bz2_extracts_safe_files() {
+        let dest = temp_dir("bz2-safe");
+        let bytes = tar_bz2(&[
+            Entry::file("shdeps", b"binary"),
+            Entry::file("man/man1/shdeps.1", b"man"),
+        ]);
+
+        let extracted = unpack_tar_bz2(&bytes, &dest).unwrap();
 
         assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
         assert_eq!(fs::read(dest.join("man/man1/shdeps.1")).unwrap(), b"man");
@@ -291,6 +318,20 @@ mod tests {
     }
 
     fn tar_gz(entries: &[Entry<'_>]) -> Vec<u8> {
+        let tar = tar(entries);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn tar_bz2(entries: &[Entry<'_>]) -> Vec<u8> {
+        let tar = tar(entries);
+        let mut encoder = BzEncoder::new(Vec::new(), BzCompression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn tar(entries: &[Entry<'_>]) -> Vec<u8> {
         let mut tar = Vec::new();
         {
             let mut builder = Builder::new(&mut tar);
@@ -325,10 +366,7 @@ mod tests {
             }
             builder.finish().unwrap();
         }
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&tar).unwrap();
-        encoder.finish().unwrap()
+        tar
     }
 
     struct ZipEntry<'a> {
