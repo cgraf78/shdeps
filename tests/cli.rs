@@ -330,6 +330,21 @@ fn prune_preserves_packages_and_guards_empty_config() {
         .is_empty());
 }
 
+#[test]
+fn self_update_reports_unsupported_non_checkout_installs() {
+    let fixture = Fixture::new("self-update-unsupported");
+    let install = fixture.dir.join("shdeps");
+    fs::create_dir_all(&install).unwrap();
+    let mut command = fixture.command(["self-update"]);
+    command.env("SHDEPS_DIR", &install);
+
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stdout).is_empty());
+    assert!(text(&output.stderr).contains("no install metadata"));
+}
+
 fn run(command: &mut Command) -> Output {
     command.output().expect("shdeps command should run")
 }

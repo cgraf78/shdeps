@@ -14,10 +14,12 @@ use crate::config::{self, Entry};
 use crate::dep_path;
 use crate::errors::Error;
 use crate::hooks::{BashCustomProbe, Uninstall};
+use crate::http::Curl;
 use crate::manifest;
 use crate::process::{self, Process};
 use crate::prune::{self, Options as PruneOptions};
 use crate::runtime::{self, Overrides, ProcessEnv};
+use crate::self_update::{self, Outcome, ReleaseArchiveOutcome, Target};
 use crate::status::{self, Context, DependencyStatus, SkipReason, State};
 use crate::version;
 use crate::Result;
@@ -118,7 +120,8 @@ where
             Ok(2)
         }
         "prune" => prune_cmd(rest, &parsed, stdout, stderr),
-        "update" | "self-update" => not_implemented(command, rest, stderr),
+        "self-update" => self_update_cmd(rest, stdout, stderr),
+        "update" => not_implemented(command, rest, stderr),
         other => {
             writeln!(stderr, "error: unknown command '{other}'")?;
             writeln!(stderr, "Run 'shdeps help' for usage.")?;
@@ -459,6 +462,42 @@ where
     Ok(if summary.has_errors() { 1 } else { 0 })
 }
 
+fn self_update_cmd<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    if let Some(arg) = args.first() {
+        writeln!(stderr, "error: unknown self-update argument '{arg}'")?;
+        return Ok(2);
+    }
+
+    let dir = shdeps_install_dir()?;
+    match self_update::target(&dir)? {
+        Target::SourceCheckout => {
+            let summary = self_update::source_checkout(&dir, &Process)?;
+            write_source_self_update(&summary, stderr)?;
+            Ok(summary.exit_code())
+        }
+        Target::ReleaseArchive(metadata) => {
+            match self_update::release_archive(&dir, &metadata, &ProcessEnv, &Process, &Curl) {
+                Ok(summary) => {
+                    write_release_self_update(&summary, stdout, stderr)?;
+                    Ok(summary.exit_code())
+                }
+                Err(error) => {
+                    writeln!(stderr, "shdeps: self-update failed ({error})")?;
+                    Ok(1)
+                }
+            }
+        }
+        Target::Unsupported { reason } => {
+            writeln!(stderr, "{reason}")?;
+            Ok(1)
+        }
+    }
+}
+
 fn dep_root<W>(target: &str, options: &ParsedOptions, stdout: &mut W) -> Result<i32>
 where
     W: Write,
@@ -664,6 +703,57 @@ where
     Ok(())
 }
 
+fn write_source_self_update<E>(summary: &self_update::Summary, stderr: &mut E) -> Result<()>
+where
+    E: Write,
+{
+    if summary.outcome == Outcome::PullFailed {
+        writeln!(
+            stderr,
+            "shdeps: self-update failed (git pull --ff-only failed)"
+        )?;
+    }
+    Ok(())
+}
+
+fn write_release_self_update<W, E>(
+    summary: &self_update::ReleaseArchiveSummary,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<()>
+where
+    W: Write,
+    E: Write,
+{
+    match &summary.outcome {
+        ReleaseArchiveOutcome::Updated { tag } => {
+            writeln!(stdout, "shdeps: updated to {tag}")?;
+        }
+        ReleaseArchiveOutcome::NoUpdate { current, .. } => {
+            writeln!(stdout, "shdeps: no update available ({current})")?;
+        }
+        ReleaseArchiveOutcome::NoSelectableRelease => {
+            writeln!(stderr, "shdeps: no stable release available")?;
+        }
+        ReleaseArchiveOutcome::UnsupportedPlatform => {
+            writeln!(
+                stderr,
+                "shdeps: no supported release artifact for this platform"
+            )?;
+        }
+        ReleaseArchiveOutcome::NoSupportedArtifact {
+            tag,
+            platform_label,
+        } => {
+            writeln!(
+                stderr,
+                "shdeps: release {tag} has no artifact for {platform_label}"
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn confirm_prune<W>(stdout: &mut W) -> Result<bool>
 where
     W: Write,
@@ -701,6 +791,24 @@ fn shdeps_lib_path() -> Option<PathBuf> {
 
 fn missing_shdeps_lib() -> PathBuf {
     Path::new("/__shdeps_missing__").join("shdeps.sh")
+}
+
+fn shdeps_install_dir() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("SHDEPS_DIR").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+
+    let exe = env::current_exe()?;
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    // Release installs put the Rust binary directly in SHDEPS_DIR, while the
+    // Bash source checkout keeps the wrapper at bin/shdeps. Supporting both
+    // shapes lets the same CLI entry point update converted installs and
+    // developer checkouts without relying on a wrapper-specific env var.
+    if dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+        Ok(dir.parent().unwrap_or(dir).to_path_buf())
+    } else {
+        Ok(dir.to_path_buf())
+    }
 }
 
 fn run_path_lookup<W>(result: Result<PathBuf>, stdout: &mut W) -> Result<i32>
