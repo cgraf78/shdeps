@@ -2,7 +2,8 @@
 
 ![Tests](https://github.com/cgraf78/shdeps/actions/workflows/test.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Bash Version](https://img.shields.io/badge/bash-%3E%3D4.3-blue.svg)](https://www.gnu.org/software/bash/)
+[![Rust](https://img.shields.io/badge/rust-%3E%3D1.74-orange.svg)](https://www.rust-lang.org/)
+[![Bash API](https://img.shields.io/badge/bash%20API-%3E%3D4.3-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
 Declare your shell tools in one config file. shdeps installs and updates them everywhere — brew, apt, dnf, pacman, zypper, apk, GitHub repos, or GitHub release binaries. One manifest, any machine.
@@ -21,7 +22,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 - **TTL-based caching** — avoids redundant network calls
 - **Post-install hooks** — run arbitrary setup when a dependency changes
 - **Config composition** — split deps across multiple `*.conf` files in a config directory
-- **Usable as CLI or library** — `bin/shdeps` CLI or `source shdeps.sh`
+- **Usable as CLI or library** — Rust `shdeps` CLI or `source shdeps.sh`
 
 ## Quick Start
 
@@ -29,7 +30,10 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 curl -fsSL https://raw.githubusercontent.com/cgraf78/shdeps/main/install.sh | bash
 ```
 
-This clones shdeps to `~/.local/share/shdeps` and symlinks the CLI into `~/.local/bin/shdeps`. Re-running the installer updates to the latest version.
+This installs the latest release archive to `~/.local/share/shdeps` and
+symlinks the Rust CLI into `~/.local/bin/shdeps`. Re-running the installer is
+idempotent. Developer/source-checkout installs are still supported when you run
+`install.sh` from a git checkout or set `SHDEPS_REPO` explicitly.
 
 Then create a config and run:
 
@@ -43,7 +47,7 @@ EOF
 shdeps update
 ```
 
-The CLI loads all `*.conf` files from `~/.config/shdeps/` (sorted alphabetically). Split deps across multiple files for organization (e.g., `00-core.conf`, `50-tools.conf`, `99-local.conf`). The library (`source shdeps.sh`) defaults to `./shdeps/`.
+The CLI loads all `*.conf` files from `~/.config/shdeps/` (sorted alphabetically). Split deps across multiple files for organization (e.g., `00-core.conf`, `50-tools.conf`, `99-local.conf`). The sourceable Bash API (`source shdeps.sh`) defaults to `./shdeps/`.
 
 ### Updating shdeps
 
@@ -51,7 +55,10 @@ The CLI loads all `*.conf` files from `~/.config/shdeps/` (sorted alphabetically
 shdeps self-update
 ```
 
-Uses TTL-based caching to avoid redundant pulls. Skips updates if the working tree has uncommitted changes (active development). Use `--force` to bypass the TTL cache.
+Uses TTL-based caching to avoid redundant work. Release installs update from
+the latest matching archive, while source checkouts use `git pull --ff-only`
+and skip updates when the working tree has uncommitted changes (active
+development). Use `--force` to bypass the TTL cache.
 
 ### Uninstalling
 
@@ -312,7 +319,10 @@ The `--bootstrap` flag:
 
 ## Public API
 
-All `shdeps_` functions are defined in a single section at the top of `shdeps.sh`. This is the complete public contract — available to callers, library users, and hook authors.
+The sourceable Bash compatibility wrapper defines the public `shdeps_`
+functions and delegates behavior to the Rust binary through a small hidden
+bridge. This is the complete shell contract available to callers, library
+users, and hook authors.
 
 | Function                          | Description                                                                                 |
 | --------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -357,9 +367,14 @@ Package-manager deps do not have shdeps-owned roots.
 
 ```bash
 ./test/shdeps-test
+SHDEPS_IMPL=rust ./test/shdeps-test
+cargo test
+./test/shdeps-wrapper-test
 ```
 
-Requires bash 4.3+ (for associative arrays and namerefs).
+The standalone CLI is a Rust binary. The sourceable Bash compatibility API and
+hook prelude require Bash 4.3+; `install.sh` itself is kept compatible with the
+stock macOS Bash 3.2 installer path.
 
 ## License
 
