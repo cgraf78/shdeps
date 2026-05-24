@@ -1,4 +1,4 @@
-//! `shdeps self-update` planning and source-checkout behavior.
+//! `shdeps self-update` planning and update behavior.
 //!
 //! Release-archive self-update has stricter rollback and checksum requirements,
 //! so this module starts with the behavior the Bash implementation already owns:
@@ -6,12 +6,15 @@
 //! release-install path share one summary type and one "do not break the
 //! existing install" contract.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::github::Release;
+use crate::github::{self, Release};
+use crate::http::Client;
 use crate::install_metadata::{self, Metadata, Method, Read};
 use crate::process::Runner;
 use crate::release_artifact::{self, Pair};
+use crate::release_stage;
 use crate::runtime::Env;
 use crate::Result;
 
@@ -98,6 +101,79 @@ pub struct Summary {
     /// True when the caller should re-link shdeps-owned extras from `dir`.
     pub relink_extras: bool,
 }
+
+/// Outcome of a release-archive self-update attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseArchiveOutcome {
+    /// The release archive was activated.
+    Updated {
+        /// New active release tag.
+        tag: String,
+    },
+    /// The selected release is not newer than the installed release.
+    NoUpdate {
+        /// Installed tag from metadata.
+        current: String,
+        /// Best selectable tag that was considered.
+        candidate: String,
+    },
+    /// No stable release was available.
+    NoSelectableRelease,
+    /// This host has no supported shdeps release artifact label.
+    UnsupportedPlatform,
+    /// The selected release did not contain this host's archive/checksum pair.
+    NoSupportedArtifact {
+        /// Release tag that was selected.
+        tag: String,
+        /// Required host artifact platform label.
+        platform_label: String,
+    },
+}
+
+/// Summary for release-archive self-update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseArchiveSummary {
+    /// Install directory that was inspected and possibly replaced.
+    pub dir: PathBuf,
+    /// Final release-archive outcome.
+    pub outcome: ReleaseArchiveOutcome,
+}
+
+impl ReleaseArchiveSummary {
+    /// Returns the command's compatibility exit code for this outcome.
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        match self.outcome {
+            ReleaseArchiveOutcome::Updated { .. } | ReleaseArchiveOutcome::NoUpdate { .. } => 0,
+            ReleaseArchiveOutcome::NoSelectableRelease
+            | ReleaseArchiveOutcome::UnsupportedPlatform
+            | ReleaseArchiveOutcome::NoSupportedArtifact { .. } => 1,
+        }
+    }
+}
+
+/// Failure after selecting a concrete release archive update.
+#[derive(Debug)]
+pub enum ReleaseArchiveFailure {
+    /// GitHub release metadata could not be fetched or parsed.
+    Fetch(crate::Error),
+    /// The selected archive failed checksum, extraction, or validation.
+    Stage(release_stage::Failure),
+    /// The verified staged archive could not be activated safely.
+    Activate(crate::release_activate::Failure),
+}
+
+impl fmt::Display for ReleaseArchiveFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fetch(error) => write!(formatter, "release metadata fetch failed: {error}"),
+            Self::Stage(error) => write!(formatter, "release staging failed: {error}"),
+            Self::Activate(error) => write!(formatter, "release activation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ReleaseArchiveFailure {}
 
 impl Summary {
     /// Returns the command's compatibility exit code for this outcome.
@@ -263,6 +339,98 @@ pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
     })
 }
 
+/// Runs the release-archive portion of `shdeps self-update`.
+pub fn release_archive(
+    dir: &Path,
+    metadata: &Metadata,
+    env: &impl Env,
+    runner: &impl Runner,
+    client: &impl Client,
+) -> std::result::Result<ReleaseArchiveSummary, ReleaseArchiveFailure> {
+    let repo = metadata
+        .repo
+        .as_deref()
+        .filter(|repo| !repo.is_empty())
+        .unwrap_or("cgraf78/shdeps");
+    let token = github::token(env, runner);
+    let releases_json = client
+        .get(&github::releases_url(repo), token.as_deref())
+        .map_err(crate::Error::from)
+        .map_err(ReleaseArchiveFailure::Fetch)?;
+    let releases = github::parse_releases(&String::from_utf8_lossy(&releases_json))
+        .map_err(ReleaseArchiveFailure::Fetch)?;
+
+    let (release, pair) = match select_archive(&releases, metadata, env) {
+        ArchiveDecision::Update { release, pair } => (release, pair),
+        ArchiveDecision::NoSelectableRelease => {
+            return Ok(ReleaseArchiveSummary {
+                dir: dir.to_path_buf(),
+                outcome: ReleaseArchiveOutcome::NoSelectableRelease,
+            });
+        }
+        ArchiveDecision::NoUpdate { current, candidate } => {
+            return Ok(ReleaseArchiveSummary {
+                dir: dir.to_path_buf(),
+                outcome: ReleaseArchiveOutcome::NoUpdate { current, candidate },
+            });
+        }
+        ArchiveDecision::UnsupportedPlatform => {
+            return Ok(ReleaseArchiveSummary {
+                dir: dir.to_path_buf(),
+                outcome: ReleaseArchiveOutcome::UnsupportedPlatform,
+            });
+        }
+        ArchiveDecision::NoSupportedArtifact {
+            tag,
+            platform_label,
+        } => {
+            return Ok(ReleaseArchiveSummary {
+                dir: dir.to_path_buf(),
+                outcome: ReleaseArchiveOutcome::NoSupportedArtifact {
+                    tag,
+                    platform_label,
+                },
+            });
+        }
+    };
+
+    let stage_parent = dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let staged = release_stage::stage(&pair, &release.tag, &stage_parent, token.as_deref(), client)
+        .map_err(ReleaseArchiveFailure::Stage)?;
+    let mut next_metadata = metadata.clone();
+    next_metadata.method = Method::Release;
+    next_metadata.tag = Some(release.tag.clone());
+    next_metadata.repo = Some(repo.to_owned());
+    next_metadata.artifact_platform = artifact_platform_from_pair(&pair);
+
+    crate::release_activate::activate(&staged, dir, &next_metadata)
+        .map_err(ReleaseArchiveFailure::Activate)?;
+
+    Ok(ReleaseArchiveSummary {
+        dir: dir.to_path_buf(),
+        outcome: ReleaseArchiveOutcome::Updated { tag: release.tag },
+    })
+}
+
+fn artifact_platform_from_pair(pair: &Pair) -> Option<String> {
+    let body = pair
+        .archive_name
+        .strip_prefix("shdeps-")?
+        .strip_suffix(".tar.gz")?;
+    [
+        "linux-x86_64-musl",
+        "linux-aarch64-musl",
+        "macos-x86_64",
+        "macos-aarch64",
+    ]
+    .iter()
+    .find(|label| body.ends_with(&format!("-{label}")))
+    .map(|label| (*label).to_owned())
+}
+
 fn compare_tags(left: &str, right: &str) -> std::cmp::Ordering {
     let mut left_parts = TagParts::new(left);
     let mut right_parts = TagParts::new(right);
@@ -355,15 +523,21 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fs;
-    use std::io;
+    use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
+
     use super::{
-        select_archive, select_release, source_checkout, target, ArchiveDecision, Outcome,
-        ReleaseDecision, Target,
+        release_archive, select_archive, select_release, source_checkout, target, ArchiveDecision,
+        Outcome, ReleaseArchiveOutcome, ReleaseDecision, Target,
     };
+    use crate::checksum;
     use crate::github::{Asset, Release};
+    use crate::http::Client;
     use crate::install_metadata::{write, Metadata, Method};
     use crate::process::{Output, Runner};
     use crate::release_artifact::Pair;
@@ -739,6 +913,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn release_archive_self_update_returns_no_update_without_download() {
+        let dir = temp_dir("release-no-update");
+        let mut metadata = Metadata::new(Method::Release);
+        metadata.tag = Some("v2026.05.24".to_owned());
+        metadata.repo = Some("cgraf78/shdeps".to_owned());
+        let env = FakeEnv::new()
+            .with_var("GH_TOKEN", "token")
+            .with_var("SHDEPS_TEST_PLATFORM", "linux")
+            .with_command("uname -m", "x86_64");
+        let client = FakeClient::new().with(
+            "https://api.github.com/repos/cgraf78/shdeps/releases",
+            releases_json("v2026.05.24").into_bytes(),
+        );
+
+        let summary =
+            release_archive(&dir, &metadata, &env, &FakeRunner::default(), &client).unwrap();
+
+        assert_eq!(
+            summary.outcome,
+            ReleaseArchiveOutcome::NoUpdate {
+                current: "v2026.05.24".to_owned(),
+                candidate: "v2026.05.24".to_owned(),
+            }
+        );
+        assert_eq!(summary.exit_code(), 0);
+        assert_eq!(
+            client.urls(),
+            vec!["https://api.github.com/repos/cgraf78/shdeps/releases"]
+        );
+    }
+
+    #[test]
+    fn release_archive_self_update_stages_and_activates_release() {
+        let root = temp_dir("release-update-root");
+        let dir = root.join("shdeps");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("old"), "old").unwrap();
+        let mut metadata = Metadata::new(Method::Release);
+        metadata.tag = Some("v2026.05.23".to_owned());
+        metadata.repo = Some("cgraf78/shdeps".to_owned());
+        let env = FakeEnv::new()
+            .with_var("GH_TOKEN", "token")
+            .with_var("SHDEPS_TEST_PLATFORM", "linux")
+            .with_command("uname -m", "x86_64");
+        let archive_name = "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz";
+        let checksum_name = format!("{archive_name}.sha256");
+        let archive = release_tar();
+        let checksum = format!("{}  {archive_name}\n", checksum::sha256_hex(&archive));
+        let client = FakeClient::new()
+            .with(
+                "https://api.github.com/repos/cgraf78/shdeps/releases",
+                releases_json("v2026.05.24").into_bytes(),
+            )
+            .with(&format!("https://example/{archive_name}"), archive)
+            .with(
+                &format!("https://example/{checksum_name}"),
+                checksum.into_bytes(),
+            );
+
+        let summary =
+            release_archive(&dir, &metadata, &env, &FakeRunner::default(), &client).unwrap();
+
+        assert_eq!(
+            summary.outcome,
+            ReleaseArchiveOutcome::Updated {
+                tag: "v2026.05.24".to_owned()
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("shdeps")).unwrap(),
+            "new binary"
+        );
+        assert!(!dir.join("old").exists());
+        let written = crate::install_metadata::read(&dir).unwrap();
+        assert!(
+            matches!(written, crate::install_metadata::Read::Valid(metadata)
+                if metadata.tag.as_deref() == Some("v2026.05.24")
+                    && metadata.artifact_platform.as_deref() == Some("linux-x86_64-musl"))
+        );
+        assert_eq!(
+            client.tokens(),
+            vec![
+                Some("token".to_owned()),
+                Some("token".to_owned()),
+                Some("token".to_owned())
+            ]
+        );
+    }
+
     fn checkout(name: &str) -> PathBuf {
         let dir = temp_dir(name);
         fs::create_dir_all(dir.join(".git")).unwrap();
@@ -817,6 +1081,94 @@ mod tests {
         fn read_to_string(&self, _path: &Path) -> Option<String> {
             None
         }
+    }
+
+    #[derive(Default)]
+    struct FakeClient {
+        responses: BTreeMap<String, Vec<u8>>,
+        calls: std::cell::RefCell<Vec<(String, Option<String>)>>,
+    }
+
+    impl FakeClient {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with(mut self, url: &str, body: Vec<u8>) -> Self {
+            self.responses.insert(url.to_owned(), body);
+            self
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|(url, _)| url.clone())
+                .collect()
+        }
+
+        fn tokens(&self) -> Vec<Option<String>> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|(_, token)| token.clone())
+                .collect()
+        }
+    }
+
+    impl Client for FakeClient {
+        fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+            self.calls
+                .borrow_mut()
+                .push((url.to_owned(), token.map(ToOwned::to_owned)));
+            self.responses
+                .get(url)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, url.to_owned()))
+        }
+    }
+
+    fn releases_json(tag: &str) -> String {
+        let archive_name = format!("shdeps-{tag}-linux-x86_64-musl.tar.gz");
+        format!(
+            r#"[{{
+              "tag_name": "{tag}",
+              "draft": false,
+              "prerelease": false,
+              "assets": [
+                {{"name":"{archive_name}","browser_download_url":"https://example/{archive_name}"}},
+                {{"name":"{archive_name}.sha256","browser_download_url":"https://example/{archive_name}.sha256"}}
+              ]
+            }}]"#
+        )
+    }
+
+    fn release_tar() -> Vec<u8> {
+        let files = [
+            ("shdeps", &b"new binary"[..]),
+            ("shdeps.sh", &b"shim"[..]),
+            ("install.sh", &b"install"[..]),
+            ("README.md", &b"readme"[..]),
+            ("LICENSE", &b"license"[..]),
+            ("man/man1/shdeps.1", &b"man"[..]),
+        ];
+        let mut tar = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar);
+            for (path, body) in files {
+                let mut header = Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder.append(&header, body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn temp_dir(name: &str) -> PathBuf {
