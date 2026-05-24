@@ -42,6 +42,7 @@ pub mod stamp;
 pub mod state;
 pub mod status;
 pub mod tool_version;
+pub mod update;
 pub mod version;
 
 pub use errors::{Error, Result};
