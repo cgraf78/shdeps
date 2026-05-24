@@ -15,7 +15,9 @@ use crate::dep_path;
 use crate::errors::Error;
 use crate::extras;
 use crate::link_state::{self, Kind};
+use crate::pkg::{self, CommandSpec};
 use crate::platform;
+use crate::process::{self, Process, Runner};
 use crate::runtime::{self, Overrides, ProcessEnv};
 use crate::Result;
 
@@ -169,7 +171,21 @@ where
             link_state::unlink_tracked(&link_state::path(&roots.state_dir, name, Kind::Extras))?;
             Ok(0)
         }
-        "pkg-install" | "pkg-install-for-mgr" | "require-sudo" | "github-release-install" => {
+        "pkg-install" => {
+            let Some(package) = rest.first() else {
+                writeln!(stderr, "error: __api pkg-install requires a package name")?;
+                return Ok(2);
+            };
+            pkg_install(package, stderr)
+        }
+        "pkg-install-for-mgr" => {
+            if rest.is_empty() {
+                writeln!(stderr, "error: __api pkg-install-for-mgr requires specs")?;
+                return Ok(2);
+            };
+            pkg_install_for_mgr(rest, stderr)
+        }
+        "require-sudo" | "github-release-install" => {
             // These names are part of the wrapper ABI, so recognize them now
             // instead of letting callers see "unknown command" and infer that
             // the bridge surface changed. They remain explicit runtime
@@ -230,6 +246,104 @@ where
         ),
         stdout,
     )
+}
+
+fn pkg_install_for_mgr<E>(specs: &[String], stderr: &mut E) -> Result<i32>
+where
+    E: Write,
+{
+    let pkg_mgr = package_manager();
+    if pkg_mgr.is_empty() {
+        writeln!(
+            stderr,
+            "warning: no package manager found - cannot install package"
+        )?;
+        return Ok(1);
+    }
+
+    for spec in specs {
+        let Some((mgr, package)) = spec.split_once(':') else {
+            continue;
+        };
+        if mgr == pkg_mgr {
+            return pkg_install_with_mgr(&pkg_mgr, package, stderr);
+        }
+    }
+    Ok(1)
+}
+
+fn pkg_install<E>(package: &str, stderr: &mut E) -> Result<i32>
+where
+    E: Write,
+{
+    let pkg_mgr = package_manager();
+    if pkg_mgr.is_empty() {
+        writeln!(
+            stderr,
+            "warning: no package manager found - cannot install {package}"
+        )?;
+        return Ok(1);
+    }
+
+    pkg_install_with_mgr(&pkg_mgr, package, stderr)
+}
+
+fn pkg_install_with_mgr<E>(pkg_mgr: &str, package: &str, stderr: &mut E) -> Result<i32>
+where
+    E: Write,
+{
+    if package.is_empty() {
+        return Ok(1);
+    }
+
+    if let Some(refresh) = pkg::refresh(pkg_mgr) {
+        // Bash treats metadata refresh as best effort: a stale repo cache
+        // should not prevent an explicit hook fallback from checking whether
+        // the requested package is available. Preserve that behavior here so
+        // transient mirror failures do not block custom hooks unnecessarily.
+        let _ = run_pkg_command(&refresh);
+    }
+
+    let Some(available) = pkg::available(pkg_mgr, package) else {
+        writeln!(
+            stderr,
+            "warning: unsupported package manager {pkg_mgr} - cannot install {package}"
+        )?;
+        return Ok(1);
+    };
+    let output = run_pkg_command(&available)?;
+    if !pkg::available_ok(pkg_mgr, output.success, &output.stdout) {
+        writeln!(
+            stderr,
+            "warning: {package} not available in {pkg_mgr} repos"
+        )?;
+        return Ok(1);
+    }
+
+    let packages = [package.to_owned()];
+    let Some(install) = pkg::install(pkg_mgr, &packages) else {
+        return Ok(1);
+    };
+    if run_pkg_command(&install)?.success {
+        Ok(0)
+    } else {
+        writeln!(stderr, "warning: failed to install {package}")?;
+        Ok(1)
+    }
+}
+
+fn package_manager() -> String {
+    let cached = runtime::pkg_mgr(&ProcessEnv);
+    if cached.is_empty() {
+        process::detect_package_manager(&Process)
+    } else {
+        cached
+    }
+}
+
+fn run_pkg_command(command: &CommandSpec) -> Result<crate::process::Output> {
+    let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+    Ok(Process.run(&command.program, &args, None)?)
 }
 
 fn path_result<W>(result: Result<PathBuf>, stdout: &mut W) -> Result<i32>

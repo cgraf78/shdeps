@@ -1058,11 +1058,15 @@ mod tests {
 
     #[test]
     fn api_mutating_registry_names_fail_as_unimplemented_not_unknown() {
-        let (code, stdout, stderr) = run_capture(["__api", "pkg-install", "tool"]);
+        let (code, stdout, stderr) =
+            run_capture(["__api", "github-release-install", "tool", "tool"]);
 
         assert_eq!(code, 1);
         assert!(stdout.is_empty());
-        assert_eq!(stderr, "error: __api pkg-install is not implemented yet\n");
+        assert_eq!(
+            stderr,
+            "error: __api github-release-install is not implemented yet\n"
+        );
     }
 
     fn run_capture<const N: usize>(args: [&str; N]) -> (i32, String, String) {

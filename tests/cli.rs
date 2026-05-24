@@ -164,6 +164,53 @@ fn mutating_api_links_and_unlinks_extras() {
 }
 
 #[test]
+fn mutating_api_installs_packages_with_cached_manager() {
+    let fixture = Fixture::new("api-pkg-install");
+    let fakebin = fixture.dir.join("fakebin");
+    let log = fixture.dir.join("pkg.log");
+    let path = format!("{}:/usr/bin:/bin", fakebin.display());
+    fixture.write_executable(
+        "fakebin/apt-cache",
+        "#!/bin/sh\nprintf 'apt-cache %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$1:$2\" = show:tool ]\n",
+    );
+    fixture.write_executable(
+        "fakebin/sudo",
+        "#!/bin/sh\nprintf 'sudo %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\n",
+    );
+
+    let mut direct = fixture.command(["__api", "pkg-install", "tool"]);
+    direct
+        .env("PATH", &path)
+        .env("SHDEPS_PKG_MGR", "apt")
+        .env("SHDEPS_TEST_LOG", &log);
+    let direct = run(&mut direct);
+
+    assert_success(&direct);
+    assert_eq!(text(&direct.stdout), "");
+    assert_eq!(text(&direct.stderr), "");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "sudo apt-get update -qq\napt-cache show tool\nsudo apt-get install -y tool\n"
+    );
+
+    fs::write(&log, "").unwrap();
+    let mut for_mgr = fixture.command(["__api", "pkg-install-for-mgr", "brew:other", "apt:tool"]);
+    for_mgr
+        .env("PATH", &path)
+        .env("SHDEPS_PKG_MGR", "apt")
+        .env("SHDEPS_TEST_LOG", &log);
+    let for_mgr = run(&mut for_mgr);
+
+    assert_success(&for_mgr);
+    assert_eq!(text(&for_mgr.stdout), "");
+    assert_eq!(text(&for_mgr.stderr), "");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "sudo apt-get update -qq\napt-cache show tool\nsudo apt-get install -y tool\n"
+    );
+}
+
+#[test]
 fn dep_file_stays_fast_with_many_configured_dependencies() {
     let fixture = Fixture::new("dep-file-perf");
     let mut config = String::new();
