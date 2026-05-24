@@ -121,14 +121,6 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert_eq!(text(&count.stdout), "2\n");
     assert_eq!(text(&count.stderr), "");
 
-    let pending = run(&mut fixture.command(["__api", "link-extras", "tool", "/tmp/tool"]));
-    assert_eq!(pending.status.code(), Some(1));
-    assert_eq!(text(&pending.stdout), "");
-    assert_eq!(
-        text(&pending.stderr),
-        "error: __api link-extras is not implemented yet\n"
-    );
-
     let snapshot = run(&mut fixture.command(["--force", "__api", "env-snapshot"]));
     assert_success(&snapshot);
     let stdout = text(&snapshot.stdout);
@@ -141,6 +133,34 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert!(stdout.contains("reinstall=0\n"));
     assert!(stdout.contains("abi=1\n"));
     assert_eq!(text(&snapshot.stderr), "");
+}
+
+#[test]
+fn mutating_api_links_and_unlinks_extras() {
+    let fixture = Fixture::new("api-extras");
+    let install = fixture.dir.join("share/owner/tool");
+    let install_arg = install.to_string_lossy().into_owned();
+    fixture.write("share/owner/tool/share/man/man1/tool.1", ".TH TOOL 1\n");
+
+    let link =
+        run(&mut fixture.command(["__api", "link-extras", "owner/tool", install_arg.as_str()]));
+
+    assert_success(&link);
+    assert_eq!(text(&link.stdout), "");
+    assert_eq!(text(&link.stderr), "");
+    assert_eq!(
+        fs::read_link(fixture.dir.join("share/man/man1/tool.1")).unwrap(),
+        install.join("share/man/man1/tool.1")
+    );
+    assert!(fixture.dir.join("state/owner/tool.links").exists());
+
+    let unlink = run(&mut fixture.command(["__api", "unlink-extras", "owner/tool"]));
+
+    assert_success(&unlink);
+    assert_eq!(text(&unlink.stdout), "");
+    assert_eq!(text(&unlink.stderr), "");
+    assert!(!fixture.dir.join("share/man/man1/tool.1").exists());
+    assert!(!fixture.dir.join("state/owner/tool.links").exists());
 }
 
 #[test]

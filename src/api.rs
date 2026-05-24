@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use crate::config;
 use crate::dep_path;
 use crate::errors::Error;
+use crate::extras;
+use crate::link_state::{self, Kind};
 use crate::platform;
 use crate::runtime::{self, Overrides, ProcessEnv};
 use crate::Result;
@@ -137,12 +139,37 @@ where
             };
             dep_file(target, rel, overrides, stdout)
         }
-        "pkg-install"
-        | "pkg-install-for-mgr"
-        | "require-sudo"
-        | "link-extras"
-        | "unlink-extras"
-        | "github-release-install" => {
+        "link-extras" => {
+            let (Some(name), Some(install_dir)) = (rest.first(), rest.get(1)) else {
+                writeln!(
+                    stderr,
+                    "error: __api link-extras requires a dependency name and install dir"
+                )?;
+                return Ok(2);
+            };
+            // Keep the bridge as a thin adapter over the Rust owner. The Bash
+            // wrapper should not rediscover man/completion conventions because
+            // stale-link cleanup depends on one shared `.links` state format.
+            extras::link(
+                &roots.state_dir,
+                &roots.install_dir,
+                name,
+                Path::new(install_dir),
+            )?;
+            Ok(0)
+        }
+        "unlink-extras" => {
+            let Some(name) = rest.first() else {
+                writeln!(
+                    stderr,
+                    "error: __api unlink-extras requires a dependency name"
+                )?;
+                return Ok(2);
+            };
+            link_state::unlink_tracked(&link_state::path(&roots.state_dir, name, Kind::Extras))?;
+            Ok(0)
+        }
+        "pkg-install" | "pkg-install-for-mgr" | "require-sudo" | "github-release-install" => {
             // These names are part of the wrapper ABI, so recognize them now
             // instead of letting callers see "unknown command" and infer that
             // the bridge surface changed. They remain explicit runtime
