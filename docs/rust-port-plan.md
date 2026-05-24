@@ -52,7 +52,7 @@ The Rust port is based on these existing sources:
 - `install.sh`: current install, uninstall, and sourceable bootstrap behavior.
 - `test/shdeps-test`: current behavior suite and the primary parity oracle.
 - `README.md` and `AGENTS.md`: documented user and agent-facing contracts.
-- `docs/shdeps-spec.md`: normative compatibility contract for CLI, config,
+- `docs/rust-port-spec.md`: normative compatibility contract for CLI, config,
   state, hooks, installer, performance, and release behavior.
 - `hive-memory`: release workflow and artifact packaging reference.
 
@@ -1229,7 +1229,7 @@ Use hive-memory's checkout/auth pattern:
 ### Phase 0: Freeze The Reference
 
 - Keep the current Bash implementation available as the reference.
-- Keep `docs/shdeps-spec.md` current as the normative compatibility contract.
+- Keep `docs/rust-port-spec.md` current as the normative compatibility contract.
 - Add the dual-implementation test harness.
 - Add golden outputs for compatibility-sensitive CLI commands.
 - Add downstream audit tests for sourced API usage.
@@ -1950,7 +1950,7 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   - Files: `src/env.rs`
 - [ ] **T24 (P1, human: ~2h)** — spec — Compatibility Deltas section
   - Surfaced by: D25
-  - Files: `docs/shdeps-spec.md` (already done above)
+  - Files: `docs/rust-port-spec.md` (already done above)
 - [ ] **T25 (P2, human: ~1h)** — risk — Document quarterly checkpoint to
   re-evaluate port progress against Bash-baseline rollback option
   - Surfaced by: D26 / C#16
