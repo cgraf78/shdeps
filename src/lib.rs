@@ -14,6 +14,7 @@
 //! the intended ownership boundaries, but downstream crates should not treat
 //! this API as semver-stable yet.
 
+pub mod api;
 pub mod cleanup;
 pub mod cli;
 pub mod config;

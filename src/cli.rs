@@ -7,6 +7,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::api;
 use crate::dep_path;
 use crate::errors::Error;
 use crate::runtime::{self, Overrides, ProcessEnv};
@@ -97,6 +98,7 @@ where
         "dep-root" => dep_root_cmd(rest, &parsed, stdout, stderr),
         "dep-path" => dep_path_cmd(rest, &parsed, stdout, stderr),
         "dep-file" => dep_file_cmd(rest, &parsed, stdout, stderr),
+        "__api" => api::run(rest, &parsed.overrides, stdout, stderr),
         "update" | "self-update" | "list" | "check" | "prune" => {
             not_implemented(command, rest, stderr)
         }
@@ -125,6 +127,7 @@ where
     E: Write,
 {
     let mut index = 0;
+    let mut overrides = Overrides::default();
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
             "-c" | "--config" => {
@@ -132,11 +135,19 @@ where
                     writeln!(stderr, "error: --config requires an argument")?;
                     return Ok(ParseOutcome::Exit(2));
                 };
-                let _ = path;
+                overrides.config = Some(PathBuf::from(path));
                 index += 2;
             }
-            "-f" | "--force" | "-R" | "--reinstall" | "-q" | "--quiet" | "-v" | "--verbose"
-            | "-y" | "--dry-run" => {
+            "-f" | "--force" => {
+                overrides.force = true;
+                index += 1;
+            }
+            "-R" | "--reinstall" => {
+                overrides.force = true;
+                overrides.reinstall = true;
+                index += 1;
+            }
+            "-q" | "--quiet" | "-v" | "--verbose" | "-y" | "--dry-run" => {
                 index += 1;
             }
             "-h" | "--help" | "help" => {
@@ -151,9 +162,7 @@ where
             _ => {
                 return Ok(ParseOutcome::Command(ParsedOptions {
                     command_index: index,
-                    overrides: Overrides {
-                        config: config_path(args),
-                    },
+                    overrides,
                 }));
             }
         }
@@ -161,24 +170,6 @@ where
 
     write!(stdout, "{HELP}")?;
     Ok(ParseOutcome::Exit(0))
-}
-
-fn config_path(args: &[String]) -> Option<PathBuf> {
-    let mut index = 0;
-    let mut config = None;
-    while let Some(arg) = args.get(index) {
-        match arg.as_str() {
-            "-c" | "--config" => {
-                if let Some(path) = args.get(index + 1) {
-                    config = Some(PathBuf::from(path));
-                }
-                index += 2;
-            }
-            value if value.starts_with('-') => index += 1,
-            _ => break,
-        }
-    }
-    config
 }
 
 fn dep_root_cmd<W, E>(
@@ -197,14 +188,7 @@ where
         return Ok(2);
     };
 
-    run_path_lookup(
-        dep_path::root(
-            target,
-            &runtime::roots(&ProcessEnv, &options.overrides).dep_path_roots(),
-            &runtime::runtime_env(&ProcessEnv),
-        ),
-        stdout,
-    )
+    dep_root(target, options, stdout)
 }
 
 fn dep_path_cmd<W, E>(
@@ -226,15 +210,7 @@ where
         return Ok(2);
     };
 
-    run_path_lookup(
-        dep_path::path(
-            target,
-            rel,
-            &runtime::roots(&ProcessEnv, &options.overrides).dep_path_roots(),
-            &runtime::runtime_env(&ProcessEnv),
-        ),
-        stdout,
-    )
+    dep_path(target, rel, options, stdout)
 }
 
 fn dep_file_cmd<W, E>(
@@ -256,11 +232,50 @@ where
         return Ok(2);
     };
 
+    dep_file(target, rel, options, stdout)
+}
+
+fn dep_root<W>(target: &str, options: &ParsedOptions, stdout: &mut W) -> Result<i32>
+where
+    W: Write,
+{
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    run_path_lookup(
+        dep_path::root(
+            target,
+            &roots.dep_path_roots(),
+            &runtime::runtime_env(&ProcessEnv),
+        ),
+        stdout,
+    )
+}
+
+fn dep_path<W>(target: &str, rel: &str, options: &ParsedOptions, stdout: &mut W) -> Result<i32>
+where
+    W: Write,
+{
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    run_path_lookup(
+        dep_path::path(
+            target,
+            rel,
+            &roots.dep_path_roots(),
+            &runtime::runtime_env(&ProcessEnv),
+        ),
+        stdout,
+    )
+}
+
+fn dep_file<W>(target: &str, rel: &str, options: &ParsedOptions, stdout: &mut W) -> Result<i32>
+where
+    W: Write,
+{
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
     run_path_lookup(
         dep_path::file(
             target,
             rel,
-            &runtime::roots(&ProcessEnv, &options.overrides).dep_path_roots(),
+            &roots.dep_path_roots(),
             &runtime::runtime_env(&ProcessEnv),
         ),
         stdout,
@@ -294,6 +309,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
     use super::run;
     use crate::version;
 
@@ -339,7 +357,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn api_version_is_machine_clean_abi_line() {
+        let (code, stdout, stderr) = run_capture(["__api", "version"]);
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "abi:1\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn api_force_uses_cli_override_as_predicate_status() {
+        let (code, stdout, stderr) = run_capture(["--force", "__api", "force"]);
+
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn api_load_count_uses_config_parser_without_install_work() {
+        let dir = temp_dir("load-count");
+        fs::write(
+            dir.join("deps.conf"),
+            "# comment\nowner/tool.git github:repo\njq pkg\n",
+        )
+        .unwrap();
+
+        let (code, stdout, stderr) = run_capture_vec(vec![
+            "-c".to_owned(),
+            dir.to_string_lossy().into_owned(),
+            "__api".to_owned(),
+            "load-count".to_owned(),
+        ]);
+
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "2\n");
+        assert!(stderr.is_empty());
+    }
+
     fn run_capture<const N: usize>(args: [&str; N]) -> (i32, String, String) {
+        run_capture_vec(args.into_iter().map(str::to_owned).collect())
+    }
+
+    fn run_capture_vec(args: Vec<String>) -> (i32, String, String) {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = run(args, &mut stdout, &mut stderr).expect("CLI run should not fail");
@@ -349,5 +410,16 @@ mod tests {
             String::from_utf8(stdout).expect("stdout should be UTF-8"),
             String::from_utf8(stderr).expect("stderr should be UTF-8"),
         )
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shdeps-cli-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

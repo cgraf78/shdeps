@@ -19,6 +19,10 @@ use crate::platform::{self, RuntimeEnv};
 pub struct Overrides {
     /// `-c/--config` path. A directory is used directly; a file uses its parent.
     pub config: Option<PathBuf>,
+    /// `-f/--force` flag from the CLI.
+    pub force: bool,
+    /// `-R/--reinstall` flag from the CLI.
+    pub reinstall: bool,
 }
 
 /// Runtime roots used by commands that need filesystem context.
@@ -134,6 +138,33 @@ pub fn runtime_env(env: &impl Env) -> RuntimeEnv {
     RuntimeEnv::new(platform, host.trim())
 }
 
+/// Returns whether force mode is active.
+#[must_use]
+pub fn force(env: &impl Env, overrides: &Overrides) -> bool {
+    overrides.force || overrides.reinstall || env_flag(env, "SHDEPS_FORCE")
+}
+
+/// Returns whether reinstall mode is active.
+#[must_use]
+pub fn reinstall(env: &impl Env, overrides: &Overrides) -> bool {
+    overrides.reinstall || env_flag(env, "SHDEPS_REINSTALL")
+}
+
+/// Returns the cached package manager without probing the host.
+///
+/// The Bash helper reads `_SHDEPS_PKG_MGR` only after another path has already
+/// detected it. A Rust bridge subprocess cannot see private shell variables, so
+/// the wrapper/prelude will export this value when it has one; absent export
+/// means "unknown yet", not "go detect it now".
+#[must_use]
+pub fn pkg_mgr(env: &impl Env) -> String {
+    env_string(env, "SHDEPS_PKG_MGR").unwrap_or_default()
+}
+
+fn env_flag(env: &impl Env, name: &str) -> bool {
+    matches!(env_string(env, name).as_deref(), Some("1"))
+}
+
 fn conf_dir(env: &impl Env, overrides: &Overrides, home: &Path) -> PathBuf {
     if let Some(path) = &overrides.config {
         return if path.is_dir() {
@@ -200,6 +231,7 @@ mod tests {
         let env = FakeEnv::new().with_var("HOME", "/home/tester");
         let overrides = Overrides {
             config: Some(PathBuf::from("/tmp/app/deps.conf")),
+            ..Overrides::default()
         };
 
         assert_eq!(roots(&env, &overrides).conf_dir, PathBuf::from("/tmp/app"));
@@ -248,6 +280,23 @@ mod tests {
 
         assert_eq!(runtime.platform(), "macos");
         assert_eq!(runtime.host(), "macbook");
+    }
+
+    #[test]
+    fn mode_flags_preserve_cli_precedence_without_package_detection() {
+        let env = FakeEnv::new()
+            .with_var("SHDEPS_FORCE", "0")
+            .with_var("SHDEPS_REINSTALL", "0")
+            .with_var("SHDEPS_PKG_MGR", "apt");
+        let overrides = Overrides {
+            config: None,
+            force: false,
+            reinstall: true,
+        };
+
+        assert!(super::force(&env, &overrides));
+        assert!(super::reinstall(&env, &overrides));
+        assert_eq!(super::pkg_mgr(&env), "apt");
     }
 
     #[derive(Debug, Default)]
