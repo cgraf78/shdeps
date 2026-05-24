@@ -4629,6 +4629,74 @@ SH
   else
     _pass "install release checksum failure: staging cleaned"
   fi
+
+  _source_fb_installer=$(_tmpdir)/source-fallback-install
+  _source_fb_inst=$(_tmpdir)/shdeps-source-fallback
+  _source_fb_bin=$(_tmpdir)/source-fallback-bin
+  _source_fb_fakebin=$(_mock_bin)
+  _source_fb_log=$(_tmpdir)/source-fallback.log
+  mkdir -p "$_source_fb_installer" "$_source_fb_bin"
+  cat >"$_source_fb_fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+exit 22
+SH
+  chmod +x "$_source_fb_fakebin/curl"
+  cat >"$_source_fb_fakebin/git" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf 'git %s\n' "$*" >>"$SHDEPS_TEST_SOURCE_FALLBACK_LOG"
+if [[ "$1" == clone && "$2" == --depth && "$3" == 1 ]]; then
+  dest="$5"
+  mkdir -p "$dest"
+  cat >"$dest/shdeps.sh" <<'LIB'
+shdeps_version() { printf '%s\n' "shdeps commit sourcefb"; }
+LIB
+  cat >"$dest/install.sh" <<'INST'
+#!/usr/bin/env bash
+exit 0
+INST
+  printf '%s\n' "readme" >"$dest/README.md"
+  printf '%s\n' "license" >"$dest/LICENSE"
+  exit 0
+fi
+if [[ "$1" == -C && "$3" == rev-parse && "$4" == --short && "$5" == HEAD ]]; then
+  printf '%s\n' "sourcefb1234"
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$_source_fb_fakebin/git"
+  cat >"$_source_fb_fakebin/cargo" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf 'cargo %s\n' "$*" >>"$SHDEPS_TEST_SOURCE_FALLBACK_LOG"
+mkdir -p target/release
+cat >target/release/shdeps <<'BIN'
+#!/usr/bin/env bash
+if [[ "${1:-}" == version ]]; then
+  printf '%s\n' "shdeps commit sourcefb1234"
+fi
+BIN
+chmod +x target/release/shdeps
+SH
+  chmod +x "$_source_fb_fakebin/cargo"
+  cp "$SHDEPS_DIR/install.sh" "$_source_fb_installer/install.sh"
+  chmod +x "$_source_fb_installer/install.sh"
+  PATH="$_source_fb_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_SOURCE_FALLBACK_LOG="$_source_fb_log" \
+    SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+    SHDEPS_DIR="$_source_fb_inst" SHDEPS_BIN="$_source_fb_bin/shdeps" \
+    "$_source_fb_installer/install.sh" >/dev/null 2>&1
+  _assert_file_exists "install source fallback: root binary link created" "$_source_fb_inst/shdeps"
+  _assert_symlink "install source fallback: CLI symlinked" "$_source_fb_bin/shdeps"
+  _assert_contains "install source fallback: uses SSH clone" \
+    "git clone --depth 1 git@github.com:cgraf78/shdeps.git" "$(cat "$_source_fb_log")"
+  _assert_contains "install source fallback: builds release binary" \
+    "cargo build --release --locked" "$(cat "$_source_fb_log")"
+  _assert_contains "install source fallback: metadata records source-build" \
+    '"method":"source-build"' "$(cat "$_source_fb_inst/.shdeps-install.json")"
+  _assert_eq "install source fallback: CLI runs built binary" \
+    "shdeps commit sourcefb1234" "$("$_source_fb_bin/shdeps" version)"
 else
   _pass "install release: unsupported host platform skipped"
 fi

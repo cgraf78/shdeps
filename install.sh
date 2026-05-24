@@ -94,6 +94,30 @@ _repo_slug() {
   printf '%s\n' "$repo"
 }
 
+_github_ssh_fallback_url() {
+  local repo="$1" path owner name
+  case "$repo" in
+    https://github.com/*) path="${repo#https://github.com/}" ;;
+    *) return 1 ;;
+  esac
+  path="${path%.git}"
+  owner="${path%%/*}"
+  name="${path#*/}"
+
+  # This URL is fed directly to git. Keep the fallback deliberately narrower
+  # than GitHub itself so a malformed SHDEPS_REPO cannot smuggle shell-ish or
+  # path-traversal text into the clone target. Users with unusual remotes can
+  # still set SHDEPS_REPO explicitly and use the source-checkout path.
+  case "$owner" in
+    "" | *..* | *" "* | *":"* | */*) return 1 ;;
+  esac
+  case "$name" in
+    "" | *..* | *" "* | *":"* | */*) return 1 ;;
+  esac
+
+  printf 'git@github.com:%s/%s.git\n' "$owner" "$name"
+}
+
 _release_platform() {
   local os arch
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -147,11 +171,12 @@ _verify_checksum() {
 }
 
 _install_release_fail() {
-  local tmp="$1" message="$2"
+  local tmp="$1" kind="$2" message="$3"
 
   # Release downloads happen before any live install is touched. Clean the
   # scratch tree on every pre-activation failure so repeated curl-pipe attempts
   # do not accumulate stale archives or make a later diagnostic ambiguous.
+  _SHDEPS_RELEASE_FAILURE_KIND="$kind"
   if [[ -n "$tmp" ]]; then
     rm -rf "$tmp"
   fi
@@ -234,6 +259,7 @@ _install_bundle() {
 
 _install_release() {
   local platform repo api_url token tmp json tag archive checksum archive_url checksum_url bundle
+  _SHDEPS_RELEASE_FAILURE_KIND=""
   platform=$(_release_platform) || return 1
   repo=$(_repo_slug)
   api_url="${SHDEPS_RELEASE_API_URL:-https://api.github.com/repos/$repo/releases/latest}"
@@ -248,13 +274,13 @@ _install_release() {
   # contract instead of cloning source so fresh machines do not need a Rust
   # toolchain, and so WSL/Linux avoid host glibc drift by consuming musl assets.
   if ! _curl_get "$api_url" "$json" "$token"; then
-    _install_release_fail "$tmp" "failed to fetch shdeps release metadata"
+    _install_release_fail "$tmp" "download" "failed to fetch shdeps release metadata"
     return 1
   fi
 
   tag=$(_json_string "$json" "tag_name")
   if [[ -z "$tag" ]]; then
-    _install_release_fail "$tmp" "release metadata did not contain tag_name"
+    _install_release_fail "$tmp" "metadata" "release metadata did not contain tag_name"
     return 1
   fi
 
@@ -263,37 +289,85 @@ _install_release() {
   archive_url=$(_asset_url "$json" "$archive")
   checksum_url=$(_asset_url "$json" "$checksum")
   if [[ -z "$archive_url" || -z "$checksum_url" ]]; then
-    _install_release_fail "$tmp" "release $tag does not contain assets for $platform"
+    _install_release_fail "$tmp" "metadata" "release $tag does not contain assets for $platform"
     return 1
   fi
 
   if ! _curl_get "$archive_url" "$tmp/$archive" "$token"; then
-    _install_release_fail "$tmp" "failed to download $archive"
+    _install_release_fail "$tmp" "download" "failed to download $archive"
     return 1
   fi
   if ! _curl_get "$checksum_url" "$tmp/$checksum" "$token"; then
-    _install_release_fail "$tmp" "failed to download $checksum"
+    _install_release_fail "$tmp" "download" "failed to download $checksum"
     return 1
   fi
   if ! _verify_checksum "$tmp" "$archive" "$checksum" >/dev/null; then
-    _install_release_fail "$tmp" "checksum verification failed for $archive"
+    _install_release_fail "$tmp" "artifact" "checksum verification failed for $archive"
     return 1
   fi
 
   bundle="$tmp/bundle"
   if ! mkdir -p "$bundle"; then
-    _install_release_fail "$tmp" "failed to create release bundle directory"
+    _install_release_fail "$tmp" "artifact" "failed to create release bundle directory"
     return 1
   fi
   if ! tar -xzf "$tmp/$archive" -C "$bundle"; then
-    _install_release_fail "$tmp" "failed to extract $archive"
+    _install_release_fail "$tmp" "artifact" "failed to extract $archive"
     return 1
   fi
   if ! _install_bundle "$bundle"; then
-    _install_release_fail "$tmp" "failed to install $archive"
+    _install_release_fail "$tmp" "artifact" "failed to install $archive"
     return 1
   fi
   rm -rf "$tmp"
+}
+
+_install_source_build_fallback() {
+  local fallback parent staging commit
+
+  if [[ "${_SHDEPS_RELEASE_FAILURE_KIND:-}" != "download" ]]; then
+    return 1
+  fi
+  if [[ -e "$SHDEPS_DIR" ]]; then
+    return 1
+  fi
+  if ! fallback=$(_github_ssh_fallback_url "$SHDEPS_REPO"); then
+    return 1
+  fi
+  if ! command -v git >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+    return 1
+  fi
+
+  parent=$(dirname "$SHDEPS_DIR")
+  mkdir -p "$parent"
+  staging=$(mktemp -d "$parent/.shdeps-source-build.XXXXXX") || return 1
+
+  # Private source fallback exists for machines that can clone over SSH but
+  # cannot read private GitHub release assets. Build in a sibling staging tree
+  # and only publish it at SHDEPS_DIR after the binary exists, preserving the
+  # same no-partial-live-install guarantee as release archives.
+  if ! git clone --depth 1 "$fallback" "$staging"; then
+    rm -rf "$staging"
+    return 1
+  fi
+  if ! (cd "$staging" && cargo build --release --locked); then
+    rm -rf "$staging"
+    return 1
+  fi
+  if [[ ! -x "$staging/target/release/shdeps" ]]; then
+    rm -rf "$staging"
+    return 1
+  fi
+  ln -sf "target/release/shdeps" "$staging/shdeps"
+  commit=$(git -C "$staging" rev-parse --short HEAD 2>/dev/null || true)
+  cat >"$staging/.shdeps-install.json" <<JSON
+{"schema":1,"method":"source-build","repo":"$(_repo_slug)","commit":"$commit"}
+JSON
+  if ! mv "$staging" "$SHDEPS_DIR"; then
+    rm -rf "$staging"
+    return 1
+  fi
+  _info "shdeps: installed from source"
 }
 
 # Symlink CLI into PATH and link man page + shell completions.
@@ -358,7 +432,9 @@ _install() {
   fi
 
   if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" ]] && ! _is_source_checkout_dir "$script_dir"; then
-    _install_release || exit 1
+    if ! _install_release; then
+      _install_source_build_fallback || exit 1
+    fi
     _activate_installed_tree "$SHDEPS_DIR"
     return
   fi
