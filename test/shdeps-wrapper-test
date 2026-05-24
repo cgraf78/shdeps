@@ -119,4 +119,37 @@ _missing_rc=$?
 _assert_exit "wrapper: missing binary refuses source" 1 "$_missing_rc"
 _assert_contains "wrapper: missing binary explains refusal" "could not find the Rust shdeps binary" "$_missing_output"
 
+_bootstrap_release=$(_tmpdir)
+_bootstrap_state=$(_tmpdir)
+_bootstrap_share=$(_tmpdir)
+_bootstrap_bin_dir=$(_tmpdir)
+_bootstrap_dev=$(_tmpdir)
+cp "$SHDEPS_RUST_CLI" "$_bootstrap_release/shdeps"
+cp "$SHDEPS_DIR/shdeps-wrapper.sh" "$_bootstrap_release/shdeps.sh"
+mkdir -p "$_bootstrap_release/man/man1" "$_bootstrap_release/completions"
+printf '.TH SHDEPS 1\n' >"$_bootstrap_release/man/man1/shdeps.1"
+printf '# completion\n' >"$_bootstrap_release/completions/shdeps.bash"
+cat >"$_bootstrap_release/.shdeps-install.json" <<'JSON'
+{"schema":1,"method":"release","artifact_platform":"linux-x86_64-musl","tag":"vtest","repo":"cgraf78/shdeps"}
+JSON
+
+_bootstrap_bin="$_bootstrap_bin_dir/shdeps"
+_install_sh="$SHDEPS_DIR/install.sh"
+_bootstrap_output=$(
+  env SHDEPS_DIR="$_bootstrap_release" \
+    SHDEPS_BIN="$_bootstrap_bin" \
+    SHDEPS_RUST_CLI='' \
+    SHDEPS_STATE_DIR="$_bootstrap_state" \
+    SHDEPS_INSTALL_DIR="$_bootstrap_share" \
+    SHDEPS_GIT_DEV_DIR="$_bootstrap_dev" \
+    "$_bash" -c ". \"\$1\" --bootstrap || exit 10; declare -f shdeps_update >/dev/null || exit 11; shdeps_version" \
+    bash "$_install_sh"
+)
+_bootstrap_rc=$?
+_assert_exit "bootstrap release wrapper: succeeds" 0 "$_bootstrap_rc"
+_assert_match "bootstrap release wrapper: sourced Rust API" '^shdeps commit [0-9a-f]{7,12}$' "$_bootstrap_output"
+_assert_symlink "bootstrap release wrapper: CLI linked" "$_bootstrap_bin"
+_assert_eq "bootstrap release wrapper: CLI points at sibling binary" "$_bootstrap_release/shdeps" "$(readlink "$_bootstrap_bin")"
+_assert_symlink "bootstrap release wrapper: man page linked through public helper" "$_bootstrap_share/man/man1/shdeps.1"
+
 _test_summary

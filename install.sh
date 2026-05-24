@@ -371,7 +371,13 @@ JSON
 }
 
 # Symlink CLI into PATH and link man page + shell completions.
-# Requires shdeps.sh to be sourced first (for _shdeps_link_extras).
+#
+# During the Rust transition, `shdeps.sh` may be either the legacy Bash library
+# or the Rust compatibility wrapper. Prefer the old private helper when present
+# so source checkouts keep their historical behavior, but fall back to the
+# public helper exported by release wrappers. This is intentionally the only
+# place install.sh knows about the helper split; callers still just source
+# `install.sh --bootstrap` and get the same activation contract.
 _setup_links() {
   local shdeps_dir="$1"
   local cli="$shdeps_dir/bin/shdeps"
@@ -387,6 +393,8 @@ _setup_links() {
 
   if declare -f _shdeps_link_extras &>/dev/null; then
     _shdeps_link_extras "shdeps" "$shdeps_dir"
+  elif declare -f shdeps_link_extras &>/dev/null; then
+    shdeps_link_extras "shdeps" "$shdeps_dir"
   fi
 }
 
@@ -540,7 +548,11 @@ _uninstall() {
   if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
     # shellcheck source=/dev/null
     . "$SHDEPS_DIR/shdeps.sh"
-    _shdeps_unlink_extras "shdeps"
+    if declare -f _shdeps_unlink_extras &>/dev/null; then
+      _shdeps_unlink_extras "shdeps"
+    elif declare -f shdeps_unlink_extras &>/dev/null; then
+      shdeps_unlink_extras "shdeps"
+    fi
   fi
 
   if [[ -L "$SHDEPS_BIN" ]]; then
