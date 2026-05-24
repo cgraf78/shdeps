@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cleanup;
 use crate::config::Entry;
-use crate::hooks::{BashCustomProbe, Install, Post};
+use crate::hooks::{BashCustomProbe, Install, Post, Txn};
 use crate::http::Client;
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::platform::{self, RuntimeEnv};
@@ -152,6 +152,7 @@ pub fn run(
     let mut summary = Summary::default();
     let mut changed = Vec::new();
     let mut queued = Vec::new();
+    let hook_txn = Txn::new(&context.roots.state_dir)?;
 
     for entry in entries {
         if entry.method != "pkg" || !active(entry, context.env) {
@@ -291,6 +292,7 @@ pub fn run(
                     context.manifest_path,
                     context.roots,
                     context.hooks,
+                    &hook_txn,
                     options,
                     transitions.get(&entry.name).map(update_transition::old),
                 )?;
@@ -302,7 +304,10 @@ pub fn run(
                     summary.failed.push(entry.name.clone());
                 }
                 if item.changed {
-                    changed.push(entry.name.clone());
+                    record_changed(&mut changed, entry.name.clone());
+                }
+                for marker in outcome.marked {
+                    record_changed(&mut changed, marker);
                 }
                 summary.items.push(item);
             }
@@ -322,7 +327,13 @@ pub fn run(
     // inline with each method. Many hooks repair shell completions, symlinks,
     // or dependent tools, so they should see the final state for the full
     // update pass instead of an intermediate per-method view.
-    run_post_hooks(&changed, context.roots, context.hooks, &mut summary)?;
+    run_post_hooks(
+        &changed,
+        context.roots,
+        context.hooks,
+        &hook_txn,
+        &mut summary,
+    )?;
     Ok(summary)
 }
 
@@ -336,6 +347,7 @@ fn active(entry: &Entry, env: &RuntimeEnv) -> bool {
 struct CustomOutcome {
     item: Item,
     cleanup_leftover: bool,
+    marked: Vec<String>,
 }
 
 fn successful_custom(
@@ -364,6 +376,7 @@ fn successful_custom(
             detail,
         },
         cleanup_leftover,
+        marked: Vec::new(),
     })
 }
 
@@ -394,16 +407,24 @@ fn install_custom(
     manifest_path: &std::path::Path,
     roots: &Roots,
     hooks: &BashCustomProbe,
+    txn: &Txn,
     options: Options,
     transition: Option<&ManifestEntry>,
 ) -> Result<CustomOutcome> {
-    let install = hooks.install(&entry.name, roots, options.reinstall)?;
+    let install = hooks.install_with_txn(&entry.name, roots, options.reinstall, Some(txn))?;
+    let marked = txn.collect()?;
     match install {
         Install::Already { detail } => {
-            successful_custom(entry, manifest_path, roots, false, detail, transition)
+            let mut outcome =
+                successful_custom(entry, manifest_path, roots, false, detail, transition)?;
+            outcome.marked = marked;
+            Ok(outcome)
         }
         Install::Installed { detail } => {
-            successful_custom(entry, manifest_path, roots, true, detail, transition)
+            let mut outcome =
+                successful_custom(entry, manifest_path, roots, true, detail, transition)?;
+            outcome.marked = marked;
+            Ok(outcome)
         }
         Install::MissingHook | Install::MissingFunction | Install::SourceFailed => {
             Ok(CustomOutcome {
@@ -414,6 +435,7 @@ fn install_custom(
                     detail: "custom hook missing or unusable".to_owned(),
                 },
                 cleanup_leftover: false,
+                marked,
             })
         }
         Install::Failed => Ok(CustomOutcome {
@@ -424,7 +446,14 @@ fn install_custom(
                 detail: "custom install failed".to_owned(),
             },
             cleanup_leftover: false,
+            marked,
         }),
+    }
+}
+
+fn record_changed(changed: &mut Vec<String>, name: String) {
+    if !changed.iter().any(|existing| existing == &name) {
+        changed.push(name);
     }
 }
 
@@ -432,10 +461,11 @@ fn run_post_hooks(
     changed: &[String],
     roots: &Roots,
     hooks: &BashCustomProbe,
+    txn: &Txn,
     summary: &mut Summary,
 ) -> Result<()> {
     for name in changed {
-        match hooks.post(name, roots)? {
+        match hooks.post_with_txn(name, roots, Some(txn))? {
             Post::Ran | Post::MissingHook | Post::MissingFunction => {}
             Post::SourceFailed | Post::Failed => summary.failed.push(name.clone()),
         }
@@ -514,6 +544,62 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
         assert_eq!(
             fs::read_to_string(fixture.roots.state_dir.join("tool-post")).unwrap(),
             "post\n"
+        );
+    }
+
+    #[test]
+    fn update_collects_hook_changed_markers_for_post_scheduling() {
+        let fixture = Fixture::new("custom-marker");
+        fs::write(
+            fixture.hooks.shdeps_lib(),
+            r#"
+shdeps_mark_changed() {
+  local marker="$SHDEPS_STATE_DIR/.changed-markers/$SHDEPS_UPDATE_TXN_ID/$1"
+  mkdir -p "$(dirname "$marker")"
+  : >"$marker"
+}
+"#,
+        )
+        .unwrap();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { return 1; }
+install() {
+  [[ -n "$SHDEPS_UPDATE_TXN_ID" ]] || return 9
+  shdeps_mark_changed helper
+  printf 'installed\n'
+}
+"#,
+        );
+        fixture.write_hook(
+            "helper",
+            r#"
+exists() { return 0; }
+post() { printf 'helper post\n' > "$SHDEPS_STATE_DIR/helper-post"; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[
+                parse_entry("tool|custom|tool|-|-", None),
+                parse_entry("helper|custom|helper|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("helper-post")).unwrap(),
+            "helper post\n"
+        );
+        assert!(
+            !fixture.roots.state_dir.join(".changed-markers").exists(),
+            "per-update hook marker directory should be cleaned up after scheduling"
         );
     }
 

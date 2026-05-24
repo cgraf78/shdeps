@@ -7,7 +7,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config;
 use crate::config::Entry;
 use crate::runtime::Roots;
 use crate::status::CustomProbe;
@@ -140,6 +142,50 @@ pub struct BashCustomProbe {
     shdeps_lib: PathBuf,
 }
 
+/// Per-update hook coordination marker directory.
+#[derive(Debug, Clone)]
+pub(crate) struct Txn {
+    id: String,
+    marker_dir: PathBuf,
+}
+
+impl Txn {
+    /// Creates the marker directory used by hook subprocesses in one update.
+    pub(crate) fn new(state_dir: &Path) -> Result<Self> {
+        let id = txn_id();
+        let marker_dir = state_dir.join(".changed-markers").join(&id);
+        std::fs::create_dir_all(&marker_dir)?;
+        Ok(Self { id, marker_dir })
+    }
+
+    /// Returns the opaque ID exported as `SHDEPS_UPDATE_TXN_ID`.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Collects and removes changed markers written by hook subprocesses.
+    pub(crate) fn collect(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        collect_markers(&self.marker_dir, &self.marker_dir, &mut names)?;
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+}
+
+impl Drop for Txn {
+    fn drop(&mut self) {
+        // Keep the directory alive throughout the whole update because the
+        // prelude is intentionally tiny and may only `touch` marker files. A
+        // best-effort drop cleanup avoids state-dir clutter without letting
+        // cleanup failures affect the already-completed update result.
+        let _ = std::fs::remove_dir_all(&self.marker_dir);
+        if let Some(parent) = self.marker_dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
 impl BashCustomProbe {
     /// Creates a probe using an explicit `shdeps.sh` compatibility layer.
     #[must_use]
@@ -187,6 +233,17 @@ impl BashCustomProbe {
 
     /// Runs `install(name)` for a custom dependency hook.
     pub fn install(&self, name: &str, roots: &Roots, reinstall: bool) -> Result<Install> {
+        self.install_with_txn(name, roots, reinstall, None)
+    }
+
+    /// Runs `install(name)` with update-transaction context.
+    pub(crate) fn install_with_txn(
+        &self,
+        name: &str,
+        roots: &Roots,
+        reinstall: bool,
+        txn: Option<&Txn>,
+    ) -> Result<Install> {
         let hook = roots.hooks_dir.join(format!("{name}.sh"));
         if !hook.is_file() {
             return Ok(Install::MissingHook);
@@ -195,18 +252,10 @@ impl BashCustomProbe {
             return Ok(Install::SourceFailed);
         }
 
-        let output = self
-            .command(INSTALL_SCRIPT, name, &hook)
-            .arg(if reinstall { "1" } else { "0" })
-            .env("SHDEPS_CONF_DIR", &roots.conf_dir)
-            .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
-            .env("SHDEPS_STATE_DIR", &roots.state_dir)
-            .env("SHDEPS_GIT_DEV_DIR", &roots.git_dev_dir)
-            .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
-            .env("SHDEPS_BIN_DIR", &roots.bin_dir)
-            .env("SHDEPS_CURRENT_DEP", name)
-            .env("SHDEPS_HOOK_PHASE", "install")
-            .output()?;
+        let mut command = self.command(INSTALL_SCRIPT, name, &hook);
+        command.arg(if reinstall { "1" } else { "0" });
+        apply_hook_env(&mut command, roots, name, "install", txn);
+        let output = command.output()?;
 
         let detail = String::from_utf8_lossy(&output.stdout)
             .trim_end_matches(['\r', '\n'])
@@ -222,6 +271,16 @@ impl BashCustomProbe {
 
     /// Runs optional `post(name)` for a dependency that changed.
     pub fn post(&self, name: &str, roots: &Roots) -> Result<Post> {
+        self.post_with_txn(name, roots, None)
+    }
+
+    /// Runs optional `post(name)` with update-transaction context.
+    pub(crate) fn post_with_txn(
+        &self,
+        name: &str,
+        roots: &Roots,
+        txn: Option<&Txn>,
+    ) -> Result<Post> {
         let hook = roots.hooks_dir.join(format!("{name}.sh"));
         if !hook.is_file() {
             return Ok(Post::MissingHook);
@@ -230,17 +289,9 @@ impl BashCustomProbe {
             return Ok(Post::SourceFailed);
         }
 
-        let output = self
-            .command(POST_SCRIPT, name, &hook)
-            .env("SHDEPS_CONF_DIR", &roots.conf_dir)
-            .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
-            .env("SHDEPS_STATE_DIR", &roots.state_dir)
-            .env("SHDEPS_GIT_DEV_DIR", &roots.git_dev_dir)
-            .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
-            .env("SHDEPS_BIN_DIR", &roots.bin_dir)
-            .env("SHDEPS_CURRENT_DEP", name)
-            .env("SHDEPS_HOOK_PHASE", "post")
-            .output()?;
+        let mut command = self.command(POST_SCRIPT, name, &hook);
+        apply_hook_env(&mut command, roots, name, "post", txn);
+        let output = command.output()?;
 
         Ok(match output.status.code() {
             Some(0) => Post::Ran,
@@ -261,6 +312,60 @@ impl BashCustomProbe {
             .arg(hook);
         command
     }
+}
+
+fn apply_hook_env(
+    command: &mut Command,
+    roots: &Roots,
+    name: &str,
+    phase: &str,
+    txn: Option<&Txn>,
+) {
+    command
+        .env("SHDEPS_CONF_DIR", &roots.conf_dir)
+        .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
+        .env("SHDEPS_STATE_DIR", &roots.state_dir)
+        .env("SHDEPS_GIT_DEV_DIR", &roots.git_dev_dir)
+        .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
+        .env("SHDEPS_BIN_DIR", &roots.bin_dir)
+        .env("SHDEPS_CURRENT_DEP", name)
+        .env("SHDEPS_HOOK_PHASE", phase);
+    if let Some(txn) = txn {
+        // This env var is the only parent/child coordination channel for
+        // `shdeps_mark_changed`. Keeping it opaque prevents hooks from
+        // depending on directory layout beyond the documented helper API.
+        command.env("SHDEPS_UPDATE_TXN_ID", txn.id());
+    }
+}
+
+fn collect_markers(root: &Path, dir: &Path, names: &mut Vec<String>) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_markers(root, &path, names)?;
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if config::valid_dep_name(&name) {
+            names.push(name);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+fn txn_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
 }
 
 impl CustomProbe for BashCustomProbe {
@@ -302,10 +407,27 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{BashCustomProbe, Install, Post, Uninstall};
+    use super::{BashCustomProbe, Install, Post, Txn, Uninstall};
     use crate::config::parse_entry;
     use crate::runtime::Roots;
     use crate::status::CustomProbe;
+
+    #[test]
+    fn txn_collects_valid_markers_and_ignores_invalid_names() {
+        let roots = roots();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let txn = Txn::new(&roots.state_dir).unwrap();
+        let marker_dir = txn.marker_dir.clone();
+        fs::create_dir_all(marker_dir.join("owner")).unwrap();
+        fs::write(marker_dir.join("owner/tool"), "").unwrap();
+        fs::write(marker_dir.join("bad name"), "").unwrap();
+
+        assert_eq!(txn.collect().unwrap(), vec!["owner/tool".to_owned()]);
+        assert!(marker_dir.exists());
+
+        drop(txn);
+        assert!(!marker_dir.exists());
+    }
 
     #[test]
     fn custom_probe_returns_version_when_exists_succeeds() {
