@@ -12,6 +12,33 @@ use crate::install_metadata::{self, Metadata, Method, Read};
 use crate::process::Runner;
 use crate::Result;
 
+/// Release metadata needed for self-update selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// Release tag name from the GitHub API.
+    pub tag: String,
+    /// True when GitHub marks the release as a draft.
+    pub draft: bool,
+    /// True when GitHub marks the release as a prerelease.
+    pub prerelease: bool,
+}
+
+/// Decision after applying release-selection rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseDecision {
+    /// A release should be downloaded and verified.
+    Update(Release),
+    /// No non-draft, non-prerelease release is available.
+    NoSelectableRelease,
+    /// The selectable release is not newer than the installed tag.
+    NoUpdate {
+        /// Installed tag from metadata.
+        current: String,
+        /// Best selectable tag that was considered.
+        candidate: String,
+    },
+}
+
 /// Self-update target selected from checkout shape and install metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -95,6 +122,38 @@ pub fn target(dir: &Path) -> Result<Target> {
     }
 }
 
+/// Selects the release archive candidate for a metadata-backed self-update.
+#[must_use]
+pub fn select_release(releases: &[Release], installed_tag: Option<&str>) -> ReleaseDecision {
+    // The Bash implementation only ever consumed stable release artifacts.
+    // Keeping draft/prerelease filtering here prevents a later download layer
+    // from accidentally treating GitHub's newest experimental build as the
+    // drop-in replacement that fleet auto-update expects to be boring.
+    let Some(candidate) = releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .max_by(|left, right| compare_tags(&left.tag, &right.tag))
+        .cloned()
+    else {
+        return ReleaseDecision::NoSelectableRelease;
+    };
+
+    if let Some(current) = installed_tag.filter(|tag| !tag.is_empty()) {
+        // Metadata is the only durable proof of which archive was installed.
+        // If the best selectable release does not compare newer, refuse to
+        // rewrite files: self-update should be monotonic unless the user does
+        // an explicit reinstall or manual rollback.
+        if compare_tags(&candidate.tag, current).is_le() {
+            return ReleaseDecision::NoUpdate {
+                current: current.to_owned(),
+                candidate: candidate.tag,
+            };
+        }
+    }
+
+    ReleaseDecision::Update(candidate)
+}
+
 /// Runs the source-checkout portion of `shdeps self-update`.
 pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
     if !dir.join(".git").is_dir() {
@@ -150,6 +209,93 @@ pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
     })
 }
 
+fn compare_tags(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_parts = TagParts::new(left);
+    let mut right_parts = TagParts::new(right);
+
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(left), Some(right)) => {
+                let ordering = left.cmp(&right);
+                if !ordering.is_eq() {
+                    return ordering;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagPart<'a> {
+    Number(&'a str),
+    Text(&'a str),
+}
+
+impl TagPart<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => cmp_number(left, right),
+            (Self::Text(left), Self::Text(right)) => left.cmp(right),
+            // Numeric chunks sort after text chunks so `v10` compares greater
+            // than `vbeta`. This is intentionally only a stable natural sort,
+            // not semver: shdeps runtime versions are commit/release-label
+            // based, and the spec only needs a deterministic downgrade guard.
+            (Self::Number(_), Self::Text(_)) => std::cmp::Ordering::Greater,
+            (Self::Text(_), Self::Number(_)) => std::cmp::Ordering::Less,
+        }
+    }
+}
+
+struct TagParts<'a> {
+    value: &'a str,
+}
+
+impl<'a> TagParts<'a> {
+    fn new(value: &'a str) -> Self {
+        Self { value }
+    }
+}
+
+impl<'a> Iterator for TagParts<'a> {
+    type Item = TagPart<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self.value;
+        if value.is_empty() {
+            return None;
+        }
+
+        let numeric = value.as_bytes()[0].is_ascii_digit();
+        let split = value
+            .char_indices()
+            .find(|(_, ch)| ch.is_ascii_digit() != numeric)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        let (part, rest) = value.split_at(split);
+        self.value = rest;
+
+        Some(if numeric {
+            TagPart::Number(part)
+        } else {
+            TagPart::Text(part)
+        })
+    }
+}
+
+fn cmp_number(left: &str, right: &str) -> std::cmp::Ordering {
+    // Compare by normalized length before bytes so arbitrarily large date-ish
+    // or build-number tags never need to fit in a Rust integer type.
+    let left = left.trim_start_matches('0');
+    let right = right.trim_start_matches('0');
+    let left = if left.is_empty() { "0" } else { left };
+    let right = if right.is_empty() { "0" } else { right };
+
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -158,7 +304,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{source_checkout, target, Outcome, Target};
+    use super::{
+        select_release, source_checkout, target, Outcome, Release, ReleaseDecision, Target,
+    };
     use crate::install_metadata::{write, Metadata, Method};
     use crate::process::{Output, Runner};
 
@@ -371,10 +519,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn release_selection_skips_drafts_and_prereleases() {
+        let decision = select_release(
+            &[
+                release("v2026.05.24", true, false),
+                release("v2026.05.25", false, true),
+                release("v2026.05.23", false, false),
+            ],
+            Some("v2026.05.22"),
+        );
+
+        assert_eq!(
+            decision,
+            ReleaseDecision::Update(release("v2026.05.23", false, false))
+        );
+    }
+
+    #[test]
+    fn release_selection_reports_no_selectable_release() {
+        let decision = select_release(
+            &[
+                release("v2026.05.24", true, false),
+                release("v2026.05.25", false, true),
+            ],
+            Some("v2026.05.22"),
+        );
+
+        assert_eq!(decision, ReleaseDecision::NoSelectableRelease);
+    }
+
+    #[test]
+    fn release_selection_refuses_equal_or_older_tags() {
+        assert_eq!(
+            select_release(&[release("v2026.05.22", false, false)], Some("v2026.05.23")),
+            ReleaseDecision::NoUpdate {
+                current: "v2026.05.23".to_owned(),
+                candidate: "v2026.05.22".to_owned(),
+            }
+        );
+        assert_eq!(
+            select_release(&[release("v2026.05.23", false, false)], Some("v2026.05.23")),
+            ReleaseDecision::NoUpdate {
+                current: "v2026.05.23".to_owned(),
+                candidate: "v2026.05.23".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn release_selection_uses_natural_tag_order_not_plain_lexical_order() {
+        let decision = select_release(
+            &[
+                release("v2026.05.9", false, false),
+                release("v2026.05.10", false, false),
+            ],
+            Some("v2026.05.8"),
+        );
+
+        assert_eq!(
+            decision,
+            ReleaseDecision::Update(release("v2026.05.10", false, false))
+        );
+    }
+
+    #[test]
+    fn release_selection_allows_update_when_current_tag_is_unknown() {
+        let decision = select_release(&[release("v2026.05.23", false, false)], None);
+
+        assert_eq!(
+            decision,
+            ReleaseDecision::Update(release("v2026.05.23", false, false))
+        );
+    }
+
     fn checkout(name: &str) -> PathBuf {
         let dir = temp_dir(name);
         fs::create_dir_all(dir.join(".git")).unwrap();
         dir
+    }
+
+    fn release(tag: &str, draft: bool, prerelease: bool) -> Release {
+        Release {
+            tag: tag.to_owned(),
+            draft,
+            prerelease,
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {
