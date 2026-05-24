@@ -6,6 +6,7 @@
 //! Bash reference's `command -v` behavior. Keeping the rules here gives
 //! `list`, `check`, package installs, and future cache probes the same answers.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 #[cfg(unix)]
@@ -194,6 +195,30 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
         .is_some_and(|output| output.success)
 }
 
+/// Loads installed package versions with one manager-specific batch query.
+#[must_use]
+pub fn package_versions(runner: &impl Runner, pkg_mgr: &str) -> BTreeMap<String, String> {
+    let output = match pkg_mgr {
+        "brew" => runner.run("brew", &["list", "--versions"], None),
+        "apt" => runner.run("dpkg-query", &["-W", "-f=${Package}\t${Version}\n"], None),
+        "dnf" => runner.run("rpm", &["-qa", "--qf", "%{NAME}\t%{VERSION}\n"], None),
+        "pacman" => runner.run("pacman", &["-Q"], None),
+        // Bash loads package versions only for these managers today. Keeping
+        // zypper/apk empty avoids pretending we have parity for output formats
+        // the reference never parses.
+        _ => return BTreeMap::new(),
+    };
+
+    let Ok(output) = output else {
+        return BTreeMap::new();
+    };
+    if !output.success {
+        return BTreeMap::new();
+    }
+
+    parse_package_versions(pkg_mgr, &output.stdout)
+}
+
 /// Returns whether `path` is an executable regular file.
 #[must_use]
 pub fn executable_path(path: &Path) -> bool {
@@ -240,6 +265,33 @@ fn convert_output(output: std::process::Output) -> Output {
     }
 }
 
+fn parse_package_versions(pkg_mgr: &str, output: &str) -> BTreeMap<String, String> {
+    let mut versions = BTreeMap::new();
+    for line in output.lines() {
+        let parsed = match pkg_mgr {
+            "brew" | "pacman" => parse_space_version_line(line),
+            "apt" | "dnf" => parse_tab_version_line(line),
+            _ => None,
+        };
+        if let Some((name, version)) = parsed {
+            versions.insert(name.to_owned(), version.to_owned());
+        }
+    }
+    versions
+}
+
+fn parse_space_version_line(line: &str) -> Option<(&str, &str)> {
+    let mut fields = line.split_whitespace();
+    let name = fields.next()?;
+    let version = fields.next()?;
+    Some((name, version))
+}
+
+fn parse_tab_version_line(line: &str) -> Option<(&str, &str)> {
+    line.split_once('\t')
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+}
+
 fn command_exists(command: &str) -> bool {
     if command.is_empty() {
         return false;
@@ -281,7 +333,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        dep_exists, dep_version, detect_package_manager, package_installed, Output, Runner,
+        dep_exists, dep_version, detect_package_manager, package_installed, package_versions,
+        Output, Runner,
     };
 
     #[derive(Debug, Default)]
@@ -390,6 +443,47 @@ mod tests {
 
         assert!(package_installed(&runner, "font", "apt"));
         assert!(!package_installed(&runner, "font", "apk"));
+    }
+
+    #[test]
+    fn package_versions_parse_manager_batch_outputs() {
+        let runner = FakeRunner::default()
+            .with_output(
+                "dpkg-query",
+                ["-W", "-f=${Package}\t${Version}\n"],
+                true,
+                "bat\t1.2.3-1\nfd-find\t8.7.0\n",
+                "",
+            )
+            .with_output(
+                "brew",
+                ["list", "--versions"],
+                true,
+                "fzf 0.62.0 0.61.3\nripgrep 14.1.1\n",
+                "",
+            );
+
+        let apt = package_versions(&runner, "apt");
+        assert_eq!(apt.get("bat").map(String::as_str), Some("1.2.3-1"));
+        assert_eq!(apt.get("fd-find").map(String::as_str), Some("8.7.0"));
+
+        let brew = package_versions(&runner, "brew");
+        assert_eq!(brew.get("fzf").map(String::as_str), Some("0.62.0"));
+        assert_eq!(brew.get("ripgrep").map(String::as_str), Some("14.1.1"));
+    }
+
+    #[test]
+    fn package_versions_stay_empty_for_unparsed_managers() {
+        let runner = FakeRunner::default().with_output(
+            "apk",
+            ["info", "-vv"],
+            true,
+            "tool-1.2.3 description\n",
+            "",
+        );
+
+        assert!(package_versions(&runner, "apk").is_empty());
+        assert!(package_versions(&runner, "").is_empty());
     }
 
     #[test]

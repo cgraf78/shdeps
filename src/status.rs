@@ -7,6 +7,7 @@
 //! before package-manager detection or hook sourcing so manifest-backed deps
 //! stay cheap.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -77,19 +78,42 @@ impl CustomProbe for NoCustomProbe {
     }
 }
 
+/// Shared inputs used while classifying dependency status.
+///
+/// This keeps the public resolver API compact and makes the expensive inputs
+/// visible at the call site. A `check` caller can deliberately pass an empty
+/// package-version map for manifest-backed deps, while `list` can detect the
+/// manager and batch-load package versions once before walking all entries.
+pub struct Context<'a, R, C>
+where
+    R: Runner,
+    C: CustomProbe,
+{
+    /// Runtime filesystem roots.
+    pub roots: &'a Roots,
+    /// Runtime platform/host identity.
+    pub env: &'a RuntimeEnv,
+    /// Loaded install manifest.
+    pub manifest: &'a Manifest,
+    /// Host process runner.
+    pub runner: &'a R,
+    /// Custom hook status probe.
+    pub custom: &'a C,
+    /// Detected package manager, or empty when intentionally not detected.
+    pub pkg_mgr: &'a str,
+    /// Batch-loaded package versions keyed by resolved package name.
+    pub package_versions: &'a BTreeMap<String, String>,
+}
+
 /// Classifies all configured dependencies in already-loaded config order.
-pub fn list(
-    entries: &[Entry],
-    roots: &Roots,
-    env: &RuntimeEnv,
-    manifest: &Manifest,
-    runner: &impl Runner,
-    custom: &impl CustomProbe,
-    pkg_mgr: &str,
-) -> Result<Vec<DependencyStatus>> {
+pub fn list<R, C>(entries: &[Entry], context: &Context<'_, R, C>) -> Result<Vec<DependencyStatus>>
+where
+    R: Runner,
+    C: CustomProbe,
+{
     entries
         .iter()
-        .map(|entry| classify(entry, roots, env, manifest, runner, custom, pkg_mgr))
+        .map(|entry| classify(entry, context))
         .collect()
 }
 
@@ -99,51 +123,56 @@ pub fn list(
 /// string intentionally mirrors Bash's "unknown manager" behavior for package
 /// alias resolution; the public `check` command should detect it only after it
 /// has confirmed that the target is a `pkg` dependency.
-pub fn classify(
-    entry: &Entry,
-    roots: &Roots,
-    env: &RuntimeEnv,
-    manifest: &Manifest,
-    runner: &impl Runner,
-    custom: &impl CustomProbe,
-    pkg_mgr: &str,
-) -> Result<DependencyStatus> {
+pub fn classify<R, C>(entry: &Entry, context: &Context<'_, R, C>) -> Result<DependencyStatus>
+where
+    R: Runner,
+    C: CustomProbe,
+{
     Ok(DependencyStatus {
         name: entry.name.clone(),
         method: entry.method.clone(),
-        state: state(entry, roots, env, manifest, runner, custom, pkg_mgr)?,
+        state: state(entry, context)?,
     })
 }
 
-fn state(
-    entry: &Entry,
-    roots: &Roots,
-    env: &RuntimeEnv,
-    manifest: &Manifest,
-    runner: &impl Runner,
-    custom: &impl CustomProbe,
-    pkg_mgr: &str,
-) -> Result<State> {
-    match platform::filter_match(&entry.filter, env).exit_code() {
+fn state<R, C>(entry: &Entry, context: &Context<'_, R, C>) -> Result<State>
+where
+    R: Runner,
+    C: CustomProbe,
+{
+    match platform::filter_match(&entry.filter, context.env).exit_code() {
         1 => return Ok(State::Skipped(SkipReason::Platform)),
         2 => return Ok(State::Skipped(SkipReason::Host)),
         _ => {}
     }
 
     match entry.method.as_str() {
-        "pkg" => Ok(pkg_state(entry, runner, pkg_mgr)),
-        "github:repo" => Ok(github_repo_state(entry, roots, runner)),
-        "github:release" | "cargo" | "go" | "uv" | "npm" => {
-            Ok(manifest_backed_state(entry, manifest, runner))
-        }
-        "custom" => custom
-            .installed_detail(entry, roots)
+        "pkg" => Ok(pkg_state(
+            entry,
+            context.runner,
+            context.pkg_mgr,
+            context.package_versions,
+        )),
+        "github:repo" => Ok(github_repo_state(entry, context.roots, context.runner)),
+        "github:release" | "cargo" | "go" | "uv" | "npm" => Ok(manifest_backed_state(
+            entry,
+            context.manifest,
+            context.runner,
+        )),
+        "custom" => context
+            .custom
+            .installed_detail(entry, context.roots)
             .map(installed_or_missing),
         _ => Ok(State::Missing),
     }
 }
 
-fn pkg_state(entry: &Entry, runner: &impl Runner, pkg_mgr: &str) -> State {
+fn pkg_state(
+    entry: &Entry,
+    runner: &impl Runner,
+    pkg_mgr: &str,
+    package_versions: &BTreeMap<String, String>,
+) -> State {
     let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(pkg_mgr));
     if resolved == "NONE" {
         return State::Skipped(SkipReason::PackageManager);
@@ -153,13 +182,13 @@ fn pkg_state(entry: &Entry, runner: &impl Runner, pkg_mgr: &str) -> State {
         return State::Missing;
     }
 
-    // Command probes are cheap and match the first Bash detail source. Package
-    // database version fallback is deliberately left to the command layer that
-    // owns batching; doing per-dependency package DB probes here would make
-    // `list` scale badly and violate the warm-path performance plan.
-    State::Installed {
-        detail: process::dep_version(runner, &entry.cmd),
-    }
+    // Command probes are the first Bash detail source; package database output
+    // is the fallback. The map is supplied by the command layer so `list` can
+    // batch the expensive package query once instead of this resolver hiding a
+    // subprocess per dependency.
+    let detail = process::dep_version(runner, &entry.cmd)
+        .or_else(|| package_versions.get(&resolved).cloned());
+    State::Installed { detail }
 }
 
 fn github_repo_state(entry: &Entry, roots: &Roots, runner: &impl Runner) -> State {
@@ -240,7 +269,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{classify, list, CustomProbe, DependencyStatus, NoCustomProbe, SkipReason, State};
+    use super::{
+        classify, list, Context, CustomProbe, DependencyStatus, NoCustomProbe, SkipReason, State,
+    };
     use crate::config::parse_entry;
     use crate::manifest::{Manifest, ManifestEntry};
     use crate::platform::RuntimeEnv;
@@ -323,15 +354,20 @@ mod tests {
         let manifest = Manifest::default();
         let runner = FakeRunner::default();
         let env = RuntimeEnv::new("linux", "workstation");
-
-        let status = classify(
-            &parse_entry("tool|pkg|tool|-|os:mac", Some("apt")),
+        let package_versions = BTreeMap::new();
+        let context = context(
             &roots,
             &env,
             &manifest,
             &runner,
             &NoCustomProbe,
             "apt",
+            &package_versions,
+        );
+
+        let status = classify(
+            &parse_entry("tool|pkg|tool|-|os:mac", Some("apt")),
+            &context,
         )
         .unwrap();
 
@@ -344,17 +380,19 @@ mod tests {
         let manifest = Manifest::default();
         let runner = FakeRunner::default();
         let env = RuntimeEnv::new("linux", "workstation");
-
-        let status = classify(
-            &parse_entry("font|pkg|-|apt:NONE|-", Some("apt")),
+        let package_versions = BTreeMap::new();
+        let context = context(
             &roots,
             &env,
             &manifest,
             &runner,
             &NoCustomProbe,
             "apt",
-        )
-        .unwrap();
+            &package_versions,
+        );
+
+        let status =
+            classify(&parse_entry("font|pkg|-|apt:NONE|-", Some("apt")), &context).unwrap();
 
         assert_eq!(status.state, State::Skipped(SkipReason::PackageManager));
     }
@@ -369,22 +407,55 @@ mod tests {
             "bat 1.2.3\n",
         );
         let env = RuntimeEnv::new("linux", "workstation");
-
-        let status = classify(
-            &parse_entry("bat|pkg|bat|-|-", Some("apt")),
+        let package_versions = BTreeMap::new();
+        let context = context(
             &roots,
             &env,
             &manifest,
             &runner,
             &NoCustomProbe,
             "apt",
+            &package_versions,
+        );
+
+        let status = classify(&parse_entry("bat|pkg|bat|-|-", Some("apt")), &context).unwrap();
+
+        assert_eq!(
+            status.state,
+            State::Installed {
+                detail: Some("1.2.3".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn package_status_uses_batched_package_version_as_fallback() {
+        let roots = roots();
+        let manifest = Manifest::default();
+        let runner = FakeRunner::default().with_command("font-tool");
+        let env = RuntimeEnv::new("linux", "workstation");
+        let mut package_versions = BTreeMap::new();
+        package_versions.insert("font-package".to_owned(), "4.5.6-1".to_owned());
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &NoCustomProbe,
+            "apt",
+            &package_versions,
+        );
+
+        let status = classify(
+            &parse_entry("font-package|pkg|font-tool|-|-", Some("apt")),
+            &context,
         )
         .unwrap();
 
         assert_eq!(
             status.state,
             State::Installed {
-                detail: Some("1.2.3".to_owned())
+                detail: Some("4.5.6-1".to_owned())
             }
         );
     }
@@ -397,15 +468,21 @@ mod tests {
         fs::write(repo.join("VERSION"), "2.0.0\n").unwrap();
         let manifest = Manifest::default();
         let env = RuntimeEnv::new("linux", "workstation");
-
-        let status = classify(
-            &parse_entry("cgraf78/tool|github:repo|-|-|-", None),
+        let runner = FakeRunner::default();
+        let package_versions = BTreeMap::new();
+        let context = context(
             &roots,
             &env,
             &manifest,
-            &FakeRunner::default(),
+            &runner,
             &NoCustomProbe,
             "",
+            &package_versions,
+        );
+
+        let status = classify(
+            &parse_entry("cgraf78/tool|github:repo|-|-|-", None),
+            &context,
         )
         .unwrap();
 
@@ -435,17 +512,20 @@ mod tests {
             bin.display().to_string(),
         ));
         let runner = FakeRunner::default().with_output("tool", ["--version"], "tool 3.4.5\n");
-
-        let status = classify(
-            &parse_entry("tool|github:release|tool|-|-", None),
+        let env = RuntimeEnv::new("linux", "workstation");
+        let package_versions = BTreeMap::new();
+        let context = context(
             &roots,
-            &RuntimeEnv::new("linux", "workstation"),
+            &env,
             &manifest,
             &runner,
             &NoCustomProbe,
             "",
-        )
-        .unwrap();
+            &package_versions,
+        );
+
+        let status =
+            classify(&parse_entry("tool|github:release|tool|-|-", None), &context).unwrap();
 
         assert_eq!(
             status.state,
@@ -461,17 +541,21 @@ mod tests {
         let mut details = BTreeMap::new();
         details.insert("local-tool".to_owned(), Some("9.9.9".to_owned()));
         let custom = FakeCustom { details };
-
-        let status = classify(
-            &parse_entry("local-tool|custom|-|-|-", None),
+        let env = RuntimeEnv::new("linux", "workstation");
+        let manifest = Manifest::default();
+        let runner = FakeRunner::default();
+        let package_versions = BTreeMap::new();
+        let context = context(
             &roots,
-            &RuntimeEnv::new("linux", "workstation"),
-            &Manifest::default(),
-            &FakeRunner::default(),
+            &env,
+            &manifest,
+            &runner,
             &custom,
             "",
-        )
-        .unwrap();
+            &package_versions,
+        );
+
+        let status = classify(&parse_entry("local-tool|custom|-|-|-", None), &context).unwrap();
 
         assert_eq!(
             status.state,
@@ -490,17 +574,19 @@ mod tests {
             parse_entry("b|pkg|b|-|os:mac", Some("apt")),
             parse_entry("a|pkg|a|-|-", Some("apt")),
         ];
-
-        let statuses = list(
-            &entries,
+        let env = RuntimeEnv::new("linux", "workstation");
+        let package_versions = BTreeMap::new();
+        let context = context(
             &roots,
-            &RuntimeEnv::new("linux", "workstation"),
+            &env,
             &manifest,
             &runner,
             &NoCustomProbe,
             "apt",
-        )
-        .unwrap();
+            &package_versions,
+        );
+
+        let statuses = list(&entries, &context).unwrap();
 
         assert_eq!(
             statuses,
@@ -517,6 +603,29 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn context<'a, C>(
+        roots: &'a Roots,
+        env: &'a RuntimeEnv,
+        manifest: &'a Manifest,
+        runner: &'a FakeRunner,
+        custom: &'a C,
+        pkg_mgr: &'a str,
+        package_versions: &'a BTreeMap<String, String>,
+    ) -> Context<'a, FakeRunner, C>
+    where
+        C: CustomProbe,
+    {
+        Context {
+            roots,
+            env,
+            manifest,
+            runner,
+            custom,
+            pkg_mgr,
+            package_versions,
+        }
     }
 
     fn roots() -> Roots {
