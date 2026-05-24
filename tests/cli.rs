@@ -211,6 +211,44 @@ fn mutating_api_installs_packages_with_cached_manager() {
 }
 
 #[test]
+fn mutating_api_require_sudo_matches_quiet_prompt_rules() {
+    let fixture = Fixture::new("api-require-sudo");
+    let fakebin = fixture.dir.join("fakebin");
+    let log = fixture.dir.join("sudo.log");
+    let path = format!("{}:/usr/bin:/bin", fakebin.display());
+    fixture.write_executable("fakebin/id", "#!/bin/sh\nprintf '1000\\n'\n");
+    fixture.write_executable(
+        "fakebin/sudo",
+        "#!/bin/sh\nprintf 'sudo %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$1:$2\" = '-n:true' ] && exit 1\n[ \"$1\" = true ]\n",
+    );
+
+    let mut interactive = fixture.command(["__api", "require-sudo"]);
+    interactive.env("PATH", &path).env("SHDEPS_TEST_LOG", &log);
+    let interactive = run(&mut interactive);
+
+    assert_success(&interactive);
+    assert_eq!(text(&interactive.stdout), "");
+    assert_eq!(text(&interactive.stderr), "");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "sudo -n true\nsudo true\n"
+    );
+
+    fs::write(&log, "").unwrap();
+    let mut quiet = fixture.command(["__api", "require-sudo"]);
+    quiet
+        .env("PATH", &path)
+        .env("SHDEPS_QUIET", "1")
+        .env("SHDEPS_TEST_LOG", &log);
+    let quiet = run(&mut quiet);
+
+    assert_eq!(quiet.status.code(), Some(1));
+    assert_eq!(text(&quiet.stdout), "");
+    assert_eq!(text(&quiet.stderr), "");
+    assert_eq!(fs::read_to_string(&log).unwrap(), "sudo -n true\n");
+}
+
+#[test]
 fn dep_file_stays_fast_with_many_configured_dependencies() {
     let fixture = Fixture::new("dep-file-perf");
     let mut config = String::new();

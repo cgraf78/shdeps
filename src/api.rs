@@ -9,6 +9,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config;
 use crate::dep_path;
@@ -185,7 +186,8 @@ where
             };
             pkg_install_for_mgr(rest, stderr)
         }
-        "require-sudo" | "github-release-install" => {
+        "require-sudo" => require_sudo(),
+        "github-release-install" => {
             // These names are part of the wrapper ABI, so recognize them now
             // instead of letting callers see "unknown command" and infer that
             // the bridge surface changed. They remain explicit runtime
@@ -344,6 +346,31 @@ fn package_manager() -> String {
 fn run_pkg_command(command: &CommandSpec) -> Result<crate::process::Output> {
     let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
     Ok(Process.run(&command.program, &args, None)?)
+}
+
+fn require_sudo() -> Result<i32> {
+    let uid = Process.run("id", &["-u"], Some(Duration::from_secs(2)))?;
+    if uid.success && uid.stdout.trim() == "0" {
+        return Ok(0);
+    }
+
+    let non_interactive = Process.run("sudo", &["-n", "true"], Some(Duration::from_secs(2)))?;
+    if non_interactive.success {
+        return Ok(0);
+    }
+
+    if std::env::var("SHDEPS_QUIET").as_deref() == Ok("1") {
+        return Ok(1);
+    }
+
+    // Match the Bash helper's escalation order: only the final attempt may
+    // prompt. Hooks call this before choosing a fallback installer, so quiet
+    // mode must never block on an unexpected sudo password prompt.
+    Ok(if Process.run("sudo", &["true"], None)?.success {
+        0
+    } else {
+        1
+    })
 }
 
 fn path_result<W>(result: Result<PathBuf>, stdout: &mut W) -> Result<i32>
