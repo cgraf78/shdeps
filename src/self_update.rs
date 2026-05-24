@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use crate::github::Release;
 use crate::install_metadata::{self, Metadata, Method, Read};
 use crate::process::Runner;
+use crate::release_artifact::{self, Pair};
+use crate::runtime::Env;
 use crate::Result;
 
 /// Decision after applying release-selection rules.
@@ -26,6 +28,36 @@ pub enum ReleaseDecision {
         current: String,
         /// Best selectable tag that was considered.
         candidate: String,
+    },
+}
+
+/// Decision after selecting a concrete release archive for this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveDecision {
+    /// A verified archive/checksum pair can be downloaded and staged.
+    Update {
+        /// Selected GitHub release.
+        release: Release,
+        /// Exact archive/checksum assets for the current host.
+        pair: Pair,
+    },
+    /// No non-draft, non-prerelease release is available.
+    NoSelectableRelease,
+    /// The latest selectable release is not newer than the installed tag.
+    NoUpdate {
+        /// Installed tag from metadata.
+        current: String,
+        /// Best selectable tag that was considered.
+        candidate: String,
+    },
+    /// The current host cannot use any published shdeps release artifact.
+    UnsupportedPlatform,
+    /// The release exists, but not for the current host label.
+    NoSupportedArtifact {
+        /// Release tag that was selected before artifact matching.
+        tag: String,
+        /// Exact artifact platform label required for this host.
+        platform_label: String,
     },
 }
 
@@ -142,6 +174,38 @@ pub fn select_release(releases: &[Release], installed_tag: Option<&str>) -> Rele
     }
 
     ReleaseDecision::Update(candidate)
+}
+
+/// Selects the concrete release archive candidate for release-style self-update.
+#[must_use]
+pub fn select_archive(
+    releases: &[Release],
+    metadata: &Metadata,
+    env: &impl Env,
+) -> ArchiveDecision {
+    let release = match select_release(releases, metadata.tag.as_deref()) {
+        ReleaseDecision::Update(release) => release,
+        ReleaseDecision::NoSelectableRelease => return ArchiveDecision::NoSelectableRelease,
+        ReleaseDecision::NoUpdate { current, candidate } => {
+            return ArchiveDecision::NoUpdate { current, candidate };
+        }
+    };
+
+    let Some(platform_label) = release_artifact::host_label(env) else {
+        return ArchiveDecision::UnsupportedPlatform;
+    };
+
+    let Some(pair) = release_artifact::select_pair(&release, &platform_label) else {
+        // Do not walk backward to older releases when the latest release is
+        // missing this platform. A fallback would silently pin a host behind
+        // the rest of the fleet and could hide a broken release workflow.
+        return ArchiveDecision::NoSupportedArtifact {
+            tag: release.tag,
+            platform_label,
+        };
+    };
+
+    ArchiveDecision::Update { release, pair }
 }
 
 /// Runs the source-checkout portion of `shdeps self-update`.
@@ -289,15 +353,21 @@ fn cmp_number(left: &str, right: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::fs;
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{select_release, source_checkout, target, Outcome, ReleaseDecision, Target};
-    use crate::github::Release;
+    use super::{
+        select_archive, select_release, source_checkout, target, ArchiveDecision, Outcome,
+        ReleaseDecision, Target,
+    };
+    use crate::github::{Asset, Release};
     use crate::install_metadata::{write, Metadata, Method};
     use crate::process::{Output, Runner};
+    use crate::release_artifact::Pair;
+    use crate::runtime::Env;
 
     #[derive(Debug, Default)]
     struct FakeRunner {
@@ -582,6 +652,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn archive_selection_returns_update_with_exact_platform_pair() {
+        let mut metadata = Metadata::new(Method::Release);
+        metadata.tag = Some("v2026.05.23".to_owned());
+        let env = FakeEnv::new()
+            .with_var("SHDEPS_TEST_PLATFORM", "linux")
+            .with_command("uname -m", "x86_64");
+
+        let decision = select_archive(
+            &[release_with_assets("v2026.05.24", &["linux-x86_64-musl"])],
+            &metadata,
+            &env,
+        );
+
+        assert_eq!(
+            decision,
+            ArchiveDecision::Update {
+                release: release_with_assets("v2026.05.24", &["linux-x86_64-musl"]),
+                pair: Pair {
+                    archive_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz".to_owned(),
+                    archive_url: "https://example/shdeps-v2026.05.24-linux-x86_64-musl.tar.gz"
+                        .to_owned(),
+                    checksum_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256".to_owned(),
+                    checksum_url:
+                        "https://example/shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256"
+                            .to_owned(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn archive_selection_preserves_no_update_and_platform_errors() {
+        let mut metadata = Metadata::new(Method::Release);
+        metadata.tag = Some("v2026.05.24".to_owned());
+        let linux = FakeEnv::new()
+            .with_var("SHDEPS_TEST_PLATFORM", "linux")
+            .with_command("uname -m", "x86_64");
+        let freebsd = FakeEnv::new()
+            .with_var("SHDEPS_TEST_PLATFORM", "freebsd")
+            .with_command("uname -m", "x86_64");
+
+        assert_eq!(
+            select_archive(
+                &[release_with_assets("v2026.05.24", &["linux-x86_64-musl"])],
+                &metadata,
+                &linux,
+            ),
+            ArchiveDecision::NoUpdate {
+                current: "v2026.05.24".to_owned(),
+                candidate: "v2026.05.24".to_owned(),
+            }
+        );
+        metadata.tag = Some("v2026.05.23".to_owned());
+        assert_eq!(
+            select_archive(
+                &[release_with_assets("v2026.05.24", &["linux-x86_64-musl"])],
+                &metadata,
+                &freebsd,
+            ),
+            ArchiveDecision::UnsupportedPlatform
+        );
+    }
+
+    #[test]
+    fn archive_selection_reports_missing_artifact_for_latest_release() {
+        let mut metadata = Metadata::new(Method::Release);
+        metadata.tag = Some("v2026.05.23".to_owned());
+        let env = FakeEnv::new()
+            .with_var("SHDEPS_TEST_PLATFORM", "macos")
+            .with_command("uname -m", "arm64");
+
+        let decision = select_archive(
+            &[release_with_assets("v2026.05.24", &["linux-x86_64-musl"])],
+            &metadata,
+            &env,
+        );
+
+        assert_eq!(
+            decision,
+            ArchiveDecision::NoSupportedArtifact {
+                tag: "v2026.05.24".to_owned(),
+                platform_label: "macos-aarch64".to_owned(),
+            }
+        );
+    }
+
     fn checkout(name: &str) -> PathBuf {
         let dir = temp_dir(name);
         fs::create_dir_all(dir.join(".git")).unwrap();
@@ -594,6 +751,71 @@ mod tests {
             draft,
             prerelease,
             assets: Vec::new(),
+        }
+    }
+
+    fn release_with_assets(tag: &str, platform_labels: &[&str]) -> Release {
+        let assets = platform_labels
+            .iter()
+            .flat_map(|label| {
+                let archive = format!("shdeps-{tag}-{label}.tar.gz");
+                let checksum = format!("{archive}.sha256");
+                [
+                    Asset {
+                        name: archive.clone(),
+                        url: format!("https://example/{archive}"),
+                    },
+                    Asset {
+                        name: checksum.clone(),
+                        url: format!("https://example/{checksum}"),
+                    },
+                ]
+            })
+            .collect();
+
+        Release {
+            tag: tag.to_owned(),
+            draft: false,
+            prerelease: false,
+            assets,
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeEnv {
+        vars: BTreeMap<String, OsString>,
+        commands: BTreeMap<String, String>,
+    }
+
+    impl FakeEnv {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_var(mut self, name: &str, value: &str) -> Self {
+            self.vars.insert(name.to_owned(), OsString::from(value));
+            self
+        }
+
+        fn with_command(mut self, command: &str, output: &str) -> Self {
+            self.commands.insert(command.to_owned(), output.to_owned());
+            self
+        }
+    }
+
+    impl Env for FakeEnv {
+        fn var_os(&self, name: &str) -> Option<OsString> {
+            self.vars.get(name).cloned()
+        }
+
+        fn command_output(&self, command: &str, args: &[&str]) -> Option<String> {
+            self.commands
+                .get(&format!("{command} {}", args.join(" ")))
+                .cloned()
+        }
+
+        fn read_to_string(&self, _path: &Path) -> Option<String> {
+            None
         }
     }
 
