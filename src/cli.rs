@@ -99,6 +99,14 @@ where
         "dep-path" => dep_path_cmd(rest, &parsed, stdout, stderr),
         "dep-file" => dep_file_cmd(rest, &parsed, stdout, stderr),
         "__api" => api::run(rest, &parsed.overrides, stdout, stderr),
+        "migrate" => {
+            writeln!(
+                stderr,
+                "error: migrate has been removed from the user-facing CLI"
+            )?;
+            writeln!(stderr, "Run 'shdeps help' for usage.")?;
+            Ok(2)
+        }
         "update" | "self-update" | "list" | "check" | "prune" => {
             not_implemented(command, rest, stderr)
         }
@@ -354,6 +362,18 @@ mod tests {
         assert_eq!(
             stderr,
             "error: dep-path requires a dependency name and relative path\nUsage: shdeps dep-path <name> <relative-path>\n"
+        );
+    }
+
+    #[test]
+    fn migrate_is_removed_from_user_facing_cli() {
+        let (code, stdout, stderr) = run_capture(["migrate"]);
+
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            "error: migrate has been removed from the user-facing CLI\nRun 'shdeps help' for usage.\n"
         );
     }
 
