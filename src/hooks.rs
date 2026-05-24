@@ -211,17 +211,9 @@ impl BashCustomProbe {
             return Ok(Uninstall::SourceFailed);
         }
 
-        let output = self
-            .command(UNINSTALL_SCRIPT, name, &hook)
-            .env("SHDEPS_CONF_DIR", &roots.conf_dir)
-            .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
-            .env("SHDEPS_STATE_DIR", &roots.state_dir)
-            .env("SHDEPS_GIT_DEV_DIR", &roots.git_dev_dir)
-            .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
-            .env("SHDEPS_BIN_DIR", &roots.bin_dir)
-            .env("SHDEPS_CURRENT_DEP", name)
-            .env("SHDEPS_HOOK_PHASE", "uninstall")
-            .output()?;
+        let mut command = self.command(UNINSTALL_SCRIPT, name, &hook);
+        apply_hook_env(&mut command, roots, name, "uninstall", None);
+        let output = command.output()?;
 
         Ok(match output.status.code() {
             Some(0) => Uninstall::Removed,
@@ -375,15 +367,13 @@ impl CustomProbe for BashCustomProbe {
             return Ok(None);
         }
 
-        let output = self
-            .command(STATUS_SCRIPT, &entry.name, &hook)
-            .env("SHDEPS_CONF_DIR", &roots.conf_dir)
-            .env("SHDEPS_HOOKS_DIR", &roots.hooks_dir)
-            .env("SHDEPS_STATE_DIR", &roots.state_dir)
-            .env("SHDEPS_GIT_DEV_DIR", &roots.git_dev_dir)
-            .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
-            .env("SHDEPS_BIN_DIR", &roots.bin_dir)
-            .output()?;
+        let mut command = self.command(STATUS_SCRIPT, &entry.name, &hook);
+        // Status probes run `exists` and then optional `version` in one cheap
+        // subprocess. Report the phase as `exists` because that is the required
+        // predicate gate; hooks that need phase-specific install/post behavior
+        // get separate subprocesses with more precise phases.
+        apply_hook_env(&mut command, roots, &entry.name, "exists", None);
+        let output = command.output()?;
 
         if !output.status.success() {
             return Ok(None);
@@ -488,7 +478,11 @@ version() { printf '1.2.3\n'; }
         write_hook(
             &roots.hooks_dir.join("envtool.sh"),
             r#"
-exists() { [[ "$SHDEPS_INSTALL_DIR" == */share ]]; }
+exists() {
+  [[ "$SHDEPS_INSTALL_DIR" == */share ]] || return 1
+  [[ "$SHDEPS_CURRENT_DEP" == envtool ]] || return 1
+  [[ "$SHDEPS_HOOK_PHASE" == exists ]] || return 1
+}
 version() { printf '%s\n' "$SHDEPS_BIN_DIR"; }
 "#,
         );
