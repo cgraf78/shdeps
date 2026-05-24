@@ -1194,6 +1194,55 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_sends_token_to_metadata_and_asset_download() {
+        let mut fixture = Fixture::new("release-token");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("GH_TOKEN".to_owned(), "ci-token".to_owned());
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-linux-x86_64",
+                        "browser_download_url":"https://example/tool-linux-x86_64"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://example/tool-linux-x86_64", b"binary".to_vec());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            fixture.client.requests(),
+            vec![
+                (
+                    "https://api.github.com/repos/owner/tool/releases".to_owned(),
+                    Some("ci-token".to_owned())
+                ),
+                (
+                    "https://example/tool-linux-x86_64".to_owned(),
+                    Some("ci-token".to_owned())
+                )
+            ]
+        );
+    }
+
+    #[test]
     fn update_github_release_decompresses_gzip_single_binary() {
         let mut fixture = Fixture::new("release-gz-single");
         fixture.write_lib();
@@ -1961,6 +2010,7 @@ version() { printf 'saw-pkg\n'; }
     #[derive(Debug, Clone, Default)]
     struct FakeClient {
         responses: std::collections::BTreeMap<String, Vec<u8>>,
+        requests: std::cell::RefCell<Vec<(String, Option<String>)>>,
     }
 
     impl FakeClient {
@@ -1968,10 +2018,17 @@ version() { printf 'saw-pkg\n'; }
             self.responses.insert(url.to_owned(), bytes.into());
             self
         }
+
+        fn requests(&self) -> Vec<(String, Option<String>)> {
+            self.requests.borrow().clone()
+        }
     }
 
     impl Client for FakeClient {
-        fn get(&self, url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+        fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+            self.requests
+                .borrow_mut()
+                .push((url.to_owned(), token.map(ToOwned::to_owned)));
             self.responses.get(url).cloned().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
             })
