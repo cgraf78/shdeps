@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+use shdeps::hooks::prelude;
+
 fn shdeps() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shdeps"))
 }
@@ -364,6 +366,43 @@ fn mutating_api_github_release_reports_selection_failures() {
 }
 
 #[test]
+fn rust_hook_prelude_delegates_link_extras_during_update() {
+    let fixture = Fixture::new("hook-prelude-link-extras");
+    fixture.write("prelude.sh", prelude::source());
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  mkdir -p "$SHDEPS_INSTALL_DIR/tool/share/man/man1"
+  printf '.TH TOOL 1\n' >"$SHDEPS_INSTALL_DIR/tool/share/man/man1/tool.1"
+  shdeps_link_extras tool "$SHDEPS_INSTALL_DIR/tool" || return $?
+  printf 'installed\n'
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_RUST_LIB", fixture.dir.join("prelude.sh"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", shdeps_exe_dir().display()),
+        );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "  tool: installed\n");
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(
+        fs::read_link(fixture.dir.join("share/man/man1/tool.1")).unwrap(),
+        fixture.dir.join("share/tool/share/man/man1/tool.1")
+    );
+    assert!(fixture.dir.join("state/tool.links").exists());
+}
+
+#[test]
 fn dep_file_stays_fast_with_many_configured_dependencies() {
     let fixture = Fixture::new("dep-file-perf");
     let mut config = String::new();
@@ -692,6 +731,13 @@ fn host_arch() -> String {
         .output()
         .expect("uname should be available in CLI tests");
     text(&output.stdout).trim().to_owned()
+}
+
+fn shdeps_exe_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_shdeps"))
+        .parent()
+        .expect("shdeps test binary should have a parent directory")
+        .to_path_buf()
 }
 
 fn write_tar_gz(path: &Path, entries: &[(&str, &str, u32)]) {

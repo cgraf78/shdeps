@@ -15,6 +15,9 @@ use crate::runtime::Roots;
 use crate::status::CustomProbe;
 use crate::Result;
 
+/// Generated Bash compatibility layer for Rust hook subprocesses.
+pub mod prelude;
+
 const STATUS_SCRIPT: &str = r#"
 name=$1
 lib=$2

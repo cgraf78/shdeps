@@ -907,6 +907,16 @@ fn custom_probe() -> BashCustomProbe {
 }
 
 fn shdeps_lib_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("SHDEPS_RUST_LIB").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    // `SHDEPS_LIB` is installer-facing: dotfiles and bootstrap paths use it to
+    // pin a concrete sourceable library. Keep the Rust test/transition override
+    // above so test harnesses do not mutate the same variable that real
+    // bootstrap consumers rely on.
     if let Some(path) = env::var_os("SHDEPS_LIB").map(PathBuf::from) {
         if path.is_file() {
             return Some(path);
