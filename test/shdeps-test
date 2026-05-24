@@ -41,6 +41,18 @@ export SHDEPS_IMPL SHDEPS_CLI SHDEPS_TEST_LIB
 # shellcheck source=helpers.sh
 . "$(dirname "$0")/helpers.sh"
 
+_copy_bootstrap_fixture() {
+  local dest="$1"
+  mkdir -p "$dest"
+  cp "$SHDEPS_DIR/install.sh" "$dest/install.sh"
+  cp "$SHDEPS_DIR/shdeps.sh" "$dest/shdeps.sh"
+  cp "$SHDEPS_DIR/README.md" "$dest/README.md"
+  cp "$SHDEPS_DIR/LICENSE" "$dest/LICENSE"
+  cp -R "$SHDEPS_DIR/bin" "$dest/"
+  cp -R "$SHDEPS_DIR/man" "$dest/"
+  cp -R "$SHDEPS_DIR/completions" "$dest/"
+}
+
 # ===========================================================================
 # Section 0: Static analysis (runs before _mock_home so shim-managed
 #            tools like shellcheck can find their real install dirs)
@@ -4397,6 +4409,41 @@ _assert_dir_exists "install fresh: clone dir created" "$_inst_dir"
 _assert_file_exists "install fresh: shdeps.sh present" "$_inst_dir/shdeps.sh"
 _assert_symlink "install fresh: CLI symlinked" "$_inst_bin/shdeps"
 
+# --- Bundled release archive installs local files without git clone ---
+
+_bundle_dir=$(_tmpdir)/shdeps-bundle
+_bundle_inst=$(_tmpdir)/shdeps-bundle-install
+_bundle_bin=$(_tmpdir)/bundle-bin
+mkdir -p "$_bundle_dir" "$_bundle_bin" "$_bundle_dir/man/man1" "$_bundle_dir/completions"
+cat >"$_bundle_dir/shdeps" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == version ]]; then
+  printf '%s\n' "shdeps commit abcdef123456"
+fi
+SH
+chmod +x "$_bundle_dir/shdeps"
+printf '%s\n' "SHDEPS_PACKAGED_COMMIT=abcdef123456" >"$_bundle_dir/shdeps.sh"
+cat "$SHDEPS_DIR/shdeps.sh" >>"$_bundle_dir/shdeps.sh"
+cp "$SHDEPS_DIR/install.sh" "$_bundle_dir/install.sh"
+chmod +x "$_bundle_dir/install.sh"
+cp "$SHDEPS_DIR/README.md" "$_bundle_dir/README.md"
+cp "$SHDEPS_DIR/LICENSE" "$_bundle_dir/LICENSE"
+cp "$SHDEPS_DIR/man/man1/shdeps.1" "$_bundle_dir/man/man1/shdeps.1"
+cp "$SHDEPS_DIR/completions/shdeps.bash" "$_bundle_dir/completions/shdeps.bash"
+cp "$SHDEPS_DIR/completions/shdeps.zsh" "$_bundle_dir/completions/shdeps.zsh"
+cp "$SHDEPS_DIR/completions/shdeps.fish" "$_bundle_dir/completions/shdeps.fish"
+cat >"$_bundle_dir/.shdeps-install.json" <<'JSON'
+{"schema":1,"method":"release","artifact_platform":"test","tag":"dev-test","commit":"abcdef123456","repo":"cgraf78/shdeps"}
+JSON
+
+SHDEPS_DIR="$_bundle_inst" SHDEPS_BIN="$_bundle_bin/shdeps" \
+  "$_bundle_dir/install.sh" >/dev/null 2>&1
+_assert_file_exists "install bundle: root binary installed" "$_bundle_inst/shdeps"
+_assert_file_exists "install bundle: metadata installed" "$_bundle_inst/.shdeps-install.json"
+_assert_symlink "install bundle: CLI symlinked" "$_bundle_bin/shdeps"
+_bundle_link=$(readlink "$_bundle_bin/shdeps")
+_assert_eq "install bundle: CLI points at release binary" "$_bundle_inst/shdeps" "$_bundle_link"
+
 # --- Idempotent re-run on existing clean clone ---
 
 SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
@@ -4458,8 +4505,10 @@ unset -f shdeps_update 2>/dev/null
 _bs_dir=$(_tmpdir)/shdeps-bs
 _bs_bin=$(_tmpdir)/bs-bin
 mkdir -p "$_bs_bin"
-# Copy working tree (not git clone) so tests use uncommitted install.sh
-cp -R "$SHDEPS_DIR"/. "$_bs_dir/"
+# Copy only the files bootstrap needs. Copying the whole working tree pulls in
+# ignored Rust build artifacts, which makes this test slow and can exhaust
+# small CI/tmp filesystems after release-package dry runs.
+_copy_bootstrap_fixture "$_bs_dir"
 
 SHDEPS_DIR="$_bs_dir" SHDEPS_BIN="$_bs_bin/shdeps" \
   . "$_bs_dir/install.sh" --bootstrap
@@ -4511,7 +4560,7 @@ fi
 unset -f shdeps_update 2>/dev/null
 _bs_dev_dir=$(_tmpdir)/bs-dev
 mkdir -p "$_bs_dev_dir/shdeps"
-cp -R "$_bs_dir"/. "$_bs_dev_dir/shdeps/"
+_copy_bootstrap_fixture "$_bs_dev_dir/shdeps"
 
 SHDEPS_GIT_DEV_DIR="$_bs_dev_dir" SHDEPS_DIR="/nonexistent" \
   SHDEPS_BIN="$_bs_bin/shdeps" \

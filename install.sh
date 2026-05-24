@@ -41,14 +41,57 @@ _check_prereqs() {
   fi
 }
 
+_script_dir() {
+  local src dir
+  src="${BASH_SOURCE[0]}"
+  case "$src" in
+    */*) dir="${src%/*}" ;;
+    *) dir="." ;;
+  esac
+  cd -P -- "$dir" && pwd
+}
+
+_is_bundle_dir() {
+  local dir="$1"
+  [[ -x "$dir/shdeps" && -f "$dir/.shdeps-install.json" ]]
+}
+
+_install_bundle() {
+  local src_dir="$1"
+
+  if [[ -e "$SHDEPS_DIR" ]]; then
+    _error "$SHDEPS_DIR exists but is not a git repo"
+    exit 1
+  fi
+
+  # Release archives are already verified before users run their bundled
+  # installer. Copy the exact archive payload into SHDEPS_DIR so this mode does
+  # not need git, network, or a Rust toolchain just to activate a local bundle.
+  mkdir -p "$SHDEPS_DIR"
+  cp -p "$src_dir/shdeps" "$SHDEPS_DIR/shdeps"
+  cp -p "$src_dir/shdeps.sh" "$SHDEPS_DIR/shdeps.sh"
+  cp -p "$src_dir/install.sh" "$SHDEPS_DIR/install.sh"
+  cp -p "$src_dir/.shdeps-install.json" "$SHDEPS_DIR/.shdeps-install.json"
+  [[ -f "$src_dir/README.md" ]] && cp -p "$src_dir/README.md" "$SHDEPS_DIR/README.md"
+  [[ -f "$src_dir/LICENSE" ]] && cp -p "$src_dir/LICENSE" "$SHDEPS_DIR/LICENSE"
+  [[ -d "$src_dir/man" ]] && cp -R "$src_dir/man" "$SHDEPS_DIR/"
+  [[ -d "$src_dir/completions" ]] && cp -R "$src_dir/completions" "$SHDEPS_DIR/"
+  _info "shdeps: installed"
+}
+
 # Symlink CLI into PATH and link man page + shell completions.
 # Requires shdeps.sh to be sourced first (for _shdeps_link_extras).
 _setup_links() {
   local shdeps_dir="$1"
+  local cli="$shdeps_dir/bin/shdeps"
 
-  if [[ -x "$shdeps_dir/bin/shdeps" ]]; then
+  if [[ -x "$shdeps_dir/shdeps" ]]; then
+    cli="$shdeps_dir/shdeps"
+  fi
+
+  if [[ -x "$cli" ]]; then
     mkdir -p "$(dirname "$SHDEPS_BIN")"
-    ln -sf "$shdeps_dir/bin/shdeps" "$SHDEPS_BIN"
+    ln -sf "$cli" "$SHDEPS_BIN"
   fi
 
   if declare -f _shdeps_link_extras &>/dev/null; then
@@ -61,6 +104,19 @@ _setup_links() {
 # ---------------------------------------------------------------------------
 
 _install() {
+  local script_dir
+  script_dir=$(_script_dir) || exit 1
+
+  if _is_bundle_dir "$script_dir"; then
+    _install_bundle "$script_dir"
+    if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
+      # shellcheck source=/dev/null
+      . "$SHDEPS_DIR/shdeps.sh"
+      _setup_links "$SHDEPS_DIR"
+    fi
+    return
+  fi
+
   _check_prereqs
 
   if [[ -d "$SHDEPS_DIR/.git" ]]; then
