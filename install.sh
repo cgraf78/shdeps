@@ -41,10 +41,11 @@ _check_source_prereqs() {
     exit 1
   fi
 
-  if ! _bash_supports_legacy_library; then
-    _error "bash 4.3+ is required (found ${BASH_VERSION})"
-    exit 1
-  fi
+  # Source-checkout installs now build and activate the Rust binary first, so
+  # stock macOS Bash 3.2 is a valid installer shell. Optional extras linking may
+  # still source legacy helpers when a checkout exposes them, but that happens
+  # after the CLI is installed and can degrade gracefully instead of blocking
+  # fleet bootstrap on older system Bash versions.
 }
 
 _script_dir() {

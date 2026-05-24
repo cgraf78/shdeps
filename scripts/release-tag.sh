@@ -5,7 +5,19 @@ set -euo pipefail
 # need a stable distribution tag in their file names. Keep that concern in this
 # tiny helper so packaging, smoke tests, and GitHub Actions agree without
 # letting Cargo's placeholder package version leak into user-visible behavior.
-tag=${SHDEPS_RELEASE_TAG:-${GITHUB_REF_NAME:-}}
+#
+# GitHub sets GITHUB_REF_NAME for branches as well as tags. Branch names are not
+# release identities, and accepting them would make CI dry-runs fail on feature
+# branches such as rust-port. Trust the GitHub ref only when Actions says it is a
+# tag; branch and PR builds deliberately fall through to dev-<commit>.
+tag=${SHDEPS_RELEASE_TAG:-}
+if [[ -z "$tag" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+  tag=${GITHUB_REF_NAME:-}
+fi
+
+if [[ -z "$tag" && "${GITHUB_REF:-}" == refs/tags/* ]]; then
+  tag=${GITHUB_REF#refs/tags/}
+fi
 
 if [[ -z "$tag" ]]; then
   tag=$(git describe --tags --exact-match 2>/dev/null || true)

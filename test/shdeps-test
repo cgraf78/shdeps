@@ -4460,6 +4460,27 @@ _assert_match "shdeps_version: format" "^shdeps commit [0-9a-f]+" "$ver"
 packaged_ver=$(SHDEPS_PACKAGED_COMMIT=abcdef1234567890 bash -c '. "$1"; shdeps_version' bash "$SHDEPS_DIR/shdeps-legacy.sh")
 _assert_eq "shdeps_version: packaged commit" "shdeps commit abcdef123456" "$packaged_ver"
 
+# --- release-tag.sh ---
+
+_release_commit=$(git -C "$SHDEPS_DIR" rev-parse --short HEAD)
+_release_tag=$(
+  cd "$SHDEPS_DIR" || exit 1
+  env -u SHDEPS_RELEASE_TAG GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
+)
+_assert_eq "release tag: branch ref uses commit identity" "dev-${_release_commit}" "$_release_tag"
+
+_release_tag=$(
+  cd "$SHDEPS_DIR" || exit 1
+  env -u SHDEPS_RELEASE_TAG GITHUB_REF_TYPE=tag GITHUB_REF_NAME=v1.2.3 scripts/release-tag.sh
+)
+_assert_eq "release tag: tag ref is preserved" "v1.2.3" "$_release_tag"
+
+_release_tag=$(
+  cd "$SHDEPS_DIR" || exit 1
+  env SHDEPS_RELEASE_TAG=dev-explicit GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
+)
+_assert_eq "release tag: explicit override wins" "dev-explicit" "$_release_tag"
+
 # ===========================================================================
 # Section 11: install.sh
 # ===========================================================================
