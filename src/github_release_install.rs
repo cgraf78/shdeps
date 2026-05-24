@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::archive;
@@ -32,6 +33,18 @@ pub fn install_plain(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf>
     // helpers used by repo, cargo, go, uv, and npm installs.
     fs::rename(&tmp, &target)?;
     Ok(target)
+}
+
+/// Installs a gzip-compressed standalone release binary.
+pub fn install_gz(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let mut decoder = flate2::read::GzDecoder::new(bytes);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded)?;
+
+    // Bash treats `.gz` release assets as compressed singles, not archives.
+    // Reuse the plain-binary path after decompression so replacement and
+    // executable-bit behavior stay identical to uncompressed release assets.
+    install_plain(bin_dir, cmd, &decoded)
 }
 
 /// Installs a gzip-compressed tar release archive.
@@ -252,6 +265,19 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn gz_install_decompresses_single_binary_and_marks_executable() {
+        let dir = temp_dir("gz-single");
+        let bytes = gzip(b"binary");
+
+        let target = super::install_gz(&dir, "tool", &bytes).unwrap();
+
+        assert_eq!(target, dir.join("tool"));
+        assert_eq!(fs::read(&target).unwrap(), b"binary");
+        assert!(fs::metadata(&target).unwrap().permissions().mode() & 0o111 != 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn tar_gz_install_descends_single_root_links_binary_and_extras() {
         let dir = temp_dir("tar-gz");
         let bytes = tar_gz(&[
@@ -303,6 +329,12 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("tool binary not found"));
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {

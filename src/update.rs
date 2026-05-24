@@ -914,6 +914,52 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_decompresses_gzip_single_binary() {
+        let mut fixture = Fixture::new("release-gz-single");
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-linux-x86_64.gz",
+                        "browser_download_url":"https://example/tool-linux-x86_64.gz"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://example/tool-linux-x86_64.gz", gzip(b"binary"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "v1.2.3");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"binary");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_github_release_fast_path_repairs_manifest_without_network() {
         let fixture = Fixture::new("release-fast");
         fixture.write_lib();
@@ -1595,6 +1641,12 @@ version() { printf 'saw-pkg\n'; }
         let mut perms = fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
