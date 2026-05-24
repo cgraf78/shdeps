@@ -14,7 +14,7 @@ use crate::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Queued {
-    name: String,
+    pub(crate) name: String,
     package: String,
 }
 

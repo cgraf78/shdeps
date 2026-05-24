@@ -6,7 +6,7 @@
 //! run post hooks only for dependencies that actually changed. Keeping those
 //! rules here avoids each install method learning partial transaction policy.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cleanup;
 use crate::config::Entry;
@@ -21,6 +21,7 @@ use crate::update_external;
 use crate::update_pkg;
 use crate::update_release;
 use crate::update_repo;
+use crate::update_transition;
 use crate::Result;
 
 /// Options controlling one update run.
@@ -146,7 +147,7 @@ pub fn run(
     context: &Context<'_, impl Runner>,
     options: Options,
 ) -> Result<Summary> {
-    let transitions = transitions_by_name(manifest, entries);
+    let transitions = update_transition::by_name(manifest, entries, context.roots)?;
 
     let mut summary = Summary::default();
     let mut changed = Vec::new();
@@ -158,6 +159,21 @@ pub fn run(
         }
 
         let item = update_pkg::install(entry, context, &mut queued)?;
+        if !item.failed {
+            match item.detail.as_str() {
+                "installed" => cleanup_successful_transition(
+                    entry,
+                    transitions.get(&entry.name),
+                    context,
+                    &mut summary,
+                )?,
+                "not available" => update_transition::restore_failed(
+                    transitions.get(&entry.name),
+                    context.manifest_path,
+                )?,
+                _ => {}
+            }
+        }
         if item.changed {
             changed.push(entry.name.clone());
         }
@@ -167,7 +183,32 @@ pub fn run(
         summary.items.push(item);
     }
 
+    let pkg_changed_start = changed.len();
+    let pkg_failed_start = summary.failed.len();
     update_pkg::flush(&queued, context, &mut changed, &mut summary)?;
+    let successful_packages = changed[pkg_changed_start..]
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let failed_packages = summary.failed[pkg_failed_start..]
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for item in &queued {
+        if successful_packages.contains(&item.name) {
+            let Some(entry) = entries.iter().find(|entry| entry.name == item.name) else {
+                continue;
+            };
+            cleanup_successful_transition(
+                entry,
+                transitions.get(&entry.name),
+                context,
+                &mut summary,
+            )?;
+        } else if failed_packages.contains(&item.name) {
+            update_transition::restore_failed(transitions.get(&item.name), context.manifest_path)?;
+        }
+    }
 
     for entry in entries {
         if entry.method == "pkg" || !active(entry, context.env) {
@@ -176,7 +217,20 @@ pub fn run(
 
         match entry.method.as_str() {
             "github:release" => {
-                let item = update_release::install(entry, context, options)?;
+                let item = update_transition::install_with_prepared(
+                    entry,
+                    transitions.get(&entry.name),
+                    context.roots,
+                    || update_release::install(entry, context, options),
+                )?;
+                if !item.failed {
+                    cleanup_successful_transition(
+                        entry,
+                        transitions.get(&entry.name),
+                        context,
+                        &mut summary,
+                    )?;
+                }
                 if item.failed {
                     summary.failed.push(entry.name.clone());
                 }
@@ -186,7 +240,20 @@ pub fn run(
                 summary.items.push(item);
             }
             "github:repo" => {
-                let item = update_repo::install(entry, context, options)?;
+                let item = update_transition::install_with_prepared(
+                    entry,
+                    transitions.get(&entry.name),
+                    context.roots,
+                    || update_repo::install(entry, context, options),
+                )?;
+                if !item.failed {
+                    cleanup_successful_transition(
+                        entry,
+                        transitions.get(&entry.name),
+                        context,
+                        &mut summary,
+                    )?;
+                }
                 if item.failed {
                     summary.failed.push(entry.name.clone());
                 }
@@ -196,7 +263,20 @@ pub fn run(
                 summary.items.push(item);
             }
             "cargo" | "go" | "uv" | "npm" => {
-                let item = update_external::install(entry, context, options)?;
+                let item = update_transition::install_with_prepared(
+                    entry,
+                    transitions.get(&entry.name),
+                    context.roots,
+                    || update_external::install(entry, context, options),
+                )?;
+                if !item.failed {
+                    cleanup_successful_transition(
+                        entry,
+                        transitions.get(&entry.name),
+                        context,
+                        &mut summary,
+                    )?;
+                }
                 if item.failed {
                     summary.failed.push(entry.name.clone());
                 }
@@ -212,7 +292,7 @@ pub fn run(
                     context.roots,
                     context.hooks,
                     options,
-                    transitions.get(&entry.name),
+                    transitions.get(&entry.name).map(update_transition::old),
                 )?;
                 let item = outcome.item;
                 if outcome.cleanup_leftover {
@@ -251,13 +331,6 @@ fn active(entry: &Entry, env: &RuntimeEnv) -> bool {
         platform::filter_match(&entry.filter, env),
         platform::FilterMatch::Match
     )
-}
-
-fn transitions_by_name(manifest: &Manifest, entries: &[Entry]) -> HashMap<String, ManifestEntry> {
-    cleanup::method_transitions(manifest, entries)
-        .into_iter()
-        .map(|entry| (entry.name.clone(), entry))
-        .collect()
 }
 
 struct CustomOutcome {
@@ -302,6 +375,18 @@ fn cleanup_transition(old: &ManifestEntry, roots: &Roots) -> bool {
     // new method's hook. Running the current hook after a successful custom
     // install could undo the install we just accepted.
     cleanup::remove_builtin(old, &cleanup_roots(roots)).is_err()
+}
+
+fn cleanup_successful_transition(
+    entry: &Entry,
+    transition: Option<&update_transition::Transition>,
+    context: &Context<'_, impl Runner>,
+    summary: &mut Summary,
+) -> Result<()> {
+    if update_transition::cleanup_successful(entry, transition, context.roots)? {
+        summary.leftovers.push(entry.name.clone());
+    }
+    Ok(())
 }
 
 fn install_custom(
@@ -389,6 +474,7 @@ mod tests {
     use crate::config::parse_entry;
     use crate::hooks::BashCustomProbe;
     use crate::http::Client;
+    use crate::link_state::{self, Kind};
     use crate::manifest::{self, ManifestEntry};
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
@@ -518,6 +604,195 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
                 "tool",
                 old_install.display().to_string(),
             ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_cleans_old_builtin_method_after_repo_transition_preserving_new_links() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("transition-repo");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        fs::create_dir_all(local_clone.join("share/man/man1")).unwrap();
+        fs::write(local_clone.join("share/man/man1/ds.1"), "new man").unwrap();
+
+        let old_install = fixture.roots.install_dir.join("cgraf78/ds");
+        write_executable(&old_install.join("bin/ds"));
+        write_executable(&fixture.roots.bin_dir.join("ds"));
+        let old_extra = fixture.roots.install_dir.join("man/man1/old-ds.1");
+        fs::create_dir_all(old_extra.parent().unwrap()).unwrap();
+        symlink(old_install.join("share/man/man1/old-ds.1"), &old_extra).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "cgraf78/ds", Kind::Extras),
+            std::slice::from_ref(&old_extra),
+        )
+        .unwrap();
+
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "cgraf78/ds",
+                "github:release",
+                "ds",
+                old_install.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let install_link = fixture.roots.install_dir.join("cgraf78/ds");
+        let public_bin = fixture.roots.bin_dir.join("ds");
+        let new_extra = fixture.roots.install_dir.join("man/man1/ds.1");
+        assert!(!summary.has_errors());
+        assert!(summary.leftovers.is_empty());
+        assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+        assert_eq!(
+            fs::read_link(&public_bin).unwrap(),
+            install_link.join("bin/ds")
+        );
+        assert_eq!(
+            fs::read_link(&new_extra).unwrap(),
+            install_link.join("share/man/man1/ds.1")
+        );
+        assert!(fs::symlink_metadata(&old_extra).is_err());
+        assert_eq!(
+            link_state::read(&link_state::path(
+                &fixture.roots.state_dir,
+                "cgraf78/ds",
+                Kind::Extras
+            ))
+            .unwrap(),
+            vec![new_extra]
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("cgraf78/ds"),
+            Some(&ManifestEntry::new(
+                "cgraf78/ds",
+                "github:repo",
+                "ds",
+                install_link.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn update_pkg_transition_cleans_old_builtin_artifacts_without_uninstalling_package() {
+        let fixture = Fixture::new("transition-pkg");
+        fixture.write_lib();
+        let old_install = fixture.roots.install_dir.join("tool");
+        write_executable(&old_install.join("bin/tool"));
+        write_executable(&fixture.roots.bin_dir.join("tool"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                "github:release",
+                "tool",
+                old_install.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default().with_command("tool");
+
+        let summary = run(
+            &[parse_entry("tool|pkg|tool|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].detail, "installed");
+        assert!(!old_install.exists());
+        assert!(!fixture.roots.bin_dir.join("tool").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", "pkg", "tool", ""))
+        );
+    }
+
+    #[test]
+    fn update_pkg_transition_restores_old_manifest_when_package_install_fails() {
+        let fixture = Fixture::new("transition-pkg-failure");
+        fixture.write_lib();
+        let old_install = fixture.roots.install_dir.join("tool");
+        write_executable(&old_install.join("bin/tool"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old_manifest = ManifestEntry::new(
+            "tool",
+            "github:release",
+            "tool",
+            old_install.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default()
+            .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
+            .with_failure("sudo", ["apt-get", "install", "-y", "tool"]);
+
+        let summary = run(
+            &[parse_entry("tool|pkg|tool|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["tool"]);
+        assert!(old_install.exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old_manifest)
+        );
+    }
+
+    #[test]
+    fn update_restores_release_public_binary_when_symlink_method_transition_fails() {
+        let fixture = Fixture::new("transition-bin-restore");
+        fixture.write_lib();
+        let old_bin = fixture.roots.bin_dir.join("tool");
+        write_executable(&old_bin);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old_manifest = ManifestEntry::new(
+            "tool",
+            "github:release",
+            "tool",
+            old_bin.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("tool|cargo|tool|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].detail, "cargo not found");
+        assert_eq!(fs::read_to_string(&old_bin).unwrap(), "#!/bin/sh\n");
+        assert!(!old_bin.is_symlink());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old_manifest)
         );
     }
 

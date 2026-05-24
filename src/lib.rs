@@ -54,6 +54,7 @@ mod update_external;
 mod update_pkg;
 mod update_release;
 mod update_repo;
+mod update_transition;
 pub mod version;
 
 pub use errors::{Error, Result};
