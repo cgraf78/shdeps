@@ -32,6 +32,7 @@ pub mod package_cache;
 pub mod platform;
 pub mod process;
 pub mod prune;
+pub mod release_activate;
 pub mod release_artifact;
 pub mod release_asset;
 pub mod release_stage;
