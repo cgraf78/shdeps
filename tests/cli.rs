@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -176,6 +177,86 @@ fn dep_file_stays_fast_with_many_configured_dependencies() {
     );
 }
 
+#[test]
+fn list_reports_configured_dependency_statuses() {
+    let fixture = Fixture::new("list-status");
+    fixture.write(
+        "conf/deps.conf",
+        "cgraf78/tool github:repo\nlinux-only github:repo - - os:mac\nasset github:release asset\ncustom custom\n",
+    );
+    fixture.write("share/cgraf78/tool/VERSION", "2.0.0\n");
+    fixture.write_executable("bin/asset", "#!/bin/sh\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "asset|github:release|asset|{}\n",
+            fixture.dir.join("bin/asset").display()
+        ),
+    );
+    fixture.write(
+        "conf/hooks.d/custom.sh",
+        "exists() { return 0; }\nversion() { printf '9.9.9\\n'; }\n",
+    );
+
+    let output = run(&mut fixture.command(["list"]));
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout),
+        "NAME         METHOD         STATUS       DETAILS\n\
+         ----         ------         ------       -------\n\
+         asset        github:release installed    \n\
+         cgraf78/tool github:repo    installed    2.0.0\n\
+         custom       custom         installed    9.9.9\n\
+         linux-only   github:repo    skipped      (platform)\n"
+    );
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn check_reports_installed_skipped_missing_and_unknown() {
+    let fixture = Fixture::new("check-status");
+    fixture.write(
+        "conf/deps.conf",
+        "cgraf78/tool github:repo\nlinux-only github:repo - - os:mac\nmissing github:repo\n",
+    );
+    fixture.write("share/cgraf78/tool/VERSION", "2.0.0\n");
+
+    let installed = run(&mut fixture.command(["check", "cgraf78/tool"]));
+    assert_success(&installed);
+    assert_eq!(text(&installed.stdout), "cgraf78/tool: installed (2.0.0)\n");
+    assert_eq!(text(&installed.stderr), "");
+
+    let skipped = run(&mut fixture.command(["check", "linux-only"]));
+    assert_success(&skipped);
+    assert_eq!(
+        text(&skipped.stdout),
+        "linux-only: skipped (platform mismatch)\n"
+    );
+    assert_eq!(text(&skipped.stderr), "");
+
+    let missing = run(&mut fixture.command(["check", "missing"]));
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(text(&missing.stdout), "missing: not installed\n");
+    assert_eq!(text(&missing.stderr), "");
+
+    let unknown = run(&mut fixture.command(["check", "not-configured"]));
+    assert_eq!(unknown.status.code(), Some(1));
+    assert_eq!(text(&unknown.stdout), "");
+    assert_eq!(
+        text(&unknown.stderr),
+        "error: unknown dependency 'not-configured'\n"
+    );
+
+    let usage = run(&mut fixture.command(["check"]));
+    assert_eq!(usage.status.code(), Some(2));
+    assert_eq!(text(&usage.stdout), "");
+    assert_eq!(
+        text(&usage.stderr),
+        "error: check requires a dependency name\nUsage: shdeps check <name>\n"
+    );
+}
+
 fn run(command: &mut Command) -> Output {
     command.output().expect("shdeps command should run")
 }
@@ -216,6 +297,7 @@ impl Fixture {
             .env_clear()
             .env("HOME", self.dir.join("home"))
             .env("SHDEPS_CONF_DIR", self.dir.join("conf"))
+            .env("SHDEPS_STATE_DIR", self.dir.join("state"))
             .env("SHDEPS_GIT_DEV_DIR", self.dir.join("git"))
             .env("SHDEPS_INSTALL_DIR", self.dir.join("share"))
             .env("SHDEPS_BIN_DIR", self.dir.join("bin"))
@@ -229,5 +311,14 @@ impl Fixture {
         let path = self.dir.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    fn write_executable(&self, rel: impl AsRef<Path>, content: &str) {
+        let path = self.dir.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 }

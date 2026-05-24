@@ -4,13 +4,20 @@
 //! output text. Keeping formatting here prevents library modules from growing
 //! incidental dependencies on terminal presentation.
 
+use std::collections::BTreeMap;
+use std::env;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::api;
+use crate::config::{self, Entry};
 use crate::dep_path;
 use crate::errors::Error;
+use crate::hooks::BashCustomProbe;
+use crate::manifest;
+use crate::process::{self, Process};
 use crate::runtime::{self, Overrides, ProcessEnv};
+use crate::status::{self, Context, DependencyStatus, SkipReason, State};
 use crate::version;
 use crate::Result;
 
@@ -98,6 +105,8 @@ where
         "dep-root" => dep_root_cmd(rest, &parsed, stdout, stderr),
         "dep-path" => dep_path_cmd(rest, &parsed, stdout, stderr),
         "dep-file" => dep_file_cmd(rest, &parsed, stdout, stderr),
+        "list" => list_cmd(rest, &parsed, stdout, stderr),
+        "check" => check_cmd(rest, &parsed, stdout, stderr),
         "__api" => api::run(rest, &parsed.overrides, stdout, stderr),
         "migrate" => {
             writeln!(
@@ -107,9 +116,7 @@ where
             writeln!(stderr, "Run 'shdeps help' for usage.")?;
             Ok(2)
         }
-        "update" | "self-update" | "list" | "check" | "prune" => {
-            not_implemented(command, rest, stderr)
-        }
+        "update" | "self-update" | "prune" => not_implemented(command, rest, stderr),
         other => {
             writeln!(stderr, "error: unknown command '{other}'")?;
             writeln!(stderr, "Run 'shdeps help' for usage.")?;
@@ -243,6 +250,111 @@ where
     dep_file(target, rel, options, stdout)
 }
 
+fn list_cmd<W, E>(
+    _args: &[String],
+    options: &ParsedOptions,
+    stdout: &mut W,
+    _stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    let pkg_mgr = process::detect_package_manager(&Process);
+    let raw_entries = config::load_dir(&roots.conf_dir)?;
+    let entries = parse_entries(&raw_entries, &pkg_mgr);
+    if entries.is_empty() {
+        writeln!(stdout, "No dependencies configured.")?;
+        return Ok(0);
+    }
+
+    let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
+    let package_versions = if entries.iter().any(|entry| entry.method == "pkg") {
+        process::package_versions(&Process, &pkg_mgr)
+    } else {
+        BTreeMap::new()
+    };
+    let custom = custom_probe();
+    let env = runtime::runtime_env(&ProcessEnv);
+    let context = Context {
+        roots: &roots,
+        env: &env,
+        manifest: &manifest,
+        runner: &Process,
+        custom: &custom,
+        pkg_mgr: &pkg_mgr,
+        package_versions: &package_versions,
+    };
+    let statuses = status::list(&entries, &context)?;
+
+    write_list(&statuses, stdout)?;
+    Ok(0)
+}
+
+fn check_cmd<W, E>(
+    args: &[String],
+    options: &ParsedOptions,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    let Some(target) = args.first() else {
+        writeln!(stderr, "error: check requires a dependency name")?;
+        writeln!(stderr, "Usage: shdeps check <name>")?;
+        return Ok(2);
+    };
+
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    let raw_entries = config::load_dir(&roots.conf_dir)?;
+    let Some(raw_entry) = raw_entries.iter().find(|raw| {
+        let entry = config::parse_entry(raw, None);
+        entry.name == *target
+    }) else {
+        writeln!(stderr, "error: unknown dependency '{target}'")?;
+        return Ok(1);
+    };
+
+    let probe_entry = config::parse_entry(raw_entry, None);
+    let pkg_mgr = if probe_entry.method == "pkg" {
+        process::detect_package_manager(&Process)
+    } else {
+        String::new()
+    };
+    let entry = config::parse_entry(
+        raw_entry,
+        if pkg_mgr.is_empty() {
+            None
+        } else {
+            Some(&pkg_mgr)
+        },
+    );
+    let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
+    let package_versions = if entry.method == "pkg" {
+        process::package_versions(&Process, &pkg_mgr)
+    } else {
+        BTreeMap::new()
+    };
+    let custom = custom_probe();
+    let env = runtime::runtime_env(&ProcessEnv);
+    let context = Context {
+        roots: &roots,
+        env: &env,
+        manifest: &manifest,
+        runner: &Process,
+        custom: &custom,
+        pkg_mgr: &pkg_mgr,
+        package_versions: &package_versions,
+    };
+    let dependency = status::classify(&entry, &context)?;
+
+    write_check(&dependency, stdout)?;
+    Ok(check_exit_code(&dependency.state))
+}
+
 fn dep_root<W>(target: &str, options: &ParsedOptions, stdout: &mut W) -> Result<i32>
 where
     W: Write,
@@ -288,6 +400,123 @@ where
         ),
         stdout,
     )
+}
+
+fn parse_entries(raw_entries: &[String], pkg_mgr: &str) -> Vec<Entry> {
+    let pkg_mgr = if pkg_mgr.is_empty() {
+        None
+    } else {
+        Some(pkg_mgr)
+    };
+    raw_entries
+        .iter()
+        .map(|entry| config::parse_entry(entry, pkg_mgr))
+        .collect()
+}
+
+fn write_list<W>(statuses: &[DependencyStatus], stdout: &mut W) -> Result<()>
+where
+    W: Write,
+{
+    let name_width = statuses
+        .iter()
+        .map(|status| status.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let method_width = statuses
+        .iter()
+        .map(|status| status.method.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    writeln!(
+        stdout,
+        "{:<name_width$} {:<method_width$} {:<12} DETAILS",
+        "NAME", "METHOD", "STATUS"
+    )?;
+    writeln!(
+        stdout,
+        "{:<name_width$} {:<method_width$} {:<12} -------",
+        "----", "------", "------"
+    )?;
+
+    for status in statuses {
+        let (state, detail) = list_fields(&status.state);
+        writeln!(
+            stdout,
+            "{:<name_width$} {:<method_width$} {:<12} {}",
+            status.name, status.method, state, detail
+        )?;
+    }
+    Ok(())
+}
+
+fn list_fields(state: &State) -> (&'static str, String) {
+    match state {
+        State::Installed { detail } => ("installed", detail.clone().unwrap_or_default()),
+        State::Missing => ("missing", String::new()),
+        State::Skipped(SkipReason::Platform) => ("skipped", "(platform)".to_owned()),
+        State::Skipped(SkipReason::Host) => ("skipped", "(host)".to_owned()),
+        State::Skipped(SkipReason::PackageManager) => ("skipped", "(pkg manager)".to_owned()),
+    }
+}
+
+fn write_check<W>(status: &DependencyStatus, stdout: &mut W) -> Result<()>
+where
+    W: Write,
+{
+    match &status.state {
+        State::Installed { detail } => {
+            if let Some(detail) = detail {
+                writeln!(stdout, "{}: installed ({detail})", status.name)?;
+            } else {
+                writeln!(stdout, "{}: installed", status.name)?;
+            }
+        }
+        State::Missing => {
+            writeln!(stdout, "{}: not installed", status.name)?;
+        }
+        State::Skipped(SkipReason::Platform) => {
+            writeln!(stdout, "{}: skipped (platform mismatch)", status.name)?;
+        }
+        State::Skipped(SkipReason::Host) => {
+            writeln!(stdout, "{}: skipped (host mismatch)", status.name)?;
+        }
+        State::Skipped(SkipReason::PackageManager) => {
+            writeln!(stdout, "{}: skipped (pkg manager)", status.name)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_exit_code(state: &State) -> i32 {
+    match state {
+        State::Missing => 1,
+        State::Installed { .. } | State::Skipped(_) => 0,
+    }
+}
+
+fn custom_probe() -> BashCustomProbe {
+    BashCustomProbe::new(shdeps_lib_path().unwrap_or_else(missing_shdeps_lib))
+}
+
+fn shdeps_lib_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("SHDEPS_LIB").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let exe = env::current_exe().ok()?;
+    exe.ancestors()
+        .map(|ancestor| ancestor.join("shdeps.sh"))
+        .find(|candidate| candidate.is_file())
+}
+
+fn missing_shdeps_lib() -> PathBuf {
+    Path::new("/__shdeps_missing__").join("shdeps.sh")
 }
 
 fn run_path_lookup<W>(result: Result<PathBuf>, stdout: &mut W) -> Result<i32>
