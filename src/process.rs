@@ -194,6 +194,12 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
         .is_some_and(|output| output.success)
 }
 
+/// Returns whether `path` is an executable regular file.
+#[must_use]
+pub fn executable_path(path: &Path) -> bool {
+    is_executable(path)
+}
+
 fn run(program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Output> {
     let mut command = Command::new(program);
     command
