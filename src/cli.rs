@@ -4,15 +4,12 @@
 //! output text. Keeping formatting here prevents library modules from growing
 //! incidental dependencies on terminal presentation.
 
-use std::env;
-use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
-use crate::dep_path::{self, Roots};
+use crate::dep_path;
 use crate::errors::Error;
-use crate::platform::{self, RuntimeEnv};
+use crate::runtime::{self, Overrides, ProcessEnv};
 use crate::version;
 use crate::Result;
 
@@ -119,7 +116,7 @@ enum ParseOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedOptions {
     command_index: usize,
-    config_path: Option<PathBuf>,
+    overrides: Overrides,
 }
 
 fn parse_options<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<ParseOutcome>
@@ -154,7 +151,9 @@ where
             _ => {
                 return Ok(ParseOutcome::Command(ParsedOptions {
                     command_index: index,
-                    config_path: config_path(args),
+                    overrides: Overrides {
+                        config: config_path(args),
+                    },
                 }));
             }
         }
@@ -199,7 +198,11 @@ where
     };
 
     run_path_lookup(
-        dep_path::root(target, &roots(options), &runtime_env()),
+        dep_path::root(
+            target,
+            &runtime::roots(&ProcessEnv, &options.overrides).dep_path_roots(),
+            &runtime::runtime_env(&ProcessEnv),
+        ),
         stdout,
     )
 }
@@ -224,7 +227,12 @@ where
     };
 
     run_path_lookup(
-        dep_path::path(target, rel, &roots(options), &runtime_env()),
+        dep_path::path(
+            target,
+            rel,
+            &runtime::roots(&ProcessEnv, &options.overrides).dep_path_roots(),
+            &runtime::runtime_env(&ProcessEnv),
+        ),
         stdout,
     )
 }
@@ -249,7 +257,12 @@ where
     };
 
     run_path_lookup(
-        dep_path::file(target, rel, &roots(options), &runtime_env()),
+        dep_path::file(
+            target,
+            rel,
+            &runtime::roots(&ProcessEnv, &options.overrides).dep_path_roots(),
+            &runtime::runtime_env(&ProcessEnv),
+        ),
         stdout,
     )
 }
@@ -266,66 +279,6 @@ where
         Err(Error::Resolve(error)) => Ok(error.exit_code()),
         Err(error) => Err(error),
     }
-}
-
-fn roots(options: &ParsedOptions) -> Roots {
-    let home = home_dir();
-    Roots {
-        conf_dir: conf_dir(options, &home),
-        git_dev_dir: env_path("SHDEPS_GIT_DEV_DIR").unwrap_or_else(|| home.join("git")),
-        install_dir: env_path("SHDEPS_INSTALL_DIR").unwrap_or_else(|| home.join(".local/share")),
-    }
-}
-
-fn conf_dir(options: &ParsedOptions, home: &Path) -> PathBuf {
-    if let Some(path) = &options.config_path {
-        return if path.is_dir() {
-            path.clone()
-        } else {
-            path.parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
-        };
-    }
-
-    env_path("SHDEPS_CONF_DIR").unwrap_or_else(|| {
-        env_path("XDG_CONFIG_HOME")
-            .unwrap_or_else(|| home.join(".config"))
-            .join("shdeps")
-    })
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn home_dir() -> PathBuf {
-    env_path("HOME").unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn runtime_env() -> RuntimeEnv {
-    let platform = env::var("SHDEPS_TEST_PLATFORM").unwrap_or_else(|_| {
-        let uname = command_output("uname", &["-s"]).unwrap_or_else(|| env::consts::OS.to_owned());
-        let proc_version = fs::read_to_string("/proc/version").ok();
-        platform::normalize_platform(uname.trim(), proc_version.as_deref())
-    });
-    let host = env::var("SHDEPS_TEST_HOST").unwrap_or_else(|_| {
-        command_output("hostname", &["-s"])
-            .or_else(|| command_output("hostname", &[]))
-            .unwrap_or_else(|| "unknown".to_owned())
-    });
-
-    RuntimeEnv::new(platform, host.trim())
-}
-
-fn command_output(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn not_implemented<E>(command: &str, _rest: &[String], stderr: &mut E) -> Result<i32>
