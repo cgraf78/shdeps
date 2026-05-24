@@ -8,20 +8,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::github::Release;
 use crate::install_metadata::{self, Metadata, Method, Read};
 use crate::process::Runner;
 use crate::Result;
-
-/// Release metadata needed for self-update selection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Release {
-    /// Release tag name from the GitHub API.
-    pub tag: String,
-    /// True when GitHub marks the release as a draft.
-    pub draft: bool,
-    /// True when GitHub marks the release as a prerelease.
-    pub prerelease: bool,
-}
 
 /// Decision after applying release-selection rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,9 +294,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{
-        select_release, source_checkout, target, Outcome, Release, ReleaseDecision, Target,
-    };
+    use super::{select_release, source_checkout, target, Outcome, ReleaseDecision, Target};
+    use crate::github::Release;
     use crate::install_metadata::{write, Metadata, Method};
     use crate::process::{Output, Runner};
 
@@ -604,6 +593,7 @@ mod tests {
             tag: tag.to_owned(),
             draft,
             prerelease,
+            assets: Vec::new(),
         }
     }
 
