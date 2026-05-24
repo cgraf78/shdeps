@@ -29,6 +29,7 @@ pub mod process;
 pub mod prune;
 pub mod release_asset;
 pub mod runtime;
+pub mod self_update;
 pub mod stamp;
 pub mod state;
 pub mod status;
