@@ -533,7 +533,7 @@ mod tests {
 
     use super::{
         release_archive, select_archive, select_release, source_checkout, target, ArchiveDecision,
-        Outcome, ReleaseArchiveOutcome, ReleaseDecision, Target,
+        Outcome, ReleaseArchiveFailure, ReleaseArchiveOutcome, ReleaseDecision, Target,
     };
     use crate::checksum;
     use crate::github::{Asset, Release};
@@ -1001,6 +1001,60 @@ mod tests {
                 Some("token".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn release_archive_self_update_keeps_existing_install_on_bad_archive() {
+        let root = temp_dir("release-bad-archive-root");
+        let dir = root.join("shdeps");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("shdeps"), "old binary").unwrap();
+        fs::write(dir.join("shdeps.sh"), "old shim").unwrap();
+        let mut metadata = Metadata::new(Method::Release);
+        metadata.tag = Some("v2026.05.23".to_owned());
+        metadata.repo = Some("cgraf78/shdeps".to_owned());
+        let env = FakeEnv::new()
+            .with_var("GH_TOKEN", "token")
+            .with_var("SHDEPS_TEST_PLATFORM", "linux")
+            .with_command("uname -m", "x86_64");
+        let archive_name = "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz";
+        let checksum_name = format!("{archive_name}.sha256");
+        let archive = release_tar();
+        let client = FakeClient::new()
+            .with(
+                "https://api.github.com/repos/cgraf78/shdeps/releases",
+                releases_json("v2026.05.24").into_bytes(),
+            )
+            .with(&format!("https://example/{archive_name}"), archive)
+            .with(
+                &format!("https://example/{checksum_name}"),
+                b"bad checksum".to_vec(),
+            );
+
+        let failure =
+            release_archive(&dir, &metadata, &env, &FakeRunner::default(), &client).unwrap_err();
+
+        // A release archive is untrusted until checksum verification and
+        // required-file validation both pass. A bad candidate must never move
+        // the current install aside, because `self-update` runs from automated
+        // bootstrap paths where the old binary is the only recovery tool.
+        assert!(matches!(
+            failure,
+            ReleaseArchiveFailure::Stage(crate::release_stage::Failure::ChecksumMismatch { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(dir.join("shdeps")).unwrap(),
+            "old binary"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("shdeps.sh")).unwrap(),
+            "old shim"
+        );
+        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".shdeps-stage")));
     }
 
     fn checkout(name: &str) -> PathBuf {
