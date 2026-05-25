@@ -4961,6 +4961,14 @@ _su_dir=$(_tmpdir)/shdeps-su
 git clone "$_su_origin" "$_su_dir" >/dev/null 2>&1
 git -C "$_su_dir" config user.email "test@test.com"
 git -C "$_su_dir" config user.name "Test"
+_su_branch="shdeps-self-update-test"
+# GitHub Actions checks out pull requests at a detached commit. A self-update
+# fixture cloned from that shape has no tracked branch, so `git pull` correctly
+# has nothing to advance even after the test origin moves. Create an explicit
+# branch/upstream pair here so the behavior under test is the same as a normal
+# installed checkout on a user's machine.
+git -C "$_su_dir" checkout -B "$_su_branch" >/dev/null 2>&1
+git -C "$_su_dir" push -q -u origin "$_su_branch" >/dev/null 2>&1
 
 _source_shdeps "$SHDEPS_DIR"
 
@@ -4970,8 +4978,8 @@ _su_work=$(_tmpdir)
 git clone "$_su_origin" "$_su_work" >/dev/null 2>&1
 git -C "$_su_work" config user.email "test@test.com"
 git -C "$_su_work" config user.name "Test"
+git -C "$_su_work" checkout "$_su_branch" >/dev/null 2>&1
 git -C "$_su_work" commit --allow-empty -m "pull-test" -q
-_su_branch=$(git -C "$_su_work" branch --show-current)
 # Push the setup commit to the exact branch the self-update clone tracks.
 # A bare `git push` depends on the runner's `push.default` and upstream config;
 # Debian CI exposed that as a silent setup miss because stderr is intentionally
