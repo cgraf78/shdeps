@@ -249,14 +249,40 @@ fn preserve_paths(entry: &Entry, roots: &Roots) -> BTreeSet<PathBuf> {
     }
 
     match entry.method.as_str() {
-        "github:repo" | "github:release" | "cargo" | "go" | "uv" | "npm" => {
+        "github:repo" | "cargo" | "go" | "uv" | "npm" => {
             preserve.insert(roots.bin_dir.join(&entry.cmd));
             preserve.insert(roots.install_dir.join(&entry.name));
+        }
+        "github:release" => {
+            preserve.insert(roots.bin_dir.join(&entry.cmd));
+
+            let install_root = roots.install_dir.join(&entry.name);
+            if release_install_root_is_owned(&install_root) {
+                preserve.insert(install_root);
+            }
         }
         _ => {}
     }
 
     preserve
+}
+
+fn release_install_root_is_owned(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+
+    // `github:release` has two ownership modes. Raw/compressed single-file
+    // assets own only the public binary, while archive assets replace the
+    // managed install root with a real directory and then symlink the public
+    // command into it. During a method transition from `github:repo`, that same
+    // path may still be a symlink to a local development checkout. Preserving
+    // the symlink would leave stale repo state behind and make `dep-root` point
+    // at a clone even though the configured method is now release-based. A real
+    // directory, however, is the archive payload we just installed and must be
+    // kept. `symlink_metadata` is the important detail here: following symlinks
+    // would make a stale dev-clone link look like an owned archive directory.
+    metadata.is_dir() && !metadata.file_type().is_symlink()
 }
 
 fn unlink_snapshot(

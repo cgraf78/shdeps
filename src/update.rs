@@ -964,6 +964,182 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
     }
 
     #[test]
+    fn update_github_release_ignores_local_clone_for_release_method() {
+        let mut fixture = Fixture::new("release-ignores-local-clone");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/cgraf78/ds/releases",
+                release_response("ds", "v1.2.3", "https://example/ds-linux-x86_64"),
+            )
+            .with(
+                "https://example/ds-linux-x86_64",
+                b"release-binary".to_vec(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:release|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let bin_path = fixture.roots.bin_dir.join("ds");
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].detail, "v1.2.3");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"release-binary");
+        assert!(local_clone.join("bin/ds").exists());
+        assert!(!fixture.roots.install_dir.join("cgraf78/ds").exists());
+        assert!(runner.calls().iter().all(|call| !call.starts_with("git\0")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_repo_to_plain_release_removes_local_clone_symlink_but_preserves_clone() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = Fixture::new("transition-repo-to-plain-release");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        let install_link = fixture.roots.install_dir.join("cgraf78/ds");
+        fs::create_dir_all(install_link.parent().unwrap()).unwrap();
+        symlink(&local_clone, &install_link).unwrap();
+        let public_bin = fixture.roots.bin_dir.join("ds");
+        fs::create_dir_all(public_bin.parent().unwrap()).unwrap();
+        symlink(install_link.join("bin/ds"), &public_bin).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "cgraf78/ds", Kind::Bin),
+            std::slice::from_ref(&public_bin),
+        )
+        .unwrap();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/cgraf78/ds/releases",
+                release_response("ds", "v1.2.3", "https://example/ds-linux-x86_64"),
+            )
+            .with(
+                "https://example/ds-linux-x86_64",
+                b"release-binary".to_vec(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "cgraf78/ds",
+                "github:repo",
+                "ds",
+                install_link.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:release|ds|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(fs::read(&public_bin).unwrap(), b"release-binary");
+        assert!(local_clone.join("bin/ds").exists());
+        assert!(fs::symlink_metadata(&install_link).is_err());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("cgraf78/ds"),
+            Some(&ManifestEntry::new(
+                "cgraf78/ds",
+                "github:release",
+                "ds",
+                public_bin.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_repo_to_archive_release_replaces_local_clone_symlink_with_archive_root() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = Fixture::new("transition-repo-to-archive-release");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        let install_link = fixture.roots.install_dir.join("cgraf78/ds");
+        fs::create_dir_all(install_link.parent().unwrap()).unwrap();
+        symlink(&local_clone, &install_link).unwrap();
+        let public_bin = fixture.roots.bin_dir.join("ds");
+        fs::create_dir_all(public_bin.parent().unwrap()).unwrap();
+        symlink(install_link.join("bin/ds"), &public_bin).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "cgraf78/ds", Kind::Bin),
+            std::slice::from_ref(&public_bin),
+        )
+        .unwrap();
+        let archive = tar_gz(&[
+            ("ds-v1.2.3/bin/ds", b"release-binary".as_slice(), 0o755),
+            ("ds-v1.2.3/share/man/man1/ds.1", b"man".as_slice(), 0o644),
+        ]);
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/cgraf78/ds/releases",
+                release_response("ds", "v1.2.3", "https://example/ds-linux-x86_64.tar.gz"),
+            )
+            .with("https://example/ds-linux-x86_64.tar.gz", archive);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "cgraf78/ds",
+                "github:repo",
+                "ds",
+                install_link.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:release|ds|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(install_link.is_dir());
+        assert!(!install_link.is_symlink());
+        assert_eq!(
+            fs::read_link(&public_bin).unwrap(),
+            install_link.join("bin/ds")
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.install_dir.join("man/man1/ds.1")).unwrap(),
+            install_link.join("share/man/man1/ds.1")
+        );
+        assert!(local_clone.join("bin/ds").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("cgraf78/ds"),
+            Some(&ManifestEntry::new(
+                "cgraf78/ds",
+                "github:release",
+                "ds",
+                public_bin.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_reports_custom_install_failure_without_manifest_row() {
         let fixture = Fixture::new("custom-failure");
         fixture.write_lib();
@@ -2352,6 +2528,84 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert!(!summary.items[0].changed);
         assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_repo_replaces_removed_local_clone_symlink_with_managed_clone() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("repo-local-removed");
+        fixture.write_lib();
+        let removed_local_clone = fixture.roots.git_dev_dir.join("ds");
+        let install_dir = fixture.roots.install_dir.join("cgraf78/ds");
+        fs::create_dir_all(install_dir.parent().unwrap()).unwrap();
+        symlink(&removed_local_clone, &install_dir).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "cgraf78/ds",
+                "github:repo",
+                "ds",
+                install_dir.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let clone_tmp = fixture
+            .roots
+            .install_dir
+            .join(format!("cgraf78/ds.tmp.{}", std::process::id()));
+        let runner = FakeRunner::default()
+            .with_command("git")
+            .with_created_dir(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/cgraf78/ds",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join(".git"),
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "git@github.com:cgraf78/ds.git",
+                ],
+                "",
+            );
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].detail, "added");
+        assert!(install_dir.join(".git").is_dir());
+        assert!(!install_dir.is_symlink());
+        assert!(!removed_local_clone.exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("cgraf78/ds"),
+            Some(&ManifestEntry::new(
+                "cgraf78/ds",
+                "github:repo",
+                "ds",
+                install_dir.display().to_string(),
+            ))
+        );
     }
 
     #[test]
