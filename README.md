@@ -22,7 +22,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 - **TTL-based caching** — avoids redundant network calls
 - **Post-install hooks** — run arbitrary setup when a dependency changes
 - **Config composition** — split deps across multiple `*.conf` files in a config directory
-- **Usable as CLI or library** — Rust `shdeps` CLI or `source shdeps.sh`
+- **Usable from CLI, Bash, or Rust** — Rust `shdeps` CLI, stable Bash functions via `source shdeps.sh`, and a documented Rust crate API
 
 ## Quick Start
 
@@ -31,9 +31,12 @@ curl -fsSL https://raw.githubusercontent.com/cgraf78/shdeps/main/install.sh | ba
 ```
 
 This installs the latest release archive to `~/.local/share/shdeps` and
-symlinks the Rust CLI into `~/.local/bin/shdeps`. Re-running the installer is
-idempotent. Developer/source-checkout installs are still supported when you run
-`install.sh` from a git checkout or set `SHDEPS_REPO` explicitly.
+symlinks the Rust CLI into `~/.local/bin/shdeps`. If a release archive is not
+available, the installer falls back to a source checkout build so first-time
+installs keep working while release assets are being bootstrapped. Re-running
+the installer is idempotent. Developer/source-checkout installs are still
+supported when you run `install.sh` from a git checkout or set `SHDEPS_REPO`
+explicitly.
 
 Then create a config and run:
 
@@ -47,7 +50,7 @@ EOF
 shdeps update
 ```
 
-The CLI loads all `*.conf` files from `~/.config/shdeps/` (sorted alphabetically). Split deps across multiple files for organization (e.g., `00-core.conf`, `50-tools.conf`, `99-local.conf`). The sourceable Bash API (`source shdeps.sh`) defaults to `./shdeps/`.
+The CLI loads all `*.conf` files from `~/.config/shdeps/` (sorted alphabetically). Split deps across multiple files for organization (e.g., `00-core.conf`, `50-tools.conf`, `99-local.conf`). The Bash API (`source shdeps.sh`) defaults to `./shdeps/`.
 
 ### Updating shdeps
 
@@ -88,20 +91,20 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 
 ### Environment Variables
 
-| Variable             | Default                                            | Description                                                                                                |
-| -------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `SHDEPS_CONF_DIR`    | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded)                                                               |
-| `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                               | Post-install hooks directory                                                                               |
-| `SHDEPS_STATE_DIR`   | `$XDG_STATE_HOME/shdeps`                           | Cache/state directory                                                                                      |
-| `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache (check for updates now)                                                                   |
-| `SHDEPS_REINSTALL`   | `0`                                                | Force reinstall all deps                                                                                   |
-| `SHDEPS_QUIET`       | `0`                                                | Suppress interactive prompts                                                                               |
-| `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                                       |
-| `SHDEPS_GIT_DEV_DIR` | `~/git`                                            | Dev clone directory for `github:repo` deps (prefers `<dir>/<repo>` over fresh clone)                       |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github:*`, `cargo`, `go`, `uv`, and `npm` installs (each dep lives in `<dir>/<name>/`) |
-| `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                                              |
-| `SHDEPS_LOG_LEVEL`   | `1`                                                | 0=quiet, 1=normal, 2=verbose                                                                               |
-| `SHDEPS_JOBS`        | auto (`nproc`)                                     | Max concurrent read-only probes. Explicit values win; `1` = sequential.                                    |
+| Variable             | Default                                                 | Description                                                                                                                                                                           |
+| -------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SHDEPS_CONF_DIR`    | `~/.config/shdeps/` (CLI) or `./shdeps/` (Bash API)     | Config directory (all `*.conf` files loaded)                                                                                                                                          |
+| `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                                    | Post-install hooks directory                                                                                                                                                          |
+| `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`          | Cache/state directory                                                                                                                                                                 |
+| `SHDEPS_FORCE`       | `0`                                                     | Bypass TTL cache (check for updates now)                                                                                                                                              |
+| `SHDEPS_REINSTALL`   | `0`                                                     | Force reinstall all deps                                                                                                                                                              |
+| `SHDEPS_QUIET`       | `0`                                                     | Suppress interactive prompts                                                                                                                                                          |
+| `SHDEPS_REMOTE_TTL`  | `3600`                                                  | Cache TTL in seconds                                                                                                                                                                  |
+| `SHDEPS_GIT_DEV_DIR` | `~/git`                                                 | Dev clone directory used only by `github:repo` deps (prefers `<dir>/<repo>` over a managed clone)                                                                                     |
+| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                        | Base directory for shdeps-owned install roots (`github:repo`, archive-style `github:release`, `cargo`, `go`, `uv`, `npm`). Raw release binaries install into `SHDEPS_BIN_DIR` instead. |
+| `SHDEPS_BIN_DIR`     | `~/.local/bin`                                          | Directory for binary symlinks and raw `github:release` binaries                                                                                                                       |
+| `SHDEPS_LOG_LEVEL`   | `1`                                                     | 0=quiet, 1=normal, 2=verbose                                                                                                                                                          |
+| `SHDEPS_JOBS`        | auto (`nproc`)                                          | Max concurrent read-only probes. Explicit values win; `1` = sequential.                                                                                                               |
 
 ## Install Methods
 
@@ -123,6 +126,11 @@ Use `aliases` to map names across package managers. Use `NONE` to skip a dep on 
 
 Clones a GitHub repo into `$SHDEPS_INSTALL_DIR/<owner>/<repo>` (default `~/.local/share/<owner>/<repo>`). Prefers local dev clones in `$SHDEPS_GIT_DEV_DIR/<repo>` (default `~/git/<repo>`, symlinked for live development). Falls back to a shallow clone for fresh installs. Every executable directly under the repo's `bin/` directory is symlinked into `$SHDEPS_BIN_DIR`; existing regular files in `$SHDEPS_BIN_DIR` are preserved so shdeps never overwrites a user-owned command.
 
+Local clone discovery is intentionally limited to `github:repo`. Other methods,
+including `github:release`, ignore `$SHDEPS_GIT_DEV_DIR` so changing a dep's
+method cleanly changes ownership and install behavior instead of accidentally
+continuing to use a live checkout.
+
 ```text
 cgraf78/ds    github:repo
 ```
@@ -131,7 +139,7 @@ The `owner/repo` is the `name` field. Override the repo URL with `SHDEPS_<NAME>_
 
 ### `github:release` — GitHub Release Binaries
 
-Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries.
+Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries. Archive-style releases install into a shdeps-owned root under `$SHDEPS_INSTALL_DIR/<owner>/<repo>` so bundled assets can be linked. Raw and compressed single-binary releases install directly to `$SHDEPS_BIN_DIR/<cmd>`, preserving the historical Bash behavior for this method.
 
 ```text
 neovim/neovim    github:release    nvim
@@ -210,7 +218,14 @@ All [public API functions](#public-api) are available to hook authors. See [exam
 
 ## Man Pages & Completions
 
-shdeps automatically discovers man pages and shell completions bundled inside `github` installs and symlinks them into standard XDG user-local directories. Tools like neovim, gum, ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable without this linking. `cargo`, `go`, `uv`, and `npm` deps install single binaries without bundled extras — generate completions from the tool itself in a `post()` hook (see [examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh)).
+shdeps automatically discovers man pages and shell completions bundled inside
+`github:repo` installs and archive-style `github:release` installs, then
+symlinks them into standard XDG user-local directories. Tools like neovim, gum,
+ripgrep, fd, bat, and hyperfine ship these files but they're not discoverable
+without this linking. Raw single-binary releases and `cargo`, `go`, `uv`, and
+`npm` deps do not provide bundled extras through shdeps — generate completions
+from the tool itself in a `post()` hook (see
+[examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh)).
 
 **What gets linked:**
 
@@ -255,11 +270,25 @@ Options:
   -f, --force           Bypass TTL cache (check for updates now)
   -R, --reinstall       Force reinstall all dependencies (implies --force)
   -q, --quiet           Suppress interactive prompts
-  -v, --verbose         Verbose output
+  -v, --verbose         Verbose output (log level 2)
 
 Prune options:
   -y                    Skip confirmation prompt
   --dry-run             Show what would be removed without removing
+
+Examples:
+  shdeps update
+  shdeps -c ~/.config/myapp/ update
+  shdeps --force update
+  shdeps list
+  shdeps check jq
+  shdeps prune --dry-run
+  shdeps prune -y
+
+Exit codes:
+  0  Success
+  1  Error
+  2  Usage error
 ```
 
 ### Removing Dependencies
@@ -280,7 +309,7 @@ shdeps prune --dry-run # preview without removing
 
 For `pkg` deps, prune warns that manual removal is needed (system packages may be shared). For `custom` deps, prune calls the optional `uninstall()` hook function.
 
-## As a Library
+## Bash API
 
 ```bash
 export SHDEPS_CONF_DIR="$HOME/.config/myapp"
@@ -317,10 +346,11 @@ The `--bootstrap` flag:
 
 ## Public API
 
-The sourceable Bash compatibility wrapper defines the public `shdeps_`
-functions and delegates behavior to the Rust binary through a small hidden
-bridge. This is the complete shell contract available to callers, library
-users, and hook authors.
+The sourceable Bash API defines the public `shdeps_` functions and delegates
+behavior to the Rust binary through a small hidden bridge. This is the complete
+shell contract available to callers and hook authors, and it is intended to
+remain stable because Bash hook code depends on it. A Rust crate API also
+exists; this Bash section documents the shell-facing contract specifically.
 
 | Function                          | Description                                                                                 |
 | --------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -357,22 +387,37 @@ users, and hook authors.
 `shdeps_dep_root` follows the same ownership rules as installation. For
 `github:repo`, it prefers `$SHDEPS_GIT_DEV_DIR/<repo>` when a local development
 clone exists, then falls back to `$SHDEPS_INSTALL_DIR/<owner>/<repo>`. For
-methods with per-dependency install directories (`github:release`, `cargo`,
-`go`, `uv`, and `npm`), it returns `$SHDEPS_INSTALL_DIR/<name>` when present.
-Package-manager deps do not have shdeps-owned roots.
+methods with per-dependency install directories (`cargo`, `go`, `uv`, `npm`,
+and archive-style `github:release` installs), it returns
+`$SHDEPS_INSTALL_DIR/<name>` when present. Raw single-binary `github:release`
+installs and package-manager deps do not have shdeps-owned roots.
+
+## Rust API
+
+shdeps builds a normal Rust library crate (`shdeps`) alongside the CLI. The
+binary, tests, and future Rust consumers call into documented modules such as
+`shdeps::config`, `shdeps::runtime`, `shdeps::status`, `shdeps::update`, and
+`shdeps::prune`.
+
+The Rust API is intentionally documented in code because it owns the real
+implementation boundaries. Its stability promise is narrower than the CLI and
+Bash API while the Rust port is still landing: downstream Rust callers can use
+the crate, but module boundaries may still tighten before the first public crate
+release. shdeps does not currently promise a stable C ABI or `libshdeps.a`
+static archive.
 
 ## Testing
 
 ```bash
 ./test/shdeps-test
 SHDEPS_IMPL=rust ./test/shdeps-test
-cargo test
+cargo test --locked
 ./test/shdeps-wrapper-test
 ```
 
-The standalone CLI is a Rust binary. The sourceable Bash compatibility API and
-hook prelude require Bash 4.3+; `install.sh` itself is kept compatible with the
-stock macOS Bash 3.2 installer path.
+The standalone CLI is a Rust binary. The sourceable Bash API and hook prelude
+require Bash 4.3+; `install.sh` itself is kept compatible with the stock macOS
+Bash 3.2 installer path.
 
 ## License
 
