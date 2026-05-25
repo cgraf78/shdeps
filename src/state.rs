@@ -167,7 +167,7 @@ const LOCK_NB: i32 = 4;
 const LOCK_UN: i32 = 8;
 
 #[cfg(unix)]
-extern "C" {
+unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
 
@@ -185,7 +185,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{write_atomic, StateLock};
+    use super::{StateLock, write_atomic};
 
     #[test]
     fn lock_serializes_state_dir_access() {

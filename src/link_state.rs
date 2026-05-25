@@ -8,8 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::state;
 use crate::Result;
+use crate::state;
 
 /// Link-state file kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +93,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{path, read, unlink_tracked, write, Kind};
+    use super::{Kind, path, read, unlink_tracked, write};
 
     #[test]
     fn paths_preserve_nested_dependency_names() {

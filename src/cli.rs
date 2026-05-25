@@ -9,6 +9,7 @@ use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::api;
 use crate::config::{self, Entry};
 use crate::dep_path;
@@ -25,7 +26,6 @@ use crate::self_update::{self, Outcome, ReleaseArchiveOutcome, Target};
 use crate::status::{self, Context as StatusContext, DependencyStatus, SkipReason, State};
 use crate::update::{self, Context as UpdateContext, Options as UpdateOptions};
 use crate::version;
-use crate::Result;
 
 /// Compatibility help text for the `shdeps` CLI.
 ///
@@ -965,7 +965,15 @@ fn ensure_bin_dir_on_path(bin_dir: &Path) {
         // same run. The Rust CLI mutates only this process environment, right
         // before spawning those subprocess-backed phases, to preserve that
         // behavior without making every runner call rebuild PATH by hand.
-        env::set_var("PATH", joined);
+        //
+        // Rust 2024 marks environment mutation unsafe because concurrent reads
+        // in other threads can race with the process-wide environment update.
+        // `shdeps` reaches this path from the single-threaded CLI command
+        // dispatcher before it starts hook/package subprocesses, so there are
+        // no Rust threads in this process observing PATH while it changes.
+        unsafe {
+            env::set_var("PATH", joined);
+        }
     }
 }
 
@@ -1028,9 +1036,9 @@ fn shdeps_install_dir() -> Result<PathBuf> {
         return Ok(source_dir);
     }
 
-    // Release installs put the Rust binary directly in SHDEPS_DIR, while the
-    // Bash source checkout keeps the wrapper at bin/shdeps. Supporting both
-    // shapes lets the same CLI entry point update converted installs and
+    // Release installs put the Rust binary directly in SHDEPS_DIR, while older
+    // source checkouts historically kept a CLI wrapper under bin/. Supporting
+    // both shapes lets the same CLI entry point update converted installs and
     // developer checkouts without relying on a wrapper-specific env var.
     if dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
         Ok(dir.parent().unwrap_or(dir).to_path_buf())

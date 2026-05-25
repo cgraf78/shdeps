@@ -1,4 +1,4 @@
-use shdeps::release_asset::{select, Target};
+use shdeps::release_asset::{Target, select};
 
 fn linux() -> Target {
     Target::new("linux", "x86_64", "gnu")

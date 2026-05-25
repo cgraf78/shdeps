@@ -12,10 +12,10 @@ use std::io;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::archive;
 use crate::extras;
 use crate::process;
-use crate::Result;
 
 /// Installs a raw standalone release binary into `SHDEPS_BIN_DIR`.
 pub fn install_plain(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
@@ -456,13 +456,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    use bzip2::write::BzEncoder;
     use bzip2::Compression as BzCompression;
-    use flate2::write::GzEncoder;
+    use bzip2::write::BzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use tar::{Builder, Header};
-    use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     #[test]
     fn plain_install_writes_executable_binary() {
@@ -555,13 +555,13 @@ mod tests {
             fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
             dir.join("share/owner/tool/share/man/man1/tool.1")
         );
-        assert!(fs::read_dir(dir.join("share/owner"))
-            .unwrap()
-            .all(|entry| !entry
+        assert!(fs::read_dir(dir.join("share/owner")).unwrap().all(|entry| {
+            !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".tmp.")));
+                .contains(".tmp.")
+        }));
     }
 
     #[test]
@@ -586,10 +586,12 @@ mod tests {
 
         assert_eq!(installed, public);
         assert_eq!(fs::read(&public).unwrap(), b"binary");
-        assert!(!fs::symlink_metadata(&public)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            !fs::symlink_metadata(&public)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
             dir.join("share/owner/tool/share/man/man1/tool.1")

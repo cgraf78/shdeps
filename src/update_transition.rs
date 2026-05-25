@@ -10,13 +10,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::cleanup;
 use crate::config::{self, Entry};
 use crate::link_state::{self, Kind};
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::runtime::Roots;
 use crate::update::Item;
-use crate::Result;
 
 /// Pre-install snapshot for a configured method transition.
 #[derive(Debug, Clone)]

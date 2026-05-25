@@ -8,6 +8,7 @@
 
 use std::fs;
 
+use crate::Result;
 use crate::bin_link;
 use crate::config::Entry;
 use crate::external;
@@ -16,7 +17,6 @@ use crate::pkg::CommandSpec;
 use crate::process::{self, Output, Runner};
 use crate::stamp;
 use crate::update::{Context, Item, Options};
-use crate::Result;
 
 pub(crate) fn install(
     entry: &Entry,

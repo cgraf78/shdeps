@@ -90,7 +90,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use super::{host_label, select_pair, Pair};
+    use super::{Pair, host_label, select_pair};
     use crate::github::{Asset, Release};
     use crate::runtime::Env;
 

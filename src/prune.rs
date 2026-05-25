@@ -10,12 +10,12 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
+use crate::Result;
 use crate::cleanup;
 use crate::config::Entry;
 use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::runtime;
-use crate::Result;
 
 /// User options for `shdeps prune`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -163,7 +163,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{run, Options};
+    use super::{Options, run};
     use crate::config::parse_entry;
     use crate::hooks::{BashCustomProbe, Uninstall};
     use crate::manifest::{self, ManifestEntry};

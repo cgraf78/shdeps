@@ -40,8 +40,10 @@ fn help_output_is_stable_and_hides_removed_migrate_command() {
     assert_success(&output);
     let stdout = text(&output.stdout);
     assert!(stdout.starts_with("Usage: shdeps [options] <command> [args]\n"));
-    assert!(stdout
-        .contains("  dep-path <name> <rel>  Print a path below a configured dependency root\n"));
+    assert!(
+        stdout
+            .contains("  dep-path <name> <rel>  Print a path below a configured dependency root\n")
+    );
     assert!(stdout.contains(
         "  dep-file <name> <rel>  Print a readable regular file below a dependency root\n"
     ));
@@ -337,10 +339,12 @@ esac
             .dir
             .join("share/owner/mytool/share/man/man1/mytool.1")
     );
-    assert!(fixture
-        .dir
-        .join("state/.changed-markers/txn123/owner/mytool")
-        .exists());
+    assert!(
+        fixture
+            .dir
+            .join("state/.changed-markers/txn123/owner/mytool")
+            .exists()
+    );
 
     let log = fs::read_to_string(curl_log).unwrap();
     assert!(log.contains("url = \"https://api.github.com/repos/owner/mytool/releases\""));
@@ -732,9 +736,11 @@ fn update_bare_github_falls_back_to_repo_and_uses_local_clone() {
         fs::read_link(fixture.dir.join("bin/tool")).unwrap(),
         fixture.dir.join("share/owner/tool/bin/tool")
     );
-    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
-        .unwrap()
-        .contains("owner/tool|github:repo|tool|"));
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("owner/tool|github:repo|tool|")
+    );
 }
 
 #[test]
@@ -764,9 +770,11 @@ fn update_bare_github_transitions_repo_to_release_after_release_appears() {
 
     assert_success(&output);
     assert!(!fixture.dir.join("share/owner/tool").exists());
-    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
-        .unwrap()
-        .contains("owner/tool|github:release|tool|"));
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("owner/tool|github:release|tool|")
+    );
 }
 
 #[test]
@@ -799,9 +807,11 @@ fn update_bare_github_transitions_release_to_repo_when_release_is_unavailable() 
         fs::read_link(fixture.dir.join("share/owner/tool")).unwrap(),
         fixture.dir.join("git/tool")
     );
-    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
-        .unwrap()
-        .contains("owner/tool|github:repo|tool|"));
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("owner/tool|github:repo|tool|")
+    );
 }
 
 #[test]
@@ -908,9 +918,11 @@ install() { printf 'installed\n'; }
         "==> 1 orphaned dep(s) no longer in config:\n  old (github:release)\nRun `shdeps prune` to remove orphaned artifacts.\n"
     );
     assert!(fixture.dir.join("bin/old").exists());
-    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
-        .unwrap()
-        .contains("old|github:release|old|"));
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("old|github:release|old|")
+    );
 }
 
 #[test]
@@ -950,9 +962,11 @@ fn prune_lists_dry_runs_and_removes_orphans() {
         fs::read_to_string(fixture.dir.join("state/hook-ran")).unwrap(),
         "old\n"
     );
-    assert!(!fs::read_to_string(fixture.dir.join("state/manifest"))
-        .unwrap()
-        .contains("old|"));
+    assert!(
+        !fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("old|")
+    );
 }
 
 #[test]
@@ -967,9 +981,11 @@ fn prune_preserves_packages_and_guards_empty_config() {
         text(&guarded.stderr),
         "warning: no deps in config but 1 in manifest — all would be orphaned\n  If intentional, re-run with -y\n"
     );
-    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
-        .unwrap()
-        .contains("pkg-tool|"));
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("pkg-tool|")
+    );
 
     let removed_tracking = run(&mut fixture.command(["prune", "-y"]));
     assert_success(&removed_tracking);
@@ -981,9 +997,11 @@ fn prune_preserves_packages_and_guards_empty_config() {
         text(&removed_tracking.stderr),
         "  pkg-tool: pkg dep — remove manually via system package manager\n"
     );
-    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
-        .unwrap()
-        .is_empty());
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

@@ -18,12 +18,12 @@ use std::time::UNIX_EPOCH;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+use crate::Result;
 use crate::config::{self, Entry};
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
 use crate::runtime::Roots;
 use crate::state;
-use crate::Result;
 
 const CACHE_VERSION: &str = "shdeps-pkg-check-cache-v3";
 const CACHE_FILE: &str = "pkg-check-cache-v3";
@@ -946,7 +946,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{current, path, write, Inputs, Status};
+    use super::{Inputs, Status, current, path, write};
 
     #[test]
     fn write_and_validate_cache_hit() {

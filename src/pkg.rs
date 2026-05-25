@@ -108,7 +108,7 @@ pub fn install(mgr: &str, packages: &[String]) -> Option<CommandSpec> {
 
 #[cfg(test)]
 mod tests {
-    use super::{available, install, refresh, CommandSpec};
+    use super::{CommandSpec, available, install, refresh};
 
     #[test]
     fn availability_probes_match_bash_manager_branches() {

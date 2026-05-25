@@ -144,11 +144,11 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use tar::{Builder, Header};
 
-    use super::{stage, Failure};
+    use super::{Failure, stage};
     use crate::checksum;
     use crate::http::Client;
     use crate::release_artifact::Pair;

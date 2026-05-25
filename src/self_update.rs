@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::Result;
 use crate::github::{self, Release};
 use crate::http::Client;
 use crate::install_metadata::{self, Metadata, Method, Read};
@@ -19,7 +20,6 @@ use crate::process::Runner;
 use crate::release_artifact::{self, Pair};
 use crate::release_stage;
 use crate::runtime::Env;
-use crate::Result;
 
 /// Decision after applying release-selection rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -656,18 +656,18 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use tar::{Builder, Header};
 
     use super::{
-        release_archive, select_archive, select_release, source_checkout, target, ArchiveDecision,
-        Outcome, ReleaseArchiveFailure, ReleaseArchiveOutcome, ReleaseDecision, Target,
+        ArchiveDecision, Outcome, ReleaseArchiveFailure, ReleaseArchiveOutcome, ReleaseDecision,
+        Target, release_archive, select_archive, select_release, source_checkout, target,
     };
     use crate::checksum;
     use crate::github::{Asset, Release};
     use crate::http::Client;
-    use crate::install_metadata::{write, Metadata, Method};
+    use crate::install_metadata::{Metadata, Method, write};
     use crate::process::{Output, Runner};
     use crate::release_artifact::Pair;
     use crate::runtime::Env;
@@ -1304,11 +1304,13 @@ mod tests {
             fs::read_to_string(dir.join("shdeps.sh")).unwrap(),
             "old shim"
         );
-        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains(".shdeps-stage")));
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".shdeps-stage")
+        }));
     }
 
     fn checkout(name: &str) -> PathBuf {

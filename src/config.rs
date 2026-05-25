@@ -175,11 +175,7 @@ pub fn valid_dep_name(name: &str) -> bool {
 }
 
 fn dash_to_empty(value: &str) -> &str {
-    if value == "-" {
-        ""
-    } else {
-        value
-    }
+    if value == "-" { "" } else { value }
 }
 
 fn entry_name(entry: &str) -> &str {

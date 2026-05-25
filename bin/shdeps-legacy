@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# shdeps — legacy Bash CLI wrapper for the shdeps shell dependency manager.
+# shdeps-legacy — legacy Bash CLI wrapper for the shdeps shell dependency manager.
 #
-# Finds and sources shdeps.sh relative to its own location, then dispatches
-# to the requested subcommand.
+# The explicit legacy name keeps direnv's ./bin PATH entry from shadowing the
+# Rust `shdeps` binary while this compatibility/reference path still exists.
+# It finds and sources shdeps-legacy.sh relative to its own location, then
+# dispatches to the requested subcommand.
 
 set -euo pipefail
 

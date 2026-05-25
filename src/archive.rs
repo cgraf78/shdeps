@@ -187,13 +187,13 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use bzip2::write::BzEncoder;
     use bzip2::Compression as BzCompression;
-    use flate2::write::GzEncoder;
+    use bzip2::write::BzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use tar::{Builder, EntryType, Header};
-    use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     use super::{
         safe_entry_path, unpack_tar_bz2, unpack_tar_gz, unpack_tar_xz, unpack_tar_zst, unpack_zip,

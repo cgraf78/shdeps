@@ -374,8 +374,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        dep_exists, dep_version, detect_package_manager, package_installed, package_versions,
-        Output, Runner,
+        Output, Runner, dep_exists, dep_version, detect_package_manager, package_installed,
+        package_versions,
     };
 
     #[derive(Debug, Default)]

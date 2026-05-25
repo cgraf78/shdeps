@@ -13,8 +13,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::link_state::{self, Kind};
 use crate::Result;
+use crate::link_state::{self, Kind};
 
 const MAN_PATTERNS: &[&str] = &[
     "share/man/man[0-9]/*.[0-9]",

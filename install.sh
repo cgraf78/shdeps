@@ -473,10 +473,16 @@ _bootstrap_self_update() {
 # migration without spreading the legacy/private helper split to callers.
 _setup_links() {
   local shdeps_dir="$1"
-  local cli="$shdeps_dir/bin/shdeps"
+  local cli="$shdeps_dir/bin/shdeps-legacy"
 
   if [[ -x "$shdeps_dir/shdeps" ]]; then
     cli="$shdeps_dir/shdeps"
+  elif [[ -x "$shdeps_dir/bin/shdeps" ]]; then
+    # Current source checkouts spell the preserved Bash entry point
+    # `shdeps-legacy` so repo-local direnv paths cannot shadow the Rust CLI.
+    # The historical name remains a fallback only for bootstrapping older
+    # installed checkouts while they are being replaced.
+    cli="$shdeps_dir/bin/shdeps"
   fi
 
   if [[ -x "$cli" ]]; then

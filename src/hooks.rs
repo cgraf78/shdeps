@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::Result;
 use crate::config;
 use crate::config::Entry;
 use crate::runtime::Roots;
 use crate::status::CustomProbe;
-use crate::Result;
 
 /// Generated Bash compatibility layer for Rust hook subprocesses.
 pub mod prelude;

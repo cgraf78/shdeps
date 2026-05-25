@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::Result;
 use crate::cleanup;
 use crate::config::{self, Entry};
 use crate::hooks::{BashCustomProbe, Install, Post, Txn};
@@ -23,7 +24,6 @@ use crate::update_pkg;
 use crate::update_release;
 use crate::update_repo;
 use crate::update_transition;
-use crate::Result;
 
 /// Options controlling one update run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,14 +573,14 @@ mod tests {
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{run, Context, Options};
-    use bzip2::write::BzEncoder;
+    use super::{Context, Options, run};
     use bzip2::Compression as BzCompression;
-    use flate2::write::GzEncoder;
+    use bzip2::write::BzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use tar::{Builder, Header};
-    use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     use crate::config::parse_entry;
     use crate::hooks::BashCustomProbe;
@@ -1163,10 +1163,12 @@ install() { return 42; }
         assert!(summary.has_errors());
         assert_eq!(summary.failed, ["tool"]);
         assert_eq!(summary.items[0].detail, "custom install failed");
-        assert!(manifest::read(&manifest_path)
-            .unwrap()
-            .get("tool")
-            .is_none());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("tool")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1330,10 +1332,12 @@ install() { return 42; }
             summary.items[0].detail,
             "skipped by package-manager override"
         );
-        assert!(manifest::read(&manifest_path)
-            .unwrap()
-            .get("tool")
-            .is_none());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("tool")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1620,10 +1624,12 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(summary.has_errors());
         assert_eq!(summary.failed, ["ripgrep"]);
-        assert!(manifest::read(&manifest_path)
-            .unwrap()
-            .get("ripgrep")
-            .is_none());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("ripgrep")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1979,11 +1985,13 @@ version() { printf 'saw-pkg\n'; }
             token_calls, 1,
             "`gh auth token` can be noticeably slow; shdeps should resolve it once per update run and reuse it for every release request"
         );
-        assert!(fixture
-            .client
-            .requests()
-            .iter()
-            .all(|(_, token)| token.as_deref() == Some("gh-token")));
+        assert!(
+            fixture
+                .client
+                .requests()
+                .iter()
+                .all(|(_, token)| token.as_deref() == Some("gh-token"))
+        );
     }
 
     #[test]
@@ -2627,14 +2635,18 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert!(fixture.roots.install_dir.join("cgraf78/ds").is_symlink());
         assert!(!fixture.roots.install_dir.join("cgraf78/ds.git").exists());
-        assert!(manifest::read(&manifest_path)
-            .unwrap()
-            .get("cgraf78/ds")
-            .is_some());
-        assert!(manifest::read(&manifest_path)
-            .unwrap()
-            .get("cgraf78/ds.git")
-            .is_none());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("cgraf78/ds")
+                .is_some()
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("cgraf78/ds.git")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2654,10 +2666,12 @@ version() { printf 'saw-pkg\n'; }
         assert!(summary.has_errors());
         assert_eq!(summary.failed, ["cgraf78/ds"]);
         assert_eq!(summary.items[0].detail, "git not available");
-        assert!(manifest::read(&manifest_path)
-            .unwrap()
-            .get("cgraf78/ds")
-            .is_none());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("cgraf78/ds")
+                .is_none()
+        );
     }
 
     #[test]

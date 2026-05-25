@@ -77,7 +77,7 @@ fn safe_github_path(path: &str) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{override_var, source, ssh_fallback, Source};
+    use super::{Source, override_var, source, ssh_fallback};
 
     #[test]
     fn source_uses_canonical_name_short_name_and_default_https_url() {

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::config::Entry;
 use crate::github;
 use crate::github_release;
@@ -22,7 +23,6 @@ use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::tool_version;
 use crate::update::{Context, Item, Options};
-use crate::Result;
 
 pub(crate) fn install_with_prefetch(
     entry: &Entry,
@@ -530,7 +530,7 @@ impl Env for EnvVars<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_kind, comparable_versions, installed_matches_tag, AssetKind};
+    use super::{AssetKind, asset_kind, comparable_versions, installed_matches_tag};
 
     #[test]
     fn asset_kind_accepts_raw_binary_urls() {

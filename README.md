@@ -2,7 +2,7 @@
 
 ![Tests](https://github.com/cgraf78/shdeps/actions/workflows/test.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-%3E%3D1.74-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-%3E%3D1.85-orange.svg)](https://www.rust-lang.org/)
 [![Bash API](https://img.shields.io/badge/bash%20API-%3E%3D4.3-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 

@@ -21,9 +21,10 @@ changes.
 - **`shdeps-legacy.sh`** — preserved Bash reference implementation. Keep it
   available for parity tests and emergency comparison, but do not add new
   behavior here unless a test explicitly needs to pin legacy behavior.
-- **`bin/shdeps`** — legacy Bash CLI wrapper that sources
+- **`bin/shdeps-legacy`** — temporary legacy Bash CLI wrapper that sources
   `shdeps-legacy.sh`. Release archives and normal installs should use the
-  Rust `shdeps` binary instead.
+  Rust `shdeps` binary instead, and `bin/` must not contain a `shdeps`
+  executable that can shadow the Rust CLI when `.envrc` adds `./bin` to `PATH`.
 - **`install.sh`** — curl-pipeable installer and bootstrap script. It installs
   release archives when available, can build explicit source checkouts, symlinks
   the CLI into `~/.local/bin`, and supports `--uninstall` plus sourceable

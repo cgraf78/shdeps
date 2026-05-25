@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use crate::Result;
 use crate::config::{self, Entry};
 use crate::jobs;
 use crate::manifest::Manifest;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::{self, Runner};
 use crate::runtime::Roots;
-use crate::Result;
 
 /// Why a configured dependency was skipped instead of checked for install state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,11 +296,7 @@ fn repo_version(root: &Path, runner: &impl Runner) -> Option<String> {
 }
 
 fn non_empty(value: String) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 #[cfg(test)]
@@ -313,15 +309,15 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        classify, list, list_with_jobs, Context, CustomProbe, DependencyStatus, NoCustomProbe,
-        SkipReason, State,
+        Context, CustomProbe, DependencyStatus, NoCustomProbe, SkipReason, State, classify, list,
+        list_with_jobs,
     };
+    use crate::Result;
     use crate::config::parse_entry;
     use crate::manifest::{Manifest, ManifestEntry};
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
     use crate::runtime::Roots;
-    use crate::Result;
 
     #[derive(Debug, Default)]
     struct FakeRunner {

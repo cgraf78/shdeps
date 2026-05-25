@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::bin_link;
 use crate::config::Entry;
 use crate::extras;
@@ -16,7 +17,6 @@ use crate::process::Runner;
 use crate::repo;
 use crate::stamp;
 use crate::update::{Context, Item, Options};
-use crate::Result;
 
 pub(crate) fn install(
     entry: &Entry,

@@ -115,7 +115,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{activate, Failure};
+    use super::{Failure, activate};
     use crate::install_metadata::{self, Metadata, Method};
     use crate::release_stage::Staged;
 
@@ -141,11 +141,13 @@ mod tests {
             install_metadata::read(&root.join("shdeps")).unwrap(),
             install_metadata::Read::Valid(metadata)
         );
-        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("backup")));
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("backup")
+        }));
     }
 
     #[test]

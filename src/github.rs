@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::Result;
 use crate::http::Client;
 use crate::process::Runner;
 use crate::runtime::Env;
-use crate::Result;
 
 const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -169,7 +169,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{fetch_releases, parse_releases, releases_url, token, Asset, Release};
+    use super::{Asset, Release, fetch_releases, parse_releases, releases_url, token};
     use crate::http::Client;
     use crate::process::{Output, Runner};
     use crate::runtime::Env;

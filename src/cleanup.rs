@@ -10,10 +10,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::config;
 use crate::link_state::{self, Kind};
 use crate::manifest::{Manifest, ManifestEntry};
-use crate::Result;
 
 /// Filesystem roots needed for built-in artifact cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +229,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    use super::{method_transitions, remove_builtin, Roots};
+    use super::{Roots, method_transitions, remove_builtin};
     use crate::config::Entry;
     use crate::link_state::{self, Kind};
     use crate::manifest::{Manifest, ManifestEntry};
@@ -292,11 +292,13 @@ mod tests {
         assert!(fs::symlink_metadata(short_bin).is_err());
         assert!(fs::symlink_metadata(extra_bin).is_err());
         assert!(fs::symlink_metadata(man_link).is_err());
-        assert!(!fixture
-            .roots
-            .state_dir
-            .join("repo-tool.repo.stamp")
-            .exists());
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join("repo-tool.repo.stamp")
+                .exists()
+        );
     }
 
     #[test]
@@ -317,11 +319,13 @@ mod tests {
         assert!(!fixture.roots.bin_dir.join("binary-tool").exists());
         assert!(!fixture.roots.install_dir.join("owner/binary-tool").exists());
         assert!(!fixture.roots.install_dir.join("owner").exists());
-        assert!(!fixture
-            .roots
-            .state_dir
-            .join("owner/binary-tool.release.stamp")
-            .exists());
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join("owner/binary-tool.release.stamp")
+                .exists()
+        );
     }
 
     #[test]
@@ -351,11 +355,13 @@ mod tests {
         .unwrap();
 
         assert!(summary.custom_requires_hook);
-        assert!(!fixture
-            .roots
-            .state_dir
-            .join("custom-tool.custom.stamp")
-            .exists());
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join("custom-tool.custom.stamp")
+                .exists()
+        );
     }
 
     fn entry(name: &str, method: &str) -> Entry {

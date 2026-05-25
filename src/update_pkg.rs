@@ -5,13 +5,13 @@
 //! and batch failures retry one package at a time. Keeping that here prevents
 //! the top-level update orchestrator from becoming another monolith.
 
+use crate::Result;
 use crate::config::{self, Entry};
 use crate::manifest::{self, ManifestEntry};
 use crate::package_cache;
 use crate::pkg;
 use crate::process::{self, Output, Runner};
-use crate::update::{active, Context, Item, Options, Summary};
-use crate::Result;
+use crate::update::{Context, Item, Options, Summary, active};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Queued {

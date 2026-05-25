@@ -8,8 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::state;
 use crate::Result;
+use crate::state;
 
 /// Runtime flags that affect stamp freshness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,8 +81,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        remote_fresh, remote_path, remote_touch, revision_path, revision_read, revision_touch,
-        Freshness,
+        Freshness, remote_fresh, remote_path, remote_touch, revision_path, revision_read,
+        revision_touch,
     };
 
     #[test]

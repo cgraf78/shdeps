@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::config::Entry;
 use crate::github;
 use crate::github_release;
@@ -21,7 +22,6 @@ use crate::process::Runner;
 use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::state;
-use crate::Result;
 
 const METHOD_RELEASE: &str = "github:release";
 const METHOD_REPO: &str = "github:repo";
@@ -239,7 +239,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{resolve_entries, Context, Options};
+    use super::{Context, Options, resolve_entries};
     use crate::config::parse_entry;
     use crate::github;
     use crate::http::Client;

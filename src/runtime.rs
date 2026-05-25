@@ -209,7 +209,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
-    use super::{roots, runtime_env, Env, Overrides};
+    use super::{Env, Overrides, roots, runtime_env};
 
     #[test]
     fn defaults_follow_cli_environment_contract() {

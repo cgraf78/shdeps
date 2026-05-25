@@ -144,13 +144,15 @@ mod tests {
         )];
         let runner = FakeRunner::new("arm64", "");
 
-        assert!(select(
-            "tool",
-            &releases,
-            &RuntimeEnv::new("macos", "host"),
-            &runner
-        )
-        .is_some());
+        assert!(
+            select(
+                "tool",
+                &releases,
+                &RuntimeEnv::new("macos", "host"),
+                &runner
+            )
+            .is_some()
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::Result;
 use crate::config;
 use crate::dep_path;
 use crate::errors::Error;
@@ -23,7 +24,6 @@ use crate::process::{self, Process, Runner};
 use crate::runtime::{self, Overrides, ProcessEnv};
 use crate::update::Options;
 use crate::update_release::{self, ReleaseRequest};
-use crate::Result;
 
 /// Runs one hidden bridge command.
 pub fn run<W, E>(
@@ -523,11 +523,7 @@ where
 }
 
 fn flag(value: bool) -> &'static str {
-    if value {
-        "1"
-    } else {
-        "0"
-    }
+    if value { "1" } else { "0" }
 }
 
 fn load_count(conf_dir: &Path) -> Result<usize> {

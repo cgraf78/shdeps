@@ -47,8 +47,8 @@ exit codes, and install behavior.
 The Rust port is based on these existing sources:
 
 - `shdeps.sh`: current implementation and public Bash API.
-- `bin/shdeps`: current CLI argument parsing, command names, help text, and
-  output conventions.
+- `bin/shdeps-legacy`: legacy CLI argument parsing, command names, help text,
+  and output conventions.
 - `install.sh`: current install, uninstall, and sourceable bootstrap behavior.
 - `test/shdeps-test`: current behavior suite and the primary parity oracle.
 - `README.md` and `AGENTS.md`: documented user and agent-facing contracts.
@@ -1739,7 +1739,7 @@ D21); the rest live here as the authoritative list for implementers.
 
 What's already partially or fully solved by current Bash:
 
-- **CLI argument parsing, command dispatch, help text.** `bin/shdeps` (573
+- **CLI argument parsing, command dispatch, help text.** `bin/shdeps-legacy` (573
   LOC) is the reference. Rust CLI just re-implements with same syntax/exit
   codes/text. Reuse: behavior contract via golden tests; do not port code
   line-for-line.

@@ -173,7 +173,7 @@ fn normalize_item(item: &str, case_mode: CaseMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_match, host_match, normalize_platform, platform_match, FilterMatch, RuntimeEnv,
+        FilterMatch, RuntimeEnv, filter_match, host_match, normalize_platform, platform_match,
     };
 
     #[test]

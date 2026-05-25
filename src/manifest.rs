@@ -10,9 +10,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::config::Entry;
 use crate::state;
-use crate::Result;
 
 /// One manifest row: `name|method|cmd|install_path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,7 +222,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{path, read, remove, upsert, Manifest, ManifestEntry};
+    use super::{Manifest, ManifestEntry, path, read, remove, upsert};
     use crate::config::parse_entry;
 
     #[test]

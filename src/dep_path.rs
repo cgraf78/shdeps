@@ -7,10 +7,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::config::{self, Entry};
 use crate::manifest;
 use crate::platform::{self, RuntimeEnv};
-use crate::Result;
 
 /// Filesystem/config roots used to resolve dependency paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,7 +189,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{file, find_entry, path, root, ResolveError, Roots};
+    use super::{ResolveError, Roots, file, find_entry, path, root};
     use crate::platform::RuntimeEnv;
 
     #[test]
@@ -362,13 +362,15 @@ mod tests {
         fixture.mkdir("git/sley/share/sley/dir-asset");
         fixture.write("git/sley/share/sley/shell.sh", "SLEY_SHELL_LOADED=dev\n");
 
-        assert!(file(
-            "cgraf78/sley",
-            "share/sley/shell.sh",
-            &fixture.roots(),
-            &fixture.env()
-        )
-        .is_ok());
+        assert!(
+            file(
+                "cgraf78/sley",
+                "share/sley/shell.sh",
+                &fixture.roots(),
+                &fixture.env()
+            )
+            .is_ok()
+        );
         assert!(matches!(
             file(
                 "cgraf78/sley",

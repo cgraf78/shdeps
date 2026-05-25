@@ -8,8 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::link_state::{self, Kind};
 use crate::Result;
+use crate::link_state::{self, Kind};
 
 /// Result of trying to expose one binary in the public bin directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +92,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    use super::{one, Link};
+    use super::{Link, one};
 
     #[test]
     #[cfg(unix)]

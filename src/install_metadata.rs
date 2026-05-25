@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::state;
 use crate::Result;
+use crate::state;
 
 /// Install metadata file name stored under `SHDEPS_DIR`.
 pub const FILE_NAME: &str = ".shdeps-install.json";
@@ -173,7 +173,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{path, read, write, ConvertedFrom, Metadata, Method, Read};
+    use super::{ConvertedFrom, Metadata, Method, Read, path, read, write};
 
     #[test]
     fn missing_metadata_is_explicit() {

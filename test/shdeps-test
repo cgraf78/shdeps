@@ -19,7 +19,7 @@ SHDEPS_IMPL="${SHDEPS_IMPL:-bash}"
 
 case "$SHDEPS_IMPL" in
   bash)
-    SHDEPS_CLI="${SHDEPS_CLI:-$SHDEPS_DIR/bin/shdeps}"
+    SHDEPS_CLI="${SHDEPS_CLI:-$SHDEPS_DIR/bin/shdeps-legacy}"
     SHDEPS_TEST_LIB="$SHDEPS_DIR/shdeps-legacy.sh"
     ;;
   rust)
@@ -135,6 +135,11 @@ echo "=== ShellCheck ==="
 _pass "implementation harness: selected $SHDEPS_IMPL"
 _assert_file_exists "implementation harness: library exists" "$SHDEPS_TEST_LIB"
 _assert_file_exists "implementation harness: CLI exists" "$SHDEPS_CLI"
+_assert_file_exists "legacy CLI: explicit wrapper exists" "$SHDEPS_DIR/bin/shdeps-legacy"
+_assert_not_exists "legacy CLI: bin/shdeps does not shadow Rust CLI" "$SHDEPS_DIR/bin/shdeps"
+_bin_path_shdeps=$(PATH="$SHDEPS_DIR/bin:/usr/bin:/bin" command -v shdeps 2>/dev/null || true)
+_assert_neq "legacy CLI: bin PATH entry does not resolve shdeps" \
+  "$SHDEPS_DIR/bin/shdeps" "$_bin_path_shdeps"
 
 _sc_files=()
 while IFS= read -r _tracked; do
