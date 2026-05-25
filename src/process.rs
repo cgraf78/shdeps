@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -51,6 +51,16 @@ pub trait Runner {
     /// Returns whether `command` is executable according to shell lookup rules.
     fn exists(&self, command: &str) -> bool;
 
+    /// Returns the executable path used for shell lookup, when known.
+    ///
+    /// Most tests only care about present-vs-missing behavior, so the default
+    /// implementation derives a stable synthetic path from `exists()`. The
+    /// production runner overrides this with the real PATH result so cache keys
+    /// notice command replacements even when the command name stays the same.
+    fn path(&self, command: &str) -> Option<PathBuf> {
+        self.exists(command).then(|| PathBuf::from(command))
+    }
+
     /// Runs `program` with `args`, optionally enforcing `timeout`.
     fn run(&self, program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Output>;
 }
@@ -62,6 +72,10 @@ pub struct Process;
 impl Runner for Process {
     fn exists(&self, command: &str) -> bool {
         command_exists(command)
+    }
+
+    fn path(&self, command: &str) -> Option<PathBuf> {
+        command_path(command)
     }
 
     fn run(&self, program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Output> {
@@ -316,17 +330,21 @@ fn parse_tab_version_line(line: &str) -> Option<(&str, &str)> {
 }
 
 fn command_exists(command: &str) -> bool {
+    command_path(command).is_some()
+}
+
+fn command_path(command: &str) -> Option<PathBuf> {
     if command.is_empty() {
-        return false;
+        return None;
     }
     if command.contains('/') {
-        return is_executable(Path::new(command));
+        return is_executable(Path::new(command)).then(|| PathBuf::from(command));
     }
 
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(command)))
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(command))
+        .find(|path| is_executable(path))
 }
 
 fn is_executable(path: &Path) -> bool {

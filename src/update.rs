@@ -9,10 +9,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cleanup;
-use crate::config::Entry;
+use crate::config::{self, Entry};
 use crate::hooks::{BashCustomProbe, Install, Post, Txn};
 use crate::http::Client;
 use crate::manifest::{self, Manifest, ManifestEntry};
+use crate::package_cache;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
 use crate::runtime::Roots;
@@ -157,62 +158,114 @@ where
     let mut queued = Vec::new();
     let hook_txn = Txn::new(&context.roots.state_dir)?;
 
-    update_pkg::prepare(entries, context);
+    let active_package_entries = entries
+        .iter()
+        .any(|entry| entry.method == "pkg" && active(entry, context.env));
+    let package_count = entries
+        .iter()
+        .filter(|entry| entry.method == "pkg" && active(entry, context.env))
+        .filter(|entry| {
+            config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr)) != "NONE"
+        })
+        .count();
+    if active_package_entries {
+        let package_cache = if package_count == 0 {
+            package_cache::Status::Hit { count: 0 }
+        } else {
+            update_pkg::cache_status(entries, context, package_count, options)?
+        };
+        if package_cache.is_hit() {
+            // The package cache is stronger than a TTL: it records the package
+            // DB, manifest, config, command paths, hooks, host, platform, and
+            // env knobs that affected the last clean package pass. On a hit,
+            // replay the same per-entry "installed/skipped" items but avoid
+            // package-manager probes and manifest rewrites. Non-package
+            // methods still run normally below.
+            summary
+                .items
+                .extend(update_pkg::cached_items(entries, context));
+        } else {
+            let package_versions = update_pkg::package_versions(entries, context);
+            update_pkg::prepare(entries, context, &package_versions);
 
-    for entry in entries {
-        if entry.method != "pkg" || !active(entry, context.env) {
-            continue;
-        }
+            let mut package_clean = true;
 
-        let item = update_pkg::install(entry, context, &mut queued)?;
-        if !item.failed {
-            match item.detail.as_str() {
-                "installed" => cleanup_successful_transition(
-                    entry,
-                    transitions.get(&entry.name),
-                    context,
-                    &mut summary,
-                )?,
-                "not available" => update_transition::restore_failed(
-                    transitions.get(&entry.name),
-                    context.manifest_path,
-                )?,
-                _ => {}
+            for entry in entries {
+                if entry.method != "pkg" || !active(entry, context.env) {
+                    continue;
+                }
+
+                let item = update_pkg::install(entry, context, &mut queued, &package_versions)?;
+                if !item.failed {
+                    match item.detail.as_str() {
+                        "installed" => cleanup_successful_transition(
+                            entry,
+                            transitions.get(&entry.name),
+                            context,
+                            &mut summary,
+                        )?,
+                        "not available" => update_transition::restore_failed(
+                            transitions.get(&entry.name),
+                            context.manifest_path,
+                        )?,
+                        _ => {}
+                    }
+                }
+                if (item.detail != "installed"
+                    && item.detail != "skipped by package-manager override")
+                    || item.changed
+                    || item.failed
+                {
+                    package_clean = false;
+                }
+                if item.changed {
+                    changed.push(entry.name.clone());
+                }
+                if item.failed {
+                    summary.failed.push(entry.name.clone());
+                }
+                summary.items.push(item);
             }
-        }
-        if item.changed {
-            changed.push(entry.name.clone());
-        }
-        if item.failed {
-            summary.failed.push(entry.name.clone());
-        }
-        summary.items.push(item);
-    }
 
-    let pkg_changed_start = changed.len();
-    let pkg_failed_start = summary.failed.len();
-    update_pkg::flush(&queued, context, &mut changed, &mut summary)?;
-    let successful_packages = changed[pkg_changed_start..]
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let failed_packages = summary.failed[pkg_failed_start..]
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    for item in &queued {
-        if successful_packages.contains(&item.name) {
-            let Some(entry) = entries.iter().find(|entry| entry.name == item.name) else {
-                continue;
-            };
-            cleanup_successful_transition(
-                entry,
-                transitions.get(&entry.name),
-                context,
-                &mut summary,
-            )?;
-        } else if failed_packages.contains(&item.name) {
-            update_transition::restore_failed(transitions.get(&item.name), context.manifest_path)?;
+            let pkg_changed_start = changed.len();
+            let pkg_failed_start = summary.failed.len();
+            update_pkg::flush(&queued, context, &mut changed, &mut summary)?;
+            let successful_packages = changed[pkg_changed_start..]
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let failed_packages = summary.failed[pkg_failed_start..]
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for item in &queued {
+                if successful_packages.contains(&item.name) {
+                    let Some(entry) = entries.iter().find(|entry| entry.name == item.name) else {
+                        continue;
+                    };
+                    cleanup_successful_transition(
+                        entry,
+                        transitions.get(&entry.name),
+                        context,
+                        &mut summary,
+                    )?;
+                } else if failed_packages.contains(&item.name) {
+                    update_transition::restore_failed(
+                        transitions.get(&item.name),
+                        context.manifest_path,
+                    )?;
+                }
+            }
+
+            if !queued.is_empty()
+                || changed.len() != pkg_changed_start
+                || summary.failed.len() != pkg_failed_start
+            {
+                package_clean = false;
+            }
+            if package_clean {
+                update_pkg::write_cache(entries, context, package_count, options)?;
+            }
         }
     }
 
@@ -960,6 +1013,125 @@ install() { return 42; }
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("jq"),
             Some(&ManifestEntry::new("jq", "pkg", "jq", ""))
+        );
+    }
+
+    #[test]
+    fn update_reuses_clean_package_cache_for_warm_noop_scan() {
+        let fixture = Fixture::new("pkg-cache-hit");
+        fixture.write_lib();
+        fs::create_dir_all(&fixture.roots.conf_dir).unwrap();
+        fs::write(fixture.roots.conf_dir.join("deps.conf"), "font pkg\n").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entries = [parse_entry("font|pkg|font|-|-", None)];
+        let first_runner = FakeRunner::default().with_success(
+            "dpkg-query",
+            ["-W", "-f=${Package}\t${Version}\n"],
+            "font\t1.0\n",
+        );
+
+        let first = run(
+            &entries,
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &first_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(first.items[0].detail, "installed");
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let second_runner = FakeRunner::default();
+        let second = run(
+            &entries,
+            &manifest,
+            &fixture.context(&manifest_path, &second_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(second.items[0].detail, "installed");
+        assert!(
+            second_runner.calls().is_empty(),
+            "a proof-backed package cache hit should not spawn package-manager probes"
+        );
+    }
+
+    #[test]
+    fn update_force_bypasses_clean_package_cache() {
+        let fixture = Fixture::new("pkg-cache-force");
+        fixture.write_lib();
+        fs::create_dir_all(&fixture.roots.conf_dir).unwrap();
+        fs::write(fixture.roots.conf_dir.join("deps.conf"), "font pkg\n").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entries = [parse_entry("font|pkg|font|-|-", None)];
+        let first_runner = FakeRunner::default().with_success(
+            "dpkg-query",
+            ["-W", "-f=${Package}\t${Version}\n"],
+            "font\t1.0\n",
+        );
+
+        run(
+            &entries,
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &first_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let forced_runner = FakeRunner::default().with_success(
+            "dpkg-query",
+            ["-W", "-f=${Package}\t${Version}\n"],
+            "font\t1.0\n",
+        );
+        let forced = run(
+            &entries,
+            &manifest,
+            &fixture.context(&manifest_path, &forced_runner, "apt"),
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(forced.items[0].detail, "installed");
+        assert!(
+            forced_runner
+                .calls()
+                .contains(&key("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"])),
+            "force mode must re-prove package state instead of trusting the warm cache"
+        );
+    }
+
+    #[test]
+    fn update_force_avoids_batch_package_versions_when_commands_prove_state() {
+        let fixture = Fixture::new("pkg-force-command-only");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_command("jq").with_command("rg");
+
+        let summary = run(
+            &[
+                parse_entry("jq|pkg|jq|-|-", None),
+                parse_entry("ripgrep|pkg|rg|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.items.len(), 2);
+        assert!(summary.items.iter().all(|item| item.detail == "installed"));
+        assert!(
+            !runner
+                .calls()
+                .contains(&key("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"])),
+            "forced package checks still need to re-prove command presence, but the expensive manager-wide version snapshot is unnecessary when every command is present"
         );
     }
 

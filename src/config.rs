@@ -186,7 +186,12 @@ fn entry_name(entry: &str) -> &str {
     entry.split('|').next().unwrap_or(entry)
 }
 
-fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
+/// Returns direct `*.conf` files in a config directory.
+///
+/// Loading and cache validation both need the same file set. Keeping the glob
+/// rule here prevents the package warm-path cache from accidentally proving a
+/// different config surface than `load_dir()` actually reads.
+pub fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
     let Ok(entries) = fs::read_dir(conf_dir) else {
         return Ok(Vec::new());
     };

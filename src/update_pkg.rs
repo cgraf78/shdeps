@@ -7,9 +7,10 @@
 
 use crate::config::{self, Entry};
 use crate::manifest::{self, ManifestEntry};
+use crate::package_cache;
 use crate::pkg;
 use crate::process::{self, Output, Runner};
-use crate::update::{active, Context, Item, Summary};
+use crate::update::{active, Context, Item, Options, Summary};
 use crate::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,8 +19,128 @@ pub(crate) struct Queued {
     package: String,
 }
 
-pub(crate) fn prepare(entries: &[Entry], context: &Context<'_, impl Runner>) {
-    if !needs_package_work(entries, context) {
+pub(crate) fn cache_status(
+    entries: &[Entry],
+    context: &Context<'_, impl Runner>,
+    count: usize,
+    options: Options,
+) -> Result<package_cache::Status> {
+    if context.pkg_mgr.is_empty() {
+        return Ok(package_cache::Status::Miss {
+            reason: "no package manager".to_owned(),
+        });
+    }
+    if let Some(reason) = cache_disabled(context, options) {
+        return Ok(package_cache::Status::Miss {
+            reason: reason.to_owned(),
+        });
+    }
+
+    let inputs = package_cache::inputs(package_cache::InputSource {
+        entries,
+        roots: context.roots,
+        env: context.env,
+        manifest_path: context.manifest_path,
+        pkg_mgr: context.pkg_mgr,
+        env_vars: context.env_vars,
+        runner: context.runner,
+        count,
+        force: options.force,
+        reinstall: options.reinstall,
+    })?;
+    package_cache::current(&inputs)
+}
+
+pub(crate) fn write_cache(
+    entries: &[Entry],
+    context: &Context<'_, impl Runner>,
+    count: usize,
+    options: Options,
+) -> Result<()> {
+    if context.pkg_mgr.is_empty() {
+        return Ok(());
+    }
+    if cache_disabled(context, options).is_some() {
+        return Ok(());
+    }
+
+    let inputs = package_cache::inputs(package_cache::InputSource {
+        entries,
+        roots: context.roots,
+        env: context.env,
+        manifest_path: context.manifest_path,
+        pkg_mgr: context.pkg_mgr,
+        env_vars: context.env_vars,
+        runner: context.runner,
+        count,
+        force: options.force,
+        reinstall: options.reinstall,
+    })?;
+    package_cache::write(&inputs)
+}
+
+fn cache_disabled<R: Runner>(context: &Context<'_, R>, options: Options) -> Option<&'static str> {
+    if options.force || context.env_vars.get("SHDEPS_FORCE").map(String::as_str) == Some("1") {
+        Some("force enabled")
+    } else if options.reinstall
+        || context.env_vars.get("SHDEPS_REINSTALL").map(String::as_str) == Some("1")
+    {
+        Some("reinstall enabled")
+    } else if context
+        .env_vars
+        .get("SHDEPS_LOG_LEVEL")
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(1)
+        >= 2
+    {
+        Some("verbose logging enabled")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn cached_items(entries: &[Entry], context: &Context<'_, impl Runner>) -> Vec<Item> {
+    entries
+        .iter()
+        .filter(|entry| entry.method == "pkg" && active(entry, context.env))
+        .map(|entry| {
+            let resolved =
+                config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
+            if resolved == "NONE" {
+                Item {
+                    name: entry.name.clone(),
+                    changed: false,
+                    failed: false,
+                    detail: "skipped by package-manager override".to_owned(),
+                }
+            } else {
+                Item {
+                    name: entry.name.clone(),
+                    changed: false,
+                    failed: false,
+                    detail: "installed".to_owned(),
+                }
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn package_versions(
+    entries: &[Entry],
+    context: &Context<'_, impl Runner>,
+) -> std::collections::BTreeMap<String, String> {
+    if !needs_package_version_snapshot(entries, context) {
+        return std::collections::BTreeMap::new();
+    }
+    process::package_versions(context.runner, context.pkg_mgr)
+}
+
+pub(crate) fn prepare(
+    entries: &[Entry],
+    context: &Context<'_, impl Runner>,
+    package_versions: &std::collections::BTreeMap<String, String>,
+) {
+    if !needs_package_work(entries, context, package_versions) {
         return;
     }
 
@@ -27,10 +148,26 @@ pub(crate) fn prepare(entries: &[Entry], context: &Context<'_, impl Runner>) {
     refresh_metadata(context);
 }
 
+fn needs_package_version_snapshot(entries: &[Entry], context: &Context<'_, impl Runner>) -> bool {
+    // Batch package versions are useful only when command lookup alone cannot
+    // prove every active package dependency. Avoiding the manager-wide query on
+    // the common "all commands are on PATH" path keeps forced updates snappy
+    // while still collapsing the expensive fallback for fonts/data packages and
+    // package-name/command-name mismatches.
+    entries.iter().any(|entry| {
+        if entry.method != "pkg" || !active(entry, context.env) {
+            return false;
+        }
+        let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
+        resolved != "NONE" && !context.runner.exists(&entry.cmd)
+    })
+}
+
 pub(crate) fn install(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     queued: &mut Vec<Queued>,
+    package_versions: &std::collections::BTreeMap<String, String>,
 ) -> Result<Item> {
     let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
     if resolved == "NONE" {
@@ -42,7 +179,13 @@ pub(crate) fn install(
         });
     }
 
-    if process::dep_exists(context.runner, &entry.cmd, &resolved, context.pkg_mgr) {
+    if process::dep_exists_with_versions(
+        context.runner,
+        &entry.cmd,
+        &resolved,
+        context.pkg_mgr,
+        package_versions,
+    ) {
         manifest::upsert(
             context.manifest_path,
             ManifestEntry::new(&entry.name, "pkg", &entry.cmd, ""),
@@ -131,7 +274,11 @@ fn missing_command_needs_repair(entry: &Entry, context: &Context<'_, impl Runner
             .is_file()
 }
 
-fn needs_package_work(entries: &[Entry], context: &Context<'_, impl Runner>) -> bool {
+fn needs_package_work(
+    entries: &[Entry],
+    context: &Context<'_, impl Runner>,
+    package_versions: &std::collections::BTreeMap<String, String>,
+) -> bool {
     if context.pkg_mgr.is_empty() {
         return false;
     }
@@ -143,7 +290,13 @@ fn needs_package_work(entries: &[Entry], context: &Context<'_, impl Runner>) -> 
 
         let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
         resolved != "NONE"
-            && !process::dep_exists(context.runner, &entry.cmd, &resolved, context.pkg_mgr)
+            && !process::dep_exists_with_versions(
+                context.runner,
+                &entry.cmd,
+                &resolved,
+                context.pkg_mgr,
+                package_versions,
+            )
     })
 }
 

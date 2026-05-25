@@ -18,6 +18,10 @@ use std::time::UNIX_EPOCH;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+use crate::config::{self, Entry};
+use crate::platform::{self, RuntimeEnv};
+use crate::process::Runner;
+use crate::runtime::Roots;
 use crate::state;
 use crate::Result;
 
@@ -131,6 +135,260 @@ pub fn write(inputs: &Inputs) -> Result<()> {
 
     let cache = build_cache(inputs)?;
     state::write_atomic(&path(&inputs.state_dir), &cache.content())
+}
+
+/// Source data used to build package-cache proof inputs.
+pub struct InputSource<'a, R: Runner> {
+    /// Parsed config entries in operational order.
+    pub entries: &'a [Entry],
+    /// Runtime filesystem roots.
+    pub roots: &'a Roots,
+    /// Runtime platform/host identity.
+    pub env: &'a RuntimeEnv,
+    /// Manifest path whose content participates in the proof.
+    pub manifest_path: &'a Path,
+    /// Active package manager.
+    pub pkg_mgr: &'a str,
+    /// Environment values that affect package decisions.
+    pub env_vars: &'a BTreeMap<String, String>,
+    /// Host runner used for command and package-manager probes.
+    pub runner: &'a R,
+    /// Number of active, non-skipped package deps proven clean.
+    pub count: usize,
+    /// CLI force flag, which bypasses the cache even without env state.
+    pub force: bool,
+    /// CLI reinstall flag, which bypasses the cache even without env state.
+    pub reinstall: bool,
+}
+
+/// Builds the proof inputs for the package-check cache.
+///
+/// A cache hit stands in for a full package scan, so the input surface must
+/// include every ambient fact that can change the answer: the active config
+/// files, host/platform filters, manifest rows, package database state, command
+/// lookup results, package-specific post hooks, and repo/feature env toggles.
+/// This function intentionally lives next to cache validation so future cache
+/// format changes do not require update orchestration to relearn those rules.
+pub fn inputs<R: Runner>(source: InputSource<'_, R>) -> Result<Inputs> {
+    let active = active_packages(source.entries, source.env, source.pkg_mgr);
+    Ok(Inputs {
+        state_dir: source.roots.state_dir.clone(),
+        count: source.count,
+        pkg_mgr: source.pkg_mgr.to_owned(),
+        platform: source.env.platform().to_owned(),
+        host: source.env.host().to_owned(),
+        conf_dir: source.roots.conf_dir.clone(),
+        conf_files: config::conf_files(&source.roots.conf_dir)?,
+        manifest_path: source.manifest_path.to_path_buf(),
+        env_overrides: source
+            .env_vars
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        db_signatures: db_signatures(source.pkg_mgr, source.env_vars, source.runner, &active)?,
+        commands: command_signatures(source.runner, &active),
+        hooks: active
+            .iter()
+            .map(|dep| {
+                (
+                    dep.name.clone(),
+                    source.roots.hooks_dir.join(format!("{}.sh", dep.name)),
+                )
+            })
+            .collect(),
+        force: source.force || env_flag(source.env_vars, "SHDEPS_FORCE"),
+        reinstall: source.reinstall || env_flag(source.env_vars, "SHDEPS_REINSTALL"),
+        log_level: source
+            .env_vars
+            .get("SHDEPS_LOG_LEVEL")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(1),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivePackage {
+    name: String,
+    cmd: String,
+    package: String,
+}
+
+fn active_packages(entries: &[Entry], env: &RuntimeEnv, pkg_mgr: &str) -> Vec<ActivePackage> {
+    entries
+        .iter()
+        .filter(|entry| entry.method == "pkg")
+        .filter(|entry| {
+            matches!(
+                platform::filter_match(&entry.filter, env),
+                platform::FilterMatch::Match
+            )
+        })
+        .filter_map(|entry| {
+            let package = config::resolve_override(&entry.name, &entry.aliases, Some(pkg_mgr));
+            (package != "NONE").then(|| ActivePackage {
+                name: entry.name.clone(),
+                cmd: entry.cmd.clone(),
+                package,
+            })
+        })
+        .collect()
+}
+
+fn command_signatures(runner: &impl Runner, packages: &[ActivePackage]) -> Vec<(String, String)> {
+    packages
+        .iter()
+        .map(|dep| {
+            let path = runner
+                .path(&dep.cmd)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (dep.cmd.clone(), path)
+        })
+        .collect()
+}
+
+fn db_signatures(
+    pkg_mgr: &str,
+    env_vars: &BTreeMap<String, String>,
+    runner: &impl Runner,
+    packages: &[ActivePackage],
+) -> Result<Vec<(String, String)>> {
+    let mut signatures = BTreeMap::new();
+    for dep in packages {
+        let key = db_key(pkg_mgr, &dep.package);
+        if signatures.contains_key(&key) {
+            continue;
+        }
+        let signature = match pkg_mgr {
+            "brew" => brew_signature(env_vars, runner, &dep.package)?,
+            "apt" => paths_signature([PathBuf::from("/var/lib/dpkg/status")])?,
+            "dnf" | "zypper" => rpm_signature()?,
+            "pacman" => pacman_signature(&dep.package)?,
+            "apk" => paths_signature([PathBuf::from("/lib/apk/db/installed")])?,
+            other => format!("unknown-manager:{other}:{}", dep.package),
+        };
+        signatures.insert(key, signature);
+    }
+    Ok(signatures.into_iter().collect())
+}
+
+fn db_key(pkg_mgr: &str, package: &str) -> String {
+    match pkg_mgr {
+        "apt" => "apt".to_owned(),
+        "dnf" | "zypper" => "rpm".to_owned(),
+        "apk" => "apk".to_owned(),
+        other => format!("{other}:{package}"),
+    }
+}
+
+fn brew_signature(
+    env_vars: &BTreeMap<String, String>,
+    runner: &impl Runner,
+    package: &str,
+) -> Result<String> {
+    let prefix = env_vars
+        .get("HOMEBREW_PREFIX")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| {
+            runner
+                .run("brew", &["--prefix"], None)
+                .ok()
+                .filter(|output| output.success)
+                .map(|output| output.stdout.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default();
+    paths_signature([
+        PathBuf::from(&prefix).join("Cellar").join(package),
+        PathBuf::from(&prefix).join("Caskroom").join(package),
+    ])
+}
+
+fn rpm_signature() -> Result<String> {
+    let mut paths = vec![
+        PathBuf::from("/usr/lib/sysimage/rpm"),
+        PathBuf::from("/var/lib/rpm"),
+    ];
+    for dir in ["/usr/lib/sysimage/rpm", "/var/lib/rpm"] {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-shm") || name.ends_with("-wal"))
+            {
+                continue;
+            }
+            paths.push(path);
+        }
+    }
+    paths_signature(paths)
+}
+
+fn pacman_signature(package: &str) -> Result<String> {
+    let mut paths = Vec::new();
+    if let Ok(entries) = fs::read_dir("/var/lib/pacman/local") {
+        let prefix = format!("{package}-");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                paths.push(path);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Ok(format!("missing-pacman:{package}"));
+    }
+    paths_signature(paths)
+}
+
+fn paths_signature(paths: impl IntoIterator<Item = PathBuf>) -> Result<String> {
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
+    paths.sort();
+    let mut hasher = StableHasher::default();
+    for path in paths {
+        path.to_string_lossy().hash(&mut hasher);
+        path_metadata_fingerprint(&path)?.hash(&mut hasher);
+    }
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn path_metadata_fingerprint(path: &Path) -> Result<String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let mut value = format!(
+                "{}:{}:{}",
+                kind(&metadata),
+                metadata.len(),
+                metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default()
+            );
+            #[cfg(unix)]
+            {
+                value.push(':');
+                value.push_str(&metadata.ino().to_string());
+            }
+            Ok(value)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("missing".to_owned()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn env_flag(env_vars: &BTreeMap<String, String>, name: &str) -> bool {
+    env_vars.get(name).map(String::as_str) == Some("1")
 }
 
 fn disabled_reason(inputs: &Inputs) -> Option<&'static str> {
