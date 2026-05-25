@@ -4530,6 +4530,7 @@ git -C "$_release_script_repo" remote add origin "$_release_script_origin"
 git -C "$_release_script_repo" push origin main >/dev/null 2>&1
 _release_script_commit=$(git -C "$_release_script_repo" rev-parse HEAD)
 _release_script_tag="20990205-060708-${_release_script_commit:0:8}"
+git -C "$_release_script_repo" update-ref -d refs/remotes/origin/main
 
 _release_tag=$(
   cd "$_release_script_repo" || exit 1
@@ -4552,6 +4553,11 @@ _assert_contains "release script dry-run: ignores ambient build env" \
   "release: tag $_release_script_tag" "$_release_script_output"
 _assert_contains "release script dry-run: prints push plan" \
   "would push main and refs/tags/$_release_script_tag to origin" "$_release_script_output"
+if git -C "$_release_script_repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null; then
+  _pass "release script dry-run: recreates missing remote-tracking branch"
+else
+  _fail "release script dry-run: recreates missing remote-tracking branch"
+fi
 if git -C "$_release_script_repo" rev-parse -q --verify "refs/tags/$_release_script_tag" >/dev/null; then
   _fail "release script dry-run: does not create local tag"
 else

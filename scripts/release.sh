@@ -38,6 +38,7 @@ done
 
 remote=${SHDEPS_RELEASE_REMOTE:-origin}
 branch=${SHDEPS_RELEASE_BRANCH:-main}
+remote_ref="refs/remotes/$remote/$branch"
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
@@ -58,10 +59,10 @@ fi
 # Fetch before deriving the tag so local release cuts are anchored to the same
 # commit that GitHub will build. The explicit refspec keeps this independent of
 # whatever upstream tracking configuration a developer happens to have locally.
-git fetch --quiet "$remote" "$branch:refs/remotes/$remote/$branch" --tags
+git fetch --quiet --tags "$remote" "+refs/heads/$branch:$remote_ref"
 
 head_commit=$(git rev-parse HEAD)
-remote_commit=$(git rev-parse "$remote/$branch")
+remote_commit=$(git rev-parse "$remote_ref")
 if [[ "$head_commit" != "$remote_commit" ]]; then
   die "local $branch ($head_commit) does not match $remote/$branch ($remote_commit)"
 fi
