@@ -342,7 +342,17 @@ fn mutating_api_github_release_reports_selection_failures() {
     let fakebin = fixture.dir.join("fakebin");
     fixture.write_executable(
         "fakebin/curl",
-        "#!/bin/sh\nprintf '[{\"tag_name\":\"v1.0.0\",\"assets\":[]}]\\n'\n",
+        r#"#!/bin/sh
+set -eu
+
+# Keep this fake compatible with the production curl transport, which sends the
+# request through a stdin config so auth headers do not leak through argv. Some
+# curl versions treat a script that ignores stdin differently after the writer
+# side closes; consuming the config makes this fixture behave consistently on
+# the older CentOS Stream userspace in the shared CI matrix.
+cat >/dev/null
+printf '[{"tag_name":"v1.0.0","assets":[]}]\n'
+"#,
     );
 
     let mut command = fixture.command([
