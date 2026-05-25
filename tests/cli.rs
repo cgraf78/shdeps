@@ -388,7 +388,10 @@ install() {
     let output = run(&mut command);
 
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "  tool: installed\n");
+    assert_eq!(
+        text(&output.stdout),
+        "==> Installing/upgrading tools...\n  tool: installed\n"
+    );
     assert_eq!(text(&output.stderr), "");
     assert_eq!(
         fs::read_link(fixture.dir.join("share/man/man1/tool.1")).unwrap(),
@@ -531,7 +534,7 @@ fn no_op_manifest_backed_update_stays_fast_and_skips_network_and_tools() {
     let (output, elapsed) = timed(&mut command);
 
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "");
+    assert_eq!(text(&output.stdout), "==> Installing/upgrading tools...\n");
     assert_eq!(text(&output.stderr), "");
     assert!(
         elapsed <= Duration::from_secs(1),
@@ -652,7 +655,10 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-pos
     let first = run(&mut fixture.command(["update"]));
 
     assert_success(&first);
-    assert_eq!(text(&first.stdout), "  tool: 1.2.3\n");
+    assert_eq!(
+        text(&first.stdout),
+        "==> Installing/upgrading tools...\n  tool: 1.2.3\n"
+    );
     assert_eq!(text(&first.stderr), "");
     assert_eq!(
         fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
@@ -666,7 +672,7 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-pos
     let second = run(&mut fixture.command(["update"]));
 
     assert_success(&second);
-    assert_eq!(text(&second.stdout), "");
+    assert_eq!(text(&second.stdout), "==> Installing/upgrading tools...\n");
     assert_eq!(text(&second.stderr), "");
 }
 
@@ -682,7 +688,7 @@ fn update_fails_when_custom_install_fails() {
     let output = run(&mut fixture.command(["update"]));
 
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(text(&output.stdout), "");
+    assert_eq!(text(&output.stdout), "==> Installing/upgrading tools...\n");
     assert_eq!(
         text(&output.stderr),
         "  broken failed: custom install failed\n"
@@ -713,7 +719,10 @@ install() { printf 'installed\n'; }
     let output = run(&mut fixture.command(["update"]));
 
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "  tool: installed\n");
+    assert_eq!(
+        text(&output.stdout),
+        "==> Installing/upgrading tools...\n  tool: installed\n"
+    );
     assert_eq!(
         text(&output.stderr),
         "==> 1 orphaned dep(s) no longer in config:\n  old (github:release)\nRun `shdeps prune` to remove orphaned artifacts.\n"

@@ -4157,6 +4157,10 @@ prettier                  npm
 CONF
 
 SHDEPS_CONF_DIR="$_lc_conf" SHDEPS_QUIET=1 "$SHDEPS_CLI" update >/dev/null 2>&1
+_lc_update_out=$(SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_CLI" update 2>&1)
+if [[ "$SHDEPS_IMPL" == "rust" ]]; then
+  _assert_contains "cli update: prints install phase header" "Installing/upgrading tools" "$_lc_update_out"
+fi
 
 _lc_list=$(SHDEPS_CONF_DIR="$_lc_conf" "$SHDEPS_CLI" list 2>&1)
 _assert_contains "list: shows cargo dep" "mytool" "$_lc_list"

@@ -421,6 +421,15 @@ where
         ..UpdateOptions::default()
     };
 
+    if !options.quiet {
+        // This line looks cosmetic, but it is part of the legacy bootstrap
+        // contract. dotfiles and humans both use it as the boundary between
+        // repository sync/merge work and shdeps-managed dependency work, so
+        // omitting it makes successful installs look like the update skipped
+        // package/tool installation entirely.
+        writeln!(stdout, "==> Installing/upgrading tools...")?;
+    }
+
     let summary = update::run(&entries, &manifest, &context, update_options)?;
     write_update_summary(&summary, options.quiet, stdout, stderr)?;
 
