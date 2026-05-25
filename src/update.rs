@@ -1861,7 +1861,7 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert!(summary.items[0].changed);
         assert!(install_dir.join(".git").is_dir());
-        assert_eq!(summary.items[0].detail, "cloned");
+        assert_eq!(summary.items[0].detail, "added");
         assert_eq!(
             fs::read_to_string(crate::stamp::remote_path(
                 &fixture.roots.state_dir,
@@ -1939,7 +1939,7 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(!summary.has_errors());
         assert!(install_dir.join(".git").is_dir());
-        assert_eq!(summary.items[0].detail, "cloned");
+        assert_eq!(summary.items[0].detail, "added");
     }
 
     #[test]

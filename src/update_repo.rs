@@ -178,7 +178,12 @@ fn install_fresh(
         name: entry.name.clone(),
         changed: true,
         failed: false,
-        detail: "cloned".to_owned(),
+        // Bash reported a newly materialized repo dependency as "added".
+        // Downstream bootstrap tests and log triage treat that word as the
+        // public install contract, while "cloned" is only the implementation
+        // mechanism. Keep the user-facing status stable so a Rust binary can
+        // replace the shell CLI without forcing client repos to relearn it.
+        detail: "added".to_owned(),
     })
 }
 
