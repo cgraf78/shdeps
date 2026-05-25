@@ -21,6 +21,19 @@ pub struct Selection {
     pub url: String,
 }
 
+/// Returns the release that GitHub would expose as "latest" for third-party deps.
+///
+/// The releases API is already ordered by GitHub's publication recency. Keeping
+/// this helper public inside the crate lets update logic compare the installed
+/// binary version before doing asset matching or downloads, which preserves the
+/// Bash contract that `--force` means "check now", not "reinstall now".
+#[must_use]
+pub(crate) fn latest_stable(releases: &[Release]) -> Option<&Release> {
+    releases
+        .iter()
+        .find(|release| !release.draft && !release.prerelease)
+}
+
 /// Selects the best install asset for a command on the current host.
 #[must_use]
 pub fn select(
@@ -34,9 +47,7 @@ pub fn select(
     // API returns newest first, so choose the first stable release instead of
     // sorting tags. Third-party projects often use tags that are not monotonic
     // under shdeps' own release-version comparison.
-    let release = releases
-        .iter()
-        .find(|release| !release.draft && !release.prerelease)?;
+    let release = latest_stable(releases)?;
     let urls = release
         .assets
         .iter()

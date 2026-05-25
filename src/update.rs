@@ -1574,6 +1574,124 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_force_checks_without_reinstalling_current_binary() {
+        let mut fixture = Fixture::new("release-force-current");
+        fixture.write_lib();
+        fixture.client = FakeClient::default().with(
+            "https://api.github.com/repos/owner/tool/releases",
+            br#"[{
+                "tag_name":"v1.2.3",
+                "draft":false,
+                "prerelease":false,
+                "assets":[{
+                    "name":"tool-linux-x86_64",
+                    "browser_download_url":"https://example/tool-linux-x86_64"
+                }]
+            }]"#
+            .to_vec(),
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release"),
+            1_700_000_000,
+        )
+        .unwrap();
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.2.3\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                force: true,
+                now: 1_700_000_500,
+                remote_ttl: 3600,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "1.2.3");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"#!/bin/sh\n");
+        assert_eq!(
+            fixture.client.requests(),
+            vec![(
+                "https://api.github.com/repos/owner/tool/releases".to_owned(),
+                None
+            )],
+            "force should refresh metadata but must not download a release asset when the installed version is current"
+        );
+        assert_eq!(
+            fs::read_to_string(crate::stamp::remote_path(
+                &fixture.roots.state_dir,
+                "owner/tool",
+                "release"
+            ))
+            .unwrap(),
+            "1700000500\n"
+        );
+    }
+
+    #[test]
+    fn update_github_release_reinstall_downloads_even_when_current() {
+        let mut fixture = Fixture::new("release-reinstall-current");
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-linux-x86_64",
+                        "browser_download_url":"https://example/tool-linux-x86_64"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://example/tool-linux-x86_64", b"new-binary".to_vec());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.2.3\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "v1.2.3");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"new-binary");
+        assert_eq!(
+            fixture.client.requests(),
+            vec![
+                (
+                    "https://api.github.com/repos/owner/tool/releases".to_owned(),
+                    None
+                ),
+                ("https://example/tool-linux-x86_64".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn update_github_release_installs_tar_gz_archive_and_links_extras() {
         let mut fixture = Fixture::new("release-tar-gz");

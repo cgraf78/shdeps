@@ -18,6 +18,7 @@ use crate::platform::RuntimeEnv;
 use crate::process::{self, Runner};
 use crate::runtime::{Env, Roots};
 use crate::stamp;
+use crate::tool_version;
 use crate::update::{Context, Item, Options};
 use crate::Result;
 
@@ -98,6 +99,10 @@ pub(crate) fn install_request(
         });
     }
 
+    let current_version = process::executable_path(request.public_bin)
+        .then(|| process::dep_version(runner, request.cmd))
+        .flatten();
+
     let env = EnvVars {
         vars: env_vars,
         runtime: runtime_env,
@@ -108,6 +113,28 @@ pub(crate) fn install_request(
             return Ok(failed("release metadata fetch failed"));
         }
     };
+    if let Some(latest) = github_release::latest_stable(&releases) {
+        if !options.reinstall
+            && current_version
+                .as_deref()
+                .is_some_and(|current| installed_matches_tag(current, &latest.tag))
+        {
+            // `--force` deliberately bypasses the TTL so users can ask GitHub
+            // "is there anything newer?" immediately. It must not imply a
+            // reinstall loop: release downloads are the most expensive shdeps
+            // path, and post hooks should only run when the dependency really
+            // changed. Bash compared the probed command version to the latest
+            // release tag before asset selection, so keep that no-op path even
+            // if the release has no asset we would install from scratch today.
+            stamp::remote_touch(&stamp_path, options.now)?;
+            link_existing_extras(roots, request.name)?;
+            return Ok(ReleaseOutcome {
+                changed: false,
+                failed: false,
+                detail: current_version.unwrap_or_else(|| latest.tag.clone()),
+            });
+        }
+    }
     let Some(selection) = github_release::select(request.cmd, &releases, runtime_env, runner)
     else {
         return Ok(failed("no matching release asset"));
@@ -193,6 +220,12 @@ pub(crate) fn install_request(
     })
 }
 
+fn link_existing_extras(roots: &Roots, name: &str) -> Result<()> {
+    let install_dir = roots.install_dir.join(name);
+    crate::extras::link(&roots.state_dir, &roots.install_dir, name, &install_dir)?;
+    Ok(())
+}
+
 fn write_manifest(entry: &Entry, context: &Context<'_, impl Runner>) -> Result<()> {
     manifest::upsert(
         context.manifest_path,
@@ -211,6 +244,36 @@ fn failed(detail: &str) -> ReleaseOutcome {
         failed: true,
         detail: detail.to_owned(),
     }
+}
+
+fn installed_matches_tag(installed: &str, tag: &str) -> bool {
+    comparable_versions(tag)
+        .into_iter()
+        .any(|candidate| candidate == installed)
+}
+
+fn comparable_versions(tag: &str) -> Vec<String> {
+    let tag = tag.trim();
+    let mut versions = Vec::new();
+
+    // Keep exact-ish comparisons first for projects that report their tag
+    // verbatim. Then add the de-prefixed and dotted forms that cover common
+    // GitHub tags such as `v1.2.3`, `rust-v0.133.0`, and `release-2026.5.15`.
+    push_unique(&mut versions, tag);
+    push_unique(&mut versions, tag.strip_prefix('v').unwrap_or(tag));
+
+    if let Some(dotted) = tool_version::extract(&[tag], "release-tag") {
+        push_unique(&mut versions, &dotted);
+    }
+
+    versions
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if value.is_empty() || values.iter().any(|existing| existing == value) {
+        return;
+    }
+    values.push(value.to_owned());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,7 +351,7 @@ impl Env for EnvVars<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_kind, AssetKind};
+    use super::{asset_kind, comparable_versions, installed_matches_tag, AssetKind};
 
     #[test]
     fn asset_kind_accepts_raw_binary_urls() {
@@ -375,6 +438,23 @@ mod tests {
         assert_eq!(
             asset_kind("https://example.com/tool-linux-x86_64.zip"),
             AssetKind::Zip
+        );
+    }
+
+    #[test]
+    fn release_tag_comparison_accepts_common_github_prefixes() {
+        assert!(installed_matches_tag("1.2.3", "v1.2.3"));
+        assert!(installed_matches_tag("0.133.0", "rust-v0.133.0"));
+        assert!(installed_matches_tag("2026.5.15", "release-2026.5.15"));
+        assert!(installed_matches_tag(
+            "nightly-20260525",
+            "nightly-20260525"
+        ));
+        assert!(!installed_matches_tag("1.2.2", "v1.2.3"));
+
+        assert_eq!(
+            comparable_versions("rust-v0.133.0"),
+            vec!["rust-v0.133.0", "0.133.0"]
         );
     }
 }
