@@ -4941,6 +4941,50 @@ else
   _fail "bootstrap dev dir: shdeps_update defined"
 fi
 
+# --- Bootstrap rebuilds stale Rust source checkout binary ---
+
+unset -f shdeps_update 2>/dev/null
+_bs_stale_dir=$(_tmpdir)/bs-stale-rust
+_bs_stale_bin=$(_tmpdir)/bs-stale-bin
+_bs_stale_fakebin=$(_mock_bin)
+_bs_stale_log=$(_tmpdir)/bs-stale.log
+_bs_stale_new="$_bs_stale_fakebin/shdeps-new"
+mkdir -p "$_bs_stale_dir/.git" "$_bs_stale_bin"
+cp "$SHDEPS_DIR/install.sh" "$_bs_stale_dir/install.sh"
+cp "$SHDEPS_DIR/shdeps.sh" "$_bs_stale_dir/shdeps.sh"
+printf '%s\n' '[package]' 'name = "shdeps"' >"$_bs_stale_dir/Cargo.toml"
+_write_fake_release_shdeps "$_bs_stale_dir/shdeps" "20990203-040506-cafebabe"
+_write_fake_release_shdeps "$_bs_stale_new" "20990203-040506-deadbeef"
+cat >"$_bs_stale_fakebin/git" <<'SH'
+#!/usr/bin/env bash
+set -eu
+if [[ "${1:-}" == -C && "${3:-}" == rev-parse && "${4:-}" == --short=8 && "${5:-}" == HEAD ]]; then
+  printf '%s\n' "deadbeef"
+  exit 0
+fi
+exit 0
+SH
+cat >"$_bs_stale_fakebin/cargo" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf 'cargo %s\n' "$*" >>"$SHDEPS_BOOTSTRAP_STALE_LOG"
+mkdir -p target/release
+cp "$SHDEPS_BOOTSTRAP_STALE_NEW" target/release/shdeps
+chmod +x target/release/shdeps
+SH
+chmod +x "$_bs_stale_fakebin/git" "$_bs_stale_fakebin/cargo"
+_bs_saved_path="$PATH"
+PATH="$_bs_stale_fakebin:/usr/bin:/bin" \
+  SHDEPS_BOOTSTRAP_STALE_LOG="$_bs_stale_log" \
+  SHDEPS_BOOTSTRAP_STALE_NEW="$_bs_stale_new" \
+  SHDEPS_DIR="$_bs_stale_dir" SHDEPS_BIN="$_bs_stale_bin/shdeps" \
+  . "$_bs_stale_dir/install.sh" --bootstrap
+PATH="$_bs_saved_path"
+_assert_eq "bootstrap stale Rust checkout: rebuilt binary active" \
+  "shdeps 20990203-040506-deadbeef" "$("$_bs_stale_bin/shdeps" version)"
+_assert_contains "bootstrap stale Rust checkout: cargo build ran" \
+  "cargo build --release --locked" "$(cat "$_bs_stale_log")"
+
 # --- Bootstrap fresh install fallback ---
 
 unset -f shdeps_update 2>/dev/null

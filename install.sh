@@ -374,17 +374,26 @@ JSON
 
 _ensure_source_checkout_binary() {
   local shdeps_dir="$1"
+  local head=""
 
-  if [[ -x "$shdeps_dir/shdeps" ]]; then
+  if [[ -d "$shdeps_dir/.git" ]]; then
+    head=$(git -C "$shdeps_dir" rev-parse --short=8 HEAD 2>/dev/null || true)
+  fi
+
+  # A source checkout can move forward without replacing its already-built
+  # binary: `dot update` sources install.sh, then shdeps self-update may only
+  # run `git pull`. Treat the build hash as the freshness marker so a pulled
+  # Rust checkout cannot keep delegating to an older executable indefinitely.
+  if _source_checkout_binary_matches_head "$shdeps_dir/shdeps" "$head"; then
     return 0
   fi
 
-  if [[ -x "$shdeps_dir/target/release/shdeps" ]]; then
+  if _source_checkout_binary_matches_head "$shdeps_dir/target/release/shdeps" "$head"; then
     ln -sf "target/release/shdeps" "$shdeps_dir/shdeps"
     return 0
   fi
 
-  if [[ -x "$shdeps_dir/target/debug/shdeps" ]]; then
+  if _source_checkout_binary_matches_head "$shdeps_dir/target/debug/shdeps" "$head"; then
     # Developer activation often happens immediately after `cargo build`.
     # Accepting that existing debug binary keeps local bootstrap snappy; fresh
     # clones with no binary still build release below, and fleet installs use
@@ -408,7 +417,11 @@ _ensure_source_checkout_binary() {
   # explicitly asks install.sh to use a checkout, build the Rust binary before
   # sourcing `shdeps.sh`; otherwise the wrapper could accidentally delegate to
   # an older `shdeps` on PATH or fail after the clone already succeeded.
-  if ! (cd "$shdeps_dir" && cargo build --release --locked); then
+  # Force Cargo's target dir back under the checkout. A user's ambient
+  # CARGO_TARGET_DIR is useful for normal development, but bootstrap activation
+  # needs one predictable sibling binary so the sourceable wrapper and the
+  # ~/.local/bin link cannot point at different builds.
+  if ! (cd "$shdeps_dir" && CARGO_TARGET_DIR="$shdeps_dir/target" cargo build --release --locked); then
     _error "failed to build shdeps source checkout"
     return 1
   fi
@@ -417,6 +430,39 @@ _ensure_source_checkout_binary() {
     return 1
   fi
   ln -sf "target/release/shdeps" "$shdeps_dir/shdeps"
+}
+
+_source_checkout_binary_matches_head() {
+  local binary="$1" head="$2" version=""
+
+  [[ -x "$binary" ]] || return 1
+  if [[ -z "$head" ]]; then
+    # Non-git source fixtures and pre-Rust installs cannot provide a durable
+    # commit identity. In that fallback shape, any executable is still better
+    # than rejecting a usable install during bootstrap.
+    return 0
+  fi
+
+  version=$("$binary" version 2>/dev/null || true)
+  case "$version" in
+    *"$head"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_bootstrap_self_update() {
+  local shdeps_dir="$1"
+
+  if declare -f _shdeps_self_update &>/dev/null; then
+    _shdeps_self_update "$shdeps_dir"
+  elif declare -f shdeps_self_update &>/dev/null; then
+    # The Rust public wrapper intentionally has a clean no-arg CLI surface, so
+    # pass the bootstrap-selected checkout through the environment instead of
+    # preserving the legacy private helper's positional argument shape.
+    local SHDEPS_DIR="$shdeps_dir"
+    export SHDEPS_DIR
+    shdeps_self_update
+  fi
 }
 
 # Symlink CLI into PATH and link man page + shell completions.
@@ -584,8 +630,17 @@ _bootstrap() {
   . "$_bs_lib" || return 1
 
   # Pull latest shdeps (skips dirty clones / active development)
-  if [[ -n "$_bs_dir" ]] && declare -f _shdeps_self_update &>/dev/null; then
-    _shdeps_self_update "$_bs_dir" 2>/dev/null || true
+  if [[ -n "$_bs_dir" ]]; then
+    _bootstrap_self_update "$_bs_dir" 2>/dev/null || true
+  fi
+
+  # The self-update call above may have pulled new Rust sources while the
+  # currently executing binary was still the old build. Re-run the activation
+  # check after the pull so `dot update` converges the checked-out source and the
+  # delegated executable in the same bootstrap pass whenever this install.sh is
+  # new enough to know about Rust builds.
+  if [[ -n "$_bs_dir" && -d "$_bs_dir/.git" && -f "$_bs_dir/Cargo.toml" ]]; then
+    _ensure_source_checkout_binary "$_bs_dir" || return 1
   fi
 
   # Set up symlinks (CLI, man, completions) after self-update so newly

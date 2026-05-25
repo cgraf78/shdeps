@@ -947,6 +947,10 @@ fn shdeps_install_dir() -> Result<PathBuf> {
 
     let exe = env::current_exe()?;
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    if let Some(source_dir) = source_checkout_dir_from_target(dir) {
+        return Ok(source_dir);
+    }
+
     // Release installs put the Rust binary directly in SHDEPS_DIR, while the
     // Bash source checkout keeps the wrapper at bin/shdeps. Supporting both
     // shapes lets the same CLI entry point update converted installs and
@@ -956,6 +960,26 @@ fn shdeps_install_dir() -> Result<PathBuf> {
     } else {
         Ok(dir.to_path_buf())
     }
+}
+
+fn source_checkout_dir_from_target(dir: &Path) -> Option<PathBuf> {
+    let profile = dir.file_name().and_then(|name| name.to_str())?;
+    if profile != "debug" && profile != "release" {
+        return None;
+    }
+
+    let target = dir.parent()?;
+    if target.file_name().and_then(|name| name.to_str()) != Some("target") {
+        return None;
+    }
+
+    let checkout = target.parent()?;
+    // `std::env::current_exe()` resolves the `shdeps -> target/release/shdeps`
+    // symlink on many Unix hosts. Without this checkout-shape correction,
+    // running a source-built binary directly would try to self-update the
+    // `target/release` directory instead of the repository that owns it.
+    (checkout.join(".git").is_dir() && checkout.join("Cargo.toml").is_file())
+        .then(|| checkout.to_path_buf())
 }
 
 fn run_path_lookup<W>(result: Result<PathBuf>, stdout: &mut W) -> Result<i32>
@@ -977,7 +1001,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::run;
+    use super::{run, source_checkout_dir_from_target};
     use crate::version;
 
     #[test]
@@ -1082,6 +1106,24 @@ mod tests {
         assert_eq!(
             stderr,
             "error: __api github-release-install requires a name and command\n"
+        );
+    }
+
+    #[test]
+    fn target_dir_executables_resolve_to_source_checkout_root() {
+        let checkout = temp_dir("target-dir-source-root");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        fs::write(
+            checkout.join("Cargo.toml"),
+            "[package]\nname = \"shdeps\"\n",
+        )
+        .unwrap();
+        let release_dir = checkout.join("target/release");
+        fs::create_dir_all(&release_dir).unwrap();
+
+        assert_eq!(
+            source_checkout_dir_from_target(&release_dir),
+            Some(checkout)
         );
     }
 

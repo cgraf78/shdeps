@@ -7,7 +7,10 @@
 //! existing install" contract.
 
 use std::fmt;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::github::{self, Release};
 use crate::http::Client;
@@ -87,6 +90,8 @@ pub enum Outcome {
     DirtySkipped,
     /// A clean checkout ran `git pull --ff-only --quiet` successfully.
     Pulled,
+    /// The checkout moved forward, but rebuilding the Rust binary failed.
+    BuildFailed,
     /// The pull failed non-destructively; the existing checkout remains usable.
     PullFailed,
 }
@@ -182,6 +187,7 @@ impl Summary {
         match self.outcome {
             Outcome::Unsupported => 1,
             Outcome::DirtySkipped | Outcome::Pulled | Outcome::PullFailed => 0,
+            Outcome::BuildFailed => 1,
         }
     }
 }
@@ -324,6 +330,15 @@ pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
         ],
         None,
     )?;
+
+    if pull.success && !ensure_source_binary_current(dir, runner)? {
+        return Ok(Summary {
+            dir: dir.to_path_buf(),
+            outcome: Outcome::BuildFailed,
+            relink_extras: true,
+        });
+    }
+
     Ok(Summary {
         dir: dir.to_path_buf(),
         outcome: if pull.success {
@@ -337,6 +352,118 @@ pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
         },
         relink_extras: true,
     })
+}
+
+fn ensure_source_binary_current(dir: &Path, runner: &impl Runner) -> Result<bool> {
+    if !dir.join("Cargo.toml").is_file() {
+        return Ok(true);
+    }
+
+    let Some(head) = checkout_head(dir, runner)? else {
+        return Ok(true);
+    };
+
+    for (relative, link_target) in [
+        ("shdeps", None),
+        ("target/release/shdeps", Some("target/release/shdeps")),
+        ("target/debug/shdeps", Some("target/debug/shdeps")),
+    ] {
+        if binary_matches_head(&dir.join(relative), &head, runner)? {
+            if let Some(link_target) = link_target {
+                link_checkout_binary(dir, link_target)?;
+            }
+            return Ok(true);
+        }
+    }
+
+    if !runner.exists("cargo") {
+        return Ok(false);
+    }
+
+    // Source-checkout self-update is the developer/canary path. Release
+    // installs update from archives and do not need Rust, but a checked-out
+    // Rust tree must keep its sibling binary in lockstep with HEAD or the
+    // wrapper can keep executing the previous build after a successful pull.
+    let manifest_path = dir.join("Cargo.toml").display().to_string();
+    let target_dir = dir.join("target").display().to_string();
+    let build = runner.run(
+        "cargo",
+        &[
+            "build",
+            "--release",
+            "--locked",
+            "--manifest-path",
+            &manifest_path,
+            "--target-dir",
+            &target_dir,
+        ],
+        None,
+    )?;
+    if !build.success {
+        return Ok(false);
+    }
+
+    if !binary_matches_head(&dir.join("target/release/shdeps"), &head, runner)? {
+        return Ok(false);
+    }
+
+    link_checkout_binary(dir, "target/release/shdeps")?;
+    Ok(true)
+}
+
+fn checkout_head(dir: &Path, runner: &impl Runner) -> Result<Option<String>> {
+    let output = runner.run(
+        "git",
+        &[
+            "-C",
+            &dir.display().to_string(),
+            "rev-parse",
+            "--short=8",
+            "HEAD",
+        ],
+        None,
+    )?;
+    if !output.success {
+        return Ok(None);
+    }
+
+    let head = output.stdout.trim();
+    Ok((!head.is_empty()).then(|| head.to_owned()))
+}
+
+fn binary_matches_head(binary: &Path, head: &str, runner: &impl Runner) -> Result<bool> {
+    if !crate::process::executable_path(binary) {
+        return Ok(false);
+    }
+
+    let output = match runner.run(
+        &binary.display().to_string(),
+        &["version"],
+        Some(Duration::from_secs(2)),
+    ) {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+
+    Ok(output.success && output.stdout.contains(head))
+}
+
+fn link_checkout_binary(dir: &Path, target: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let link = dir.join("shdeps");
+        match fs::remove_file(&link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        symlink(target, link)?;
+    }
+
+    Ok(())
 }
 
 /// Runs the release-archive portion of `shdeps self-update`.
@@ -525,6 +652,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::io::{self, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -660,6 +788,131 @@ mod tests {
         let summary = source_checkout(&dir, &runner).unwrap();
 
         assert_eq!(summary.outcome, Outcome::Pulled);
+        assert!(summary.relink_extras);
+    }
+
+    #[test]
+    fn current_rust_checkout_skips_rebuild_after_pull() {
+        let dir = checkout("current-rust");
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"shdeps\"\n").unwrap();
+        executable(&dir.join("shdeps"));
+        let runner = FakeRunner::default()
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &dir.display().to_string(),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                ],
+                true,
+                "",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &dir.display().to_string(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+                true,
+                "",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &dir.display().to_string(),
+                    "rev-parse",
+                    "--short=8",
+                    "HEAD",
+                ],
+                true,
+                "deadbeef\n",
+            )
+            .with_output(
+                &dir.join("shdeps").display().to_string(),
+                ["version"],
+                true,
+                "shdeps 20990203-040506-deadbeef\n",
+            );
+
+        let summary = source_checkout(&dir, &runner).unwrap();
+
+        assert_eq!(summary.outcome, Outcome::Pulled);
+        assert_eq!(summary.exit_code(), 0);
+    }
+
+    #[test]
+    fn stale_rust_checkout_reports_build_failure_after_pull() {
+        let dir = checkout("stale-rust");
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"shdeps\"\n").unwrap();
+        executable(&dir.join("shdeps"));
+        let runner = FakeRunner::default()
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &dir.display().to_string(),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                ],
+                true,
+                "",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &dir.display().to_string(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+                true,
+                "",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &dir.display().to_string(),
+                    "rev-parse",
+                    "--short=8",
+                    "HEAD",
+                ],
+                true,
+                "deadbeef\n",
+            )
+            .with_output(
+                &dir.join("shdeps").display().to_string(),
+                ["version"],
+                true,
+                "shdeps commit cafebabe\n",
+            )
+            .with_output(
+                "cargo",
+                [
+                    "build",
+                    "--release",
+                    "--locked",
+                    "--manifest-path",
+                    &dir.join("Cargo.toml").display().to_string(),
+                    "--target-dir",
+                    &dir.join("target").display().to_string(),
+                ],
+                false,
+                "",
+            );
+
+        let summary = source_checkout(&dir, &runner).unwrap();
+
+        assert_eq!(summary.outcome, Outcome::BuildFailed);
+        assert_eq!(summary.exit_code(), 1);
         assert!(summary.relink_extras);
     }
 
@@ -1062,6 +1315,13 @@ mod tests {
         let dir = temp_dir(name);
         fs::create_dir_all(dir.join(".git")).unwrap();
         dir
+    }
+
+    fn executable(path: &Path) {
+        fs::write(path, b"#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     fn release(tag: &str, draft: bool, prerelease: bool) -> Release {
