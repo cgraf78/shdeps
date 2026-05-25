@@ -953,7 +953,15 @@ fn host_arch() -> String {
         .arg("-m")
         .output()
         .expect("uname should be available in CLI tests");
-    text(&output.stdout).trim().to_owned()
+    match text(&output.stdout).trim() {
+        // Release labels normalize common architecture aliases. Keep the test
+        // fixtures on the same canonical spelling so macOS arm64 runners do not
+        // accidentally publish `linux-arm64-musl`, which is not a shdeps asset
+        // contract.
+        "arm64" => "aarch64".to_owned(),
+        "amd64" => "x86_64".to_owned(),
+        arch => arch.to_owned(),
+    }
 }
 
 fn shdeps_exe_dir() -> PathBuf {

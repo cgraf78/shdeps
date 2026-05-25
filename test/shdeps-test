@@ -4479,8 +4479,8 @@ _release_tag=$(
 _assert_eq "release tag: tag ref is preserved" "v1.2.3" "$_release_tag"
 
 _release_workflow=$(cat "$SHDEPS_DIR/.github/workflows/release.yml")
-_assert_contains "release workflow: reusable tag prefix disabled" \
-  'tag-prefix: ""' "$_release_workflow"
+_assert_contains "release workflow: uses exact reusable tag command" \
+  'tag-command: scripts/release-tag.sh' "$_release_workflow"
 
 rc=0
 (
