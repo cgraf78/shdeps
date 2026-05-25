@@ -132,7 +132,14 @@ pub fn runtime_env(env: &impl Env) -> RuntimeEnv {
     let host = env_string(env, "SHDEPS_TEST_HOST").unwrap_or_else(|| {
         env.command_output("hostname", &["-s"])
             .or_else(|| env.command_output("hostname", &[]))
-            .unwrap_or_else(|| "unknown".to_owned())
+            // Bash command substitution produced an empty host when both
+            // probes failed. That matters for legacy host-filter edge cases:
+            // callers that build a spec from the same failed probe can produce
+            // `hosts=!`, and the Bash matcher treated that as excluding the
+            // current empty host. Avoid inventing "unknown" here or child
+            // `__api host-match` calls stop matching the caller's shell view
+            // in minimal containers where `hostname -s` is unavailable.
+            .unwrap_or_default()
     });
 
     RuntimeEnv::new(platform, host.trim())
@@ -280,6 +287,16 @@ mod tests {
 
         assert_eq!(runtime.platform(), "macos");
         assert_eq!(runtime.host(), "macbook");
+    }
+
+    #[test]
+    fn runtime_identity_preserves_legacy_empty_host_when_probes_fail() {
+        let env = FakeEnv::new().with_command("uname -s", "Linux\n");
+
+        let runtime = runtime_env(&env);
+
+        assert_eq!(runtime.platform(), "linux");
+        assert_eq!(runtime.host(), "");
     }
 
     #[test]

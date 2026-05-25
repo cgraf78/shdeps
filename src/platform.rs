@@ -253,6 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn host_exclude_list_preserves_empty_host_semantics() {
+        let env = RuntimeEnv::new("linux", "");
+
+        // Legacy Bash compared against the raw empty command-substitution
+        // result when hostname probes failed. Specs generated from that same
+        // failed probe can therefore be `hosts=!`, and they must still exclude
+        // the current host after the Rust port.
+        assert!(!host_match("!", &env));
+        assert!(host_match("!host-a", &env));
+    }
+
+    #[test]
     fn host_mixed_list_checks_excludes_before_includes() {
         let env = RuntimeEnv::new("linux", "nas");
 
