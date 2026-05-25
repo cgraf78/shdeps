@@ -45,7 +45,15 @@ fn unpack_tar(reader: impl Read, dest: &Path) -> io::Result<Vec<PathBuf>> {
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let relative = safe_entry_path(entry.path()?.as_ref())?;
+        let Some(relative) = safe_entry_path(entry.path()?.as_ref())? else {
+            // Some release archives include an explicit `.` directory entry as
+            // top-level metadata. GNU/BSD tar treat that as harmless context
+            // for the following files, and the Bash implementation inherited
+            // that behavior. Preserve compatibility by ignoring only this
+            // normalized-empty path after traversal checks have run; entries
+            // with real parent/root components still fail closed below.
+            continue;
+        };
         reject_links(entry.header().entry_type())?;
         let target = dest.join(&relative);
 
@@ -93,7 +101,7 @@ pub fn unpack_zip(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(extracted)
 }
 
-fn safe_entry_path(path: &Path) -> io::Result<PathBuf> {
+fn safe_entry_path(path: &Path) -> io::Result<Option<PathBuf>> {
     let mut safe = PathBuf::new();
     for component in path.components() {
         match component {
@@ -109,12 +117,9 @@ fn safe_entry_path(path: &Path) -> io::Result<PathBuf> {
     }
 
     if safe.as_os_str().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "empty archive path",
-        ));
+        return Ok(None);
     }
-    Ok(safe)
+    Ok(Some(safe))
 }
 
 fn safe_zip_path(entry: &zip::read::ZipFile<'_>) -> io::Result<PathBuf> {
@@ -268,6 +273,17 @@ mod tests {
     }
 
     #[test]
+    fn unpack_tar_gz_skips_metadata_only_current_directory_entries() {
+        let dest = temp_dir("dot-entry");
+        let bytes = tar_gz(&[Entry::directory("."), Entry::file("shdeps", b"binary")]);
+
+        let extracted = unpack_tar_gz(&bytes, &dest).unwrap();
+
+        assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
+        assert_eq!(extracted, vec![PathBuf::from("shdeps")]);
+    }
+
+    #[test]
     fn unpack_tar_gz_rejects_symlinks_and_hardlinks() {
         let dest = temp_dir("links");
 
@@ -346,6 +362,9 @@ mod tests {
             target: &'a str,
             symbolic: bool,
         },
+        Directory {
+            path: &'a str,
+        },
     }
 
     impl<'a> Entry<'a> {
@@ -359,6 +378,10 @@ mod tests {
                 target,
                 symbolic,
             }
+        }
+
+        fn directory(path: &'a str) -> Self {
+            Self::Directory { path }
         }
     }
 
@@ -416,6 +439,15 @@ mod tests {
                         });
                         header.set_link_name(target).unwrap();
                         header.set_size(0);
+                        header.set_cksum();
+                        builder.append(&header, std::io::empty()).unwrap();
+                    }
+                    Entry::Directory { path } => {
+                        let mut header = Header::new_gnu();
+                        header.set_path(path).unwrap();
+                        header.set_entry_type(EntryType::Directory);
+                        header.set_size(0);
+                        header.set_mode(0o755);
                         header.set_cksum();
                         builder.append(&header, std::io::empty()).unwrap();
                     }
