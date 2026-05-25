@@ -112,19 +112,30 @@ _curl_get() {
 }
 
 _repo_slug() {
-  local repo="$SHDEPS_REPO"
-  repo="${repo#https://github.com/}"
-  repo="${repo#git@github.com:}"
-  repo="${repo%.git}"
-  printf '%s\n' "$repo"
+  _repo_url_slug "$SHDEPS_REPO"
 }
 
 _repo_url_slug() {
   local repo="$1"
-  repo="${repo#https://github.com/}"
-  repo="${repo#git@github.com:}"
+
+  # The same GitHub repository can be spelled several ways in bootstrap
+  # contexts: public HTTPS, normal SSH, or a GitHub SSH host alias such as
+  # git@github.com-shdeps:cgraf78/shdeps.git from CI deploy-key config. Compare
+  # ownership by owner/repo slug so install policy does not drift based on the
+  # transport required to authenticate, but keep the normalization GitHub-scoped
+  # so an unrelated host with the same path is not silently treated as ours.
+  case "$repo" in
+    https://github.com/*) repo="${repo#https://github.com/}" ;;
+    ssh://git@github.com/*) repo="${repo#ssh://git@github.com/}" ;;
+    git@github.com:*) repo="${repo#git@github.com:}" ;;
+    git@github.com-*:*) repo="${repo#*:}" ;;
+  esac
   repo="${repo%.git}"
   printf '%s\n' "$repo"
+}
+
+_uses_default_repo_slug() {
+  [[ "$(_repo_slug)" == "$(_repo_url_slug "$_SHDEPS_DEFAULT_REPO")" ]]
 }
 
 _github_ssh_fallback_url() {
@@ -303,13 +314,32 @@ _release_can_replace_source_checkout() {
   fi
 
   # Release migration is meant for fleet-owned source installs left behind by
-  # the Bash-to-Rust transition. A dirty tree may be a real developer checkout
-  # hiding in SHDEPS_DIR, so preserve it and let the existing source path build
-  # or self-update instead of deleting local work.
-  if [[ -n "$(git -C "$dir" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+  # the Bash-to-Rust transition. Preserve real edits, but ignore the small set
+  # of artifacts install.sh itself may have created while activating a managed
+  # checkout: release/source metadata, the root CLI link, and Cargo build
+  # output. Treating those as user dirt traps old fleet installs on the source
+  # path and makes fresh machines need Rust for no good reason.
+  if _source_checkout_has_user_changes "$dir"; then
     _error "$dir is a dirty git checkout; refusing release migration"
     return 1
   fi
+}
+
+_source_checkout_has_user_changes() {
+  local dir="$1" line status path
+
+  while IFS= read -r line; do
+    status="${line:0:2}"
+    path="${line:3}"
+    case "$status:$path" in
+      "??:.shdeps-install.json" | "??:shdeps" | "??:target" | "??:target/"*)
+        continue
+        ;;
+    esac
+    return 0
+  done < <(git -C "$dir" status --porcelain --untracked-files=normal 2>/dev/null)
+
+  return 1
 }
 
 _cleanup_release_install_for_source_checkout() {
@@ -612,7 +642,7 @@ _install() {
     return
   fi
 
-  if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" ]] && ! _is_source_checkout_dir "$script_dir"; then
+  if _uses_default_repo_slug && ! _is_source_checkout_dir "$script_dir"; then
     if ! _install_release; then
       _install_source_build_fallback || exit 1
     fi
@@ -694,7 +724,7 @@ _bootstrap() {
   # discovery result. Route that shape through the installed-tree path so it can
   # be migrated from source checkout to release assets.
   if _bootstrap_lib_is_installed_tree; then
-    if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" && -d "$SHDEPS_DIR/.git" ]]; then
+    if _uses_default_repo_slug && [[ -d "$SHDEPS_DIR/.git" ]]; then
       _install_release >/dev/null 2>&1 || true
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
@@ -706,7 +736,7 @@ _bootstrap() {
     _bs_lib="$_dev_dir/shdeps/shdeps.sh"
     _bs_dir="$_dev_dir/shdeps"
   elif [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
-    if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" && -d "$SHDEPS_DIR/.git" ]]; then
+    if _uses_default_repo_slug && [[ -d "$SHDEPS_DIR/.git" ]]; then
       # Older fleet machines may already have a source checkout installed in the
       # default SHDEPS_DIR. That checkout was bootstrap state, not an intentional
       # dev workspace, so prefer the release archive now that one exists. Keep

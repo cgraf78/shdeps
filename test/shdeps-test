@@ -4913,9 +4913,14 @@ SH
   printf '%s\n' "old source checkout" >"$_release_migrate_inst/shdeps.sh"
   git -C "$_release_migrate_inst" add shdeps.sh
   git -C "$_release_migrate_inst" commit -m "source install" >/dev/null 2>&1
+  printf '%s\n' '{"schema":1,"method":"source-build"}' >"$_release_migrate_inst/.shdeps-install.json"
+  mkdir -p "$_release_migrate_inst/target/release"
+  printf '%s\n' "old build output" >"$_release_migrate_inst/target/release/shdeps"
+  ln -sf "target/release/shdeps" "$_release_migrate_inst/shdeps"
   PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-migrate.log" \
     SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+    SHDEPS_REPO="git@github.com-shdeps:cgraf78/shdeps.git" \
     SHDEPS_DIR="$_release_migrate_inst" SHDEPS_BIN="$_release_migrate_bin/shdeps" \
     "$_release_installer/install.sh" >/dev/null 2>&1
   _assert_file_missing "install release migration: source checkout replaced" "$_release_migrate_inst/.git/config"
@@ -4931,7 +4936,7 @@ SH
   git -C "$_release_other_inst" init >/dev/null 2>&1
   git -C "$_release_other_inst" config user.email "test@test.com"
   git -C "$_release_other_inst" config user.name "Test"
-  git -C "$_release_other_inst" remote add origin "https://github.com/example/shdeps.git"
+  git -C "$_release_other_inst" remote add origin "git@example.test:cgraf78/shdeps.git"
   printf '%s\n' "old source checkout" >"$_release_other_inst/shdeps.sh"
   git -C "$_release_other_inst" add shdeps.sh
   git -C "$_release_other_inst" commit -m "source install" >/dev/null 2>&1
@@ -5253,6 +5258,10 @@ if [[ -n "${_release_platform:-}" ]]; then
   printf '%s\n' '[package]' 'name = "shdeps"' >"$_bs_release_inst/Cargo.toml"
   git -C "$_bs_release_inst" add shdeps.sh Cargo.toml
   git -C "$_bs_release_inst" commit -m "source install" >/dev/null 2>&1
+  printf '%s\n' '{"schema":1,"method":"source-build"}' >"$_bs_release_inst/.shdeps-install.json"
+  mkdir -p "$_bs_release_inst/target/release"
+  printf '%s\n' "old build output" >"$_bs_release_inst/target/release/shdeps"
+  ln -sf "target/release/shdeps" "$_bs_release_inst/shdeps"
   cp "$_release_fakebin/curl" "$_bs_release_fakebin/curl"
   _write_failing_cargo "$_bs_release_fakebin/cargo"
   _bs_saved_path="$PATH"
@@ -5260,6 +5269,7 @@ if [[ -n "${_release_platform:-}" ]]; then
     SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-bs-release.log" \
     SHDEPS_TEST_CARGO_LOG="$_bs_release_cargo_log" \
     SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+    SHDEPS_REPO="git@github.com-shdeps:cgraf78/shdeps.git" \
     SHDEPS_DIR="$_bs_release_inst" SHDEPS_BIN="$_bs_release_bin/shdeps" \
     SHDEPS_GIT_DEV_DIR="/nonexistent" \
     . "$_bs_dir/install.sh" --bootstrap
