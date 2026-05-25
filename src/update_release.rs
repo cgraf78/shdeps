@@ -36,16 +36,16 @@ pub(crate) fn install_with_prefetch(
         repo: &entry.name,
         public_bin: &bin_path,
     };
-    let outcome = install_request(
-        &request,
-        context.roots,
-        context.env,
-        context.env_vars,
-        context.runner,
-        context.client,
+    let request_context = RequestContext {
+        roots: context.roots,
+        runtime_env: context.env,
+        env_vars: context.env_vars,
+        runner: context.runner,
+        client: context.client,
         options,
         prefetch,
-    )?;
+    };
+    let outcome = install_request(&request, &request_context)?;
     if !outcome.failed {
         write_manifest(entry, context)?;
     }
@@ -189,8 +189,7 @@ pub(crate) fn jobs_max(env_vars: &BTreeMap<String, String>) -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
-        .min(8)
-        .max(1)
+        .clamp(1, 8)
 }
 
 pub(crate) struct ReleaseRequest<'a> {
@@ -198,6 +197,16 @@ pub(crate) struct ReleaseRequest<'a> {
     pub(crate) cmd: &'a str,
     pub(crate) repo: &'a str,
     pub(crate) public_bin: &'a Path,
+}
+
+pub(crate) struct RequestContext<'a, R: Runner> {
+    pub(crate) roots: &'a Roots,
+    pub(crate) runtime_env: &'a RuntimeEnv,
+    pub(crate) env_vars: &'a BTreeMap<String, String>,
+    pub(crate) runner: &'a R,
+    pub(crate) client: &'a dyn Client,
+    pub(crate) options: Options,
+    pub(crate) prefetch: &'a Prefetch,
 }
 
 pub(crate) struct ReleaseOutcome {
@@ -208,26 +217,20 @@ pub(crate) struct ReleaseOutcome {
 
 pub(crate) fn install_request(
     request: &ReleaseRequest<'_>,
-    roots: &Roots,
-    runtime_env: &RuntimeEnv,
-    env_vars: &std::collections::BTreeMap<String, String>,
-    runner: &impl Runner,
-    client: &dyn Client,
-    options: Options,
-    prefetch: &Prefetch,
+    context: &RequestContext<'_, impl Runner>,
 ) -> Result<ReleaseOutcome> {
-    let stamp_path = stamp::remote_path(&roots.state_dir, request.name, "release");
+    let stamp_path = stamp::remote_path(&context.roots.state_dir, request.name, "release");
     if process::executable_path(request.public_bin)
-        && stamp::remote_fresh(&stamp_path, options.freshness())
+        && stamp::remote_fresh(&stamp_path, context.options.freshness())
     {
         // Bash relinks extras even on the TTL fast path. That idempotent repair
         // matters when a user prunes a completion/manpage symlink by hand while
         // keeping the binary; a fresh stamp should skip the network, not leave
         // related shell integration broken until the next forced reinstall.
-        let install_dir = roots.install_dir.join(request.name);
+        let install_dir = context.roots.install_dir.join(request.name);
         crate::extras::link(
-            &roots.state_dir,
-            &roots.install_dir,
+            &context.roots.state_dir,
+            &context.roots.install_dir,
             request.name,
             &install_dir,
         )?;
@@ -239,23 +242,23 @@ pub(crate) fn install_request(
     }
 
     let current_version = process::executable_path(request.public_bin)
-        .then(|| process::dep_version(runner, request.cmd))
+        .then(|| process::dep_version(context.runner, request.cmd))
         .flatten();
 
     let env = EnvVars {
-        vars: env_vars,
-        runtime: runtime_env,
+        vars: context.env_vars,
+        runtime: context.runtime_env,
     };
     let fetched_releases;
-    let releases = if let Some(releases) = prefetch.releases(request.repo) {
+    let releases = if let Some(releases) = context.prefetch.releases(request.repo) {
         releases
     } else {
         fetched_releases = match fetch_releases_with_prefetch_token(
             request.repo,
             &env,
-            runner,
-            client,
-            prefetch,
+            context.runner,
+            context.client,
+            context.prefetch,
         ) {
             Ok(releases) => releases,
             Err(_) => {
@@ -264,8 +267,8 @@ pub(crate) fn install_request(
         };
         &fetched_releases
     };
-    if let Some(latest) = github_release::latest_stable(&releases) {
-        if !options.reinstall
+    if let Some(latest) = github_release::latest_stable(releases) {
+        if !context.options.reinstall
             && current_version
                 .as_deref()
                 .is_some_and(|current| installed_matches_tag(current, &latest.tag))
@@ -277,8 +280,8 @@ pub(crate) fn install_request(
             // changed. Bash compared the probed command version to the latest
             // release tag before asset selection, so keep that no-op path even
             // if the release has no asset we would install from scratch today.
-            stamp::remote_touch(&stamp_path, options.now)?;
-            link_existing_extras(roots, request.name)?;
+            stamp::remote_touch(&stamp_path, context.options.now)?;
+            link_existing_extras(context.roots, request.name)?;
             return Ok(ReleaseOutcome {
                 changed: false,
                 failed: false,
@@ -286,12 +289,13 @@ pub(crate) fn install_request(
             });
         }
     }
-    let Some(selection) = github_release::select(request.cmd, &releases, runtime_env, runner)
+    let Some(selection) =
+        github_release::select(request.cmd, releases, context.runtime_env, context.runner)
     else {
         return Ok(failed("no matching release asset"));
     };
-    let token = prefetch.token(&env, runner);
-    let bytes = match client.get(&selection.url, token.as_deref()) {
+    let token = context.prefetch.token(&env, context.runner);
+    let bytes = match context.client.get(&selection.url, token.as_deref()) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(failed("release asset download failed")),
     };
@@ -310,8 +314,8 @@ pub(crate) fn install_request(
         }
         AssetKind::TarGz => {
             github_release_install::install_tar_gz_to(
-                &roots.state_dir,
-                &roots.install_dir,
+                &context.roots.state_dir,
+                &context.roots.install_dir,
                 request.public_bin,
                 request.name,
                 request.cmd,
@@ -320,8 +324,8 @@ pub(crate) fn install_request(
         }
         AssetKind::TarBz2 => {
             github_release_install::install_tar_bz2_to(
-                &roots.state_dir,
-                &roots.install_dir,
+                &context.roots.state_dir,
+                &context.roots.install_dir,
                 request.public_bin,
                 request.name,
                 request.cmd,
@@ -330,8 +334,8 @@ pub(crate) fn install_request(
         }
         AssetKind::TarZst => {
             github_release_install::install_tar_zst_to(
-                &roots.state_dir,
-                &roots.install_dir,
+                &context.roots.state_dir,
+                &context.roots.install_dir,
                 request.public_bin,
                 request.name,
                 request.cmd,
@@ -340,8 +344,8 @@ pub(crate) fn install_request(
         }
         AssetKind::TarXz => {
             github_release_install::install_tar_xz_to(
-                &roots.state_dir,
-                &roots.install_dir,
+                &context.roots.state_dir,
+                &context.roots.install_dir,
                 request.public_bin,
                 request.name,
                 request.cmd,
@@ -350,8 +354,8 @@ pub(crate) fn install_request(
         }
         AssetKind::Zip => {
             github_release_install::install_zip_to(
-                &roots.state_dir,
-                &roots.install_dir,
+                &context.roots.state_dir,
+                &context.roots.install_dir,
                 request.public_bin,
                 request.name,
                 request.cmd,
@@ -362,7 +366,7 @@ pub(crate) fn install_request(
             return Ok(failed("release asset type is not implemented yet"));
         }
     }
-    stamp::remote_touch(&stamp_path, options.now)?;
+    stamp::remote_touch(&stamp_path, context.options.now)?;
 
     Ok(ReleaseOutcome {
         changed: true,

@@ -263,16 +263,16 @@ where
     // empty prefetch object so token/freshness behavior stays identical to the
     // top-level update flow.
     let prefetch = update_release::Prefetch::default();
-    let outcome = update_release::install_request(
-        &request,
-        &roots,
-        &runtime_env,
-        &env_vars,
-        &Process,
-        &Curl,
+    let request_context = update_release::RequestContext {
+        roots: &roots,
+        runtime_env: &runtime_env,
+        env_vars: &env_vars,
+        runner: &Process,
+        client: &Curl,
         options,
-        &prefetch,
-    )?;
+        prefetch: &prefetch,
+    };
+    let outcome = update_release::install_request(&request, &request_context)?;
 
     if outcome.failed {
         writeln!(

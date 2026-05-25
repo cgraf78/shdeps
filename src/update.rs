@@ -2457,13 +2457,16 @@ version() { printf 'saw-pkg\n'; }
         }
     }
 
+    type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+    type AtomicCounter = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
     #[derive(Debug, Clone, Default)]
     struct FakeClient {
         responses: std::collections::BTreeMap<String, Vec<u8>>,
-        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+        requests: RequestLog,
         delay: Option<Duration>,
-        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        max_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        active: AtomicCounter,
+        max_active: AtomicCounter,
     }
 
     impl FakeClient {
