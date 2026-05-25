@@ -139,6 +139,16 @@ SH
   chmod +x "$path"
 }
 
+_assert_no_install_backups() {
+  local name="$1" install_dir="$2"
+
+  if compgen -G "${install_dir}.shdeps-backup.*" >/dev/null; then
+    _fail "$name"
+  else
+    _pass "$name"
+  fi
+}
+
 # ===========================================================================
 # Section 0: Static analysis (runs before _mock_home so shim-managed
 #            tools like shellcheck can find their real install dirs)
@@ -4728,6 +4738,23 @@ _assert_symlink "install bundle: CLI symlinked" "$_bundle_bin/shdeps"
 _bundle_link=$(readlink "$_bundle_bin/shdeps")
 _assert_eq "install bundle: CLI points at release binary" "$_bundle_inst/shdeps" "$_bundle_link"
 
+# --- Direct source install replaces release-owned assets ---
+
+_source_replace_inst=$(_tmpdir)/shdeps-source-replaces-release
+_source_replace_bin=$(_tmpdir)/source-replace-bin
+mkdir -p "$_source_replace_inst" "$_source_replace_bin"
+cp -R "$_bundle_dir/." "$_source_replace_inst/"
+PATH="$_install_build_bin:/usr/bin:/bin" \
+  SHDEPS_TEST_FAKE_RELEASE_SHDEPS="$_install_fake_shdeps" \
+  SHDEPS_DIR="$_source_replace_inst" SHDEPS_BIN="$_source_replace_bin/shdeps" \
+  SHDEPS_REPO="$_install_repo" "$_install_script" >/dev/null 2>&1
+_assert_file_exists "install source replace release: source checkout installed" \
+  "$_source_replace_inst/.git/config"
+_assert_file_missing "install source replace release: release metadata cleaned" \
+  "$_source_replace_inst/.shdeps-install.json"
+_assert_eq "install source replace release: CLI runs source binary" \
+  "shdeps 20990203-040506-abc12345" "$("$_source_replace_bin/shdeps" version)"
+
 # --- Bundled release archive replaces an existing release-owned install ---
 
 _bundle_update_dir=$(_tmpdir)/shdeps-bundle-update
@@ -4895,6 +4922,8 @@ SH
   _assert_file_exists "install release migration: metadata installed" "$_release_migrate_inst/.shdeps-install.json"
   _assert_eq "install release migration: CLI runs release binary" \
     "shdeps $_release_tag" "$("$_release_migrate_bin/shdeps" version)"
+  _assert_no_install_backups "install release migration: managed clone backup cleaned" \
+    "$_release_migrate_inst"
 
   _release_other_inst=$(_tmpdir)/shdeps-release-other-origin
   _release_other_bin=$(_tmpdir)/release-other-origin-bin
@@ -5240,10 +5269,54 @@ if [[ -n "${_release_platform:-}" ]]; then
   _assert_file_missing "bootstrap release migration: source checkout replaced" "$_bs_release_inst/.git/config"
   _assert_eq "bootstrap release migration: CLI runs release binary" \
     "shdeps $_release_tag" "$("$_bs_release_bin/shdeps" version)"
+  _assert_no_install_backups "bootstrap release migration: managed clone backup cleaned" \
+    "$_bs_release_inst"
   if [[ -s "$_bs_release_cargo_log" ]]; then
     _fail "bootstrap release migration: cargo not used"
   else
     _pass "bootstrap release migration: cargo not used"
+  fi
+
+  # --- Bootstrap migrates even when callers cached SHDEPS_LIB for SHDEPS_DIR ---
+
+  unset -f shdeps_update 2>/dev/null
+  _bs_release_lib_inst=$(_tmpdir)/bs-release-lib-source-install
+  _bs_release_lib_bin=$(_tmpdir)/bs-release-lib-bin
+  _bs_release_lib_fakebin=$(_mock_bin)
+  _bs_release_lib_cargo_log=$(_tmpdir)/bs-release-lib-cargo.log
+  mkdir -p "$_bs_release_lib_inst" "$_bs_release_lib_bin"
+  git -C "$_bs_release_lib_inst" init >/dev/null 2>&1
+  git -C "$_bs_release_lib_inst" config user.email "test@test.com"
+  git -C "$_bs_release_lib_inst" config user.name "Test"
+  git -C "$_bs_release_lib_inst" remote add origin "https://github.com/cgraf78/shdeps.git"
+  printf '%s\n' "old source checkout" >"$_bs_release_lib_inst/shdeps.sh"
+  printf '%s\n' '[package]' 'name = "shdeps"' >"$_bs_release_lib_inst/Cargo.toml"
+  git -C "$_bs_release_lib_inst" add shdeps.sh Cargo.toml
+  git -C "$_bs_release_lib_inst" commit -m "source install" >/dev/null 2>&1
+  cp "$_release_fakebin/curl" "$_bs_release_lib_fakebin/curl"
+  _write_failing_cargo "$_bs_release_lib_fakebin/cargo"
+  _bs_saved_path="$PATH"
+  PATH="$_bs_release_lib_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-bs-release-lib.log" \
+    SHDEPS_TEST_CARGO_LOG="$_bs_release_lib_cargo_log" \
+    SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+    SHDEPS_LIB="$_bs_release_lib_inst/shdeps.sh" \
+    SHDEPS_DIR="$_bs_release_lib_inst" SHDEPS_BIN="$_bs_release_lib_bin/shdeps" \
+    SHDEPS_GIT_DEV_DIR="/nonexistent" \
+    . "$_bs_dir/install.sh" --bootstrap
+  _bs_release_lib_rc=$?
+  PATH="$_bs_saved_path"
+  _assert_exit "bootstrap release migration with SHDEPS_LIB: succeeds" 0 "$_bs_release_lib_rc"
+  _assert_file_missing "bootstrap release migration with SHDEPS_LIB: source checkout replaced" \
+    "$_bs_release_lib_inst/.git/config"
+  _assert_eq "bootstrap release migration with SHDEPS_LIB: CLI runs release binary" \
+    "shdeps $_release_tag" "$("$_bs_release_lib_bin/shdeps" version)"
+  _assert_no_install_backups "bootstrap release migration with SHDEPS_LIB: managed clone backup cleaned" \
+    "$_bs_release_lib_inst"
+  if [[ -s "$_bs_release_lib_cargo_log" ]]; then
+    _fail "bootstrap release migration with SHDEPS_LIB: cargo not used"
+  else
+    _pass "bootstrap release migration with SHDEPS_LIB: cargo not used"
   fi
 
   # --- Bootstrap follows a dev clone when it appears and release when it goes ---
@@ -5252,8 +5325,10 @@ if [[ -n "${_release_platform:-}" ]]; then
   _bs_toggle_inst=$(_tmpdir)/bs-toggle-release-install
   _bs_toggle_bin=$(_tmpdir)/bs-toggle-bin
   _bs_toggle_dev=$(_tmpdir)/bs-toggle-dev
+  _bs_toggle_fakebin=$(_mock_bin)
   mkdir -p "$_bs_toggle_inst" "$_bs_toggle_bin" "$_bs_toggle_dev/shdeps"
   cp -R "$_release_payload/." "$_bs_toggle_inst/"
+  cp "$_release_fakebin/curl" "$_bs_toggle_fakebin/curl"
   cp "$SHDEPS_DIR/shdeps.sh" "$_bs_toggle_dev/shdeps/shdeps.sh"
   cp "$SHDEPS_DIR/install.sh" "$_bs_toggle_dev/shdeps/install.sh"
   _write_fake_release_shdeps "$_bs_toggle_dev/shdeps/shdeps" "20990207-080910-devclone"
@@ -5263,19 +5338,29 @@ if [[ -n "${_release_platform:-}" ]]; then
   git -C "$_bs_toggle_dev/shdeps" remote add origin "https://github.com/cgraf78/shdeps.git"
   git -C "$_bs_toggle_dev/shdeps" add shdeps.sh install.sh shdeps
   git -C "$_bs_toggle_dev/shdeps" commit -m "dev clone" >/dev/null 2>&1
-  SHDEPS_GIT_DEV_DIR="$_bs_toggle_dev" SHDEPS_DIR="$_bs_toggle_inst" \
+  SHDEPS_LIB="$_bs_toggle_dev/shdeps/shdeps.sh" \
+    SHDEPS_GIT_DEV_DIR="/nonexistent" SHDEPS_DIR="$_bs_toggle_inst" \
     SHDEPS_BIN="$_bs_toggle_bin/shdeps" \
     . "$_bs_dir/install.sh" --bootstrap
   _assert_eq "bootstrap dev/release toggle: dev clone wins when present" \
     "shdeps 20990207-080910-devclone" "$("$_bs_toggle_bin/shdeps" version)"
+  _assert_file_missing "bootstrap dev/release toggle: release assets cleaned when dev wins" \
+    "$_bs_toggle_inst/.shdeps-install.json"
 
   unset -f shdeps_update 2>/dev/null
   rm -rf "$_bs_toggle_dev/shdeps"
-  SHDEPS_GIT_DEV_DIR="$_bs_toggle_dev" SHDEPS_DIR="$_bs_toggle_inst" \
+  _bs_saved_path="$PATH"
+  PATH="$_bs_toggle_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-bs-toggle.log" \
+    SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+    SHDEPS_GIT_DEV_DIR="$_bs_toggle_dev" SHDEPS_DIR="$_bs_toggle_inst" \
     SHDEPS_BIN="$_bs_toggle_bin/shdeps" \
     . "$_bs_dir/install.sh" --bootstrap
+  PATH="$_bs_saved_path"
   _assert_eq "bootstrap dev/release toggle: release wins after dev clone removed" \
     "shdeps $_release_tag" "$("$_bs_toggle_bin/shdeps" version)"
+  _assert_file_exists "bootstrap dev/release toggle: release assets restored after dev removed" \
+    "$_bs_toggle_inst/.shdeps-install.json"
 else
   _pass "bootstrap release migration: unsupported host platform skipped"
 fi

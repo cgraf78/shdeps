@@ -10,7 +10,7 @@
 #   SHDEPS_DIR          Install directory      (default: ~/.local/share/shdeps)
 #   SHDEPS_REPO         Git repo URL           (default: https://github.com/cgraf78/shdeps.git)
 #   SHDEPS_BIN          CLI symlink path       (default: ~/.local/bin/shdeps)
-#   SHDEPS_LIB          Direct path to shdeps.sh (skips discovery in --bootstrap)
+#   SHDEPS_LIB          Direct path to shdeps.sh for explicit/dev bootstrap use
 #   SHDEPS_GIT_DEV_DIR  Dev clone directory    (default: ~/git)
 
 # Strict mode when executed directly; skip when sourced (--bootstrap)
@@ -63,9 +63,33 @@ _is_bundle_dir() {
   [[ -x "$dir/shdeps" && -f "$dir/.shdeps-install.json" ]]
 }
 
+_is_release_install_dir() {
+  local dir="$1"
+
+  [[ -d "$dir" && ! -d "$dir/.git" ]] || return 1
+  grep -q '"method"[[:space:]]*:[[:space:]]*"release"' "$dir/.shdeps-install.json" 2>/dev/null
+}
+
 _is_source_checkout_dir() {
   local dir="$1"
   [[ -d "$dir/.git" ]]
+}
+
+_bootstrap_lib_is_installed_tree() {
+  local lib_dir install_dir
+
+  [[ -n "${SHDEPS_LIB:-}" && -f "$SHDEPS_LIB" ]] || return 1
+  [[ "${SHDEPS_LIB##*/}" == "shdeps.sh" ]] || return 1
+
+  # Some callers historically exported SHDEPS_LIB after finding the default
+  # installed tree. That is not a true override: it points at the same tree
+  # bootstrap would have inspected anyway. Normalize both directories so those
+  # callers still get release migration instead of pinning the old source
+  # checkout layout forever.
+  lib_dir="${SHDEPS_LIB%/*}"
+  lib_dir=$(cd -P -- "$lib_dir" 2>/dev/null && pwd) || return 1
+  install_dir=$(cd -P -- "$SHDEPS_DIR" 2>/dev/null && pwd) || return 1
+  [[ "$lib_dir" == "$install_dir" ]]
 }
 
 _github_token() {
@@ -202,7 +226,7 @@ _install_bundle() {
         return 1
       fi
       backup="${SHDEPS_DIR}.shdeps-backup.$$"
-    elif ! grep -q '"method"[[:space:]]*:[[:space:]]*"release"' "$SHDEPS_DIR/.shdeps-install.json" 2>/dev/null; then
+    elif ! _is_release_install_dir "$SHDEPS_DIR"; then
       _error "$SHDEPS_DIR exists but is not a shdeps release install"
       return 1
     else
@@ -284,6 +308,26 @@ _release_can_replace_source_checkout() {
   # or self-update instead of deleting local work.
   if [[ -n "$(git -C "$dir" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
     _error "$dir is a dirty git checkout; refusing release migration"
+    return 1
+  fi
+}
+
+_cleanup_release_install_for_source_checkout() {
+  local source_dir="$1" source_real install_real
+
+  [[ -d "$source_dir/.git" ]] || return 0
+  _is_release_install_dir "$SHDEPS_DIR" || return 0
+
+  source_real=$(cd -P -- "$source_dir" 2>/dev/null && pwd) || return 0
+  install_real=$(cd -P -- "$SHDEPS_DIR" 2>/dev/null && pwd) || return 0
+  [[ "$source_real" != "$install_real" ]] || return 0
+
+  # Once a developer checkout is the active implementation, a release payload
+  # under SHDEPS_DIR is stale managed state. Remove only installs carrying
+  # release metadata; arbitrary directories and source checkouts are handled by
+  # stricter migration paths above.
+  if ! rm -rf "$SHDEPS_DIR"; then
+    _error "failed to remove stale shdeps release install at $SHDEPS_DIR"
     return 1
   fi
 }
@@ -588,6 +632,17 @@ _install() {
       _error "shdeps: update failed (git pull --ff-only failed)"
       exit 1
     fi
+  elif _is_release_install_dir "$SHDEPS_DIR"; then
+    # Direct source installs are explicit developer/source mode. If a managed
+    # release payload is present, clean it before cloning the source install so
+    # the selected implementation has a single owner on disk.
+    if ! rm -rf "$SHDEPS_DIR"; then
+      _error "failed to remove stale shdeps release install at $SHDEPS_DIR"
+      exit 1
+    fi
+    _info "shdeps: cloning to $SHDEPS_DIR..."
+    git clone --depth 1 "$SHDEPS_REPO" "$SHDEPS_DIR" || exit 1
+    _info "shdeps: installed"
   elif [[ -d "$SHDEPS_DIR" ]]; then
     _error "$SHDEPS_DIR exists but is not a git repo"
     exit 1
@@ -633,8 +688,18 @@ _bootstrap() {
   local _bs_lib="" _bs_dir=""
   local _dev_dir="${SHDEPS_GIT_DEV_DIR:-$HOME/git}"
 
-  # Find shdeps.sh: env override → dev clone → installed clone → fresh install
-  if [[ -n "${SHDEPS_LIB:-}" && -f "$SHDEPS_LIB" ]]; then
+  # Find shdeps.sh: installed-tree env hint → env override → dev clone →
+  # installed tree → fresh install. SHDEPS_LIB usually means "do exactly this",
+  # but when it points back at SHDEPS_DIR it is just an older caller's cached
+  # discovery result. Route that shape through the installed-tree path so it can
+  # be migrated from source checkout to release assets.
+  if _bootstrap_lib_is_installed_tree; then
+    if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" && -d "$SHDEPS_DIR/.git" ]]; then
+      _install_release >/dev/null 2>&1 || true
+    fi
+    _bs_lib="$SHDEPS_DIR/shdeps.sh"
+    _bs_dir="$SHDEPS_DIR"
+  elif [[ -n "${SHDEPS_LIB:-}" && -f "$SHDEPS_LIB" ]]; then
     _bs_lib="$SHDEPS_LIB"
     _bs_dir="${SHDEPS_LIB%/*}"
   elif [[ -f "$_dev_dir/shdeps/shdeps.sh" ]]; then
@@ -690,6 +755,7 @@ _bootstrap() {
   # Set up symlinks (CLI, man, completions) after self-update so newly
   # pulled files (e.g. man pages, completions) are linked immediately.
   [[ -n "$_bs_dir" ]] && _setup_links "$_bs_dir"
+  [[ -n "$_bs_dir" ]] && _cleanup_release_install_for_source_checkout "$_bs_dir"
 }
 
 # ---------------------------------------------------------------------------
