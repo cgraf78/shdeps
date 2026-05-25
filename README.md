@@ -440,6 +440,22 @@ The standalone CLI is a Rust binary. The sourceable Bash API and hook prelude
 require Bash 4.3+; `install.sh` itself is kept compatible with the stock macOS
 Bash 3.2 installer path.
 
+## Releasing
+
+After `main` is clean, current, and green in CI, cut a release with:
+
+```bash
+scripts/release.sh --push
+```
+
+The script creates the timestamp/hash release tag and pushes it. GitHub Actions
+then builds and smokes the release artifacts. Archive names use:
+
+```text
+shdeps-YYYYMMDD-HHMMSS-<8hex>-<asset-platform>.tar.gz
+shdeps-YYYYMMDD-HHMMSS-<8hex>-<asset-platform>.tar.gz.sha256
+```
+
 ## License
 
 [MIT](LICENSE)

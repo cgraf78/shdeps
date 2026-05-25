@@ -4514,6 +4514,95 @@ _release_tag=$(
 )
 _assert_eq "release tag: explicit build version wins" "20990204-050607-abcdef12" "$_release_tag"
 
+_release_script_origin=$(_tmpdir)/release-origin.git
+_release_script_repo=$(_tmpdir)/release-repo
+git init --bare "$_release_script_origin" >/dev/null 2>&1
+git init -b main "$_release_script_repo" >/dev/null 2>&1
+mkdir -p "$_release_script_repo/scripts"
+cp "$SHDEPS_DIR/scripts/release.sh" "$_release_script_repo/scripts/release.sh"
+cp "$SHDEPS_DIR/scripts/release-tag.sh" "$_release_script_repo/scripts/release-tag.sh"
+cp "$SHDEPS_DIR/scripts/release-version.sh" "$_release_script_repo/scripts/release-version.sh"
+chmod +x "$_release_script_repo/scripts/"*.sh
+git -C "$_release_script_repo" add scripts >/dev/null 2>&1
+git -C "$_release_script_repo" commit -m init >/dev/null 2>&1
+git -C "$_release_script_repo" remote add origin "$_release_script_origin"
+git -C "$_release_script_repo" push origin main >/dev/null 2>&1
+_release_script_commit=$(git -C "$_release_script_repo" rev-parse HEAD)
+_release_script_tag="20990205-060708-${_release_script_commit:0:8}"
+
+_release_script_output=$(
+  cd "$_release_script_repo" || exit 1
+  env SHDEPS_BUILD_COMMIT="$_release_script_commit" SHDEPS_BUILD_TIMESTAMP=20990205-060708 \
+    scripts/release.sh --push --dry-run
+)
+_assert_contains "release script dry-run: prints generated tag" \
+  "release: tag $_release_script_tag" "$_release_script_output"
+_assert_contains "release script dry-run: prints push plan" \
+  "would push main and refs/tags/$_release_script_tag to origin" "$_release_script_output"
+if git -C "$_release_script_repo" rev-parse -q --verify "refs/tags/$_release_script_tag" >/dev/null; then
+  _fail "release script dry-run: does not create local tag"
+else
+  _pass "release script dry-run: does not create local tag"
+fi
+
+_release_script_output=$(
+  cd "$_release_script_repo" || exit 1
+  env SHDEPS_BUILD_COMMIT="$_release_script_commit" SHDEPS_BUILD_TIMESTAMP=20990205-060708 \
+    scripts/release.sh --push
+)
+_assert_contains "release script push: creates tag" \
+  "release: created tag $_release_script_tag" "$_release_script_output"
+_assert_contains "release script push: pushes tag" \
+  "release: pushed tag $_release_script_tag" "$_release_script_output"
+if git ls-remote --exit-code --tags "$_release_script_origin" "refs/tags/$_release_script_tag" >/dev/null 2>&1; then
+  _pass "release script push: remote tag exists"
+else
+  _fail "release script push: remote tag exists"
+fi
+
+rc=0
+_release_script_error=$(
+  cd "$_release_script_repo" || exit 1
+  env SHDEPS_BUILD_COMMIT="$_release_script_commit" SHDEPS_BUILD_TIMESTAMP=20990205-060708 \
+    scripts/release.sh --push 2>&1
+) || rc=$?
+_assert_exit "release script duplicate: exits 1" 1 "$rc"
+_assert_contains "release script duplicate: rejects existing local tag" \
+  "local tag $_release_script_tag already exists" "$_release_script_error"
+
+git -C "$_release_script_repo" checkout -b feature >/dev/null 2>&1
+rc=0
+_release_script_error=$(
+  cd "$_release_script_repo" || exit 1
+  env SHDEPS_BUILD_COMMIT="$_release_script_commit" SHDEPS_BUILD_TIMESTAMP=20990206-070809 \
+    scripts/release.sh --dry-run 2>&1
+) || rc=$?
+_assert_exit "release script branch guard: exits 1" 1 "$rc"
+_assert_contains "release script branch guard: requires main" \
+  "release: run from main" "$_release_script_error"
+
+git -C "$_release_script_repo" checkout main >/dev/null 2>&1
+_release_script_gh_bin=$(_mock_bin)
+cat >"$_release_script_gh_bin/gh" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "release" && "${2:-}" == "view" ]]; then
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$_release_script_gh_bin/gh"
+_release_script_tag_2="20990206-070809-${_release_script_commit:0:8}"
+rc=0
+_release_script_error=$(
+  cd "$_release_script_repo" || exit 1
+  PATH="$_release_script_gh_bin:$PATH" \
+    SHDEPS_BUILD_COMMIT="$_release_script_commit" SHDEPS_BUILD_TIMESTAMP=20990206-070809 \
+    scripts/release.sh --dry-run 2>&1
+) || rc=$?
+_assert_exit "release script GitHub release guard: exits 1" 1 "$rc"
+_assert_contains "release script GitHub release guard: rejects existing release" \
+  "GitHub release $_release_script_tag_2 already exists" "$_release_script_error"
+
 # ===========================================================================
 # Section 11: install.sh
 # ===========================================================================
