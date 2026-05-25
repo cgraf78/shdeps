@@ -397,6 +397,16 @@ fn remove_any(path: &Path) -> Result<()> {
 fn replace_symlink(source: &Path, target: &Path) -> Result<()> {
     use std::os::unix::fs::symlink;
 
+    if source == target {
+        // Custom hooks can deliberately place the public command at the binary
+        // path inside the managed install tree. Dotfiles' Neovim hook does this
+        // so ~/.local/bin/nvim can remain a launcher while the real editor
+        // lives at ~/.local/share/neovim/neovim/bin/nvim. In that layout there
+        // is nothing to link: replacing `target` would first remove the real
+        // binary, then create a self-referential symlink that can never exec.
+        return Ok(());
+    }
+
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -411,6 +421,10 @@ fn replace_symlink(source: &Path, target: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn replace_symlink(source: &Path, target: &Path) -> Result<()> {
+    if source == target {
+        return Ok(());
+    }
+
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -548,6 +562,38 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .contains(".tmp.")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tar_gz_install_keeps_in_tree_custom_public_binary() {
+        let dir = temp_dir("tar-gz-in-tree-public");
+        let bytes = tar_gz(&[
+            ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
+        ]);
+        let public = dir.join("share/owner/tool/bin/tool");
+
+        let installed = super::install_tar_gz_to(
+            &dir.join("state"),
+            &dir.join("share"),
+            &public,
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(installed, public);
+        assert_eq!(fs::read(&public).unwrap(), b"binary");
+        assert!(!fs::symlink_metadata(&public)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
+            dir.join("share/owner/tool/share/man/man1/tool.1")
+        );
     }
 
     #[test]

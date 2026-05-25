@@ -177,6 +177,50 @@ _assert_not_contains "wrapper cache: bin-dir not refetched" "__api bin-dir" "$_c
 _assert_not_contains "wrapper cache: git-dev-dir not refetched" "__api git-dev-dir" "$_cache_log_content"
 _assert_not_contains "wrapper cache: platform not refetched" "__api platform" "$_cache_log_content"
 
+_path_fake=$(_tmpdir)/shdeps
+cat >"$_path_fake" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}:${2:-}" in
+  __api:version)
+    printf '%s\n' "abi:1"
+    ;;
+  __api:env-snapshot)
+    printf '%s\n' \
+      "install_dir=/path/install" \
+      "bin_dir=/path/bin" \
+      "git_dev_dir=/path/git" \
+      "platform=linux" \
+      "pkg_mgr=" \
+      "force=0" \
+      "reinstall=0"
+    ;;
+  update:)
+    printf '%s\n' "$PATH" >"${SHDEPS_WRAPPER_PATH_LOG:?missing path log}"
+    ;;
+  *)
+    printf 'unexpected wrapper path call: %s\n' "$*" >&2
+    exit 9
+    ;;
+esac
+SH
+chmod +x "$_path_fake"
+_path_log=$(_tmpdir)/wrapper-path.log
+_path_output=$(
+  SHDEPS_RUST_CLI="$_path_fake" \
+    SHDEPS_WRAPPER_PATH_LOG="$_path_log" \
+    PATH="/usr/bin:/bin" \
+    "$(command -v bash)" -c "
+      unset SHDEPS_BIN_DIR
+      . \"\$1\"
+      shdeps_update
+      printf '%s\n' \"\$PATH\"
+    " \
+    bash "$SHDEPS_DIR/shdeps.sh"
+)
+_assert_eq "wrapper update: prepends cached bin dir in caller" "/path/bin:/usr/bin:/bin" "$_path_output"
+_assert_eq "wrapper update: child sees prepended bin dir" "/path/bin:/usr/bin:/bin" "$(cat "$_path_log")"
+
 _fake=$(_tmpdir)/shdeps
 cat >"$_fake" <<'SH'
 #!/usr/bin/env bash

@@ -83,6 +83,22 @@ _shdepsw_call() {
   command "$_SHDEPSW_BIN" "$@"
 }
 
+_shdepsw_prepend_bin_dir() {
+  local bin_dir
+  bin_dir="${SHDEPS_BIN_DIR:-${_SHDEPSW_BIN_DIR:-$(_shdepsw_call __api bin-dir)}}"
+  case ":${PATH:-}:" in
+    *":$bin_dir:"*) ;;
+    *)
+      # The Bash implementation updated the caller's PATH before `update` so
+      # freshly installed release/toolchain binaries were visible to later
+      # hooks in the same `dot update` or bootstrap process. Rust can only
+      # mutate its child environment, so the sourceable wrapper preserves that
+      # parent-shell contract here and leaves all install behavior in Rust.
+      export PATH="$bin_dir:${PATH:-}"
+      ;;
+  esac
+}
+
 _shdepsw_ensure_abi() {
   local version
   [[ "${_SHDEPS_ABI_CHECKED:-}" == "1" ]] && return 0
@@ -159,7 +175,7 @@ _shdepsw_cache_env || return 1 2>/dev/null || exit 1
 # alone.
 
 shdeps_version() { _shdepsw_call version "$@"; }
-shdeps_update() { _shdepsw_call update "$@"; }
+shdeps_update() { _shdepsw_prepend_bin_dir && _shdepsw_call update "$@"; }
 shdeps_self_update() { _shdepsw_call self-update "$@"; }
 shdeps_load() { _shdepsw_call __api load-count "$@"; }
 shdeps_prune() { _shdepsw_call prune "$@"; }
