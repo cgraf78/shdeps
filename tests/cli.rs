@@ -605,6 +605,7 @@ fn list_reports_configured_dependency_statuses() {
 #[test]
 fn list_resolves_bare_github_to_concrete_release_method() {
     let fixture = Fixture::new("list-github-release");
+    let asset = host_linux_asset("tool", "v1.0.0");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
     fixture.write_executable("bin/tool", "#!/bin/sh\nprintf '1.0.0\\n'\n");
     fixture.write(
@@ -614,10 +615,7 @@ fn list_resolves_bare_github_to_concrete_release_method() {
             fixture.dir.join("bin/tool").display()
         ),
     );
-    fixture.write_fake_curl(
-        &release_json("v1.0.0", &["tool-v1.0.0-linux-x86_64"]),
-        "unused",
-    );
+    fixture.write_fake_curl(&release_json("v1.0.0", &[asset.as_str()]), "unused");
 
     let mut command = fixture.command(["list"]);
     command.env(
@@ -678,10 +676,11 @@ fn check_reports_installed_skipped_missing_and_unknown() {
 #[test]
 fn update_bare_github_prefers_release_and_records_concrete_manifest_method() {
     let fixture = Fixture::new("update-github-release");
+    let asset = host_linux_asset("tool", "v1.0.0");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
     fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
     fixture.write_fake_curl(
-        &release_json("v1.0.0", &["tool-v1.0.0-linux-x86_64"]),
+        &release_json("v1.0.0", &[asset.as_str()]),
         "#!/bin/sh\nprintf 'release asset\\n'\n",
     );
 
@@ -741,6 +740,7 @@ fn update_bare_github_falls_back_to_repo_and_uses_local_clone() {
 #[test]
 fn update_bare_github_transitions_repo_to_release_after_release_appears() {
     let fixture = Fixture::new("update-github-repo-to-release");
+    let asset = host_linux_asset("tool", "v1.0.0");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
     fixture.write_executable("share/owner/tool/bin/tool", "#!/bin/sh\nprintf 'repo\\n'\n");
     fixture.write(
@@ -751,7 +751,7 @@ fn update_bare_github_transitions_repo_to_release_after_release_appears() {
         ),
     );
     fixture.write_fake_curl(
-        &release_json("v1.0.0", &["tool-v1.0.0-linux-x86_64"]),
+        &release_json("v1.0.0", &[asset.as_str()]),
         "#!/bin/sh\nprintf 'release asset\\n'\n",
     );
 
@@ -1145,6 +1145,16 @@ fn host_arch() -> String {
         "amd64" => "x86_64".to_owned(),
         arch => arch.to_owned(),
     }
+}
+
+fn host_linux_asset(cmd: &str, tag: &str) -> String {
+    // The CLI fixtures force shdeps' logical platform to Linux so release
+    // selection exercises one stable asset naming path on every CI runner.
+    // Asset matching still asks the host for `uname -m`, though, so keep the
+    // fixture architecture aligned with the actual runner instead of assuming
+    // x86_64. That catches real matching behavior without making ARM macOS CI
+    // look like a missing-release fallback.
+    format!("{cmd}-{tag}-linux-{}", host_arch())
 }
 
 fn shdeps_exe_dir() -> PathBuf {
