@@ -239,18 +239,16 @@ Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdep
 Usage: shdeps [options] <command> [args]
 
 Commands:
-  update          Install/update all dependencies
-  self-update     Update shdeps itself (git pull, skips dirty trees)
-  list            List all configured dependencies with status
-  check <name>    Check if a specific dependency is installed
-  dep-root <name> Print a configured dependency root directory
-  dep-path <name> <rel>
-                  Print a path below a configured dependency root
-  dep-file <name> <rel>
-                  Print an existing file below a configured dependency root
-  prune           Remove orphaned deps no longer in config
-  version         Print shdeps version
-  help            Show this help message
+  update                 Install/update all dependencies
+  self-update            Update shdeps itself (git pull, skips dirty trees)
+  list                   List all configured dependencies with status
+  check <name>           Check if a specific dependency is installed
+  dep-root <name>        Print a configured dependency root directory
+  dep-path <name> <rel>  Print a path below a configured dependency root
+  dep-file <name> <rel>  Print a readable regular file below a dependency root
+  prune                  Remove orphaned deps no longer in config
+  version                Print shdeps version
+  help                   Show this help message
 
 Options:
   -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)

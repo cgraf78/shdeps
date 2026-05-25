@@ -40,7 +40,11 @@ fn help_output_is_stable_and_hides_removed_migrate_command() {
     assert_success(&output);
     let stdout = text(&output.stdout);
     assert!(stdout.starts_with("Usage: shdeps [options] <command> [args]\n"));
-    assert!(stdout.contains("  dep-file <name> <rel>\n"));
+    assert!(stdout
+        .contains("  dep-path <name> <rel>  Print a path below a configured dependency root\n"));
+    assert!(stdout.contains(
+        "  dep-file <name> <rel>  Print a readable regular file below a dependency root\n"
+    ));
     assert!(
         !stdout.contains("migrate"),
         "removed migrate command must stay out of user-facing help"
