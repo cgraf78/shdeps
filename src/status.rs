@@ -12,6 +12,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::{self, Entry};
+use crate::jobs;
 use crate::manifest::Manifest;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::{self, Runner};
@@ -117,6 +118,47 @@ where
         .collect()
 }
 
+/// Classifies all configured dependencies with bounded read-only parallelism.
+///
+/// Built-in status probes are read-only: command lookup, `--version`, manifest
+/// checks, package database probes, and `git rev-parse`. Those can safely
+/// overlap as long as final rows are emitted in config order. Custom hooks are
+/// different because they are user-authored shell code; even an `exists()`
+/// hook can touch files or depend on side effects. To preserve that observable
+/// ordering, this function parallelizes only contiguous non-custom runs and
+/// executes each custom entry at its original position.
+pub fn list_with_jobs<R, C>(
+    entries: &[Entry],
+    context: &Context<'_, R, C>,
+    max_jobs: usize,
+) -> Result<Vec<DependencyStatus>>
+where
+    R: Runner + Sync,
+    C: CustomProbe + Sync,
+{
+    let mut statuses = Vec::with_capacity(entries.len());
+    let mut index = 0;
+    while index < entries.len() {
+        if entries[index].method == "custom" {
+            statuses.push(classify(&entries[index], context)?);
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < entries.len() && entries[index].method != "custom" {
+            index += 1;
+        }
+
+        for status in jobs::parallel_map(&entries[start..index], max_jobs, |entry| {
+            classify(entry, context)
+        }) {
+            statuses.push(status?);
+        }
+    }
+    Ok(statuses)
+}
+
 /// Classifies one configured dependency.
 ///
 /// Callers choose whether `pkg_mgr` has already been detected. Passing an empty
@@ -178,7 +220,8 @@ fn pkg_state(
         return State::Skipped(SkipReason::PackageManager);
     }
 
-    if !process::dep_exists(runner, &entry.cmd, &resolved, pkg_mgr) {
+    if !process::dep_exists_with_versions(runner, &entry.cmd, &resolved, pkg_mgr, package_versions)
+    {
         return State::Missing;
     }
 
@@ -270,7 +313,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        classify, list, Context, CustomProbe, DependencyStatus, NoCustomProbe, SkipReason, State,
+        classify, list, list_with_jobs, Context, CustomProbe, DependencyStatus, NoCustomProbe,
+        SkipReason, State,
     };
     use crate::config::parse_entry;
     use crate::manifest::{Manifest, ManifestEntry};
@@ -283,12 +327,24 @@ mod tests {
     struct FakeRunner {
         commands: BTreeSet<String>,
         outputs: BTreeMap<(String, Vec<String>), Output>,
+        delay: Option<Duration>,
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeRunner {
         fn with_command(mut self, command: &str) -> Self {
             self.commands.insert(command.to_owned());
             self
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn with_output<const N: usize>(
@@ -324,6 +380,18 @@ mod tests {
             args: &[&str],
             _timeout: Option<Duration>,
         ) -> io::Result<Output> {
+            let active = self
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_active
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            let _guard = ActiveGuard {
+                active: &self.active,
+            };
+            if let Some(delay) = self.delay {
+                std::thread::sleep(delay);
+            }
             self.outputs
                 .get(&(
                     program.to_owned(),
@@ -331,6 +399,17 @@ mod tests {
                 ))
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing fake command"))
+        }
+    }
+
+    struct ActiveGuard<'a> {
+        active: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl Drop for ActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -448,6 +527,38 @@ mod tests {
 
         let status = classify(
             &parse_entry("font-package|pkg|font-tool|-|-", Some("apt")),
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(
+            status.state,
+            State::Installed {
+                detail: Some("4.5.6-1".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn package_status_uses_batched_package_presence_before_subprocess_fallback() {
+        let roots = roots();
+        let manifest = Manifest::default();
+        let runner = FakeRunner::default();
+        let env = RuntimeEnv::new("linux", "workstation");
+        let mut package_versions = BTreeMap::new();
+        package_versions.insert("font-package".to_owned(), "4.5.6-1".to_owned());
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &NoCustomProbe,
+            "apt",
+            &package_versions,
+        );
+
+        let status = classify(
+            &parse_entry("font-package|pkg|-|-|-", Some("apt")),
             &context,
         )
         .unwrap();
@@ -602,6 +713,141 @@ mod tests {
                     state: State::Installed { detail: None },
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn list_with_jobs_parallelizes_builtin_probes_and_preserves_order() {
+        let roots = roots();
+        let manifest = Manifest::default();
+        let runner = FakeRunner::default()
+            .with_command("a")
+            .with_command("b")
+            .with_output("a", ["--version"], "a 1.0.0\n")
+            .with_output("b", ["--version"], "b 2.0.0\n")
+            .with_delay(Duration::from_millis(40));
+        let entries = vec![
+            parse_entry("b|pkg|b|-|-", Some("apt")),
+            parse_entry("a|pkg|a|-|-", Some("apt")),
+        ];
+        let env = RuntimeEnv::new("linux", "workstation");
+        let package_versions = BTreeMap::new();
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &NoCustomProbe,
+            "apt",
+            &package_versions,
+        );
+
+        let statuses = list_with_jobs(&entries, &context, 2).unwrap();
+
+        assert_eq!(
+            statuses,
+            vec![
+                DependencyStatus {
+                    name: "b".to_owned(),
+                    method: "pkg".to_owned(),
+                    state: State::Installed {
+                        detail: Some("2.0.0".to_owned())
+                    },
+                },
+                DependencyStatus {
+                    name: "a".to_owned(),
+                    method: "pkg".to_owned(),
+                    state: State::Installed {
+                        detail: Some("1.0.0".to_owned())
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            runner.max_active(),
+            2,
+            "read-only list probes should overlap up to SHDEPS_JOBS while final rows stay in config order"
+        );
+    }
+
+    #[test]
+    fn list_with_jobs_one_keeps_builtin_probes_sequential() {
+        let roots = roots();
+        let manifest = Manifest::default();
+        let runner = FakeRunner::default()
+            .with_command("a")
+            .with_command("b")
+            .with_output("a", ["--version"], "a 1.0.0\n")
+            .with_output("b", ["--version"], "b 2.0.0\n")
+            .with_delay(Duration::from_millis(10));
+        let entries = vec![
+            parse_entry("a|pkg|a|-|-", Some("apt")),
+            parse_entry("b|pkg|b|-|-", Some("apt")),
+        ];
+        let env = RuntimeEnv::new("linux", "workstation");
+        let package_versions = BTreeMap::new();
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &NoCustomProbe,
+            "apt",
+            &package_versions,
+        );
+
+        list_with_jobs(&entries, &context, 1).unwrap();
+
+        assert_eq!(
+            runner.max_active(),
+            1,
+            "SHDEPS_JOBS=1 must remain the deterministic list escape hatch"
+        );
+    }
+
+    #[test]
+    fn list_with_jobs_keeps_custom_hooks_as_ordering_boundaries() {
+        let roots = roots();
+        let manifest = Manifest::default();
+        let runner = FakeRunner::default()
+            .with_command("a")
+            .with_command("b")
+            .with_output("a", ["--version"], "a 1.0.0\n")
+            .with_output("b", ["--version"], "b 2.0.0\n")
+            .with_delay(Duration::from_millis(10));
+        let mut details = BTreeMap::new();
+        details.insert("custom-tool".to_owned(), Some("custom 3.0.0".to_owned()));
+        let custom = FakeCustom { details };
+        let entries = vec![
+            parse_entry("a|pkg|a|-|-", Some("apt")),
+            parse_entry("custom-tool|custom|-|-|-", Some("apt")),
+            parse_entry("b|pkg|b|-|-", Some("apt")),
+        ];
+        let env = RuntimeEnv::new("linux", "workstation");
+        let package_versions = BTreeMap::new();
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &custom,
+            "apt",
+            &package_versions,
+        );
+
+        let statuses = list_with_jobs(&entries, &context, 4).unwrap();
+
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|status| status.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "custom-tool", "b"]
+        );
+        assert_eq!(
+            runner.max_active(),
+            1,
+            "custom hooks are user shell code, so they split parallel builtin runs instead of being reordered around them"
         );
     }
 

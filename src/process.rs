@@ -104,6 +104,25 @@ pub fn detect_package_manager(runner: &impl Runner) -> String {
 /// can still report installed.
 #[must_use]
 pub fn dep_exists(runner: &impl Runner, command: &str, package_name: &str, pkg_mgr: &str) -> bool {
+    dep_exists_with_versions(runner, command, package_name, pkg_mgr, &BTreeMap::new())
+}
+
+/// Returns whether a dependency is installed, using batch package data first.
+///
+/// `shdeps list` already pays for one manager-wide package-version snapshot on
+/// platforms where the Bash reference knows how to parse it. Reusing that map
+/// avoids a slow per-package `dpkg -s`/`rpm -q`/`pacman -Q` fallback whenever a
+/// dependency has no command or the command name differs from the package name.
+/// The final subprocess fallback is preserved for managers without batch data
+/// and for stale snapshots.
+#[must_use]
+pub fn dep_exists_with_versions(
+    runner: &impl Runner,
+    command: &str,
+    package_name: &str,
+    pkg_mgr: &str,
+    package_versions: &BTreeMap<String, String>,
+) -> bool {
     if !command.is_empty() {
         if runner.exists(command) {
             return true;
@@ -126,6 +145,10 @@ pub fn dep_exists(runner: &impl Runner, command: &str, package_name: &str, pkg_m
                 return true;
             }
         }
+    }
+
+    if package_versions.contains_key(package_name) {
+        return true;
     }
 
     package_installed(runner, package_name, pkg_mgr)

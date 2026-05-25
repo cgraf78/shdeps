@@ -141,12 +141,15 @@ impl Summary {
 }
 
 /// Runs update for already-parsed entries.
-pub fn run(
+pub fn run<R>(
     entries: &[Entry],
     manifest: &Manifest,
-    context: &Context<'_, impl Runner>,
+    context: &Context<'_, R>,
     options: Options,
-) -> Result<Summary> {
+) -> Result<Summary>
+where
+    R: Runner + Sync,
+{
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
 
     let mut summary = Summary::default();
@@ -1481,6 +1484,67 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_prefetches_current_versions_with_bounded_parallelism() {
+        let mut fixture = Fixture::new("release-version-prefetch");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "2".to_owned());
+        fixture
+            .env_vars
+            .insert("GH_TOKEN".to_owned(), "ci-token".to_owned());
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool-a/releases",
+                release_response("tool-a", "v1.0.0", "https://example/tool-a-linux-x86_64"),
+            )
+            .with(
+                "https://api.github.com/repos/owner/tool-b/releases",
+                release_response("tool-b", "v2.0.0", "https://example/tool-b-linux-x86_64"),
+            );
+        write_executable(&fixture.roots.bin_dir.join("tool-a"));
+        write_executable(&fixture.roots.bin_dir.join("tool-b"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("tool-a", ["--version"], "tool-a 1.0.0\n")
+            .with_success("tool-b", ["--version"], "tool-b 2.0.0\n")
+            .with_delay(Duration::from_millis(25));
+
+        let summary = run(
+            &[
+                parse_entry("owner/tool-a|github:release|tool-a|-|-", None),
+                parse_entry("owner/tool-b|github:release|tool-b|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        let asset_count = fixture
+            .client
+            .requests()
+            .iter()
+            .filter(|(url, _)| url.starts_with("https://example/tool-"))
+            .count();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items.iter().all(|item| !item.changed));
+        assert_eq!(
+            asset_count, 0,
+            "prefetched current versions should preserve the force no-op path and avoid unnecessary release downloads"
+        );
+        assert_eq!(
+            runner.max_active(),
+            2,
+            "installed-version probes are read-only and should overlap with the same SHDEPS_JOBS bound as release metadata"
+        );
+    }
+
+    #[test]
     fn update_github_release_jobs_one_keeps_remote_checks_sequential() {
         let mut fixture = Fixture::new("release-prefetch-sequential");
         fixture.write_lib();
@@ -2530,7 +2594,10 @@ version() { printf 'saw-pkg\n'; }
         outputs: std::collections::BTreeMap<String, QueuedOutputs>,
         creates: std::collections::BTreeMap<String, Vec<PathBuf>>,
         creates_dirs: std::collections::BTreeMap<String, Vec<PathBuf>>,
-        calls: std::cell::RefCell<Vec<String>>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        delay: Option<Duration>,
+        active: AtomicCounter,
+        max_active: AtomicCounter,
     }
 
     impl FakeRunner {
@@ -2614,16 +2681,26 @@ version() { printf 'saw-pkg\n'; }
             self
         }
 
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
+        }
+
         fn push_output(&mut self, key: String, output: Output) {
             self.outputs
                 .entry(key)
                 .or_default()
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push_back(output);
         }
 
         fn calls(&self) -> Vec<String> {
-            self.calls.borrow().clone()
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -2639,7 +2716,19 @@ version() { printf 'saw-pkg\n'; }
             _timeout: Option<Duration>,
         ) -> io::Result<Output> {
             let key = key(program, args);
-            self.calls.borrow_mut().push(key.clone());
+            let active = self
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_active
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            let _guard = ActiveGuard {
+                active: &self.active,
+            };
+            if let Some(delay) = self.delay {
+                std::thread::sleep(delay);
+            }
+            self.calls.lock().unwrap().push(key.clone());
             for path in self.creates.get(&key).into_iter().flatten() {
                 write_executable(path);
             }
@@ -2655,14 +2744,14 @@ version() { printf 'saw-pkg\n'; }
         }
     }
 
-    type QueuedOutputs = std::cell::RefCell<std::collections::VecDeque<Output>>;
+    type QueuedOutputs = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Output>>>;
 
     fn next_output(outputs: &QueuedOutputs) -> Output {
         // Some install flows intentionally run the same command twice, for
         // example `git pull` before and after rewriting an HTTPS origin to SSH.
         // Keep a tiny queue per command key so tests can model those retries
         // without shell scripts or global PATH mutation.
-        let mut outputs = outputs.borrow_mut();
+        let mut outputs = outputs.lock().unwrap();
         if outputs.len() > 1 {
             outputs.pop_front().unwrap()
         } else {

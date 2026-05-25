@@ -7,13 +7,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Entry;
 use crate::github;
 use crate::github_release;
 use crate::github_release_install;
 use crate::http::Client;
+use crate::jobs;
 use crate::manifest::{self, ManifestEntry};
 use crate::platform::RuntimeEnv;
 use crate::process::{self, Runner};
@@ -61,6 +62,7 @@ pub(crate) fn install_with_prefetch(
 #[derive(Debug, Default)]
 pub(crate) struct Prefetch {
     releases: BTreeMap<String, Vec<github::Release>>,
+    versions: BTreeMap<String, String>,
     token: Option<String>,
     token_resolved: bool,
 }
@@ -68,6 +70,10 @@ pub(crate) struct Prefetch {
 impl Prefetch {
     fn releases(&self, repo: &str) -> Option<&[github::Release]> {
         self.releases.get(repo).map(Vec::as_slice)
+    }
+
+    fn version(&self, name: &str) -> Option<&str> {
+        self.versions.get(name).map(String::as_str)
     }
 
     fn token(&self, env: &impl Env, runner: &impl Runner) -> Option<String> {
@@ -81,18 +87,24 @@ impl Prefetch {
 
 #[derive(Debug, Clone)]
 struct Candidate {
+    name: String,
+    cmd: String,
     repo: String,
+    public_bin: PathBuf,
 }
 
-pub(crate) fn prefetch(
+pub(crate) fn prefetch<R>(
     entries: &[&Entry],
     roots: &Roots,
     runtime_env: &RuntimeEnv,
     env_vars: &BTreeMap<String, String>,
-    runner: &impl Runner,
+    runner: &R,
     client: &dyn Client,
     options: Options,
-) -> Prefetch {
+) -> Prefetch
+where
+    R: Runner + Sync,
+{
     let candidates = prefetch_candidates(entries, roots, options);
     if candidates.is_empty() {
         return Prefetch::default();
@@ -105,10 +117,11 @@ pub(crate) fn prefetch(
     let token = github::token(&env, runner);
     let mut prefetch = Prefetch {
         releases: BTreeMap::new(),
+        versions: BTreeMap::new(),
         token: token.clone(),
         token_resolved: true,
     };
-    let jobs = jobs_max(env_vars);
+    let jobs = jobs::max(env_vars);
     if jobs <= 1 || candidates.len() <= 1 {
         // Still cache the token in the sequential path. The old Bash
         // implementation naturally held this in shell state, but the Rust port
@@ -118,30 +131,30 @@ pub(crate) fn prefetch(
         return prefetch;
     }
 
-    // Prefetch only release metadata, never install artifacts or run hooks.
-    // Installation order is part of the public behavior because post hooks and
-    // method-transition cleanup are observable. Metadata is safe to overlap:
-    // it has no local side effects, and a failed prefetch is deliberately not
-    // cached so the normal per-dependency path can retry and report the same
-    // failure it would have reported without this optimization.
-    for chunk in candidates.chunks(jobs) {
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(chunk.len());
-            for candidate in chunk {
-                let token = token.as_deref();
-                handles.push(scope.spawn(move || {
-                    fetch_releases_with_token(&candidate.repo, client, token)
-                        .ok()
-                        .map(|releases| (candidate.repo.clone(), releases))
-                }));
-            }
-
-            for handle in handles {
-                if let Ok(Some((repo, releases))) = handle.join() {
-                    prefetch.releases.insert(repo, releases);
-                }
-            }
-        });
+    // Prefetch only read-only release facts: GitHub metadata and the currently
+    // installed command version. Installation order is part of the public
+    // behavior because post hooks and method-transition cleanup are observable.
+    // These probes are safe to overlap because they have no local mutation. A
+    // failed metadata prefetch is deliberately not cached so the normal
+    // per-dependency path can retry and report the same failure it would have
+    // reported without this optimization. Version probes are cached only when
+    // they succeed; a missing/odd tool gets the old serial second chance.
+    for fetched in jobs::parallel_map(&candidates, jobs, |candidate| {
+        let releases = fetch_releases_with_token(&candidate.repo, client, token.as_deref())
+            .ok()
+            .map(|releases| (candidate.repo.clone(), releases));
+        let version = process::executable_path(&candidate.public_bin)
+            .then(|| process::dep_version(runner, &candidate.cmd))
+            .flatten()
+            .map(|version| (candidate.name.clone(), version));
+        (releases, version)
+    }) {
+        if let Some((repo, releases)) = fetched.0 {
+            prefetch.releases.insert(repo, releases);
+        }
+        if let Some((name, version)) = fetched.1 {
+            prefetch.versions.insert(name, version);
+        }
     }
 
     prefetch
@@ -163,33 +176,14 @@ fn prefetch_candidates(entries: &[&Entry], roots: &Roots, options: Options) -> V
         // preventing the prefetch phase from multiplying GitHub API pressure.
         if seen.insert(entry.name.clone()) {
             candidates.push(Candidate {
+                name: entry.name.clone(),
+                cmd: entry.cmd.clone(),
                 repo: entry.name.clone(),
+                public_bin,
             });
         }
     }
     candidates
-}
-
-pub(crate) fn jobs_max(env_vars: &BTreeMap<String, String>) -> usize {
-    let configured = env_vars
-        .get("SHDEPS_JOBS")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    if configured > 0 {
-        // An explicit value is a deliberate operator choice. Do not cap it:
-        // CI and large developer machines may want to exercise high fan-out,
-        // while `SHDEPS_JOBS=1` remains the deterministic sequential escape
-        // hatch for debugging slow or flaky remotes.
-        return configured;
-    }
-
-    // The auto value is intentionally conservative. Release metadata requests
-    // are mostly network-bound, but unbounded fan-out can trip GitHub rate
-    // limits and make low-power hosts feel worse, not better.
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .clamp(1, 8)
 }
 
 pub(crate) struct ReleaseRequest<'a> {
@@ -241,9 +235,15 @@ pub(crate) fn install_request(
         });
     }
 
-    let current_version = process::executable_path(request.public_bin)
-        .then(|| process::dep_version(context.runner, request.cmd))
-        .flatten();
+    let current_version = context
+        .prefetch
+        .version(request.name)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            process::executable_path(request.public_bin)
+                .then(|| process::dep_version(context.runner, request.cmd))
+                .flatten()
+        });
 
     let env = EnvVars {
         vars: context.env_vars,
@@ -530,39 +530,7 @@ impl Env for EnvVars<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use super::{asset_kind, comparable_versions, installed_matches_tag, jobs_max, AssetKind};
-
-    #[test]
-    fn jobs_max_uses_explicit_values_without_auto_cap() {
-        let mut env = BTreeMap::new();
-        env.insert("SHDEPS_JOBS".to_owned(), "32".to_owned());
-
-        assert_eq!(jobs_max(&env), 32);
-    }
-
-    #[test]
-    fn jobs_max_keeps_one_as_sequential_escape_hatch() {
-        let mut env = BTreeMap::new();
-        env.insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
-
-        assert_eq!(jobs_max(&env), 1);
-    }
-
-    #[test]
-    fn jobs_max_ignores_invalid_or_zero_values_for_auto_mode() {
-        for value in ["0", "not-a-number"] {
-            let mut env = BTreeMap::new();
-            env.insert("SHDEPS_JOBS".to_owned(), value.to_owned());
-
-            let jobs = jobs_max(&env);
-            assert!(
-                (1..=8).contains(&jobs),
-                "auto mode should stay bounded, got {jobs} for {value:?}"
-            );
-        }
-    }
+    use super::{asset_kind, comparable_versions, installed_matches_tag, AssetKind};
 
     #[test]
     fn asset_kind_accepts_raw_binary_urls() {

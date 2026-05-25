@@ -162,11 +162,10 @@ Behavior:
 - MUST detect the package manager.
 - MUST prepare method transitions before installing new method artifacts.
 - MUST process package-manager deps before non-package deps.
-- MUST run non-package deps with bounded concurrency when `SHDEPS_JOBS > 1`.
-- When the parallel job runner is active, MUST run `custom` deps sequentially
-  after parallel non-custom Phase B deps. With `SHDEPS_JOBS=1`, current Bash
-  behavior processes all non-`pkg` deps sequentially in loaded dependency order,
-  so a `custom` dep can run before a later-sorting non-custom dep.
+- MUST keep mutation phases sequential unless a future spec revision defines a
+  stronger dependency model for install/hook ordering.
+- MAY run read-only probes with bounded concurrency from `SHDEPS_JOBS`.
+  `SHDEPS_JOBS=1` MUST remain a deterministic sequential escape hatch.
 - MUST run `post(name)` hooks for changed deps after install phases.
 - MUST return `1` if any required dep install fails, while still attempting
   later independent deps.
@@ -401,7 +400,7 @@ Runtime environment variables:
 | `SHDEPS_INSTALL_DIR` | `$HOME/.local/share` | Dependency install root |
 | `SHDEPS_BIN_DIR` | `$HOME/.local/bin` | Public command symlink dir |
 | `SHDEPS_LOG_LEVEL` | `1` | `0` quiet, `1` normal, `2` verbose |
-| `SHDEPS_JOBS` | auto, max `8` | Max concurrent non-custom Phase B jobs |
+| `SHDEPS_JOBS` | auto CPU parallelism | Max concurrent read-only probe jobs; explicit values win |
 | `SHDEPS_AUTO_EPEL` | `0` unless caller sets | dnf CRB/EPEL automation gate |
 | `GH_TOKEN` | unset | Preferred GitHub auth token for runtime GitHub API and asset calls |
 | `GITHUB_TOKEN` | unset | GitHub auth token fallback for runtime GitHub API and asset calls |

@@ -15,6 +15,7 @@ use crate::dep_path;
 use crate::errors::Error;
 use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::http::Curl;
+use crate::jobs;
 use crate::manifest;
 use crate::process::{self, Process};
 use crate::prune::{self, Options as PruneOptions};
@@ -293,6 +294,7 @@ where
     };
     let custom = custom_probe();
     let env = runtime::runtime_env(&ProcessEnv);
+    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
     let context = StatusContext {
         roots: &roots,
         env: &env,
@@ -302,7 +304,7 @@ where
         pkg_mgr: &pkg_mgr,
         package_versions: &package_versions,
     };
-    let statuses = status::list(&entries, &context)?;
+    let statuses = status::list_with_jobs(&entries, &context, jobs::max(&env_vars))?;
 
     write_list(&statuses, stdout)?;
     Ok(0)

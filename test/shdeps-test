@@ -5286,10 +5286,10 @@ _assert_eq "jobs_max: explicit" "3" "$(_shdeps_jobs_max)"
 
 SHDEPS_JOBS=0
 _auto_jobs=$(_shdeps_jobs_max)
-if [[ "$_auto_jobs" -ge 1 && "$_auto_jobs" -le 8 ]]; then
-  _pass "jobs_max: auto in [1,8] (got $_auto_jobs)"
+if [[ "$_auto_jobs" -ge 1 ]]; then
+  _pass "jobs_max: auto uses host parallelism (got $_auto_jobs)"
 else
-  _fail "jobs_max: auto=$_auto_jobs not in [1,8]"
+  _fail "jobs_max: auto=$_auto_jobs not positive"
 fi
 
 SHDEPS_JOBS=1

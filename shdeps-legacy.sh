@@ -22,7 +22,7 @@
 #   SHDEPS_INSTALL_DIR  Base dir for github installs (default: ~/.local/share)
 #   SHDEPS_BIN_DIR      Directory for binary symlinks (default: ~/.local/bin)
 #   SHDEPS_LOG_LEVEL    0=quiet, 1=normal, 2=verbose(default: 1)
-#   SHDEPS_JOBS         Max parallel jobs          (default: auto/nproc, max 8)
+#   SHDEPS_JOBS         Max parallel jobs          (default: auto/nproc)
 #   SHDEPS_AUTO_EPEL    Auto-configure CRB/EPEL on dnf (default: 0)
 
 _shdeps_valid_commit() {
@@ -195,8 +195,11 @@ _shdeps_host_name() {
 _shdeps_jobs_max() {
   local jobs="${SHDEPS_JOBS:-0}"
   if [[ "$jobs" -le 0 ]]; then
+    # Auto mode follows the host's CPU count. Earlier shdeps capped this at 8,
+    # but that made large developer machines pay avoidable latency even though
+    # the operator had not requested conservative fan-out. Keep explicit
+    # SHDEPS_JOBS as the real throttle, with SHDEPS_JOBS=1 for debugging.
     jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-    ((jobs > 8)) && jobs=8
   fi
   echo "$jobs"
 }

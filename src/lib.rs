@@ -31,6 +31,7 @@ pub mod github_release_install;
 pub mod hooks;
 pub mod http;
 pub mod install_metadata;
+pub mod jobs;
 pub mod link_state;
 pub mod manifest;
 pub mod package_cache;
