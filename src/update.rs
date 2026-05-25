@@ -2540,6 +2540,55 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
+    fn update_github_repo_local_dev_clone_keeps_user_directory_modes() {
+        let fixture = Fixture::new("repo-local-modes");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        fs::create_dir_all(local_clone.join("src")).unwrap();
+        fs::write(local_clone.join("src/_ds"), "#compdef ds\n").unwrap();
+        fs::set_permissions(&local_clone, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(local_clone.join("src"), fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(
+            local_clone.join("src/_ds"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            fs::metadata(&local_clone).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(local_clone.join("src"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(local_clone.join("src/_ds"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o666
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_github_repo_replaces_removed_local_clone_symlink_with_managed_clone() {
         use std::os::unix::fs::symlink;
 
@@ -2808,6 +2857,63 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert!(install_dir.join(".git").is_dir());
         assert_eq!(summary.items[0].detail, "added");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_repo_existing_managed_clone_strips_insecure_write_bits() {
+        let fixture = Fixture::new("repo-managed-modes");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("private/tool");
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        fs::create_dir_all(install_dir.join("src")).unwrap();
+        fs::write(install_dir.join("src/_tool"), "#compdef tool\n").unwrap();
+        fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(install_dir.join("src"), fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(
+            install_dir.join("src/_tool"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "private/tool", "repo"),
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let summary = run(
+            &[parse_entry("private/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            fs::metadata(&install_dir).unwrap().permissions().mode() & 0o022,
+            0
+        );
+        assert_eq!(
+            fs::metadata(install_dir.join("src"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o022,
+            0
+        );
+        assert_eq!(
+            fs::metadata(install_dir.join("src/_tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o022,
+            0
+        );
     }
 
     #[test]

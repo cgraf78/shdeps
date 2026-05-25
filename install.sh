@@ -770,7 +770,11 @@ _bootstrap() {
 
   # Pull latest shdeps (skips dirty clones / active development)
   if [[ -n "$_bs_dir" ]]; then
-    _bootstrap_self_update "$_bs_dir" 2>/dev/null || true
+    # Bootstrap is sourced into callers, so stdout belongs to the caller's
+    # script. Self-update is opportunistic here and ignored on failure; keep it
+    # quiet for the same reason so status chatter cannot pollute command
+    # substitutions around `. install.sh --bootstrap`.
+    _bootstrap_self_update "$_bs_dir" >/dev/null 2>&1 || true
   fi
 
   # The self-update call above may have pulled new Rust sources while the

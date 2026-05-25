@@ -6,6 +6,8 @@
 //! install directory.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
@@ -95,6 +97,7 @@ fn install_existing(
     sync_ssh_push_url(context.runner, install_dir);
 
     if stamp::remote_fresh(&stamp_path, options.freshness()) {
+        secure_managed_clone_permissions(install_dir)?;
         record_success(entry, context, install_dir)?;
         return Ok(Item {
             name: entry.name.clone(),
@@ -111,6 +114,7 @@ fn install_existing(
         // Bash treats an existing clone pull failure as a warning, not an
         // install failure: the previous checkout is still usable, and hooks
         // should not run because no successful change happened.
+        secure_managed_clone_permissions(install_dir)?;
         record_success(entry, context, install_dir)?;
         return Ok(Item {
             name: entry.name.clone(),
@@ -122,6 +126,7 @@ fn install_existing(
 
     let head_after = git_head(context.runner, install_dir);
     stamp::remote_touch(&stamp_path, options.now)?;
+    secure_managed_clone_permissions(install_dir)?;
     record_success(entry, context, install_dir)?;
     Ok(Item {
         name: entry.name.clone(),
@@ -170,6 +175,7 @@ fn install_fresh(
     remove_any(install_dir)?;
     fs::rename(&clone_tmp, install_dir)?;
     set_ssh_push_url(context.runner, install_dir, url);
+    secure_managed_clone_permissions(install_dir)?;
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
     stamp::remote_touch(&stamp_path, options.now)?;
     record_success(entry, context, install_dir)?;
@@ -185,6 +191,48 @@ fn install_fresh(
         // replace the shell CLI without forcing client repos to relearn it.
         detail: "added".to_owned(),
     })
+}
+
+fn secure_managed_clone_permissions(install_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut pending = vec![install_dir.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let metadata = fs::symlink_metadata(&path)?;
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            // Repo installs are often consumed directly by shells, not only
+            // through shdeps' generated completion symlinks. Zsh's compaudit
+            // rejects group/other-writable fpath directories and completion
+            // files, so a permissive umask can turn an otherwise valid managed
+            // clone into an interactive-shell prompt on every startup. Strip
+            // only write bits from shdeps-owned managed clone paths; the
+            // local-dev-clone path intentionally does not call this helper, so
+            // real checkouts under `SHDEPS_GIT_DEV_DIR` keep user-selected
+            // collaboration modes.
+            if file_type.is_dir() || file_type.is_file() {
+                let mode = metadata.permissions().mode();
+                let secure_mode = mode & !0o022;
+                if secure_mode != mode {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(secure_mode))?;
+                }
+            }
+
+            if file_type.is_dir() {
+                for entry in fs::read_dir(&path)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_symlink() {
+                        pending.push(entry.path());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn record_success(
