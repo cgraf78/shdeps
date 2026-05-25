@@ -14,69 +14,37 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
-    name: Rust
-    steps:
-      # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run Rust tests
-        run: cargo test --locked
-
-      - name: Build release binary
-        run: cargo build --release --locked
-
-      - name: Install Linux release target
-        run: |
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@main # zizmor: ignore[unpinned-uses]
+    with:
+      clippy-command: cargo clippy --locked --all-targets -- -D warnings
+      doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
+      package-smoke-setup-command: |
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          # The release archive smoke test intentionally exercises the same
+          # static Linux target that fleet bootstrap installs. Keep this as
+          # caller-owned setup because the shared Rust workflow should not need
+          # to know which projects package musl archives.
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get update
           sudo apt-get install -y musl-tools
+        fi
+      package-smoke-command: |
+        # Release archives are the fleet bootstrap contract, so regular CI
+        # should exercise the same Linux musl label that tagged releases
+        # publish instead of waiting until a tag push discovers drift.
+        scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
+        scripts/smoke-release.sh linux-x86_64-musl
 
-      - name: Smoke release archive packaging
-        run: |
-          # Release archives are the fleet bootstrap contract, so regular CI
-          # should exercise the same Linux musl label that tagged releases
-          # publish instead of waiting until a tag push discovers drift.
-          scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
-          scripts/smoke-release.sh linux-x86_64-musl
-
-      - name: Run shell parity against Rust binary
-        run: SHDEPS_IMPL=rust SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-test
-
-      - name: Smoke Rust compatibility wrapper
-        run: SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-wrapper-test
-
-      - name: Check Rust docs
-        run: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
-
-  install-bash32:
-    runs-on: macos-15-intel
-    name: install.sh Bash 3.2
-    steps:
-      # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-
-      - name: Smoke test release installer with stock macOS Bash
-        shell: /bin/bash {0}
-        run: |
-          /bin/bash --version
-          /bin/bash scripts/smoke-install-bash32.sh
+        # The shell parity and wrapper checks use the optimized host binary from
+        # rust-ci's build gate. That keeps Rust behavior covered against the
+        # existing Bash suite without making every platform matrix job compile a
+        # release binary just to run wrapper smoke tests.
+        SHDEPS_IMPL=rust SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-test
+        SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-wrapper-test
 
   test:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@main # zizmor: ignore[unpinned-uses]
     with:
       profiles: base,shellcheck
       test-command: ./test/shdeps-test
+      bash32-command: /bin/bash scripts/smoke-install-bash32.sh
