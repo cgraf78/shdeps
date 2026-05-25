@@ -4478,6 +4478,10 @@ _release_tag=$(
 )
 _assert_eq "release tag: tag ref is preserved" "v1.2.3" "$_release_tag"
 
+_release_workflow=$(cat "$SHDEPS_DIR/.github/workflows/release.yml")
+_assert_contains "release workflow: reusable tag prefix disabled" \
+  'tag-prefix: ""' "$_release_workflow"
+
 _release_tag=$(
   cd "$SHDEPS_DIR" || exit 1
   env SHDEPS_RELEASE_TAG=dev-explicit GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh

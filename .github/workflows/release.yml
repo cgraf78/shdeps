@@ -15,6 +15,12 @@ jobs:
       contents: write
     with:
       version-command: scripts/release-tag.sh
+      # shdeps deliberately keeps runtime versions commit-based, while release
+      # archives use the full distribution tag (`v1.2.3`) in their filenames.
+      # The shared workflow normally prepends `v` to semver output from Cargo;
+      # disable that prefix here so a real tag validates as `v1.2.3` instead of
+      # the impossible `vv1.2.3`.
+      tag-prefix: ""
       setup-command: |
         if [[ "$RUNNER_OS" == "Linux" ]]; then
           # shdeps links native compression crates into static Linux release
