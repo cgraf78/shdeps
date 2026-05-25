@@ -5,6 +5,7 @@
 //! fast path, release metadata fetch, host asset selection, asset download,
 //! install, stamp, and manifest repair.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -22,10 +23,11 @@ use crate::tool_version;
 use crate::update::{Context, Item, Options};
 use crate::Result;
 
-pub(crate) fn install(
+pub(crate) fn install_with_prefetch(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     options: Options,
+    prefetch: &Prefetch,
 ) -> Result<Item> {
     let bin_path = context.roots.bin_dir.join(&entry.cmd);
     let request = ReleaseRequest {
@@ -42,6 +44,7 @@ pub(crate) fn install(
         context.runner,
         context.client,
         options,
+        prefetch,
     )?;
     if !outcome.failed {
         write_manifest(entry, context)?;
@@ -53,6 +56,141 @@ pub(crate) fn install(
         failed: outcome.failed,
         detail: outcome.detail,
     })
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Prefetch {
+    releases: BTreeMap<String, Vec<github::Release>>,
+    token: Option<String>,
+    token_resolved: bool,
+}
+
+impl Prefetch {
+    fn releases(&self, repo: &str) -> Option<&[github::Release]> {
+        self.releases.get(repo).map(Vec::as_slice)
+    }
+
+    fn token(&self, env: &impl Env, runner: &impl Runner) -> Option<String> {
+        if self.token_resolved {
+            self.token.clone()
+        } else {
+            github::token(env, runner)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    repo: String,
+}
+
+pub(crate) fn prefetch(
+    entries: &[&Entry],
+    roots: &Roots,
+    runtime_env: &RuntimeEnv,
+    env_vars: &BTreeMap<String, String>,
+    runner: &impl Runner,
+    client: &dyn Client,
+    options: Options,
+) -> Prefetch {
+    let candidates = prefetch_candidates(entries, roots, options);
+    if candidates.is_empty() {
+        return Prefetch::default();
+    }
+
+    let env = EnvVars {
+        vars: env_vars,
+        runtime: runtime_env,
+    };
+    let token = github::token(&env, runner);
+    let mut prefetch = Prefetch {
+        releases: BTreeMap::new(),
+        token: token.clone(),
+        token_resolved: true,
+    };
+    let jobs = jobs_max(env_vars);
+    if jobs <= 1 || candidates.len() <= 1 {
+        // Still cache the token in the sequential path. The old Bash
+        // implementation naturally held this in shell state, but the Rust port
+        // otherwise probes `gh auth token` once per metadata/asset request.
+        // Avoiding that subprocess fan-out is a warm-path performance win and
+        // also keeps CI logs quieter when GitHub credentials are present.
+        return prefetch;
+    }
+
+    // Prefetch only release metadata, never install artifacts or run hooks.
+    // Installation order is part of the public behavior because post hooks and
+    // method-transition cleanup are observable. Metadata is safe to overlap:
+    // it has no local side effects, and a failed prefetch is deliberately not
+    // cached so the normal per-dependency path can retry and report the same
+    // failure it would have reported without this optimization.
+    for chunk in candidates.chunks(jobs) {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(chunk.len());
+            for candidate in chunk {
+                let token = token.as_deref();
+                handles.push(scope.spawn(move || {
+                    fetch_releases_with_token(&candidate.repo, client, token)
+                        .ok()
+                        .map(|releases| (candidate.repo.clone(), releases))
+                }));
+            }
+
+            for handle in handles {
+                if let Ok(Some((repo, releases))) = handle.join() {
+                    prefetch.releases.insert(repo, releases);
+                }
+            }
+        });
+    }
+
+    prefetch
+}
+
+fn prefetch_candidates(entries: &[&Entry], roots: &Roots, options: Options) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let public_bin = roots.bin_dir.join(&entry.cmd);
+        let stamp_path = stamp::remote_path(&roots.state_dir, &entry.name, "release");
+        if process::executable_path(&public_bin)
+            && stamp::remote_fresh(&stamp_path, options.freshness())
+        {
+            continue;
+        }
+        // Duplicate repo rows are unusual but legal enough that the optimizer
+        // should be defensive. Fetching once preserves install behavior while
+        // preventing the prefetch phase from multiplying GitHub API pressure.
+        if seen.insert(entry.name.clone()) {
+            candidates.push(Candidate {
+                repo: entry.name.clone(),
+            });
+        }
+    }
+    candidates
+}
+
+pub(crate) fn jobs_max(env_vars: &BTreeMap<String, String>) -> usize {
+    let configured = env_vars
+        .get("SHDEPS_JOBS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if configured > 0 {
+        // An explicit value is a deliberate operator choice. Do not cap it:
+        // CI and large developer machines may want to exercise high fan-out,
+        // while `SHDEPS_JOBS=1` remains the deterministic sequential escape
+        // hatch for debugging slow or flaky remotes.
+        return configured;
+    }
+
+    // The auto value is intentionally conservative. Release metadata requests
+    // are mostly network-bound, but unbounded fan-out can trip GitHub rate
+    // limits and make low-power hosts feel worse, not better.
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .min(8)
+        .max(1)
 }
 
 pub(crate) struct ReleaseRequest<'a> {
@@ -76,6 +214,7 @@ pub(crate) fn install_request(
     runner: &impl Runner,
     client: &dyn Client,
     options: Options,
+    prefetch: &Prefetch,
 ) -> Result<ReleaseOutcome> {
     let stamp_path = stamp::remote_path(&roots.state_dir, request.name, "release");
     if process::executable_path(request.public_bin)
@@ -107,11 +246,23 @@ pub(crate) fn install_request(
         vars: env_vars,
         runtime: runtime_env,
     };
-    let releases = match github::fetch_releases(request.repo, &env, runner, client) {
-        Ok(releases) => releases,
-        Err(_) => {
-            return Ok(failed("release metadata fetch failed"));
-        }
+    let fetched_releases;
+    let releases = if let Some(releases) = prefetch.releases(request.repo) {
+        releases
+    } else {
+        fetched_releases = match fetch_releases_with_prefetch_token(
+            request.repo,
+            &env,
+            runner,
+            client,
+            prefetch,
+        ) {
+            Ok(releases) => releases,
+            Err(_) => {
+                return Ok(failed("release metadata fetch failed"));
+            }
+        };
+        &fetched_releases
     };
     if let Some(latest) = github_release::latest_stable(&releases) {
         if !options.reinstall
@@ -139,7 +290,7 @@ pub(crate) fn install_request(
     else {
         return Ok(failed("no matching release asset"));
     };
-    let token = github::token(&env, runner);
+    let token = prefetch.token(&env, runner);
     let bytes = match client.get(&selection.url, token.as_deref()) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(failed("release asset download failed")),
@@ -218,6 +369,30 @@ pub(crate) fn install_request(
         failed: false,
         detail: selection.tag,
     })
+}
+
+fn fetch_releases_with_prefetch_token(
+    repo: &str,
+    env: &impl Env,
+    runner: &impl Runner,
+    client: &dyn Client,
+    prefetch: &Prefetch,
+) -> Result<Vec<github::Release>> {
+    if prefetch.token_resolved {
+        fetch_releases_with_token(repo, client, prefetch.token.as_deref())
+    } else {
+        github::fetch_releases(repo, env, runner, client)
+    }
+}
+
+fn fetch_releases_with_token(
+    repo: &str,
+    client: &dyn Client,
+    token: Option<&str>,
+) -> Result<Vec<github::Release>> {
+    let bytes = client.get(&github::releases_url(repo), token)?;
+    let json = String::from_utf8_lossy(&bytes);
+    github::parse_releases(&json)
 }
 
 fn link_existing_extras(roots: &Roots, name: &str) -> Result<()> {
@@ -351,7 +526,39 @@ impl Env for EnvVars<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{asset_kind, comparable_versions, installed_matches_tag, AssetKind};
+    use std::collections::BTreeMap;
+
+    use super::{asset_kind, comparable_versions, installed_matches_tag, jobs_max, AssetKind};
+
+    #[test]
+    fn jobs_max_uses_explicit_values_without_auto_cap() {
+        let mut env = BTreeMap::new();
+        env.insert("SHDEPS_JOBS".to_owned(), "32".to_owned());
+
+        assert_eq!(jobs_max(&env), 32);
+    }
+
+    #[test]
+    fn jobs_max_keeps_one_as_sequential_escape_hatch() {
+        let mut env = BTreeMap::new();
+        env.insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
+
+        assert_eq!(jobs_max(&env), 1);
+    }
+
+    #[test]
+    fn jobs_max_ignores_invalid_or_zero_values_for_auto_mode() {
+        for value in ["0", "not-a-number"] {
+            let mut env = BTreeMap::new();
+            env.insert("SHDEPS_JOBS".to_owned(), value.to_owned());
+
+            let jobs = jobs_max(&env);
+            assert!(
+                (1..=8).contains(&jobs),
+                "auto mode should stay bounded, got {jobs} for {value:?}"
+            );
+        }
+    }
 
     #[test]
     fn asset_kind_accepts_raw_binary_urls() {

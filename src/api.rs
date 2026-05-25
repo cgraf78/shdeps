@@ -258,6 +258,11 @@ where
         repo: &repo,
         public_bin: &public_bin,
     };
+    // Hidden API calls install exactly one release dependency, so there is no
+    // batch to prefetch. Keep the call on the shared installer path with an
+    // empty prefetch object so token/freshness behavior stays identical to the
+    // top-level update flow.
+    let prefetch = update_release::Prefetch::default();
     let outcome = update_release::install_request(
         &request,
         &roots,
@@ -266,6 +271,7 @@ where
         &Process,
         &Curl,
         options,
+        &prefetch,
     )?;
 
     if outcome.failed {

@@ -1401,7 +1401,7 @@ mod tests {
     #[derive(Default)]
     struct FakeClient {
         responses: BTreeMap<String, Vec<u8>>,
-        calls: std::cell::RefCell<Vec<(String, Option<String>)>>,
+        calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl FakeClient {
@@ -1416,7 +1416,8 @@ mod tests {
 
         fn urls(&self) -> Vec<String> {
             self.calls
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .map(|(url, _)| url.clone())
                 .collect()
@@ -1424,7 +1425,8 @@ mod tests {
 
         fn tokens(&self) -> Vec<Option<String>> {
             self.calls
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .map(|(_, token)| token.clone())
                 .collect()
@@ -1434,7 +1436,8 @@ mod tests {
     impl Client for FakeClient {
         fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
             self.calls
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push((url.to_owned(), token.map(ToOwned::to_owned)));
             self.responses
                 .get(url)

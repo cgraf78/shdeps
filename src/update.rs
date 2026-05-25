@@ -213,6 +213,20 @@ pub fn run(
         }
     }
 
+    let release_entries = entries
+        .iter()
+        .filter(|entry| entry.method == "github:release" && active(entry, context.env))
+        .collect::<Vec<_>>();
+    let release_prefetch = update_release::prefetch(
+        &release_entries,
+        context.roots,
+        context.env,
+        context.env_vars,
+        context.runner,
+        context.client,
+        options,
+    );
+
     for entry in entries {
         if entry.method == "pkg" || !active(entry, context.env) {
             continue;
@@ -224,7 +238,14 @@ pub fn run(
                     entry,
                     transitions.get(&entry.name),
                     context.roots,
-                    || update_release::install(entry, context, options),
+                    || {
+                        update_release::install_with_prefetch(
+                            entry,
+                            context,
+                            options,
+                            &release_prefetch,
+                        )
+                    },
                 )?;
                 if !item.failed {
                     cleanup_successful_transition(
@@ -1397,6 +1418,163 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_prefetches_metadata_with_bounded_parallelism() {
+        let mut fixture = Fixture::new("release-prefetch-parallel");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "2".to_owned());
+        fixture.client = FakeClient::default()
+            .with_delay(Duration::from_millis(25))
+            .with(
+                "https://api.github.com/repos/owner/tool-a/releases",
+                release_response("tool-a", "v1.0.0", "https://example/tool-a-linux-x86_64"),
+            )
+            .with("https://example/tool-a-linux-x86_64", b"tool-a".to_vec())
+            .with(
+                "https://api.github.com/repos/owner/tool-b/releases",
+                release_response("tool-b", "v1.0.0", "https://example/tool-b-linux-x86_64"),
+            )
+            .with("https://example/tool-b-linux-x86_64", b"tool-b".to_vec())
+            .with(
+                "https://api.github.com/repos/owner/tool-c/releases",
+                release_response("tool-c", "v1.0.0", "https://example/tool-c-linux-x86_64"),
+            )
+            .with("https://example/tool-c-linux-x86_64", b"tool-c".to_vec());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[
+                parse_entry("owner/tool-a|github:release|tool-a|-|-", None),
+                parse_entry("owner/tool-b|github:release|tool-b|-|-", None),
+                parse_entry("owner/tool-c|github:release|tool-c|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let requests = fixture.client.requests();
+        let metadata_count = requests
+            .iter()
+            .filter(|(url, _)| url.starts_with("https://api.github.com/repos/owner/tool-"))
+            .count();
+        let asset_count = requests
+            .iter()
+            .filter(|(url, _)| url.starts_with("https://example/tool-"))
+            .count();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items.iter().all(|item| item.changed));
+        assert_eq!(
+            metadata_count, 3,
+            "each release repo should be fetched once; duplicate metadata fetches are the first sign that prefetch results are not being reused"
+        );
+        assert_eq!(asset_count, 3);
+        assert_eq!(
+            fixture.client.max_active(),
+            2,
+            "SHDEPS_JOBS=2 should overlap release metadata checks but never exceed the configured bound"
+        );
+    }
+
+    #[test]
+    fn update_github_release_jobs_one_keeps_remote_checks_sequential() {
+        let mut fixture = Fixture::new("release-prefetch-sequential");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
+        fixture.client = FakeClient::default()
+            .with_delay(Duration::from_millis(5))
+            .with(
+                "https://api.github.com/repos/owner/tool-a/releases",
+                release_response("tool-a", "v1.0.0", "https://example/tool-a-linux-x86_64"),
+            )
+            .with("https://example/tool-a-linux-x86_64", b"tool-a".to_vec())
+            .with(
+                "https://api.github.com/repos/owner/tool-b/releases",
+                release_response("tool-b", "v1.0.0", "https://example/tool-b-linux-x86_64"),
+            )
+            .with("https://example/tool-b-linux-x86_64", b"tool-b".to_vec());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[
+                parse_entry("owner/tool-a|github:release|tool-a|-|-", None),
+                parse_entry("owner/tool-b|github:release|tool-b|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            fixture.client.max_active(),
+            1,
+            "SHDEPS_JOBS=1 is the debugging and low-resource escape hatch, so the prefetch layer must not introduce hidden parallelism"
+        );
+    }
+
+    #[test]
+    fn update_github_release_reuses_gh_token_across_metadata_and_assets() {
+        let mut fixture = Fixture::new("release-token-prefetch");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool-a/releases",
+                release_response("tool-a", "v1.0.0", "https://example/tool-a-linux-x86_64"),
+            )
+            .with("https://example/tool-a-linux-x86_64", b"tool-a".to_vec())
+            .with(
+                "https://api.github.com/repos/owner/tool-b/releases",
+                release_response("tool-b", "v1.0.0", "https://example/tool-b-linux-x86_64"),
+            )
+            .with("https://example/tool-b-linux-x86_64", b"tool-b".to_vec());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_command("gh")
+            .with_success("gh", ["auth", "token"], "gh-token\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[
+                parse_entry("owner/tool-a|github:release|tool-a|-|-", None),
+                parse_entry("owner/tool-b|github:release|tool-b|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let token_calls = runner
+            .calls()
+            .into_iter()
+            .filter(|call| call == &key("gh", ["auth", "token"]))
+            .count();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            token_calls, 1,
+            "`gh auth token` can be noticeably slow; shdeps should resolve it once per update run and reuse it for every release request"
+        );
+        assert!(fixture
+            .client
+            .requests()
+            .iter()
+            .all(|(_, token)| token.as_deref() == Some("gh-token")));
+    }
+
+    #[test]
     fn update_github_release_decompresses_gzip_single_binary() {
         let mut fixture = Fixture::new("release-gz-single");
         fixture.write_lib();
@@ -2282,7 +2460,10 @@ version() { printf 'saw-pkg\n'; }
     #[derive(Debug, Clone, Default)]
     struct FakeClient {
         responses: std::collections::BTreeMap<String, Vec<u8>>,
-        requests: std::cell::RefCell<Vec<(String, Option<String>)>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+        delay: Option<Duration>,
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeClient {
@@ -2291,19 +2472,52 @@ version() { printf 'saw-pkg\n'; }
             self
         }
 
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
+        }
+
         fn requests(&self) -> Vec<(String, Option<String>)> {
-            self.requests.borrow().clone()
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
     impl Client for FakeClient {
         fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+            let active = self
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_active
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            let _guard = ActiveGuard {
+                active: &self.active,
+            };
+            if let Some(delay) = self.delay {
+                std::thread::sleep(delay);
+            }
             self.requests
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .push((url.to_owned(), token.map(ToOwned::to_owned)));
             self.responses.get(url).cloned().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
             })
+        }
+    }
+
+    struct ActiveGuard<'a> {
+        active: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl Drop for ActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -2480,6 +2694,26 @@ version() { printf 'saw-pkg\n'; }
         let mut perms = fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn release_response(cmd: &str, tag: &str, url: &str) -> Vec<u8> {
+        // Keep release fixtures in one helper so performance tests can add
+        // multiple repos without hiding the important assertion behind pages of
+        // repeated GitHub JSON. The asset name still includes the command and
+        // target platform because the selector's matching rules are part of
+        // the behavior those tests are exercising.
+        format!(
+            r#"[{{
+                "tag_name":"{tag}",
+                "draft":false,
+                "prerelease":false,
+                "assets":[{{
+                    "name":"{cmd}-linux-x86_64",
+                    "browser_download_url":"{url}"
+                }}]
+            }}]"#
+        )
+        .into_bytes()
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {

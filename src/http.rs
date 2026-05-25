@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
 /// HTTP client interface used by installer and self-update workflows.
-pub trait Client {
+pub trait Client: Sync {
     /// Downloads `url`, optionally adding a GitHub bearer token.
     fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>>;
 }

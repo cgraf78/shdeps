@@ -256,7 +256,7 @@ mod tests {
     #[derive(Default)]
     struct FakeClient {
         responses: BTreeMap<String, Vec<u8>>,
-        tokens: std::cell::RefCell<Vec<Option<String>>>,
+        tokens: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     impl FakeClient {
@@ -270,13 +270,16 @@ mod tests {
         }
 
         fn tokens(&self) -> Vec<Option<String>> {
-            self.tokens.borrow().clone()
+            self.tokens.lock().unwrap().clone()
         }
     }
 
     impl Client for FakeClient {
         fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
-            self.tokens.borrow_mut().push(token.map(ToOwned::to_owned));
+            self.tokens
+                .lock()
+                .unwrap()
+                .push(token.map(ToOwned::to_owned));
             self.responses
                 .get(url)
                 .cloned()
