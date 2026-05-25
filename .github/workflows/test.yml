@@ -42,7 +42,7 @@ jobs:
         SHDEPS_IMPL=rust SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-test
         SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-wrapper-test
 
-  test:
+  shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@main # zizmor: ignore[unpinned-uses]
     with:
       profiles: base,shellcheck
