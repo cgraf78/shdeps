@@ -18,6 +18,19 @@ case "$asset_platform" in
 esac
 tag=$(scripts/release-tag.sh)
 archive="dist/shdeps-${tag}-${asset_platform}.tar.gz"
+if [[ ! -f "$archive" && -f dist/.shdeps-release-version ]]; then
+  # Local dry-runs are not anchored by a pushed release tag. Reuse the package
+  # script's recorded version when recomputing would point smoke at a different
+  # timestamped archive than the one just built.
+  tag=$(<dist/.shdeps-release-version)
+  case "$tag" in
+    '' | *[!A-Za-z0-9._-]*)
+      printf 'recorded release version is unsafe for asset names: %s\n' "$tag" >&2
+      exit 2
+      ;;
+  esac
+  archive="dist/shdeps-${tag}-${asset_platform}.tar.gz"
+fi
 smoke=$(mktemp -d)
 
 cleanup() {

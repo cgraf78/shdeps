@@ -983,7 +983,7 @@ mod tests {
     use crate::version;
 
     #[test]
-    fn version_prints_embedded_commit() {
+    fn version_prints_embedded_public_version() {
         let (code, stdout, stderr) = run_capture(["version"]);
 
         assert_eq!(code, 0);

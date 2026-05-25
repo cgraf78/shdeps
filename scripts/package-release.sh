@@ -25,11 +25,11 @@ case "$asset_platform" in
 esac
 
 tag=$(scripts/release-tag.sh)
-commit=${SHDEPS_BUILD_COMMIT:-}
+commit=${SHDEPS_BUILD_COMMIT:-${GITHUB_SHA:-}}
 if [[ -z "$commit" ]]; then
-  commit=$(git rev-parse --short HEAD)
+  commit=$(git rev-parse HEAD)
 fi
-if [[ ! "$commit" =~ ^[0-9a-fA-F]{7,}$ ]]; then
+if [[ ! "$commit" =~ ^[0-9a-fA-F]{8,}$ ]]; then
   printf 'build commit must be a concrete git hash, got %s\n' "$commit" >&2
   exit 1
 fi
@@ -47,7 +47,8 @@ trap cleanup EXIT
 # toolchain or a source checkout. Package only the executable plus the stable
 # Bash/sourceable compatibility surface and docs that installer/self-update
 # code knows how to activate.
-cargo build --release --locked --target "$target"
+SHDEPS_BUILD_COMMIT="$commit" SHDEPS_BUILD_VERSION="$tag" \
+  cargo build --release --locked --target "$target"
 
 install -m 0755 "target/${target}/release/shdeps" "$staging/shdeps"
 # `shdeps.sh` is now the Rust-era sourceable wrapper. Keep release archives
@@ -73,6 +74,7 @@ cat >"$staging/.shdeps-install.json" <<EOF
   "schema": 1,
   "method": "release",
   "artifact_platform": "$asset_platform",
+  "version": "$tag",
   "tag": "$tag",
   "commit": "$commit",
   "repo": "cgraf78/shdeps"
@@ -80,6 +82,12 @@ cat >"$staging/.shdeps-install.json" <<EOF
 EOF
 
 mkdir -p "$dist_dir"
+# Non-tag dry-runs mint a timestamped version when package-release starts.
+# The smoke script may run a moment later and recompute a different timestamp,
+# so leave a tiny breadcrumb in the ignored dist directory to keep local
+# package+smoke loops testing the archive that was actually produced. Real tag
+# releases remain governed by the GitHub tag and do not depend on this file.
+printf '%s\n' "$tag" >"${dist_dir}/.shdeps-release-version"
 tar -C "$staging" -czf "${dist_dir}/${asset}" .
 
 # GNU coreutils and macOS expose different checksum commands. Prefer

@@ -402,6 +402,7 @@ pub fn release_archive(
         .map_err(ReleaseArchiveFailure::Stage)?;
     let mut next_metadata = metadata.clone();
     next_metadata.method = Method::Release;
+    next_metadata.version = Some(release.tag.clone());
     next_metadata.tag = Some(release.tag.clone());
     next_metadata.repo = Some(repo.to_owned());
     next_metadata.artifact_platform = artifact_platform_from_pair(&pair);

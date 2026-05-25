@@ -138,11 +138,13 @@ source hooks, or touch the network.
 `shdeps version` MUST print:
 
 ```text
-shdeps commit <short-git-commit>
+shdeps YYYYMMDD-HHMMSS-<8hex>
 ```
 
-It MUST NOT print `unknown`. If a concrete commit cannot be resolved at build or
-runtime, build or startup MUST fail clearly before producing a misleading
+It MUST NOT print `unknown`. The timestamp portion is the generated build or
+release identity timestamp in UTC, and the final eight hex characters MUST
+match the build commit prefix. If a concrete commit cannot be resolved at build
+or runtime, build or startup MUST fail clearly before producing a misleading
 version.
 
 `version` is a cheap command. It MUST NOT load config, detect package managers,
@@ -993,7 +995,7 @@ The stable Bash API is:
 
 | Function | Stdout | Return contract |
 | --- | --- | --- |
-| `shdeps_version` | `shdeps commit <hash>` | `0` when version resolved, non-zero if no concrete commit is available |
+| `shdeps_version` | `shdeps YYYYMMDD-HHMMSS-<8hex>` | `0` when version resolved, non-zero if no concrete commit is available |
 | `shdeps_update [args...]` | human logs | `0` on successful update, `1` on runtime/install failure |
 | `shdeps_self_update [dir]` | human logs/warnings | non-zero when the target is not self-updatable; current Bash returns success for dirty-tree skips and non-destructive pull failures |
 | `shdeps_load` | configured dependency count | `0`; populates Bash reference internals but callers should prefer the count/output contract |
@@ -1474,7 +1476,8 @@ Schema draft:
   "schema": 1,
   "method": "release",
   "artifact_platform": "linux-x86_64-musl",
-  "tag": "v2026.05.23",
+  "version": "20260523-184512-abc12345",
+  "tag": "20260523-184512-abc12345",
   "commit": "abc1234",
   "repo": "cgraf78/shdeps",
   "converted_from": {
@@ -1880,4 +1883,3 @@ These are intentionally unresolved in this draft:
 
 - Whether a C ABI or `staticlib` artifact is needed for a future non-Rust
   consumer.
-- Exact release tag scheme for distribution archives.

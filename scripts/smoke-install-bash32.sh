@@ -55,7 +55,7 @@ trap 'rm -rf "$_tmp_root"' EXIT
 
 _repo_dir=$(_script_dir)
 _repo_dir="${_repo_dir%/scripts}"
-_tag="v2099.02.03"
+_tag="20990203-040506-abc12345"
 _platform=$(_platform_label)
 _archive="shdeps-${_tag}-${_platform}.tar.gz"
 _release_dir="$_tmp_root/release"
@@ -69,7 +69,7 @@ mkdir -p "$_release_dir" "$_payload" "$_fakebin" "$_installer_dir" "$_bin_dir"
 cat >"$_payload/shdeps" <<'SH'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "version" ]]; then
-  printf '%s\n' "shdeps commit abc123456789"
+  printf '%s\n' "shdeps 20990203-040506-abc12345"
 fi
 SH
 chmod +x "$_payload/shdeps"
@@ -81,7 +81,7 @@ cat >"$_payload/shdeps.sh" <<'SH'
 if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
   return 42
 fi
-shdeps_version() { printf '%s\n' "shdeps commit abc123456789"; }
+shdeps_version() { printf '%s\n' "shdeps 20990203-040506-abc12345"; }
 SH
 
 cp "$_repo_dir/install.sh" "$_payload/install.sh"
@@ -89,7 +89,7 @@ cp "$_repo_dir/install.sh" "$_installer_dir/install.sh"
 cp "$_repo_dir/README.md" "$_payload/README.md"
 cp "$_repo_dir/LICENSE" "$_payload/LICENSE"
 cat >"$_payload/.shdeps-install.json" <<JSON
-{"schema":1,"method":"release","artifact_platform":"$_platform","tag":"$_tag","commit":"abc123456789","repo":"cgraf78/shdeps"}
+{"schema":1,"method":"release","artifact_platform":"$_platform","version":"$_tag","tag":"$_tag","commit":"abc123456789","repo":"cgraf78/shdeps"}
 JSON
 
 (cd "$_payload" && tar -czf "$_release_dir/$_archive" .)
@@ -160,6 +160,6 @@ PATH="$_fakebin:$PATH" \
 [[ -L "$_bin_dir/shdeps" ]] || _die "CLI symlink was not created"
 
 _version=$("$_bin_dir/shdeps" version)
-[[ "$_version" == "shdeps commit abc123456789" ]] || _die "unexpected version output: $_version"
+[[ "$_version" == "shdeps 20990203-040506-abc12345" ]] || _die "unexpected version output: $_version"
 
 printf 'install.sh Bash %s release smoke passed\n' "$BASH_VERSION"

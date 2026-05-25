@@ -23,8 +23,8 @@ exit codes, and install behavior.
 - Provide prebuilt binaries for every supported platform.
 - Keep the current test coverage, then extend it with Rust unit,
   integration, parity, compatibility, and release smoke tests.
-- Keep `shdeps version` tied to a concrete git commit. It must never degrade to
-  `unknown`.
+- Keep `shdeps version` readable and tied to a concrete git commit suffix. It
+  must never degrade to `unknown`.
 
 ## Non-Goals
 
@@ -726,22 +726,27 @@ Documentation requirements:
 `shdeps version` must keep returning:
 
 ```text
-shdeps commit <short-hash>
+shdeps YYYYMMDD-HHMMSS-<8hex>
 ```
 
-The Rust build should resolve this through `build.rs`.
+The Rust build should resolve this through `build.rs` and the shared
+`scripts/release-version.sh` formatter.
 
 Resolution order:
 
-1. `SHDEPS_BUILD_COMMIT`, when provided by release CI.
-2. `git rev-parse --short HEAD`, when building from a git checkout.
-3. fail the build.
+1. `SHDEPS_BUILD_VERSION`, when release packaging pins the exact public
+   version.
+2. A pushed release tag with the same `YYYYMMDD-HHMMSS-<8hex>` shape.
+3. `SHDEPS_BUILD_COMMIT`/`GITHUB_SHA` plus `SHDEPS_BUILD_TIMESTAMP`.
+4. `SHDEPS_BUILD_COMMIT`/`GITHUB_SHA` plus the current UTC timestamp.
+5. Git checkout commit plus the current UTC timestamp.
+6. fail the build.
 
 Do not fall back to `unknown`.
 
 `Cargo.toml` may need a package version because Cargo requires one, and release
-tags may use a distribution identifier. That package version must not become the
-runtime shdeps version. The runtime version remains the commit hash.
+tags use the same generated identifier as the runtime binary. The Cargo package
+version must not become the runtime shdeps version.
 
 ## Release And Binary Distribution
 
@@ -785,8 +790,8 @@ shdeps-${TAG}-${ASSET_PLATFORM}.tar.gz.sha256
 Example:
 
 ```text
-shdeps-v2026.05.23-linux-x86_64-musl.tar.gz
-shdeps-v2026.05.23-linux-x86_64-musl.tar.gz.sha256
+shdeps-20260523-184512-abc12345-linux-x86_64-musl.tar.gz
+shdeps-20260523-184512-abc12345-linux-x86_64-musl.tar.gz.sha256
 ```
 
 The archive should contain:
@@ -817,9 +822,9 @@ Release jobs should keep default permissions read-only and grant
 Use pinned Actions revisions, as hive-memory does.
 
 Do not copy hive-memory's Cargo-version tag validation verbatim unless shdeps
-chooses semver package releases. `shdeps` runtime versioning is commit-based,
-so release tag validation should validate the chosen distribution tag scheme
-and ensure `SHDEPS_BUILD_COMMIT` matches the tagged commit.
+chooses semver package releases. `shdeps` runtime versioning is generated from
+build timestamp plus commit suffix, so release tag validation should validate
+that scheme and ensure the suffix matches the tagged commit.
 
 ### Packaging Script
 
@@ -982,7 +987,8 @@ Add a fixture that starts from a Bash-era installed checkout, runs the same
 bootstrap path dotfiles uses, and verifies that:
 
 - the call returns success without manual intervention
-- `shdeps version` resolves to the Rust binary's concrete commit version
+- `shdeps version` resolves to the Rust binary's generated timestamp-plus-commit
+  version
 - `source shdeps.sh; shdeps_update` still works
 - public Bash helpers delegate successfully
 - a failed artifact download/checksum/extraction leaves the Bash install usable
@@ -1282,7 +1288,7 @@ Acceptance:
 
 - Add `Cargo.toml`.
 - Add `src/lib.rs` and `src/main.rs`.
-- Add `build.rs` commit-version enforcement.
+- Add `build.rs` generated-version enforcement.
 - Add top-level module docs that define the crate's public API boundaries.
 - Add initial CI for fmt, clippy, test, and doc checks.
 
@@ -1291,7 +1297,7 @@ Acceptance:
 - `cargo test` passes.
 - `RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps` passes.
 - `cargo build --release` produces the `shdeps` binary.
-- `shdeps version` prints `shdeps commit <hash>`.
+- `shdeps version` prints `shdeps YYYYMMDD-HHMMSS-<8hex>`.
 
 ### Phase 2: Pure Logic
 
@@ -1547,9 +1553,10 @@ Acceptance:
 
 These should be decided before the release workflow lands:
 
-- Release tag format. The runtime version remains commit-based, but release
-  assets still need a distribution tag. A CalVer tag such as `v2026.05.23` fits
-  the no-`VERSION` direction better than reintroducing manual semver.
+- Release tag format. The runtime version, release tag, release archive names,
+  and packaged metadata all use `YYYYMMDD-HHMMSS-<8hex>`. This keeps versions
+  readable and traceable without reintroducing a hand-maintained `VERSION`
+  file.
 - Private release asset access. If the repo or release assets remain private,
   fleet installs need `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`; SSH clone
   auth is not enough.

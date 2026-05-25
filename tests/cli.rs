@@ -9,15 +9,23 @@ fn shdeps() -> Command {
 }
 
 #[test]
-fn version_output_is_commit_based() {
+fn version_output_is_generated_and_commit_traceable() {
     let output = run(shdeps().arg("version"));
 
     assert_success(&output);
     let stdout = text(&output.stdout);
-    assert!(
-        stdout.starts_with("shdeps commit "),
-        "unexpected version output: {stdout:?}"
-    );
+    let version = stdout
+        .strip_prefix("shdeps ")
+        .and_then(|line| line.strip_suffix('\n'))
+        .expect("version output should be a single shdeps line");
+    let parts = version.split('-').collect::<Vec<_>>();
+    assert_eq!(parts.len(), 3, "unexpected version output: {stdout:?}");
+    assert_eq!(parts[0].len(), 8, "unexpected version output: {stdout:?}");
+    assert_eq!(parts[1].len(), 6, "unexpected version output: {stdout:?}");
+    assert_eq!(parts[2].len(), 8, "unexpected version output: {stdout:?}");
+    assert!(parts[0].bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(parts[1].bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert!(
         !stdout.contains("unknown"),
         "version must never fall back to unknown: {stdout:?}"
@@ -850,18 +858,18 @@ fn self_update_release_archive_install_updates_through_cli() {
     fixture.write(
         "release-install/.shdeps-install.json",
         &format!(
-            r#"{{"schema":1,"method":"release","artifact_platform":"{platform}","tag":"v2026.05.23","repo":"cgraf78/shdeps"}}"#
+            r#"{{"schema":1,"method":"release","artifact_platform":"{platform}","tag":"20260523-120000-cafebabe","repo":"cgraf78/shdeps"}}"#
         ),
     );
 
-    let archive_name = format!("shdeps-v2026.05.24-{platform}.tar.gz");
+    let archive_name = format!("shdeps-20260524-120000-deadbeef-{platform}.tar.gz");
     let checksum_name = format!("{archive_name}.sha256");
     write_tar_gz(
         &archive,
         &[
             (
                 "shdeps",
-                "#!/bin/sh\nprintf 'shdeps commit cliupdate\\n'\n",
+                "#!/bin/sh\nprintf 'shdeps 20260524-120000-deadbeef\\n'\n",
                 0o755,
             ),
             ("shdeps.sh", "shdeps_version() { :; }\n", 0o644),
@@ -890,7 +898,7 @@ config=$(cat)
 # shortcuts that the real transport does not use.
 case "$config" in
   *'url = "https://api.github.com/repos/cgraf78/shdeps/releases"'*)
-    printf '[{"tag_name":"v2026.05.24","draft":false,"prerelease":false,"assets":[{"name":"%s","browser_download_url":"https://downloads.example/%s"},{"name":"%s","browser_download_url":"https://downloads.example/%s"}]}]\n' \
+    printf '[{"tag_name":"20260524-120000-deadbeef","draft":false,"prerelease":false,"assets":[{"name":"%s","browser_download_url":"https://downloads.example/%s"},{"name":"%s","browser_download_url":"https://downloads.example/%s"}]}]\n' \
       "$SHDEPS_TEST_ARCHIVE_NAME" "$SHDEPS_TEST_ARCHIVE_NAME" \
       "$SHDEPS_TEST_CHECKSUM_NAME" "$SHDEPS_TEST_CHECKSUM_NAME"
     ;;
@@ -919,16 +927,19 @@ esac
     let output = run(&mut command);
 
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "shdeps: updated to v2026.05.24\n");
+    assert_eq!(
+        text(&output.stdout),
+        "shdeps: updated to 20260524-120000-deadbeef\n"
+    );
     assert_eq!(text(&output.stderr), "");
     assert_eq!(
         fs::read_to_string(install.join("shdeps")).unwrap(),
-        "#!/bin/sh\nprintf 'shdeps commit cliupdate\\n'\n"
+        "#!/bin/sh\nprintf 'shdeps 20260524-120000-deadbeef\\n'\n"
     );
     let metadata = shdeps::install_metadata::read(&install).unwrap();
     assert!(
         matches!(metadata, shdeps::install_metadata::Read::Valid(metadata)
-            if metadata.tag.as_deref() == Some("v2026.05.24")
+            if metadata.tag.as_deref() == Some("20260524-120000-deadbeef")
                 && metadata.artifact_platform.as_deref() == Some(platform.as_str())
                 && metadata.repo.as_deref() == Some("cgraf78/shdeps"))
     );

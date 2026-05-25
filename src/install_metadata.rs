@@ -72,6 +72,13 @@ pub struct Metadata {
     /// Release artifact platform label such as `linux-x86_64-musl`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_platform: Option<String>,
+    /// Public shdeps version reported by the installed binary.
+    ///
+    /// For release archives this is intentionally the same value as `tag`.
+    /// Keeping the field explicit avoids forcing diagnostics and future
+    /// migration code to infer the runtime version from release-specific state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Release tag used by the current install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
@@ -97,6 +104,7 @@ impl Metadata {
             schema: SCHEMA,
             method,
             artifact_platform: None,
+            version: None,
             tag: None,
             commit: None,
             repo: None,
@@ -179,8 +187,9 @@ mod tests {
         let dir = temp_dir("round-trip");
         let mut metadata = Metadata::new(Method::Release);
         metadata.artifact_platform = Some("linux-x86_64-musl".to_owned());
-        metadata.tag = Some("v2026.05.23".to_owned());
-        metadata.commit = Some("abc1234".to_owned());
+        metadata.version = Some("20260523-184512-abc12345".to_owned());
+        metadata.tag = Some("20260523-184512-abc12345".to_owned());
+        metadata.commit = Some("abc123456789".to_owned());
         metadata.repo = Some("cgraf78/shdeps".to_owned());
         metadata.converted_from = Some(ConvertedFrom {
             method: Method::Git,

@@ -3,7 +3,9 @@ name: Release
 on:
   push:
     tags:
-      - v*.*.*
+      # GitHub's filter glob is intentionally coarse here; scripts/release-tag.sh
+      # performs the exact YYYYMMDD-HHMMSS-<8hex> validation against the commit.
+      - "20*"
 
 permissions:
   contents: read
@@ -14,9 +16,9 @@ jobs:
     permissions:
       contents: write
     with:
-      # shdeps deliberately keeps runtime versions commit-based, while release
-      # archives use human-facing distribution tags. Ask the shared workflow to
-      # validate the exact tag instead of forcing this repo through Cargo's
+      # shdeps' public version is generated from build time plus the commit
+      # suffix, not from Cargo.toml semver. Ask the shared workflow to validate
+      # the exact release tag instead of forcing this repo through Cargo's
       # semver-oriented `version-command` + `tag-prefix` path.
       tag-command: scripts/release-tag.sh
       setup-command: |

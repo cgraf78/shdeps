@@ -61,14 +61,14 @@ _copy_bootstrap_fixture() {
 }
 
 _write_fake_release_shdeps() {
-  local path="$1" commit="$2"
+  local path="$1" version="$2"
 
   cat >"$path" <<SH
 #!/usr/bin/env bash
-_commit="$commit"
+_version="$version"
 case "\${1:-}" in
   version)
-    printf '%s\n' "shdeps commit \$_commit"
+    printf '%s\n' "shdeps \$_version"
     ;;
   __api)
     case "\${2:-}" in
@@ -4468,15 +4468,15 @@ _assert_eq "shdeps_version: packaged commit" "shdeps commit abcdef123456" "$pack
 
 _release_tag=$(
   cd "$SHDEPS_DIR" || exit 1
-  env -u SHDEPS_RELEASE_TAG SHDEPS_BUILD_COMMIT=abcdef123456 GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
+  env SHDEPS_BUILD_COMMIT=abcdef123456 SHDEPS_BUILD_TIMESTAMP=20990203-040506 GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
 )
-_assert_eq "release tag: branch ref uses commit identity" "dev-abcdef1" "$_release_tag"
+_assert_eq "release tag: branch ref uses generated identity" "20990203-040506-abcdef12" "$_release_tag"
 
 _release_tag=$(
   cd "$SHDEPS_DIR" || exit 1
-  env -u SHDEPS_RELEASE_TAG GITHUB_REF_TYPE=tag GITHUB_REF_NAME=v1.2.3 scripts/release-tag.sh
+  env SHDEPS_BUILD_COMMIT=abcdef123456 GITHUB_REF_TYPE=tag GITHUB_REF_NAME=20990203-040506-abcdef12 scripts/release-tag.sh
 )
-_assert_eq "release tag: tag ref is preserved" "v1.2.3" "$_release_tag"
+_assert_eq "release tag: version tag ref is preserved" "20990203-040506-abcdef12" "$_release_tag"
 
 _release_workflow=$(cat "$SHDEPS_DIR/.github/workflows/release.yml")
 _assert_contains "release workflow: uses exact reusable tag command" \
@@ -4505,9 +4505,9 @@ _assert_exit "smoke release: rejects Rust target label" 2 "$rc"
 
 _release_tag=$(
   cd "$SHDEPS_DIR" || exit 1
-  env SHDEPS_RELEASE_TAG=dev-explicit GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
+  env SHDEPS_BUILD_COMMIT=abcdef123456 SHDEPS_BUILD_VERSION=20990204-050607-abcdef12 GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
 )
-_assert_eq "release tag: explicit override wins" "dev-explicit" "$_release_tag"
+_assert_eq "release tag: explicit build version wins" "20990204-050607-abcdef12" "$_release_tag"
 
 # ===========================================================================
 # Section 11: install.sh
@@ -4520,7 +4520,7 @@ _install_script="$SHDEPS_DIR/install.sh"
 _install_repo="$SHDEPS_DIR"
 _install_build_bin=$(_mock_bin)
 _install_fake_shdeps="$_install_build_bin/shdeps-built"
-_write_fake_release_shdeps "$_install_fake_shdeps" "sourcebuild123456"
+_write_fake_release_shdeps "$_install_fake_shdeps" "20990203-040506-abc12345"
 _write_fake_cargo_build "$_install_build_bin/cargo"
 
 # --- Fresh install into empty dir ---
@@ -4542,7 +4542,7 @@ _bundle_dir=$(_tmpdir)/shdeps-bundle
 _bundle_inst=$(_tmpdir)/shdeps-bundle-install
 _bundle_bin=$(_tmpdir)/bundle-bin
 mkdir -p "$_bundle_dir" "$_bundle_bin" "$_bundle_dir/man/man1" "$_bundle_dir/completions"
-_write_fake_release_shdeps "$_bundle_dir/shdeps" "abcdef123456"
+_write_fake_release_shdeps "$_bundle_dir/shdeps" "20990203-040506-abcdef12"
 printf '%s\n' "SHDEPS_PACKAGED_COMMIT=abcdef123456" >"$_bundle_dir/shdeps.sh"
 cat "$SHDEPS_DIR/shdeps.sh" >>"$_bundle_dir/shdeps.sh"
 cp "$SHDEPS_DIR/install.sh" "$_bundle_dir/install.sh"
@@ -4554,7 +4554,7 @@ cp "$SHDEPS_DIR/completions/shdeps.bash" "$_bundle_dir/completions/shdeps.bash"
 cp "$SHDEPS_DIR/completions/shdeps.zsh" "$_bundle_dir/completions/shdeps.zsh"
 cp "$SHDEPS_DIR/completions/shdeps.fish" "$_bundle_dir/completions/shdeps.fish"
 cat >"$_bundle_dir/.shdeps-install.json" <<'JSON'
-{"schema":1,"method":"release","artifact_platform":"test","tag":"dev-test","commit":"abcdef123456","repo":"cgraf78/shdeps"}
+{"schema":1,"method":"release","artifact_platform":"test","version":"20990203-040506-abcdef12","tag":"20990203-040506-abcdef12","commit":"abcdef123456","repo":"cgraf78/shdeps"}
 JSON
 
 SHDEPS_DIR="$_bundle_inst" SHDEPS_BIN="$_bundle_bin/shdeps" \
@@ -4570,14 +4570,14 @@ _assert_eq "install bundle: CLI points at release binary" "$_bundle_inst/shdeps"
 _bundle_update_dir=$(_tmpdir)/shdeps-bundle-update
 mkdir -p "$_bundle_update_dir"
 cp -R "$_bundle_dir/." "$_bundle_update_dir/"
-_write_fake_release_shdeps "$_bundle_update_dir/shdeps" "222222222222"
+_write_fake_release_shdeps "$_bundle_update_dir/shdeps" "20990204-050607-22222222"
 cat >"$_bundle_update_dir/.shdeps-install.json" <<'JSON'
-{"schema":1,"method":"release","artifact_platform":"test","tag":"dev-test-2","commit":"222222222222","repo":"cgraf78/shdeps"}
+{"schema":1,"method":"release","artifact_platform":"test","version":"20990204-050607-22222222","tag":"20990204-050607-22222222","commit":"222222222222","repo":"cgraf78/shdeps"}
 JSON
 SHDEPS_DIR="$_bundle_inst" SHDEPS_BIN="$_bundle_bin/shdeps" \
   "$_bundle_update_dir/install.sh" >/dev/null 2>&1
 _assert_eq "install bundle replace: binary updated" \
-  "shdeps commit 222222222222" "$("$_bundle_inst/shdeps" version)"
+  "shdeps 20990204-050607-22222222" "$("$_bundle_inst/shdeps" version)"
 _assert_symlink "install bundle replace: CLI symlink preserved" "$_bundle_bin/shdeps"
 _bundle_link=$(readlink "$_bundle_bin/shdeps")
 _assert_eq "install bundle replace: CLI still points at release binary" "$_bundle_inst/shdeps" "$_bundle_link"
@@ -4624,7 +4624,7 @@ SHDEPS_DIR="$_bundle_inst" SHDEPS_BIN="$_bundle_bin/shdeps" \
   "$_bad_replace_dir/install.sh" >/dev/null 2>&1 || rc=$?
 _assert_exit "install bundle replace failure: exits 1" 1 "$rc"
 _assert_eq "install bundle replace failure: old binary preserved" \
-  "shdeps commit 222222222222" "$("$_bundle_inst/shdeps" version)"
+  "shdeps 20990204-050607-22222222" "$("$_bundle_inst/shdeps" version)"
 _assert_symlink "install bundle replace failure: CLI symlink preserved" "$_bundle_bin/shdeps"
 
 # --- Curl-pipe mode downloads and installs latest release archive ---
@@ -4638,7 +4638,7 @@ case "$(uname -s | tr '[:upper:]' '[:lower:]'):$(uname -m | tr '[:upper:]' '[:lo
 esac
 
 if [[ -n "$_release_platform" ]]; then
-  _release_tag="v2099.01.01"
+  _release_tag="20990101-020304-fedcba98"
   _release_archive="shdeps-${_release_tag}-${_release_platform}.tar.gz"
   _release_dir=$(_tmpdir)/release
   _release_payload=$(_tmpdir)/release-payload
@@ -4648,7 +4648,7 @@ if [[ -n "$_release_platform" ]]; then
   _release_fakebin=$(_mock_bin)
   mkdir -p "$_release_dir" "$_release_payload/man/man1" "$_release_payload/completions" \
     "$_release_installer" "$_release_bin"
-  _write_fake_release_shdeps "$_release_payload/shdeps" "fedcba987654"
+  _write_fake_release_shdeps "$_release_payload/shdeps" "$_release_tag"
   printf '%s\n' "SHDEPS_PACKAGED_COMMIT=fedcba987654" >"$_release_payload/shdeps.sh"
   cat "$SHDEPS_DIR/shdeps.sh" >>"$_release_payload/shdeps.sh"
   cp "$SHDEPS_DIR/install.sh" "$_release_payload/install.sh"
@@ -4660,7 +4660,7 @@ if [[ -n "$_release_platform" ]]; then
   cp "$SHDEPS_DIR/completions/shdeps.zsh" "$_release_payload/completions/shdeps.zsh"
   cp "$SHDEPS_DIR/completions/shdeps.fish" "$_release_payload/completions/shdeps.fish"
   cat >"$_release_payload/.shdeps-install.json" <<JSON
-{"schema":1,"method":"release","artifact_platform":"$_release_platform","tag":"$_release_tag","commit":"fedcba987654","repo":"cgraf78/shdeps"}
+{"schema":1,"method":"release","artifact_platform":"$_release_platform","version":"$_release_tag","tag":"$_release_tag","commit":"fedcba987654","repo":"cgraf78/shdeps"}
 JSON
   tar -C "$_release_payload" -czf "$_release_dir/$_release_archive" .
   if command -v sha256sum >/dev/null 2>&1; then
@@ -4758,7 +4758,7 @@ if [[ "$1" == clone && "$2" == --depth && "$3" == 1 ]]; then
   dest="$5"
   mkdir -p "$dest"
   cat >"$dest/shdeps.sh" <<'LIB'
-shdeps_version() { printf '%s\n' "shdeps commit sourcefb"; }
+shdeps_version() { printf '%s\n' "shdeps 20990102-030405-abc12345"; }
 LIB
   cat >"$dest/install.sh" <<'INST'
 #!/usr/bin/env bash
@@ -4768,8 +4768,8 @@ INST
   printf '%s\n' "license" >"$dest/LICENSE"
   exit 0
 fi
-if [[ "$1" == -C && "$3" == rev-parse && "$4" == --short && "$5" == HEAD ]]; then
-  printf '%s\n' "sourcefb1234"
+if [[ "$1" == -C && "$3" == rev-parse && "$4" == HEAD ]]; then
+  printf '%s\n' "abc123456789abcdef"
   exit 0
 fi
 exit 1
@@ -4783,7 +4783,7 @@ mkdir -p target/release
 cat >target/release/shdeps <<'BIN'
 #!/usr/bin/env bash
 if [[ "${1:-}" == version ]]; then
-  printf '%s\n' "shdeps commit sourcefb1234"
+  printf '%s\n' "shdeps 20990102-030405-abc12345"
 fi
 BIN
 chmod +x target/release/shdeps
@@ -4805,7 +4805,7 @@ SH
   _assert_contains "install source fallback: metadata records source-build" \
     '"method":"source-build"' "$(cat "$_source_fb_inst/.shdeps-install.json")"
   _assert_eq "install source fallback: CLI runs built binary" \
-    "shdeps commit sourcefb1234" "$("$_source_fb_bin/shdeps" version)"
+    "shdeps 20990102-030405-abc12345" "$("$_source_fb_bin/shdeps" version)"
 else
   _pass "install release: unsupported host platform skipped"
 fi

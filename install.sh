@@ -324,7 +324,7 @@ _install_release() {
 }
 
 _install_source_build_fallback() {
-  local fallback parent staging commit
+  local fallback parent staging commit version
 
   if [[ "${_SHDEPS_RELEASE_FAILURE_KIND:-}" != "download" ]]; then
     return 1
@@ -360,9 +360,10 @@ _install_source_build_fallback() {
     return 1
   fi
   ln -sf "target/release/shdeps" "$staging/shdeps"
-  commit=$(git -C "$staging" rev-parse --short HEAD 2>/dev/null || true)
+  commit=$(git -C "$staging" rev-parse HEAD 2>/dev/null || true)
+  version=$("$staging/target/release/shdeps" version 2>/dev/null | sed -n 's/^shdeps //p' | head -n 1 || true)
   cat >"$staging/.shdeps-install.json" <<JSON
-{"schema":1,"method":"source-build","repo":"$(_repo_slug)","commit":"$commit"}
+{"schema":1,"method":"source-build","repo":"$(_repo_slug)","version":"$version","commit":"$commit"}
 JSON
   if ! mv "$staging" "$SHDEPS_DIR"; then
     rm -rf "$staging"
