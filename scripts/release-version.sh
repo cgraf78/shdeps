@@ -5,9 +5,10 @@ set -euo pipefail
 # packaged metadata, and `shdeps version`.
 #
 # shdeps no longer has a hand-maintained VERSION file, but release binaries
-# still need a readable identity. The timestamp makes it obvious when the build
-# identity was minted, while the commit suffix keeps source-only installs and
-# release assets traceable back to the exact git history they came from.
+# still need a readable identity. The timestamp comes from the commit when Git
+# metadata is available, so the same commit maps to the same release version.
+# The hash suffix keeps source-only installs and release assets traceable back
+# to the exact git history they came from.
 
 _valid_commit() {
   [[ "${1:-}" =~ ^[0-9a-fA-F]{8,}$ ]]
@@ -32,9 +33,18 @@ _commit_from_git() {
 
 _current_timestamp() {
   # `date -u +FORMAT` is available on GNU and BSD/macOS date. Keep this helper
-  # shell-portable because release creation is allowed from developer laptops,
-  # not just from a homogeneous CI image.
+  # as a fallback for source snapshots that provide a commit but no git object.
   date -u +%Y%m%d-%H%M%S
+}
+
+_commit_timestamp() {
+  local commit="$1"
+
+  # Git's `format-local` uses the process timezone, so forcing TZ=UTC gives the
+  # same YYYYMMDD-HHMMSS tag prefix on developer laptops and CI runners. This
+  # keeps release tags deterministic for a commit without depending on GNU-only
+  # or BSD-only `date` epoch conversion flags.
+  TZ=UTC git show -s --date=format-local:%Y%m%d-%H%M%S --format=%cd "$commit" 2>/dev/null || true
 }
 
 _ref_version() {
@@ -79,6 +89,9 @@ if [[ -n "$version" ]]; then
 fi
 
 timestamp=${SHDEPS_BUILD_TIMESTAMP:-}
+if [[ -z "$timestamp" ]]; then
+  timestamp=$(_commit_timestamp "$commit")
+fi
 if [[ -z "$timestamp" ]]; then
   timestamp=$(_current_timestamp)
 fi

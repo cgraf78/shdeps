@@ -82,11 +82,10 @@ cat >"$staging/.shdeps-install.json" <<EOF
 EOF
 
 mkdir -p "$dist_dir"
-# Non-tag dry-runs mint a timestamped version when package-release starts.
-# The smoke script may run a moment later and recompute a different timestamp,
-# so leave a tiny breadcrumb in the ignored dist directory to keep local
-# package+smoke loops testing the archive that was actually produced. Real tag
-# releases remain governed by the GitHub tag and do not depend on this file.
+# Local package+smoke loops should test the archive that was actually produced,
+# even when the caller is using explicit build env or a source snapshot without
+# Git metadata. Real tag releases remain governed by the GitHub tag and do not
+# depend on this ignored breadcrumb.
 printf '%s\n' "$tag" >"${dist_dir}/.shdeps-release-version"
 tar -C "$staging" -czf "${dist_dir}/${asset}" .
 

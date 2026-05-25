@@ -16,10 +16,10 @@ jobs:
     permissions:
       contents: write
     with:
-      # shdeps' public version is generated from build time plus the commit
-      # suffix, not from Cargo.toml semver. Ask the shared workflow to validate
-      # the exact release tag instead of forcing this repo through Cargo's
-      # semver-oriented `version-command` + `tag-prefix` path.
+      # shdeps' public version is generated from the UTC committer timestamp
+      # plus the commit suffix, not from Cargo.toml semver. Ask the shared
+      # workflow to validate the exact release tag instead of forcing this repo
+      # through Cargo's semver-oriented `version-command` + `tag-prefix` path.
       tag-command: scripts/release-tag.sh
       setup-command: |
         if [[ "$RUNNER_OS" == "Linux" ]]; then

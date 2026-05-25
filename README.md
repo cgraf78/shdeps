@@ -448,8 +448,8 @@ After `main` is clean, current, and green in CI, cut a release with:
 scripts/release.sh --push
 ```
 
-The script creates the timestamp/hash release tag and pushes it. GitHub Actions
-then builds and smokes the release artifacts. Archive names use:
+The script creates the UTC committer-timestamp/hash release tag and pushes it.
+GitHub Actions then builds and smokes the release artifacts. Archive names use:
 
 ```text
 shdeps-YYYYMMDD-HHMMSS-<8hex>-<asset-platform>.tar.gz

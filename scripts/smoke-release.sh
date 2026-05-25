@@ -20,8 +20,8 @@ tag=$(scripts/release-tag.sh)
 archive="dist/shdeps-${tag}-${asset_platform}.tar.gz"
 if [[ ! -f "$archive" && -f dist/.shdeps-release-version ]]; then
   # Local dry-runs are not anchored by a pushed release tag. Reuse the package
-  # script's recorded version when recomputing would point smoke at a different
-  # timestamped archive than the one just built.
+  # script's recorded version so smoke always verifies the archive produced by
+  # the immediately preceding package step.
   tag=$(<dist/.shdeps-release-version)
   case "$tag" in
     '' | *[!A-Za-z0-9._-]*)
