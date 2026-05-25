@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-  printf 'usage: scripts/package-release.sh <rust-target> [asset-platform]\n' >&2
+if [[ $# -ne 2 ]]; then
+  printf 'usage: scripts/package-release.sh <rust-target> <asset-platform>\n' >&2
   exit 2
 fi
 
 target=$1
-asset_platform=${2:-$target}
+asset_platform=$2
 
 case "$asset_platform" in
   '' | *[!A-Za-z0-9._-]*)
     printf 'asset platform contains characters unsafe for asset names: %s\n' "$asset_platform" >&2
+    exit 2
+    ;;
+  *unknown*)
+    # Rust target triples include a vendor field (`unknown` for the targets we
+    # use), but that is compiler plumbing rather than user-facing release
+    # identity. Require the caller to pass the installer-facing platform label
+    # from the release matrix so published assets stay readable and stable.
+    printf 'asset platform must be a public release label, not a Rust target triple: %s\n' "$asset_platform" >&2
     exit 2
     ;;
 esac

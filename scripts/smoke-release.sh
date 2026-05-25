@@ -7,6 +7,15 @@ if [[ $# -ne 1 ]]; then
 fi
 
 asset_platform=$1
+case "$asset_platform" in
+  *unknown*)
+    # Smoke tests run against the same label that gets uploaded. Reject target
+    # triples here too so a workflow edit cannot package a clean label but smoke
+    # a different, Rust-internal archive name by mistake.
+    printf 'asset platform must be a public release label, not a Rust target triple: %s\n' "$asset_platform" >&2
+    exit 2
+    ;;
+esac
 tag=$(scripts/release-tag.sh)
 archive="dist/shdeps-${tag}-${asset_platform}.tar.gz"
 smoke=$(mktemp -d)

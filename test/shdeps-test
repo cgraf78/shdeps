@@ -4482,6 +4482,27 @@ _release_workflow=$(cat "$SHDEPS_DIR/.github/workflows/release.yml")
 _assert_contains "release workflow: reusable tag prefix disabled" \
   'tag-prefix: ""' "$_release_workflow"
 
+rc=0
+(
+  cd "$SHDEPS_DIR" || exit 1
+  scripts/package-release.sh x86_64-unknown-linux-musl >/dev/null 2>&1
+) || rc=$?
+_assert_exit "package release: requires public asset label" 2 "$rc"
+
+rc=0
+(
+  cd "$SHDEPS_DIR" || exit 1
+  scripts/package-release.sh x86_64-unknown-linux-musl x86_64-unknown-linux-musl >/dev/null 2>&1
+) || rc=$?
+_assert_exit "package release: rejects Rust target label" 2 "$rc"
+
+rc=0
+(
+  cd "$SHDEPS_DIR" || exit 1
+  scripts/smoke-release.sh x86_64-unknown-linux-musl >/dev/null 2>&1
+) || rc=$?
+_assert_exit "smoke release: rejects Rust target label" 2 "$rc"
+
 _release_tag=$(
   cd "$SHDEPS_DIR" || exit 1
   env SHDEPS_RELEASE_TAG=dev-explicit GITHUB_REF_TYPE=branch GITHUB_REF_NAME=rust-port scripts/release-tag.sh
