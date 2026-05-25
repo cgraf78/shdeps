@@ -30,7 +30,7 @@ pub struct Entry {
 #[must_use]
 pub fn canonical_name(name: &str, method: &str) -> String {
     match method {
-        "github:repo" | "github:release" => name
+        "github" | "github:repo" | "github:release" => name
             .strip_suffix(".git")
             .filter(|_| name.contains('/'))
             .unwrap_or(name)
@@ -306,10 +306,13 @@ mod tests {
     #[test]
     fn parse_entry_canonicalizes_github_git_suffix() {
         let repo = parse_entry("cgraf78/ds.git|github:repo", None);
+        let auto = parse_entry("owner/auto.git|github|auto", None);
         let release = parse_entry("owner/tool.git|github:release|tool", None);
 
         assert_eq!(repo.name, "cgraf78/ds");
         assert_eq!(repo.cmd, "ds");
+        assert_eq!(auto.name, "owner/auto");
+        assert_eq!(auto.cmd, "auto");
         assert_eq!(release.name, "owner/tool");
         assert_eq!(release.cmd, "tool");
     }
@@ -334,6 +337,10 @@ mod tests {
         assert_eq!(
             parse_config_line("cgraf78/ds.git github:repo").as_deref(),
             Some("cgraf78/ds|github:repo")
+        );
+        assert_eq!(
+            parse_config_line("owner/auto.git github").as_deref(),
+            Some("owner/auto|github")
         );
         assert_eq!(
             parse_config_line("tool.git pkg").as_deref(),

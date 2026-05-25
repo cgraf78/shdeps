@@ -603,6 +603,35 @@ fn list_reports_configured_dependency_statuses() {
 }
 
 #[test]
+fn list_resolves_bare_github_to_concrete_release_method() {
+    let fixture = Fixture::new("list-github-release");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable("bin/tool", "#!/bin/sh\nprintf '1.0.0\\n'\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.dir.join("bin/tool").display()
+        ),
+    );
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &["tool-v1.0.0-linux-x86_64"]),
+        "unused",
+    );
+
+    let mut command = fixture.command(["list"]);
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert!(text(&output.stdout).contains("owner/tool github:release installed"));
+    assert!(!text(&output.stdout).contains(" github "));
+}
+
+#[test]
 fn check_reports_installed_skipped_missing_and_unknown() {
     let fixture = Fixture::new("check-status");
     fixture.write(
@@ -644,6 +673,135 @@ fn check_reports_installed_skipped_missing_and_unknown() {
         text(&usage.stderr),
         "error: check requires a dependency name\nUsage: shdeps check <name>\n"
     );
+}
+
+#[test]
+fn update_bare_github_prefers_release_and_records_concrete_manifest_method() {
+    let fixture = Fixture::new("update-github-release");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &["tool-v1.0.0-linux-x86_64"]),
+        "#!/bin/sh\nprintf 'release asset\\n'\n",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("bin/tool")).unwrap(),
+        "#!/bin/sh\nprintf 'release asset\\n'\n"
+    );
+    assert!(!fixture.dir.join("share/owner/tool").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.dir.join("bin/tool").display()
+        )
+    );
+}
+
+#[test]
+fn update_bare_github_falls_back_to_repo_and_uses_local_clone() {
+    let fixture = Fixture::new("update-github-repo");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &["tool-v1.0.0-darwin-aarch64"]),
+        "unused",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_link(fixture.dir.join("share/owner/tool")).unwrap(),
+        fixture.dir.join("git/tool")
+    );
+    assert_eq!(
+        fs::read_link(fixture.dir.join("bin/tool")).unwrap(),
+        fixture.dir.join("share/owner/tool/bin/tool")
+    );
+    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
+        .unwrap()
+        .contains("owner/tool|github:repo|tool|"));
+}
+
+#[test]
+fn update_bare_github_transitions_repo_to_release_after_release_appears() {
+    let fixture = Fixture::new("update-github-repo-to-release");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable("share/owner/tool/bin/tool", "#!/bin/sh\nprintf 'repo\\n'\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "owner/tool|github:repo|tool|{}\n",
+            fixture.dir.join("share/owner/tool").display()
+        ),
+    );
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &["tool-v1.0.0-linux-x86_64"]),
+        "#!/bin/sh\nprintf 'release asset\\n'\n",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert!(!fixture.dir.join("share/owner/tool").exists());
+    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
+        .unwrap()
+        .contains("owner/tool|github:release|tool|"));
+}
+
+#[test]
+fn update_bare_github_transitions_release_to_repo_when_release_is_unavailable() {
+    let fixture = Fixture::new("update-github-release-to-repo");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
+    fixture.write_executable("bin/tool", "#!/bin/sh\nprintf 'old release\\n'\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.dir.join("bin/tool").display()
+        ),
+    );
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &["tool-v1.0.0-darwin-aarch64"]),
+        "unused",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_link(fixture.dir.join("share/owner/tool")).unwrap(),
+        fixture.dir.join("git/tool")
+    );
+    assert!(fs::read_to_string(fixture.dir.join("state/manifest"))
+        .unwrap()
+        .contains("owner/tool|github:repo|tool|"));
 }
 
 #[test]
@@ -1013,6 +1171,19 @@ fn write_tar_gz(path: &Path, entries: &[(&str, &str, u32)]) {
     encoder.finish().unwrap();
 }
 
+fn release_json(tag: &str, assets: &[&str]) -> String {
+    let assets = assets
+        .iter()
+        .map(|asset| {
+            format!(
+                r#"{{"name":"{asset}","browser_download_url":"https://downloads.example/{asset}"}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"[{{"tag_name":"{tag}","draft":false,"prerelease":false,"assets":[{assets}]}}]"#)
+}
+
 struct Fixture {
     dir: PathBuf,
 }
@@ -1041,6 +1212,11 @@ impl Fixture {
             .env("SHDEPS_BIN_DIR", self.dir.join("bin"))
             .env("SHDEPS_TEST_PLATFORM", "linux")
             .env("SHDEPS_TEST_HOST", "test-host")
+            .env(
+                "SHDEPS_TEST_RELEASE_JSON",
+                self.dir.join("fake/release.json"),
+            )
+            .env("SHDEPS_TEST_RELEASE_ASSET", self.dir.join("fake/asset"))
             .args(args);
         command
     }
@@ -1058,6 +1234,30 @@ impl Fixture {
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn write_fake_curl(&self, releases_json: &str, asset_body: &str) {
+        self.write("fake/release.json", releases_json);
+        self.write("fake/asset", asset_body);
+        self.write_executable(
+            "fakebin/curl",
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+config=$(cat)
+case "$config" in
+  *'url = "https://api.github.com/repos/owner/tool/releases"'*)
+    cat "$SHDEPS_TEST_RELEASE_JSON"
+    ;;
+  *'url = "https://downloads.example/'*)
+    cat "$SHDEPS_TEST_RELEASE_ASSET"
+    ;;
+  *)
+    printf 'unexpected curl config\n%s\n' "$config" >&2
+    exit 22
+    ;;
+esac
+"#,
+        );
     }
 
     fn write_fresh_stamp(&self, name: &str, kind: &str) {

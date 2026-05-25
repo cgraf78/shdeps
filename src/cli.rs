@@ -13,6 +13,7 @@ use crate::api;
 use crate::config::{self, Entry};
 use crate::dep_path;
 use crate::errors::Error;
+use crate::github_method;
 use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::http::Curl;
 use crate::jobs;
@@ -286,6 +287,9 @@ where
         return Ok(0);
     }
 
+    let env = runtime::runtime_env(&ProcessEnv);
+    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let entries = resolve_github_entries(&entries, &roots, &env, &env_vars, options)?;
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let package_versions = if entries.iter().any(|entry| entry.method == "pkg") {
         process::package_versions(&Process, &pkg_mgr)
@@ -293,8 +297,6 @@ where
         BTreeMap::new()
     };
     let custom = custom_probe();
-    let env = runtime::runtime_env(&ProcessEnv);
-    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
     let context = StatusContext {
         roots: &roots,
         env: &env,
@@ -350,6 +352,9 @@ where
             Some(&pkg_mgr)
         },
     );
+    let env = runtime::runtime_env(&ProcessEnv);
+    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let entry = resolve_github_entry(&entry, &roots, &env, &env_vars, options)?;
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let package_versions = if entry.method == "pkg" {
         process::package_versions(&Process, &pkg_mgr)
@@ -357,7 +362,6 @@ where
         BTreeMap::new()
     };
     let custom = custom_probe();
-    let env = runtime::runtime_env(&ProcessEnv);
     let context = StatusContext {
         roots: &roots,
         env: &env,
@@ -404,6 +408,19 @@ where
     let hooks = custom_probe();
     let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let update_options = UpdateOptions {
+        reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
+        force: runtime::force(&ProcessEnv, &options.overrides),
+        remote_ttl: remote_ttl(),
+        ..UpdateOptions::default()
+    };
+    let entries = resolve_github_entries_with_options(
+        &entries,
+        &roots,
+        &env,
+        &env_vars,
+        github_options_from_update(update_options),
+    )?;
     let context = UpdateContext {
         manifest_path: &manifest_path,
         roots: &roots,
@@ -414,13 +431,6 @@ where
         env_vars: &env_vars,
         client: &Curl,
     };
-    let update_options = UpdateOptions {
-        reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
-        force: runtime::force(&ProcessEnv, &options.overrides),
-        remote_ttl: remote_ttl(),
-        ..UpdateOptions::default()
-    };
-
     if !options.quiet {
         // This line looks cosmetic, but it is part of the legacy bootstrap
         // contract. dotfiles and humans both use it as the boundary between
@@ -471,6 +481,9 @@ where
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     let raw_entries = config::load_dir(&roots.conf_dir)?;
     let entries = parse_entries(&raw_entries, "");
+    let env = runtime::runtime_env(&ProcessEnv);
+    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let entries = resolve_github_entries(&entries, &roots, &env, &env_vars, options)?;
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
     let hooks = custom_probe();
@@ -626,6 +639,68 @@ fn parse_entries(raw_entries: &[String], pkg_mgr: &str) -> Vec<Entry> {
         .iter()
         .map(|entry| config::parse_entry(entry, pkg_mgr))
         .collect()
+}
+
+fn resolve_github_entries(
+    entries: &[Entry],
+    roots: &runtime::Roots,
+    env: &crate::platform::RuntimeEnv,
+    env_vars: &BTreeMap<String, String>,
+    options: &ParsedOptions,
+) -> Result<Vec<Entry>> {
+    resolve_github_entries_with_options(entries, roots, env, env_vars, github_options(options))
+}
+
+fn resolve_github_entry(
+    entry: &Entry,
+    roots: &runtime::Roots,
+    env: &crate::platform::RuntimeEnv,
+    env_vars: &BTreeMap<String, String>,
+    options: &ParsedOptions,
+) -> Result<Entry> {
+    let context = github_method::Context {
+        roots,
+        env,
+        env_vars,
+        runner: &Process,
+        client: &Curl,
+    };
+    github_method::resolve_entry(entry, &context, github_options(options))
+}
+
+fn resolve_github_entries_with_options(
+    entries: &[Entry],
+    roots: &runtime::Roots,
+    env: &crate::platform::RuntimeEnv,
+    env_vars: &BTreeMap<String, String>,
+    options: github_method::Options,
+) -> Result<Vec<Entry>> {
+    let context = github_method::Context {
+        roots,
+        env,
+        env_vars,
+        runner: &Process,
+        client: &Curl,
+    };
+    github_method::resolve_entries(entries, &context, options)
+}
+
+fn github_options(options: &ParsedOptions) -> github_method::Options {
+    github_method::Options {
+        force: runtime::force(&ProcessEnv, &options.overrides),
+        reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
+        remote_ttl: remote_ttl(),
+        ..github_method::Options::default()
+    }
+}
+
+fn github_options_from_update(options: UpdateOptions) -> github_method::Options {
+    github_method::Options {
+        force: options.force,
+        reinstall: options.reinstall,
+        now: options.now,
+        remote_ttl: options.remote_ttl,
+    }
 }
 
 fn write_list<W>(statuses: &[DependencyStatus], stdout: &mut W) -> Result<()>

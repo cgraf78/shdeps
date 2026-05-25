@@ -1,0 +1,552 @@
+//! Resolver for the config-level `github` install method.
+//!
+//! Bare `github` is intentionally not an installed method. It is config sugar
+//! for "use the best GitHub-backed concrete method on this host." Resolving it
+//! before update/status/prune keeps the rest of the system simple: manifests,
+//! method-transition cleanup, status output, and install code continue to see
+//! only `github:release` or `github:repo`, which are the methods that actually
+//! own files on disk.
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::config::Entry;
+use crate::github;
+use crate::github_release;
+use crate::http::Client;
+use crate::platform::{self, RuntimeEnv};
+use crate::process::Runner;
+use crate::runtime::{Env, Roots};
+use crate::stamp;
+use crate::state;
+use crate::Result;
+
+const METHOD_RELEASE: &str = "github:release";
+const METHOD_REPO: &str = "github:repo";
+const RESOLVE_KIND: &str = "github";
+
+/// Runtime flags for `github` method resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    /// Bypass cached resolver decisions.
+    pub force: bool,
+    /// Reinstall also bypasses cache because update/install work is explicit.
+    pub reinstall: bool,
+    /// Current epoch seconds used for TTL stamps.
+    pub now: u64,
+    /// Resolver cache TTL in seconds.
+    pub remote_ttl: u64,
+}
+
+impl Options {
+    fn freshness(self) -> stamp::Freshness {
+        stamp::Freshness {
+            now: self.now,
+            ttl: self.remote_ttl,
+            force: self.force,
+            reinstall: self.reinstall,
+        }
+    }
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            force: false,
+            reinstall: false,
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs()),
+            remote_ttl: 3600,
+        }
+    }
+}
+
+/// Inputs needed to resolve bare `github` entries.
+pub struct Context<'a, R: Runner> {
+    /// Runtime filesystem roots.
+    pub roots: &'a Roots,
+    /// Runtime platform/host identity.
+    pub env: &'a RuntimeEnv,
+    /// Environment variables used for GitHub credentials.
+    pub env_vars: &'a BTreeMap<String, String>,
+    /// Host subprocess runner used by GitHub token and asset matching logic.
+    pub runner: &'a R,
+    /// HTTP client used to fetch GitHub release metadata.
+    pub client: &'a dyn Client,
+}
+
+/// Resolves all bare `github` entries to concrete install methods.
+pub fn resolve_entries<R>(
+    entries: &[Entry],
+    context: &Context<'_, R>,
+    options: Options,
+) -> Result<Vec<Entry>>
+where
+    R: Runner,
+{
+    entries
+        .iter()
+        .map(|entry| resolve_entry(entry, context, options))
+        .collect()
+}
+
+/// Resolves one entry, leaving explicit concrete methods untouched.
+pub fn resolve_entry<R>(entry: &Entry, context: &Context<'_, R>, options: Options) -> Result<Entry>
+where
+    R: Runner,
+{
+    if entry.method != "github" {
+        return Ok(entry.clone());
+    }
+
+    let method = resolve_method(entry, context, options)?;
+    let mut resolved = entry.clone();
+    resolved.method = method.to_owned();
+    Ok(resolved)
+}
+
+fn resolve_method<R>(
+    entry: &Entry,
+    context: &Context<'_, R>,
+    options: Options,
+) -> Result<&'static str>
+where
+    R: Runner,
+{
+    if !active(entry, context.env) {
+        // A filtered dependency does not own artifacts on this host, so there
+        // is no useful remote fact to learn. Still return a concrete method so
+        // `shdeps list` never exposes the config-only meta-method.
+        return Ok(METHOD_REPO);
+    }
+
+    let cache = Cache::new(&context.roots.state_dir, &entry.name);
+    if stamp::remote_fresh(&cache.stamp, options.freshness()) {
+        if let Some(method) = cache.read_method()? {
+            return Ok(method);
+        }
+    }
+
+    let env = EnvVars {
+        vars: context.env_vars,
+        runtime: context.env,
+    };
+    let method = match github::fetch_releases(&entry.name, &env, context.runner, context.client) {
+        Ok(releases)
+            if github_release::select(&entry.cmd, &releases, context.env, context.runner)
+                .is_some() =>
+        {
+            // Release assets are the preferred fleet path because they avoid
+            // requiring git source trees or a local toolchain. A local checkout
+            // under SHDEPS_GIT_DEV_DIR must not override this decision; users
+            // who want live-checkout behavior should ask for `github:repo`
+            // explicitly.
+            METHOD_RELEASE
+        }
+        Ok(_) | Err(_) => {
+            // Falling back to repo is the conservative concrete behavior when
+            // no compatible release asset can be proven. `github:repo` already
+            // has mature local-clone and managed-clone semantics, so this path
+            // preserves installability while letting projects adopt releases
+            // later without changing config again.
+            METHOD_REPO
+        }
+    };
+
+    cache.write_method(method)?;
+    stamp::remote_touch(&cache.stamp, options.now)?;
+    Ok(method)
+}
+
+fn active(entry: &Entry, env: &RuntimeEnv) -> bool {
+    matches!(
+        platform::filter_match(&entry.filter, env),
+        platform::FilterMatch::Match
+    )
+}
+
+struct Cache {
+    method: PathBuf,
+    stamp: PathBuf,
+}
+
+impl Cache {
+    fn new(state_dir: &Path, name: &str) -> Self {
+        Self {
+            // This is resolver cache state, not manifest metadata. The manifest
+            // remains the installed-state ledger and stores only the concrete
+            // method that owns files; this cache only avoids repeating GitHub
+            // release probes on warm `github` config entries.
+            method: state_dir.join(format!("{name}.github.method")),
+            stamp: stamp::remote_path(state_dir, name, RESOLVE_KIND),
+        }
+    }
+
+    fn read_method(&self) -> Result<Option<&'static str>> {
+        let content = match fs::read_to_string(&self.method) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(match content.trim_end() {
+            METHOD_RELEASE => Some(METHOD_RELEASE),
+            METHOD_REPO => Some(METHOD_REPO),
+            _ => None,
+        })
+    }
+
+    fn write_method(&self, method: &str) -> Result<()> {
+        state::write_atomic(&self.method, &format!("{method}\n"))
+    }
+}
+
+struct EnvVars<'a> {
+    vars: &'a BTreeMap<String, String>,
+    runtime: &'a RuntimeEnv,
+}
+
+impl Env for EnvVars<'_> {
+    fn var_os(&self, name: &str) -> Option<OsString> {
+        self.vars.get(name).map(OsString::from)
+    }
+
+    fn command_output(&self, command: &str, args: &[&str]) -> Option<String> {
+        match (command, args) {
+            ("uname", ["-s"]) => Some(match self.runtime.platform() {
+                "macos" => "Darwin".to_owned(),
+                "wsl" | "linux" => "Linux".to_owned(),
+                other => other.to_owned(),
+            }),
+            ("hostname", []) => Some(self.runtime.host().to_owned()),
+            _ => None,
+        }
+    }
+
+    fn read_to_string(&self, _path: &Path) -> Option<String> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::{resolve_entries, Context, Options};
+    use crate::config::parse_entry;
+    use crate::github;
+    use crate::http::Client;
+    use crate::platform::RuntimeEnv;
+    use crate::process::{Output, Runner};
+    use crate::runtime::Roots;
+    use crate::stamp;
+
+    #[test]
+    fn github_resolves_to_release_when_compatible_asset_exists() {
+        let fixture = Fixture::new("release");
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["tool-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            fixture.options(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[test]
+    fn github_resolves_to_repo_when_no_compatible_asset_exists() {
+        let fixture = Fixture::new("repo-fallback");
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["tool-v1.0.0-darwin-aarch64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            fixture.options(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:repo");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:repo");
+    }
+
+    #[test]
+    fn github_resolves_to_repo_when_release_metadata_fetch_fails() {
+        let fixture = Fixture::new("fetch-fallback");
+        let client = FakeClient::new();
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            fixture.options(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:repo");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:repo");
+    }
+
+    #[test]
+    fn explicit_github_methods_are_not_resolved_or_fetched() {
+        let fixture = Fixture::new("explicit");
+        let client = FakeClient::new();
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![
+            parse_entry("owner/tool|github:release|tool|-|-", None),
+            parse_entry("owner/repo|github:repo|repo|-|-", None),
+        ];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            fixture.options(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, entries);
+        assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn cached_resolution_avoids_repeated_github_fetches() {
+        let fixture = Fixture::new("warm-cache");
+        fixture.write_cache("owner/tool", "github:release", 10);
+        let client = FakeClient::new();
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn force_bypasses_cached_resolution() {
+        let fixture = Fixture::new("force-cache");
+        fixture.write_cache("owner/tool", "github:repo", 10);
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["tool-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            Options {
+                force: true,
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        roots: Roots,
+        env: RuntimeEnv,
+        env_vars: BTreeMap<String, String>,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "shdeps-github-method-{name}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let roots = Roots {
+                conf_dir: root.join("conf"),
+                hooks_dir: root.join("conf/hooks.d"),
+                state_dir: root.join("state"),
+                git_dev_dir: root.join("git"),
+                install_dir: root.join("share"),
+                bin_dir: root.join("bin"),
+                home: root.join("home"),
+            };
+            fs::create_dir_all(&roots.state_dir).unwrap();
+            Self {
+                root,
+                roots,
+                env: RuntimeEnv::new("linux", "host"),
+                env_vars: BTreeMap::new(),
+            }
+        }
+
+        fn context<'a>(
+            &'a self,
+            runner: &'a FakeRunner,
+            client: &'a FakeClient,
+        ) -> Context<'a, FakeRunner> {
+            Context {
+                roots: &self.roots,
+                env: &self.env,
+                env_vars: &self.env_vars,
+                runner,
+                client,
+            }
+        }
+
+        fn options(&self, force: bool) -> Options {
+            Options {
+                force,
+                now: 1_700_000_000,
+                remote_ttl: 3600,
+                reinstall: false,
+            }
+        }
+
+        fn write_cache(&self, name: &str, method: &str, now: u64) {
+            let method_path = self.roots.state_dir.join(format!("{name}.github.method"));
+            fs::create_dir_all(method_path.parent().unwrap()).unwrap();
+            fs::write(method_path, format!("{method}\n")).unwrap();
+            stamp::remote_touch(
+                &stamp::remote_path(&self.roots.state_dir, name, "github"),
+                now,
+            )
+            .unwrap();
+        }
+
+        fn cached_method(&self, name: &str) -> String {
+            fs::read_to_string(self.roots.state_dir.join(format!("{name}.github.method")))
+                .unwrap()
+                .trim_end()
+                .to_owned()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeClient {
+        responses: BTreeMap<String, Vec<u8>>,
+        urls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeClient {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_releases(mut self, repo: &str, json: String) -> Self {
+            self.responses
+                .insert(github::releases_url(repo), json.into_bytes());
+            self
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
+    }
+
+    impl Client for FakeClient {
+        fn get(&self, url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+            self.urls.lock().unwrap().push(url.to_owned());
+            self.responses.get(url).cloned().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRunner {
+        uname: String,
+    }
+
+    impl FakeRunner {
+        fn new() -> Self {
+            Self {
+                uname: "x86_64".to_owned(),
+            }
+        }
+
+        fn with_uname(mut self, uname: &str) -> Self {
+            self.uname = uname.to_owned();
+            self
+        }
+    }
+
+    impl Runner for FakeRunner {
+        fn exists(&self, command: &str) -> bool {
+            command != "ldd"
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            _timeout: Option<Duration>,
+        ) -> io::Result<Output> {
+            match (program, args) {
+                ("uname", ["-m"]) => Ok(Output {
+                    success: true,
+                    timed_out: false,
+                    stdout: format!("{}\n", self.uname),
+                    stderr: String::new(),
+                }),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "missing fake command",
+                )),
+            }
+        }
+    }
+
+    fn releases_json(tag: &str, assets: &[&str]) -> String {
+        let assets = assets
+            .iter()
+            .map(|asset| {
+                format!(r#"{{"name":"{asset}","browser_download_url":"https://example/{asset}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"[{{"tag_name":"{tag}","draft":false,"prerelease":false,"assets":[{assets}]}}]"#)
+    }
+}

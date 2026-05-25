@@ -254,10 +254,11 @@ fn preserve_paths(entry: &Entry, roots: &Roots) -> BTreeSet<PathBuf> {
             preserve.insert(roots.install_dir.join(&entry.name));
         }
         "github:release" => {
-            preserve.insert(roots.bin_dir.join(&entry.cmd));
+            let public_bin = roots.bin_dir.join(&entry.cmd);
+            preserve.insert(public_bin.clone());
 
             let install_root = roots.install_dir.join(&entry.name);
-            if release_install_root_is_owned(&install_root) {
+            if release_install_root_is_owned(&install_root, &public_bin) {
                 preserve.insert(install_root);
             }
         }
@@ -267,7 +268,7 @@ fn preserve_paths(entry: &Entry, roots: &Roots) -> BTreeSet<PathBuf> {
     preserve
 }
 
-fn release_install_root_is_owned(path: &Path) -> bool {
+fn release_install_root_is_owned(path: &Path, public_bin: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
@@ -279,10 +280,35 @@ fn release_install_root_is_owned(path: &Path) -> bool {
     // path may still be a symlink to a local development checkout. Preserving
     // the symlink would leave stale repo state behind and make `dep-root` point
     // at a clone even though the configured method is now release-based. A real
-    // directory, however, is the archive payload we just installed and must be
-    // kept. `symlink_metadata` is the important detail here: following symlinks
-    // would make a stale dev-clone link look like an owned archive directory.
-    metadata.is_dir() && !metadata.file_type().is_symlink()
+    // directory is only safe to keep when the public command actually resolves
+    // into it. A repo -> raw-release transition can leave an old real checkout
+    // directory at the same path; preserving it would make the manifest say
+    // release while `dep-root` and cleanup still see stale repo-owned files.
+    // The public command is the durable proof of archive ownership because raw
+    // release installs write a regular bin file, while archive installs expose
+    // the selected binary from inside the extracted root.
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+
+    points_into(public_bin, path)
+}
+
+fn points_into(path: &Path, root: &Path) -> bool {
+    let resolved = if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        match fs::read_link(path) {
+            Ok(target) if target.is_absolute() => target,
+            Ok(target) => path.parent().unwrap_or_else(|| Path::new("/")).join(target),
+            Err(_) => return false,
+        }
+    } else {
+        path.to_path_buf()
+    };
+
+    resolved.starts_with(root)
 }
 
 fn unlink_snapshot(

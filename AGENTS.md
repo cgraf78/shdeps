@@ -72,6 +72,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 jq                  pkg
 bat                 pkg              apt:batcat
 fd                  pkg              apt:fdfind       apt:fd-find,dnf:fd-find
+cgraf78/ds          github
 cgraf78/ds          github:repo
 neovim/neovim       github:release   nvim
 ripgrep             cargo            rg
@@ -82,8 +83,8 @@ openai/codex        github:release   -                -                        h
 dust                pkg              -                -                        os:macos
 ```
 
-Methods: `pkg` (system package manager), `github:repo` (GitHub clone), `github:release` (GitHub release binary), `cargo` (Rust crate), `go` (Go module), `uv` (Python CLI tool), `npm` (Node.js package), `custom` (hook-only).
-Fields are ordered most-used to least-used. For `github:repo`/`github:release`, the `owner/repo` is the `name` field. For `go`, the full module path (e.g. `github.com/junegunn/fzf`) is the `name`. `cmd` supports `mgr:name` qualifiers (e.g., `apt:batcat`). `aliases` holds per-manager package name overrides for `pkg` deps. `filter` uses `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:!wsl`).
+Methods: `pkg` (system package manager), `github` (auto-resolve to release or repo), `github:repo` (GitHub clone), `github:release` (GitHub release binary), `cargo` (Rust crate), `go` (Go module), `uv` (Python CLI tool), `npm` (Node.js package), `custom` (hook-only).
+Fields are ordered most-used to least-used. For `github`/`github:repo`/`github:release`, the `owner/repo` is the `name` field. For `go`, the full module path (e.g. `github.com/junegunn/fzf`) is the `name`. `cmd` supports `mgr:name` qualifiers (e.g., `apt:batcat`). `aliases` holds per-manager package name overrides for `pkg` deps. `filter` uses `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:!wsl`).
 
 ## State Tracking
 
