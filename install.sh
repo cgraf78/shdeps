@@ -95,6 +95,14 @@ _repo_slug() {
   printf '%s\n' "$repo"
 }
 
+_repo_url_slug() {
+  local repo="$1"
+  repo="${repo#https://github.com/}"
+  repo="${repo#git@github.com:}"
+  repo="${repo%.git}"
+  printf '%s\n' "$repo"
+}
+
 _github_ssh_fallback_url() {
   local repo="$1" path owner name
   case "$repo" in
@@ -190,14 +198,16 @@ _install_bundle() {
 
   if [[ -e "$SHDEPS_DIR" ]]; then
     if [[ -d "$SHDEPS_DIR/.git" ]]; then
-      _error "$SHDEPS_DIR is a git checkout; refusing to replace it with a release archive"
-      return 1
-    fi
-    if ! grep -q '"method"[[:space:]]*:[[:space:]]*"release"' "$SHDEPS_DIR/.shdeps-install.json" 2>/dev/null; then
+      if ! _release_can_replace_source_checkout "$SHDEPS_DIR"; then
+        return 1
+      fi
+      backup="${SHDEPS_DIR}.shdeps-backup.$$"
+    elif ! grep -q '"method"[[:space:]]*:[[:space:]]*"release"' "$SHDEPS_DIR/.shdeps-install.json" 2>/dev/null; then
       _error "$SHDEPS_DIR exists but is not a shdeps release install"
       return 1
+    else
+      backup="${SHDEPS_DIR}.shdeps-backup.$$"
     fi
-    backup="${SHDEPS_DIR}.shdeps-backup.$$"
   fi
 
   parent=$(dirname "$SHDEPS_DIR")
@@ -256,6 +266,26 @@ _install_bundle() {
     rm -rf "$backup"
   fi
   _info "shdeps: installed"
+}
+
+_release_can_replace_source_checkout() {
+  local dir="$1" origin="" expected
+
+  expected=$(_repo_slug)
+  origin=$(git -C "$dir" config --get remote.origin.url 2>/dev/null || true)
+  if [[ -z "$origin" || "$(_repo_url_slug "$origin")" != "$expected" ]]; then
+    _error "$dir is a git checkout for ${origin:-unknown}; refusing release migration"
+    return 1
+  fi
+
+  # Release migration is meant for fleet-owned source installs left behind by
+  # the Bash-to-Rust transition. A dirty tree may be a real developer checkout
+  # hiding in SHDEPS_DIR, so preserve it and let the existing source path build
+  # or self-update instead of deleting local work.
+  if [[ -n "$(git -C "$dir" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+    _error "$dir is a dirty git checkout; refusing release migration"
+    return 1
+  fi
 }
 
 _install_release() {
@@ -611,6 +641,14 @@ _bootstrap() {
     _bs_lib="$_dev_dir/shdeps/shdeps.sh"
     _bs_dir="$_dev_dir/shdeps"
   elif [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
+    if [[ "$SHDEPS_REPO" == "$_SHDEPS_DEFAULT_REPO" && -d "$SHDEPS_DIR/.git" ]]; then
+      # Older fleet machines may already have a source checkout installed in the
+      # default SHDEPS_DIR. That checkout was bootstrap state, not an intentional
+      # dev workspace, so prefer the release archive now that one exists. Keep
+      # this opportunistic: failed downloads, dirty checkouts, or unsupported
+      # platforms fall through to the source path so bootstrap still converges.
+      _install_release >/dev/null 2>&1 || true
+    fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
   else
