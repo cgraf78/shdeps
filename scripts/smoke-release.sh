@@ -16,6 +16,35 @@ case "$asset_platform" in
     exit 2
     ;;
 esac
+
+modern_bash() {
+  local candidate candidate_path major minor
+
+  # GitHub macOS runners execute workflow shell steps with /bin/bash 3.2, but
+  # the shipped sourceable wrapper intentionally requires Bash 4.3+. Probe the
+  # common Homebrew locations before giving up so release smoke tests validate
+  # the wrapper contract on macOS without weakening that runtime floor.
+  for candidate in "${SHDEPS_SMOKE_BASH:-}" bash /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -n "$candidate" ]] || continue
+    if [[ -x "$candidate" ]]; then
+      candidate_path=$candidate
+    else
+      candidate_path=$(command -v "$candidate" 2>/dev/null || true)
+    fi
+    [[ -n "$candidate_path" ]] || continue
+
+    major=$("$candidate_path" -c "printf '%s\n' \"\${BASH_VERSINFO[0]:-0}\"" 2>/dev/null || true)
+    minor=$("$candidate_path" -c "printf '%s\n' \"\${BASH_VERSINFO[1]:-0}\"" 2>/dev/null || true)
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || continue
+    if ((major > 4 || (major == 4 && minor >= 3))); then
+      printf '%s\n' "$candidate_path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 tag=$(scripts/release-tag.sh)
 archive="dist/shdeps-${tag}-${asset_platform}.tar.gz"
 if [[ ! -f "$archive" && -f dist/.shdeps-release-version ]]; then
@@ -55,4 +84,8 @@ test -f "$smoke/completions/shdeps.fish"
 "$smoke/shdeps" version
 "$smoke/shdeps" help >/dev/null
 
-bash -c '. "$1"; shdeps_version >/dev/null' bash "$smoke/shdeps.sh"
+bash_for_wrapper=$(modern_bash) || {
+  printf 'release smoke: shdeps.sh requires Bash 4.3+; set SHDEPS_SMOKE_BASH to a compatible bash\n' >&2
+  exit 1
+}
+"$bash_for_wrapper" -c ". \"\$1\"; shdeps_version >/dev/null" bash "$smoke/shdeps.sh"

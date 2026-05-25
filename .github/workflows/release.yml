@@ -28,6 +28,12 @@ jobs:
           # owns the linker/toolchain prerequisite those musl targets need.
           sudo apt-get update
           sudo apt-get install -y musl-tools
+        elif [[ "$RUNNER_OS" == "macOS" ]]; then
+          # macOS workflow steps still run under Apple's /bin/bash 3.2, while
+          # the shipped sourceable wrapper requires Bash 4.3+. Install
+          # Homebrew Bash for the release smoke test without changing the
+          # workflow shell itself.
+          brew list bash >/dev/null 2>&1 || brew install bash
         fi
       package-command: scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
       smoke-command: scripts/smoke-release.sh "$ASSET_PLATFORM"
