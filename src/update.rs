@@ -154,6 +154,8 @@ pub fn run(
     let mut queued = Vec::new();
     let hook_txn = Txn::new(&context.roots.state_dir)?;
 
+    update_pkg::prepare(entries, context);
+
     for entry in entries {
         if entry.method != "pkg" || !active(entry, context.env) {
             continue;
@@ -337,7 +339,7 @@ pub fn run(
     Ok(summary)
 }
 
-fn active(entry: &Entry, env: &RuntimeEnv) -> bool {
+pub(crate) fn active(entry: &Entry, env: &RuntimeEnv) -> bool {
     matches!(
         platform::filter_match(&entry.filter, env),
         platform::FilterMatch::Match
@@ -982,6 +984,72 @@ install() { return 42; }
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("missing"),
             Some(&ManifestEntry::new("missing", "pkg", "missing", ""))
+        );
+    }
+
+    #[test]
+    fn update_refreshes_package_metadata_before_availability_probe() {
+        let fixture = Fixture::new("pkg-refresh");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("sudo", ["apk", "update"], "")
+            .with_success("apk", ["search", "-e", "jq"], "jq-1.8.1-r0\n")
+            .with_success("sudo", ["apk", "add", "jq"], "");
+
+        let summary = run(
+            &[parse_entry("jq|pkg|jq|-|-", Some("apk"))],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apk"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        let calls = runner.calls();
+        assert!(
+            call_index(&calls, "sudo", ["apk", "update"])
+                < call_index(&calls, "apk", ["search", "-e", "jq"])
+        );
+    }
+
+    #[test]
+    fn update_enables_epel_before_dnf_availability_probe() {
+        let mut fixture = Fixture::new("pkg-epel");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_AUTO_EPEL".to_owned(), "1".to_owned());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success(
+                "sudo",
+                ["dnf", "config-manager", "--set-enabled", "crb"],
+                "",
+            )
+            .with_failure("rpm", ["-q", "epel-release"])
+            .with_success("sudo", ["dnf", "install", "-y", "epel-release"], "")
+            .with_success("sudo", ["dnf", "makecache", "-q"], "")
+            .with_success("dnf", ["info", "ripgrep"], "Name         : ripgrep\n")
+            .with_success("sudo", ["dnf", "install", "-y", "ripgrep"], "");
+
+        let summary = run(
+            &[parse_entry("ripgrep|pkg|rg|-|-", Some("dnf"))],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "dnf"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        let calls = runner.calls();
+        assert!(
+            call_index(&calls, "sudo", ["dnf", "install", "-y", "epel-release"])
+                < call_index(&calls, "dnf", ["info", "ripgrep"])
+        );
+        assert!(
+            call_index(&calls, "sudo", ["dnf", "makecache", "-q"])
+                < call_index(&calls, "dnf", ["info", "ripgrep"])
         );
     }
 
@@ -2127,6 +2195,7 @@ version() { printf 'saw-pkg\n'; }
         outputs: std::collections::BTreeMap<String, QueuedOutputs>,
         creates: std::collections::BTreeMap<String, Vec<PathBuf>>,
         creates_dirs: std::collections::BTreeMap<String, Vec<PathBuf>>,
+        calls: std::cell::RefCell<Vec<String>>,
     }
 
     impl FakeRunner {
@@ -2217,6 +2286,10 @@ version() { printf 'saw-pkg\n'; }
                 .borrow_mut()
                 .push_back(output);
         }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
     }
 
     impl Runner for FakeRunner {
@@ -2231,6 +2304,7 @@ version() { printf 'saw-pkg\n'; }
             _timeout: Option<Duration>,
         ) -> io::Result<Output> {
             let key = key(program, args);
+            self.calls.borrow_mut().push(key.clone());
             for path in self.creates.get(&key).into_iter().flatten() {
                 write_executable(path);
             }
@@ -2268,6 +2342,18 @@ version() { printf 'saw-pkg\n'; }
             key.push_str(arg.as_ref());
         }
         key
+    }
+
+    fn call_index(
+        calls: &[String],
+        program: &str,
+        args: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> usize {
+        let expected = key(program, args);
+        calls
+            .iter()
+            .position(|call| call == &expected)
+            .unwrap_or_else(|| panic!("missing call: {expected:?}"))
     }
 
     fn write_executable(path: &PathBuf) {

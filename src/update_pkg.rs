@@ -9,13 +9,22 @@ use crate::config::{self, Entry};
 use crate::manifest::{self, ManifestEntry};
 use crate::pkg;
 use crate::process::{self, Output, Runner};
-use crate::update::{Context, Item, Summary};
+use crate::update::{active, Context, Item, Summary};
 use crate::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Queued {
     pub(crate) name: String,
     package: String,
+}
+
+pub(crate) fn prepare(entries: &[Entry], context: &Context<'_, impl Runner>) {
+    if !needs_package_work(entries, context) {
+        return;
+    }
+
+    maybe_enable_epel(context);
+    refresh_metadata(context);
 }
 
 pub(crate) fn install(
@@ -122,6 +131,81 @@ fn missing_command_needs_repair(entry: &Entry, context: &Context<'_, impl Runner
             .is_file()
 }
 
+fn needs_package_work(entries: &[Entry], context: &Context<'_, impl Runner>) -> bool {
+    if context.pkg_mgr.is_empty() {
+        return false;
+    }
+
+    entries.iter().any(|entry| {
+        if entry.method != "pkg" || !active(entry, context.env) {
+            return false;
+        }
+
+        let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
+        resolved != "NONE"
+            && !process::dep_exists(context.runner, &entry.cmd, &resolved, context.pkg_mgr)
+    })
+}
+
+fn maybe_enable_epel(context: &Context<'_, impl Runner>) {
+    if context.pkg_mgr != "dnf"
+        || context.env_vars.get("SHDEPS_AUTO_EPEL").map(String::as_str) != Some("1")
+    {
+        return;
+    }
+
+    // CentOS/RHEL-family machines often need EPEL for everyday CLI packages
+    // such as ripgrep, and EPEL itself may depend on CodeReady Builder/CRB
+    // being enabled first. This is intentionally best-effort like the Bash
+    // implementation: if the host has no CRB, no EPEL package, or a locked-down
+    // sudo policy, the per-dependency availability probe below still makes the
+    // final skip/install decision without turning the whole update into a hard
+    // failure.
+    repair_dnf_optional_repo(context);
+
+    if best_effort_run_raw(context.runner, "rpm", &["-q", "epel-release"])
+        .is_some_and(|output| output.success)
+    {
+        return;
+    }
+
+    let packages = vec!["epel-release".to_owned()];
+    let Some(command) = pkg::install("dnf", &packages) else {
+        return;
+    };
+    let _ = best_effort_run(context.runner, &command);
+}
+
+fn repair_dnf_optional_repo(context: &Context<'_, impl Runner>) {
+    for repo in ["crb", "powertools"] {
+        let Some(output) = best_effort_run_raw(
+            context.runner,
+            "sudo",
+            &["dnf", "config-manager", "--set-enabled", repo],
+        ) else {
+            continue;
+        };
+        if output.success {
+            break;
+        }
+    }
+}
+
+fn refresh_metadata(context: &Context<'_, impl Runner>) {
+    let Some(command) = pkg::refresh(context.pkg_mgr) else {
+        return;
+    };
+
+    // Availability checks are only as good as the local package metadata. This
+    // matters most in ephemeral CI containers: `apk add --no-cache cargo` can
+    // install bootstrap tools without leaving an index for the later
+    // `apk search -e jq` probe, and dnf needs an EPEL/metadata pass before
+    // CentOS-only packages like ripgrep are visible. Refresh failures stay
+    // nonfatal for Bash compatibility; the later availability probe still owns
+    // the skip-vs-install decision for each dependency.
+    let _ = best_effort_run(context.runner, &command);
+}
+
 fn available(runner: &impl Runner, mgr: &str, package: &str) -> Result<bool> {
     let Some(command) = pkg::available(mgr, package) else {
         return Ok(true);
@@ -132,7 +216,23 @@ fn available(runner: &impl Runner, mgr: &str, package: &str) -> Result<bool> {
 
 fn run(runner: &impl Runner, command: &pkg::CommandSpec) -> Result<Output> {
     let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
-    runner
-        .run(&command.program, &args, None)
-        .map_err(Into::into)
+    run_raw(runner, &command.program, &args)
+}
+
+fn run_raw(runner: &impl Runner, program: &str, args: &[&str]) -> Result<Output> {
+    runner.run(program, args, None).map_err(Into::into)
+}
+
+fn best_effort_run(runner: &impl Runner, command: &pkg::CommandSpec) -> Option<Output> {
+    let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+    best_effort_run_raw(runner, &command.program, &args)
+}
+
+fn best_effort_run_raw(runner: &impl Runner, program: &str, args: &[&str]) -> Option<Output> {
+    // Package metadata preparation has always been advisory: it improves the
+    // accuracy of availability probes, but a missing sudo/config-manager or a
+    // transient repo refresh error must not hide the dependency-level result.
+    // Install and availability calls still use `run_raw` so real install
+    // failures are not silently swallowed.
+    runner.run(program, args, None).ok()
 }
