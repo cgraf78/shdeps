@@ -82,7 +82,7 @@ fn usage_errors_match_public_cli_contract() {
 #[test]
 fn path_helpers_resolve_installed_assets_with_clean_stdout() {
     let fixture = Fixture::new("path-helpers");
-    fixture.write("conf/deps.conf", "cgraf78/sley  github:repo\n");
+    fixture.write("conf/deps.conf", "cgraf78/sley  github\n");
     fixture.write("share/cgraf78/sley/share/sley/shell.sh", "SLEY=installed\n");
 
     let root = run(&mut fixture.command(["dep-root", "cgraf78/sley"]));

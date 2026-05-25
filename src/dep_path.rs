@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, Entry};
+use crate::manifest;
 use crate::platform::{self, RuntimeEnv};
 use crate::Result;
 
@@ -16,6 +17,8 @@ use crate::Result;
 pub struct Roots {
     /// Config directory containing `*.conf` files.
     pub conf_dir: PathBuf,
+    /// State directory containing the install manifest.
+    pub state_dir: PathBuf,
     /// Local development clone directory, normally `~/git`.
     pub git_dev_dir: PathBuf,
     /// Managed install directory, normally `~/.local/share`.
@@ -107,19 +110,51 @@ pub fn find_entry(target: &str, conf_dir: &Path, env: &RuntimeEnv) -> Result<Opt
 
 fn root_for_entry(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
     match entry.method.as_str() {
-        "github:repo" => {
-            // Local development clones intentionally win over managed clones.
-            // Client projects use this to source assets from the live checkout
-            // while iterating, and the Bash implementation has treated
-            // `~/git/<short-name>` as the highest-priority root for years.
-            let dev_root = roots.git_dev_dir.join(config::short_name(&entry.name));
-            existing_root(&dev_root).or_else(|| existing_root(&roots.install_dir.join(&entry.name)))
-        }
-        "github:release" | "cargo" | "go" | "uv" | "npm" => {
-            existing_root(&roots.install_dir.join(&entry.name))
-        }
+        "github" => github_root(entry, roots),
+        "github:repo" => repo_root(entry, roots),
+        "github:release" | "cargo" | "go" | "uv" | "npm" => install_root(entry, roots),
         _ => None,
     }
+}
+
+fn github_root(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
+    // `github` is a config-only meta-method, so the cheap path API cannot make
+    // the same release-vs-repo decision as `update` by contacting GitHub. Hooks,
+    // shell startup, and `dot doctor` all rely on these commands staying local
+    // and fast. The manifest is the installed-state ledger that records the
+    // concrete method chosen by the last update, so it is the first place we
+    // look when translating a bare `github` config entry back to an owned root.
+    if let Some(method) = manifest::read(&manifest::path(&roots.state_dir))
+        .ok()
+        .and_then(|manifest| manifest.get(&entry.name).map(|entry| entry.method.clone()))
+    {
+        return match method.as_str() {
+            "github:repo" => repo_root(entry, roots),
+            "github:release" => install_root(entry, roots),
+            _ => None,
+        };
+    }
+
+    // A missing manifest can happen before the first Rust-era update, after
+    // manual state cleanup, or in tiny test fixtures. Without network access
+    // the only reliable local fact is an existing checkout/install root. This
+    // fallback lets existing repo-style consumers keep resolving assets while
+    // avoiding the dangerous case where a local checkout overrides a manifest
+    // that explicitly says a release asset owns the dependency.
+    repo_root(entry, roots).or_else(|| install_root(entry, roots))
+}
+
+fn repo_root(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
+    // Local development clones intentionally win over managed clones for
+    // concrete repo installs. Client projects use this to source assets from
+    // the live checkout while iterating, and the Bash implementation has
+    // treated `~/git/<short-name>` as the highest-priority root for years.
+    let dev_root = roots.git_dev_dir.join(config::short_name(&entry.name));
+    existing_root(&dev_root).or_else(|| install_root(entry, roots))
+}
+
+fn install_root(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
+    existing_root(&roots.install_dir.join(&entry.name))
 }
 
 fn existing_root(path: &Path) -> Option<PathBuf> {
@@ -185,6 +220,59 @@ mod tests {
                 .canonicalize()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn bare_github_uses_manifest_repo_method_and_prefers_dev_clone() {
+        let fixture = Fixture::new("github-auto-repo");
+        fixture.write_conf("cgraf78/sley  github\n");
+        fixture.write_manifest("cgraf78/sley|github:repo|sley|/old/managed/root\n");
+        fixture.mkdir("share/cgraf78/sley/share/sley");
+        fixture.mkdir("git/sley/share/sley");
+
+        let root = root("cgraf78/sley", &fixture.roots(), &fixture.env()).unwrap();
+
+        assert_eq!(root, fixture.dir.join("git/sley").canonicalize().unwrap());
+    }
+
+    #[test]
+    fn bare_github_manifest_release_does_not_use_local_clone() {
+        let fixture = Fixture::new("github-auto-release");
+        fixture.write_conf("owner/tool  github  tool\n");
+        fixture.write_manifest("owner/tool|github:release|tool|/tmp/bin/tool\n");
+        fixture.mkdir("git/tool/share/tool");
+        fixture.mkdir("share/owner/tool/share/tool");
+
+        let root = root("owner/tool", &fixture.roots(), &fixture.env()).unwrap();
+
+        assert_eq!(
+            root,
+            fixture.dir.join("share/owner/tool").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn bare_github_falls_back_to_local_repo_when_manifest_missing() {
+        let fixture = Fixture::new("github-auto-missing-manifest");
+        fixture.write_conf("cgraf78/sley  github\n");
+        fixture.mkdir("git/sley/share/sley");
+
+        let root = root("cgraf78/sley", &fixture.roots(), &fixture.env()).unwrap();
+
+        assert_eq!(root, fixture.dir.join("git/sley").canonicalize().unwrap());
+    }
+
+    #[test]
+    fn bare_github_without_installed_local_state_is_missing() {
+        let fixture = Fixture::new("github-auto-missing");
+        fixture.write_conf("cgraf78/sley  github\n");
+
+        let error = root("cgraf78/sley", &fixture.roots(), &fixture.env()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::Resolve(ResolveError::NotFound)
+        ));
     }
 
     #[test]
@@ -372,6 +460,7 @@ mod tests {
         fn roots(&self) -> Roots {
             Roots {
                 conf_dir: self.dir.join("conf"),
+                state_dir: self.dir.join("state"),
                 git_dev_dir: self.dir.join("git"),
                 install_dir: self.dir.join("share"),
             }
@@ -383,6 +472,10 @@ mod tests {
 
         fn write_conf(&self, content: &str) {
             self.write("conf/deps.conf", content);
+        }
+
+        fn write_manifest(&self, content: &str) {
+            self.write("state/manifest", content);
         }
 
         fn mkdir(&self, rel: impl AsRef<Path>) {

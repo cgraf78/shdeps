@@ -17,7 +17,7 @@ if [[ ! -x "$SHDEPS_RUST_CLI" ]]; then
   SHDEPS_RUST_CLI="$SHDEPS_DIR/target/debug/shdeps"
 fi
 
-# shellcheck source=helpers.sh
+# shellcheck source=test/helpers.sh disable=SC1091
 . "$(dirname "$0")/helpers.sh"
 
 echo "=== Downstream client smoke ==="
@@ -57,11 +57,13 @@ _install=$(_tmpdir)
 _bin=$(_tmpdir)
 
 # The smoke wants dependency resolution, not installation. A temp config keeps
-# the public parser in the loop while SHDEPS_GIT_DEV_DIR makes github:repo deps
-# resolve to the already-cloned local repos without network or filesystem churn.
+# the public parser in the loop while bare github exercises the same local path
+# resolver that shell hooks use after fleet configs ask shdeps to auto-pick
+# release vs repo installs. The temp state intentionally has no manifest, so
+# this pins the network-free fallback to already-cloned local repos.
 for _spec in "${_client_specs[@]}"; do
   IFS='|' read -r _dep _repo _asset <<<"$_spec"
-  printf '%s github:repo\n' "$_dep"
+  printf '%s github\n' "$_dep"
 done >"$_conf/deps.conf"
 
 _run_with_temp_env() {

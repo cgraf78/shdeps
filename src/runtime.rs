@@ -50,6 +50,7 @@ impl Roots {
     pub fn dep_path_roots(&self) -> dep_path::Roots {
         dep_path::Roots {
             conf_dir: self.conf_dir.clone(),
+            state_dir: self.state_dir.clone(),
             git_dev_dir: self.git_dev_dir.clone(),
             install_dir: self.install_dir.clone(),
         }
