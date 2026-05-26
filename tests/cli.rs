@@ -392,6 +392,43 @@ printf '[{"tag_name":"v1.0.0","assets":[]}]\n'
 }
 
 #[test]
+fn mutating_api_github_release_rejects_unsafe_cmd_basename() {
+    // Regression for the bridge-side path-escape hole. Without
+    // `valid_cmd_basename` applied here, an absolute `cmd` argument
+    // would make the default `roots.bin_dir.join(cmd)` resolve to
+    // the absolute path verbatim (Rust's `Path::join` discards the
+    // left operand when the right is absolute), and the downstream
+    // release-install pipeline would rename the staged executable
+    // straight onto that path — outside the managed bin dir and
+    // outside the `safe_managed_path` containment that protects
+    // manifest `install_path`. The bridge must enforce the same
+    // basename validator the config-side `parse_entry` does, so
+    // the two entry points cannot diverge.
+    let fixture = Fixture::new("api-github-release-unsafe-cmd");
+
+    // No curl fake needed: the request must fail validation before
+    // any network call. If validation regressed we'd see a totally
+    // different failure mode (network or asset-selection error).
+    let mut command = fixture.command([
+        "__api",
+        "github-release-install",
+        "owner/mytool",
+        "/etc/passwd",
+    ]);
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(text(&output.stdout), "");
+    assert!(
+        text(&output.stderr).contains("invalid github-release-install arguments"),
+        "stderr should report invalid args, got: {}",
+        text(&output.stderr)
+    );
+    // No public-bin link should have been touched.
+    assert!(!std::path::Path::new("/etc/passwd-shdeps-marker").exists());
+}
+
+#[test]
 fn rust_hook_prelude_delegates_link_extras_during_update() {
     let fixture = Fixture::new("hook-prelude-link-extras");
     fixture.write("conf/deps.conf", "tool custom\n");
