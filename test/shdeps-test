@@ -5394,6 +5394,71 @@ if [[ -n "${_release_platform:-}" ]]; then
     _pass "bootstrap release migration with SHDEPS_LIB: cargo not used"
   fi
 
+  # --- Bootstrap refreshes stale release installs before sourcing them ---
+
+  unset -f shdeps_update 2>/dev/null
+  _bs_stale_release_inst=$(_tmpdir)/bs-stale-release-install
+  _bs_stale_release_bin=$(_tmpdir)/bs-stale-release-bin
+  _bs_stale_release_fakebin=$(_mock_bin)
+  _bs_stale_release_marker=$(_tmpdir)/bs-stale-release-markers
+  _bs_stale_release_old_tag="20980101-000000-11111111"
+  mkdir -p "$_bs_stale_release_inst" "$_bs_stale_release_bin"
+  cp -R "$_release_payload/." "$_bs_stale_release_inst/"
+  _write_fake_release_shdeps "$_bs_stale_release_inst/shdeps" "$_bs_stale_release_old_tag"
+  cat >"$_bs_stale_release_inst/.shdeps-install.json" <<JSON
+{"schema":1,"method":"release","artifact_platform":"$_release_platform","version":"$_bs_stale_release_old_tag","tag":"$_bs_stale_release_old_tag","commit":"111111111111","repo":"cgraf78/shdeps"}
+JSON
+  cp "$_release_fakebin/curl" "$_bs_stale_release_fakebin/curl"
+  _bs_saved_path="$PATH"
+  PATH="$_bs_stale_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_release_tag" \
+    SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-bs-stale-release.log" \
+    SHDEPS_TEST_CURL_MARKER_DIR="$_bs_stale_release_marker" \
+    SHDEPS_GIT_DEV_DIR="/nonexistent" SHDEPS_DIR="$_bs_stale_release_inst" \
+    SHDEPS_BIN="$_bs_stale_release_bin/shdeps" \
+    . "$_bs_dir/install.sh" --bootstrap
+  _bs_stale_release_rc=$?
+  PATH="$_bs_saved_path"
+  _assert_exit "bootstrap stale release refresh: succeeds" 0 "$_bs_stale_release_rc"
+  _assert_eq "bootstrap stale release refresh: CLI runs latest release" \
+    "shdeps $_release_tag" "$("$_bs_stale_release_bin/shdeps" version)"
+  _assert_file_exists "bootstrap stale release refresh: resolves latest via browser redirect" \
+    "$_bs_stale_release_marker/latest"
+  _assert_file_exists "bootstrap stale release refresh: downloads archive" \
+    "$_bs_stale_release_marker/archive"
+  _assert_file_exists "bootstrap stale release refresh: downloads checksum" \
+    "$_bs_stale_release_marker/checksum"
+
+  # --- Bootstrap leaves current release installs alone after the cheap check ---
+
+  unset -f shdeps_update 2>/dev/null
+  _bs_current_release_inst=$(_tmpdir)/bs-current-release-install
+  _bs_current_release_bin=$(_tmpdir)/bs-current-release-bin
+  _bs_current_release_fakebin=$(_mock_bin)
+  _bs_current_release_marker=$(_tmpdir)/bs-current-release-markers
+  mkdir -p "$_bs_current_release_inst" "$_bs_current_release_bin"
+  cp -R "$_release_payload/." "$_bs_current_release_inst/"
+  cp "$_release_fakebin/curl" "$_bs_current_release_fakebin/curl"
+  _bs_saved_path="$PATH"
+  PATH="$_bs_current_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_release_tag" \
+    SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-bs-current-release.log" \
+    SHDEPS_TEST_CURL_MARKER_DIR="$_bs_current_release_marker" \
+    SHDEPS_GIT_DEV_DIR="/nonexistent" SHDEPS_DIR="$_bs_current_release_inst" \
+    SHDEPS_BIN="$_bs_current_release_bin/shdeps" \
+    . "$_bs_dir/install.sh" --bootstrap
+  _bs_current_release_rc=$?
+  PATH="$_bs_saved_path"
+  _assert_exit "bootstrap current release refresh: succeeds" 0 "$_bs_current_release_rc"
+  _assert_eq "bootstrap current release refresh: CLI stays current" \
+    "shdeps $_release_tag" "$("$_bs_current_release_bin/shdeps" version)"
+  _assert_file_exists "bootstrap current release refresh: still checks latest" \
+    "$_bs_current_release_marker/latest"
+  _assert_file_missing "bootstrap current release refresh: does not download archive" \
+    "$_bs_current_release_marker/archive"
+  _assert_file_missing "bootstrap current release refresh: does not download checksum" \
+    "$_bs_current_release_marker/checksum"
+
   # --- Bootstrap follows a dev clone when it appears and release when it goes ---
 
   unset -f shdeps_update 2>/dev/null

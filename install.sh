@@ -171,6 +171,19 @@ _json_string() {
   sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
 }
 
+_installed_release_tag() {
+  local dir="$1"
+
+  _json_string "$dir/.shdeps-install.json" "tag"
+}
+
+_release_tag_newer() {
+  local latest="$1" current="$2"
+
+  [[ -n "$latest" ]] || return 1
+  [[ -z "$current" || "$latest" > "$current" ]]
+}
+
 _asset_url() {
   local file="$1" name="$2"
 
@@ -375,6 +388,25 @@ _cleanup_installed_state_for_source_checkout() {
   if ! rm -rf "$SHDEPS_DIR"; then
     _error "failed to remove stale shdeps install at $SHDEPS_DIR"
     return 1
+  fi
+}
+
+_refresh_release_install_if_stale() {
+  local current latest repo
+
+  _uses_default_repo_slug || return 0
+  _is_release_install_dir "$SHDEPS_DIR" || return 0
+
+  repo=$(_repo_slug)
+  current=$(_installed_release_tag "$SHDEPS_DIR")
+  latest=$(_latest_release_tag "$repo") || return 0
+
+  # Bootstrap self-update has to be conservative but useful. Release tags are
+  # timestamp-prefixed (`YYYYMMDD-HHMMSS-<hash>`), so lexical ordering is enough
+  # to avoid replacing a newer local archive with an older or deleted GitHub
+  # "latest" release while still advancing normal fleet installs promptly.
+  if _release_tag_newer "$latest" "$current"; then
+    _install_release >/dev/null 2>&1 || true
   fi
 }
 
@@ -707,6 +739,8 @@ _bootstrap() {
   if _bootstrap_lib_is_installed_tree; then
     if _uses_default_repo_slug && [[ -d "$SHDEPS_DIR/.git" ]]; then
       _install_release >/dev/null 2>&1 || true
+    else
+      _refresh_release_install_if_stale
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
@@ -724,6 +758,8 @@ _bootstrap() {
       # this opportunistic: failed downloads, dirty checkouts, or unsupported
       # platforms fall through to the source path so bootstrap still converges.
       _install_release >/dev/null 2>&1 || true
+    else
+      _refresh_release_install_if_stale
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
