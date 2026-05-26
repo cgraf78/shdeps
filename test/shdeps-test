@@ -304,6 +304,38 @@ _assert_contains "multi-file: sorted second" "tool-a" "${_SHDEPS_DEPS[1]}"
 _assert_contains "multi-file: sorted third" "tool-b" "${_SHDEPS_DEPS[2]}"
 _assert_contains "multi-file: sorted fourth" "tool-d" "${_SHDEPS_DEPS[3]}"
 
+# --- Duplicates across .conf files collapse to last-wins ---
+
+_dedupe_dir=$(_tmpdir)
+cat >"$_dedupe_dir/00-core.conf" <<'EOF'
+tool-a  pkg
+tool-b  pkg
+EOF
+cat >"$_dedupe_dir/99-overrides.conf" <<'EOF'
+tool-a  cargo
+EOF
+SHDEPS_CONF_DIR="$_dedupe_dir"
+_shdeps_load
+_assert_eq "dedupe multi-file: count collapses to unique names" "2" "${#_SHDEPS_DEPS[@]}"
+# After sort, tool-a sorts before tool-b. Last-wins gives `tool-a|cargo`,
+# matching the override file's redeclaration.
+_assert_eq "dedupe multi-file: later file wins for tool-a" "tool-a|cargo" "${_SHDEPS_DEPS[0]}"
+_assert_eq "dedupe multi-file: tool-b survives" "tool-b|pkg" "${_SHDEPS_DEPS[1]}"
+
+# --- Duplicates within one .conf file also collapse ---
+
+_dedupe_within_dir=$(_tmpdir)
+cat >"$_dedupe_within_dir/deps.conf" <<'EOF'
+tool-a  pkg
+tool-b  pkg
+tool-a  cargo
+EOF
+SHDEPS_CONF_DIR="$_dedupe_within_dir"
+_shdeps_load
+_assert_eq "dedupe single-file: count collapses" "2" "${#_SHDEPS_DEPS[@]}"
+_assert_eq "dedupe single-file: later redeclaration wins" "tool-a|cargo" "${_SHDEPS_DEPS[0]}"
+_assert_eq "dedupe single-file: tool-b survives" "tool-b|pkg" "${_SHDEPS_DEPS[1]}"
+
 # --- Non-.conf files ignored ---
 
 _mixed_dir=$(_tmpdir)
