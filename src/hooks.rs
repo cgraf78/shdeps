@@ -56,6 +56,32 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
     let timeout = hook_timeout();
     let max_bytes = hook_max_bytes();
 
+    // Put the child in its own process group on Unix so timeout-kill
+    // can reach grandchildren too. Without this, `child.kill()` only
+    // terminates the immediate bash process; a hook that backgrounds
+    // a subprocess (`some-tool &`) leaves that subprocess holding the
+    // inherited stdout/stderr pipes open, so the reader threads block
+    // on EOF until the grandchild exits — defeating
+    // `SHDEPS_HOOK_TIMEOUT_SECS`. With the child as a process-group
+    // leader (via `setsid`), `kill(-pgid, SIG)` signals the whole
+    // group atomically.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` is async-signal-safe and the pre-exec
+        // callback runs between fork and exec where only
+        // async-signal-safe calls are valid. Detaching from the
+        // parent's controlling terminal is the documented purpose.
+        unsafe {
+            command.pre_exec(|| {
+                if libc_setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -78,10 +104,30 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
             break status;
         }
         if Instant::now() >= deadline {
-            // Hook timed out. SIGKILL is OK here because the surrounding
-            // contract is "best effort" — a wedged hook is already a
-            // failure regardless of cleanup-handler semantics.
-            let _ = child.kill();
+            // Hook timed out. Signal the whole process group so any
+            // grandchildren the hook backgrounded are reaped too —
+            // otherwise they keep the inherited pipes open and the
+            // reader threads hang past the timeout.
+            #[cfg(unix)]
+            {
+                // The child was placed in its own session by
+                // `setsid` above, so its PID is also its PGID. Negate
+                // the PID to signal the whole group.
+                let pgid = -(child.id() as i32);
+                // SAFETY: `kill` with a negative PID is a documented
+                // POSIX way to signal a process group. The pgid is
+                // the child's own session-leader PID which we just
+                // created via setsid in pre_exec; it cannot have
+                // been reused while the child is still alive
+                // (per `try_wait` above returning None).
+                unsafe {
+                    libc_kill(pgid, SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
             break child.wait()?;
         }
         thread::sleep(HOOK_WAIT_POLL);
@@ -94,6 +140,17 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
         stdout,
         stderr,
     })
+}
+
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "setsid"]
+    fn libc_setsid() -> i32;
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 fn read_capped<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {

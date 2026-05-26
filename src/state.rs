@@ -43,11 +43,35 @@ pub const REENTRY_ENV: &str = "SHDEPS_STATE_LOCK_HELD";
 
 /// Per-state-directory advisory lock.
 ///
-/// Hold this only around short read-modify-write windows. The lock exists to
-/// keep Rust-owned state files coherent when two `shdeps update` or `prune`
-/// runs overlap; it must not be held across package-manager installs, network
-/// downloads, or hooks because those operations can block for a long time or
-/// call back into shdeps.
+/// The lock exists to keep Rust-owned state files coherent when two
+/// `shdeps update` or `prune` runs overlap. It is intentionally held
+/// for the full duration of `update::run` and `prune::run` —
+/// including package-manager installs, network downloads, and hooks
+/// — because the manifest/link-state writes interleaved through
+/// those operations all need the same serialization guarantee.
+///
+/// **Reentry contract:** a hook subprocess that recursively invokes
+/// `shdeps update` / `shdeps prune` (e.g., a `post()` hook that
+/// installs another dep) WOULD deadlock against the parent's flock
+/// without an escape valve. The escape valve is the `REENTRY_ENV`
+/// env var:
+///
+/// 1. `hooks::apply_hook_env` writes the Rust parent's PID into
+///    `SHDEPS_STATE_LOCK_HELD` on every hook subprocess command.
+/// 2. Each hook bash script re-exports `SHDEPS_STATE_LOCK_HELD=$$`
+///    so the value is rebound to bash's own PID before any
+///    recursive `shdeps` invocation. See the SCRIPT constants in
+///    `hooks.rs` for the prelude line.
+/// 3. `StateLock::acquire` checks the env value against `getppid()`
+///    in `is_legitimate_reentry`. When they match (= the inner
+///    shdeps's parent is the bash that knows about the outer
+///    lock), `acquire` returns a no-op `StateLock { file: None }`
+///    instead of trying to re-take the flock.
+///
+/// Callers spawning ANY subprocess that may recursively invoke
+/// shdeps MUST propagate the env var the same way `apply_hook_env`
+/// + the hook SCRIPT prelude do — otherwise the recursive child
+/// will block on the parent's flock.
 #[derive(Debug)]
 pub struct StateLock {
     /// `None` means this is a re-entry no-op guard: a parent shdeps
