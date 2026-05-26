@@ -70,8 +70,10 @@ pub const REENTRY_ENV: &str = "SHDEPS_STATE_LOCK_HELD";
 ///
 /// Callers spawning ANY subprocess that may recursively invoke
 /// shdeps MUST propagate the env var the same way `apply_hook_env`
-/// + the hook SCRIPT prelude do — otherwise the recursive child
-/// will block on the parent's flock.
+/// and the hook SCRIPT prelude do — otherwise the recursive child
+/// will block on the parent's flock. The `+` prefix is avoided
+/// because rustdoc parses it as a Markdown list marker and triggers
+/// `clippy::doc_lazy_continuation` on the next line.
 #[derive(Debug)]
 pub struct StateLock {
     /// `None` means this is a re-entry no-op guard: a parent shdeps
