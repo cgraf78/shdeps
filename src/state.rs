@@ -345,6 +345,14 @@ mod tests {
         let _env_guard = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        // Defensive reset: if a previous test panicked while holding
+        // the env mutated, the recovered (poisoned) mutex hands us
+        // control but the env var is still set. Clear it explicitly
+        // before any acquire so we never inherit stale state.
+        // SAFETY: env mutation is serialized by `ENV_TEST_LOCK`.
+        unsafe {
+            std::env::remove_var(super::REENTRY_ENV);
+        }
 
         let fixture = Fixture::new("reentry");
         let primary = StateLock::acquire(&fixture.dir).unwrap();
@@ -385,6 +393,12 @@ mod tests {
         let _env_guard = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        // Same defensive reset as the sibling reentry test — clear
+        // stale env state from any previously-panicking test.
+        // SAFETY: env mutation is serialized by `ENV_TEST_LOCK`.
+        unsafe {
+            std::env::remove_var(super::REENTRY_ENV);
+        }
 
         let fixture = Fixture::new("reentry-wrong-pid");
         let primary = StateLock::acquire(&fixture.dir).unwrap();

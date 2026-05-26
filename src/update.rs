@@ -3435,6 +3435,13 @@ version() { printf 'saw-pkg\n'; }
         let _env_guard = STRICT_LEFTOVERS_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        // Defensive reset: a previous test panicking with the env
+        // var set would otherwise leak state into this run despite
+        // the recovered mutex. Clear before asserting either branch.
+        // SAFETY: env mutation is serialized by the test lock.
+        unsafe {
+            std::env::remove_var("SHDEPS_STRICT_LEFTOVERS");
+        }
 
         let mut summary = Summary::default();
         assert!(!summary.has_errors());

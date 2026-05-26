@@ -145,6 +145,31 @@ pub fn run(
             quiet_skipped: false,
         });
     }
+    // Re-apply the all-orphans guard against the FRESH manifest. The
+    // pre-lock check at the top of this function already decided
+    // based on the caller's snapshot, but if the manifest changed
+    // since then (a concurrent update added or removed deps), the
+    // guard's "every tracked dep is about to be deleted" condition
+    // can now be true even though it wasn't pre-lock. Without this
+    // re-check the mutation loop would silently bulk-delete every
+    // currently-tracked dep without the `--yes` confirmation.
+    let fresh_unique_manifest: std::collections::BTreeSet<&str> = fresh_manifest
+        .entries()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let fresh_unique_orphans: std::collections::BTreeSet<&str> =
+        orphans.iter().map(|entry| entry.name.as_str()).collect();
+    let post_lock_prunes_everything = !fresh_unique_manifest.is_empty()
+        && fresh_unique_orphans.len() == fresh_unique_manifest.len();
+    if post_lock_prunes_everything && !options.yes {
+        return Ok(Summary {
+            orphans,
+            removed: Vec::new(),
+            guarded_all_orphans: true,
+            quiet_skipped: false,
+        });
+    }
 
     let cleanup_roots = cleanup_roots(roots);
     let mut removed = Vec::new();
