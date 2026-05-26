@@ -451,6 +451,15 @@ _refresh_release_install_if_stale() {
 
   repo=$(_repo_slug)
   current=$(_installed_release_tag "$SHDEPS_DIR")
+  # When the local install metadata is missing a `tag` field, we have no
+  # comparison baseline. Treating "no current tag" as "always stale" used
+  # to fire a `_install_release` call on every shell startup, hammering
+  # GitHub for an install that was probably fine. A missing tag indicates
+  # either a fresh install (which `_install_release` ran moments ago) or
+  # a corrupted state file (which the user repairs by re-running the
+  # installer explicitly). Either way, the background refresh should be
+  # a no-op rather than a silent re-download loop.
+  [[ -n "$current" ]] || return 0
   latest=$(_latest_release_tag "$repo") || return 0
 
   # Bootstrap self-update has to be conservative but useful. Release tags are
@@ -903,13 +912,24 @@ _uninstall() {
 # Main
 # ---------------------------------------------------------------------------
 
-case "${1:-}" in
-  --uninstall) _uninstall ;;
-  --bootstrap) _bootstrap ;;
-  "") _install ;;
-  *)
-    _error "unknown argument: $1"
-    _info "Usage: install.sh [--uninstall|--bootstrap]"
-    exit 2
-    ;;
-esac
+# `install.sh` is normally executed as a script for the curl-pipe install
+# path, but `_bootstrap` is intentionally invoked via `. install.sh
+# --bootstrap` so that the caller's shell can use the freshly-installed
+# helper functions afterwards. That makes the `${BASH_SOURCE}` vs `$0`
+# trick unsuitable for distinguishing real invocations from unit-test
+# sourcing — both go through the same sourced path. Instead, opt-out via
+# the `SHDEPS_INSTALL_SH_NO_DISPATCH` env var: the test harness sets it
+# before sourcing so the dispatch becomes a no-op and the helpers are
+# loaded for direct exercising.
+if [[ "${SHDEPS_INSTALL_SH_NO_DISPATCH:-0}" != "1" ]]; then
+  case "${1:-}" in
+    --uninstall) _uninstall ;;
+    --bootstrap) _bootstrap ;;
+    "") _install ;;
+    *)
+      _error "unknown argument: $1"
+      _info "Usage: install.sh [--uninstall|--bootstrap]"
+      exit 2
+      ;;
+  esac
+fi
