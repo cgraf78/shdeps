@@ -82,8 +82,17 @@ pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
             unlink_state(roots, &entry.name, Kind::Extras, &mut summary)?;
 
             if !entry.install_path.is_empty() {
-                let install_path = manifest_path(&entry.install_path, &roots.home);
-                remove_any(&install_path, &mut summary)?;
+                // The manifest file is human-editable text. A corrupted or
+                // hand-edited `install_path` value (absolute path or
+                // `..`-escape into another tree) would otherwise hand
+                // `remove_dir_all` an arbitrary path. `safe_managed_path`
+                // refuses anything not lexically contained under
+                // `install_dir` or `home`, so the worst case is a skipped
+                // cleanup with a noted leftover rather than a destructive
+                // delete outside the shdeps-managed tree.
+                if let Some(install_path) = safe_managed_path(&entry.install_path, roots) {
+                    remove_any(&install_path, &mut summary)?;
+                }
             }
 
             remove_any(
@@ -174,6 +183,35 @@ fn manifest_path(path: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// Returns a manifest-supplied install path only when it lexically resolves
+/// inside one of the shdeps-managed trees (`install_dir` or `home`).
+///
+/// The manifest is a human-readable text file with no schema enforcement, so
+/// a corrupt record or a hand edit could plant any absolute path or a
+/// `..`-escape into `entry.install_path`. Without this guard, the cleanup
+/// path would hand that value straight to `remove_dir_all`. Rather than
+/// canonicalize (which would follow symlinks and could mask escapes through
+/// link targets), this check rejects anything with a `..` or `.` component
+/// after resolution and requires lexical containment under one of the
+/// known-good roots. Note that `install_dir` is normally a descendant of
+/// `home`, but we list both to support test fixtures and custom layouts
+/// where they live in independent locations.
+fn safe_managed_path(install_path: &str, roots: &Roots) -> Option<PathBuf> {
+    let path = manifest_path(install_path, &roots.home);
+    // Refuse `..` (parent-dir escape) and `.` (which can mask `..` patterns
+    // in some path joinings). Plain `Normal` components are fine.
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return None;
+    }
+    let safe = path.starts_with(&roots.install_dir) || path.starts_with(&roots.home);
+    safe.then_some(path)
+}
+
 fn remove_any(path: &Path, summary: &mut Summary) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -235,7 +273,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    use super::{Roots, Summary, method_transitions, remove_builtin, remove_stamps};
+    use super::{
+        Roots, Summary, method_transitions, remove_builtin, remove_stamps, safe_managed_path,
+    };
     use crate::config::Entry;
     use crate::link_state::{self, Kind};
     use crate::manifest::{Manifest, ManifestEntry};
@@ -398,6 +438,69 @@ mod tests {
                 .exists(),
             "tool.extra's stamp must not be removed by pruning tool"
         );
+    }
+
+    #[test]
+    fn safe_managed_path_accepts_relative_paths_under_home() {
+        // The historical Bash layout stored install paths as `.local/share/...`
+        // strings relative to `$HOME`. These must continue to resolve into the
+        // home-rooted location they always have.
+        let fixture = Fixture::new("safe-rel-home");
+        let resolved = safe_managed_path(".local/share/repo-tool", &fixture.roots).unwrap();
+        assert_eq!(resolved, fixture.roots.home.join(".local/share/repo-tool"));
+    }
+
+    #[test]
+    fn safe_managed_path_accepts_absolute_paths_under_install_dir() {
+        // Newer github:repo records may carry an absolute path under the
+        // managed install root. Lexical containment of `install_dir` covers
+        // that case.
+        let fixture = Fixture::new("safe-abs-install");
+        let absolute = fixture.roots.install_dir.join("owner/repo");
+        let resolved = safe_managed_path(absolute.to_str().unwrap(), &fixture.roots).unwrap();
+        assert_eq!(resolved, absolute);
+    }
+
+    #[test]
+    fn safe_managed_path_rejects_absolute_path_outside_managed_roots() {
+        // A corrupt manifest record could otherwise hand `remove_dir_all` an
+        // arbitrary system path. The guard must refuse it rather than treat
+        // the record as authoritative.
+        let fixture = Fixture::new("safe-escape-abs");
+        assert!(safe_managed_path("/etc/passwd", &fixture.roots).is_none());
+        assert!(safe_managed_path("/tmp/unrelated", &fixture.roots).is_none());
+    }
+
+    #[test]
+    fn safe_managed_path_rejects_parent_dir_escapes() {
+        // `..` segments would lexically allow a path to escape the
+        // `starts_with` check even when the prefix matches one of the
+        // managed roots. They are refused outright.
+        let fixture = Fixture::new("safe-escape-parent");
+        assert!(safe_managed_path("../../etc/passwd", &fixture.roots).is_none());
+        assert!(safe_managed_path(".local/share/../../../etc", &fixture.roots).is_none());
+    }
+
+    #[test]
+    fn github_repo_cleanup_skips_install_path_outside_managed_roots() {
+        // End-to-end: a tampered manifest record with an absolute escape path
+        // must not result in `remove_dir_all` being called on that path. The
+        // bin-dir cleanup and stamp removal still run, but the external file
+        // must be left untouched.
+        let fixture = Fixture::new("tampered-install-path");
+        let bystander = fixture.dir.join("bystander");
+        fs::create_dir_all(&bystander).unwrap();
+        fs::write(bystander.join("data"), "user-owned").unwrap();
+        let absolute = bystander.to_string_lossy().into_owned();
+
+        remove_builtin(
+            &ManifestEntry::new("repo-tool", "github:repo", "repo-tool", &absolute),
+            &fixture.roots,
+        )
+        .unwrap();
+
+        assert!(bystander.exists(), "external path must be preserved");
+        assert!(bystander.join("data").exists());
     }
 
     fn entry(name: &str, method: &str) -> Entry {
