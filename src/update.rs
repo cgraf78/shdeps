@@ -155,6 +155,18 @@ impl Summary {
     /// suddenly start failing for previously-tolerated I/O errors.
     /// The env-var opt-in lets operators who want strict cleanup
     /// gating enable it without breaking everyone else's quiet path.
+    ///
+    /// **Test concurrency invariant:** `has_errors` reads
+    /// `SHDEPS_STRICT_LEFTOVERS` from the process-global env. Tests
+    /// that mutate that env (currently
+    /// `summary_has_errors_only_promotes_leftovers_when_strict_mode_enabled`)
+    /// must serialize against any concurrent test that calls
+    /// `has_errors` on a non-empty `leftovers` vector — see
+    /// `STRICT_LEFTOVERS_TEST_LOCK` in the test module. No
+    /// non-test caller mutates the env, so the production read is
+    /// race-free. A future test that exercises `has_errors` with
+    /// leftovers MUST acquire the same mutex or it will flake
+    /// under parallel test execution.
     #[must_use]
     pub fn has_errors(&self) -> bool {
         if !self.failed.is_empty() {
