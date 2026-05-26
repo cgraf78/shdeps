@@ -514,7 +514,29 @@ _install_bundle() {
     # payload is complete, then restore it if the final activation rename
     # fails. Git checkouts and unknown/manual dirs are rejected above because
     # automatic release conversion needs a separate migration path.
+    #
+    # Trap INT/TERM/HUP around the rename window so a Ctrl-C in the
+    # exact moment between `mv SHDEPS_DIR backup` and `mv staging
+    # SHDEPS_DIR` does not strand the user with `SHDEPS_DIR` missing
+    # and a backup directory the next bootstrap does not understand.
+    # The handler restores the backup (best-effort), cleans the
+    # staging tree, and re-raises the signal so the shell exits with
+    # the conventional 128+signal code instead of silently swallowing
+    # the interruption.
+    # Double-quoted trap body is intentional here: we want `$backup`
+    # and `$staging` baked in at trap-set time so the handler is robust
+    # against later reassignment. shellcheck SC2064 flags this as a
+    # maintenance concern; the trade-off is acceptable for this single
+    # signal-handling site.
+    # shellcheck disable=SC2064
+    trap "
+      mv \"$backup\" \"$SHDEPS_DIR\" 2>/dev/null || true
+      rm -rf \"$staging\"
+      trap - INT TERM HUP
+      kill -INT \$\$ 2>/dev/null || exit 130
+    " INT TERM HUP
     if ! mv "$SHDEPS_DIR" "$backup"; then
+      trap - INT TERM HUP
       rm -rf "$staging"
       return 1
     fi
@@ -522,11 +544,16 @@ _install_bundle() {
   if ! mv "$staging" "$SHDEPS_DIR"; then
     if [[ -n "$backup" ]]; then
       mv "$backup" "$SHDEPS_DIR" 2>/dev/null || true
+      trap - INT TERM HUP
     fi
     rm -rf "$staging"
     return 1
   fi
   if [[ -n "$backup" ]]; then
+    # New install activated. Disarm the rollback trap before cleaning
+    # the backup so a Ctrl-C during backup removal does not try to
+    # restore from a directory we are deliberately deleting.
+    trap - INT TERM HUP
     rm -rf "$backup"
   fi
   _info "shdeps: installed"
