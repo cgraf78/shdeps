@@ -339,15 +339,27 @@ fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
     // in the same parent directory, then `rename` it over `target`.
     // `rename` is atomic on POSIX when both paths are on the same
     // filesystem (guaranteed here because the temp name shares a
-    // parent dir). This collapses the previous
-    // `symlink_metadata` → `remove_file` → `symlink` window that
-    // would let an adversary with write access to the parent
-    // directory swap the existing symlink for a regular file
-    // between the check and the unlink, causing us to delete a
-    // user-owned file. With atomic rename, the worst the attacker
-    // can do is race the rename — and the final state is always
-    // "either the old target or the new symlink", never "deleted
-    // user file with no replacement".
+    // parent dir). This NARROWS — does not eliminate — the previous
+    // `symlink_metadata` → `remove_file` → `symlink` race window.
+    //
+    // Specifically: the prior sequence had a "delete then create"
+    // gap during which the path was momentarily missing entirely. An
+    // adversary could observe that gap to delete a user-owned file
+    // that the user atomically placed at the path between the
+    // metadata check and the unlink, then race shdeps for what gets
+    // created.
+    //
+    // With atomic rename there is no missing-path gap: the path is
+    // always either the prior content or the new symlink. The race
+    // window between `symlink_metadata` and `rename` still exists,
+    // and within that window a process that atomically replaces the
+    // existing symlink with a regular file will see that file
+    // overwritten by our new symlink. The user file is lost in that
+    // case — but only its content; no "deleted with no replacement"
+    // gap exists. Combined with the upfront `is_symlink` guard that
+    // returns false for non-symlinks observed at check time, this is
+    // the smallest race surface achievable without
+    // `AT_EMPTY_PATH`-style atomic check-and-replace primitives.
     let parent = target.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

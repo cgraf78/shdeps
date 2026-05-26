@@ -485,10 +485,12 @@ fn apply_hook_env(
         .env("SHDEPS_HOOK_PHASE", phase)
         // Signal to any recursive `shdeps` invocation from inside the
         // hook that our parent already holds the per-state-dir flock.
-        // The inner `StateLock::acquire` short-circuits to a no-op
-        // guard instead of trying to acquire the lock and deadlocking
-        // against itself. See `state::REENTRY_ENV` for the contract.
-        .env(crate::state::REENTRY_ENV, "1");
+        // The value is our own PID; the inner `StateLock::acquire`
+        // accepts the reentry signal only when the env value equals
+        // the child's `getppid()`. That binding blocks the "user
+        // exported SHDEPS_STATE_LOCK_HELD in their shell" bypass —
+        // see `state::REENTRY_ENV` for the full rationale.
+        .env(crate::state::REENTRY_ENV, std::process::id().to_string());
     if let Some(txn) = txn {
         // This env var is the only parent/child coordination channel for
         // `shdeps_mark_changed`. Keeping it opaque prevents hooks from

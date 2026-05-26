@@ -3425,11 +3425,22 @@ version() { printf 'saw-pkg\n'; }
         // `SHDEPS_STRICT_LEFTOVERS=1`. Default mode preserves the
         // historical quiet behavior; strict mode is the opt-in for
         // operators who want hard enforcement.
+        //
+        // Serialize against any other test in this module that
+        // touches `SHDEPS_STRICT_LEFTOVERS`. Rust test harness runs
+        // tests in parallel within the same process; `set_var`
+        // mutates process-global state, so without a mutex two
+        // tests can see each other's transient values and silently
+        // mis-classify.
+        let _env_guard = STRICT_LEFTOVERS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         let mut summary = Summary::default();
         assert!(!summary.has_errors());
         summary.leftovers.push("owner/tool".to_owned());
-        // SAFETY: single-threaded test context; value reverted before
-        // exit so other tests are unaffected.
+        // SAFETY: env mutation is serialized by the test lock;
+        // value reverted before the lock is released.
         unsafe {
             std::env::remove_var("SHDEPS_STRICT_LEFTOVERS");
         }
@@ -3449,6 +3460,14 @@ version() { printf 'saw-pkg\n'; }
             "leftover must gate exit when SHDEPS_STRICT_LEFTOVERS=1 is set"
         );
     }
+
+    /// Process-wide mutex serializing tests that mutate
+    /// `SHDEPS_STRICT_LEFTOVERS`. See the matching `ENV_TEST_LOCK`
+    /// pattern in `state.rs`. Module-private because we only
+    /// need to serialize against same-module tests; cross-module
+    /// env-var races on different keys are not observed in
+    /// practice for shdeps' test inventory.
+    static STRICT_LEFTOVERS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn update_github_repo_existing_clone_pull_failure_reports_dirty_tree_cause() {

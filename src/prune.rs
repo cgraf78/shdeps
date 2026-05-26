@@ -130,6 +130,22 @@ pub fn run(
     // coherent with a concurrent update.
     let _lock = crate::state::StateLock::acquire(&roots.state_dir)?;
 
+    // Re-read the manifest now that we hold the lock. The `orphans`
+    // computed above is based on the caller's pre-lock snapshot; a
+    // concurrent `shdeps update` may have added or removed entries
+    // since then, which would invalidate the orphan list. Recomputing
+    // inside the lock guarantees we mutate against the current state.
+    let fresh_manifest = manifest::read(manifest_path)?;
+    let orphans = self::orphans(&fresh_manifest, config);
+    if orphans.is_empty() {
+        return Ok(Summary {
+            orphans,
+            removed: Vec::new(),
+            guarded_all_orphans: false,
+            quiet_skipped: false,
+        });
+    }
+
     let cleanup_roots = cleanup_roots(roots);
     let mut removed = Vec::new();
     for entry in &orphans {

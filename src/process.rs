@@ -330,6 +330,12 @@ fn terminate_then_kill(child: &mut std::process::Child) {
         // our SIGTERM lands. Skipping the signal when `try_wait`
         // reports the child already exited closes that window.
         // The grace loop below does the same check on each iteration.
+        //
+        // Note: Rust's `Child` caches the exit status from the first
+        // successful `try_wait`, so re-calling after a successful
+        // reap returns the cached status without re-issuing
+        // `waitpid`. The repeated calls in this loop are safe and
+        // do not race with each other.
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
