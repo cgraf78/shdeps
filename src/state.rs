@@ -33,9 +33,9 @@ const LOCK_FILE: &str = ".lock";
 /// the reentry guard fires ONLY when the value equals the current
 /// process's PARENT pid (`getppid`). This blocks the trivial-bypass
 /// case where a user (or hostile shell init) does
-/// `export SHDEPS_STATE_LOCK_HELD=1` — that value would not match
-/// `getppid()` for a top-level invocation, so locking is still
-/// enforced. The hook-spawn path in `apply_hook_env` writes the
+/// `export SHDEPS_STATE_LOCK_HELD=1` — that value (or any non-PID
+/// integer) would not match `getppid()` for a top-level invocation,
+/// so locking is still enforced. The hook-spawn path in `apply_hook_env` writes the
 /// parent's `std::process::id()` into the env, which matches the
 /// child's `getppid()` exactly when the child was spawned by that
 /// parent.

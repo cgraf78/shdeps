@@ -135,6 +135,13 @@ pub fn run(
     // concurrent `shdeps update` may have added or removed entries
     // since then, which would invalidate the orphan list. Recomputing
     // inside the lock guarantees we mutate against the current state.
+    //
+    // The `config` is intentionally NOT re-read: shdeps does not write
+    // to user config files, so a concurrent shdeps invocation cannot
+    // mutate it. Only an operator-side edit (text editor, git pull)
+    // would change it, and racing against that is out of scope —
+    // the operator is expected to re-run prune if they edit config
+    // mid-run.
     let fresh_manifest = manifest::read(manifest_path)?;
     let orphans = self::orphans(&fresh_manifest, config);
     if orphans.is_empty() {
