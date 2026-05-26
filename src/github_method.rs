@@ -131,7 +131,9 @@ where
     let cache = Cache::new(&context.roots.state_dir, &entry.name);
     if stamp::remote_fresh(&cache.stamp, options.freshness()) {
         if let Some(method) = cache.read_method()? {
-            return Ok(method);
+            if let Some(method) = usable_cached_method(method, entry, context) {
+                return Ok(method);
+            }
         }
     }
     if let Some(method) = seed_method_from_manifest(entry, context, &cache, options)? {
@@ -174,7 +176,7 @@ where
             // an installed release-backed CLI to a source checkout just
             // because the fleet exhausted the unauthenticated API quota.
             if let Some(method) = cache.read_stale_method()? {
-                method
+                usable_cached_method(method, entry, context).unwrap_or(METHOD_REPO)
             } else {
                 // With no prior signal, keep the historical soft fallback so
                 // first-time installs can still try a source checkout when the
@@ -227,7 +229,7 @@ impl Cache {
         Ok(match content.trim_end() {
             METHOD_RELEASE => Some(METHOD_RELEASE),
             METHOD_REPO_NO_ASSET => Some(METHOD_REPO),
-            METHOD_REPO_LAST_KNOWN => Some(METHOD_REPO),
+            METHOD_REPO_LAST_KNOWN => Some(METHOD_REPO_LAST_KNOWN),
             // Legacy cache files wrote plain `github:repo` for both "no
             // compatible release" and "metadata fetch failed". Re-probe those
             // once so hosts can recover after credentials or repo visibility
@@ -267,7 +269,7 @@ where
         return Ok(None);
     }
 
-    let Some((stored, resolved)) = manifest_method(row, context.roots) else {
+    let Some((stored, resolved)) = manifest_method(row, context.roots, context.runner) else {
         return Ok(None);
     };
 
@@ -282,25 +284,89 @@ where
     Ok(Some(resolved))
 }
 
-fn manifest_method(
+fn usable_cached_method<R>(
+    method: &'static str,
+    entry: &Entry,
+    context: &Context<'_, R>,
+) -> Option<&'static str>
+where
+    R: Runner,
+{
+    match method {
+        METHOD_REPO_LAST_KNOWN if last_known_repo_still_matches(entry, context) => {
+            Some(METHOD_REPO)
+        }
+        METHOD_REPO_LAST_KNOWN => None,
+        _ => Some(method),
+    }
+}
+
+fn last_known_repo_still_matches<R>(entry: &Entry, context: &Context<'_, R>) -> bool
+where
+    R: Runner,
+{
+    let Some(manifest) = context.manifest else {
+        return false;
+    };
+    let Some(row) = manifest.get(&entry.name) else {
+        return false;
+    };
+    row.cmd == entry.cmd && manifest_method(row, context.roots, context.runner).is_some()
+}
+
+fn manifest_method<R>(
     row: &crate::manifest::ManifestEntry,
     roots: &Roots,
-) -> Option<(&'static str, &'static str)> {
+    runner: &R,
+) -> Option<(&'static str, &'static str)>
+where
+    R: Runner,
+{
     match row.method.as_str() {
-        METHOD_REPO if manifest_repo_exists(row, roots) => {
+        METHOD_REPO if manifest_repo_command_visible(row, roots, runner) => {
             Some((METHOD_REPO_LAST_KNOWN, METHOD_REPO))
         }
         _ => None,
     }
 }
 
-fn manifest_repo_exists(row: &crate::manifest::ManifestEntry, roots: &Roots) -> bool {
-    let path = if row.install_path.is_empty() {
+fn manifest_repo_command_visible<R>(
+    row: &crate::manifest::ManifestEntry,
+    roots: &Roots,
+    runner: &R,
+) -> bool
+where
+    R: Runner,
+{
+    let repo_path = manifest_repo_path(row, roots);
+    let Some(command_path) = runner.path(&row.cmd) else {
+        return false;
+    };
+
+    // The manifest seed is a rollout optimization, not proof of correctness.
+    // Source checkouts often contain many executable helper scripts, and an
+    // unrelated package can also put the same command name on PATH. Trust a
+    // cached repo answer only when shell lookup resolves back into the repo
+    // path recorded in the manifest.
+    canonical_child_of(&command_path, &repo_path)
+}
+
+fn manifest_repo_path(row: &crate::manifest::ManifestEntry, roots: &Roots) -> PathBuf {
+    if row.install_path.is_empty() {
         roots.install_dir.join(&row.name)
     } else {
         PathBuf::from(&row.install_path)
+    }
+}
+
+fn canonical_child_of(child: &Path, parent: &Path) -> bool {
+    let Ok(child) = fs::canonicalize(child) else {
+        return false;
     };
-    path.exists()
+    let Ok(parent) = fs::canonicalize(parent) else {
+        return false;
+    };
+    child.starts_with(parent)
 }
 
 struct EnvVars<'a> {
@@ -332,7 +398,7 @@ impl Env for EnvVars<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io;
     use std::path::PathBuf;
@@ -487,13 +553,15 @@ mod tests {
     #[test]
     fn manifest_repo_seed_avoids_first_bare_github_probe() {
         let fixture = Fixture::new("manifest-repo-seed");
-        fs::create_dir_all(fixture.roots.install_dir.join("owner/tool")).unwrap();
+        let command_path = fixture.write_repo_command("owner/tool", "tool");
         let manifest = Manifest::parse(&format!(
             "owner/tool|github:repo|tool|{}\n",
             fixture.roots.install_dir.join("owner/tool").display()
         ));
         let client = FakeClient::new();
-        let runner = FakeRunner::new().with_uname("x86_64");
+        let runner = FakeRunner::new()
+            .with_uname("x86_64")
+            .with_path("tool", command_path);
         let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
 
         let resolved = resolve_entries(
@@ -509,6 +577,125 @@ mod tests {
             "github:repo:last-known"
         );
         assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn manifest_repo_seed_requires_visible_command() {
+        let fixture = Fixture::new("manifest-repo-seed-missing-command");
+        fs::create_dir_all(fixture.roots.install_dir.join("owner/tool")).unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|tool|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["tool-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64").missing("tool");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            fixture.options(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[test]
+    fn manifest_repo_seed_rejects_unrelated_visible_command() {
+        let fixture = Fixture::new("manifest-repo-seed-unrelated-command");
+        fs::create_dir_all(fixture.roots.install_dir.join("owner/tool")).unwrap();
+        let outside_command = fixture.write_outside_command("tool");
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|tool|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["tool-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new()
+            .with_uname("x86_64")
+            .with_path("tool", outside_command);
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            fixture.options(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[test]
+    fn fresh_last_known_repo_cache_uses_manifest_command_path() {
+        let fixture = Fixture::new("last-known-repo-cache-valid");
+        fixture.write_cache("owner/tool", "github:repo:last-known", 10);
+        let command_path = fixture.write_repo_command("owner/tool", "tool");
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|tool|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let client = FakeClient::new();
+        let runner = FakeRunner::new()
+            .with_uname("x86_64")
+            .with_path("tool", command_path);
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:repo");
+        assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn fresh_last_known_repo_cache_requires_manifest_command_path() {
+        let fixture = Fixture::new("last-known-repo-missing-command");
+        fixture.write_cache("owner/tool", "github:repo:last-known", 10);
+        fs::create_dir_all(fixture.roots.install_dir.join("owner/tool")).unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|tool|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["tool-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64").missing("tool");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
     }
 
     #[test]
@@ -715,6 +902,20 @@ mod tests {
                 .trim_end()
                 .to_owned()
         }
+
+        fn write_repo_command(&self, name: &str, command: &str) -> PathBuf {
+            let command_path = self.roots.install_dir.join(name).join("bin").join(command);
+            fs::create_dir_all(command_path.parent().unwrap()).unwrap();
+            fs::write(&command_path, b"fake executable").unwrap();
+            command_path
+        }
+
+        fn write_outside_command(&self, command: &str) -> PathBuf {
+            let command_path = self.root.join("outside-bin").join(command);
+            fs::create_dir_all(command_path.parent().unwrap()).unwrap();
+            fs::write(&command_path, b"fake executable").unwrap();
+            command_path
+        }
     }
 
     impl Drop for Fixture {
@@ -757,12 +958,16 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         uname: String,
+        missing: BTreeSet<String>,
+        paths: BTreeMap<String, PathBuf>,
     }
 
     impl FakeRunner {
         fn new() -> Self {
             Self {
                 uname: "x86_64".to_owned(),
+                missing: BTreeSet::new(),
+                paths: BTreeMap::new(),
             }
         }
 
@@ -770,11 +975,31 @@ mod tests {
             self.uname = uname.to_owned();
             self
         }
+
+        fn missing(mut self, command: &str) -> Self {
+            self.missing.insert(command.to_owned());
+            self
+        }
+
+        fn with_path(mut self, command: &str, path: PathBuf) -> Self {
+            self.paths.insert(command.to_owned(), path);
+            self
+        }
     }
 
     impl Runner for FakeRunner {
         fn exists(&self, command: &str) -> bool {
-            command != "ldd"
+            command != "ldd" && !self.missing.contains(command)
+        }
+
+        fn path(&self, command: &str) -> Option<PathBuf> {
+            if !self.exists(command) {
+                return None;
+            }
+            self.paths
+                .get(command)
+                .cloned()
+                .or_else(|| Some(PathBuf::from(command)))
         }
 
         fn run(
