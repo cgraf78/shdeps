@@ -221,6 +221,68 @@ _lazy_call_calls=$(
 _assert_true "lazy init: subprocesses fire on first public-API call" \
   test "$_lazy_call_calls" -gt 0
 
+echo "=== install.sh: _archive_entries_safe ==="
+
+_archive_dir=$(mktemp -d)
+trap 'rm -rf "$_fixture_dir" "$_lazy_dir" "$_archive_dir"' EXIT
+
+# Safe archive: relative paths only.
+_safe_archive="$_archive_dir/safe.tar.gz"
+(
+  cd "$_archive_dir"
+  mkdir -p stage/bin stage/share/man/man1
+  printf '#!/bin/sh\n' >stage/bin/shdeps
+  printf '.TH SHDEPS 1\n' >stage/share/man/man1/shdeps.1
+  tar -czf safe.tar.gz -C stage .
+)
+_assert_true "archive guard accepts a clean relative-path archive" \
+  _archive_entries_safe "$_safe_archive"
+
+# Hostile archive: absolute path. Use tar's --absolute-names where
+# available; otherwise build via a tar member with a leading slash.
+_evil_abs="$_archive_dir/evil-abs.tar.gz"
+(
+  cd "$_archive_dir"
+  mkdir -p stage_abs/tmp
+  printf 'evil\n' >stage_abs/tmp/file
+  # tar normally strips leading slashes; use the -P flag (GNU) or
+  # --absolute-paths (BSD) to preserve them. Fall back to a manual
+  # path manipulation that the consumer-side `case` test catches.
+  if tar --help 2>&1 | grep -q -- '--absolute-names'; then
+    tar -czPf evil-abs.tar.gz /tmp/shdeps-test-evil-marker 2>/dev/null ||
+      tar -czf evil-abs.tar.gz --transform 's,^,/abs/,' -C stage_abs tmp/file 2>/dev/null ||
+      cp "$_safe_archive" evil-abs.tar.gz
+  else
+    cp "$_safe_archive" evil-abs.tar.gz
+  fi
+)
+# If we built a real absolute-path archive above, the guard must refuse.
+# If the tar flavor refused to build one, the test is a no-op (the
+# `cp $_safe_archive` fallback would let the guard accept it), so guard
+# only-fail when we can confirm the archive actually has an abs path.
+if tar -tzf "$_evil_abs" 2>/dev/null | grep -qE '^/'; then
+  _assert_false "archive guard refuses absolute-path entries" \
+    _archive_entries_safe "$_evil_abs"
+fi
+
+# Hostile archive: `..` traversal in a path component.
+_evil_dotdot="$_archive_dir/evil-dotdot.tar.gz"
+(
+  cd "$_archive_dir"
+  mkdir -p stage_dd
+  printf 'evil\n' >stage_dd/file
+  # `tar --transform` (GNU) rewrites the member name to include `..`.
+  if tar --help 2>&1 | grep -q -- '--transform'; then
+    tar -czf evil-dotdot.tar.gz --transform 's,file,../escape,' -C stage_dd file
+  else
+    cp "$_safe_archive" evil-dotdot.tar.gz
+  fi
+)
+if tar -tzf "$_evil_dotdot" 2>/dev/null | grep -qE '(^|/)\.\.(/|$)'; then
+  _assert_false 'archive guard refuses dot-dot traversal entries' \
+    _archive_entries_safe "$_evil_dotdot"
+fi
+
 echo "=== shdeps.sh: PATH fallback opt-in ==="
 
 # The wrapper used to silently fall through to whatever `shdeps` happened
