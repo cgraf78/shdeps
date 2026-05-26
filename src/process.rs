@@ -98,7 +98,14 @@ impl Runner for Process {
 pub fn detect_package_manager(runner: &impl Runner) -> String {
     if runner.exists("brew")
         && runner
-            .run("uname", &["-s"], None)
+            // Bound `uname -s` to a short timeout. In container/VM
+            // environments with broken syscall emulation, `uname` has
+            // been observed to hang indefinitely; without a deadline,
+            // the entire `shdeps list`/`update` warm path would block
+            // on a probe that should answer in microseconds. The
+            // SIGTERM-then-SIGKILL helper still gives the child a tiny
+            // chance to exit cleanly.
+            .run("uname", &["-s"], Some(VERSION_PROBE_TIMEOUT))
             .ok()
             .is_some_and(|output| output.success && output.stdout.trim() == "Darwin")
     {
@@ -476,6 +483,48 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing fake command"))
         }
+    }
+
+    #[test]
+    fn detect_package_manager_bounds_uname_with_timeout() {
+        // Container/VM environments with broken syscall emulation can
+        // hang `uname` indefinitely. The detector must pass a finite
+        // timeout to its only blocking probe so the warm path cannot
+        // wedge on a misbehaving environment.
+        use std::sync::Mutex;
+        struct RecordingRunner {
+            timeouts: Mutex<Vec<Option<Duration>>>,
+        }
+        impl Runner for RecordingRunner {
+            fn exists(&self, command: &str) -> bool {
+                command == "brew"
+            }
+            fn run(
+                &self,
+                _program: &str,
+                _args: &[&str],
+                timeout: Option<Duration>,
+            ) -> io::Result<Output> {
+                self.timeouts.lock().unwrap().push(timeout);
+                Ok(Output {
+                    success: true,
+                    timed_out: false,
+                    stdout: "Linux\n".to_owned(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let runner = RecordingRunner {
+            timeouts: Mutex::new(Vec::new()),
+        };
+        let _ = detect_package_manager(&runner);
+        let observed = runner.timeouts.lock().unwrap().clone();
+        assert!(
+            observed
+                .iter()
+                .all(|timeout| timeout.is_some_and(|duration| duration > Duration::ZERO)),
+            "uname probes must be passed a positive timeout: {observed:?}"
+        );
     }
 
     #[test]
