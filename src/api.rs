@@ -232,7 +232,27 @@ where
     let runtime_env = runtime::runtime_env(&ProcessEnv);
     let name = config::canonical_name(name, "github:release");
     let repo = config::canonical_name(repo.unwrap_or(&name), "github:release");
-    if !config::valid_dep_name(&name) || !config::valid_dep_name(&repo) || cmd.is_empty() {
+    // Apply the same basename validator the config-side `parse_entry`
+    // path uses (see `config::valid_cmd_basename`). Without this guard
+    // the hidden API would be a second, looser entry point: a hook —
+    // or any caller of the Bash `shdeps_github_release_install`
+    // wrapper — could pass `cmd=/etc/passwd` and, when `bin_path` is
+    // omitted, the default `roots.bin_dir.join(cmd)` would resolve
+    // to the absolute path verbatim under Rust's `Path::join`
+    // semantics. The downstream release-install pipeline then
+    // renames the staged executable onto that exact path. The
+    // config-side hardening would be a half-measure if the bridge
+    // bypassed the same validator. `bin_path` stays unvalidated
+    // here because the bridge intentionally exposes it as a
+    // hook-author flexibility point (custom install layouts under
+    // managed roots that the default `<bin_dir>/<cmd>` does not
+    // cover); hooks are trusted user code per `hooks.rs`'s file
+    // comment, so the bin_path-trust contract is consistent with
+    // the rest of the hook surface.
+    if !config::valid_dep_name(&name)
+        || !config::valid_dep_name(&repo)
+        || !config::valid_cmd_basename(cmd)
+    {
         writeln!(stderr, "error: invalid github-release-install arguments")?;
         return Ok(2);
     }
