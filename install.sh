@@ -72,7 +72,15 @@ _is_release_install_dir() {
 
 _is_source_checkout_dir() {
   local dir="$1"
-  [[ -d "$dir/.git" ]]
+
+  # A curl-pipe installer is executed from the caller's current directory. In
+  # CI that directory is often another Git checkout, such as dotfiles. Treating
+  # any `.git` directory as "this script is running from a shdeps source
+  # checkout" accidentally routes fresh installs into the source-build path and
+  # makes release-capable machines need Cargo. A real shdeps checkout has both
+  # the installer and sourceable library beside the Git metadata, so use that as
+  # the ownership signal instead of the caller's unrelated repository shape.
+  [[ -d "$dir/.git" && -f "$dir/install.sh" && -f "$dir/shdeps.sh" ]]
 }
 
 _bootstrap_lib_is_installed_tree() {

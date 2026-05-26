@@ -4903,6 +4903,32 @@ SH
   _assert_eq "install release: CLI points at release binary" "$_release_inst/shdeps" "$_release_link"
   _assert_contains "install release: sends GitHub token" "Authorization: Bearer release-token" "$(cat "$_release_log")"
 
+  _release_pipe_cwd=$(_tmpdir)/dotfiles-like-cwd
+  _release_pipe_inst=$(_tmpdir)/shdeps-release-pipe-install
+  _release_pipe_bin=$(_tmpdir)/release-pipe-bin
+  _release_pipe_cargo_log=$(_tmpdir)/release-pipe-cargo.log
+  mkdir -p "$_release_pipe_cwd" "$_release_pipe_bin"
+  git -C "$_release_pipe_cwd" init >/dev/null 2>&1
+  cat >"$_release_fakebin/cargo" <<'SH'
+#!/usr/bin/env bash
+printf 'cargo %s\n' "$*" >>"$SHDEPS_TEST_CARGO_LOG"
+exit 99
+SH
+  chmod +x "$_release_fakebin/cargo"
+  (
+    cd "$_release_pipe_cwd" || exit 1
+    PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+      SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-pipe-cwd.log" \
+      SHDEPS_TEST_CARGO_LOG="$_release_pipe_cargo_log" \
+      SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+      SHDEPS_DIR="$_release_pipe_inst" SHDEPS_BIN="$_release_pipe_bin/shdeps" \
+      bash <"$_release_installer/install.sh" >/dev/null 2>&1
+  )
+  _assert_file_exists "install release pipe: unrelated git cwd installs release" \
+    "$_release_pipe_inst/.shdeps-install.json"
+  _assert_eq "install release pipe: unrelated git cwd does not require cargo" \
+    "" "$(cat "$_release_pipe_cargo_log" 2>/dev/null || true)"
+
   _release_migrate_inst=$(_tmpdir)/shdeps-release-migrate
   _release_migrate_bin=$(_tmpdir)/release-migrate-bin
   mkdir -p "$_release_migrate_inst" "$_release_migrate_bin"
