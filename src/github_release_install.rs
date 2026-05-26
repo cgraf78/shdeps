@@ -326,15 +326,20 @@ fn install_archive(
         // Clean up the staged content directory so retries don't
         // accumulate `.tmp.<pid>`-style stragglers next to the live
         // install — same hygiene `release_activate` applies.
-        let _ = fs::remove_dir_all(&content_root);
+        let _ = remove_any(&content_root);
         return Err(switch.into());
     }
     if had_existing {
         // Live install successfully switched. Backup cleanup is
         // best-effort so a transient file handle or an antivirus
         // scanner does not turn a successful install into a rollback
-        // of a good install.
-        let _ = fs::remove_dir_all(&backup);
+        // of a good install. Use `remove_any` (not
+        // `fs::remove_dir_all`) so that if `install_dir` happened to
+        // be a symlink to a real directory — unusual but legal — the
+        // backup we just renamed is a symlink whose target must not
+        // be touched. `remove_any` routes through `symlink_metadata`
+        // and unlinks the symlink entry without following it.
+        let _ = remove_any(&backup);
     }
     if content_root != extract_dir {
         remove_any(&extract_dir)?;

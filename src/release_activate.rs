@@ -101,20 +101,47 @@ pub fn activate(
         // directory next to the live install. Best-effort cleanup
         // here keeps the directory listing tidy without masking the
         // underlying switch error.
-        let _ = fs::remove_dir_all(&staged.dir);
+        let _ = remove_path(&staged.dir);
         return Err(Failure::Switch(switch));
     }
 
     if had_existing {
-        // The live install has already switched successfully. Backup cleanup is
-        // best-effort so an antivirus, shell cwd, or transient file handle does
-        // not turn a successful self-update into a rollback of a good install.
-        let _ = fs::remove_dir_all(&backup);
+        // The live install has already switched successfully. Backup
+        // cleanup is best-effort so an antivirus, shell cwd, or
+        // transient file handle does not turn a successful self-
+        // update into a rollback of a good install. Route through
+        // `remove_path` (which checks `symlink_metadata` first) so
+        // that if `install_dir` was a symlink to a real directory —
+        // unusual but legal — the backup we just renamed is a
+        // symlink whose target must NOT be touched. `remove_dir_all`
+        // on a symlinked dir has uncertain semantics across Rust
+        // stdlib versions; `remove_path` is unambiguous.
+        let _ = remove_path(&backup);
     }
 
     Ok(Activation {
         install_dir: install_dir.to_path_buf(),
     })
+}
+
+/// Removes the entry at `path` without following symlinks.
+///
+/// Mirrors the local `remove_any` helpers in `github_release_install`
+/// and `update_transition`. The three callers are now identical, and
+/// the helper is small enough to keep duplicated rather than introduce
+/// a `fs_util` module just for this — but the consolidation point is
+/// worth noting for a future "fourth use → extract" decision.
+fn remove_path(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn backup_path(install_dir: &Path) -> PathBuf {
