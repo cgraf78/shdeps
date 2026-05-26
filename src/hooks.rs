@@ -5,15 +5,119 @@
 //! each hook query in a short Bash subprocess preserves the shell API boundary
 //! while preventing hook-defined functions from leaking between dependencies.
 
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Result;
 use crate::config;
 use crate::config::Entry;
 use crate::runtime::Roots;
 use crate::status::CustomProbe;
+
+/// Default wall-clock timeout for a single hook subprocess.
+///
+/// A misbehaving hook (infinite loop, blocking on a closed pipe, waiting
+/// on user input) used to hang the parent `shdeps update` indefinitely.
+/// Five minutes is generous for a real install hook that downloads and
+/// builds something while still preventing the unbounded-hang failure
+/// mode. Operators can override with `SHDEPS_HOOK_TIMEOUT_SECS`.
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 300;
+
+/// Default per-stream cap for hook stdout/stderr capture.
+///
+/// `command.output()` buffers the full child output in memory, so a hook
+/// that emits unbounded text (e.g., `version() { cat /var/log/syslog; }`
+/// — a real footgun in the wild) could OOM the parent. We continue
+/// draining the pipes after the cap so the child does not block on a
+/// full pipe buffer, but only the first `MAX` bytes are kept in memory.
+const DEFAULT_HOOK_MAX_OUTPUT_BYTES: usize = 1 << 20;
+
+/// Poll interval used while waiting for a hook child to exit.
+const HOOK_WAIT_POLL: Duration = Duration::from_millis(50);
+
+/// Runs a configured hook command with a wall-clock timeout and a
+/// per-stream output cap.
+fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
+    let timeout = hook_timeout();
+    let max_bytes = hook_max_bytes();
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    // Drain the pipes concurrently in background threads so the child
+    // cannot wedge on a full pipe buffer while we wait for it to exit.
+    // Each reader stops storing bytes after `max_bytes` but keeps
+    // reading-and-discarding until EOF; without that, a runaway hook
+    // would block forever on the next pipe write.
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stdout_handle = thread::spawn(move || read_capped(stdout, max_bytes));
+    let stderr_handle = thread::spawn(move || read_capped(stderr, max_bytes));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // Hook timed out. SIGKILL is OK here because the surrounding
+            // contract is "best effort" — a wedged hook is already a
+            // failure regardless of cleanup-handler semantics.
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        thread::sleep(HOOK_WAIT_POLL);
+    };
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_capped<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => return kept,
+            Ok(n) => n,
+            Err(_) => return kept,
+        };
+        if kept.len() < max_bytes {
+            // Append only up to the cap; subsequent bytes from this read
+            // are intentionally discarded, but the loop continues so the
+            // child's later writes do not block on a full pipe buffer.
+            let room = max_bytes - kept.len();
+            let take = std::cmp::min(room, n);
+            kept.extend_from_slice(&chunk[..take]);
+        }
+    }
+}
+
+fn hook_timeout() -> Duration {
+    std::env::var("SHDEPS_HOOK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_HOOK_TIMEOUT_SECS))
+}
+
+fn hook_max_bytes() -> usize {
+    std::env::var("SHDEPS_HOOK_MAX_OUTPUT_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_HOOK_MAX_OUTPUT_BYTES)
+}
 
 /// Generated Bash compatibility layer for Rust hook subprocesses.
 pub mod prelude;
@@ -247,7 +351,7 @@ impl BashCustomProbe {
 
         let mut command = self.command(UNINSTALL_SCRIPT, name, &hook);
         apply_hook_env(&mut command, roots, name, "uninstall", None);
-        let output = command.output()?;
+        let output = run_hook_command(command)?;
 
         Ok(match output.status.code() {
             Some(0) => Uninstall::Removed,
@@ -281,7 +385,7 @@ impl BashCustomProbe {
         let mut command = self.command(INSTALL_SCRIPT, name, &hook);
         command.arg(if reinstall { "1" } else { "0" });
         apply_hook_env(&mut command, roots, name, "install", txn);
-        let output = command.output()?;
+        let output = run_hook_command(command)?;
 
         let detail = String::from_utf8_lossy(&output.stdout)
             .trim_end_matches(['\r', '\n'])
@@ -317,7 +421,7 @@ impl BashCustomProbe {
 
         let mut command = self.command(POST_SCRIPT, name, &hook);
         apply_hook_env(&mut command, roots, name, "post", txn);
-        let output = command.output()?;
+        let output = run_hook_command(command)?;
 
         Ok(match output.status.code() {
             Some(0) => Post::Ran,
@@ -418,7 +522,7 @@ impl CustomProbe for BashCustomProbe {
         // predicate gate; hooks that need phase-specific install/post behavior
         // get separate subprocesses with more precise phases.
         apply_hook_env(&mut command, roots, &entry.name, "exists", None);
-        let output = command.output()?;
+        let output = run_hook_command(command)?;
 
         if !output.status.success() {
             return Ok(None);
@@ -442,10 +546,31 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{BashCustomProbe, Install, Post, Txn, Uninstall};
+    use super::{BashCustomProbe, Install, Post, Txn, Uninstall, read_capped};
     use crate::config::parse_entry;
     use crate::runtime::Roots;
     use crate::status::CustomProbe;
+
+    #[test]
+    fn read_capped_keeps_only_first_max_bytes_but_drains_to_eof() {
+        // The cap is the in-memory storage limit, not a read limit. The
+        // reader must keep draining the source so a real hook child does
+        // not block on a full pipe buffer; only the first `max_bytes`
+        // are retained for the caller.
+        let payload = vec![b'a'; 64 * 1024];
+        let kept = read_capped(std::io::Cursor::new(payload.clone()), 16 * 1024);
+        assert_eq!(kept.len(), 16 * 1024);
+        assert!(kept.iter().all(|byte| *byte == b'a'));
+
+        // A reader whose total bytes fit under the cap is returned in full.
+        let small = b"hello world".to_vec();
+        let kept = read_capped(std::io::Cursor::new(small.clone()), 16 * 1024);
+        assert_eq!(kept, small);
+
+        // A zero cap discards every byte but still returns Ok with empty.
+        let kept = read_capped(std::io::Cursor::new(payload), 0);
+        assert!(kept.is_empty());
+    }
 
     #[test]
     fn txn_collects_valid_markers_and_ignores_invalid_names() {

@@ -66,6 +66,7 @@ fn parse_named_line(line: &str, file_name: &str) -> Option<String> {
     (candidate == file_name).then_some(hash)
 }
 
+#[cfg(test)]
 fn parse_bare_hash(line: &str) -> Option<String> {
     // Bare-hash parsing is intentionally NOT in the verify path. The
     // production `expected_sha256` only accepts filename-bound lines so a
