@@ -411,6 +411,38 @@ _verify_checksum() {
   fi
 }
 
+# Returns 0 (safe) only when every entry in a tar.gz archive uses a
+# relative path with no `..` components. The list step uses `tar -tzf`,
+# which is supported by both GNU tar and the BSD tar shipped on macOS,
+# so the bootstrap script does not depend on a platform-specific
+# `--no-absolute-filenames` flag. Mirrors the structural defense the
+# Rust extractor (`archive.rs`) applies — keeping the two
+# implementations consistent prevents the curl-pipe path from being a
+# softer target than the steady-state Rust path.
+_archive_entries_safe() {
+  local archive="$1" entry
+  if ! command -v tar >/dev/null 2>&1; then
+    return 1
+  fi
+  # Use a process substitution-fed loop so we surface non-zero exit
+  # from `tar -tzf` itself (corrupt archive, IO error) as an
+  # unsafe verdict.
+  while IFS= read -r entry; do
+    case "$entry" in
+      # Absolute paths escape the bundle root. `*../*` covers `..` as
+      # any path component (`a/../b`, `./../b`, etc.). `*/..` and `..`
+      # catch the trailing/standalone cases. Together they reject every
+      # shell-glob representation of a traversal segment without needing
+      # a full path canonicalizer.
+      /*) return 1 ;;
+      *../*) return 1 ;;
+      */..) return 1 ;;
+      ..) return 1 ;;
+    esac
+  done < <(tar -tzf "$archive" 2>/dev/null) || return 1
+  return 0
+}
+
 _install_release_fail() {
   local tmp="$1" kind="$2" message="$3"
 
@@ -669,6 +701,17 @@ _install_release() {
   bundle="$tmp/bundle"
   if ! mkdir -p "$bundle"; then
     _install_release_fail "$tmp" "artifact" "failed to create release bundle directory"
+    return 1
+  fi
+  # Tar traversal hardening: list the archive contents before extracting
+  # and refuse any entry whose path is absolute (`/foo`) or escapes the
+  # destination via `..`. GNU tar's `--no-absolute-filenames` is one
+  # mitigation but not portable to the BSD tar shipped on macOS; the
+  # list-and-validate approach works on both. The Rust extraction path
+  # (`archive.rs`) does the same check at a higher level; this is the
+  # bootstrap-side equivalent for the curl-pipe install path.
+  if ! _archive_entries_safe "$tmp/$archive"; then
+    _install_release_fail "$tmp" "artifact" "refusing to extract $archive: contains absolute or traversal paths"
     return 1
   fi
   if ! tar -xzf "$tmp/$archive" -C "$bundle"; then
