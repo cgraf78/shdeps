@@ -333,8 +333,17 @@ fn normalize_ancestor_perms(leaf: &Path) -> Result<()> {
 /// parent directory, which on the normal `~/.local/share/...` layout
 /// is just the user themselves, but operators sharing that path with
 /// less-trusted tooling should be aware.
+/// Atomically replaces (or creates) the symlink at `target` so that it
+/// points at `source`. Returns `Ok(true)` when a symlink was created
+/// or replaced, `Ok(false)` when the existing entry is a non-symlink
+/// regular file or directory that must be preserved.
+///
+/// Exposed at `pub(crate)` so `bin_link::one` can share the
+/// staging+rename machinery instead of duplicating its subtle
+/// TOCTOU semantics — the two were the only callers needing this
+/// pattern in the tree.
 #[cfg(unix)]
-fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
+pub(crate) fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
     use std::os::unix::fs::symlink;
 
     // `symlink_metadata` does not follow symlinks, so a dangling symlink is

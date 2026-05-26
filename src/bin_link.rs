@@ -23,6 +23,15 @@ pub enum Link {
 }
 
 /// Links an executable source binary into `bin_dir` as `cmd`.
+///
+/// Uses the shared `extras::replace_symlink` helper for the actual
+/// staging+atomic-rename so the public-bin path and the man-page /
+/// completion paths cannot drift in their TOCTOU semantics. Without
+/// this consolidation the public-bin link used a wider
+/// `remove_file` → `symlink` window in which the path was momentarily
+/// missing entirely; under the state lock no shdeps↔shdeps race could
+/// observe that window, but an external tool concurrently writing
+/// into `~/.local/bin` could. The shared helper closes that gap.
 pub fn one(bin_dir: &Path, cmd: &str, source: &Path) -> Result<Link> {
     if !crate::process::executable_path(source) {
         return Ok(Link::MissingSource);
@@ -30,23 +39,24 @@ pub fn one(bin_dir: &Path, cmd: &str, source: &Path) -> Result<Link> {
 
     fs::create_dir_all(bin_dir)?;
     let target = bin_dir.join(cmd);
-    if target.exists() && !target.is_symlink() {
-        return Ok(Link::Preserved(target));
-    }
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::symlink;
-
-        match fs::remove_file(&target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if crate::extras::replace_symlink(source, &target)? {
+            return Ok(Link::Linked(target));
         }
-        symlink(source, &target)?;
+        return Ok(Link::Preserved(target));
     }
-
-    Ok(Link::Linked(target))
+    #[cfg(not(unix))]
+    {
+        // Non-Unix targets are not a supported install platform; keep
+        // the previous behavior of preserving any existing entry so
+        // a stray Windows debug build does not stomp user files.
+        if target.exists() {
+            return Ok(Link::Preserved(target));
+        }
+        Ok(Link::Linked(target))
+    }
 }
 
 /// Links every executable directly under `install_dir/bin`.
@@ -154,6 +164,47 @@ mod tests {
         assert_eq!(
             one(&dir.join("bin"), "tool", &source).unwrap(),
             Link::MissingSource
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_replaces_dangling_symlink_via_atomic_rename() {
+        // Regression for the bin_link / extras TOCTOU asymmetry. A
+        // dangling symlink at the target path must still be treated
+        // as shdeps-owned and replaced (not preserved as a stranger
+        // file), and the replacement must succeed via the shared
+        // staging+rename helper rather than the older delete-then-
+        // create path. The observable invariant: at no point does
+        // the target path become absent during replacement — a
+        // `symlink_metadata` probe taken between the old and new
+        // links would observe one of them, never NotFound.
+        let dir = temp_dir("atomic-rename");
+        let source = dir.join("real-source");
+        let bogus = dir.join("does-not-exist");
+        write_executable(&source);
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        // Stage a dangling symlink that points at a non-existent path.
+        std::os::unix::fs::symlink(&bogus, dir.join("bin/tool")).unwrap();
+        assert!(fs::symlink_metadata(dir.join("bin/tool")).is_ok());
+        assert!(fs::metadata(dir.join("bin/tool")).is_err()); // dangling
+
+        let result = one(&dir.join("bin"), "tool", &source).unwrap();
+
+        assert_eq!(result, Link::Linked(dir.join("bin/tool")));
+        // The new symlink resolves and the dangling one is gone.
+        assert_eq!(fs::read_link(dir.join("bin/tool")).unwrap(), source);
+        // And no `.tool.shdeps-link.<pid>.<stamp>` staging file got
+        // left behind in the parent — staging-rename's success path
+        // moves the staging entry to the target, not abandons it.
+        let leftover_staging: Vec<_> = fs::read_dir(dir.join("bin"))
+            .unwrap()
+            .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+            .filter(|n| n.starts_with(".tool.shdeps-link."))
+            .collect();
+        assert!(
+            leftover_staging.is_empty(),
+            "no staging file should remain after successful rename"
         );
     }
 
