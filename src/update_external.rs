@@ -68,6 +68,15 @@ pub(crate) fn install(
     fs::create_dir_all(plan.install_root.join("bin"))?;
     let command = plan.command_for(options.reinstall);
     if !run(context.runner, &command)?.success {
+        // Best-effort cleanup: if the install never produced any
+        // content under the freshly-created install_root, remove the
+        // empty `bin/` and `install_root` so a failed first-time
+        // install does not leave stub directories scattered under the
+        // managed tree. `remove_dir` fails on non-empty directories,
+        // which is exactly what we want — a reinstall that failed
+        // mid-stream still leaves the dep's previous state intact.
+        let _ = fs::remove_dir(plan.install_root.join("bin"));
+        let _ = fs::remove_dir(&plan.install_root);
         return Ok(Item {
             name: entry.name.clone(),
             changed: false,
