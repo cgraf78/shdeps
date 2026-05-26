@@ -221,6 +221,23 @@ _lazy_call_calls=$(
 _assert_true "lazy init: subprocesses fire on first public-API call" \
   test "$_lazy_call_calls" -gt 0
 
+echo "=== install.sh: _curl_config_quote ==="
+
+# The bearer token + URL are passed through `_curl_config_quote`
+# before being embedded in `"..."`-quoted curl config fields.
+# Escape contract: `\` → `\\`, `"` → `\"`. Plain alphanumerics
+# pass through unchanged. Tokens from `gh auth token` are
+# alphanumeric, but escaping is defensive against a malformed
+# `SHDEPS_GH_TOKEN`.
+_assert_eq "quote: alphanumeric passthrough" \
+  "ghp_abc123XYZ" "$(_curl_config_quote 'ghp_abc123XYZ')"
+_assert_eq 'quote: backslash doubled' \
+  'a\\b' "$(_curl_config_quote 'a\b')"
+_assert_eq 'quote: double-quote escaped' \
+  'a\"b' "$(_curl_config_quote 'a"b')"
+_assert_eq 'quote: backslash before quote order-correct' \
+  'a\\\"b' "$(_curl_config_quote 'a\"b')"
+
 echo "=== install.sh: _archive_entries_safe ==="
 
 _archive_dir=$(mktemp -d)
