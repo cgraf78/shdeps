@@ -214,7 +214,132 @@ _release_tag_newer() {
   local latest="$1" current="$2"
 
   [[ -n "$latest" ]] || return 1
-  [[ -z "$current" || "$latest" > "$current" ]]
+  # When no current tag exists we cannot compute "newer than"; let the
+  # caller decide whether to install. (The bootstrap refresh path already
+  # short-circuits this case; this branch is here for direct callers.)
+  [[ -n "$current" ]] || return 0
+  [[ "$(_natural_tag_cmp "$latest" "$current")" == "gt" ]]
+}
+
+# Natural-order tag comparison shared with the Rust self-update path.
+#
+# Stable lexical comparison of release tags works for shdeps' own
+# `YYYYMMDD-HHMMSS-<hash>` format because the timestamp prefix is
+# zero-padded. It silently breaks down for any tag scheme with a numeric
+# component that grows past 9 (e.g., `v1.10` vs `v1.9`, where lexical
+# comparison incorrectly orders `v1.10` before `v1.9`). The Rust
+# implementation in `src/self_update.rs::compare_tags` already does a
+# natural sort that treats numeric runs by trimmed length and then by
+# bytes, with numeric runs sorting after text runs. Mirror that here so
+# bootstrap-time and runtime self-update agree on which release is newer
+# for every possible tag scheme.
+#
+# Echoes one of `lt`, `eq`, `gt` to stdout. Stays Bash 3.2-compatible
+# because `install.sh` runs from the curl-pipe path on macOS's stock
+# /bin/bash.
+_natural_tag_cmp() {
+  local left="$1" right="$2"
+  local left_pos=0 right_pos=0
+  local left_len=${#left} right_len=${#right}
+  local lc rc l_run r_run l_digit r_digit l_trim r_trim
+
+  while [[ $left_pos -lt $left_len || $right_pos -lt $right_len ]]; do
+    if [[ $left_pos -ge $left_len ]]; then
+      echo "lt"
+      return
+    fi
+    if [[ $right_pos -ge $right_len ]]; then
+      echo "gt"
+      return
+    fi
+
+    # Determine whether the next run on each side is numeric or textual.
+    lc="${left:$left_pos:1}"
+    rc="${right:$right_pos:1}"
+    case "$lc" in [0-9]) l_digit=1 ;; *) l_digit=0 ;; esac
+    case "$rc" in [0-9]) r_digit=1 ;; *) r_digit=0 ;; esac
+
+    # Extract the maximal same-class run from each side.
+    l_run=""
+    if [[ $l_digit -eq 1 ]]; then
+      while [[ $left_pos -lt $left_len ]]; do
+        case "${left:$left_pos:1}" in [0-9]) ;; *) break ;; esac
+        l_run="$l_run${left:$left_pos:1}"
+        left_pos=$((left_pos + 1))
+      done
+    else
+      while [[ $left_pos -lt $left_len ]]; do
+        case "${left:$left_pos:1}" in [0-9]) break ;; esac
+        l_run="$l_run${left:$left_pos:1}"
+        left_pos=$((left_pos + 1))
+      done
+    fi
+    r_run=""
+    if [[ $r_digit -eq 1 ]]; then
+      while [[ $right_pos -lt $right_len ]]; do
+        case "${right:$right_pos:1}" in [0-9]) ;; *) break ;; esac
+        r_run="$r_run${right:$right_pos:1}"
+        right_pos=$((right_pos + 1))
+      done
+    else
+      while [[ $right_pos -lt $right_len ]]; do
+        case "${right:$right_pos:1}" in [0-9]) break ;; esac
+        r_run="$r_run${right:$right_pos:1}"
+        right_pos=$((right_pos + 1))
+      done
+    fi
+
+    # Cross-class: numeric runs sort AFTER text runs so `v10` > `vbeta`.
+    if [[ $l_digit -ne $r_digit ]]; then
+      if [[ $l_digit -eq 1 ]]; then echo "gt"; else echo "lt"; fi
+      return
+    fi
+
+    if [[ $l_digit -eq 1 ]]; then
+      # Numeric: trim leading zeros, compare by length first (so 10 > 9
+      # without ever fitting into a fixed-width integer), then by bytes
+      # for the same-length case.
+      l_trim="${l_run#"${l_run%%[!0]*}"}"
+      r_trim="${r_run#"${r_run%%[!0]*}"}"
+      [[ -z "$l_trim" ]] && l_trim="0"
+      [[ -z "$r_trim" ]] && r_trim="0"
+      if [[ ${#l_trim} -lt ${#r_trim} ]]; then
+        echo "lt"
+        return
+      fi
+      if [[ ${#l_trim} -gt ${#r_trim} ]]; then
+        echo "gt"
+        return
+      fi
+      # `<` / `>` inside `[[ ]]` is lexicographic; on equal-length pure
+      # digit strings that matches numeric ordering exactly. Use it
+      # instead of `(( ))` so the comparison stays correct for numbers
+      # that exceed bash's integer width. shellcheck SC2071 misreads
+      # the intent so disable it inline rather than reshape the code.
+      # shellcheck disable=SC2071
+      if [[ "$l_trim" < "$r_trim" ]]; then
+        echo "lt"
+        return
+      fi
+      # shellcheck disable=SC2071
+      if [[ "$l_trim" > "$r_trim" ]]; then
+        echo "gt"
+        return
+      fi
+    else
+      # shellcheck disable=SC2071
+      if [[ "$l_run" < "$r_run" ]]; then
+        echo "lt"
+        return
+      fi
+      # shellcheck disable=SC2071
+      if [[ "$l_run" > "$r_run" ]]; then
+        echo "gt"
+        return
+      fi
+    fi
+  done
+  echo "eq"
 }
 
 _asset_url() {
