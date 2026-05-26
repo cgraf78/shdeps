@@ -2172,6 +2172,95 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_keeps_existing_binary_when_metadata_fetch_fails() {
+        let fixture = Fixture::new("release-metadata-outage");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        let runner = FakeRunner::default().with_success("tool", ["--version"], "tool 1.2.3\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "1.2.3");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"#!/bin/sh\n");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+        assert!(
+            fs::read_to_string(crate::stamp::remote_path(
+                &fixture.roots.state_dir,
+                "owner/tool",
+                "release"
+            ))
+            .is_err(),
+            "metadata failures should not refresh the remote stamp"
+        );
+    }
+
+    #[test]
+    fn update_github_release_metadata_failure_still_fails_without_binary() {
+        let fixture = Fixture::new("release-metadata-outage-missing");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["owner/tool"]);
+        assert_eq!(summary.items[0].detail, "release metadata fetch failed");
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn update_github_release_reinstall_requires_metadata_even_with_binary() {
+        let fixture = Fixture::new("release-metadata-outage-reinstall");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        write_executable(&fixture.roots.bin_dir.join("tool"));
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["owner/tool"]);
+        assert_eq!(summary.items[0].detail, "release metadata fetch failed");
+    }
+
+    #[test]
     fn update_github_release_force_checks_without_reinstalling_current_binary() {
         let mut fixture = Fixture::new("release-force-current");
         fixture.write_lib();

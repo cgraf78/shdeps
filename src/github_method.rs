@@ -17,6 +17,7 @@ use crate::config::Entry;
 use crate::github;
 use crate::github_release;
 use crate::http::Client;
+use crate::manifest::Manifest;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
 use crate::runtime::{Env, Roots};
@@ -26,6 +27,7 @@ use crate::state;
 const METHOD_RELEASE: &str = "github:release";
 const METHOD_REPO: &str = "github:repo";
 const METHOD_REPO_NO_ASSET: &str = "github:repo:no-compatible-release";
+const METHOD_REPO_LAST_KNOWN: &str = "github:repo:last-known";
 const RESOLVE_KIND: &str = "github";
 
 /// Runtime flags for `github` method resolution.
@@ -69,6 +71,8 @@ impl Default for Options {
 pub struct Context<'a, R: Runner> {
     /// Runtime filesystem roots.
     pub roots: &'a Roots,
+    /// Existing install manifest, used to seed bare `github` caches.
+    pub manifest: Option<&'a Manifest>,
     /// Runtime platform/host identity.
     pub env: &'a RuntimeEnv,
     /// Environment variables used for GitHub credentials.
@@ -130,6 +134,9 @@ where
             return Ok(method);
         }
     }
+    if let Some(method) = seed_method_from_manifest(entry, context, &cache, options)? {
+        return Ok(method);
+    }
 
     let env = EnvVars {
         vars: context.env_vars,
@@ -144,6 +151,7 @@ where
                 // local checkout under SHDEPS_GIT_DEV_DIR must not override
                 // this decision; users who want live-checkout behavior should
                 // ask for `github:repo` explicitly.
+                github::write_cached_releases(&context.roots.state_dir, &entry.name, &releases)?;
                 cache.write_method(METHOD_RELEASE)?;
                 stamp::remote_touch(&cache.stamp, options.now)?;
                 METHOD_RELEASE
@@ -153,18 +161,26 @@ where
                 // release asset. Cache it with an explicit reason so old
                 // "github:repo" cache files written after fetch failures are
                 // not trusted forever.
+                github::write_cached_releases(&context.roots.state_dir, &entry.name, &releases)?;
                 cache.write_method(METHOD_REPO_NO_ASSET)?;
                 stamp::remote_touch(&cache.stamp, options.now)?;
                 METHOD_REPO
             }
         }
         Err(_) => {
-            // Treat metadata fetch failures as a soft, uncached fallback. A
-            // missing token, private-to-public repo transition, transient API
-            // outage, or rate limit should not pin a machine to source clones
-            // for the whole TTL, because many CLI projects do not leave a
-            // usable binary in a fresh repo checkout.
-            METHOD_REPO
+            // Prefer the last proven concrete method during transient GitHub
+            // failures. A stale cache is not authoritative enough to skip a
+            // successful remote re-check, but it is much better than flipping
+            // an installed release-backed CLI to a source checkout just
+            // because the fleet exhausted the unauthenticated API quota.
+            if let Some(method) = cache.read_stale_method()? {
+                method
+            } else {
+                // With no prior signal, keep the historical soft fallback so
+                // first-time installs can still try a source checkout when the
+                // API is unavailable.
+                METHOD_REPO
+            }
         }
     };
     Ok(method)
@@ -195,6 +211,14 @@ impl Cache {
     }
 
     fn read_method(&self) -> Result<Option<&'static str>> {
+        self.read_method_file(false)
+    }
+
+    fn read_stale_method(&self) -> Result<Option<&'static str>> {
+        self.read_method_file(true)
+    }
+
+    fn read_method_file(&self, allow_legacy_repo: bool) -> Result<Option<&'static str>> {
         let content = match fs::read_to_string(&self.method) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -203,11 +227,13 @@ impl Cache {
         Ok(match content.trim_end() {
             METHOD_RELEASE => Some(METHOD_RELEASE),
             METHOD_REPO_NO_ASSET => Some(METHOD_REPO),
+            METHOD_REPO_LAST_KNOWN => Some(METHOD_REPO),
             // Legacy cache files wrote plain `github:repo` for both "no
             // compatible release" and "metadata fetch failed". Re-probe those
             // once so hosts can recover after credentials or repo visibility
             // change, then rewrite successful no-asset fallbacks with the
             // reasoned marker above.
+            METHOD_REPO if allow_legacy_repo => Some(METHOD_REPO),
             METHOD_REPO => None,
             _ => None,
         })
@@ -216,6 +242,65 @@ impl Cache {
     fn write_method(&self, method: &str) -> Result<()> {
         state::write_atomic(&self.method, &format!("{method}\n"))
     }
+}
+
+fn seed_method_from_manifest<R>(
+    entry: &Entry,
+    context: &Context<'_, R>,
+    cache: &Cache,
+    options: Options,
+) -> Result<Option<&'static str>>
+where
+    R: Runner,
+{
+    if options.force || options.reinstall {
+        return Ok(None);
+    }
+
+    let Some(manifest) = context.manifest else {
+        return Ok(None);
+    };
+    let Some(row) = manifest.get(&entry.name) else {
+        return Ok(None);
+    };
+    if row.cmd != entry.cmd {
+        return Ok(None);
+    }
+
+    let Some((stored, resolved)) = manifest_method(row, context.roots) else {
+        return Ok(None);
+    };
+
+    // Bare `github` was introduced after many machines already had concrete
+    // manifest rows. Trusting that local install state for one TTL avoids a
+    // fleet-wide burst of GitHub release probes just to rediscover "this repo
+    // has always been a source checkout." The next stale/forced run still
+    // performs the normal remote check, so this is a bootstrap cache, not a
+    // permanent policy override.
+    cache.write_method(stored)?;
+    stamp::remote_touch(&cache.stamp, options.now)?;
+    Ok(Some(resolved))
+}
+
+fn manifest_method(
+    row: &crate::manifest::ManifestEntry,
+    roots: &Roots,
+) -> Option<(&'static str, &'static str)> {
+    match row.method.as_str() {
+        METHOD_REPO if manifest_repo_exists(row, roots) => {
+            Some((METHOD_REPO_LAST_KNOWN, METHOD_REPO))
+        }
+        _ => None,
+    }
+}
+
+fn manifest_repo_exists(row: &crate::manifest::ManifestEntry, roots: &Roots) -> bool {
+    let path = if row.install_path.is_empty() {
+        roots.install_dir.join(&row.name)
+    } else {
+        PathBuf::from(&row.install_path)
+    };
+    path.exists()
 }
 
 struct EnvVars<'a> {
@@ -258,6 +343,7 @@ mod tests {
     use crate::config::parse_entry;
     use crate::github;
     use crate::http::Client;
+    use crate::manifest::Manifest;
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
     use crate::runtime::Roots;
@@ -282,6 +368,10 @@ mod tests {
 
         assert_eq!(resolved[0].method, "github:release");
         assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(
+            github::read_cached_releases(&fixture.roots.state_dir, "owner/tool").unwrap()[0].tag,
+            "v1.0.0"
+        );
         assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
     }
 
@@ -395,6 +485,90 @@ mod tests {
     }
 
     #[test]
+    fn manifest_repo_seed_avoids_first_bare_github_probe() {
+        let fixture = Fixture::new("manifest-repo-seed");
+        fs::create_dir_all(fixture.roots.install_dir.join("owner/tool")).unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|tool|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let client = FakeClient::new();
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            fixture.options(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:repo");
+        assert_eq!(
+            fixture.cached_method("owner/tool"),
+            "github:repo:last-known"
+        );
+        assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn force_bypasses_manifest_seed() {
+        let fixture = Fixture::new("manifest-seed-force");
+        fs::create_dir_all(fixture.roots.install_dir.join("owner/tool")).unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|tool|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["tool-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                force: true,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[test]
+    fn stale_release_cache_survives_metadata_fetch_failures() {
+        let fixture = Fixture::new("stale-release-cache");
+        fixture.write_cache("owner/tool", "github:release", 10);
+        let client = FakeClient::new();
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            Options {
+                now: 4_000,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(
+            client.urls(),
+            vec![github::releases_url("owner/tool")],
+            "stale caches should still try the remote before falling back"
+        );
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+    }
+
+    #[test]
     fn legacy_repo_cache_is_rechecked_so_release_assets_can_take_over() {
         let fixture = Fixture::new("legacy-repo-cache");
         fixture.write_cache("owner/tool", "github:repo", 10);
@@ -491,6 +665,23 @@ mod tests {
         ) -> Context<'a, FakeRunner> {
             Context {
                 roots: &self.roots,
+                manifest: None,
+                env: &self.env,
+                env_vars: &self.env_vars,
+                runner,
+                client,
+            }
+        }
+
+        fn context_with_manifest<'a>(
+            &'a self,
+            runner: &'a FakeRunner,
+            client: &'a FakeClient,
+            manifest: &'a Manifest,
+        ) -> Context<'a, FakeRunner> {
+            Context {
+                roots: &self.roots,
+                manifest: Some(manifest),
                 env: &self.env,
                 env_vars: &self.env_vars,
                 runner,

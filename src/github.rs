@@ -7,19 +7,22 @@
 //! fields, and it gives tests a cheap place to exercise malformed API input
 //! without touching the network.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::http::Client;
 use crate::process::Runner;
 use crate::runtime::Env;
+use crate::state;
 
 const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Release asset identity needed by shdeps install/update code.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Asset {
     /// GitHub asset name, used for diagnostics and checksum pairing.
     pub name: String,
@@ -28,7 +31,7 @@ pub struct Asset {
 }
 
 /// GitHub release data after API parsing and compatibility filtering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Release {
     /// Release tag name from GitHub's `tag_name` field.
     pub tag: String,
@@ -72,6 +75,33 @@ pub fn fetch_releases(
 #[must_use]
 pub fn releases_url(repo: &str) -> String {
     format!("https://api.github.com/repos/{repo}/releases")
+}
+
+/// Returns the shared release-metadata cache path for `owner/repo`.
+#[must_use]
+pub fn releases_cache_path(state_dir: &Path, repo: &str) -> PathBuf {
+    state_dir.join(format!("{repo}.github.releases.json"))
+}
+
+/// Reads cached release metadata written by the generic `github` resolver.
+///
+/// The cache is an optimization only. A corrupt or missing file is treated as
+/// a miss by callers so a later network fetch can repair it; do not let cached
+/// metadata become another source of install failure.
+pub fn read_cached_releases(state_dir: &Path, repo: &str) -> Option<Vec<Release>> {
+    let content = fs::read_to_string(releases_cache_path(state_dir, repo)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Writes parsed release metadata for reuse by later update phases.
+///
+/// Bare `github` resolution and `github:release` installation both need the
+/// same GitHub release payload. Persisting the parsed model lets one update run
+/// share that fact without inventing a wider in-memory planner object.
+pub fn write_cached_releases(state_dir: &Path, repo: &str, releases: &[Release]) -> Result<()> {
+    let mut content = serde_json::to_string(releases)?;
+    content.push('\n');
+    state::write_atomic(&releases_cache_path(state_dir, repo), &content)
 }
 
 /// Resolves the runtime token used for GitHub API calls.

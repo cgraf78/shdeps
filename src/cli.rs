@@ -18,7 +18,7 @@ use crate::github_method;
 use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::http::Curl;
 use crate::jobs;
-use crate::manifest;
+use crate::manifest::{self, Manifest};
 use crate::process::{self, Process};
 use crate::prune::{self, Options as PruneOptions};
 use crate::runtime::{self, Overrides, ProcessEnv};
@@ -293,8 +293,9 @@ where
 
     let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
-    let entries = resolve_github_entries(&entries, &roots, &env, &env_vars, options)?;
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
+    let entries =
+        resolve_github_entries(&entries, &roots, Some(&manifest), &env, &env_vars, options)?;
     let package_versions = if entries.iter().any(|entry| entry.method == "pkg") {
         process::package_versions(&Process, &pkg_mgr)
     } else {
@@ -358,8 +359,8 @@ where
     );
     let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
-    let entry = resolve_github_entry(&entry, &roots, &env, &env_vars, options)?;
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
+    let entry = resolve_github_entry(&entry, &roots, Some(&manifest), &env, &env_vars, options)?;
     let package_versions = if entry.method == "pkg" {
         process::package_versions(&Process, &pkg_mgr)
     } else {
@@ -424,6 +425,7 @@ where
     let entries = resolve_github_entries_with_options(
         &entries,
         &roots,
+        Some(&manifest),
         &env,
         &env_vars,
         github_options_from_update(update_options),
@@ -490,9 +492,10 @@ where
     let entries = parse_entries(&raw_entries, "");
     let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
-    let entries = resolve_github_entries(&entries, &roots, &env, &env_vars, options)?;
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
+    let entries =
+        resolve_github_entries(&entries, &roots, Some(&manifest), &env, &env_vars, options)?;
     let hooks = custom_probe();
     let detected = prune::run(
         &entries,
@@ -656,22 +659,32 @@ fn parse_entries(raw_entries: &[String], pkg_mgr: &str) -> Vec<Entry> {
 fn resolve_github_entries(
     entries: &[Entry],
     roots: &runtime::Roots,
+    manifest: Option<&Manifest>,
     env: &crate::platform::RuntimeEnv,
     env_vars: &BTreeMap<String, String>,
     options: &ParsedOptions,
 ) -> Result<Vec<Entry>> {
-    resolve_github_entries_with_options(entries, roots, env, env_vars, github_options(options))
+    resolve_github_entries_with_options(
+        entries,
+        roots,
+        manifest,
+        env,
+        env_vars,
+        github_options(options),
+    )
 }
 
 fn resolve_github_entry(
     entry: &Entry,
     roots: &runtime::Roots,
+    manifest: Option<&Manifest>,
     env: &crate::platform::RuntimeEnv,
     env_vars: &BTreeMap<String, String>,
     options: &ParsedOptions,
 ) -> Result<Entry> {
     let context = github_method::Context {
         roots,
+        manifest,
         env,
         env_vars,
         runner: &Process,
@@ -683,12 +696,14 @@ fn resolve_github_entry(
 fn resolve_github_entries_with_options(
     entries: &[Entry],
     roots: &runtime::Roots,
+    manifest: Option<&Manifest>,
     env: &crate::platform::RuntimeEnv,
     env_vars: &BTreeMap<String, String>,
     options: github_method::Options,
 ) -> Result<Vec<Entry>> {
     let context = github_method::Context {
         roots,
+        manifest,
         env,
         env_vars,
         runner: &Process,

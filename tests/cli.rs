@@ -689,6 +689,7 @@ fn update_bare_github_prefers_release_and_records_concrete_manifest_method() {
     );
 
     let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_TEST_CURL_LOG", fixture.dir.join("fake/curl.log"));
     command.env(
         "PATH",
         format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
@@ -707,6 +708,70 @@ fn update_bare_github_prefers_release_and_records_concrete_manifest_method() {
             "owner/tool|github:release|tool|{}\n",
             fixture.dir.join("bin/tool").display()
         )
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("fake/curl.log")).unwrap(),
+        "api\nasset\n",
+        "bare github resolution should reuse release metadata during install"
+    );
+}
+
+#[test]
+fn update_explicit_github_release_fetches_without_bare_github_cache() {
+    let fixture = Fixture::new("update-explicit-github-release");
+    let asset = host_linux_asset("tool", "v1.0.0");
+    fixture.write("conf/deps.conf", "owner/tool github:release tool\n");
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &[asset.as_str()]),
+        "#!/bin/sh\nprintf 'release asset\\n'\n",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_TEST_CURL_LOG", fixture.dir.join("fake/curl.log"));
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("bin/tool")).unwrap(),
+        "#!/bin/sh\nprintf 'release asset\\n'\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("fake/curl.log")).unwrap(),
+        "api\nasset\n",
+        "explicit github:release should fetch normally when no resolver cache exists"
+    );
+}
+
+#[test]
+fn update_explicit_github_repo_does_not_fetch_release_metadata() {
+    let fixture = Fixture::new("update-explicit-github-repo");
+    fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");
+    fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &[host_linux_asset("tool", "v1.0.0").as_str()]),
+        "unused",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_TEST_CURL_LOG", fixture.dir.join("fake/curl.log"));
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("bin/tool")).unwrap(),
+        "#!/bin/sh\nprintf 'local clone\\n'\n"
+    );
+    assert!(
+        !fixture.dir.join("fake/curl.log").exists(),
+        "explicit github:repo should not consult release metadata"
     );
 }
 
@@ -761,7 +826,7 @@ fn update_bare_github_transitions_repo_to_release_after_release_appears() {
         "#!/bin/sh\nprintf 'release asset\\n'\n",
     );
 
-    let mut command = fixture.command(["update"]);
+    let mut command = fixture.command(["--force", "update"]);
     command.env(
         "PATH",
         format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
@@ -797,7 +862,7 @@ fn update_bare_github_rechecks_legacy_repo_cache_and_transitions_to_release() {
         "#!/bin/sh\nprintf 'release asset\\n'\n",
     );
 
-    let mut command = fixture.command(["update"]);
+    let mut command = fixture.command(["--force", "update"]);
     command.env(
         "PATH",
         format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
@@ -1382,9 +1447,15 @@ set -euo pipefail
 config=$(cat)
 case "$config" in
   *'url = "https://api.github.com/repos/owner/tool/releases"'*)
+    if [[ -n "${SHDEPS_TEST_CURL_LOG:-}" ]]; then
+      printf 'api\n' >>"$SHDEPS_TEST_CURL_LOG"
+    fi
     cat "$SHDEPS_TEST_RELEASE_JSON"
     ;;
   *'url = "https://downloads.example/'*)
+    if [[ -n "${SHDEPS_TEST_CURL_LOG:-}" ]]; then
+      printf 'asset\n' >>"$SHDEPS_TEST_CURL_LOG"
+    fi
     cat "$SHDEPS_TEST_RELEASE_ASSET"
     ;;
   *)

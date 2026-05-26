@@ -140,8 +140,8 @@ where
     // reported without this optimization. Version probes are cached only when
     // they succeed; a missing/odd tool gets the old serial second chance.
     for fetched in jobs::parallel_map(&candidates, jobs, |candidate| {
-        let releases = fetch_releases_with_token(&candidate.repo, client, token.as_deref())
-            .ok()
+        let releases = cached_releases(&candidate.repo, roots, options)
+            .or_else(|| fetch_releases_with_token(&candidate.repo, client, token.as_deref()).ok())
             .map(|releases| (candidate.repo.clone(), releases));
         let version = process::executable_path(&candidate.public_bin)
             .then(|| process::dep_version(runner, &candidate.cmd))
@@ -253,15 +253,35 @@ pub(crate) fn install_request(
     let releases = if let Some(releases) = context.prefetch.releases(request.repo) {
         releases
     } else {
-        fetched_releases = match fetch_releases_with_prefetch_token(
-            request.repo,
-            &env,
-            context.runner,
-            context.client,
-            context.prefetch,
-        ) {
+        fetched_releases = match cached_releases(request.repo, context.roots, context.options)
+            .map(Ok)
+            .unwrap_or_else(|| {
+                fetch_releases_with_prefetch_token(
+                    request.repo,
+                    &env,
+                    context.runner,
+                    context.client,
+                    context.prefetch,
+                )
+            }) {
             Ok(releases) => releases,
             Err(_) => {
+                if process::executable_path(request.public_bin) && !context.options.reinstall {
+                    // GitHub metadata is a freshness check, not proof that an
+                    // already-installed binary disappeared. Fleet updates can
+                    // exhaust unauthenticated API quota long before anything
+                    // is actually stale, so preserve the working tool and try
+                    // again on the next run instead of turning a transient API
+                    // failure into a broken `dot update`.
+                    let detail = current_version
+                        .unwrap_or_else(|| "release metadata unavailable".to_owned());
+                    link_existing_extras(context.roots, request.name)?;
+                    return Ok(ReleaseOutcome {
+                        changed: false,
+                        failed: false,
+                        detail,
+                    });
+                }
                 return Ok(failed("release metadata fetch failed"));
             }
         };
@@ -373,6 +393,15 @@ pub(crate) fn install_request(
         failed: false,
         detail: selection.tag,
     })
+}
+
+fn cached_releases(repo: &str, roots: &Roots, options: Options) -> Option<Vec<github::Release>> {
+    let stamp_path = stamp::remote_path(&roots.state_dir, repo, "github");
+    if !stamp::remote_fresh(&stamp_path, options.freshness()) {
+        return None;
+    }
+
+    github::read_cached_releases(&roots.state_dir, repo)
 }
 
 fn fetch_releases_with_prefetch_token(
