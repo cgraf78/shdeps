@@ -120,18 +120,57 @@ fn arch(runner: &impl Runner) -> String {
 }
 
 fn libc(runner: &impl Runner) -> &'static str {
-    if !runner.exists("ldd") {
-        return "gnu";
+    libc_with_probe(runner, host_musl_ld_present())
+}
+
+/// Pure decision function for libc identity, separated from FS probing so
+/// tests can inject the musl-loader-present signal without touching the
+/// real `/lib` tree.
+fn libc_with_probe(runner: &impl Runner, musl_ld_present: bool) -> &'static str {
+    // Preferred signal: `ldd --version` text. On glibc systems this prints
+    // a string mentioning glibc; on musl it prints "musl libc". When ldd
+    // is present and the output is parseable, trust it — it is the most
+    // precise indicator the host can offer.
+    if runner.exists("ldd") {
+        if let Ok(output) = runner.run("ldd", &["--version"], None) {
+            let combined = format!("{}{}", output.stdout, output.stderr);
+            if combined.to_ascii_lowercase().contains("musl") {
+                return "musl";
+            }
+            // Successful ldd output without "musl" → glibc. This is the
+            // common case on Debian/Ubuntu/RHEL/Fedora.
+            return "gnu";
+        }
     }
-    let Ok(output) = runner.run("ldd", &["--version"], None) else {
-        return "gnu";
+
+    // Fallback: no usable ldd output. Defaulting to "gnu" used to silently
+    // mis-select gnu binaries on Alpine-minimal, NixOS minimal profiles,
+    // and static-link-only container images that ship a musl loader but
+    // no `ldd` wrapper. Look for the canonical musl loader on disk
+    // before falling through to the gnu default.
+    if musl_ld_present {
+        return "musl";
+    }
+    "gnu"
+}
+
+/// Returns whether the host has a musl dynamic loader at the canonical
+/// path (`/lib/ld-musl-*.so.1`). Used as the fallback signal when `ldd`
+/// is absent or malformed.
+fn host_musl_ld_present() -> bool {
+    // Iterating `/lib` is cheap (one stat per entry) and works for any
+    // arch suffix musl publishes (x86_64, aarch64, armhf, ...). Reading
+    // the dir rather than checking a fixed list keeps this correct on
+    // arches we have not enumerated here.
+    let Ok(entries) = std::fs::read_dir("/lib") else {
+        return false;
     };
-    let combined = format!("{}{}", output.stdout, output.stderr);
-    if combined.to_ascii_lowercase().contains("musl") {
-        "musl"
-    } else {
-        "gnu"
-    }
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("ld-musl-") && name.ends_with(".so.1"))
+    })
 }
 
 #[cfg(test)]
@@ -143,6 +182,61 @@ mod tests {
     use crate::github::{Asset, Release};
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
+
+    #[test]
+    fn libc_with_probe_prefers_ldd_output_over_filesystem_signal() {
+        // When `ldd --version` says musl, that is the precise signal —
+        // do not be swayed by a stray musl-loader file on a glibc-primary
+        // host (theoretical, but the test pins the precedence).
+        let runner = FakeRunner::new("x86_64", "musl libc x86_64");
+        assert_eq!(super::libc_with_probe(&runner, false), "musl");
+
+        // ldd present with glibc-ish output → gnu, regardless of any
+        // musl-loader presence (no real host has both as primary, but
+        // again the precedence is what is being pinned).
+        let runner = FakeRunner::new("x86_64", "GNU libc 2.39");
+        assert_eq!(super::libc_with_probe(&runner, true), "gnu");
+    }
+
+    #[test]
+    fn libc_with_probe_falls_back_to_musl_loader_when_ldd_absent() {
+        // Alpine-minimal images and NixOS minimal profiles can ship a
+        // musl loader at `/lib/ld-musl-*.so.1` but no `ldd` wrapper at
+        // all. The pre-fix code defaulted to "gnu" in that case, which
+        // installed glibc-linked binaries that crashed at runtime. The
+        // fallback to the filesystem probe fixes that without disturbing
+        // the normal `ldd`-present paths.
+        let runner = NoLddRunner;
+        assert_eq!(super::libc_with_probe(&runner, true), "musl");
+    }
+
+    #[test]
+    fn libc_with_probe_defaults_to_gnu_when_no_signals_available() {
+        // No ldd, no musl loader → gnu. This preserves the legacy
+        // default for hosts that legitimately have neither (e.g.,
+        // statically-linked busybox-only systems where the choice does
+        // not matter), and keeps the behavior the same as before this
+        // change for the majority of dev machines.
+        let runner = NoLddRunner;
+        assert_eq!(super::libc_with_probe(&runner, false), "gnu");
+    }
+
+    /// Runner where `ldd` is reported absent, used to exercise the
+    /// FS-probe fallback path in `libc_with_probe`.
+    struct NoLddRunner;
+    impl Runner for NoLddRunner {
+        fn exists(&self, _command: &str) -> bool {
+            false
+        }
+        fn run(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _timeout: Option<Duration>,
+        ) -> io::Result<Output> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+        }
+    }
 
     #[test]
     fn select_skips_drafts_prereleases_and_matches_current_host() {
