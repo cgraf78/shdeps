@@ -20,6 +20,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Parses the expected SHA-256 for `file_name` from checksum file text.
+///
+/// Only filename-bound lines (the standard `<hash>  <file>` /
+/// `<hash> *<file>` formats produced by `sha256sum` and `shasum -a 256`)
+/// are accepted. Bare-hash lines are rejected here: accepting a
+/// detached digest would let any checksum-file payload match any
+/// downloaded asset, silently dropping the per-file binding that the
+/// whole verification is supposed to enforce. A mirror that publishes a
+/// checksum file without the filename — accidentally or otherwise —
+/// must fail verification rather than vacuously pass it. Tests that
+/// need to compute bare-hash equivalence can call `parse_bare_hash`
+/// directly with a known file name.
 #[must_use]
 pub fn expected_sha256(content: &str, file_name: &str) -> Option<String> {
     for line in content.lines() {
@@ -29,9 +40,6 @@ pub fn expected_sha256(content: &str, file_name: &str) -> Option<String> {
         }
 
         if let Some(hash) = parse_named_line(line, file_name) {
-            return Some(hash);
-        }
-        if let Some(hash) = parse_bare_hash(line) {
             return Some(hash);
         }
     }
@@ -59,9 +67,12 @@ fn parse_named_line(line: &str, file_name: &str) -> Option<String> {
 }
 
 fn parse_bare_hash(line: &str) -> Option<String> {
-    // A bare hash is useful for simple fixtures and mirrors. Only accept it
-    // when the whole non-comment line is exactly one digest; otherwise a
-    // malformed named line should fail closed instead of silently matching.
+    // Bare-hash parsing is intentionally NOT in the verify path. The
+    // production `expected_sha256` only accepts filename-bound lines so a
+    // checksum-file payload that drops the filename cannot be vacuously
+    // matched against any asset. This helper stays available so tests can
+    // round-trip a known digest without constructing a full `sha256sum`-
+    // formatted line.
     normalize_hash(line)
 }
 
@@ -116,10 +127,16 @@ mod tests {
     }
 
     #[test]
-    fn expected_sha256_accepts_bare_hash_only_when_unambiguous() {
+    fn expected_sha256_rejects_bare_hash_to_preserve_filename_binding() {
+        // A checksum file that contains only a bare digest (no filename)
+        // must NOT verify any asset. Otherwise a mirror that strips
+        // filenames (accidentally or maliciously) would let any payload
+        // pass verification against any expected name. The strict form
+        // protects the per-file binding that the whole verification step
+        // is supposed to enforce.
         assert_eq!(
             expected_sha256(EMPTY_SHA256, "archive.tar.gz").as_deref(),
-            Some(EMPTY_SHA256)
+            None
         );
         assert_eq!(
             expected_sha256(
@@ -128,6 +145,15 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn verify_rejects_bare_hash_payload_for_any_file() {
+        // End-to-end: bytes whose digest matches the bare-hash payload
+        // must still NOT verify. The named-line path is the only way to
+        // express a per-file expectation in production.
+        assert!(!verify(EMPTY_SHA256, "archive.tar.gz", b""));
+        assert!(!verify(EMPTY_SHA256, "different.tar.gz", b""));
     }
 
     #[test]
@@ -142,8 +168,16 @@ mod tests {
     }
 
     #[test]
-    fn verify_matches_bytes_against_expected_digest() {
-        assert!(verify(EMPTY_SHA256, "archive.tar.gz", b""));
-        assert!(!verify(EMPTY_SHA256, "archive.tar.gz", b"not empty"));
+    fn verify_matches_bytes_against_named_digest_line() {
+        // The production verify path requires a `<hash>  <file>` line
+        // (or the binary-mode `<hash> *<file>` variant). Bare-hash
+        // checksum files no longer pass — that case is covered by
+        // `verify_rejects_bare_hash_payload_for_any_file`.
+        let named = format!("{EMPTY_SHA256}  archive.tar.gz\n");
+        assert!(verify(&named, "archive.tar.gz", b""));
+        assert!(!verify(&named, "archive.tar.gz", b"not empty"));
+        // Wrong filename also fails verification even when the digest
+        // happens to match the empty payload.
+        assert!(!verify(&named, "different.tar.gz", b""));
     }
 }
