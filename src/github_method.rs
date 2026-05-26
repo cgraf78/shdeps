@@ -25,6 +25,7 @@ use crate::state;
 
 const METHOD_RELEASE: &str = "github:release";
 const METHOD_REPO: &str = "github:repo";
+const METHOD_REPO_NO_ASSET: &str = "github:repo:no-compatible-release";
 const RESOLVE_KIND: &str = "github";
 
 /// Runtime flags for `github` method resolution.
@@ -135,29 +136,37 @@ where
         runtime: context.env,
     };
     let method = match github::fetch_releases(&entry.name, &env, context.runner, context.client) {
-        Ok(releases)
-            if github_release::select(&entry.cmd, &releases, context.env, context.runner)
-                .is_some() =>
-        {
-            // Release assets are the preferred fleet path because they avoid
-            // requiring git source trees or a local toolchain. A local checkout
-            // under SHDEPS_GIT_DEV_DIR must not override this decision; users
-            // who want live-checkout behavior should ask for `github:repo`
-            // explicitly.
-            METHOD_RELEASE
+        Ok(releases) => {
+            if github_release::select(&entry.cmd, &releases, context.env, context.runner).is_some()
+            {
+                // Release assets are the preferred fleet path because they
+                // avoid requiring git source trees or a local toolchain. A
+                // local checkout under SHDEPS_GIT_DEV_DIR must not override
+                // this decision; users who want live-checkout behavior should
+                // ask for `github:repo` explicitly.
+                cache.write_method(METHOD_RELEASE)?;
+                stamp::remote_touch(&cache.stamp, options.now)?;
+                METHOD_RELEASE
+            } else {
+                // This is the only repo fallback worth caching: GitHub
+                // answered successfully, and the current host has no matching
+                // release asset. Cache it with an explicit reason so old
+                // "github:repo" cache files written after fetch failures are
+                // not trusted forever.
+                cache.write_method(METHOD_REPO_NO_ASSET)?;
+                stamp::remote_touch(&cache.stamp, options.now)?;
+                METHOD_REPO
+            }
         }
-        Ok(_) | Err(_) => {
-            // Falling back to repo is the conservative concrete behavior when
-            // no compatible release asset can be proven. `github:repo` already
-            // has mature local-clone and managed-clone semantics, so this path
-            // preserves installability while letting projects adopt releases
-            // later without changing config again.
+        Err(_) => {
+            // Treat metadata fetch failures as a soft, uncached fallback. A
+            // missing token, private-to-public repo transition, transient API
+            // outage, or rate limit should not pin a machine to source clones
+            // for the whole TTL, because many CLI projects do not leave a
+            // usable binary in a fresh repo checkout.
             METHOD_REPO
         }
     };
-
-    cache.write_method(method)?;
-    stamp::remote_touch(&cache.stamp, options.now)?;
     Ok(method)
 }
 
@@ -193,7 +202,13 @@ impl Cache {
         };
         Ok(match content.trim_end() {
             METHOD_RELEASE => Some(METHOD_RELEASE),
-            METHOD_REPO => Some(METHOD_REPO),
+            METHOD_REPO_NO_ASSET => Some(METHOD_REPO),
+            // Legacy cache files wrote plain `github:repo` for both "no
+            // compatible release" and "metadata fetch failed". Re-probe those
+            // once so hosts can recover after credentials or repo visibility
+            // change, then rewrite successful no-asset fallbacks with the
+            // reasoned marker above.
+            METHOD_REPO => None,
             _ => None,
         })
     }
@@ -288,7 +303,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved[0].method, "github:repo");
-        assert_eq!(fixture.cached_method("owner/tool"), "github:repo");
+        assert_eq!(
+            fixture.cached_method("owner/tool"),
+            "github:repo:no-compatible-release"
+        );
     }
 
     #[test]
@@ -306,7 +324,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved[0].method, "github:repo");
-        assert_eq!(fixture.cached_method("owner/tool"), "github:repo");
+        assert!(fixture.cached_method("owner/tool").is_empty());
     }
 
     #[test]
@@ -351,6 +369,56 @@ mod tests {
 
         assert_eq!(resolved[0].method, "github:release");
         assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn cached_no_asset_repo_resolution_avoids_repeated_github_fetches() {
+        let fixture = Fixture::new("warm-repo-cache");
+        fixture.write_cache("owner/tool", "github:repo:no-compatible-release", 10);
+        let client = FakeClient::new();
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:repo");
+        assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn legacy_repo_cache_is_rechecked_so_release_assets_can_take_over() {
+        let fixture = Fixture::new("legacy-repo-cache");
+        fixture.write_cache("owner/tool", "github:repo", 10);
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["tool-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
     }
 
     #[test]
@@ -452,7 +520,7 @@ mod tests {
 
         fn cached_method(&self, name: &str) -> String {
             fs::read_to_string(self.roots.state_dir.join(format!("{name}.github.method")))
-                .unwrap()
+                .unwrap_or_default()
                 .trim_end()
                 .to_owned()
         }

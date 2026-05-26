@@ -778,6 +778,50 @@ fn update_bare_github_transitions_repo_to_release_after_release_appears() {
 }
 
 #[test]
+fn update_bare_github_rechecks_legacy_repo_cache_and_transitions_to_release() {
+    let fixture = Fixture::new("update-github-legacy-repo-cache");
+    let asset = host_linux_asset("tool", "v1.0.0");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable("share/owner/tool/bin/tool", "#!/bin/sh\nprintf 'repo\\n'\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "owner/tool|github:repo|tool|{}\n",
+            fixture.dir.join("share/owner/tool").display()
+        ),
+    );
+    fixture.write("state/owner/tool.github.method", "github:repo\n");
+    fixture.write_fresh_stamp("owner/tool", "github");
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &[asset.as_str()]),
+        "#!/bin/sh\nprintf 'release asset\\n'\n",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("bin/tool")).unwrap(),
+        "#!/bin/sh\nprintf 'release asset\\n'\n"
+    );
+    assert!(!fixture.dir.join("share/owner/tool").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/owner/tool.github.method")).unwrap(),
+        "github:release\n"
+    );
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("owner/tool|github:release|tool|")
+    );
+}
+
+#[test]
 fn update_bare_github_transitions_release_to_repo_when_release_is_unavailable() {
     let fixture = Fixture::new("update-github-release-to-repo");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
