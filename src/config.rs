@@ -148,14 +148,47 @@ pub fn sort_entries(entries: &mut [String]) {
 }
 
 /// Parses config text from already ordered files into sorted raw entries.
+///
+/// When the same dependency name appears more than once across the input
+/// files (or within one file), only the *last* occurrence is kept. This
+/// matches the `manifest::get` semantics — which already returns the last
+/// matching record for a given name — and prevents the updater from
+/// processing the same dep twice (and consequently running install / post
+/// hooks twice). Inputs are iterated in caller-supplied order, so the
+/// directory loader's lexical file ordering is preserved end-to-end.
 #[must_use]
 pub fn parse_config_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    let mut entries = texts
+    let entries = texts
         .into_iter()
         .flat_map(|text| text.lines().filter_map(parse_config_line))
         .collect::<Vec<_>>();
+    let mut entries = dedupe_last_wins(entries);
     sort_entries(&mut entries);
     entries
+}
+
+/// Deduplicates entries by dependency name, keeping the LAST occurrence.
+///
+/// Two-pass: first walk records the index of each name's last occurrence,
+/// then a second walk keeps only entries whose index matches. This is
+/// stable with respect to load order (caller's order is preserved for the
+/// surviving records) and runs in O(n) time on top of one `HashMap` —
+/// suitable for the few-hundred-deps scale we expect in practice without
+/// introducing a sort-then-dedup that would silently reorder load order
+/// for clients that rely on `parse_config_texts` directly.
+fn dedupe_last_wins(entries: Vec<String>) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut last_seen: HashMap<String, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        last_seen.insert(entry_name(entry).to_owned(), index);
+    }
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            (last_seen.get(entry_name(&entry)) == Some(&index)).then_some(entry)
+        })
+        .collect()
 }
 
 /// Loads all direct `*.conf` files from a config directory into sorted entries.
@@ -174,6 +207,11 @@ pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
         let content = fs::read_to_string(file)?;
         entries.extend(content.lines().filter_map(parse_config_line));
     }
+    // Match `parse_config_texts`: dedupe by dep name before sorting so a
+    // user who declares the same dep in two `*.conf` files gets the last
+    // (lex-order) definition rather than two adjacent entries that would
+    // both get processed by `update`.
+    let mut entries = dedupe_last_wins(entries);
     sort_entries(&mut entries);
     Ok(entries)
 }
@@ -416,6 +454,45 @@ mod tests {
                 "tool-d|custom"
             ]
         );
+    }
+
+    #[test]
+    fn parse_config_texts_deduplicates_repeats_with_last_occurrence_winning() {
+        // `manifest::get` is last-wins, so loading the same dep twice from
+        // two `.conf` files must collapse to one entry — the later one.
+        // Otherwise `update` would process the dep twice and run install
+        // and post-hook side effects twice, with the user seeing two rows
+        // in `shdeps list`.
+        let entries = parse_config_texts([
+            "tool-a  pkg\ntool-b  pkg\n",
+            "tool-a  cargo\n", // same name, different method: later wins
+        ]);
+        assert_eq!(entries, vec!["tool-a|cargo", "tool-b|pkg"]);
+    }
+
+    #[test]
+    fn parse_config_texts_deduplicates_repeats_within_one_file() {
+        // Duplicates inside one file also collapse — the last definition
+        // wins, mirroring the cross-file behavior so a user can override a
+        // shared template by re-declaring later in the same file.
+        let entries = parse_config_texts(["tool-a  pkg\ntool-b  pkg\ntool-a  cargo\n"]);
+        assert_eq!(entries, vec!["tool-a|cargo", "tool-b|pkg"]);
+    }
+
+    #[test]
+    fn load_dir_deduplicates_across_lexically_ordered_conf_files() {
+        // Files are loaded in lex order, and the dedupe is last-wins, so a
+        // later-named `*.conf` file is the authoritative source for any
+        // dep name it redeclares. This lets a user drop in an overrides
+        // file with a high prefix (e.g., `99-overrides.conf`) and have it
+        // win without touching the upstream templates.
+        let dir = temp_dir("dedupe-multi");
+        write(&dir.join("00-core.conf"), "tool-a  pkg\ntool-b  pkg\n");
+        write(&dir.join("99-overrides.conf"), "tool-a  cargo\n");
+
+        let entries = load_dir(&dir).unwrap();
+
+        assert_eq!(entries, vec!["tool-a|cargo", "tool-b|pkg"]);
     }
 
     #[test]

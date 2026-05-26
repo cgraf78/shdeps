@@ -539,6 +539,33 @@ _shdeps_load() {
     done <"$f"
   done
 
+  # Deduplicate by dependency name, last-wins. Without this the loader
+  # would emit two adjacent records for a dep redeclared across files (or
+  # within one file) and `update` would run install + post hooks twice.
+  # `manifest::get` is already last-wins, so collapsing to the last
+  # definition here keeps the loader's view consistent with the durable
+  # manifest's view. Implementation: walk forward recording the latest
+  # index per dep name, then keep only those indices on the second pass.
+  if [[ ${#_SHDEPS_DEPS[@]} -gt 1 ]]; then
+    local i entry name
+    declare -A _shdeps_last_seen=()
+    for i in "${!_SHDEPS_DEPS[@]}"; do
+      entry="${_SHDEPS_DEPS[$i]}"
+      name="${entry%%|*}"
+      _shdeps_last_seen["$name"]=$i
+    done
+    local -a deduped=()
+    for i in "${!_SHDEPS_DEPS[@]}"; do
+      entry="${_SHDEPS_DEPS[$i]}"
+      name="${entry%%|*}"
+      if [[ "${_shdeps_last_seen[$name]}" == "$i" ]]; then
+        deduped+=("$entry")
+      fi
+    done
+    _SHDEPS_DEPS=("${deduped[@]}")
+    unset _shdeps_last_seen
+  fi
+
   # Sort alphabetically by name for stable, scannable output.
   # Processing order doesn't affect correctness — pkg deps are batched,
   # and github:repo/release/custom deps are independent of each other.
