@@ -89,6 +89,21 @@ pub fn parse_entry(raw: &str, pkg_mgr: Option<&str>) -> Entry {
     if cmd.contains(':') {
         cmd = resolve_override(short_name(&name), &cmd, pkg_mgr);
     }
+    // The `cmd` field is concatenated into `<bin_dir>/<cmd>` at install
+    // (`bin_link::one`), cleanup (`cleanup::remove_builtin`), and release
+    // staging (`release_activate::activate`) time. `Path::join` discards
+    // its left operand whenever the right operand is absolute, so a
+    // config line with `cmd=/etc/passwd` would let shdeps symlink-over /
+    // remove that exact path — outside any managed root and outside the
+    // `safe_managed_path` containment we already enforce for
+    // manifest `install_path`. Reject the same hostile forms
+    // `valid_dep_name` rejects (absolute, `..`/`.`, separators,
+    // backslashes) and fall back to the dep's short name, which is
+    // already validated upstream. The fallback is silent — the dep
+    // still installs, it just won't honor a clearly-broken `cmd`.
+    if !valid_cmd_basename(&cmd) {
+        cmd = short_name(&name).to_owned();
+    }
 
     Entry {
         name,
@@ -97,6 +112,27 @@ pub fn parse_entry(raw: &str, pkg_mgr: Option<&str>) -> Entry {
         aliases,
         filter,
     }
+}
+
+/// Returns whether a resolved `cmd` value is safe to use as a
+/// `<bin_dir>/<cmd>` path suffix.
+///
+/// Apply this AFTER `mgr:name` resolution, on the single concrete
+/// binary name we will later `Path::join` into `bin_dir`. The pre-
+/// resolution form for `pkg` deps (`apt:batcat,brew:bat`) is
+/// intentionally allowed to contain `:` and `,` and should not be
+/// passed through this check directly — those characters become
+/// meaningless in the resolved single-name form.
+#[must_use]
+pub fn valid_cmd_basename(cmd: &str) -> bool {
+    if cmd.is_empty() || cmd == "." || cmd == ".." {
+        return false;
+    }
+    !cmd.starts_with('/')
+        && !cmd.contains('/')
+        && !cmd.contains('\\')
+        && !cmd.contains('|')
+        && !cmd.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// Parses a single config-file line into the raw loaded-entry representation.
@@ -320,7 +356,7 @@ mod tests {
 
     use super::{
         canonical_name, load_dir, parse_config_line, parse_config_texts, parse_entry,
-        resolve_override, short_name, sort_entries, valid_dep_name,
+        resolve_override, short_name, sort_entries, valid_cmd_basename, valid_dep_name,
     };
 
     #[test]
@@ -626,6 +662,52 @@ mod tests {
         assert!(!valid_dep_name("owner//tool"));
         assert!(!valid_dep_name("owner/"));
         assert!(!valid_dep_name("owner\\tool"));
+    }
+
+    #[test]
+    fn valid_cmd_basename_rejects_path_traversal_and_unsafe_names() {
+        // Resolved single-name cmds: alphanumerics, dots, dashes,
+        // underscores are all fine. The pre-resolution forms with
+        // `:` and `,` are intentionally not passed through this check.
+        assert!(valid_cmd_basename("jq"));
+        assert!(valid_cmd_basename("nvim"));
+        assert!(valid_cmd_basename("clang-format"));
+        assert!(valid_cmd_basename("tool.json"));
+        assert!(valid_cmd_basename("rg_2"));
+
+        // Absolute or relative path forms would escape `<bin_dir>` via
+        // `Path::join`'s "absolute right operand discards left" rule
+        // or via `..` traversal once the assembled path is resolved.
+        assert!(!valid_cmd_basename(""));
+        assert!(!valid_cmd_basename("/etc/passwd"));
+        assert!(!valid_cmd_basename("../escape"));
+        assert!(!valid_cmd_basename("subdir/tool"));
+        assert!(!valid_cmd_basename("."));
+        assert!(!valid_cmd_basename(".."));
+        assert!(!valid_cmd_basename("bin\\tool"));
+        assert!(!valid_cmd_basename("bad|cmd"));
+        assert!(!valid_cmd_basename("bad cmd"));
+        assert!(!valid_cmd_basename("bad\ttab"));
+        assert!(!valid_cmd_basename("bad\nnewline"));
+    }
+
+    #[test]
+    fn parse_entry_falls_back_to_short_name_when_cmd_is_unsafe() {
+        // A hostile or typo'd `cmd=/etc/passwd` would, without this
+        // guard, propagate into `bin_link::one` and
+        // `cleanup::remove_builtin` where `<bin_dir>.join("/etc/passwd")`
+        // resolves to `/etc/passwd` outright. `parse_entry` now falls
+        // back to the dep's short name (already validated upstream)
+        // rather than carrying the unsafe value forward.
+        let entry = parse_entry("tool|github:release|/etc/passwd", None);
+        assert_eq!(entry.cmd, "tool");
+
+        let entry = parse_entry("owner/tool|github:repo|../escape", None);
+        assert_eq!(entry.cmd, "tool");
+
+        // Subdir-style cmds are also rejected.
+        let entry = parse_entry("tool|cargo|bin/tool", None);
+        assert_eq!(entry.cmd, "tool");
     }
 
     #[test]
