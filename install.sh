@@ -168,11 +168,36 @@ _curl_get_release_asset() {
       return 1
       ;;
   esac
-  curl -fsSL -A shdeps \
-    -H "Accept: application/octet-stream" \
-    -H "Authorization: Bearer $token" \
-    -o "$out" \
-    "$api_url"
+  # Feed the request via `curl --config -` over stdin so the bearer
+  # token never appears in argv (where it would be visible to `ps`
+  # / `/proc/<pid>/cmdline` for any other user on the same host).
+  # `printf` is a Bash builtin, so the token in `printf '...' "$token"`
+  # stays inside this bash process and never leaks to a child argv.
+  # Mirrors the same pattern `src/http.rs::curl_config` uses for the
+  # steady-state Rust path. Each value is wrapped in `"..."` with
+  # `\` and `"` backslash-escaped per curl's config syntax.
+  _bearer_token_escaped=$(_curl_config_quote "$token")
+  _api_url_escaped=$(_curl_config_quote "$api_url")
+  {
+    printf 'url = "%s"\n' "$_api_url_escaped"
+    printf 'user-agent = "shdeps"\n'
+    printf 'header = "Accept: application/octet-stream"\n'
+    printf 'header = "Authorization: Bearer %s"\n' "$_bearer_token_escaped"
+  } | curl -fsSL --config - -o "$out"
+}
+
+# Escape a value for inclusion inside a `"..."`-quoted curl
+# `--config` field. curl's config format treats `\` as an escape
+# character and `"` as the field terminator, so both must be
+# doubled. Tokens from `gh auth token` are alphanumeric and would
+# pass through unchanged, but escaping is cheap and prevents a
+# malformed `SHDEPS_GH_TOKEN` from breaking the curl invocation in
+# a confusing way.
+_curl_config_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
 }
 
 _repo_slug() {
