@@ -73,7 +73,18 @@ pub fn run(
     options: Options,
 ) -> Result<Summary> {
     let orphans = orphans(manifest, config);
-    if config.is_empty() && !orphans.is_empty() && !options.yes {
+    // The "all orphans" guard prevents a silent bulk-delete of every
+    // shdeps-tracked dep without explicit `--yes`. The pre-fix gate
+    // (`config.is_empty()`) only caught the literal empty-config case;
+    // it missed the equally-dangerous shape where the config is
+    // non-empty but every manifest entry is still about to be deleted
+    // — e.g., a filtered config whose declared names do not match any
+    // currently-tracked dep, or a config that renames everything in
+    // one go. Gating on `orphans.len() == manifest.entries().len()`
+    // catches every "you're about to delete everything" scenario.
+    let prunes_everything =
+        !manifest.entries().is_empty() && orphans.len() == manifest.entries().len();
+    if prunes_everything && !options.yes {
         return Ok(Summary {
             orphans,
             removed: Vec::new(),
@@ -242,8 +253,18 @@ mod tests {
 
     #[test]
     fn dry_run_and_quiet_skip_do_not_touch_manifest() {
+        // Two manifest entries: `keep` matches the config and survives;
+        // `old` is the orphan. This shape is important because the
+        // all-orphans guard fires before the quiet-skip branch, so the
+        // quiet behavior only exercises when at least one tracked dep
+        // is NOT being deleted.
         let fixture = Fixture::new("dry-run");
         let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("keep", "custom", "keep", ""),
+        )
+        .unwrap();
         manifest::upsert(
             &manifest_path,
             ManifestEntry::new("old", "custom", "old", ""),
@@ -252,7 +273,7 @@ mod tests {
         let manifest = manifest::read(&manifest_path).unwrap();
 
         let dry = run(
-            &[],
+            &[parse_entry("keep|custom", None)],
             &manifest,
             &manifest_path,
             &fixture.roots,
@@ -265,7 +286,7 @@ mod tests {
         )
         .unwrap();
         let quiet = run(
-            &[parse_entry("current|pkg", None)],
+            &[parse_entry("keep|custom", None)],
             &manifest,
             &manifest_path,
             &fixture.roots,
@@ -281,6 +302,62 @@ mod tests {
         assert!(dry.removed.is_empty());
         assert!(quiet.quiet_skipped);
         assert!(manifest::read(&manifest_path).unwrap().get("old").is_some());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("keep")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn all_orphans_guard_fires_when_every_tracked_dep_is_about_to_be_pruned() {
+        // The pre-fix guard only caught the literal `config.is_empty()`
+        // case. Equally dangerous: a non-empty config whose declared
+        // names do not match any tracked dep (e.g., everything renamed
+        // in one go, or platform filters at a higher layer that drop
+        // every survivor). Both shapes now trip the same guard so a
+        // silent bulk-delete cannot happen without explicit `--yes`.
+        let fixture = Fixture::new("all-orphans-nonempty-config");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("old-a", "pkg", "old-a", ""),
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("old-b", "pkg", "old-b", ""),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            // Non-empty config, but neither name matches anything in
+            // the manifest — every existing record is an orphan.
+            &[parse_entry("new-tool|pkg", None)],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.guarded_all_orphans);
+        assert!(summary.removed.is_empty());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("old-a")
+                .is_some()
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("old-b")
+                .is_some()
+        );
     }
 
     #[test]
