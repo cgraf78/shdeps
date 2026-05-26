@@ -49,13 +49,19 @@ pub fn one(bin_dir: &Path, cmd: &str, source: &Path) -> Result<Link> {
     }
     #[cfg(not(unix))]
     {
-        // Non-Unix targets are not a supported install platform; keep
-        // the previous behavior of preserving any existing entry so
-        // a stray Windows debug build does not stomp user files.
+        // Non-Unix targets are not a supported install platform. We
+        // cannot honestly return `Link::Linked` here without an
+        // actual symlink call — the `Linked` variant's docstring
+        // says "the public symlink was created or replaced" and a
+        // no-op return would silently lie to callers that branch on
+        // the variant. Preserve any existing entry and otherwise
+        // report `MissingSource` so non-Unix debug builds neither
+        // stomp user files nor falsely advertise an install.
         if target.exists() {
-            return Ok(Link::Preserved(target));
+            Ok(Link::Preserved(target))
+        } else {
+            Ok(Link::MissingSource)
         }
-        Ok(Link::Linked(target))
     }
 }
 
