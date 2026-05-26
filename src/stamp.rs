@@ -30,6 +30,16 @@ pub fn remote_path(state_dir: &Path, name: &str, kind: &str) -> PathBuf {
     state_dir.join(format!("{name}.{kind}.stamp"))
 }
 
+/// Maximum amount the cached stamp may exceed `now` before we treat
+/// the stamp as suspicious and refuse to consider it fresh.
+///
+/// A small slack (5 minutes) absorbs normal NTP corrections and the
+/// occasional VM clock adjustment. Anything beyond that almost
+/// certainly indicates a real clock-backward event or a tampered/copied
+/// stamp file; in either case the right behavior is to re-do the
+/// remote check rather than trust an indefinitely-future-dated stamp.
+const FUTURE_STAMP_TOLERANCE_SECS: u64 = 300;
+
 /// Returns whether the stamp is fresh under the supplied runtime flags.
 #[must_use]
 pub fn remote_fresh(path: &Path, freshness: Freshness) -> bool {
@@ -44,9 +54,21 @@ pub fn remote_fresh(path: &Path, freshness: Freshness) -> bool {
         return false;
     };
 
-    // `saturating_sub` avoids an underflow if the system clock moves backward.
-    // Treating a future stamp as fresh mirrors the Bash arithmetic intent more
-    // closely than turning clock skew into a forced network check.
+    // A stamp materially in the future of `now` means the wall clock
+    // moved backward (NTP correction, VM suspend/resume, backup
+    // restore). Without this guard, `saturating_sub` would return 0
+    // for any future-dated stamp and treat the dep as fresh forever
+    // until the wall clock caught back up to `cached + ttl` — which
+    // could be hours or days, during which no remote checks run.
+    if cached > freshness.now.saturating_add(FUTURE_STAMP_TOLERANCE_SECS) {
+        return false;
+    }
+
+    // `saturating_sub` avoids an underflow if `cached` is within
+    // tolerance but still slightly ahead of `now`. The tolerance
+    // window above guarantees we only reach this branch when the
+    // delta is tiny, so treating "near-future" as fresh remains
+    // safe and matches the Bash arithmetic intent.
     freshness.now.saturating_sub(cached) < freshness.ttl
 }
 
@@ -127,6 +149,57 @@ mod tests {
                 reinstall: false,
             }
         ));
+    }
+
+    #[test]
+    fn remote_fresh_rejects_stamp_materially_in_the_future() {
+        // A stamp that is dated significantly past `now` indicates a
+        // clock-backward event (NTP correction, VM resume, backup
+        // restore). Without this guard the dep would be treated as
+        // fresh until the wall clock caught back up, which could be
+        // hours or days — silently skipping all remote checks.
+        let dir = temp_dir("remote-future");
+        let stamp = remote_path(&dir, "test-tool", "repo");
+        remote_touch(&stamp, 2_000_000_000).unwrap();
+
+        assert!(
+            !remote_fresh(
+                &stamp,
+                Freshness {
+                    now: 1_700_000_000,
+                    ttl: 3600,
+                    force: false,
+                    reinstall: false,
+                }
+            ),
+            "a stamp dated far in the future must NOT count as fresh"
+        );
+    }
+
+    #[test]
+    fn remote_fresh_tolerates_small_clock_skew() {
+        // Real systems experience small NTP-driven clock adjustments
+        // (a few seconds, occasionally a minute). The tolerance window
+        // (5 minutes) keeps such normal skew from forcing spurious
+        // remote checks — only stamps materially in the future fail.
+        let dir = temp_dir("remote-small-skew");
+        let stamp = remote_path(&dir, "test-tool", "repo");
+        remote_touch(&stamp, 1_700_000_120).unwrap();
+
+        assert!(
+            remote_fresh(
+                &stamp,
+                Freshness {
+                    // `cached` is 2 minutes ahead of `now` — within
+                    // the 5-minute tolerance, so still considered fresh.
+                    now: 1_700_000_000,
+                    ttl: 3600,
+                    force: false,
+                    reinstall: false,
+                }
+            ),
+            "small clock skew within tolerance must still be fresh"
+        );
     }
 
     #[test]
