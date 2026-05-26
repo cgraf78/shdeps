@@ -4,6 +4,18 @@
 //! source them into the Rust process or model them as ordinary libraries. Running
 //! each hook query in a short Bash subprocess preserves the shell API boundary
 //! while preventing hook-defined functions from leaking between dependencies.
+//!
+//! # Hook file layout
+//!
+//! The hook file for a dep named `<name>` is looked up at
+//! `<hooks_dir>/<name>.sh`. For deps named `owner/repo` (the
+//! github:repo / github:release convention), the slash is preserved in
+//! the path, so the hook file MUST live at
+//! `<hooks_dir>/owner/repo.sh` — the `owner/` subdirectory is part of
+//! the path. A file placed flat at `<hooks_dir>/repo.sh` will produce
+//! a silent `MissingHook` result rather than running. This mirrors the
+//! `<install_dir>/<name>` layout the install path uses for the same
+//! deps, keeping hooks parallel to their dep's install root.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
