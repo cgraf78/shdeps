@@ -150,9 +150,20 @@ pub fn is_safe_api_asset_url(url: &str) -> bool {
 }
 
 /// Returns the GitHub API releases URL for `owner/repo`.
+///
+/// The `per_page=100` query parameter raises the page size from
+/// GitHub's default of 30 to the API maximum. Without it, projects
+/// that publish many releases (active CIs publishing nightly builds,
+/// patch-heavy projects, repos with many drafts/prereleases) can have
+/// `latest_stable` pick the wrong tag — or no tag at all — because
+/// the first 30 releases by publication order might be entirely
+/// drafts/prereleases. 100 is the API ceiling per single request;
+/// callers that need to scan further must implement RFC 5988 Link
+/// pagination, which is intentionally NOT done here because shdeps
+/// only needs the most recent stable release.
 #[must_use]
 pub fn releases_url(repo: &str) -> String {
-    format!("https://api.github.com/repos/{repo}/releases")
+    format!("https://api.github.com/repos/{repo}/releases?per_page=100")
 }
 
 /// Returns the shared release-metadata cache path for `owner/repo`.
@@ -327,6 +338,24 @@ mod tests {
                     ),
                 }],
             }]
+        );
+    }
+
+    #[test]
+    fn releases_url_requests_max_page_size_to_cover_active_release_streams() {
+        // GitHub's default page size is 30; without `per_page=100`,
+        // active projects with many drafts/prereleases at the top of
+        // the response can starve `latest_stable` of any usable entry.
+        // This test pins the contract so a refactor cannot silently
+        // shrink the page size and re-introduce that bug.
+        let url = super::releases_url("owner/tool");
+        assert!(
+            url.starts_with("https://api.github.com/repos/owner/tool/releases"),
+            "URL must point at the standard releases endpoint: {url}"
+        );
+        assert!(
+            url.contains("per_page=100"),
+            "URL must request the API maximum page size: {url}"
         );
     }
 

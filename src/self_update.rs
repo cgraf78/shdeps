@@ -1180,7 +1180,7 @@ mod tests {
             .with_var("SHDEPS_TEST_PLATFORM", "linux")
             .with_command("uname -m", "x86_64");
         let client = FakeClient::new().with(
-            "https://api.github.com/repos/cgraf78/shdeps/releases",
+            "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100",
             releases_json("v2026.05.24").into_bytes(),
         );
 
@@ -1197,7 +1197,7 @@ mod tests {
         assert_eq!(summary.exit_code(), 0);
         assert_eq!(
             client.urls(),
-            vec!["https://api.github.com/repos/cgraf78/shdeps/releases"]
+            vec!["https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100"]
         );
     }
 
@@ -1220,10 +1220,13 @@ mod tests {
         let checksum = format!("{}  {archive_name}\n", checksum::sha256_hex(&archive));
         let client = FakeClient::new()
             .with(
-                "https://api.github.com/repos/cgraf78/shdeps/releases",
+                "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100",
                 releases_json("v2026.05.24").into_bytes(),
             )
-            .with(&format!("https://github.com/owner/tool/releases/download/v1/{archive_name}"), archive)
+            .with(
+                &format!("https://github.com/owner/tool/releases/download/v1/{archive_name}"),
+                archive,
+            )
             .with(
                 &format!("https://github.com/owner/tool/releases/download/v1/{checksum_name}"),
                 checksum.into_bytes(),
@@ -1271,10 +1274,13 @@ mod tests {
         let archive = release_tar();
         let client = FakeClient::new()
             .with(
-                "https://api.github.com/repos/cgraf78/shdeps/releases",
+                "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100",
                 releases_json("v2026.05.24").into_bytes(),
             )
-            .with(&format!("https://github.com/owner/tool/releases/download/v1/{archive_name}"), archive)
+            .with(
+                &format!("https://github.com/owner/tool/releases/download/v1/{archive_name}"),
+                archive,
+            )
             .with(
                 &format!("https://github.com/owner/tool/releases/download/v1/{checksum_name}"),
                 b"bad checksum".to_vec(),
@@ -1339,12 +1345,16 @@ mod tests {
                 [
                     Asset {
                         name: archive.clone(),
-                        url: format!("https://github.com/owner/tool/releases/download/v1/{archive}"),
+                        url: format!(
+                            "https://github.com/owner/tool/releases/download/v1/{archive}"
+                        ),
                         api_url: None,
                     },
                     Asset {
                         name: checksum.clone(),
-                        url: format!("https://github.com/owner/tool/releases/download/v1/{checksum}"),
+                        url: format!(
+                            "https://github.com/owner/tool/releases/download/v1/{checksum}"
+                        ),
                         api_url: None,
                     },
                 ]
