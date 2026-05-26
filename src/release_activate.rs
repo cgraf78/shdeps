@@ -83,9 +83,25 @@ pub fn activate(
     if let Err(switch) = fs::rename(&staged.dir, install_dir) {
         if had_existing {
             if let Err(rollback) = fs::rename(&backup, install_dir) {
+                // Two failures in a row: the rename into the live path
+                // failed, then the restore from backup also failed.
+                // The install state is genuinely ambiguous, so we keep
+                // both `staged.dir` and `backup` on disk for the user
+                // to inspect rather than discarding evidence with a
+                // best-effort cleanup. Returning the combined error
+                // is the operator's signal to investigate manually.
                 return Err(Failure::Rollback { switch, rollback });
             }
         }
+        // The switch failed but the previous install (if any) has been
+        // successfully restored. The staged candidate is now orphaned
+        // — leaving it on disk would let it accumulate on every retry,
+        // especially under disk-full conditions where each new
+        // `self-update` would stack another `.shdeps-stage-...`
+        // directory next to the live install. Best-effort cleanup
+        // here keeps the directory listing tidy without masking the
+        // underlying switch error.
+        let _ = fs::remove_dir_all(&staged.dir);
         return Err(Failure::Switch(switch));
     }
 
@@ -160,6 +176,35 @@ mod tests {
         activate(&staged, &install, &metadata).unwrap();
 
         assert_eq!(fs::read_to_string(install.join("shdeps")).unwrap(), "new");
+    }
+
+    #[test]
+    fn activate_cleans_up_staged_dir_after_recoverable_switch_failure() {
+        // The Switch failure path used to leave `staged.dir` on disk
+        // after restoring the previous install. Under disk-full
+        // conditions the directory would accumulate on every retry,
+        // wasting inodes and confusing later cleanup. The fix removes
+        // the orphaned staged dir best-effort.
+        //
+        // Force a Switch failure by passing an `install_dir` whose
+        // parent does not exist — `rename` cannot create the parent,
+        // so the staged-to-live rename fails reliably regardless of
+        // the underlying filesystem.
+        let root = temp_dir("switch-cleanup");
+        let install = root.join("missing-parent/shdeps");
+        let staged = staged(&root, "v2026.05.24");
+        let staged_dir = staged.dir.clone();
+
+        let failure = activate(&staged, &install, &Metadata::new(Method::Release)).unwrap_err();
+
+        assert!(
+            matches!(failure, Failure::Switch(_)),
+            "switch failure expected, got {failure:?}"
+        );
+        assert!(
+            !staged_dir.exists(),
+            "orphaned staged dir must be cleaned up after a recoverable switch failure"
+        );
     }
 
     #[test]
