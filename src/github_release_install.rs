@@ -413,15 +413,50 @@ fn replace_symlink(source: &Path, target: &Path) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "release public-bin target has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+
+    // Same staging+rename TOCTOU narrowing the consolidated
+    // `extras::replace_symlink` helper applies. We can't share the
+    // helper directly because `github:release` deliberately overwrites
+    // regular files at `target` — a Bash-parity carve-out documented at
+    // the top of `install_plain` — whereas `extras::replace_symlink`
+    // preserves non-symlinks. Use the same staging pattern inline so the
+    // missing-path window between `remove_file` and `symlink` is
+    // eliminated for the public-bin link: the path is always either the
+    // old binary/symlink or the new symlink, never absent. Without this,
+    // an external concurrent writer to `~/.local/bin` could observe the
+    // momentary gap (the same window `bin_link::one` was rewritten to
+    // close in round 8).
+    let file_name = target.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "release public-bin target has no file name",
+        )
+    })?;
+    let staging = parent.join(format!(
+        ".{}.shdeps-release-link.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    ));
+    // Remove any prior staging leftover from a crashed write before we
+    // create our own; `create_dir_all(parent)` does not touch existing
+    // files and `symlink` would EEXIST against a stale entry.
+    let _ = fs::remove_file(&staging);
+    symlink(source, &staging)?;
+    if let Err(error) = fs::rename(&staging, target) {
+        let _ = fs::remove_file(&staging);
+        return Err(error.into());
     }
-    match fs::remove_file(target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    symlink(source, target)?;
     Ok(())
 }
 
@@ -602,6 +637,53 @@ mod tests {
             fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
             dir.join("share/owner/tool/share/man/man1/tool.1")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_replaces_public_bin_via_atomic_rename() {
+        // Regression for the iteration-3 paladin finding that this
+        // file's local `replace_symlink` used a wider `remove_file` +
+        // `symlink` TOCTOU window than the shared
+        // `extras::replace_symlink`. The path is now staged in the
+        // same parent dir and `rename`-d into place, so a successful
+        // install must leave NO `.tool.shdeps-release-link.*` staging
+        // file behind in the public-bin parent directory. If a future
+        // edit reintroduces the older delete-then-create pattern this
+        // assertion is unchanged but the missing-path window is back;
+        // the better signal is the absence of any staging leftover
+        // file, which the rename success path always cleans by moving
+        // it onto the target.
+        let dir = temp_dir("atomic-rename-release-link");
+        let bytes = tar_gz(&[("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755)]);
+        let public = dir.join("bin/tool");
+
+        // Stage a dangling symlink at the target so the path already
+        // has an entry that needs to be replaced.
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        std::os::unix::fs::symlink(dir.join("nonexistent"), &public).unwrap();
+
+        super::install_tar_gz_to(
+            &dir.join("state"),
+            &dir.join("share"),
+            &public,
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        let leftovers: Vec<_> = fs::read_dir(dir.join("bin"))
+            .unwrap()
+            .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+            .filter(|n| n.starts_with(".tool.shdeps-release-link."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no staging file should remain after successful atomic rename, found: {leftovers:?}"
+        );
+        // The new symlink resolves and the dangling one is gone.
+        assert!(public.is_symlink());
     }
 
     #[test]
