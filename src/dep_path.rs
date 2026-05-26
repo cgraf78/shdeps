@@ -172,9 +172,24 @@ fn valid_relative(rel: &str) -> bool {
 
     // This validation is intentionally lexical. It prevents callers from
     // spelling absolute paths or explicit parent traversal, but it does not
-    // promise a symlink sandbox inside the dependency root. The spec keeps that
-    // boundary because dependency assets are trusted local tool data, and a
-    // full canonicalization sandbox would break legitimate symlinked assets.
+    // promise a symlink sandbox inside the dependency root. The spec keeps
+    // that boundary because dependency assets are trusted local tool data,
+    // and a full canonicalization sandbox would break legitimate symlinked
+    // assets (e.g., a github:repo dep that ships a symlinked completion
+    // file).
+    //
+    // TRUST CONTRACT: callers that source the resolved path into a shell
+    // (`dep-file`, hook prelude) inherit this trust. For pkg/cargo/go/uv/npm
+    // deps the asset producer is the system package manager or the upstream
+    // toolchain, both of which already curate file content. For github:repo
+    // and github:release deps the asset producer is the upstream archive
+    // author; shdeps verifies the SHA-256 of the downloaded archive (see
+    // `release_stage::stage` and `update_release::install_request`) before
+    // any path under it becomes resolvable here, which is what closes the
+    // loop. Without that upstream verification, a hostile archive could
+    // plant a symlink into `/etc/passwd` that this lexical check would
+    // pass — the integrity check is the load-bearing defense, not this
+    // function.
     !rel.split('/').any(|part| part == "..")
 }
 
