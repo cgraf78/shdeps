@@ -89,8 +89,51 @@ fn temp_path(path: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("state");
+    // PID + nanos alone can collide when two threads in the same process
+    // write to the same directory in the same nanosecond — `create_new`
+    // then surfaces a confusing `AlreadyExists` error and the loser's
+    // write fails on what is really a self-collision. Mixing in a nonce
+    // pushes the collision probability into the cosmic-noise range so
+    // the `create_new` invariant remains a real concurrency guard
+    // rather than a TOCTOU trap.
+    let nonce = temp_nonce();
+    path.with_file_name(format!(
+        ".{name}.tmp.{}.{stamp}.{nonce:016x}",
+        std::process::id()
+    ))
+}
 
-    path.with_file_name(format!(".{name}.tmp.{}.{stamp}", std::process::id()))
+/// Returns a 64-bit nonce for atomic-write temp filenames.
+///
+/// Tries `/dev/urandom` first on Unix because it is the cheapest
+/// per-call entropy source available without adding a crate
+/// dependency. Falls back to mixing in thread-id, address, and a
+/// monotonic counter — still strong enough to make same-nanosecond
+/// collisions vanishingly rare.
+fn temp_nonce() -> u64 {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 8];
+            if f.read_exact(&mut buf).is_ok() {
+                return u64::from_ne_bytes(buf);
+            }
+        }
+    }
+    // Software fallback: bit-mix several sources that vary between
+    // concurrent writers in the same process.
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+    // The address of a local heap allocation differs per call thanks
+    // to allocator-state churn and ASLR.
+    let probe = Box::new(0u8);
+    (std::ptr::from_ref::<u8>(&*probe) as usize).hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +228,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{StateLock, write_atomic};
+    use super::{StateLock, temp_nonce, write_atomic};
 
     #[test]
     fn lock_serializes_state_dir_access() {
@@ -197,6 +240,24 @@ mod tests {
 
         drop(lock);
         assert!(StateLock::try_acquire(&fixture.dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn temp_nonce_is_unique_across_consecutive_calls() {
+        // The nonce mixes /dev/urandom or per-thread/per-allocation
+        // entropy; either source must produce different values on
+        // consecutive calls in the same thread. A duplicate nonce on
+        // back-to-back invocations is the exact failure mode that
+        // would re-introduce the same-nanosecond temp-filename
+        // collision the helper exists to prevent.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            assert!(
+                seen.insert(temp_nonce()),
+                "temp_nonce returned a duplicate within {} calls",
+                seen.len()
+            );
+        }
     }
 
     #[test]
