@@ -482,7 +482,13 @@ fn apply_hook_env(
         .env("SHDEPS_INSTALL_DIR", &roots.install_dir)
         .env("SHDEPS_BIN_DIR", &roots.bin_dir)
         .env("SHDEPS_CURRENT_DEP", name)
-        .env("SHDEPS_HOOK_PHASE", phase);
+        .env("SHDEPS_HOOK_PHASE", phase)
+        // Signal to any recursive `shdeps` invocation from inside the
+        // hook that our parent already holds the per-state-dir flock.
+        // The inner `StateLock::acquire` short-circuits to a no-op
+        // guard instead of trying to acquire the lock and deadlocking
+        // against itself. See `state::REENTRY_ENV` for the contract.
+        .env(crate::state::REENTRY_ENV, "1");
     if let Some(txn) = txn {
         // This env var is the only parent/child coordination channel for
         // `shdeps_mark_changed`. Keeping it opaque prevents hooks from
