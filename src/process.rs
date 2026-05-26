@@ -319,11 +319,8 @@ fn run(program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Ou
 fn terminate_then_kill(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        // Direct `libc::kill`-style syscall through the same `extern "C"`
-        // pattern `state::lock_file` uses. Avoids pulling in a crate just
-        // for `kill(2)`. PID is i32 on every Unix Rust supports.
-        //
-        // PID-reuse safety: check `try_wait` immediately before the
+        // Direct `kill(2)` via the `libc` crate. PID-reuse safety:
+        // check `try_wait` immediately before the
         // signal call. The child can exit between when the deadline
         // is observed and when we issue `kill(2)`; if it does, the
         // OS may reassign that PID to an unrelated process before
@@ -340,7 +337,7 @@ fn terminate_then_kill(child: &mut std::process::Child) {
             return;
         }
         unsafe {
-            kill(child.id() as i32, SIGTERM);
+            libc::kill(child.id() as i32, libc::SIGTERM);
         }
         let grace_deadline = Instant::now() + SIGTERM_GRACE;
         while Instant::now() < grace_deadline {
@@ -357,13 +354,6 @@ fn terminate_then_kill(child: &mut std::process::Child) {
         }
     }
     let _ = child.kill();
-}
-
-#[cfg(unix)]
-const SIGTERM: i32 = 15;
-#[cfg(unix)]
-unsafe extern "C" {
-    fn kill(pid: i32, sig: i32) -> i32;
 }
 
 fn convert_output(output: std::process::Output) -> Output {

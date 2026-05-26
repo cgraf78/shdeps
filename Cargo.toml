@@ -25,6 +25,16 @@ bzip2 = "0.5.2"
 zstd = { version = "0.13.3", default-features = false }
 xz2 = "0.1.7"
 
+# Used only on Unix targets for syscall bindings and POSIX constants
+# (`flock`, `setsid`, `kill`, `getppid`, `LOCK_EX`, `SIGKILL`, `EPERM`,
+# `SIGTERM`, etc.). The crate is pure FFI bindings — it does not add a
+# runtime dependency and stays fully compatible with the
+# `x86_64-unknown-linux-musl` static-binary distribution target. The
+# crate is intentionally Unix-only here; nothing in shdeps's Windows
+# code path needs libc.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "shdeps"
 path = "src/main.rs"

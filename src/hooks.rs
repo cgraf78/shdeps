@@ -74,14 +74,14 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
         // parent's controlling terminal is the documented purpose.
         unsafe {
             command.pre_exec(|| {
-                if libc_setsid() == -1 {
+                if libc::setsid() == -1 {
                     let err = std::io::Error::last_os_error();
                     // EPERM means the caller is already a process-group
                     // leader, so setsid refuses — but the child inherits
                     // that leader status, which is exactly the state we
                     // wanted (kill(-pgid) will reach the whole group).
                     // Any other errno genuinely blocks detachment.
-                    if err.raw_os_error() != Some(EPERM) {
+                    if err.raw_os_error() != Some(libc::EPERM) {
                         return Err(err);
                     }
                 }
@@ -129,7 +129,7 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
                 // been reused while the child is still alive
                 // (per `try_wait` above returning None).
                 unsafe {
-                    libc_kill(pgid, SIGKILL);
+                    libc::kill(pgid, libc::SIGKILL);
                 }
             }
             #[cfg(not(unix))]
@@ -148,24 +148,6 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
         stdout,
         stderr,
     })
-}
-
-#[cfg(unix)]
-const SIGKILL: i32 = 9;
-
-// EPERM == 1 on every Unix this crate is built for (Linux, macOS, and
-// the BSDs all derive their errno table from the same historical base).
-// We avoid pulling in `libc` as a dependency just to surface a single
-// constant, mirroring the inline `extern "C"` declarations below.
-#[cfg(unix)]
-const EPERM: i32 = 1;
-
-#[cfg(unix)]
-unsafe extern "C" {
-    #[link_name = "setsid"]
-    fn libc_setsid() -> i32;
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 fn read_capped<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
