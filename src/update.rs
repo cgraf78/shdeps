@@ -3446,11 +3446,10 @@ version() { printf 'saw-pkg\n'; }
         let mut summary = Summary::default();
         assert!(!summary.has_errors());
         summary.leftovers.push("owner/tool".to_owned());
-        // SAFETY: env mutation is serialized by the test lock;
-        // value reverted before the lock is released.
-        unsafe {
-            std::env::remove_var("SHDEPS_STRICT_LEFTOVERS");
-        }
+        // The defensive reset above already cleared the env var; no
+        // second `remove_var` here. The reviewer's eye caught the
+        // duplicate as a copy-paste artifact that wrongly implied a
+        // `set_var` had intervened.
         assert!(
             !summary.has_errors(),
             "leftover must NOT gate exit by default — that would be a CI regression"

@@ -28,9 +28,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// downloaded asset, silently dropping the per-file binding that the
 /// whole verification is supposed to enforce. A mirror that publishes a
 /// checksum file without the filename — accidentally or otherwise —
-/// must fail verification rather than vacuously pass it. Tests that
-/// need to compute bare-hash equivalence can call `parse_bare_hash`
-/// directly with a known file name.
+/// must fail verification rather than vacuously pass it.
 #[must_use]
 pub fn expected_sha256(content: &str, file_name: &str) -> Option<String> {
     for line in content.lines() {
@@ -64,17 +62,6 @@ fn parse_named_line(line: &str, file_name: &str) -> Option<String> {
     // Match the checksum entry to the exact archive name so a multi-asset
     // release cannot accidentally verify Linux bytes with a macOS checksum.
     (candidate == file_name).then_some(hash)
-}
-
-#[cfg(test)]
-fn parse_bare_hash(line: &str) -> Option<String> {
-    // Bare-hash parsing is intentionally NOT in the verify path. The
-    // production `expected_sha256` only accepts filename-bound lines so a
-    // checksum-file payload that drops the filename cannot be vacuously
-    // matched against any asset. This helper stays available so tests can
-    // round-trip a known digest without constructing a full `sha256sum`-
-    // formatted line.
-    normalize_hash(line)
 }
 
 fn normalize_hash(value: &str) -> Option<String> {
