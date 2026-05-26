@@ -45,6 +45,14 @@ impl ManifestEntry {
     }
 
     /// Parses a manifest row, ignoring blank lines.
+    ///
+    /// Tolerates a stray trailing `\r` on each field (`str::lines` already
+    /// strips a `\r` that precedes the line-feed, but a `\r` at the end
+    /// of the final field's content — e.g., the last line of a CRLF file
+    /// without a final newline — would otherwise survive into the parsed
+    /// `install_path` value and silently break path comparisons later).
+    /// Field-level trim is the simplest place to enforce this without
+    /// changing `parse(content)` callers.
     #[must_use]
     pub fn parse(line: &str) -> Option<Self> {
         if line.is_empty() {
@@ -52,16 +60,16 @@ impl ManifestEntry {
         }
 
         let mut fields = line.splitn(4, '|');
-        let name = fields.next().unwrap_or_default();
+        let name = fields.next().unwrap_or_default().trim_end_matches('\r');
         if name.is_empty() {
             return None;
         }
 
         Some(Self::new(
             name,
-            fields.next().unwrap_or_default(),
-            fields.next().unwrap_or_default(),
-            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default().trim_end_matches('\r'),
+            fields.next().unwrap_or_default().trim_end_matches('\r'),
+            fields.next().unwrap_or_default().trim_end_matches('\r'),
         ))
     }
 
@@ -87,8 +95,16 @@ pub struct Manifest {
 
 impl Manifest {
     /// Parses manifest file content.
+    ///
+    /// Strips a leading UTF-8 BOM (`\u{FEFF}`) so a manifest produced by
+    /// a BOM-emitting editor (some Windows tools default to this) parses
+    /// the first record correctly. Without the strip, the BOM would
+    /// remain glued to the first `name` field and silently fail every
+    /// later `manifest.get(name)` lookup with a confusing "dep is
+    /// untracked" symptom on Windows-edited or backup-restored manifests.
     #[must_use]
     pub fn parse(content: &str) -> Self {
+        let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
         Self {
             entries: content.lines().filter_map(ManifestEntry::parse).collect(),
         }
@@ -224,6 +240,46 @@ mod tests {
 
     use super::{Manifest, ManifestEntry, path, read, remove, upsert};
     use crate::config::parse_entry;
+
+    #[test]
+    fn parse_strips_utf8_bom_at_file_start() {
+        // A manifest produced by a BOM-emitting editor (some Windows
+        // tools default to this) would otherwise glue the BOM to the
+        // first dep's `name` field, breaking every later
+        // `manifest.get(name)` lookup with a confusing "dep is
+        // untracked" symptom on Windows-edited / backup-restored files.
+        let manifest = Manifest::parse("\u{FEFF}tool-a|pkg|tool-a|\n");
+
+        assert_eq!(manifest.entries().len(), 1);
+        assert_eq!(
+            manifest.get("tool-a"),
+            Some(&ManifestEntry::new("tool-a", "pkg", "tool-a", ""))
+        );
+    }
+
+    #[test]
+    fn parse_tolerates_trailing_carriage_returns_on_each_field() {
+        // `str::lines` already strips `\r` that precedes a `\n`, but a
+        // file with CRLF endings whose final line lacks a trailing
+        // newline would leave a `\r` glued to the last field's value.
+        // Field-level trim catches that case and keeps `manifest.get()`
+        // lookups working on Windows-edited manifests.
+        let crlf = Manifest::parse("tool-a|pkg|tool-a|.local/share\r\ntool-b|pkg|tool-b|\r");
+        assert_eq!(crlf.entries().len(), 2);
+        assert_eq!(
+            crlf.get("tool-a"),
+            Some(&ManifestEntry::new(
+                "tool-a",
+                "pkg",
+                "tool-a",
+                ".local/share"
+            ))
+        );
+        assert_eq!(
+            crlf.get("tool-b"),
+            Some(&ManifestEntry::new("tool-b", "pkg", "tool-b", ""))
+        );
+    }
 
     #[test]
     fn parse_ignores_blank_lines_and_preserves_last_duplicate_as_effective() {
