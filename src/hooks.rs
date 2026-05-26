@@ -638,7 +638,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
 
     use super::{BashCustomProbe, Install, Post, Txn, Uninstall, read_capped};
     use crate::config::parse_entry;
@@ -932,13 +932,18 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" > "$SHDEPS_STATE_DIR/post-ra
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!("shdeps-{name}-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        path
+        // Use the thread name (which is the test function name in Rust's test
+        // harness) rather than a nanosecond timestamp. macOS clock resolution
+        // can be coarser than nanoseconds, so two tests running concurrently
+        // may get the same timestamp and land in the same directory — causing
+        // hook files and state written by one test to corrupt another.
+        let dir = std::env::temp_dir().join(format!(
+            "shdeps-{name}-{}-{}",
+            std::process::id(),
+            thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
