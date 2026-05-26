@@ -199,10 +199,29 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
             )?;
 
             if !transition.old.install_path.is_empty() {
-                let install_path = manifest_path(&transition.old.install_path, &roots.home);
-                if !preserve.contains(&install_path) {
-                    remove_any(&install_path)?;
-                    remove_empty_install_parents(&install_path, &roots.install_dir)?;
+                // Mirror the containment hardening that
+                // `cleanup::remove_builtin` applies to the same field.
+                // Without this guard, a tampered manifest record
+                // pointing `install_path` at, say, `/etc` would be
+                // handed straight to `remove_dir_all` during a method
+                // transition. The shared `safe_managed_path` is the
+                // single source of truth for "is this path in a
+                // shdeps-managed tree" — duplicating the check here
+                // would invite drift the next time the predicate
+                // tightens.
+                let cleanup_roots = crate::cleanup::Roots {
+                    state_dir: roots.state_dir.clone(),
+                    install_dir: roots.install_dir.clone(),
+                    bin_dir: roots.bin_dir.clone(),
+                    home: roots.home.clone(),
+                };
+                if let Some(install_path) =
+                    crate::cleanup::safe_managed_path(&transition.old.install_path, &cleanup_roots)
+                {
+                    if !preserve.contains(&install_path) {
+                        remove_any(&install_path)?;
+                        remove_empty_install_parents(&install_path, &roots.install_dir)?;
+                    }
                 }
             }
 
@@ -363,15 +382,6 @@ fn unlink_snapshot(
     Ok(())
 }
 
-fn manifest_path(path: &str, home: &Path) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        path
-    } else {
-        home.join(path)
-    }
-}
-
 fn remove_stamps(state_dir: &Path, name: &str) -> Result<()> {
     cleanup::remove_stamps(state_dir, name, &mut cleanup::Summary::default())
 }
@@ -420,8 +430,11 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    use super::{points_into, unlink_snapshot};
+    use super::{Transition, cleanup_snapshot, points_into, unlink_snapshot};
+    use crate::config::Entry;
     use crate::link_state::{self, Kind};
+    use crate::manifest::ManifestEntry;
+    use crate::runtime::Roots;
     use std::collections::BTreeSet;
 
     #[test]
@@ -559,6 +572,58 @@ mod tests {
         assert!(
             !state_path.exists(),
             "state file should be removed once no entries remain"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_snapshot_skips_tampered_install_path_outside_managed_roots() {
+        // Regression for round-6 finding: the `github:repo` cleanup
+        // path in `cleanup_snapshot` had its own `manifest_path +
+        // remove_any` sequence that bypassed the `safe_managed_path`
+        // hardening added to `cleanup::remove_builtin`. A method
+        // transition with a tampered `old.install_path = /<bystander>`
+        // would have removed that bystander on transition. After the
+        // fix, the shared helper rejects out-of-tree paths and the
+        // bystander survives.
+        let dir = temp_dir("tampered-install-path");
+        let bystander = dir.join("bystander");
+        fs::create_dir_all(&bystander).unwrap();
+        fs::write(bystander.join("data"), "user-owned").unwrap();
+
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                bystander.to_string_lossy(),
+            ),
+            bin_links: Vec::new(),
+            extra_links: Vec::new(),
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "github:release".to_owned(),
+            cmd: "tool".to_owned(),
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+
+        assert!(bystander.exists(), "bystander dir must be preserved");
+        assert!(
+            bystander.join("data").exists(),
+            "bystander contents must be preserved"
         );
     }
 
