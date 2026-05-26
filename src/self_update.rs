@@ -1100,12 +1100,12 @@ mod tests {
                 release: release_with_assets("v2026.05.24", &["linux-x86_64-musl"]),
                 pair: Pair {
                     archive_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz".to_owned(),
-                    archive_url: "https://example/shdeps-v2026.05.24-linux-x86_64-musl.tar.gz"
+                    archive_url: "https://github.com/owner/tool/releases/download/v1/shdeps-v2026.05.24-linux-x86_64-musl.tar.gz"
                         .to_owned(),
                     archive_api_url: None,
                     checksum_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256".to_owned(),
                     checksum_url:
-                        "https://example/shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256"
+                        "https://github.com/owner/tool/releases/download/v1/shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256"
                             .to_owned(),
                     checksum_api_url: None,
                 },
@@ -1223,9 +1223,9 @@ mod tests {
                 "https://api.github.com/repos/cgraf78/shdeps/releases",
                 releases_json("v2026.05.24").into_bytes(),
             )
-            .with(&format!("https://example/{archive_name}"), archive)
+            .with(&format!("https://github.com/owner/tool/releases/download/v1/{archive_name}"), archive)
             .with(
-                &format!("https://example/{checksum_name}"),
+                &format!("https://github.com/owner/tool/releases/download/v1/{checksum_name}"),
                 checksum.into_bytes(),
             );
 
@@ -1274,9 +1274,9 @@ mod tests {
                 "https://api.github.com/repos/cgraf78/shdeps/releases",
                 releases_json("v2026.05.24").into_bytes(),
             )
-            .with(&format!("https://example/{archive_name}"), archive)
+            .with(&format!("https://github.com/owner/tool/releases/download/v1/{archive_name}"), archive)
             .with(
-                &format!("https://example/{checksum_name}"),
+                &format!("https://github.com/owner/tool/releases/download/v1/{checksum_name}"),
                 b"bad checksum".to_vec(),
             );
 
@@ -1339,12 +1339,12 @@ mod tests {
                 [
                     Asset {
                         name: archive.clone(),
-                        url: format!("https://example/{archive}"),
+                        url: format!("https://github.com/owner/tool/releases/download/v1/{archive}"),
                         api_url: None,
                     },
                     Asset {
                         name: checksum.clone(),
-                        url: format!("https://example/{checksum}"),
+                        url: format!("https://github.com/owner/tool/releases/download/v1/{checksum}"),
                         api_url: None,
                     },
                 ]
@@ -1453,8 +1453,8 @@ mod tests {
               "draft": false,
               "prerelease": false,
               "assets": [
-                {{"name":"{archive_name}","browser_download_url":"https://example/{archive_name}"}},
-                {{"name":"{archive_name}.sha256","browser_download_url":"https://example/{archive_name}.sha256"}}
+                {{"name":"{archive_name}","browser_download_url":"https://github.com/owner/tool/releases/download/v1/{archive_name}"}},
+                {{"name":"{archive_name}.sha256","browser_download_url":"https://github.com/owner/tool/releases/download/v1/{archive_name}.sha256"}}
               ]
             }}]"#
         )

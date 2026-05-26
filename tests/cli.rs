@@ -294,10 +294,10 @@ config=$(cat)
 printf '%s\n---\n' "$config" >>"$SHDEPS_TEST_CURL_LOG"
 case "$config" in
   *'url = "https://api.github.com/repos/owner/mytool/releases"'*)
-    printf '[{"tag_name":"v1.0.0","assets":[{"name":"%s","browser_download_url":"https://downloads.example/%s"}]}]\n' \
+    printf '[{"tag_name":"v1.0.0","assets":[{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"}]}]\n' \
       "$SHDEPS_TEST_ASSET" "$SHDEPS_TEST_ASSET"
     ;;
-  *'url = "https://downloads.example/'"$SHDEPS_TEST_ASSET"'"'*)
+  *'url = "https://github.com/owner/tool/releases/download/v1/'"$SHDEPS_TEST_ASSET"'"'*)
     cat "$SHDEPS_TEST_ARCHIVE"
     ;;
   *)
@@ -1236,14 +1236,14 @@ config=$(cat)
 # shortcuts that the real transport does not use.
 case "$config" in
   *'url = "https://api.github.com/repos/cgraf78/shdeps/releases"'*)
-    printf '[{"tag_name":"20260524-120000-deadbeef","draft":false,"prerelease":false,"assets":[{"name":"%s","browser_download_url":"https://downloads.example/%s"},{"name":"%s","browser_download_url":"https://downloads.example/%s"}]}]\n' \
+    printf '[{"tag_name":"20260524-120000-deadbeef","draft":false,"prerelease":false,"assets":[{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"},{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"}]}]\n' \
       "$SHDEPS_TEST_ARCHIVE_NAME" "$SHDEPS_TEST_ARCHIVE_NAME" \
       "$SHDEPS_TEST_CHECKSUM_NAME" "$SHDEPS_TEST_CHECKSUM_NAME"
     ;;
-  *'url = "https://downloads.example/'"$SHDEPS_TEST_ARCHIVE_NAME"'"'*)
+  *'url = "https://github.com/owner/tool/releases/download/v1/'"$SHDEPS_TEST_ARCHIVE_NAME"'"'*)
     cat "$SHDEPS_TEST_ARCHIVE"
     ;;
-  *'url = "https://downloads.example/'"$SHDEPS_TEST_CHECKSUM_NAME"'"'*)
+  *'url = "https://github.com/owner/tool/releases/download/v1/'"$SHDEPS_TEST_CHECKSUM_NAME"'"'*)
     cat "$SHDEPS_TEST_CHECKSUM"
     ;;
   *)
@@ -1377,7 +1377,7 @@ fn release_json(tag: &str, assets: &[&str]) -> String {
         .iter()
         .map(|asset| {
             format!(
-                r#"{{"name":"{asset}","browser_download_url":"https://downloads.example/{asset}"}}"#
+                r#"{{"name":"{asset}","browser_download_url":"https://github.com/owner/tool/releases/download/v1/{asset}"}}"#
             )
         })
         .collect::<Vec<_>>()
@@ -1452,7 +1452,7 @@ case "$config" in
     fi
     cat "$SHDEPS_TEST_RELEASE_JSON"
     ;;
-  *'url = "https://downloads.example/'*)
+  *'url = "https://github.com/owner/tool/releases/download/v1/'*)
     if [[ -n "${SHDEPS_TEST_CURL_LOG:-}" ]]; then
       printf 'asset\n' >>"$SHDEPS_TEST_CURL_LOG"
     fi

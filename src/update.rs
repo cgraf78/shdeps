@@ -972,10 +972,14 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         fixture.client = FakeClient::default()
             .with(
                 "https://api.github.com/repos/cgraf78/ds/releases",
-                release_response("ds", "v1.2.3", "https://example/ds-linux-x86_64"),
+                release_response(
+                    "ds",
+                    "v1.2.3",
+                    "https://github.com/owner/tool/releases/download/v1/ds-linux-x86_64",
+                ),
             )
             .with(
-                "https://example/ds-linux-x86_64",
+                "https://github.com/owner/tool/releases/download/v1/ds-linux-x86_64",
                 b"release-binary".to_vec(),
             );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
@@ -1021,10 +1025,14 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         fixture.client = FakeClient::default()
             .with(
                 "https://api.github.com/repos/cgraf78/ds/releases",
-                release_response("ds", "v1.2.3", "https://example/ds-linux-x86_64"),
+                release_response(
+                    "ds",
+                    "v1.2.3",
+                    "https://github.com/owner/tool/releases/download/v1/ds-linux-x86_64",
+                ),
             )
             .with(
-                "https://example/ds-linux-x86_64",
+                "https://github.com/owner/tool/releases/download/v1/ds-linux-x86_64",
                 b"release-binary".to_vec(),
             );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
@@ -1091,9 +1099,16 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         fixture.client = FakeClient::default()
             .with(
                 "https://api.github.com/repos/cgraf78/ds/releases",
-                release_response("ds", "v1.2.3", "https://example/ds-linux-x86_64.tar.gz"),
+                release_response(
+                    "ds",
+                    "v1.2.3",
+                    "https://github.com/owner/tool/releases/download/v1/ds-linux-x86_64.tar.gz",
+                ),
             )
-            .with("https://example/ds-linux-x86_64.tar.gz", archive);
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/ds-linux-x86_64.tar.gz",
+                archive,
+            );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         manifest::upsert(
             &manifest_path,
@@ -1680,12 +1695,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-linux-x86_64",
-                        "browser_download_url":"https://example/tool-linux-x86_64"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-linux-x86_64", b"binary".to_vec());
+            .with("https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64", b"binary".to_vec());
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -1741,12 +1756,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-linux-x86_64",
-                        "browser_download_url":"https://example/tool-linux-x86_64"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-linux-x86_64", b"binary".to_vec());
+            .with("https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64", b"binary".to_vec());
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -1766,7 +1781,11 @@ version() { printf 'saw-pkg\n'; }
                     "https://api.github.com/repos/owner/tool/releases".to_owned(),
                     Some("ci-token".to_owned())
                 ),
-                ("https://example/tool-linux-x86_64".to_owned(), None)
+                (
+                    "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64"
+                        .to_owned(),
+                    None
+                )
             ]
         );
     }
@@ -1788,11 +1807,15 @@ version() { printf 'saw-pkg\n'; }
                     "assets":[{
                         "url":"https://api.github.com/repos/owner/tool/releases/assets/7",
                         "name":"tool-linux-x86_64",
-                        "browser_download_url":"https://private.example/tool-linux-x86_64"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
                     }]
                 }]"#
                 .to_vec(),
             )
+            // No `.with(...)` for the browser URL: the fake client returns
+            // NotFound for that GET, which mirrors how the real flow falls
+            // through to the authenticated REST asset endpoint when the
+            // signed-URL redirect fails for a private release.
             .with(
                 "https://api.github.com/repos/owner/tool/releases/assets/7",
                 b"binary".to_vec(),
@@ -1816,7 +1839,11 @@ version() { printf 'saw-pkg\n'; }
                     "https://api.github.com/repos/owner/tool/releases".to_owned(),
                     Some("ci-token".to_owned())
                 ),
-                ("https://private.example/tool-linux-x86_64".to_owned(), None),
+                (
+                    "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        .to_owned(),
+                    None,
+                ),
                 (
                     "https://api.github.com/repos/owner/tool/releases/assets/7".to_owned(),
                     Some("ci-token".to_owned())
@@ -1836,19 +1863,40 @@ version() { printf 'saw-pkg\n'; }
             .with_delay(Duration::from_millis(25))
             .with(
                 "https://api.github.com/repos/owner/tool-a/releases",
-                release_response("tool-a", "v1.0.0", "https://example/tool-a-linux-x86_64"),
+                release_response(
+                    "tool-a",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                ),
             )
-            .with("https://example/tool-a-linux-x86_64", b"tool-a".to_vec())
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                b"tool-a".to_vec(),
+            )
             .with(
                 "https://api.github.com/repos/owner/tool-b/releases",
-                release_response("tool-b", "v1.0.0", "https://example/tool-b-linux-x86_64"),
+                release_response(
+                    "tool-b",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                ),
             )
-            .with("https://example/tool-b-linux-x86_64", b"tool-b".to_vec())
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                b"tool-b".to_vec(),
+            )
             .with(
                 "https://api.github.com/repos/owner/tool-c/releases",
-                release_response("tool-c", "v1.0.0", "https://example/tool-c-linux-x86_64"),
+                release_response(
+                    "tool-c",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-c-linux-x86_64",
+                ),
             )
-            .with("https://example/tool-c-linux-x86_64", b"tool-c".to_vec());
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-c-linux-x86_64",
+                b"tool-c".to_vec(),
+            );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -1871,7 +1919,9 @@ version() { printf 'saw-pkg\n'; }
             .count();
         let asset_count = requests
             .iter()
-            .filter(|(url, _)| url.starts_with("https://example/tool-"))
+            .filter(|(url, _)| {
+                url.starts_with("https://github.com/owner/tool/releases/download/v1/tool-")
+            })
             .count();
 
         assert!(!summary.has_errors());
@@ -1901,11 +1951,19 @@ version() { printf 'saw-pkg\n'; }
         fixture.client = FakeClient::default()
             .with(
                 "https://api.github.com/repos/owner/tool-a/releases",
-                release_response("tool-a", "v1.0.0", "https://example/tool-a-linux-x86_64"),
+                release_response(
+                    "tool-a",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                ),
             )
             .with(
                 "https://api.github.com/repos/owner/tool-b/releases",
-                release_response("tool-b", "v2.0.0", "https://example/tool-b-linux-x86_64"),
+                release_response(
+                    "tool-b",
+                    "v2.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                ),
             );
         write_executable(&fixture.roots.bin_dir.join("tool-a"));
         write_executable(&fixture.roots.bin_dir.join("tool-b"));
@@ -1933,7 +1991,9 @@ version() { printf 'saw-pkg\n'; }
             .client
             .requests()
             .iter()
-            .filter(|(url, _)| url.starts_with("https://example/tool-"))
+            .filter(|(url, _)| {
+                url.starts_with("https://github.com/owner/tool/releases/download/v1/tool-")
+            })
             .count();
 
         assert!(!summary.has_errors());
@@ -1960,14 +2020,28 @@ version() { printf 'saw-pkg\n'; }
             .with_delay(Duration::from_millis(5))
             .with(
                 "https://api.github.com/repos/owner/tool-a/releases",
-                release_response("tool-a", "v1.0.0", "https://example/tool-a-linux-x86_64"),
+                release_response(
+                    "tool-a",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                ),
             )
-            .with("https://example/tool-a-linux-x86_64", b"tool-a".to_vec())
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                b"tool-a".to_vec(),
+            )
             .with(
                 "https://api.github.com/repos/owner/tool-b/releases",
-                release_response("tool-b", "v1.0.0", "https://example/tool-b-linux-x86_64"),
+                release_response(
+                    "tool-b",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                ),
             )
-            .with("https://example/tool-b-linux-x86_64", b"tool-b".to_vec());
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                b"tool-b".to_vec(),
+            );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -2000,14 +2074,28 @@ version() { printf 'saw-pkg\n'; }
         fixture.client = FakeClient::default()
             .with(
                 "https://api.github.com/repos/owner/tool-a/releases",
-                release_response("tool-a", "v1.0.0", "https://example/tool-a-linux-x86_64"),
+                release_response(
+                    "tool-a",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                ),
             )
-            .with("https://example/tool-a-linux-x86_64", b"tool-a".to_vec())
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                b"tool-a".to_vec(),
+            )
             .with(
                 "https://api.github.com/repos/owner/tool-b/releases",
-                release_response("tool-b", "v1.0.0", "https://example/tool-b-linux-x86_64"),
+                release_response(
+                    "tool-b",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                ),
             )
-            .with("https://example/tool-b-linux-x86_64", b"tool-b".to_vec());
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                b"tool-b".to_vec(),
+            );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default()
             .with_command("gh")
@@ -2043,12 +2131,20 @@ version() { printf 'saw-pkg\n'; }
                     "https://api.github.com/repos/owner/tool-a/releases".to_owned(),
                     Some("gh-token".to_owned())
                 ),
-                ("https://example/tool-a-linux-x86_64".to_owned(), None),
+                (
+                    "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64"
+                        .to_owned(),
+                    None
+                ),
                 (
                     "https://api.github.com/repos/owner/tool-b/releases".to_owned(),
                     Some("gh-token".to_owned())
                 ),
-                ("https://example/tool-b-linux-x86_64".to_owned(), None),
+                (
+                    "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64"
+                        .to_owned(),
+                    None
+                ),
             ]
         );
     }
@@ -2066,12 +2162,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-linux-x86_64.gz",
-                        "browser_download_url":"https://example/tool-linux-x86_64.gz"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.gz"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-linux-x86_64.gz", gzip(b"binary"));
+            .with("https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.gz", gzip(b"binary"));
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -2112,12 +2208,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-linux-x86_64.bz2",
-                        "browser_download_url":"https://example/tool-linux-x86_64.bz2"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.bz2"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-linux-x86_64.bz2", bzip2(b"binary"));
+            .with("https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.bz2", bzip2(b"binary"));
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -2158,12 +2254,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-linux-x86_64.zst",
-                        "browser_download_url":"https://example/tool-linux-x86_64.zst"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.zst"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-linux-x86_64.zst", zstd(b"binary"));
+            .with("https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.zst", zstd(b"binary"));
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -2331,7 +2427,7 @@ version() { printf 'saw-pkg\n'; }
                 "prerelease":false,
                 "assets":[{
                     "name":"tool-linux-x86_64",
-                    "browser_download_url":"https://example/tool-linux-x86_64"
+                    "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64"
                 }]
             }]"#
             .to_vec(),
@@ -2397,12 +2493,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-linux-x86_64",
-                        "browser_download_url":"https://example/tool-linux-x86_64"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-linux-x86_64", b"new-binary".to_vec());
+            .with("https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64", b"new-binary".to_vec());
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let bin_path = fixture.roots.bin_dir.join("tool");
         write_executable(&bin_path);
@@ -2432,7 +2528,11 @@ version() { printf 'saw-pkg\n'; }
                     "https://api.github.com/repos/owner/tool/releases".to_owned(),
                     None
                 ),
-                ("https://example/tool-linux-x86_64".to_owned(), None)
+                (
+                    "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64"
+                        .to_owned(),
+                    None
+                )
             ]
         );
     }
@@ -2459,12 +2559,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-v1.2.3-linux-x86_64.tar.gz",
-                        "browser_download_url":"https://example/tool-v1.2.3-linux-x86_64.tar.gz"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-v1.2.3-linux-x86_64.tar.gz"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-v1.2.3-linux-x86_64.tar.gz", archive);
+            .with("https://github.com/owner/tool/releases/download/v1/tool-v1.2.3-linux-x86_64.tar.gz", archive);
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -2521,12 +2621,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-v1.2.3-linux-x86_64.tar.xz",
-                        "browser_download_url":"https://example/tool-v1.2.3-linux-x86_64.tar.xz"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-v1.2.3-linux-x86_64.tar.xz"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-v1.2.3-linux-x86_64.tar.xz", archive);
+            .with("https://github.com/owner/tool/releases/download/v1/tool-v1.2.3-linux-x86_64.tar.xz", archive);
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -2579,12 +2679,12 @@ version() { printf 'saw-pkg\n'; }
                     "prerelease":false,
                     "assets":[{
                         "name":"tool-v1.2.3-linux-x86_64.zip",
-                        "browser_download_url":"https://example/tool-v1.2.3-linux-x86_64.zip"
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-v1.2.3-linux-x86_64.zip"
                     }]
                 }]"#
                 .to_vec(),
             )
-            .with("https://example/tool-v1.2.3-linux-x86_64.zip", archive);
+            .with("https://github.com/owner/tool/releases/download/v1/tool-v1.2.3-linux-x86_64.zip", archive);
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 

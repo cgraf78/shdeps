@@ -137,7 +137,7 @@ mod tests {
             ),
             Some(super::Selection {
                 tag: "v1.8.0".to_owned(),
-                url: "https://example/tool-v1.8.0-linux-x86_64.tar.gz".to_owned(),
+                url: "https://github.com/owner/tool/releases/download/v1/tool-v1.8.0-linux-x86_64.tar.gz".to_owned(),
                 api_url: None,
             })
         );
@@ -186,7 +186,7 @@ mod tests {
             )
             .unwrap()
             .url,
-            "https://example/tool-v1.0.0-linux-x86_64-musl.tar.gz"
+            "https://github.com/owner/tool/releases/download/v1/tool-v1.0.0-linux-x86_64-musl.tar.gz"
         );
     }
 
@@ -250,7 +250,7 @@ mod tests {
                 .iter()
                 .map(|name| Asset {
                     name: (*name).to_owned(),
-                    url: format!("https://example/{name}"),
+                    url: format!("https://github.com/owner/tool/releases/download/v1/{name}"),
                     api_url: None,
                 })
                 .collect(),
