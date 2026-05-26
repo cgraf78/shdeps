@@ -317,6 +317,19 @@ fn normalize_ancestor_perms(leaf: &Path) -> Result<()> {
 /// the same path (a real man page, a hand-written completion, etc.). Without
 /// this guard, an `extras` linker would silently delete user files on every
 /// `shdeps update`.
+///
+/// **Residual race window:** the check is `symlink_metadata` followed by an
+/// atomic-rename `symlink` swap (see body comments). If a concurrent process
+/// atomically replaces `target` with a regular file in the narrow window
+/// between the check and the rename, the rename will atomically overwrite
+/// that regular file with the new symlink and this function will return
+/// `Ok(true)`. The user's file content is lost in that case, but the
+/// observation point (`symlink_metadata`) saw a symlink, so the function
+/// behaves as though it operated on a symlink. Callers that need a
+/// stronger guarantee would have to acquire a parent-directory lock
+/// outside this function. The race is bounded by user-write access to the
+/// parent directory, which on the normal `~/.local/share/...` layout is
+/// just the user themselves.
 #[cfg(unix)]
 fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
     use std::os::unix::fs::symlink;
