@@ -205,8 +205,18 @@ pub fn parse_config_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<S
     // in-memory bridge path (used by the Bash wrapper's `__api`
     // callers) gets the same fail-closed treatment as the on-disk
     // loader so a hostile or malformed config can't escape via the
-    // shorter code path.
-    entries.retain(|entry| valid_dep_name(entry_name(entry)));
+    // shorter code path. Emit the same stderr warning as `load_dir`
+    // so a misconfigured dep surfaces with an actionable message
+    // through every entry point, not just the on-disk loader.
+    entries.retain(|entry| {
+        let name = entry_name(entry);
+        if valid_dep_name(name) {
+            true
+        } else {
+            eprintln!("shdeps: skipping config entry with unsafe dep name: {name:?}");
+            false
+        }
+    });
     sort_entries(&mut entries);
     entries
 }

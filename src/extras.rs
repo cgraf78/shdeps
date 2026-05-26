@@ -308,15 +308,22 @@ fn normalize_ancestor_perms(leaf: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replaces a shdeps-owned symlink at `target` pointing to `source`.
+/// Atomically replaces (or creates) the symlink at `target` so that it
+/// points at `source`.
 ///
-/// Returns `Ok(true)` when the link was created or replaced, and `Ok(false)`
-/// when an existing regular file or non-symlink at `target` was preserved.
-/// The ownership rule mirrors `bin_link::one`: shdeps may overwrite its own
-/// symlinks, but must never clobber a user-owned file the user has placed at
-/// the same path (a real man page, a hand-written completion, etc.). Without
-/// this guard, an `extras` linker would silently delete user files on every
-/// `shdeps update`.
+/// Returns `Ok(true)` when the link was created or replaced, and
+/// `Ok(false)` when an existing regular file or non-symlink at
+/// `target` was preserved untouched. The ownership rule: shdeps may
+/// overwrite its own symlinks, but must never clobber a user-owned
+/// file the user has placed at the same path (a real man page, a
+/// hand-written completion, a hand-installed binary). Without this
+/// guard, an `extras` linker or `bin_link::one` would silently delete
+/// user files on every `shdeps update`.
+///
+/// Exposed at `pub(crate)` so `bin_link::one` can share the
+/// staging+rename machinery instead of duplicating its subtle
+/// TOCTOU semantics — the two were the only callers needing this
+/// pattern in the tree.
 ///
 /// **Residual race window — user file CAN BE LOST:** if a concurrent
 /// process atomically replaces `target` with a regular file in the
@@ -324,24 +331,16 @@ fn normalize_ancestor_perms(leaf: &Path) -> Result<()> {
 /// the atomic-rename `symlink` swap, the rename will atomically
 /// overwrite that regular file with the new symlink and this function
 /// will return `Ok(true)`. The user's file content is destroyed. The
-/// `symlink_metadata` check provides the legitimate-no-clobber guarantee
-/// only under the assumption that no other process is racing the same
-/// path; the race outcome IS data loss for the user file, not just
-/// "behaves as if no file were there." Callers that need a stronger
-/// guarantee would have to acquire a parent-directory lock outside
-/// this function. The race is bounded by user-write access to the
-/// parent directory, which on the normal `~/.local/share/...` layout
-/// is just the user themselves, but operators sharing that path with
-/// less-trusted tooling should be aware.
-/// Atomically replaces (or creates) the symlink at `target` so that it
-/// points at `source`. Returns `Ok(true)` when a symlink was created
-/// or replaced, `Ok(false)` when the existing entry is a non-symlink
-/// regular file or directory that must be preserved.
-///
-/// Exposed at `pub(crate)` so `bin_link::one` can share the
-/// staging+rename machinery instead of duplicating its subtle
-/// TOCTOU semantics — the two were the only callers needing this
-/// pattern in the tree.
+/// `symlink_metadata` check provides the legitimate-no-clobber
+/// guarantee only under the assumption that no other process is
+/// racing the same path; the race outcome IS data loss for the user
+/// file, not just "behaves as if no file were there." Callers that
+/// need a stronger guarantee would have to acquire a parent-directory
+/// lock outside this function. The race is bounded by user-write
+/// access to the parent directory, which on the normal
+/// `~/.local/share/...` layout is just the user themselves, but
+/// operators sharing that path with less-trusted tooling should be
+/// aware.
 #[cfg(unix)]
 pub(crate) fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
     use std::os::unix::fs::symlink;
