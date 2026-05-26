@@ -28,6 +28,17 @@ const LOCK_FILE: &str = ".lock";
 /// already holds the lock; the inner acquire returns a no-op guard
 /// instead. Hooks inherit the env var transparently, so any depth of
 /// re-entry from a single top-level `shdeps update` is covered.
+///
+/// **PID binding:** the env var value is the lock holder's PID, and
+/// the reentry guard fires ONLY when the value equals the current
+/// process's PARENT pid (`getppid`). This blocks the trivial-bypass
+/// case where a user (or hostile shell init) does
+/// `export SHDEPS_STATE_LOCK_HELD=1` — that value would not match
+/// `getppid()` for a top-level invocation, so locking is still
+/// enforced. The hook-spawn path in `apply_hook_env` writes the
+/// parent's `std::process::id()` into the env, which matches the
+/// child's `getppid()` exactly when the child was spawned by that
+/// parent.
 pub const REENTRY_ENV: &str = "SHDEPS_STATE_LOCK_HELD";
 
 /// Per-state-directory advisory lock.
@@ -48,12 +59,7 @@ pub struct StateLock {
 impl StateLock {
     /// Acquires the per-state-dir lock, waiting for any current holder.
     pub fn acquire(state_dir: &Path) -> Result<Self> {
-        if std::env::var_os(REENTRY_ENV).is_some() {
-            // Hook re-entry path: the parent shdeps that spawned this
-            // subprocess already holds the flock. Acquiring our own
-            // would deadlock the parent (it is waiting for the hook
-            // to finish, but the hook is waiting for the lock the
-            // parent holds). Return a no-op guard.
+        if is_legitimate_reentry() {
             return Ok(StateLock { file: None });
         }
         acquire_impl(state_dir, LockMode::Blocking)
@@ -66,7 +72,7 @@ impl StateLock {
     /// code should use the blocking variant so concurrent invocations serialize
     /// instead of failing spuriously on a busy developer machine.
     pub fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
-        if std::env::var_os(REENTRY_ENV).is_some() {
+        if is_legitimate_reentry() {
             // Same re-entry rule as `acquire`: report success without
             // actually acquiring so callers gated on `Some(_)` proceed
             // normally.
@@ -249,6 +255,45 @@ const LOCK_UN: i32 = 8;
 #[cfg(unix)]
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
+    fn getppid() -> i32;
+}
+
+/// True when the current process is a legitimate reentry from a lock-holding
+/// parent.
+///
+/// The env var alone is insufficient: a user could `export
+/// SHDEPS_STATE_LOCK_HELD=1` in their shell init and silently disable
+/// the lock for every subsequent invocation. Binding the value to the
+/// parent PID and verifying it against `getppid()` blocks that bypass:
+/// a literal `"1"` value will never match a real PID, and a parent
+/// shdeps that legitimately spawned us put its own `process::id()`
+/// into the env, which matches the child's `getppid()` exactly. The
+/// check is best-effort — on non-Unix targets we conservatively
+/// refuse to treat any env value as a valid reentry signal, so the
+/// caller goes through the real acquire path (which is itself
+/// `cfg(not(unix))` => unsupported error today).
+fn is_legitimate_reentry() -> bool {
+    #[cfg(unix)]
+    {
+        let Some(value) = std::env::var_os(REENTRY_ENV) else {
+            return false;
+        };
+        let Some(value) = value.to_str() else {
+            return false;
+        };
+        let Ok(expected_parent_pid) = value.trim().parse::<i32>() else {
+            return false;
+        };
+        // SAFETY: `getppid` is a non-failing POSIX syscall on all
+        // Unix targets Rust supports. It takes no arguments and
+        // cannot fault.
+        let actual_parent = unsafe { getppid() };
+        actual_parent == expected_parent_pid && actual_parent > 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[cfg(not(unix))]
@@ -288,17 +333,31 @@ mod tests {
         // alive on this thread, a second `acquire` with the env var
         // set must succeed immediately and produce a no-op guard
         // (the existing holder's lock stays unaffected).
+        //
+        // Tests run in parallel within the same process by default,
+        // and `set_var`/`remove_var` mutate process-global state.
+        // The shared `ENV_TEST_LOCK` mutex serializes every test in
+        // this module that touches `REENTRY_ENV` so concurrent test
+        // threads do not see each other's transient values. The
+        // mutex is intentionally module-private; callers in other
+        // modules that need the same guarantee should use a similar
+        // pattern.
+        let _env_guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
         let fixture = Fixture::new("reentry");
         let primary = StateLock::acquire(&fixture.dir).unwrap();
 
-        // Use `temp_env`-style scoped set/unset: we set the env var,
-        // call acquire, and unset before yielding. `set_var` is safe
-        // here because the test is single-threaded and we revert.
-        // SAFETY: `set_var`/`remove_var` are marked unsafe in recent
-        // Rust nightlies but stable as of this writing; single-threaded
-        // test context, value reverted before exit.
+        // The reentry env value MUST equal the current process's
+        // parent PID (`getppid`) for the guard to fire. Use it
+        // directly rather than a literal "1" so the test exercises
+        // the PID-binding contract, not just env-presence.
+        let parent_pid = unsafe { super::getppid() };
+        // SAFETY: env mutation is serialized by `ENV_TEST_LOCK`;
+        // value is reverted before the lock is released.
         unsafe {
-            std::env::set_var(super::REENTRY_ENV, "1");
+            std::env::set_var(super::REENTRY_ENV, parent_pid.to_string());
         }
         let reentry = StateLock::acquire(&fixture.dir).unwrap();
         unsafe {
@@ -316,6 +375,44 @@ mod tests {
         );
         drop(primary);
     }
+
+    #[test]
+    fn reentry_env_with_wrong_pid_does_not_bypass_lock() {
+        // The user-export bypass scenario: a hostile or careless
+        // shell init sets `SHDEPS_STATE_LOCK_HELD=1` (or any value
+        // not equal to `getppid()`). The reentry guard must NOT
+        // fire; locking must still be enforced.
+        let _env_guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let fixture = Fixture::new("reentry-wrong-pid");
+        let primary = StateLock::acquire(&fixture.dir).unwrap();
+
+        // Use a sentinel value that definitely won't match getppid.
+        // Both `1` (a literal that a hostile env-export might use)
+        // and `0` (invalid PID) should be refused.
+        unsafe {
+            std::env::set_var(super::REENTRY_ENV, "1");
+        }
+        let try_acquire_with_wrong_pid = StateLock::try_acquire(&fixture.dir).unwrap();
+        unsafe {
+            std::env::remove_var(super::REENTRY_ENV);
+        }
+
+        assert!(
+            try_acquire_with_wrong_pid.is_none(),
+            "wrong-PID env value must NOT bypass the lock — primary is still held"
+        );
+        drop(primary);
+    }
+
+    /// Process-wide mutex that serializes env-mutating tests in this
+    /// module. Without it, parallel `#[test]` threads racing on
+    /// `SHDEPS_STATE_LOCK_HELD` would see each other's set/unset
+    /// transient values and silently miss the reentry guard for
+    /// unrelated tests.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn temp_nonce_is_unique_across_consecutive_calls() {
