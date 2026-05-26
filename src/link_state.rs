@@ -49,6 +49,14 @@ pub fn read(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Writes tracked links, removing the state file when there is nothing to track.
+///
+/// Returns `InvalidInput` if any link path contains a newline. The
+/// on-disk format is newline-delimited, so embedded newlines would
+/// split a single path into two phantom paths on the next `read` —
+/// silently corrupting cleanup state. POSIX permits newlines in
+/// filenames but no real install method shdeps drives produces them;
+/// surfacing this as an error catches a misbehaving hook or upstream
+/// archive rather than letting the bad data round-trip.
 pub fn write(path: &Path, links: &[PathBuf]) -> Result<()> {
     if links.is_empty() {
         match fs::remove_file(path) {
@@ -60,7 +68,18 @@ pub fn write(path: &Path, links: &[PathBuf]) -> Result<()> {
 
     let mut content = String::new();
     for link in links {
-        content.push_str(&link.to_string_lossy());
+        let display = link.to_string_lossy();
+        if display.contains('\n') || display.contains('\r') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to record link path containing newline: {}",
+                    display.escape_default()
+                ),
+            )
+            .into());
+        }
+        content.push_str(&display);
         content.push('\n');
     }
     state::write_atomic(path, &content)
@@ -128,6 +147,25 @@ mod tests {
         write(&state, &links).unwrap();
 
         assert_eq!(read(&state).unwrap(), links);
+    }
+
+    #[test]
+    fn write_refuses_link_paths_containing_newline() {
+        // The on-disk format is newline-delimited. A path with an
+        // embedded `\n` would survive a write/read cycle as two
+        // phantom paths, silently corrupting prune state — at best
+        // leaving stale symlinks, at worst pointing the cleaner at
+        // an unrelated path. Surface the malformed input here.
+        let dir = temp_dir("newline-link");
+        let state = path(&dir, "tool", Kind::Extras);
+        let bad = dir.join("share/man\ninjected");
+        let err = write(&state, &[bad]).unwrap_err();
+        assert!(
+            err.to_string().contains("newline"),
+            "error should explain the newline rejection: {err}"
+        );
+        // The state file must NOT exist (atomic-write rolled back).
+        assert!(!state.exists());
     }
 
     #[test]
