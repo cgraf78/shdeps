@@ -295,20 +295,34 @@ fn release_install_root_is_owned(path: &Path, public_bin: &Path) -> bool {
 }
 
 fn points_into(path: &Path, root: &Path) -> bool {
-    let resolved = if fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        match fs::read_link(path) {
-            Ok(target) if target.is_absolute() => target,
-            Ok(target) => path.parent().unwrap_or_else(|| Path::new("/")).join(target),
-            Err(_) => return false,
+    // Fully resolve all symlink levels so chained symlinks (e.g. bin/tool ->
+    // share/name/current -> share/name/v1.2.3/bin/tool) are handled correctly.
+    // canonicalize fails for broken symlinks or targets that don't exist yet
+    // during concurrent installs, so fall back to single-level read_link in
+    // that case — the one-level result is still useful for the primary check.
+    let resolved = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            if !fs::symlink_metadata(path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                path.to_path_buf()
+            } else {
+                match fs::read_link(path) {
+                    Ok(target) if target.is_absolute() => target,
+                    Ok(target) => path.parent().unwrap_or_else(|| Path::new("/")).join(target),
+                    Err(_) => return false,
+                }
+            }
         }
-    } else {
-        path.to_path_buf()
     };
 
-    resolved.starts_with(root)
+    // Canonicalize root as well — intermediate path components (e.g. a home
+    // directory exposed through a /home -> /usr/home symlink) would otherwise
+    // make the starts_with prefix check fail even for a correct containment.
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    resolved.starts_with(canonical_root)
 }
 
 fn unlink_snapshot(
@@ -385,4 +399,73 @@ fn remove_empty_install_parents(path: &Path, install_dir: &Path) -> Result<()> {
         parent = dir.parent();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    use super::points_into;
+
+    #[test]
+    #[cfg(unix)]
+    fn points_into_follows_direct_symlink() {
+        let dir = temp_dir("direct");
+        let target = dir.join("root/bin/tool");
+        let link = dir.join("bin/tool");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"binary").unwrap();
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(points_into(&link, &dir.join("root")));
+        assert!(!points_into(&link, &dir.join("other")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn points_into_follows_chained_symlinks() {
+        // Two-hop chain: bin/tool -> middle/tool -> root/bin/tool. The old
+        // single-level read_link would resolve to `middle/tool` and then check
+        // starts_with("root"), which is false — incorrectly treating the archive
+        // install root as unowned and deleting it during a method transition.
+        let dir = temp_dir("chained");
+        let final_target = dir.join("root/bin/tool");
+        let intermediate = dir.join("middle/tool");
+        let link = dir.join("bin/tool");
+        fs::create_dir_all(final_target.parent().unwrap()).unwrap();
+        fs::write(&final_target, b"binary").unwrap();
+        fs::create_dir_all(intermediate.parent().unwrap()).unwrap();
+        symlink(&final_target, &intermediate).unwrap();
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&intermediate, &link).unwrap();
+
+        assert!(points_into(&link, &dir.join("root")));
+        assert!(!points_into(&link, &dir.join("middle")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn points_into_returns_false_for_broken_symlink() {
+        let dir = temp_dir("broken");
+        let link = dir.join("bin/tool");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(dir.join("nonexistent"), &link).unwrap();
+
+        assert!(!points_into(&link, &dir.join("root")));
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shdeps-transition-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }

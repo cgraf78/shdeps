@@ -301,7 +301,13 @@ fn install_archive(
     // Release archives commonly carry completions or man pages beside the
     // binary. Reusing the shared extras linker keeps those secondary artifacts
     // tracked and prunable exactly like repo-based installs.
-    extras::link(state_dir, install_base, name, &install_dir)?;
+    //
+    // Extras linking is best-effort: a failure here (rare permission or
+    // state-dir error) must not undo a successfully installed binary. The
+    // binary symlink at `public` is already live; returning Err now would leave
+    // the dep installed but with no manifest entry, causing a spurious
+    // reinstall on every future `shdeps update`.
+    let _ = extras::link(state_dir, install_base, name, &install_dir);
     Ok(public.to_path_buf())
 }
 
@@ -595,6 +601,41 @@ mod tests {
         assert_eq!(
             fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
             dir.join("share/owner/tool/share/man/man1/tool.1")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_succeeds_even_when_extras_link_fails() {
+        // Place a regular file where state_dir should be. link_state operations
+        // expect a directory and fail with ENOTDIR when they try to read or
+        // write link-state files beneath it. This simulates the unlikely but
+        // possible case where state writes fail (permissions, disk full, etc.)
+        // after the binary has already been extracted and symlinked. The install
+        // must still return Ok so the caller can write the manifest entry and
+        // avoid a spurious reinstall on the next update.
+        let dir = temp_dir("archive-extras-fail");
+        let bytes = tar_gz(&[
+            ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
+        ]);
+        let state_as_file = dir.join("state");
+        fs::write(&state_as_file, "blocker").unwrap();
+
+        let public = super::install_tar_gz(
+            &state_as_file,
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(public, dir.join("bin/tool"));
+        assert_eq!(
+            fs::read_link(dir.join("bin/tool")).unwrap(),
+            dir.join("share/owner/tool/bin/tool")
         );
     }
 

@@ -134,8 +134,14 @@ pub fn remove_stamps(state_dir: &Path, name: &str, summary: &mut Summary) -> Res
         let Some(file_name) = path.file_name().and_then(|file_name| file_name.to_str()) else {
             continue;
         };
-        let is_stamp =
-            file_name.starts_with(&format!("{base_name}.")) && file_name.ends_with(".stamp");
+        // All known stamp kinds are single words without dots (repo, release,
+        // github, cargo, etc.). Requiring a dot-free middle prevents
+        // accidentally matching stamps for a dep whose name starts with the
+        // same prefix, e.g. `tool.extra.repo.stamp` when base_name is `tool`.
+        let is_stamp = file_name
+            .strip_prefix(&format!("{base_name}."))
+            .and_then(|s| s.strip_suffix(".stamp"))
+            .is_some_and(|kind| !kind.contains('.'));
         let is_rev = file_name == format!("{base_name}.rev");
         if is_stamp || is_rev {
             remove_file_if_present(&path, summary)?;
@@ -229,7 +235,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    use super::{Roots, method_transitions, remove_builtin};
+    use super::{Roots, Summary, method_transitions, remove_builtin, remove_stamps};
     use crate::config::Entry;
     use crate::link_state::{self, Kind};
     use crate::manifest::{Manifest, ManifestEntry};
@@ -361,6 +367,36 @@ mod tests {
                 .state_dir
                 .join("custom-tool.custom.stamp")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn remove_stamps_does_not_delete_stamps_for_dep_with_matching_name_prefix() {
+        // Two deps in the same namespace directory — `owner/tool` and
+        // `owner/tool.extra` — share the `tool.` filename prefix. Pruning one
+        // must not delete the other's stamps.
+        let fixture = Fixture::new("stamp-prefix");
+        fixture.write_state("owner/tool.repo.stamp", "1\n");
+        fixture.write_state("owner/tool.extra.repo.stamp", "1\n");
+
+        let mut summary = Summary::default();
+        remove_stamps(&fixture.roots.state_dir, "owner/tool", &mut summary).unwrap();
+
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join("owner/tool.repo.stamp")
+                .exists(),
+            "tool's own stamp should be removed"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join("owner/tool.extra.repo.stamp")
+                .exists(),
+            "tool.extra's stamp must not be removed by pruning tool"
         );
     }
 
