@@ -152,6 +152,22 @@ _curl_get_release_asset() {
   # Browser URL failed; try GitHub's REST asset endpoint with the
   # private-asset headers, matching GitHub's documented private
   # release download flow.
+  #
+  # Validate the api_url is actually a GitHub API host before
+  # attaching the bearer token. The Rust `download_asset` enforces
+  # the same prefix check via `is_safe_api_asset_url`; without
+  # mirroring it here, a caller (or a tampered release JSON) that
+  # supplied a non-GitHub `api_url` would leak the bearer token to
+  # that host. Bash bootstrap inputs are normally constructed from
+  # the release JSON shdeps just verified, but defense-in-depth
+  # keeps the two implementations consistent.
+  case "$api_url" in
+    https://api.github.com/*) ;;
+    *)
+      _error "refusing authenticated download from non-GitHub API host: $api_url"
+      return 1
+      ;;
+  esac
   curl -fsSL -A shdeps \
     -H "Accept: application/octet-stream" \
     -H "Authorization: Bearer $token" \

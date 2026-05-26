@@ -78,8 +78,19 @@ _shdepsw_resolve_binary() {
   # leak into the caller. Operators who genuinely want that fallback
   # opt in with `SHDEPS_ALLOW_PATH_FALLBACK=1`.
   if [[ "${SHDEPS_ALLOW_PATH_FALLBACK:-0}" == "1" ]]; then
-    command -v shdeps 2>/dev/null
+    if candidate=$(command -v shdeps 2>/dev/null); then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
   fi
+
+  # No candidate found by any path. Return non-zero explicitly so the
+  # caller's `|| {}` source-fail branch fires instead of treating a
+  # successful-empty-output as a usable binary. Without this explicit
+  # return, the function would inherit the exit code of the previous
+  # if/test (often 0 when the opt-in branch is not taken), and
+  # `_SHDEPSW_BIN` would silently become an empty string.
+  return 1
 }
 
 _SHDEPSW_BIN="$(_shdepsw_resolve_binary)" || {

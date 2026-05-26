@@ -310,12 +310,20 @@ _isolation_dir=$(mktemp -d)
 cp "$_repo_root/shdeps.sh" "$_isolation_dir/shdeps.sh"
 
 _path_default=$(
+  # Use newline-separated commands so the echo runs regardless of
+  # source's exit code. The earlier audit flagged a hypothetical
+  # `&&` form that would silently skip the echo; this form is robust
+  # against that. Also capture the source exit code separately so we
+  # can assert source actually FAILED (a vacuous pass would be the
+  # source succeeding with an empty `_SHDEPSW_BIN`).
   PATH="$_path_dir:/usr/bin:/bin" bash -c "
     source '$_isolation_dir/shdeps.sh' 2>/dev/null
-    echo \"BIN=\${_SHDEPSW_BIN:-NONE}\"
+    _src_rc=\$?
+    echo \"BIN=\${_SHDEPSW_BIN:-NONE} SRC_RC=\$_src_rc\"
   " 2>/dev/null
 )
-_assert_eq "PATH fallback off by default" "BIN=NONE" "$_path_default"
+_assert_eq "PATH fallback off by default: source fails AND BIN unset" \
+  "BIN=NONE SRC_RC=1" "$_path_default"
 
 _path_opted_in=$(
   PATH="$_path_dir:/usr/bin:/bin" SHDEPS_ALLOW_PATH_FALLBACK=1 \
