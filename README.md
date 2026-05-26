@@ -24,6 +24,42 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 - **Config composition** — split deps across multiple `*.conf` files in a config directory
 - **Usable from CLI, Bash, or Rust** — Rust `shdeps` CLI, stable Bash functions via `source shdeps.sh`, and a documented Rust crate API
 
+## How shdeps Compares
+
+shdeps occupies a deliberately narrow niche: **"the set of CLI tools I want
+on every box I touch, installed via whatever native means is best on that
+box, and sourceable from my shell init."** It is not a polyglot runtime
+version manager and does not try to be one. If you're choosing between
+shdeps and one of the established tools below, this section should help.
+
+| Tool         | Primary purpose                                       | Per-project versions | Cross-OS package abstraction       | Sourceable from shell init                |
+| ------------ | ----------------------------------------------------- | -------------------- | ---------------------------------- | ----------------------------------------- |
+| **shdeps**   | One CLI install list across all machines              | No                   | Yes (brew/apt/dnf/pacman/zypper/apk + GitHub) | Yes (`source shdeps.sh` exposes `shdeps_*` Bash API) |
+| **mise**     | Polyglot language-runtime + tool version manager      | Yes (per directory)  | Mostly via plugins                 | Yes (shell activation)                    |
+| **asdf**     | Polyglot language-runtime version manager (asdf protocol; mise is the modern asdf-compatible alternative) | Yes         | Via plugins                        | Yes (shell activation)                    |
+| **aqua**     | Declarative GitHub Releases-focused CLI installer     | Yes (per directory)  | No (downloads release archives)    | Yes (shell activation)                    |
+| **chezmoi**  | Dotfile manager (with external-binary support)        | No                   | No (basic external download)       | N/A (manages dotfiles, not shell API)     |
+| **Homebrew** | Native package manager (macOS-first)                  | No                   | macOS-only (Linuxbrew variant)     | No (only PATH)                            |
+| **Nix / Home Manager** | Hermetic, reproducible package manager      | Implicit (per generation) | Yes, hermetic                  | Yes (after substantial setup)             |
+
+### Pick shdeps when
+
+- You want **one config file** that says "install `jq`, `fzf`, `ripgrep`, `neovim` everywhere" and shdeps figures out whether that means `brew`, `apt`, a GitHub release archive, or a Cargo crate on each host.
+- You write Bash dotfiles or hooks and want `source shdeps.sh` to give you `shdeps_update`, `shdeps_dep_source`, `shdeps_platform`, `shdeps_pkg_mgr`, etc. — so your `.bashrc` can both *install* and *use* tools without forking shells.
+- You're comfortable with "latest stable" semantics. shdeps does not pin tool versions, and that is a deliberate design choice — pinning would conflict with `pkg`-installed tools whose version is the distro's call.
+- You want custom escape hatches: any tool that doesn't fit `pkg`/`github*`/`cargo`/`go`/`uv`/`npm` gets a `custom` method with a 4-function Bash hook (`exists`/`version`/`install`/`uninstall`) and shdeps treats it as a first-class entry.
+
+### Pick something else when
+
+- You need **per-project tool versions** (Node 18 in repo A, Node 20 in repo B). Use mise or asdf — that's their job.
+- You want **hermetic, byte-reproducible** installs across machines. Use Nix.
+- You want a **GitHub Releases-first registry** with curated install recipes shared across users. Use aqua.
+- Your dotfile workflow is dominated by templating, encryption, or multi-host file rewriting, and tool install is incidental. Use chezmoi (and call `shdeps update` from a chezmoi script if you still want the shdeps install model).
+
+### Coexistence
+
+shdeps does not own `$PATH` or shadow other tools. It is designed to run alongside mise, Homebrew, or asdf. Each entry in your config explicitly names its install method, so shdeps only touches what you told it to manage; everything else stays under whichever tool owns it. The `pkg` method defers to the system package manager and skips entries that are already present, so it never re-installs what your distro (or Homebrew, etc.) already provides.
+
 ## Quick Start
 
 ```bash
