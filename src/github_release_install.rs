@@ -290,8 +290,52 @@ fn install_archive(
     if let Some(parent) = install_dir.parent() {
         fs::create_dir_all(parent)?;
     }
-    remove_any(&install_dir)?;
-    fs::rename(&content_root, &install_dir)?;
+
+    // Backup/switch/rollback pattern (mirrors `release_activate::activate`):
+    // the previous `remove_any(&install_dir)` immediately followed by
+    // `rename(&content_root, &install_dir)` had a window where, if the
+    // rename failed for any reason (transient FS error, permissions, a
+    // stale file handle preventing the parent's directory entry from being
+    // claimed), the existing install was already gone and the public
+    // symlink left pointing at a now-missing path. Atomically rename the
+    // old install to a sibling backup first, attempt the switch, and
+    // restore the backup if the switch fails. Both renames stay on the
+    // same filesystem (sibling paths) so they're atomic on POSIX.
+    let backup = install_backup_path(&install_dir);
+    let had_existing = install_dir.exists();
+    if had_existing {
+        fs::rename(&install_dir, &backup)?;
+    }
+    if let Err(switch) = fs::rename(&content_root, &install_dir) {
+        if had_existing {
+            if let Err(rollback) = fs::rename(&backup, &install_dir) {
+                // Two failures in a row: the live-switch and the
+                // restore both failed. Leave both `content_root` and
+                // `backup` on disk so the user can inspect what's
+                // there rather than silently discarding evidence; the
+                // returned error carries the switch error (the
+                // primary cause), with the rollback error appended.
+                return Err(std::io::Error::other(format!(
+                    "archive install switch failed and backup restore also failed: \
+                     switch={switch}, rollback={rollback}"
+                ))
+                .into());
+            }
+        }
+        // Switch failed but previous install (if any) is restored.
+        // Clean up the staged content directory so retries don't
+        // accumulate `.tmp.<pid>`-style stragglers next to the live
+        // install — same hygiene `release_activate` applies.
+        let _ = fs::remove_dir_all(&content_root);
+        return Err(switch.into());
+    }
+    if had_existing {
+        // Live install successfully switched. Backup cleanup is
+        // best-effort so a transient file handle or an antivirus
+        // scanner does not turn a successful install into a rollback
+        // of a good install.
+        let _ = fs::remove_dir_all(&backup);
+    }
     if content_root != extract_dir {
         remove_any(&extract_dir)?;
     }
@@ -329,6 +373,24 @@ fn temp_install_path(target: &Path) -> PathBuf {
         .unwrap_or("release-install");
     tmp.set_file_name(format!(".{name}.tmp.{}", std::process::id()));
     tmp
+}
+
+/// Sibling path used to atomically park the prior install_dir while a
+/// new archive is being renamed into place. Same shape as
+/// `release_activate::backup_path` — kept local to avoid cross-module
+/// dependency on a 3-line helper, but the structural intent is
+/// identical (sibling path on the same filesystem so the rename is
+/// atomic on POSIX, with `pid + nanos` to avoid collision between
+/// concurrent installs targeting the same parent dir).
+fn install_backup_path(install_dir: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    install_dir.with_extension(format!(
+        "shdeps-archive-backup-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 fn content_root(extract_dir: &Path) -> Result<PathBuf> {
@@ -636,6 +698,68 @@ mod tests {
         assert_eq!(
             fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
             dir.join("share/owner/tool/share/man/man1/tool.1")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_uses_backup_swap_and_cleans_up() {
+        // Regression for the iteration-3 codex finding that
+        // `install_archive` used to `remove_any(install_dir)` BEFORE
+        // the final rename, leaving a window where a failed rename
+        // would strand the user with no install at all. The new flow
+        // moves the existing install to a sibling backup, renames the
+        // staged content into place, and only then removes the
+        // backup. The happy-path observable is: existing install is
+        // replaced AND no `.<name>.shdeps-archive-backup-*` sibling
+        // remains afterward. A failure-path rollback test would
+        // require simulating a rename(2) failure mid-flow, which
+        // needs platform tricks beyond what we can portably do here;
+        // the no-leftover assertion catches the most common
+        // backup-mechanism regression (forgetting to clean up).
+        let dir = temp_dir("archive-install-backup-swap");
+        let bytes_v1 = tar_gz(&[("tool-v1.0/bin/tool", b"v1".as_slice(), 0o755)]);
+        let bytes_v2 = tar_gz(&[("tool-v2.0/bin/tool", b"v2".as_slice(), 0o755)]);
+        let public = dir.join("bin/tool");
+
+        // First install establishes a baseline so the second install
+        // exercises the backup-then-replace branch (not the
+        // had_existing=false branch).
+        super::install_tar_gz_to(
+            &dir.join("state"),
+            &dir.join("share"),
+            &public,
+            "owner/tool",
+            "tool",
+            &bytes_v1,
+        )
+        .unwrap();
+
+        super::install_tar_gz_to(
+            &dir.join("state"),
+            &dir.join("share"),
+            &public,
+            "owner/tool",
+            "tool",
+            &bytes_v2,
+        )
+        .unwrap();
+
+        // The new install is live.
+        assert_eq!(fs::read(public.canonicalize().unwrap()).unwrap(), b"v2");
+
+        // And no backup directory is left next to the live install.
+        // The backup name pattern is `.<install_dir>.shdeps-archive-
+        // backup-<pid>-<nanos>` placed as a sibling of `install_dir`.
+        let install_parent = dir.join("share/owner");
+        let backups: Vec<_> = fs::read_dir(&install_parent)
+            .unwrap()
+            .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+            .filter(|n| n.contains(".shdeps-archive-backup-"))
+            .collect();
+        assert!(
+            backups.is_empty(),
+            "no backup dir should remain after successful install, found: {backups:?}"
         );
     }
 
