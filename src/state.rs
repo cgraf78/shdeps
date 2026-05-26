@@ -39,6 +39,25 @@ const LOCK_FILE: &str = ".lock";
 /// parent's `std::process::id()` into the env, which matches the
 /// child's `getppid()` exactly when the child was spawned by that
 /// parent.
+///
+/// **Threat model — what this guard does NOT defend against:**
+/// PID matching is forgeable. A wrapper script that exports
+/// `SHDEPS_STATE_LOCK_HELD=$$` before launching shdeps will pass
+/// the reentry check (the value matches the child's real `getppid()`)
+/// and bypass the flock. This is a deliberate trade-off: the guard
+/// is a *deadlock prevention* mechanism for legitimate hook
+/// recursion, not a security boundary. The concurrency invariants
+/// the lock protects (manifest, link-state, stamp, cache writes)
+/// are corrupted only by interleaved writers from the same user
+/// account, and that user already has full ability to inspect or
+/// break their own state. A truly unforgeable signal would require
+/// a per-lock nonce written to a state-dir file (so the env value
+/// is verified against state only the lock owner could have
+/// written) or fd inheritance of the lock itself; both are larger
+/// refactors than the deadlock-prevention contract warrants.
+/// Operators sharing a `SHDEPS_STATE_DIR` between less-trusted
+/// tooling and shdeps invocations should rely on filesystem
+/// permissions and not on this env var as a trust boundary.
 pub const REENTRY_ENV: &str = "SHDEPS_STATE_LOCK_HELD";
 
 /// Per-state-directory advisory lock.
