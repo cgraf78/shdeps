@@ -40,24 +40,8 @@ const LOCK_FILE: &str = ".lock";
 /// child's `getppid()` exactly when the child was spawned by that
 /// parent.
 ///
-/// **Threat model — what this guard does NOT defend against:**
-/// PID matching is forgeable. A wrapper script that exports
-/// `SHDEPS_STATE_LOCK_HELD=$$` before launching shdeps will pass
-/// the reentry check (the value matches the child's real `getppid()`)
-/// and bypass the flock. This is a deliberate trade-off: the guard
-/// is a *deadlock prevention* mechanism for legitimate hook
-/// recursion, not a security boundary. The concurrency invariants
-/// the lock protects (manifest, link-state, stamp, cache writes)
-/// are corrupted only by interleaved writers from the same user
-/// account, and that user already has full ability to inspect or
-/// break their own state. A truly unforgeable signal would require
-/// a per-lock nonce written to a state-dir file (so the env value
-/// is verified against state only the lock owner could have
-/// written) or fd inheritance of the lock itself; both are larger
-/// refactors than the deadlock-prevention contract warrants.
-/// Operators sharing a `SHDEPS_STATE_DIR` between less-trusted
-/// tooling and shdeps invocations should rely on filesystem
-/// permissions and not on this env var as a trust boundary.
+/// See `StateLock`'s docstring for the threat model — in particular
+/// what this PID-binding does NOT defend against.
 pub const REENTRY_ENV: &str = "SHDEPS_STATE_LOCK_HELD";
 
 /// Per-state-directory advisory lock.
@@ -93,6 +77,25 @@ pub const REENTRY_ENV: &str = "SHDEPS_STATE_LOCK_HELD";
 /// will block on the parent's flock. The `+` prefix is avoided
 /// because rustdoc parses it as a Markdown list marker and triggers
 /// `clippy::doc_lazy_continuation` on the next line.
+///
+/// **Threat model — what this guard does NOT defend against:**
+/// PID matching is forgeable. A wrapper script that exports
+/// `SHDEPS_STATE_LOCK_HELD=$$` before launching shdeps will pass
+/// the reentry check (the value matches the child's real `getppid()`)
+/// and bypass the flock. This is a deliberate trade-off: the guard
+/// is a *deadlock prevention* mechanism for legitimate hook
+/// recursion, not a security boundary. The concurrency invariants
+/// the lock protects (manifest, link-state, stamp, cache writes)
+/// are corrupted only by interleaved writers from the same user
+/// account, and that user already has full ability to inspect or
+/// break their own state. A truly unforgeable signal would require
+/// a per-lock nonce written to a state-dir file (so the env value
+/// is verified against state only the lock owner could have
+/// written) or fd inheritance of the lock itself; both are larger
+/// refactors than the deadlock-prevention contract warrants.
+/// Operators sharing a `SHDEPS_STATE_DIR` between less-trusted
+/// tooling and shdeps invocations should rely on filesystem
+/// permissions and not on this env var as a trust boundary.
 #[derive(Debug)]
 pub struct StateLock {
     /// `None` means this is a re-entry no-op guard: a parent shdeps
