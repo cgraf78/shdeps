@@ -75,7 +75,15 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
         unsafe {
             command.pre_exec(|| {
                 if libc_setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
+                    let err = std::io::Error::last_os_error();
+                    // EPERM means the caller is already a process-group
+                    // leader, so setsid refuses — but the child inherits
+                    // that leader status, which is exactly the state we
+                    // wanted (kill(-pgid) will reach the whole group).
+                    // Any other errno genuinely blocks detachment.
+                    if err.raw_os_error() != Some(EPERM) {
+                        return Err(err);
+                    }
                 }
                 Ok(())
             });
@@ -144,6 +152,13 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
 
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
+
+// EPERM == 1 on every Unix this crate is built for (Linux, macOS, and
+// the BSDs all derive their errno table from the same historical base).
+// We avoid pulling in `libc` as a dependency just to surface a single
+// constant, mirroring the inline `extern "C"` declarations below.
+#[cfg(unix)]
+const EPERM: i32 = 1;
 
 #[cfg(unix)]
 unsafe extern "C" {

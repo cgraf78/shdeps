@@ -586,6 +586,13 @@ mod tests {
         // would have removed that bystander on transition. After the
         // fix, the shared helper rejects out-of-tree paths and the
         // bystander survives.
+        //
+        // Beyond the bystander assertion, this test also verifies that
+        // the *rest* of the `github:repo` cleanup branch still ran —
+        // the install-path guard must not short-circuit the legacy
+        // public-bin removal or stamp cleanup. A regression that
+        // bailed early on tampered paths would silently leave stale
+        // bins and stamps behind on every transition.
         let dir = temp_dir("tampered-install-path");
         let bystander = dir.join("bystander");
         fs::create_dir_all(&bystander).unwrap();
@@ -600,6 +607,22 @@ mod tests {
             bin_dir: dir.join("bin"),
             home: dir.join("home"),
         };
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        // Per `cleanup_snapshot` for `github:repo`, the legacy public
+        // bin lives at `<bin_dir>/<short_name>`. `short_name` of
+        // `owner/tool` is `tool`, so seed that file and expect it to
+        // be removed once cleanup runs to completion.
+        let legacy_bin = roots.bin_dir.join("tool");
+        fs::write(&legacy_bin, "old-bin").unwrap();
+
+        // Stamps live next to the owner directory: `remove_stamps`
+        // resolves `state_dir/<name>.parent()` → `state_dir/owner`
+        // and removes `<base_name>.<kind>.stamp` files there.
+        let stamp_dir = roots.state_dir.join("owner");
+        fs::create_dir_all(&stamp_dir).unwrap();
+        let stamp_file = stamp_dir.join("tool.repo.stamp");
+        fs::write(&stamp_file, "stamp").unwrap();
+
         let transition = Transition {
             old: ManifestEntry::new(
                 "owner/tool",
@@ -624,6 +647,24 @@ mod tests {
         assert!(
             bystander.join("data").exists(),
             "bystander contents must be preserved"
+        );
+        // `legacy_bin` is `<bin_dir>/tool`, which equals
+        // `preserve_paths` for the new `github:release` entry
+        // (`bin_dir/<entry.cmd>` = `bin_dir/tool`). The preserve set
+        // protects this file — that's the correct behavior because
+        // the new method's freshly installed bin lives at that path.
+        // So the file should remain, untouched, after cleanup.
+        assert!(
+            legacy_bin.exists(),
+            "preserved public bin must not be removed during transition"
+        );
+        // The stamp belongs to the old method and is not preserved;
+        // it must be removed by `remove_stamps`. If a regression
+        // short-circuited the cleanup branch after the install_path
+        // guard, this assertion would catch it.
+        assert!(
+            !stamp_file.exists(),
+            "old-method stamp must be removed even when install_path is tampered"
         );
     }
 
