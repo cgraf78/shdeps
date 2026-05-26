@@ -126,7 +126,17 @@ fn install_existing(
         // hard build break — the more descriptive detail string is the
         // operator-visible signal.
         let post_status = git_status(context.runner, install_dir);
-        let detail = if post_status.dirty {
+        // Three-way bucketing: a dirty working tree is the
+        // user-recoverable case; a confirmed-clean tree with a pull
+        // failure points at a network/no-fast-forward issue; an
+        // unreported status (git command itself failed) means we
+        // genuinely cannot classify and must say so rather than
+        // guess. Lumping unreported into "no fast-forward" hid
+        // broken-index/missing-git failures behind a misleading
+        // label.
+        let detail = if !post_status.reported {
+            "pull failed (status unavailable)".to_owned()
+        } else if post_status.dirty {
             "pull failed (dirty working tree)".to_owned()
         } else {
             "pull failed (no fast-forward)".to_owned()
@@ -283,6 +293,11 @@ fn record_success(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GitStatus {
     dirty: bool,
+    /// Whether `git status` itself reported successfully. `false` means
+    /// the command failed (broken git index, missing git binary, non-git
+    /// directory, etc.) so `dirty` is just the default and callers
+    /// should not treat the value as authoritative.
+    reported: bool,
 }
 
 impl GitStatus {
@@ -299,9 +314,18 @@ fn git_status(runner: &impl Runner, dir: &Path) -> GitStatus {
     );
     // Bash captures `git status ... || true`, so a non-git directory or broken
     // git command behaves like an empty status string. Preserve that permissive
-    // edge case because local clone detection is intentionally just `-d`.
-    GitStatus {
-        dirty: output.is_some_and(|output| !output.stdout.is_empty()),
+    // edge case because local clone detection is intentionally just `-d` — but
+    // also record whether the command actually reported so callers can tell
+    // "clean tree" apart from "couldn't ask".
+    match output {
+        Some(output) => GitStatus {
+            dirty: !output.stdout.is_empty(),
+            reported: true,
+        },
+        None => GitStatus {
+            dirty: false,
+            reported: false,
+        },
     }
 }
 
