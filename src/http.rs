@@ -31,6 +31,20 @@ impl Client for Curl {
     }
 
     fn get_github_asset(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+        // Defense in depth: the upstream `github::download_asset` already
+        // validates the API URL host before reaching here, but this is the
+        // only place where the bearer token actually goes on the wire as
+        // an Authorization header. Refusing non-api.github.com URLs here
+        // means a future caller that skips the github.rs guard cannot
+        // accidentally leak the token to a third-party host. Returning an
+        // `InvalidInput` error before spawning curl also avoids any
+        // exposure of the token to the child process environment.
+        if !is_github_api_url(url) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing authenticated GitHub asset download from non-API host: {url}"),
+            ));
+        }
         self.get_with_accept(url, token, GithubAccept::OctetStream)
     }
 }
@@ -137,6 +151,20 @@ fn curl_quote(value: &str) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{GithubAccept, curl_config};
+
+    #[test]
+    fn curl_get_github_asset_refuses_non_api_github_host() {
+        // Defense in depth: if a future caller forgets to validate
+        // `api_url` before reaching `get_github_asset`, the http layer
+        // itself must refuse the request before the bearer can ever
+        // reach the child curl process.
+        use super::{Client, Curl};
+        let curl = Curl;
+        let error = curl
+            .get_github_asset("https://attacker.example/api/assets/1", Some("token"))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn curl_config_keeps_api_token_in_stdin_config_not_process_args() {
