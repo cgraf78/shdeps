@@ -114,13 +114,30 @@ fn install_existing(
         // Bash treats an existing clone pull failure as a warning, not an
         // install failure: the previous checkout is still usable, and hooks
         // should not run because no successful change happened.
+        //
+        // The pre-fix code reported every pull failure as the opaque string
+        // `"update failed"`, which gave operators no way to distinguish a
+        // transient network outage from a managed clone that diverged
+        // because someone edited files inside it. Run `git status` to
+        // bucket the failure: a dirty working tree is a user-recoverable
+        // situation, anything else is most likely a network/fast-forward
+        // problem that the next run will retry. Keep `failed: false` so a
+        // shdeps update does not turn a transient network failure into a
+        // hard build break — the more descriptive detail string is the
+        // operator-visible signal.
+        let post_status = git_status(context.runner, install_dir);
+        let detail = if post_status.dirty {
+            "pull failed (dirty working tree)".to_owned()
+        } else {
+            "pull failed (no fast-forward)".to_owned()
+        };
         secure_managed_clone_permissions(install_dir)?;
         record_success(entry, context, install_dir)?;
         return Ok(Item {
             name: entry.name.clone(),
             changed: false,
             failed: false,
-            detail: "update failed".to_owned(),
+            detail,
         });
     }
 
