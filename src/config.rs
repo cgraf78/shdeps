@@ -163,6 +163,14 @@ pub fn parse_config_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<S
         .flat_map(|text| text.lines().filter_map(parse_config_line))
         .collect::<Vec<_>>();
     let mut entries = dedupe_last_wins(entries);
+    // Match `load_dir`: drop entries with unsafe dep names BEFORE any
+    // downstream caller starts joining the name into managed paths.
+    // See `valid_dep_name` for the full list of rejected forms. The
+    // in-memory bridge path (used by the Bash wrapper's `__api`
+    // callers) gets the same fail-closed treatment as the on-disk
+    // loader so a hostile or malformed config can't escape via the
+    // shorter code path.
+    entries.retain(|entry| valid_dep_name(entry_name(entry)));
     sort_entries(&mut entries);
     entries
 }
@@ -220,18 +228,58 @@ pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
     // (lex-order) definition rather than two adjacent entries that would
     // both get processed by `update`.
     let mut entries = dedupe_last_wins(entries);
+    // Drop entries whose dep name is not safe to use as a managed path
+    // suffix BEFORE downstream callers (update, prune, status) start
+    // joining the name into `install_dir` / `state_dir` / `hooks_dir`.
+    // Failing closed at the loader boundary keeps every consumer from
+    // having to repeat the same validation. A noisy stderr warning is
+    // preferable to silent drop so misconfigurations surface during
+    // the next interactive `shdeps update`.
+    entries.retain(|entry| {
+        let name = entry_name(entry);
+        if valid_dep_name(name) {
+            true
+        } else {
+            eprintln!("shdeps: skipping config entry with unsafe dep name: {name:?}");
+            false
+        }
+    });
     sort_entries(&mut entries);
     Ok(entries)
 }
 
 /// Returns whether a dependency name is safe to use as a managed path suffix.
+///
+/// The dependency name is concatenated into managed paths under
+/// `install_dir`, `state_dir`, and `hooks_dir` via `Path::join`. Path
+/// components that collapse to an ancestor at runtime would let a
+/// hostile or malformed name target the entire managed tree:
+///
+/// - `..` components escape upward (already rejected).
+/// - `.` components resolve to the *parent* under `Path::join`, so a
+///   name like `.` makes `install_dir.join(".") == install_dir` and
+///   the subsequent `remove_any(&install_dir.join(name))` in the
+///   update/prune cleanup paths would wipe the entire install root.
+///   `owner/.` collapses to the `owner/` namespace directory, which
+///   would wipe sibling deps under the same owner. Reject both.
+/// - Empty path components (from leading `/`, trailing `/`, or `//`)
+///   produce the same collapse: `install_dir.join("owner/")` keeps
+///   only the `owner` segment and the trailing-slash form fails the
+///   "this is a real, distinct dep namespace" intent the name is
+///   supposed to encode. Reject empty components explicitly.
+/// - Backslash is reserved on Windows path APIs and is meaningless as
+///   a separator on Unix, but accepting it here would let a name
+///   smuggle a `\` into log lines or hook script paths. Reject it.
 #[must_use]
 pub fn valid_dep_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('/')
-        && !name.split('/').any(|part| part == "..")
-        && !name.chars().any(char::is_whitespace)
-        && !name.contains('|')
+    if name.is_empty() || name.starts_with('/') {
+        return false;
+    }
+    if name.chars().any(char::is_whitespace) || name.contains('|') || name.contains('\\') {
+        return false;
+    }
+    let mut components = name.split('/');
+    components.all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn dash_to_empty(value: &str) -> &str {
@@ -566,6 +614,48 @@ mod tests {
         assert!(!valid_dep_name("tool/../other"));
         assert!(!valid_dep_name("bad name"));
         assert!(!valid_dep_name("bad|name"));
+        // `.` and `owner/.` would collapse to the install root or a
+        // namespace directory via `Path::join`. Reject both so the
+        // update/prune cleanup paths can never use them to wipe the
+        // entire managed tree. Same for empty path components from
+        // leading/trailing/double slashes — those keep only the
+        // non-empty segment and lose the namespace intent.
+        assert!(!valid_dep_name("."));
+        assert!(!valid_dep_name("owner/."));
+        assert!(!valid_dep_name("./tool"));
+        assert!(!valid_dep_name("owner//tool"));
+        assert!(!valid_dep_name("owner/"));
+        assert!(!valid_dep_name("owner\\tool"));
+    }
+
+    #[test]
+    fn load_dir_rejects_unsafe_dep_names() {
+        // Defense in depth: even if a hostile or buggy editor writes
+        // a `.` / `owner/.` / `owner//bad` entry into a conf file,
+        // `load_dir` must drop those before any consumer of the
+        // returned entries (update, prune, status) starts joining
+        // names into managed paths. Without this guard a single
+        // bad entry could direct `remove_any` at the install root.
+        let dir = temp_dir("unsafe-dep-names");
+        write(
+            &dir.join("a.conf"),
+            ". pkg\n./tool pkg\nowner/. pkg\nowner//bad pkg\nowner/ pkg\nowner\\bad pkg\nok-tool pkg\n",
+        );
+
+        let entries = load_dir(&dir).unwrap();
+
+        // The only entry that survives is the safe one.
+        assert_eq!(entries, vec!["ok-tool|pkg"]);
+    }
+
+    #[test]
+    fn parse_config_texts_rejects_unsafe_dep_names() {
+        // The in-memory bridge path (used by Bash `__api` callers)
+        // gets the same fail-closed treatment as `load_dir` — if it
+        // didn't, the shorter code path would be a hole around the
+        // loader-side guard.
+        let entries = parse_config_texts([". pkg\n./tool pkg\nowner/. pkg\nok-tool pkg\n"]);
+        assert_eq!(entries, vec!["ok-tool|pkg"]);
     }
 
     fn temp_dir(name: &str) -> PathBuf {
