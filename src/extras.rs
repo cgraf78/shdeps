@@ -325,13 +325,62 @@ fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
     // still treated as shdeps-owned (replaceable) rather than a missing file.
     match fs::symlink_metadata(target) {
         Ok(meta) if !meta.file_type().is_symlink() => return Ok(false),
-        Ok(_) => {
-            fs::remove_file(target)?;
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No existing entry — `symlink` followed by no rename is
+            // the simplest path. There is no TOCTOU window because
+            // nothing to remove first.
+            symlink(source, target)?;
+            return Ok(true);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    symlink(source, target)?;
+    // Atomic replace: create the new symlink under a sibling temp name
+    // in the same parent directory, then `rename` it over `target`.
+    // `rename` is atomic on POSIX when both paths are on the same
+    // filesystem (guaranteed here because the temp name shares a
+    // parent dir). This collapses the previous
+    // `symlink_metadata` → `remove_file` → `symlink` window that
+    // would let an adversary with write access to the parent
+    // directory swap the existing symlink for a regular file
+    // between the check and the unlink, causing us to delete a
+    // user-owned file. With atomic rename, the worst the attacker
+    // can do is race the rename — and the final state is always
+    // "either the old target or the new symlink", never "deleted
+    // user file with no replacement".
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cannot replace symlink with no parent directory",
+        )
+    })?;
+    let file_name = target.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target path has no file name",
+        )
+    })?;
+    let staging = parent.join(format!(
+        ".{}.shdeps-link.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default(),
+    ));
+    // Clean any stale staging file from a previous crashed run before
+    // creating the new symlink — `symlink` errors out if the path
+    // already exists.
+    let _ = fs::remove_file(&staging);
+    symlink(source, &staging)?;
+    if let Err(error) = fs::rename(&staging, target) {
+        // Best-effort cleanup of the staging symlink so a failed
+        // rename does not leave a `.tool.1.shdeps-link.<pid>.<nanos>`
+        // stub next to the target.
+        let _ = fs::remove_file(&staging);
+        return Err(error.into());
+    }
     Ok(true)
 }
 

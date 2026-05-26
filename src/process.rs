@@ -322,6 +322,17 @@ fn terminate_then_kill(child: &mut std::process::Child) {
         // Direct `libc::kill`-style syscall through the same `extern "C"`
         // pattern `state::lock_file` uses. Avoids pulling in a crate just
         // for `kill(2)`. PID is i32 on every Unix Rust supports.
+        //
+        // PID-reuse safety: check `try_wait` immediately before the
+        // signal call. The child can exit between when the deadline
+        // is observed and when we issue `kill(2)`; if it does, the
+        // OS may reassign that PID to an unrelated process before
+        // our SIGTERM lands. Skipping the signal when `try_wait`
+        // reports the child already exited closes that window.
+        // The grace loop below does the same check on each iteration.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
         unsafe {
             kill(child.id() as i32, SIGTERM);
         }
@@ -331,6 +342,12 @@ fn terminate_then_kill(child: &mut std::process::Child) {
                 return;
             }
             thread::sleep(WAIT_POLL);
+        }
+        // Same liveness check before SIGKILL. `Child::kill` itself
+        // calls `kill(pid, SIGKILL)` internally without a prior
+        // reap check, so we still need this guard.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
         }
     }
     let _ = child.kill();

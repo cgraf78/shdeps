@@ -25,11 +25,19 @@ use crate::process::Runner;
 use crate::runtime::Roots;
 use crate::state;
 
-// Bumped to v4 when the in-memory fingerprint hasher switched from a
-// hand-rolled FNV-1a-ish stream cipher (with a state-reset-on-zero bug
-// and no real collision resistance) to truncated SHA-256. Existing v3
-// cache files compute stored hashes the old way, so a version mismatch
-// is the safest way to force a one-time cache refresh on upgrade.
+// `CACHE_VERSION` is the schema tag written into and read back from
+// the file. Bumping it forces every older shdeps to treat the file as
+// a miss, which is how we cleanly retire a hash format on upgrade.
+//
+// `CACHE_FILE` is the on-disk FILENAME. It is intentionally NOT bumped
+// in lockstep: the version-on-the-first-line scheme means the
+// in-file `CACHE_VERSION` is the source of truth and the filename can
+// stay stable across upgrades. The `-v3` suffix in the filename is a
+// historical artifact from when the schema and the filename were
+// bumped together; leaving it stable now means we never strand old
+// files at a different path for v4-aware shdeps to migrate. Future
+// schema bumps should update only `CACHE_VERSION` unless the on-disk
+// layout itself changes incompatibly.
 const CACHE_VERSION: &str = "shdeps-pkg-check-cache-v4";
 const CACHE_FILE: &str = "pkg-check-cache-v3";
 
