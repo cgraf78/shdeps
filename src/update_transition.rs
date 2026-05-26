@@ -344,10 +344,22 @@ fn unlink_snapshot(
         }
     }
 
+    // Clear the snapshot entries from the link-state file rather than
+    // requiring byte-exact equality. The pre-fix code only cleared when
+    // the on-disk state matched the snapshot exactly; if any entry in
+    // the snapshot had been deleted externally (manual edit, partial
+    // failure of a prior run, parallel install), the comparison failed
+    // and the state file kept stale entries pointing at paths that no
+    // longer exist. Recompute the remainder by filtering the snapshot
+    // out of the current state and writing only what is left.
     let state_path = link_state::path(state_dir, name, kind);
-    if link_state::read(&state_path)? == snapshot {
-        link_state::write(&state_path, &[])?;
-    }
+    let current = link_state::read(&state_path)?;
+    let snapshot_set: BTreeSet<&PathBuf> = snapshot.iter().collect();
+    let remainder: Vec<PathBuf> = current
+        .into_iter()
+        .filter(|link| !snapshot_set.contains(link))
+        .collect();
+    link_state::write(&state_path, &remainder)?;
     Ok(())
 }
 
@@ -408,7 +420,9 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    use super::points_into;
+    use super::{points_into, unlink_snapshot};
+    use crate::link_state::{self, Kind};
+    use std::collections::BTreeSet;
 
     #[test]
     #[cfg(unix)]
@@ -456,6 +470,96 @@ mod tests {
         symlink(dir.join("nonexistent"), &link).unwrap();
 
         assert!(!points_into(&link, &dir.join("root")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unlink_snapshot_clears_only_snapshot_entries_keeping_others_intact() {
+        // The pre-fix code only cleared the state file when its
+        // contents matched the snapshot byte-for-byte. If anything
+        // had diverged externally — entries appended by a later
+        // install, entries trimmed by manual cleanup, etc. — the
+        // equality failed and the file kept stale snapshot entries
+        // pointing at links that were just deleted. Filtering out
+        // snapshot entries from the current state always converges
+        // toward the correct remainder.
+        let dir = temp_dir("clear-semantics");
+        let state_dir = dir.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = link_state::path(&state_dir, "owner/tool", Kind::Extras);
+
+        let snapshot = vec![dir.join("a"), dir.join("b")];
+        // External addition: state file contains snapshot + an extra
+        // link that does NOT belong to this transition.
+        let extra = dir.join("external-other-dep-link");
+        let mut on_disk = snapshot.clone();
+        on_disk.push(extra.clone());
+        link_state::write(&state_path, &on_disk).unwrap();
+
+        // Pre-create the snapshot symlinks so the unlinker has
+        // something to remove (its inner is_symlink check is also
+        // exercised here).
+        let target = dir.join("target");
+        fs::write(&target, "x").unwrap();
+        for link in &snapshot {
+            symlink(&target, link).unwrap();
+        }
+        symlink(&target, &extra).unwrap();
+
+        unlink_snapshot(
+            &state_dir,
+            "owner/tool",
+            Kind::Extras,
+            &snapshot,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        let remaining = link_state::read(&state_path).unwrap();
+        assert_eq!(
+            remaining,
+            vec![extra.clone()],
+            "snapshot entries removed; foreign entries preserved"
+        );
+        assert!(extra.is_symlink(), "foreign link must still exist on disk");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unlink_snapshot_clears_state_even_when_external_entry_was_deleted() {
+        // The complementary case: state file is missing one of the
+        // snapshot entries (a prior partial cleanup removed it from
+        // the file by hand). The byte-equality gate of the pre-fix
+        // code would refuse to clear the file in this case, leaving
+        // a stale entry pointing at a link the unlinker just removed.
+        let dir = temp_dir("clear-with-missing");
+        let state_dir = dir.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = link_state::path(&state_dir, "owner/tool", Kind::Extras);
+
+        let snapshot = vec![dir.join("a"), dir.join("b")];
+        // State file only has one of the two snapshot links.
+        link_state::write(&state_path, std::slice::from_ref(&snapshot[0])).unwrap();
+        let target = dir.join("target");
+        fs::write(&target, "x").unwrap();
+        symlink(&target, &snapshot[0]).unwrap();
+
+        unlink_snapshot(
+            &state_dir,
+            "owner/tool",
+            Kind::Extras,
+            &snapshot,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        // After clearing snapshot[0] from a state that only contained
+        // snapshot[0], the file should be empty and (per
+        // link_state::write semantics) removed entirely.
+        assert!(
+            !state_path.exists(),
+            "state file should be removed once no entries remain"
+        );
     }
 
     fn temp_dir(name: &str) -> PathBuf {
