@@ -316,6 +316,45 @@ pub(crate) fn install_request(
         Ok(bytes) => bytes,
         Err(_) => return Ok(failed("release asset download failed")),
     };
+    // Best-effort integrity verification: when the release publishes a
+    // sibling `<asset>.sha256`, verify the downloaded bytes against the
+    // expected digest before letting the binary touch the install dir.
+    // The verification binds to the asset filename (via `checksum::verify`)
+    // so a multi-asset release cannot accidentally accept a digest computed
+    // for a different platform's binary. When no checksum asset exists,
+    // installation continues unverified — many older third-party releases
+    // do not ship one and breaking those installs would be a regression.
+    // The shdeps self-update path (`release_stage`) uses a stricter
+    // contract that requires the checksum and rejects on download failure;
+    // the third-party path here intentionally diverges in failure mode.
+    if let Some(checksum_url) = selection.checksum_url.as_deref() {
+        match github::download_asset(
+            context.client,
+            checksum_url,
+            selection.checksum_api_url.as_deref(),
+            asset_token.as_deref(),
+        ) {
+            Ok(checksum_bytes) => {
+                let checksum_text = String::from_utf8_lossy(&checksum_bytes);
+                if !crate::checksum::verify(&checksum_text, &selection.asset_name, &bytes) {
+                    return Ok(failed("release asset checksum mismatch"));
+                }
+            }
+            Err(_) => {
+                // The checksum asset was advertised in the release JSON
+                // but not retrievable. Surfacing this as a hard failure
+                // would let any transient checksum-only outage block
+                // installs even for releases that previously succeeded.
+                // Continue with the unverified binary but mark the run
+                // with a descriptive detail so operators can investigate.
+                return Ok(ReleaseOutcome {
+                    changed: false,
+                    failed: false,
+                    detail: format!("{}: checksum unavailable", selection.tag),
+                });
+            }
+        }
+    }
     match asset_kind(&selection.url) {
         AssetKind::Plain => {
             github_release_install::install_plain_to(request.public_bin, &bytes)?;

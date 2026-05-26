@@ -21,6 +21,19 @@ pub struct Selection {
     pub url: String,
     /// REST API URL for authenticated private-release fallback.
     pub api_url: Option<String>,
+    /// Bare asset file name as published in the release. Carried alongside
+    /// `url` so the checksum-verification step can bind the digest to the
+    /// asset name (the same filename appears as the second field in standard
+    /// `sha256sum` output) instead of relying on positional trust.
+    pub asset_name: String,
+    /// Browser URL of the sibling SHA-256 checksum asset if the upstream
+    /// release published one (looked up as `<asset_name>.sha256`). `None`
+    /// when the release does not include a per-asset digest, in which case
+    /// installation proceeds unverified for backward compatibility — see
+    /// the comment in `update_release::install_request`.
+    pub checksum_url: Option<String>,
+    /// REST API URL for the sibling checksum asset (private-release fallback).
+    pub checksum_api_url: Option<String>,
 }
 
 /// Returns the release that GitHub would expose as "latest" for third-party deps.
@@ -57,16 +70,28 @@ pub fn select(
         .collect::<Vec<_>>();
     let target = target(env, runner);
     let url = release_asset::select(cmd, &urls, &target)?.to_owned();
-    let api_url = release
+    let primary = release.assets.iter().find(|asset| asset.url == url)?;
+    let api_url = primary.api_url.clone();
+    // Standard practice for third-party GitHub releases is to publish a
+    // sibling checksum asset named `<asset>.sha256` (sometimes `.sha512`,
+    // but `.sha256` is overwhelmingly the common form). When the upstream
+    // publishes one, install code uses it to verify the binary before
+    // landing it on disk. We do not invent or fall back to other digests:
+    // a mismatched name silently downgrading the trust model is exactly
+    // the failure shape we want to avoid.
+    let checksum_name = format!("{}.sha256", primary.name);
+    let checksum_asset = release
         .assets
         .iter()
-        .find(|asset| asset.url == url)
-        .and_then(|asset| asset.api_url.clone());
+        .find(|asset| asset.name == checksum_name);
 
     Some(Selection {
         tag: release.tag.clone(),
         url,
         api_url,
+        asset_name: primary.name.clone(),
+        checksum_url: checksum_asset.map(|asset| asset.url.clone()),
+        checksum_api_url: checksum_asset.and_then(|asset| asset.api_url.clone()),
     })
 }
 
@@ -139,8 +164,79 @@ mod tests {
                 tag: "v1.8.0".to_owned(),
                 url: "https://github.com/owner/tool/releases/download/v1/tool-v1.8.0-linux-x86_64.tar.gz".to_owned(),
                 api_url: None,
+                asset_name: "tool-v1.8.0-linux-x86_64.tar.gz".to_owned(),
+                checksum_url: None,
+                checksum_api_url: None,
             })
         );
+    }
+
+    #[test]
+    fn select_finds_sibling_sha256_checksum_asset_when_published() {
+        // A well-published third-party release ships `<asset>.sha256`
+        // alongside each binary asset. The selector must surface that
+        // sibling so the install path can verify the download before
+        // landing it on disk.
+        let releases = vec![Release {
+            tag: "v1.0.0".to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                Asset {
+                    name: "tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    api_url: None,
+                },
+                Asset {
+                    name: "tool-v1.0.0-linux-x86_64.tar.gz.sha256".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.sha256".to_owned(),
+                    api_url: None,
+                },
+            ],
+        }];
+        let runner = FakeRunner::new("x86_64", "");
+
+        let selection = select(
+            "tool",
+            &releases,
+            &RuntimeEnv::new("linux", "host"),
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection.checksum_url.as_deref(),
+            Some(
+                "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.sha256"
+            )
+        );
+        assert_eq!(selection.asset_name, "tool-v1.0.0-linux-x86_64.tar.gz");
+    }
+
+    #[test]
+    fn select_returns_no_checksum_when_release_has_only_binary_asset() {
+        // Many older releases ship only the binary. Verification then runs
+        // in best-effort mode (no checksum → proceed unverified), so the
+        // selector must explicitly model that as `None` rather than
+        // invent a digest URL the install layer would 404 on.
+        let releases = vec![release(
+            "v1.0.0",
+            false,
+            false,
+            &["tool-v1.0.0-linux-x86_64.tar.gz"],
+        )];
+        let runner = FakeRunner::new("x86_64", "");
+
+        let selection = select(
+            "tool",
+            &releases,
+            &RuntimeEnv::new("linux", "host"),
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(selection.checksum_url, None);
+        assert_eq!(selection.checksum_api_url, None);
     }
 
     #[test]
