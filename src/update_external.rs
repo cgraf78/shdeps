@@ -72,11 +72,22 @@ pub(crate) fn install(
         // content under the freshly-created install_root, remove the
         // empty `bin/` and `install_root` so a failed first-time
         // install does not leave stub directories scattered under the
-        // managed tree. `remove_dir` fails on non-empty directories,
-        // which is exactly what we want — a reinstall that failed
-        // mid-stream still leaves the dep's previous state intact.
-        let _ = fs::remove_dir(plan.install_root.join("bin"));
-        let _ = fs::remove_dir(&plan.install_root);
+        // managed tree.
+        //
+        // Two protective behaviors built in here:
+        //  - `remove_dir` fails on non-empty directories, so a
+        //    reinstall that failed mid-stream still leaves the
+        //    dep's previous content intact (nothing to clean up).
+        //  - We only call `remove_dir` on entries that
+        //    `symlink_metadata` reports as a real directory.
+        //    `fs::remove_dir` on a symlink-to-directory returns
+        //    ENOTDIR which the `let _` would silently swallow; on
+        //    a symlink-to-file it would error similarly. By
+        //    skipping non-directory paths we leave any user
+        //    customization (e.g., a manually-installed symlink at
+        //    `install_root`) untouched.
+        remove_dir_if_real_dir(&plan.install_root.join("bin"));
+        remove_dir_if_real_dir(&plan.install_root);
         return Ok(Item {
             name: entry.name.clone(),
             changed: false,
@@ -128,6 +139,22 @@ fn write_manifest(
             plan.bin_path.display().to_string(),
         ),
     )
+}
+
+/// Best-effort `remove_dir` that skips non-directory entries.
+///
+/// `fs::remove_dir` errors on symlinks, files, and non-empty
+/// directories. The previous `let _ = fs::remove_dir(...)` pattern
+/// silently swallowed all three. For the failed-install cleanup case
+/// we only want to remove ACTUAL empty directories — a symlink that
+/// the user placed at `install_root` is a legitimate customization
+/// and must not be silently treated as cleanup-eligible state.
+fn remove_dir_if_real_dir(path: &std::path::Path) {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_dir() {
+            let _ = fs::remove_dir(path);
+        }
+    }
 }
 
 fn run(runner: &impl Runner, command: &CommandSpec) -> Result<Output> {

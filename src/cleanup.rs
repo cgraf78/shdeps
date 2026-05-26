@@ -198,14 +198,18 @@ fn manifest_path(path: &str, home: &Path) -> PathBuf {
 /// where they live in independent locations.
 fn safe_managed_path(install_path: &str, roots: &Roots) -> Option<PathBuf> {
     let path = manifest_path(install_path, &roots.home);
-    // Refuse `..` (parent-dir escape) and `.` (which can mask `..` patterns
-    // in some path joinings). Plain `Normal` components are fine.
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::CurDir
-        )
-    }) {
+    // Refuse `..` (parent-dir escape). `.` components are benign on
+    // their own — `join("a/", "./b")` resolves to `a/b` — and an
+    // older fleet bootstrap could legitimately have written paths
+    // like `./local/share/...` into the manifest. Rejecting `CurDir`
+    // along with `ParentDir` would silently skip cleanup for those
+    // entries. The `starts_with` check below is the load-bearing
+    // containment guard; refusing `..` keeps that check sound by
+    // preventing lexical-prefix bypass.
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return None;
     }
     let safe = path.starts_with(&roots.install_dir) || path.starts_with(&roots.home);
@@ -479,6 +483,20 @@ mod tests {
         let fixture = Fixture::new("safe-escape-parent");
         assert!(safe_managed_path("../../etc/passwd", &fixture.roots).is_none());
         assert!(safe_managed_path(".local/share/../../../etc", &fixture.roots).is_none());
+    }
+
+    #[test]
+    fn safe_managed_path_accepts_curdir_components_in_legitimate_paths() {
+        // An older fleet bootstrap could have written paths like
+        // `./local/share/...` into the manifest. `.` components are
+        // benign on their own (`join` resolves them away), so
+        // rejecting them along with `..` would silently skip cleanup
+        // for legitimate older entries. Only `..` is the real escape
+        // vector.
+        let fixture = Fixture::new("safe-curdir");
+        let resolved = safe_managed_path("./local/share/repo-tool", &fixture.roots).unwrap();
+        // The resolved path lives under home and is therefore safe.
+        assert!(resolved.starts_with(&fixture.roots.home));
     }
 
     #[test]
