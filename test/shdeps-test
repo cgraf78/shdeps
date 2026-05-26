@@ -4862,8 +4862,20 @@ JSON
 {
   "tag_name": "$_release_tag",
   "assets": [
-    {"name": "$_release_archive", "browser_download_url": "https://example.test/$_release_archive"},
-    {"name": "${_release_archive}.sha256", "browser_download_url": "https://example.test/${_release_archive}.sha256"}
+    {
+      "name": "$_release_archive",
+      "uploader": {
+        "login": "github-actions[bot]"
+      },
+      "browser_download_url": "https://example.test/$_release_archive"
+    },
+    {
+      "name": "${_release_archive}.sha256",
+      "uploader": {
+        "login": "github-actions[bot]"
+      },
+      "browser_download_url": "https://example.test/${_release_archive}.sha256"
+    }
   ]
 }
 JSON
@@ -4875,15 +4887,35 @@ url=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
+    -w) shift 2 ;;
     -H) printf '%s\n' "$2" >>"$SHDEPS_TEST_CURL_LOG"; shift 2 ;;
     -*) shift ;;
     *) url="$1"; shift ;;
   esac
 done
 case "$url" in
+  */releases/latest)
+    if [[ -n "${SHDEPS_TEST_CURL_MARKER_DIR:-}" ]]; then
+      mkdir -p "$SHDEPS_TEST_CURL_MARKER_DIR"
+      : >"$SHDEPS_TEST_CURL_MARKER_DIR/latest"
+    fi
+    printf '%s' "https://github.com/cgraf78/shdeps/releases/tag/$SHDEPS_TEST_RELEASE_TAG"
+    ;;
   */latest) cp "$SHDEPS_TEST_RELEASE_DIR/latest.json" "$out" ;;
-  *.tar.gz) cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out" ;;
-  *.sha256) cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out" ;;
+  *.tar.gz)
+    if [[ -n "${SHDEPS_TEST_CURL_MARKER_DIR:-}" ]]; then
+      mkdir -p "$SHDEPS_TEST_CURL_MARKER_DIR"
+      : >"$SHDEPS_TEST_CURL_MARKER_DIR/archive"
+    fi
+    cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out"
+    ;;
+  *.sha256)
+    if [[ -n "${SHDEPS_TEST_CURL_MARKER_DIR:-}" ]]; then
+      mkdir -p "$SHDEPS_TEST_CURL_MARKER_DIR"
+      : >"$SHDEPS_TEST_CURL_MARKER_DIR/checksum"
+    fi
+    cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out"
+    ;;
   *) printf 'unexpected url: %s\n' "$url" >&2; exit 1 ;;
 esac
 SH
@@ -4892,6 +4924,7 @@ SH
   chmod +x "$_release_installer/install.sh"
   _release_log=$(_tmpdir)/curl.log
   PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_release_tag" \
     SHDEPS_TEST_CURL_LOG="$_release_log" GH_TOKEN="release-token" \
     SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
     SHDEPS_DIR="$_release_inst" SHDEPS_BIN="$_release_bin/shdeps" \
@@ -4903,18 +4936,46 @@ SH
   _assert_eq "install release: CLI points at release binary" "$_release_inst/shdeps" "$_release_link"
   _assert_contains "install release: sends GitHub token" "Authorization: Bearer release-token" "$(cat "$_release_log")"
 
-  _release_pipe_cwd=$(_tmpdir)/dotfiles-like-cwd
-  _release_pipe_inst=$(_tmpdir)/shdeps-release-pipe-install
-  _release_pipe_bin=$(_tmpdir)/release-pipe-bin
-  _release_pipe_cargo_log=$(_tmpdir)/release-pipe-cargo.log
-  mkdir -p "$_release_pipe_cwd" "$_release_pipe_bin"
-  git -C "$_release_pipe_cwd" init >/dev/null 2>&1
   cat >"$_release_fakebin/cargo" <<'SH'
 #!/usr/bin/env bash
 printf 'cargo %s\n' "$*" >>"$SHDEPS_TEST_CARGO_LOG"
 exit 99
 SH
   chmod +x "$_release_fakebin/cargo"
+
+  _release_direct_inst=$(_tmpdir)/shdeps-release-direct-install
+  _release_direct_bin=$(_tmpdir)/release-direct-bin
+  _release_direct_curl_log=$(_tmpdir)/curl-direct.log
+  _release_direct_marker=$(_tmpdir)/curl-direct-markers
+  _release_direct_cargo_log=$(_tmpdir)/release-direct-cargo.log
+  mkdir -p "$_release_direct_bin"
+  PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_release_tag" \
+    SHDEPS_TEST_CURL_LOG="$_release_direct_curl_log" \
+    SHDEPS_TEST_CURL_MARKER_DIR="$_release_direct_marker" \
+    SHDEPS_TEST_CARGO_LOG="$_release_direct_cargo_log" \
+    GITHUB_TOKEN="invalid-public-bootstrap-token" \
+    SHDEPS_DIR="$_release_direct_inst" SHDEPS_BIN="$_release_direct_bin/shdeps" \
+    "$_release_installer/install.sh" >/dev/null 2>&1
+  _assert_file_exists "install release direct: metadata installed" \
+    "$_release_direct_inst/.shdeps-install.json"
+  _assert_file_missing "install release direct: no managed source clone" \
+    "$_release_direct_inst/.git/config"
+  _assert_eq "install release direct: does not require cargo" \
+    "" "$(cat "$_release_direct_cargo_log" 2>/dev/null || true)"
+  _assert_file_exists "install release direct: resolves latest via browser redirect" \
+    "$_release_direct_marker/latest"
+  _assert_file_exists "install release direct: downloads canonical archive URL" \
+    "$_release_direct_marker/archive"
+  _assert_file_exists "install release direct: downloads canonical checksum URL" \
+    "$_release_direct_marker/checksum"
+
+  _release_pipe_cwd=$(_tmpdir)/dotfiles-like-cwd
+  _release_pipe_inst=$(_tmpdir)/shdeps-release-pipe-install
+  _release_pipe_bin=$(_tmpdir)/release-pipe-bin
+  _release_pipe_cargo_log=$(_tmpdir)/release-pipe-cargo.log
+  mkdir -p "$_release_pipe_cwd" "$_release_pipe_bin"
+  git -C "$_release_pipe_cwd" init >/dev/null 2>&1
   (
     cd "$_release_pipe_cwd" || exit 1
     PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
@@ -5036,24 +5097,6 @@ SH
 #!/usr/bin/env bash
 set -eu
 printf 'git %s\n' "$*" >>"$SHDEPS_TEST_SOURCE_FALLBACK_LOG"
-if [[ "$1" == clone && "$2" == --depth && "$3" == 1 ]]; then
-  dest="$5"
-  mkdir -p "$dest"
-  cat >"$dest/shdeps.sh" <<'LIB'
-shdeps_version() { printf '%s\n' "shdeps 20990102-030405-abc12345"; }
-LIB
-  cat >"$dest/install.sh" <<'INST'
-#!/usr/bin/env bash
-exit 0
-INST
-  printf '%s\n' "readme" >"$dest/README.md"
-  printf '%s\n' "license" >"$dest/LICENSE"
-  exit 0
-fi
-if [[ "$1" == -C && "$3" == rev-parse && "$4" == HEAD ]]; then
-  printf '%s\n' "abc123456789abcdef"
-  exit 0
-fi
 exit 1
 SH
   chmod +x "$_source_fb_fakebin/git"
@@ -5073,21 +5116,17 @@ SH
   chmod +x "$_source_fb_fakebin/cargo"
   cp "$SHDEPS_DIR/install.sh" "$_source_fb_installer/install.sh"
   chmod +x "$_source_fb_installer/install.sh"
+  rc=0
   PATH="$_source_fb_fakebin:/usr/bin:/bin" \
     SHDEPS_TEST_SOURCE_FALLBACK_LOG="$_source_fb_log" \
     SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
     SHDEPS_DIR="$_source_fb_inst" SHDEPS_BIN="$_source_fb_bin/shdeps" \
-    "$_source_fb_installer/install.sh" >/dev/null 2>&1
-  _assert_file_exists "install source fallback: root binary link created" "$_source_fb_inst/shdeps"
-  _assert_symlink "install source fallback: CLI symlinked" "$_source_fb_bin/shdeps"
-  _assert_contains "install source fallback: uses public HTTPS clone first" \
-    "git clone --depth 1 https://github.com/cgraf78/shdeps.git" "$(cat "$_source_fb_log")"
-  _assert_contains "install source fallback: builds release binary" \
-    "cargo build --release --locked" "$(cat "$_source_fb_log")"
-  _assert_contains "install source fallback: metadata records source-build" \
-    '"method":"source-build"' "$(cat "$_source_fb_inst/.shdeps-install.json")"
-  _assert_eq "install source fallback: CLI runs built binary" \
-    "shdeps 20990102-030405-abc12345" "$("$_source_fb_bin/shdeps" version)"
+    "$_source_fb_installer/install.sh" >/dev/null 2>&1 || rc=$?
+  _assert_exit "install release failure: exits instead of source fallback" 1 "$rc"
+  _assert_dir_missing "install release failure: no managed clone created" "$_source_fb_inst"
+  _assert_not_exists "install release failure: no CLI symlink" "$_source_fb_bin/shdeps"
+  _assert_eq "install release failure: git clone not attempted" \
+    "" "$(cat "$_source_fb_log" 2>/dev/null || true)"
 else
   _pass "install release: unsupported host platform skipped"
 fi

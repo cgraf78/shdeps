@@ -31,12 +31,11 @@ curl -fsSL https://raw.githubusercontent.com/cgraf78/shdeps/main/install.sh | ba
 ```
 
 This installs the latest release archive to `~/.local/share/shdeps` and
-symlinks the Rust CLI into `~/.local/bin/shdeps`. If a release archive is not
-available, the installer falls back to a source checkout build so first-time
-installs keep working while release assets are being bootstrapped. Re-running
-the installer is idempotent. Developer/source-checkout installs are still
-supported when you run `install.sh` from a git checkout or set `SHDEPS_REPO`
-explicitly.
+symlinks the Rust CLI into `~/.local/bin/shdeps`. Re-running the installer is
+idempotent. Fresh bootstrap expects release assets; if they are unavailable,
+the installer fails instead of silently cloning and building a managed source
+checkout. Developer/source-checkout installs are still supported when you run
+`install.sh` from a git checkout or set `SHDEPS_REPO` explicitly.
 
 Then create a config and run:
 

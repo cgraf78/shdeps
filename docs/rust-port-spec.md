@@ -1322,26 +1322,31 @@ Detection order:
    binary and a `.shdeps-install.json` file, treat the surrounding directory
    as a freshly-extracted release archive. Install from the local files; do
    NOT download.
-2. **Source-checkout mode.** If `$0`'s directory contains a `.git`
-   directory, treat it as a developer source checkout. Preserve current
-   git-pull / dirty-tree-skip behavior; do NOT download a release archive.
+2. **Source-checkout mode.** If `$0`'s directory contains `.git`,
+   `install.sh`, and `shdeps.sh`, treat it as a developer source checkout.
+   Preserve current git-pull / dirty-tree-skip behavior; do NOT download a
+   release archive.
 3. **Curl-pipe mode.** Otherwise (typical `curl … | bash` path), download
    the latest release archive for the host platform, verify checksum,
    stage, swap, write metadata.
 
 Each mode MUST have a dedicated fixture test in CI.
 
-### Source-build fallback
+### Release failure policy
 
-When release-archive download fails and `git` plus a working Rust toolchain are
-available, `install.sh` SHOULD clone the configured `SHDEPS_REPO` and build from
-source rather than failing the bootstrap. The default `cgraf78/shdeps` path is
-public HTTPS; SSH fallback is preserved only as a second attempt for explicit
-private forks or transient HTTPS auth failures.
+Fresh default bootstrap MUST NOT clone and build a managed source checkout when
+release-archive download fails. `shdeps` is distributed primarily as release
+assets; silently falling back to source hides release-path bugs, introduces a
+surprising Cargo requirement, and leaves `.git` / `.envrc` state on machines
+that only asked for a CLI binary.
+
+Source builds are allowed only when the caller explicitly selects source mode:
+running `install.sh` from a real source checkout, pointing `SHDEPS_LIB` at one,
+or keeping a local development checkout under `SHDEPS_GIT_DEV_DIR`.
 
 ### Reference Behavior
 
-Bash reference executed install mode currently MUST:
+Bash reference source-checkout install mode currently MUST:
 
 - require `git`
 - clone `$SHDEPS_REPO` into `$SHDEPS_DIR` when missing

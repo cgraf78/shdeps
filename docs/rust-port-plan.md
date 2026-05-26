@@ -1401,11 +1401,11 @@ it delegates to. Without this ordering, Bash-era fleet checkouts get stranded.
 - Add packaging script (`scripts/package-release.sh`).
 - Add release workflow.
 - Add installer artifact download (multi-platform).
-- Add source-build fallback.
-- Add private release credential handling (`GH_TOKEN`/`GITHUB_TOKEN`/
-  `gh auth token`).
-- Preserve the existing SSH-clone-then-source-build fallback path for private
-  repos; do not regress fleet machines that bootstrap via SSH git clone.
+- Make release assets the default bootstrap contract. Fresh curl-pipe installs
+  must fail when release assets cannot be downloaded instead of hiding release
+  regressions behind a managed source clone.
+- Keep source builds explicit: running from a source checkout, pointing
+  `SHDEPS_LIB` at one, or using a configured local development checkout.
 - Add install metadata (`$SHDEPS_DIR/.shdeps-install.json`).
 - Add method-aware `self-update` (git checkout / release / unknown).
 - Spec release-selection rules: skip prereleases by default; skip drafts;
@@ -1433,7 +1433,7 @@ Acceptance:
 - `install.sh` runs successfully under Bash 3.2 (Docker fixture or
   macOS-default-shell CI job).
 - Three install.sh mode-detection fixtures pass (bundled / source / curl).
-- SSH-clone fallback still bootstraps private-repo fleet machines.
+- Fresh curl-pipe bootstrap never creates a managed `.git` checkout.
 
 ### Phase 8: Bash Wrapper Cutover
 
@@ -1702,8 +1702,10 @@ D21); the rest live here as the authoritative list for implementers.
   `SHDEPS_CURRENT_DEP`, `SHDEPS_HOOK_PHASE` to every hook subprocess. See
   Hook Runner section above.
 - **C#9/C#18 hooks.d audit.** Added to Phase 0 acceptance above.
-- **C#11 SSH-clone fallback.** Phase 7 explicitly preserves SSH-clone-then-
-  source-build for private-repo fleet machines.
+- **C#11 SSH-clone fallback.** Superseded by the release-asset bootstrap
+  policy: shdeps is public, so fresh installs should consume release assets
+  and fail loudly when assets are missing. Source builds remain an explicit
+  developer/local-checkout path only.
 - **C#13 release selection rules.** Phase 7 specs: skip prereleases by
   default; skip drafts; refuse downgrade; rollback to prior install on
   bad-artifact detection.
@@ -1997,8 +1999,8 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
   artifact)
   - Surfaced by: C#13
   - Files: `src/install/self_update.rs`
-- [ ] **T29 (P1, human: ~1h / CC: ~5min)** — installer — Preserve SSH-clone-
-  then-source-build fallback for private repos
+- [x] **T29 (P1, human: ~1h / CC: ~5min)** — installer — Replace managed
+  SSH/source fallback with a release-asset-only fresh bootstrap policy
   - Surfaced by: C#11
   - Files: `install.sh`
 

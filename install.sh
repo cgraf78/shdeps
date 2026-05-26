@@ -8,7 +8,8 @@
 #
 # Environment:
 #   SHDEPS_DIR          Install directory      (default: ~/.local/share/shdeps)
-#   SHDEPS_REPO         Git repo URL           (default: https://github.com/cgraf78/shdeps.git)
+#   SHDEPS_REPO         Git repo URL for source/dev mode
+#                       (default: https://github.com/cgraf78/shdeps.git)
 #   SHDEPS_BIN          CLI symlink path       (default: ~/.local/bin/shdeps)
 #   SHDEPS_LIB          Direct path to shdeps.sh for explicit/dev bootstrap use
 #   SHDEPS_GIT_DEV_DIR  Dev clone directory    (default: ~/git)
@@ -41,11 +42,9 @@ _check_source_prereqs() {
     exit 1
   fi
 
-  # Source-checkout installs now build and activate the Rust binary first, so
-  # stock macOS Bash 3.2 is a valid installer shell. Optional extras linking may
-  # still source legacy helpers when a checkout exposes them, but that happens
-  # after the CLI is installed and can degrade gracefully instead of blocking
-  # fleet bootstrap on older system Bash versions.
+  # Source-checkout installs are developer/explicit mode. Normal fleet
+  # bootstrap should use release assets and therefore should not need Git,
+  # Cargo, or a source tree at all.
 }
 
 _script_dir() {
@@ -76,7 +75,7 @@ _is_source_checkout_dir() {
   # A curl-pipe installer is executed from the caller's current directory. In
   # CI that directory is often another Git checkout, such as dotfiles. Treating
   # any `.git` directory as "this script is running from a shdeps source
-  # checkout" accidentally routes fresh installs into the source-build path and
+  # checkout" accidentally routes fresh installs into source mode and
   # makes release-capable machines need Cargo. A real shdeps checkout has both
   # the installer and sourceable library beside the Git metadata, so use that as
   # the ownership signal instead of the caller's unrelated repository shape.
@@ -146,30 +145,6 @@ _uses_default_repo_slug() {
   [[ "$(_repo_slug)" == "$(_repo_url_slug "$_SHDEPS_DEFAULT_REPO")" ]]
 }
 
-_github_ssh_fallback_url() {
-  local repo="$1" path owner name
-  case "$repo" in
-    https://github.com/*) path="${repo#https://github.com/}" ;;
-    *) return 1 ;;
-  esac
-  path="${path%.git}"
-  owner="${path%%/*}"
-  name="${path#*/}"
-
-  # This URL is fed directly to git. Keep the fallback deliberately narrower
-  # than GitHub itself so a malformed SHDEPS_REPO cannot smuggle shell-ish or
-  # path-traversal text into the clone target. Users with unusual remotes can
-  # still set SHDEPS_REPO explicitly and use the source-checkout path.
-  case "$owner" in
-    "" | *..* | *" "* | *":"* | */*) return 1 ;;
-  esac
-  case "$name" in
-    "" | *..* | *" "* | *":"* | */*) return 1 ;;
-  esac
-
-  printf 'git@github.com:%s/%s.git\n' "$owner" "$name"
-}
-
 _release_platform() {
   local os arch
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -198,6 +173,12 @@ _json_string() {
 
 _asset_url() {
   local file="$1" name="$2"
+
+  # GitHub release asset objects contain nested objects such as `uploader`
+  # before `browser_download_url`. A simple "reset on any closing brace" parser
+  # mistakes that nested brace for the end of the asset and silently misses real
+  # assets. Once the exact asset name is seen, keep scanning forward to its
+  # download URL; GitHub always emits that URL in the same asset object.
   awk -v wanted="$name" '
     $0 ~ "\"name\"[[:space:]]*:[[:space:]]*\"" wanted "\"" { in_asset = 1 }
     in_asset && /"browser_download_url"[[:space:]]*:/ {
@@ -206,8 +187,26 @@ _asset_url() {
       print
       exit
     }
-    $0 ~ /^[[:space:]]*\}/ { in_asset = 0 }
   ' "$file"
+}
+
+_latest_release_tag() {
+  local repo="$1" effective tag
+
+  # The default shdeps repo is public, so bootstrap should not burn scarce
+  # unauthenticated GitHub API quota just to learn the current tag. The normal
+  # release page redirects to `/releases/tag/<tag>` and works for curl-pipe
+  # installs without requiring `gh`, JSON parsing, or a token.
+  effective=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+    "https://github.com/$repo/releases/latest") || return 1
+  case "$effective" in
+    */releases/tag/*) ;;
+    *) return 1 ;;
+  esac
+  tag="${effective##*/releases/tag/}"
+  tag="${tag%%[?#]*}"
+  [[ -n "$tag" ]] || return 1
+  printf '%s\n' "$tag"
 }
 
 _verify_checksum() {
@@ -384,7 +383,6 @@ _install_release() {
   _SHDEPS_RELEASE_FAILURE_KIND=""
   platform=$(_release_platform) || return 1
   repo=$(_repo_slug)
-  api_url="${SHDEPS_RELEASE_API_URL:-https://api.github.com/repos/$repo/releases/latest}"
   token=$(_github_token)
   tmp=$(mktemp -d) || {
     _error "failed to create release staging directory"
@@ -392,27 +390,44 @@ _install_release() {
   }
   json="$tmp/release.json"
 
-  # curl-pipe installs have no trusted local checkout. Use the GitHub release
-  # contract instead of cloning source so fresh machines do not need a Rust
-  # toolchain, and so WSL/Linux avoid host glibc drift by consuming musl assets.
-  if ! _curl_get "$api_url" "$json" "$token"; then
-    _install_release_fail "$tmp" "download" "failed to fetch shdeps release metadata"
-    return 1
-  fi
+  if [[ -n "${SHDEPS_RELEASE_API_URL:-}" ]]; then
+    api_url="$SHDEPS_RELEASE_API_URL"
+    if ! _curl_get "$api_url" "$json" "$token"; then
+      _install_release_fail "$tmp" "download" "failed to fetch shdeps release metadata"
+      return 1
+    fi
 
-  tag=$(_json_string "$json" "tag_name")
-  if [[ -z "$tag" ]]; then
-    _install_release_fail "$tmp" "metadata" "release metadata did not contain tag_name"
-    return 1
-  fi
+    tag=$(_json_string "$json" "tag_name")
+    if [[ -z "$tag" ]]; then
+      _install_release_fail "$tmp" "metadata" "release metadata did not contain tag_name"
+      return 1
+    fi
 
-  archive="shdeps-${tag}-${platform}.tar.gz"
-  checksum="${archive}.sha256"
-  archive_url=$(_asset_url "$json" "$archive")
-  checksum_url=$(_asset_url "$json" "$checksum")
-  if [[ -z "$archive_url" || -z "$checksum_url" ]]; then
-    _install_release_fail "$tmp" "metadata" "release $tag does not contain assets for $platform"
-    return 1
+    archive="shdeps-${tag}-${platform}.tar.gz"
+    checksum="${archive}.sha256"
+    archive_url=$(_asset_url "$json" "$archive")
+    checksum_url=$(_asset_url "$json" "$checksum")
+    if [[ -z "$archive_url" || -z "$checksum_url" ]]; then
+      _install_release_fail "$tmp" "metadata" "release $tag does not contain assets for $platform"
+      return 1
+    fi
+  else
+    # For the public default repo, resolve the latest tag through the normal
+    # GitHub release redirect and construct canonical asset URLs. This avoids
+    # unauthenticated API rate limits during fleet bootstrap while keeping the
+    # archive/checksum contract explicit and easy to inspect.
+    tag=$(_latest_release_tag "$repo") || {
+      _install_release_fail "$tmp" "download" "failed to resolve latest shdeps release"
+      return 1
+    }
+    archive="shdeps-${tag}-${platform}.tar.gz"
+    checksum="${archive}.sha256"
+    archive_url="https://github.com/$repo/releases/download/$tag/$archive"
+    checksum_url="https://github.com/$repo/releases/download/$tag/$checksum"
+    # Browser download URLs for this public repo do not need API auth. Avoid
+    # forwarding a caller's unrelated or expired GitHub token to github.com,
+    # because a bad token should not make public bootstrap fail.
+    token=""
   fi
 
   if ! _curl_get "$archive_url" "$tmp/$archive" "$token"; then
@@ -442,64 +457,6 @@ _install_release() {
     return 1
   fi
   rm -rf "$tmp"
-}
-
-_install_source_build_fallback() {
-  local fallback="" clone_url parent staging commit version
-
-  if [[ "${_SHDEPS_RELEASE_FAILURE_KIND:-}" != "download" ]]; then
-    return 1
-  fi
-  if [[ -e "$SHDEPS_DIR" ]]; then
-    return 1
-  fi
-  if ! command -v git >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
-    return 1
-  fi
-  fallback=$(_github_ssh_fallback_url "$SHDEPS_REPO" 2>/dev/null || true)
-
-  parent=$(dirname "$SHDEPS_DIR")
-  mkdir -p "$parent"
-  staging=$(mktemp -d "$parent/.shdeps-source-build.XXXXXX") || return 1
-
-  # Source fallback is a recovery path for machines that can read the public
-  # repo but could not fetch release metadata or assets. Try the configured repo
-  # first so default public installs do not require SSH auth; keep the narrow
-  # GitHub SSH fallback for explicit private forks or transient HTTPS auth
-  # failures. Publish only after the binary exists, preserving the same
-  # no-partial-live-install guarantee as release archives.
-  clone_url="$SHDEPS_REPO"
-  if ! git clone --depth 1 "$clone_url" "$staging"; then
-    if [[ -z "$fallback" || "$fallback" == "$clone_url" ]]; then
-      rm -rf "$staging"
-      return 1
-    fi
-    rm -rf "$staging"
-    staging=$(mktemp -d "$parent/.shdeps-source-build.XXXXXX") || return 1
-    if ! git clone --depth 1 "$fallback" "$staging"; then
-      rm -rf "$staging"
-      return 1
-    fi
-  fi
-  if ! (cd "$staging" && cargo build --release --locked); then
-    rm -rf "$staging"
-    return 1
-  fi
-  if [[ ! -x "$staging/target/release/shdeps" ]]; then
-    rm -rf "$staging"
-    return 1
-  fi
-  ln -sf "target/release/shdeps" "$staging/shdeps"
-  commit=$(git -C "$staging" rev-parse HEAD 2>/dev/null || true)
-  version=$("$staging/target/release/shdeps" version 2>/dev/null | sed -n 's/^shdeps //p' | head -n 1 || true)
-  cat >"$staging/.shdeps-install.json" <<JSON
-{"schema":1,"method":"source-build","repo":"$(_repo_slug)","version":"$version","commit":"$commit"}
-JSON
-  if ! mv "$staging" "$SHDEPS_DIR"; then
-    rm -rf "$staging"
-    return 1
-  fi
-  _info "shdeps: installed from source"
 }
 
 _ensure_source_checkout_binary() {
@@ -669,9 +626,7 @@ _install() {
   fi
 
   if _uses_default_repo_slug && ! _is_source_checkout_dir "$script_dir"; then
-    if ! _install_release; then
-      _install_source_build_fallback || exit 1
-    fi
+    _install_release || exit 1
     _activate_installed_tree "$SHDEPS_DIR"
     return
   fi
