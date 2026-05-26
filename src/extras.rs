@@ -154,7 +154,9 @@ impl Linker<'_> {
             return Ok(());
         }
         ensure_public_parent(&target)?;
-        replace_symlink(source, &target)?;
+        if !replace_symlink(source, &target)? {
+            return Ok(());
+        }
         self.created.push(target);
         Ok(())
     }
@@ -264,17 +266,31 @@ fn ensure_public_parent(target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replaces a shdeps-owned symlink at `target` pointing to `source`.
+///
+/// Returns `Ok(true)` when the link was created or replaced, and `Ok(false)`
+/// when an existing regular file or non-symlink at `target` was preserved.
+/// The ownership rule mirrors `bin_link::one`: shdeps may overwrite its own
+/// symlinks, but must never clobber a user-owned file the user has placed at
+/// the same path (a real man page, a hand-written completion, etc.). Without
+/// this guard, an `extras` linker would silently delete user files on every
+/// `shdeps update`.
 #[cfg(unix)]
-fn replace_symlink(source: &Path, target: &Path) -> Result<()> {
+fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
     use std::os::unix::fs::symlink;
 
-    match fs::remove_file(target) {
-        Ok(()) => {}
+    // `symlink_metadata` does not follow symlinks, so a dangling symlink is
+    // still treated as shdeps-owned (replaceable) rather than a missing file.
+    match fs::symlink_metadata(target) {
+        Ok(meta) if !meta.file_type().is_symlink() => return Ok(false),
+        Ok(_) => {
+            fs::remove_file(target)?;
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     symlink(source, target)?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -315,6 +331,62 @@ mod tests {
         assert_eq!(
             fs::read_link(dir.join("xdg/fish/vendor_completions.d/tool.fish")).unwrap(),
             install.join("completions/tool.fish")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_preserves_user_owned_regular_file_at_target_path() {
+        // The user may have hand-placed a real man page or completion at one
+        // of the XDG locations shdeps writes into. Mirroring `bin_link::one`,
+        // the extras linker must skip such targets rather than `remove_file`
+        // them — otherwise every `shdeps update` silently nukes user data.
+        let dir = temp_dir("preserve");
+        let install = dir.join("install");
+        fs::create_dir_all(install.join("share/man/man1")).unwrap();
+        fs::write(install.join("share/man/man1/tool.1"), ".TH TOOL 1\n").unwrap();
+
+        // Pre-existing user-owned regular file at the destination.
+        let user_target = dir.join("xdg/man/man1/tool.1");
+        fs::create_dir_all(user_target.parent().unwrap()).unwrap();
+        fs::write(&user_target, "user-owned man page").unwrap();
+
+        let created =
+            super::link(&dir.join("state"), &dir.join("xdg"), "owner/tool", &install).unwrap();
+
+        // The user's file must still be intact and unchanged.
+        assert!(!user_target.is_symlink());
+        assert_eq!(
+            fs::read_to_string(&user_target).unwrap(),
+            "user-owned man page"
+        );
+        // The skipped target must not be recorded in link state, otherwise a
+        // later prune would unlink the user's file.
+        assert!(created.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_replaces_existing_shdeps_owned_symlink() {
+        // A stale shdeps symlink (or a dangling one) is the normal replace
+        // case; the guard for user-owned files must not block re-linking when
+        // the existing target is a symlink.
+        let dir = temp_dir("relink");
+        let install = dir.join("install");
+        fs::create_dir_all(install.join("share/man/man1")).unwrap();
+        fs::write(install.join("share/man/man1/tool.1"), ".TH TOOL 1\n").unwrap();
+
+        let target = dir.join("xdg/man/man1/tool.1");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(dir.join("stale-source"), &target).unwrap();
+
+        let created =
+            super::link(&dir.join("state"), &dir.join("xdg"), "owner/tool", &install).unwrap();
+
+        assert_eq!(created.len(), 1);
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            install.join("share/man/man1/tool.1")
         );
     }
 
