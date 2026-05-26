@@ -342,22 +342,31 @@ _source_checkout_has_user_changes() {
   return 1
 }
 
-_cleanup_release_install_for_source_checkout() {
-  local source_dir="$1" source_real install_real
+_cleanup_installed_state_for_source_checkout() {
+  local source_dir="$1" source_real install_real cleanup=0
 
   [[ -d "$source_dir/.git" ]] || return 0
-  _is_release_install_dir "$SHDEPS_DIR" || return 0
 
   source_real=$(cd -P -- "$source_dir" 2>/dev/null && pwd) || return 0
   install_real=$(cd -P -- "$SHDEPS_DIR" 2>/dev/null && pwd) || return 0
   [[ "$source_real" != "$install_real" ]] || return 0
 
-  # Once a developer checkout is the active implementation, a release payload
-  # under SHDEPS_DIR is stale managed state. Remove only installs carrying
-  # release metadata; arbitrary directories and source checkouts are handled by
-  # stricter migration paths above.
+  # Once a developer checkout is the active implementation, any owned install
+  # under SHDEPS_DIR is stale state. Release payloads are explicitly owned by
+  # shdeps metadata. Clean source checkouts of the same repo are also owned:
+  # they are the old fleet-managed clone shape that should not linger after a
+  # real dev clone takes over. Dirty or foreign checkouts are preserved because
+  # they might be someone else's work.
+  if _is_release_install_dir "$SHDEPS_DIR"; then
+    cleanup=1
+  elif [[ -d "$SHDEPS_DIR/.git" ]] &&
+    _release_can_replace_source_checkout "$SHDEPS_DIR" >/dev/null 2>&1; then
+    cleanup=1
+  fi
+  [[ "$cleanup" -eq 1 ]] || return 0
+
   if ! rm -rf "$SHDEPS_DIR"; then
-    _error "failed to remove stale shdeps release install at $SHDEPS_DIR"
+    _error "failed to remove stale shdeps install at $SHDEPS_DIR"
     return 1
   fi
 }
@@ -798,7 +807,7 @@ _bootstrap() {
   # Set up symlinks (CLI, man, completions) after self-update so newly
   # pulled files (e.g. man pages, completions) are linked immediately.
   [[ -n "$_bs_dir" ]] && _setup_links "$_bs_dir"
-  [[ -n "$_bs_dir" ]] && _cleanup_release_install_for_source_checkout "$_bs_dir"
+  [[ -n "$_bs_dir" ]] && _cleanup_installed_state_for_source_checkout "$_bs_dir"
 }
 
 # ---------------------------------------------------------------------------

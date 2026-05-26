@@ -5358,6 +5358,47 @@ if [[ -n "${_release_platform:-}" ]]; then
     "$_bs_toggle_inst/.shdeps-install.json"
 
   unset -f shdeps_update 2>/dev/null
+  _bs_toggle_source_inst=$(_tmpdir)/bs-toggle-source-install
+  _bs_toggle_source_bin=$(_tmpdir)/bs-toggle-source-bin
+  mkdir -p "$_bs_toggle_source_inst" "$_bs_toggle_source_bin"
+  git -C "$_bs_toggle_source_inst" init >/dev/null 2>&1
+  git -C "$_bs_toggle_source_inst" config user.email "test@test.com"
+  git -C "$_bs_toggle_source_inst" config user.name "Test"
+  git -C "$_bs_toggle_source_inst" remote add origin "https://github.com/cgraf78/shdeps.git"
+  printf '%s\n' "old managed source checkout" >"$_bs_toggle_source_inst/shdeps.sh"
+  git -C "$_bs_toggle_source_inst" add shdeps.sh
+  git -C "$_bs_toggle_source_inst" commit -m "managed source install" >/dev/null 2>&1
+  SHDEPS_LIB="$_bs_toggle_dev/shdeps/shdeps.sh" \
+    SHDEPS_GIT_DEV_DIR="/nonexistent" SHDEPS_DIR="$_bs_toggle_source_inst" \
+    SHDEPS_BIN="$_bs_toggle_source_bin/shdeps" \
+    . "$_bs_dir/install.sh" --bootstrap
+  _assert_eq "bootstrap dev/source toggle: dev clone wins when present" \
+    "shdeps 20990207-080910-devclone" "$("$_bs_toggle_source_bin/shdeps" version)"
+  _assert_file_missing "bootstrap dev/source toggle: managed source checkout cleaned when dev wins" \
+    "$_bs_toggle_source_inst/.git/config"
+
+  unset -f shdeps_update 2>/dev/null
+  _bs_toggle_dirty_inst=$(_tmpdir)/bs-toggle-dirty-source-install
+  _bs_toggle_dirty_bin=$(_tmpdir)/bs-toggle-dirty-bin
+  mkdir -p "$_bs_toggle_dirty_inst" "$_bs_toggle_dirty_bin"
+  git -C "$_bs_toggle_dirty_inst" init >/dev/null 2>&1
+  git -C "$_bs_toggle_dirty_inst" config user.email "test@test.com"
+  git -C "$_bs_toggle_dirty_inst" config user.name "Test"
+  git -C "$_bs_toggle_dirty_inst" remote add origin "https://github.com/cgraf78/shdeps.git"
+  printf '%s\n' "old managed source checkout" >"$_bs_toggle_dirty_inst/shdeps.sh"
+  git -C "$_bs_toggle_dirty_inst" add shdeps.sh
+  git -C "$_bs_toggle_dirty_inst" commit -m "managed source install" >/dev/null 2>&1
+  printf '%s\n' "local edit" >>"$_bs_toggle_dirty_inst/shdeps.sh"
+  SHDEPS_LIB="$_bs_toggle_dev/shdeps/shdeps.sh" \
+    SHDEPS_GIT_DEV_DIR="/nonexistent" SHDEPS_DIR="$_bs_toggle_dirty_inst" \
+    SHDEPS_BIN="$_bs_toggle_dirty_bin/shdeps" \
+    . "$_bs_dir/install.sh" --bootstrap
+  _assert_eq "bootstrap dev/source toggle: dirty installed source does not block dev clone" \
+    "shdeps 20990207-080910-devclone" "$("$_bs_toggle_dirty_bin/shdeps" version)"
+  _assert_file_exists "bootstrap dev/source toggle: dirty installed source is preserved" \
+    "$_bs_toggle_dirty_inst/.git/config"
+
+  unset -f shdeps_update 2>/dev/null
   rm -rf "$_bs_toggle_dev/shdeps"
   _bs_saved_path="$PATH"
   PATH="$_bs_toggle_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
