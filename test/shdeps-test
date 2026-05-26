@@ -257,6 +257,19 @@ _assert_eq "comments/blanks: count" "2" "${#_SHDEPS_DEPS[@]}"
 _assert_contains "comments/blanks: first" "tool-a" "${_SHDEPS_DEPS[0]}"
 _assert_contains "comments/blanks: second" "tool-b" "${_SHDEPS_DEPS[1]}"
 
+# --- Inline `#` comments are stripped from dep lines ---
+
+cat >"$_test_conf_dir/deps.conf" <<'EOF'
+tool-a  pkg   # trailing comment
+tool-b  pkg   apt:tool-b-pkg  # alias with comment
+tool-c  pkg   #no-space-before-comment-body
+EOF
+_shdeps_load
+_assert_eq "inline #: count" "3" "${#_SHDEPS_DEPS[@]}"
+_assert_eq "inline #: tool-a strips trailing comment" "tool-a|pkg" "${_SHDEPS_DEPS[0]}"
+_assert_eq "inline #: tool-b strips trailing comment with alias" "tool-b|pkg|apt:tool-b-pkg" "${_SHDEPS_DEPS[1]}"
+_assert_eq "inline #: tool-c strips no-space-after-# variant" "tool-c|pkg" "${_SHDEPS_DEPS[2]}"
+
 # --- Missing config dir ---
 
 SHDEPS_CONF_DIR="$_test_conf_dir/nonexistent"

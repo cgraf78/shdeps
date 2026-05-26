@@ -102,8 +102,11 @@ pub fn parse_entry(raw: &str, pkg_mgr: Option<&str>) -> Entry {
 /// Parses a single config-file line into the raw loaded-entry representation.
 ///
 /// Lines that are blank or begin with `#` after leading whitespace are ignored.
-/// Inline `#` is not treated as a comment, matching the shell's current
-/// whitespace-splitting behavior.
+/// Inline comments are recognized as any whitespace-separated token starting
+/// with `#`: `tool  pkg  # this is a comment` parses as the two fields
+/// `tool|pkg`. A `#` inside an unquoted field (e.g., `tool#extra pkg`) is
+/// preserved because that is a single token and there is no field whose
+/// real value starts with `#` in any current dep method.
 #[must_use]
 pub fn parse_config_line(line: &str) -> Option<String> {
     let trimmed_start = line.trim_start();
@@ -113,8 +116,19 @@ pub fn parse_config_line(line: &str) -> Option<String> {
 
     let mut fields = line
         .split_whitespace()
+        // `take_while` stops at the first token that begins a comment so we
+        // do not silently materialize `#` as the `cmd` field (or any other
+        // field) when a user appends a trailing remark to a dep line.
+        .take_while(|field| !field.starts_with('#'))
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    if fields.is_empty() {
+        // The entire line was a comment after leading non-#: e.g.,
+        // `   # spaced comment` is already handled above, but a defensive
+        // empty check keeps later index accesses safe and avoids emitting an
+        // empty `||` entry.
+        return None;
+    }
     if fields.len() >= 2 {
         fields[0] = canonical_name(&fields[0], &fields[1]);
     }
@@ -318,6 +332,47 @@ mod tests {
         assert_eq!(parse_config_line("# comment"), None);
         assert_eq!(parse_config_line("   # comment"), None);
         assert_eq!(parse_config_line("   "), None);
+    }
+
+    #[test]
+    fn parse_config_line_strips_trailing_inline_hash_comments() {
+        // The shell-style convention of a `#` token introducing a trailing
+        // comment must produce the same parse as the comment-free form.
+        // Otherwise the comment would be silently materialized as the `cmd`
+        // field (or, worse, as the `method` field), producing a wrong entry
+        // that no `valid_dep_name` style check would later catch.
+        assert_eq!(
+            parse_config_line("tool  pkg  # this is a comment").as_deref(),
+            Some("tool|pkg")
+        );
+        assert_eq!(
+            parse_config_line("tool  pkg  apt:tool-pkg  # alias hint").as_deref(),
+            Some("tool|pkg|apt:tool-pkg")
+        );
+        // A comment whose `#` is immediately followed by content still wins:
+        // it is a whitespace-separated `#`-prefixed token, no spaces required
+        // between the `#` and the text.
+        assert_eq!(
+            parse_config_line("tool  pkg  #no-space-after-hash").as_deref(),
+            Some("tool|pkg")
+        );
+    }
+
+    #[test]
+    fn parse_config_line_keeps_hash_inside_unquoted_token() {
+        // A `#` that is part of a non-whitespace-separated token is not a
+        // comment — there is no current method whose field value legitimately
+        // starts with `#`, so the only safe interpretation of a mid-token
+        // `#` is "do not split here". This guards against accidentally
+        // truncating an alias value such as `apt:foo#bar` (hypothetical).
+        assert_eq!(
+            parse_config_line("tool#extra  pkg").as_deref(),
+            Some("tool#extra|pkg")
+        );
+        assert_eq!(
+            parse_config_line("tool  pkg  apt:foo#bar").as_deref(),
+            Some("tool|pkg|apt:foo#bar")
+        );
     }
 
     #[test]
