@@ -51,7 +51,7 @@ Options:
   -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
   -f, --force           Bypass TTL cache (check for updates now)
   -R, --reinstall       Force reinstall all dependencies (implies --force)
-  -q, --quiet           Suppress interactive prompts
+  -q, --quiet           Suppress non-result output and interactive prompts
   -v, --verbose         Verbose output (log level 2)
 
 Prune options:
@@ -121,7 +121,7 @@ where
             Ok(2)
         }
         "prune" => prune_cmd(rest, &parsed, stdout, stderr),
-        "self-update" => self_update_cmd(rest, stdout, stderr),
+        "self-update" => self_update_cmd(rest, &parsed, stdout, stderr),
         "update" => update_cmd(rest, &parsed, stdout, stderr),
         other => {
             writeln!(stderr, "error: unknown command '{other}'")?;
@@ -150,7 +150,11 @@ where
 {
     let mut index = 0;
     let mut overrides = Overrides::default();
-    let mut quiet = false;
+    // `SHDEPS_QUIET` is part of the sourceable API used by dotfiles and
+    // hooks. Those callers often reach the Rust CLI through `shdeps_update`
+    // rather than spelling `shdeps -q update`, so the environment must be
+    // equivalent to the flag at the command boundary.
+    let mut quiet = env::var("SHDEPS_QUIET").as_deref() == Ok("1");
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
             "-c" | "--config" => {
@@ -399,6 +403,9 @@ where
     let raw_entries = config::load_dir(&roots.conf_dir)?;
     let entries = parse_entries(&raw_entries, &pkg_mgr);
     if entries.is_empty() {
+        if options.quiet {
+            return Ok(0);
+        }
         writeln!(stdout, "No dependencies configured.")?;
         return Ok(0);
     }
@@ -546,7 +553,12 @@ where
     Ok(if summary.has_errors() { 1 } else { 0 })
 }
 
-fn self_update_cmd<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<i32>
+fn self_update_cmd<W, E>(
+    args: &[String],
+    options: &ParsedOptions,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
 where
     W: Write,
     E: Write,
@@ -566,7 +578,7 @@ where
         Target::ReleaseArchive(metadata) => {
             match self_update::release_archive(&dir, &metadata, &ProcessEnv, &Process, &Curl) {
                 Ok(summary) => {
-                    write_release_self_update(&summary, stdout, stderr)?;
+                    write_release_self_update(&summary, options.quiet, stdout, stderr)?;
                     Ok(summary.exit_code())
                 }
                 Err(error) => {
@@ -900,6 +912,7 @@ where
 
 fn write_release_self_update<W, E>(
     summary: &self_update::ReleaseArchiveSummary,
+    quiet: bool,
     stdout: &mut W,
     stderr: &mut E,
 ) -> Result<()>
@@ -909,10 +922,14 @@ where
 {
     match &summary.outcome {
         ReleaseArchiveOutcome::Updated { tag } => {
-            writeln!(stdout, "shdeps: updated to {tag}")?;
+            if !quiet {
+                writeln!(stdout, "shdeps: updated to {tag}")?;
+            }
         }
         ReleaseArchiveOutcome::NoUpdate { current, .. } => {
-            writeln!(stdout, "shdeps: no update available ({current})")?;
+            if !quiet {
+                writeln!(stdout, "shdeps: no update available ({current})")?;
+            }
         }
         ReleaseArchiveOutcome::NoSelectableRelease => {
             writeln!(stderr, "shdeps: no stable release available")?;

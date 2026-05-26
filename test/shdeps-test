@@ -4920,7 +4920,7 @@ SH
   PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-migrate.log" \
     SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
-    SHDEPS_REPO="git@github.com-shdeps:cgraf78/shdeps.git" \
+    SHDEPS_REPO="ssh://git@github.com/cgraf78/shdeps.git" \
     SHDEPS_DIR="$_release_migrate_inst" SHDEPS_BIN="$_release_migrate_bin/shdeps" \
     "$_release_installer/install.sh" >/dev/null 2>&1
   _assert_file_missing "install release migration: source checkout replaced" "$_release_migrate_inst/.git/config"
@@ -5054,8 +5054,8 @@ SH
     "$_source_fb_installer/install.sh" >/dev/null 2>&1
   _assert_file_exists "install source fallback: root binary link created" "$_source_fb_inst/shdeps"
   _assert_symlink "install source fallback: CLI symlinked" "$_source_fb_bin/shdeps"
-  _assert_contains "install source fallback: uses SSH clone" \
-    "git clone --depth 1 git@github.com:cgraf78/shdeps.git" "$(cat "$_source_fb_log")"
+  _assert_contains "install source fallback: uses public HTTPS clone first" \
+    "git clone --depth 1 https://github.com/cgraf78/shdeps.git" "$(cat "$_source_fb_log")"
   _assert_contains "install source fallback: builds release binary" \
     "cargo build --release --locked" "$(cat "$_source_fb_log")"
   _assert_contains "install source fallback: metadata records source-build" \
@@ -5269,7 +5269,7 @@ if [[ -n "${_release_platform:-}" ]]; then
     SHDEPS_TEST_CURL_LOG="$(_tmpdir)/curl-bs-release.log" \
     SHDEPS_TEST_CARGO_LOG="$_bs_release_cargo_log" \
     SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
-    SHDEPS_REPO="git@github.com-shdeps:cgraf78/shdeps.git" \
+    SHDEPS_REPO="ssh://git@github.com/cgraf78/shdeps.git" \
     SHDEPS_DIR="$_bs_release_inst" SHDEPS_BIN="$_bs_release_bin/shdeps" \
     SHDEPS_GIT_DEV_DIR="/nonexistent" \
     . "$_bs_dir/install.sh" --bootstrap

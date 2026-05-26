@@ -826,6 +826,55 @@ fn update_reports_empty_config_without_touching_installers() {
 }
 
 #[test]
+fn update_quiet_environment_suppresses_normal_output() {
+    let fixture = Fixture::new("update-quiet-env");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() {
+  printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"
+  printf 'installed\n'
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_QUIET", "1").env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", shdeps_exe_dir().display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/tool-installed")).unwrap(),
+        "installed\n"
+    );
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("tool|custom|tool|")
+    );
+}
+
+#[test]
+fn update_quiet_environment_suppresses_empty_config_message() {
+    let fixture = Fixture::new("update-empty-quiet-env");
+
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_QUIET", "1");
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
 fn update_installs_custom_dep_runs_post_and_records_manifest() {
     let fixture = Fixture::new("update-custom");
     fixture.write("conf/deps.conf", "tool custom\n");
@@ -1123,6 +1172,21 @@ esac
                 && metadata.artifact_platform.as_deref() == Some(platform.as_str())
                 && metadata.repo.as_deref() == Some("cgraf78/shdeps"))
     );
+
+    let mut quiet = fixture.command(["self-update"]);
+    quiet
+        .env("SHDEPS_DIR", &install)
+        .env("SHDEPS_QUIET", "1")
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_ARCHIVE", &archive)
+        .env("SHDEPS_TEST_CHECKSUM", &checksum)
+        .env("SHDEPS_TEST_ARCHIVE_NAME", &archive_name)
+        .env("SHDEPS_TEST_CHECKSUM_NAME", &checksum_name);
+    let quiet = run(&mut quiet);
+
+    assert_success(&quiet);
+    assert_eq!(text(&quiet.stdout), "");
+    assert_eq!(text(&quiet.stderr), "");
 }
 
 fn run(command: &mut Command) -> Output {

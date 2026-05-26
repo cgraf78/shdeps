@@ -58,7 +58,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 | `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`     | Cache/state dir                                                                                            |
 | `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache                                                                                           |
 | `SHDEPS_REINSTALL`   | `0`                                                | Force reinstall all deps                                                                                   |
-| `SHDEPS_QUIET`       | `0`                                                | Suppress interactive prompts                                                                               |
+| `SHDEPS_QUIET`       | `0`                                                | Suppress non-result output and interactive prompts                                                             |
 | `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                                       |
 | `SHDEPS_GIT_DEV_DIR` | `~/git`                                            | Dev clone directory for the `github:repo` method                                                           |
 | `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github:*`, `cargo`, `go`, `uv`, and `npm` installs (each dep lives in `<dir>/<name>/`) |

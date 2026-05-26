@@ -94,7 +94,7 @@ Global options:
   its parent directory is used.
 - `-f, --force`: set force mode and bypass TTL caches.
 - `-R, --reinstall`: set force and reinstall mode.
-- `-q, --quiet`: suppress interactive prompts and normal logs.
+- `-q, --quiet`: suppress non-result output and interactive prompts.
 - `-v, --verbose`: set verbose log level.
 - `-h, --help`: print help and exit successfully.
 
@@ -394,7 +394,7 @@ Runtime environment variables:
 | `SHDEPS_STATE_DIR` | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps` | State root |
 | `SHDEPS_FORCE` | `0` | Bypass remote and package caches |
 | `SHDEPS_REINSTALL` | `0` | Force reinstall behavior |
-| `SHDEPS_QUIET` | `0` | Suppress normal logs and prompts |
+| `SHDEPS_QUIET` | `0` | Suppress non-result logs and prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Remote cache TTL seconds |
 | `SHDEPS_GIT_DEV_DIR` | `$HOME/git` | Local dev clone root |
 | `SHDEPS_INSTALL_DIR` | `$HOME/.local/share` | Dependency install root |
@@ -422,7 +422,7 @@ Installer/bootstrap environment variables:
 | Variable | Default | Contract |
 | --- | --- | --- |
 | `SHDEPS_DIR` | `$HOME/.local/share/shdeps` | shdeps install dir |
-| `SHDEPS_REPO` | `https://github.com/cgraf78/shdeps.git` currently; dotfiles may prefer SSH | source repo URL |
+| `SHDEPS_REPO` | `https://github.com/cgraf78/shdeps.git` | source repo URL; explicit overrides may use SSH or forks |
 | `SHDEPS_BIN` | `$HOME/.local/bin/shdeps` | CLI symlink path |
 | `SHDEPS_LIB` | unset | direct `shdeps.sh` path for bootstrap |
 | `SHDEPS_GIT_DEV_DIR` | `$HOME/git` | dev clone discovery |
@@ -1331,15 +1331,13 @@ Detection order:
 
 Each mode MUST have a dedicated fixture test in CI.
 
-### SSH-clone fallback for private repos (preserved)
+### Source-build fallback
 
-For machines that have SSH git auth but no `GH_TOKEN`/`GITHUB_TOKEN`/`gh`,
-`install.sh` MUST preserve the existing SSH-clone-then-source-build fallback
-path. Concretely, when release-archive download fails due to missing
-credentials AND `git` + a working Rust toolchain are available AND the
-configured `SHDEPS_REPO` URL is reachable over SSH, the installer SHOULD
-clone via SSH and build from source rather than failing the bootstrap.
-Fleet machines that previously bootstrapped via SSH clone MUST NOT regress.
+When release-archive download fails and `git` plus a working Rust toolchain are
+available, `install.sh` SHOULD clone the configured `SHDEPS_REPO` and build from
+source rather than failing the bootstrap. The default `cgraf78/shdeps` path is
+public HTTPS; SSH fallback is preserved only as a second attempt for explicit
+private forks or transient HTTPS auth failures.
 
 ### Reference Behavior
 
@@ -1551,7 +1549,7 @@ Log levels:
 
 Quiet mode:
 
-- suppresses normal logs
+- suppresses non-result logs
 - suppresses interactive prune prompts unless `-y` is supplied
 - MUST still allow important warnings/errors to be visible where current
   behavior does

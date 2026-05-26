@@ -52,7 +52,7 @@ Options:
   -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
   -f, --force           Bypass TTL cache (check for updates now)
   -R, --reinstall       Force reinstall all dependencies (implies --force)
-  -q, --quiet           Suppress interactive prompts
+  -q, --quiet           Suppress non-result output and interactive prompts
   -v, --verbose         Verbose output (log level 2)
 
 Prune options:

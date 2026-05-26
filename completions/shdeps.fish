@@ -50,7 +50,7 @@ end
 complete -c shdeps -s c -l config -rF -d "Config directory or file"
 complete -c shdeps -s f -l force -d "Bypass TTL cache"
 complete -c shdeps -s R -l reinstall -d "Force reinstall all dependencies"
-complete -c shdeps -s q -l quiet -d "Suppress interactive prompts"
+complete -c shdeps -s q -l quiet -d "Suppress non-result output and interactive prompts"
 complete -c shdeps -s v -l verbose -d "Verbose output"
 complete -c shdeps -s h -l help -d "Show help message"
 

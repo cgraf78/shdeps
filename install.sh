@@ -119,8 +119,8 @@ _repo_url_slug() {
   local repo="$1"
 
   # The same GitHub repository can be spelled several ways in bootstrap
-  # contexts: public HTTPS, normal SSH, or a GitHub SSH host alias such as
-  # git@github.com-shdeps:cgraf78/shdeps.git from CI deploy-key config. Compare
+  # contexts: public HTTPS, normal SSH, or a GitHub SSH host alias from a
+  # caller's custom config. Compare
   # ownership by owner/repo slug so install policy does not drift based on the
   # transport required to authenticate, but keep the normalization GitHub-scoped
   # so an unrelated host with the same path is not silently treated as ours.
@@ -428,7 +428,7 @@ _install_release() {
 }
 
 _install_source_build_fallback() {
-  local fallback parent staging commit version
+  local fallback="" clone_url parent staging commit version
 
   if [[ "${_SHDEPS_RELEASE_FAILURE_KIND:-}" != "download" ]]; then
     return 1
@@ -436,24 +436,33 @@ _install_source_build_fallback() {
   if [[ -e "$SHDEPS_DIR" ]]; then
     return 1
   fi
-  if ! fallback=$(_github_ssh_fallback_url "$SHDEPS_REPO"); then
-    return 1
-  fi
   if ! command -v git >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     return 1
   fi
+  fallback=$(_github_ssh_fallback_url "$SHDEPS_REPO" 2>/dev/null || true)
 
   parent=$(dirname "$SHDEPS_DIR")
   mkdir -p "$parent"
   staging=$(mktemp -d "$parent/.shdeps-source-build.XXXXXX") || return 1
 
-  # Private source fallback exists for machines that can clone over SSH but
-  # cannot read private GitHub release assets. Build in a sibling staging tree
-  # and only publish it at SHDEPS_DIR after the binary exists, preserving the
-  # same no-partial-live-install guarantee as release archives.
-  if ! git clone --depth 1 "$fallback" "$staging"; then
+  # Source fallback is a recovery path for machines that can read the public
+  # repo but could not fetch release metadata or assets. Try the configured repo
+  # first so default public installs do not require SSH auth; keep the narrow
+  # GitHub SSH fallback for explicit private forks or transient HTTPS auth
+  # failures. Publish only after the binary exists, preserving the same
+  # no-partial-live-install guarantee as release archives.
+  clone_url="$SHDEPS_REPO"
+  if ! git clone --depth 1 "$clone_url" "$staging"; then
+    if [[ -z "$fallback" || "$fallback" == "$clone_url" ]]; then
+      rm -rf "$staging"
+      return 1
+    fi
     rm -rf "$staging"
-    return 1
+    staging=$(mktemp -d "$parent/.shdeps-source-build.XXXXXX") || return 1
+    if ! git clone --depth 1 "$fallback" "$staging"; then
+      rm -rf "$staging"
+      return 1
+    fi
   fi
   if ! (cd "$staging" && cargo build --release --locked); then
     rm -rf "$staging"

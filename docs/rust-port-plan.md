@@ -145,8 +145,8 @@ Runtime GitHub credential precedence should be `GH_TOKEN`, then
 `GITHUB_TOKEN`, then `gh auth token`. `GH_TOKEN` is an intentional
 compatibility-safe expansion over the Bash reference so CI and fleet bootstrap
 can provide explicit credentials without depending on a host-level `gh` login.
-For private repositories and private release assets, the installer needs the
-same credential plan; see [Private Repository Bootstrap](#private-repository-bootstrap).
+For explicit private forks or private release assets, the installer needs the
+same credential plan; see [Public Release Bootstrap](#public-release-bootstrap).
 
 The installer and sourceable bootstrap have their own compatibility variables:
 
@@ -841,22 +841,22 @@ Responsibilities:
 The packaging script must be runnable locally so release behavior is
 reproducible outside GitHub Actions.
 
-## Private Repository Bootstrap
+## Public Release Bootstrap
 
 This is the biggest release/distribution edge case.
 
-Dotfiles currently handles `shdeps` as a private repo in at least some paths and
-falls back from public HTTPS to SSH clone. SSH clone credentials are not the
-same thing as credentials for downloading private GitHub release assets. A
-machine that can `git clone git@github.com:cgraf78/shdeps.git` may still be
-unable to download private release assets over the GitHub Releases API.
+`shdeps` is public, so default bootstrap should prefer the public release and
+HTTPS paths. SSH clone credentials are not a substitute for release assets: they
+can be useful for explicit forks or custom source installs, but fleet bootstrap
+should not require GitHub SSH auth to install `cgraf78/shdeps`.
 
 The installer should therefore support this order:
 
 1. Use an existing dev clone when present.
 2. Use an existing installed binary when present.
-3. Download a matching release artifact when release credentials are available.
-4. Build from source when `cargo` is available.
+3. Download a matching public release artifact.
+4. Build from source over the configured repo URL when `cargo` is available,
+   falling back to SSH only when the configured HTTPS repo cannot be cloned.
 5. Use the legacy Bash implementation only during the transition window.
 6. Fail clearly with remediation text when none of the above can work.
 
@@ -866,12 +866,8 @@ Release artifact credentials should be detected in this order:
 2. `GITHUB_TOKEN`
 3. `gh auth token`
 
-If shdeps releases remain private, fleet bootstrap must provide one of those
-credentials or ensure `cargo` is already installed. If this is not acceptable,
-the release assets need to be public even if the source repo remains private, or
-the source repo must remain public.
-
-Do not assume SSH auth can download release assets.
+Do not assume SSH auth can download release assets, and do not require SSH auth
+for the default public `cgraf78/shdeps` bootstrap path.
 
 ## Self-Update Plan
 

@@ -25,7 +25,7 @@ _shdeps() {
     '(-c --config)'{-c,--config}'[Config directory or file]:config path:_directories'
     '(-f --force)'{-f,--force}'[Bypass TTL cache]'
     '(-R --reinstall)'{-R,--reinstall}'[Force reinstall all dependencies]'
-    '(-q --quiet)'{-q,--quiet}'[Suppress interactive prompts]'
+    '(-q --quiet)'{-q,--quiet}'[Suppress non-result output and interactive prompts]'
     '(-v --verbose)'{-v,--verbose}'[Verbose output]'
     '(-h --help)'{-h,--help}'[Show help message]'
   )

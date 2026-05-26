@@ -98,7 +98,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`          | Cache/state directory                                                                                                                                                                 |
 | `SHDEPS_FORCE`       | `0`                                                     | Bypass TTL cache (check for updates now)                                                                                                                                              |
 | `SHDEPS_REINSTALL`   | `0`                                                     | Force reinstall all deps                                                                                                                                                              |
-| `SHDEPS_QUIET`       | `0`                                                     | Suppress interactive prompts                                                                                                                                                          |
+| `SHDEPS_QUIET`       | `0`                                                     | Suppress non-result output and interactive prompts                                                                                                                                         |
 | `SHDEPS_REMOTE_TTL`  | `3600`                                                  | Cache TTL in seconds                                                                                                                                                                  |
 | `SHDEPS_GIT_DEV_DIR` | `~/git`                                                 | Dev clone directory used only by `github:repo` deps (prefers `<dir>/<repo>` over a managed clone)                                                                                     |
 | `SHDEPS_INSTALL_DIR` | `~/.local/share`                                        | Base directory for shdeps-owned install roots (`github:repo`, archive-style `github:release`, `cargo`, `go`, `uv`, `npm`). Raw release binaries install into `SHDEPS_BIN_DIR` instead. |
@@ -290,7 +290,7 @@ Options:
   -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
   -f, --force           Bypass TTL cache (check for updates now)
   -R, --reinstall       Force reinstall all dependencies (implies --force)
-  -q, --quiet           Suppress interactive prompts
+  -q, --quiet           Suppress non-result output and interactive prompts
   -v, --verbose         Verbose output (log level 2)
 
 Prune options:

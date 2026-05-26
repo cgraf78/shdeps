@@ -16,7 +16,7 @@
 #   SHDEPS_STATE_DIR    Cache/state directory       (default: $XDG_STATE_HOME/shdeps)
 #   SHDEPS_FORCE        Bypass TTL cache            (default: 0)
 #   SHDEPS_REINSTALL    Force reinstall all deps    (default: 0)
-#   SHDEPS_QUIET        Suppress interactive prompts(default: 0)
+#   SHDEPS_QUIET        Suppress non-result output and interactive prompts (default: 0)
 #   SHDEPS_REMOTE_TTL   Cache TTL in seconds        (default: 3600)
 #   SHDEPS_GIT_DEV_DIR  Dev clone directory          (default: ~/git)
 #   SHDEPS_INSTALL_DIR  Base dir for github installs (default: ~/.local/share)
