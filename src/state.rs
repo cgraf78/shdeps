@@ -231,16 +231,14 @@ enum LockResult {
 
 #[cfg(unix)]
 fn lock_file(file: &File, mode: LockMode) -> Result<LockResult> {
-    let mut operation = LOCK_EX;
+    let mut operation = libc::LOCK_EX;
     if mode == LockMode::NonBlocking {
-        operation |= LOCK_NB;
+        operation |= libc::LOCK_NB;
     }
 
-    // Use the platform `flock(2)` API directly instead of introducing a crate
-    // just for one syscall. shdeps supports Unix-like targets (Linux, WSL, and
-    // macOS), and keeping the lock implementation here makes the concurrency
-    // contract obvious next to the atomic state writer it protects.
-    let rc = unsafe { flock(file.as_raw_fd(), operation) };
+    // Keep the lock implementation in this module so the concurrency
+    // contract sits next to the atomic state writer it protects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
     if rc == 0 {
         return Ok(LockResult::Acquired);
     }
@@ -266,22 +264,9 @@ impl Drop for StateLock {
         // case the parent owns the real lock and we have nothing to
         // unlock here.
         if let Some(file) = self.file.as_ref() {
-            let _ = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         }
     }
-}
-
-#[cfg(unix)]
-const LOCK_EX: i32 = 2;
-#[cfg(unix)]
-const LOCK_NB: i32 = 4;
-#[cfg(unix)]
-const LOCK_UN: i32 = 8;
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-    fn getppid() -> i32;
 }
 
 /// True when the current process is a legitimate reentry from a lock-holding
@@ -313,7 +298,7 @@ fn is_legitimate_reentry() -> bool {
         // SAFETY: `getppid` is a non-failing POSIX syscall on all
         // Unix targets Rust supports. It takes no arguments and
         // cannot fault.
-        let actual_parent = unsafe { getppid() };
+        let actual_parent = unsafe { libc::getppid() };
         actual_parent == expected_parent_pid && actual_parent > 0
     }
     #[cfg(not(unix))]
@@ -387,7 +372,7 @@ mod tests {
         // parent PID (`getppid`) for the guard to fire. Use it
         // directly rather than a literal "1" so the test exercises
         // the PID-binding contract, not just env-presence.
-        let parent_pid = unsafe { super::getppid() };
+        let parent_pid = unsafe { libc::getppid() };
         // SAFETY: env mutation is serialized by `ENV_TEST_LOCK`;
         // value is reverted before the lock is released.
         unsafe {
