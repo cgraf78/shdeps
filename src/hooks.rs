@@ -134,7 +134,24 @@ fn hook_max_bytes() -> usize {
 /// Generated Bash compatibility layer for Rust hook subprocesses.
 pub mod prelude;
 
+// Each hook bash script begins with `export SHDEPS_STATE_LOCK_HELD=$$`,
+// which re-binds the lock-reentry env var to THIS bash process's PID.
+// The parent Rust process wrote the var with its OWN PID via
+// `apply_hook_env`, which would make the recursive `shdeps` invocation's
+// `getppid()` mismatch — the recursive child's parent is this bash, not
+// the Rust grandparent. Without the re-bind, a hook that calls
+// `shdeps update` / `shdeps prune` against the same state dir would
+// deadlock waiting for the lock its grandparent still holds. With the
+// re-bind, the recursive child's `getppid()` equals the new env value
+// (= our `$$`), `is_legitimate_reentry` fires, and the lock acquisition
+// becomes a no-op guard.
+//
+// User-export-bypass remains blocked: a user shell init that exported
+// `SHDEPS_STATE_LOCK_HELD=1` is overridden by our `$$` re-export when
+// their shell goes through a hook, and a top-level `shdeps` invocation
+// (no hook in the chain) never sees the bash re-export at all.
 const STATUS_SCRIPT: &str = r#"
+export SHDEPS_STATE_LOCK_HELD=$$
 name=$1
 lib=$2
 hook=$3
@@ -157,6 +174,7 @@ fi
 "#;
 
 const UNINSTALL_SCRIPT: &str = r#"
+export SHDEPS_STATE_LOCK_HELD=$$
 name=$1
 lib=$2
 hook=$3
@@ -175,6 +193,7 @@ uninstall "$name"
 "#;
 
 const INSTALL_SCRIPT: &str = r#"
+export SHDEPS_STATE_LOCK_HELD=$$
 name=$1
 lib=$2
 hook=$3
@@ -205,6 +224,7 @@ fi
 "#;
 
 const POST_SCRIPT: &str = r#"
+export SHDEPS_STATE_LOCK_HELD=$$
 name=$1
 lib=$2
 hook=$3
