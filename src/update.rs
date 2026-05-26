@@ -93,10 +93,15 @@ pub struct Summary {
     /// At that point the dependency should remain usable even if deleting old
     /// artifacts fails, so cleanup failures are tracked separately from
     /// install failures instead of rolling back the successful method switch.
-    /// Note: these are real I/O failures from `cleanup_snapshot` (permission
-    /// denied, read-only filesystem, etc.) — not "expected-leftover" cases.
-    /// They gate the run's exit code via `has_errors` so an operator who
-    /// trusts the exit code does not miss a silently-broken transition.
+    /// These are real I/O failures from `cleanup_snapshot` (permission
+    /// denied, read-only filesystem, etc.).
+    ///
+    /// By default `has_errors` does NOT count leftovers as run failures —
+    /// promoting them would be a backwards-incompatible behavior change
+    /// for CI pipelines and dotfiles bootstraps that previously saw
+    /// silent leftover state. Operators that want exit-code enforcement
+    /// can opt in with `SHDEPS_STRICT_LEFTOVERS=1`, which is checked by
+    /// `has_errors`.
     pub leftovers: Vec<String>,
 }
 
@@ -140,15 +145,30 @@ where
 impl Summary {
     /// Returns whether the update had any failure.
     ///
-    /// Both install failures and cleanup-step leftovers gate the exit
-    /// code: a leftover means an I/O error left old-method artifacts on
-    /// disk, which is a state operators must repair. Pretending the run
-    /// succeeded would let the leftover accumulate silently until the
-    /// next manual audit.
+    /// Install failures always gate the exit code. Cleanup-step
+    /// leftovers gate the exit code only when
+    /// `SHDEPS_STRICT_LEFTOVERS=1` is set in the environment.
+    /// Promoting leftovers to a failure unconditionally would be a
+    /// backwards-incompatible behavior change: pre-fix code reported
+    /// every transient cleanup error silently, so CI pipelines and
+    /// dotfiles bootstraps that assert `shdeps update` exit 0 would
+    /// suddenly start failing for previously-tolerated I/O errors.
+    /// The env-var opt-in lets operators who want strict cleanup
+    /// gating enable it without breaking everyone else's quiet path.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        !self.failed.is_empty() || !self.leftovers.is_empty()
+        if !self.failed.is_empty() {
+            return true;
+        }
+        if !self.leftovers.is_empty() && strict_leftovers() {
+            return true;
+        }
+        false
     }
+}
+
+fn strict_leftovers() -> bool {
+    std::env::var_os("SHDEPS_STRICT_LEFTOVERS").is_some_and(|value| value == "1")
 }
 
 /// Runs update for already-parsed entries.
@@ -3397,18 +3417,36 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
-    fn summary_has_errors_promotes_leftovers_to_run_exit_signal() {
-        // Pure unit test of the Summary contract: a leftover means a
-        // real I/O error in cleanup_snapshot left old-method artifacts
-        // on disk. That state must gate the run's exit code so a script
-        // that trusts `shdeps update` exit 0 does not accumulate
-        // unreachable state.
+    fn summary_has_errors_only_promotes_leftovers_when_strict_mode_enabled() {
+        // Backwards-compat: pre-fix behavior was that leftover I/O
+        // errors did NOT gate the exit code. Audit feedback flagged
+        // an unconditional promotion as a real CI/bootstrap break
+        // risk. The compromise: leftovers gate exit only under
+        // `SHDEPS_STRICT_LEFTOVERS=1`. Default mode preserves the
+        // historical quiet behavior; strict mode is the opt-in for
+        // operators who want hard enforcement.
         let mut summary = Summary::default();
         assert!(!summary.has_errors());
         summary.leftovers.push("owner/tool".to_owned());
+        // SAFETY: single-threaded test context; value reverted before
+        // exit so other tests are unaffected.
+        unsafe {
+            std::env::remove_var("SHDEPS_STRICT_LEFTOVERS");
+        }
         assert!(
-            summary.has_errors(),
-            "a leftover must surface through has_errors so the run exits non-zero"
+            !summary.has_errors(),
+            "leftover must NOT gate exit by default — that would be a CI regression"
+        );
+        unsafe {
+            std::env::set_var("SHDEPS_STRICT_LEFTOVERS", "1");
+        }
+        let strict_result = summary.has_errors();
+        unsafe {
+            std::env::remove_var("SHDEPS_STRICT_LEFTOVERS");
+        }
+        assert!(
+            strict_result,
+            "leftover must gate exit when SHDEPS_STRICT_LEFTOVERS=1 is set"
         );
     }
 

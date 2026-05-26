@@ -72,14 +72,6 @@ pub fn run(
     hooks: &BashCustomProbe,
     options: Options,
 ) -> Result<Summary> {
-    // Hold the same state-directory advisory lock that `update::run`
-    // uses. Prune mutates the manifest, link-state files, and the
-    // install/bin trees; a concurrent update or another prune run
-    // would otherwise see/write inconsistent state. Acquired here
-    // (not in dry-run paths below) so even a dry-run reports against
-    // a consistent snapshot rather than racing an in-flight update.
-    let _lock = crate::state::StateLock::acquire(&roots.state_dir)?;
-
     let orphans = orphans(manifest, config);
     // The "all orphans" guard prevents a silent bulk-delete of every
     // shdeps-tracked dep without explicit `--yes`. The pre-fix gate
@@ -88,10 +80,21 @@ pub fn run(
     // non-empty but every manifest entry is still about to be deleted
     // — e.g., a filtered config whose declared names do not match any
     // currently-tracked dep, or a config that renames everything in
-    // one go. Gating on `orphans.len() == manifest.entries().len()`
-    // catches every "you're about to delete everything" scenario.
+    // one go. Compare by UNIQUE manifest names rather than raw row
+    // counts: the manifest format allows duplicate rows (it is the
+    // last-row-wins source of truth), and a comparison against raw
+    // `entries().len()` would let a manifest containing one duplicate
+    // row for a configured dep silently disarm the guard even when
+    // every other tracked dep is about to be pruned.
+    let unique_manifest_deps: std::collections::BTreeSet<&str> = manifest
+        .entries()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let unique_orphan_deps: std::collections::BTreeSet<&str> =
+        orphans.iter().map(|entry| entry.name.as_str()).collect();
     let prunes_everything =
-        !manifest.entries().is_empty() && orphans.len() == manifest.entries().len();
+        !unique_manifest_deps.is_empty() && unique_orphan_deps.len() == unique_manifest_deps.len();
     if prunes_everything && !options.yes {
         return Ok(Summary {
             orphans,
@@ -116,6 +119,16 @@ pub fn run(
             quiet_skipped: true,
         });
     }
+
+    // Acquire the state-directory advisory lock only after the
+    // dry-run / empty / quiet-skip early-returns. A long `shdeps
+    // update` holding the lock can take minutes (network + package
+    // manager work); making `prune --dry-run` block on that lock
+    // would be a UX regression for what is supposed to be a fast
+    // read-only preview. Real mutation paths below this point need
+    // the lock to keep manifest writes and link-state mutations
+    // coherent with a concurrent update.
+    let _lock = crate::state::StateLock::acquire(&roots.state_dir)?;
 
     let cleanup_roots = cleanup_roots(roots);
     let mut removed = Vec::new();
