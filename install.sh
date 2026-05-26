@@ -439,10 +439,20 @@ _verify_checksum() {
 # relative path with no `..` components. The list step uses `tar -tzf`,
 # which is supported by both GNU tar and the BSD tar shipped on macOS,
 # so the bootstrap script does not depend on a platform-specific
-# `--no-absolute-filenames` flag. Mirrors the structural defense the
-# Rust extractor (`archive.rs`) applies — keeping the two
-# implementations consistent prevents the curl-pipe path from being a
-# softer target than the steady-state Rust path.
+# `--no-absolute-filenames` flag.
+#
+# **Divergence from `archive.rs`:** the Rust extractor's structural
+# defense also rejects symlink and hardlink entries inside the
+# archive (see `archive::reject_links`). `tar -tzf` emits only path
+# names, so this Bash guard CANNOT distinguish a regular file from a
+# symlink/hardlink — it accepts a symlink entry like `evil ->
+# /etc/passwd` based on the path "evil" alone. In practice the
+# curl-pipe install path verifies the SHA-256 of the entire archive
+# BEFORE calling this guard, so an attacker would also need to
+# compromise the publisher's `.sha256` file to exploit the
+# symlink-blind gap. If parity with the Rust extractor matters for a
+# future code path that calls this without the upstream checksum,
+# switch to `tar -tzvf` and parse the leading mode char.
 _archive_entries_safe() {
   local archive="$1" entry
   if ! command -v tar >/dev/null 2>&1; then

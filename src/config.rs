@@ -169,13 +169,21 @@ pub fn parse_config_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<S
 
 /// Deduplicates entries by dependency name, keeping the LAST occurrence.
 ///
-/// Two-pass: first walk records the index of each name's last occurrence,
-/// then a second walk keeps only entries whose index matches. This is
-/// stable with respect to load order (caller's order is preserved for the
-/// surviving records) and runs in O(n) time on top of one `HashMap` —
-/// suitable for the few-hundred-deps scale we expect in practice without
-/// introducing a sort-then-dedup that would silently reorder load order
-/// for clients that rely on `parse_config_texts` directly.
+/// Two-pass: first walk records the index of each name's last
+/// occurrence, then a second walk keeps only entries whose index
+/// matches. The dedupe DECISION is stable with respect to load order
+/// (the latest occurrence per name is the one that survives), and the
+/// SURVIVING entries are returned in their original load-order
+/// positions — `parse_config_texts` and `load_dir` then pass that
+/// result through `sort_entries`, so the user-visible final order is
+/// sort order, NOT load order. Callers that need load-order output
+/// must call this helper directly and skip the sort.
+///
+/// Runs in O(n) time on top of one `HashMap` — suitable for the
+/// few-hundred-deps scale we expect in practice. The `HashMap<String,
+/// usize>` does allocate one owned `String` per unique name; a
+/// `&str`-keyed map would avoid that but require borrow gymnastics
+/// that are not worth the noise at this scale.
 fn dedupe_last_wins(entries: Vec<String>) -> Vec<String> {
     use std::collections::HashMap;
     let mut last_seen: HashMap<String, usize> = HashMap::new();

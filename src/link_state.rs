@@ -50,13 +50,17 @@ pub fn read(path: &Path) -> Result<Vec<PathBuf>> {
 
 /// Writes tracked links, removing the state file when there is nothing to track.
 ///
-/// Returns `InvalidInput` if any link path contains a newline. The
-/// on-disk format is newline-delimited, so embedded newlines would
-/// split a single path into two phantom paths on the next `read` —
-/// silently corrupting cleanup state. POSIX permits newlines in
-/// filenames but no real install method shdeps drives produces them;
-/// surfacing this as an error catches a misbehaving hook or upstream
-/// archive rather than letting the bad data round-trip.
+/// Returns `InvalidInput` if any link path contains a newline (`\n`)
+/// OR a carriage return (`\r`). The on-disk format is newline-
+/// delimited, so an embedded `\n` would split a single path into two
+/// phantom paths on the next `read` — silently corrupting cleanup
+/// state. A trailing `\r` is rejected on the same grounds: it would
+/// survive `str::lines` parsing as part of the path and create a
+/// stored value that no later filesystem call can match. POSIX
+/// permits both characters in filenames but no real install method
+/// shdeps drives produces them; surfacing this as an error catches
+/// a misbehaving hook or upstream archive rather than letting the
+/// bad data round-trip.
 pub fn write(path: &Path, links: &[PathBuf]) -> Result<()> {
     if links.is_empty() {
         match fs::remove_file(path) {
