@@ -1961,6 +1961,76 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_refuses_install_when_checksum_asset_is_unavailable() {
+        // Round-6 paladin finding: when the release JSON advertises a
+        // `.sha256` sibling but the checksum download fails, the
+        // installer must NOT land an unverified binary AND must NOT
+        // write a manifest entry. The earlier soft-fail returned
+        // `failed: false` which let the caller's `write_manifest`
+        // record a phantom row pointing at a bin path that did not
+        // exist on first install.
+        let mut fixture = Fixture::new("release-checksum-unavailable");
+        fixture.write_lib();
+        let binary = b"binary".to_vec();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[
+                        {
+                            "name":"tool-linux-x86_64",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        },
+                        {
+                            "name":"tool-linux-x86_64.sha256",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256"
+                        }
+                    ]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                binary,
+            );
+        // No `.with(...)` entry for the .sha256 URL: the fake client
+        // returns NotFound for it, mirroring a transient checksum-only
+        // outage that the soft-fail path used to silently install
+        // through.
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(
+            summary.has_errors(),
+            "checksum-unavailable must surface as a failure"
+        );
+        assert!(
+            summary.items[0].detail.contains("checksum unavailable"),
+            "detail must explain why: got {:?}",
+            summary.items[0].detail
+        );
+        // Critical: no phantom manifest row, no installed binary.
+        assert!(!fixture.roots.bin_dir.join("tool").exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn update_github_release_sends_token_to_metadata_only() {
         let mut fixture = Fixture::new("release-token");
         fixture.write_lib();

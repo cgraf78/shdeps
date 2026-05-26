@@ -373,20 +373,20 @@ pub(crate) fn install_request(
             }
             Err(_) => {
                 // The checksum asset was advertised in the release JSON
-                // but not retrievable. Surfacing this as a hard failure
-                // would let any transient checksum-only outage block
-                // installs even for releases that previously succeeded.
-                // Continue with the unverified binary but mark the run
-                // with a descriptive detail so operators can investigate.
-                return Ok(ReleaseOutcome {
-                    changed: false,
-                    failed: false,
-                    detail: format!("{}: checksum unavailable", selection.tag),
-                    // No install ran and the integrity check could not be
-                    // performed; do not refresh the stamp so the next run
-                    // retries the verification.
-                    stamp: false,
-                });
+                // but not retrievable. No install ran (we are NOT going
+                // to land an unverified binary), but we also do not
+                // refresh the TTL stamp so the next run retries the
+                // verification.
+                //
+                // Failure-mode: report as `failed: true` rather than the
+                // earlier soft `failed: false`. The earlier shape let
+                // the caller's unconditional `write_manifest` run on
+                // the success path, recording a manifest row pointing
+                // at a `bin_dir/cmd` that does not exist on disk for
+                // first-time installs. Treating the unavailable
+                // checksum as a real failure keeps the manifest from
+                // advertising a binary the user does not have.
+                return Ok(failed(&format!("{}: checksum unavailable", selection.tag)));
             }
         }
     }
