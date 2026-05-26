@@ -42,10 +42,14 @@ pub fn one(bin_dir: &Path, cmd: &str, source: &Path) -> Result<Link> {
 
     #[cfg(unix)]
     {
+        // Use if-else as an expression so neither branch needs a
+        // `return` — clippy's `needless_return` lint flags trailing
+        // `return` inside a function-final block.
         if crate::extras::replace_symlink(source, &target)? {
-            return Ok(Link::Linked(target));
+            Ok(Link::Linked(target))
+        } else {
+            Ok(Link::Preserved(target))
         }
-        return Ok(Link::Preserved(target));
     }
     #[cfg(not(unix))]
     {
