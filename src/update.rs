@@ -3294,6 +3294,134 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_repo_existing_clone_pull_failure_reports_dirty_tree_cause() {
+        // When `git pull` fails on a managed clone, the user-visible
+        // detail must tell the operator WHY: dirty working tree vs
+        // network/fast-forward problem. The pre-fix code lumped both
+        // into the opaque "update failed", which gave no signal that a
+        // local edit had diverged the managed clone.
+        let fixture = Fixture::new("repo-pull-dirty");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        let runner = FakeRunner::default()
+            // No SSH retry: pretend origin has no GitHub fallback.
+            .with_failure(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "get-url",
+                    "origin",
+                ],
+            )
+            .with_success(
+                "git",
+                ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"],
+                "head\n",
+            )
+            .with_failure(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+            )
+            // After the pull failure, `git status --porcelain` returns
+            // non-empty → dirty working tree branch.
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                ],
+                " M README.md\n",
+            );
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "pull failed (dirty working tree)");
+    }
+
+    #[test]
+    fn update_github_repo_existing_clone_pull_failure_reports_fast_forward_cause() {
+        // Clean tree but `git pull --ff-only` still fails — this is the
+        // network outage / non-FF case. The detail must distinguish it
+        // from the dirty-tree case so operators retry vs investigate.
+        let fixture = Fixture::new("repo-pull-clean");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        let runner = FakeRunner::default()
+            .with_failure(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "get-url",
+                    "origin",
+                ],
+            )
+            .with_success(
+                "git",
+                ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"],
+                "head\n",
+            )
+            .with_failure(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+            )
+            // After the pull failure, status returns empty → clean tree.
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                ],
+                "",
+            );
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "pull failed (no fast-forward)");
+    }
+
+    #[test]
     fn update_github_repo_existing_clone_retries_pull_with_ssh_origin() {
         let fixture = Fixture::new("repo-pull-fallback");
         fixture.write_lib();
