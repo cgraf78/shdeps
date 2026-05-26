@@ -169,10 +169,12 @@ mod tests {
             select_pair(&release, "linux-x86_64-musl"),
             Some(Pair {
                 archive_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz".to_owned(),
-                archive_url: "https://github.com/owner/tool/releases/download/v1/archive".to_owned(),
+                archive_url: "https://github.com/owner/tool/releases/download/v1/archive"
+                    .to_owned(),
                 archive_api_url: None,
                 checksum_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256".to_owned(),
-                checksum_url: "https://github.com/owner/tool/releases/download/v1/checksum".to_owned(),
+                checksum_url: "https://github.com/owner/tool/releases/download/v1/checksum"
+                    .to_owned(),
                 checksum_api_url: None,
             })
         );

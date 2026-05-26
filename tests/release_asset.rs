@@ -18,7 +18,9 @@ fn matches_rust_triple_for_platform_and_arch() {
 
     assert_eq!(
         select("tool", &urls, &linux()),
-        Some("https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-gnu.tar.gz")
+        Some(
+            "https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-gnu.tar.gz"
+        )
     );
 }
 
@@ -154,7 +156,9 @@ fn treats_tar_zst_as_archive() {
 
     assert_eq!(
         select("tool", &urls, &linux()),
-        Some("https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux.tar.zst")
+        Some(
+            "https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux.tar.zst"
+        )
     );
 }
 
@@ -177,17 +181,23 @@ fn prefers_matching_linux_libc() {
 
     assert_eq!(
         select("tool", &urls, &linux()),
-        Some("https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-gnu.tar.gz")
+        Some(
+            "https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-gnu.tar.gz"
+        )
     );
 }
 
 #[test]
 fn falls_back_to_available_linux_libc() {
-    let urls = ["https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-musl.tar.gz"];
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-musl.tar.gz",
+    ];
 
     assert_eq!(
         select("tool", &urls, &linux()),
-        Some("https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-musl.tar.gz")
+        Some(
+            "https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-musl.tar.gz"
+        )
     );
 }
 
@@ -201,7 +211,9 @@ fn prefers_exact_command_name_for_multi_binary_releases() {
 
     assert_eq!(
         select("codex", &urls, &linux()),
-        Some("https://github.com/owner/tool/releases/download/v1/codex-x86_64-unknown-linux-gnu.tar.gz")
+        Some(
+            "https://github.com/owner/tool/releases/download/v1/codex-x86_64-unknown-linux-gnu.tar.gz"
+        )
     );
 }
 
@@ -236,7 +248,8 @@ fn exact_command_name_accepts_common_separators_and_version_prefixes() {
 
 #[test]
 fn falls_back_to_non_exact_when_no_exact_asset_exists() {
-    let urls = ["https://github.com/owner/tool/releases/download/v1/tool-extended-linux-amd64.tar.gz"];
+    let urls =
+        ["https://github.com/owner/tool/releases/download/v1/tool-extended-linux-amd64.tar.gz"];
 
     assert_eq!(
         select("tool", &urls, &linux()),
