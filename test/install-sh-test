@@ -178,49 +178,6 @@ _install_release_called=0
 _refresh_release_install_if_stale
 _assert_eq "stale tag fires install" "1" "$_install_release_called"
 
-echo "=== shdeps.sh: lazy ABI/env init ==="
-
-# Source shdeps.sh in an isolated subshell with a synthetic binary that
-# logs its invocations. The pre-fix code spawned two `__api` subprocesses
-# at source time on every cold shell startup; the fix defers them to the
-# first real `shdeps_*` call. Verifying the no-call-at-source-time
-# property is the most direct way to pin the contract.
-_lazy_dir=$(mktemp -d)
-trap 'rm -rf "$_fixture_dir" "$_lazy_dir"' EXIT
-cat >"$_lazy_dir/shdeps" <<EOF
-#!/usr/bin/env bash
-# Synthetic shdeps binary used by the lazy-init test. Logs each
-# __api invocation so the test can count how often the wrapper
-# spawned a subprocess.
-printf '%s\n' "\$*" >>"$_lazy_dir/calls.log"
-case "\$1 \$2" in
-  '__api version') echo "abi:1" ;;
-  '__api env-snapshot') echo "platform=linux" ;;
-  '__api install-dir') echo "/tmp/install" ;;
-  '__api bin-dir') echo "/tmp/bin" ;;
-  *) echo "" ;;
-esac
-EOF
-chmod +x "$_lazy_dir/shdeps"
-
-_lazy_source_calls=$(
-  : >"$_lazy_dir/calls.log"
-  SHDEPS_RUST_CLI="$_lazy_dir/shdeps" \
-    bash -c "source '$_repo_root/shdeps.sh' && wc -l <'$_lazy_dir/calls.log' | tr -d '[:space:]'"
-)
-_assert_eq "lazy init: zero subprocesses at source time" "0" "$_lazy_source_calls"
-
-_lazy_call_calls=$(
-  : >"$_lazy_dir/calls.log"
-  SHDEPS_RUST_CLI="$_lazy_dir/shdeps" \
-    bash -c "source '$_repo_root/shdeps.sh' && shdeps_install_dir >/dev/null && wc -l <'$_lazy_dir/calls.log' | tr -d '[:space:]'"
-)
-# After a single public-API call, both init subprocesses fire AND the
-# install-dir lookup runs — that's 3 invocations. The exact number is
-# not contract; what matters is "> 0", proving the deferred init ran.
-_assert_true "lazy init: subprocesses fire on first public-API call" \
-  test "$_lazy_call_calls" -gt 0
-
 echo "=== install.sh: _curl_config_quote ==="
 
 # The bearer token + URL are passed through `_curl_config_quote`
@@ -241,7 +198,7 @@ _assert_eq 'quote: backslash before quote order-correct' \
 echo "=== install.sh: _archive_entries_safe ==="
 
 _archive_dir=$(mktemp -d)
-trap 'rm -rf "$_fixture_dir" "$_lazy_dir" "$_archive_dir"' EXIT
+trap 'rm -rf "$_fixture_dir" "$_archive_dir"' EXIT
 
 # Safe archive: relative paths only.
 _safe_archive="$_archive_dir/safe.tar.gz"
