@@ -20,6 +20,16 @@ use crate::tool_version;
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_POLL: Duration = Duration::from_millis(10);
+/// Grace window between SIGTERM and SIGKILL for a timed-out child.
+///
+/// Sending SIGKILL immediately (Rust's `Child::kill`) skips the
+/// child's signal handlers, which matters for tools that print a
+/// usage/version line on SIGTERM (some shells), maintain TTY state
+/// they need to restore (vim, less), or own a sub-process group they
+/// want to clean up. 250ms is short enough that the worst-case
+/// timeout extension is barely perceptible on a `list`/`status`
+/// warm path, but long enough for typical handlers to run.
+const SIGTERM_GRACE: Duration = Duration::from_millis(250);
 
 /// Captured subprocess output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,16 +291,49 @@ fn run(program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Ou
             return child.wait_with_output().map(convert_output);
         }
         if Instant::now() >= deadline {
-            // Version probes are intentionally best-effort. Killing the child
-            // is preferable to letting a tool like an editor block `list` or
-            // `check` indefinitely on a warm path.
-            let _ = child.kill();
+            // Version probes are intentionally best-effort. Send SIGTERM
+            // first so the child can run its signal handlers (TTY
+            // restoration, sub-process-group cleanup) within a short
+            // grace window, then SIGKILL if it has not exited. This
+            // mirrors POSIX shells' default behavior for `timeout(1)`.
+            terminate_then_kill(&mut child);
             let mut output = child.wait_with_output().map(convert_output)?;
             output.timed_out = true;
             return Ok(output);
         }
         thread::sleep(WAIT_POLL);
     }
+}
+
+/// Sends SIGTERM, waits up to `SIGTERM_GRACE`, and then SIGKILLs if the
+/// child has not exited. Best-effort: all failures are ignored because
+/// the caller is already in a timeout path and any further error would
+/// be reported as the timed-out variant either way.
+fn terminate_then_kill(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Direct `libc::kill`-style syscall through the same `extern "C"`
+        // pattern `state::lock_file` uses. Avoids pulling in a crate just
+        // for `kill(2)`. PID is i32 on every Unix Rust supports.
+        unsafe {
+            kill(child.id() as i32, SIGTERM);
+        }
+        let grace_deadline = Instant::now() + SIGTERM_GRACE;
+        while Instant::now() < grace_deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(WAIT_POLL);
+        }
+    }
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
 }
 
 fn convert_output(output: std::process::Output) -> Output {
