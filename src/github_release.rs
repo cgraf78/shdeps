@@ -19,6 +19,8 @@ pub struct Selection {
     pub tag: String,
     /// Download URL for the host-compatible install asset.
     pub url: String,
+    /// REST API URL for authenticated private-release fallback.
+    pub api_url: Option<String>,
 }
 
 /// Returns the release that GitHub would expose as "latest" for third-party deps.
@@ -55,10 +57,16 @@ pub fn select(
         .collect::<Vec<_>>();
     let target = target(env, runner);
     let url = release_asset::select(cmd, &urls, &target)?.to_owned();
+    let api_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.url == url)
+        .and_then(|asset| asset.api_url.clone());
 
     Some(Selection {
         tag: release.tag.clone(),
         url,
+        api_url,
     })
 }
 
@@ -130,6 +138,7 @@ mod tests {
             Some(super::Selection {
                 tag: "v1.8.0".to_owned(),
                 url: "https://example/tool-v1.8.0-linux-x86_64.tar.gz".to_owned(),
+                api_url: None,
             })
         );
     }
@@ -182,6 +191,36 @@ mod tests {
     }
 
     #[test]
+    fn select_keeps_api_asset_url_for_private_download_fallback() {
+        let releases = vec![Release {
+            tag: "v1.0.0".to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: vec![Asset {
+                name: "tool-linux-x86_64".to_owned(),
+                url: "https://private.example/tool-linux-x86_64".to_owned(),
+                api_url: Some(
+                    "https://api.github.com/repos/owner/tool/releases/assets/7".to_owned(),
+                ),
+            }],
+        }];
+        let runner = FakeRunner::new("x86_64", "");
+
+        assert_eq!(
+            select(
+                "tool",
+                &releases,
+                &RuntimeEnv::new("linux", "host"),
+                &runner
+            )
+            .unwrap()
+            .api_url
+            .as_deref(),
+            Some("https://api.github.com/repos/owner/tool/releases/assets/7")
+        );
+    }
+
+    #[test]
     fn select_preserves_github_latest_order_instead_of_sorting_tags() {
         let releases = vec![
             release("v1.0.0", false, false, &["tool-v1.0.0-linux-x86_64.tar.gz"]),
@@ -212,6 +251,7 @@ mod tests {
                 .map(|name| Asset {
                     name: (*name).to_owned(),
                     url: format!("https://example/{name}"),
+                    api_url: None,
                 })
                 .collect(),
         }

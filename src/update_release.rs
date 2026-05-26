@@ -75,14 +75,6 @@ impl Prefetch {
     fn version(&self, name: &str) -> Option<&str> {
         self.versions.get(name).map(String::as_str)
     }
-
-    fn token(&self, env: &impl Env, runner: &impl Runner) -> Option<String> {
-        if self.token_resolved {
-            self.token.clone()
-        } else {
-            github::token(env, runner)
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -314,8 +306,13 @@ pub(crate) fn install_request(
     else {
         return Ok(failed("no matching release asset"));
     };
-    let token = context.prefetch.token(&env, context.runner);
-    let bytes = match context.client.get(&selection.url, token.as_deref()) {
+    let asset_token = github_token(&env, context);
+    let bytes = match github::download_asset(
+        context.client,
+        &selection.url,
+        selection.api_url.as_deref(),
+        asset_token.as_deref(),
+    ) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(failed("release asset download failed")),
     };
@@ -426,6 +423,13 @@ fn fetch_releases_with_token(
     let bytes = client.get(&github::releases_url(repo), token)?;
     let json = String::from_utf8_lossy(&bytes);
     github::parse_releases(&json)
+}
+
+fn github_token(env: &impl Env, context: &RequestContext<'_, impl Runner>) -> Option<String> {
+    if context.prefetch.token_resolved {
+        return context.prefetch.token.clone();
+    }
+    github::token(env, context.runner)
 }
 
 fn link_existing_extras(roots: &Roots, name: &str) -> Result<()> {

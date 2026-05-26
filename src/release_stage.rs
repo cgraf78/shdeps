@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::archive;
 use crate::checksum;
+use crate::github;
 use crate::http::Client;
 use crate::release_artifact::Pair;
 
@@ -85,12 +86,20 @@ pub fn stage(
     token: Option<&str>,
     client: &impl Client,
 ) -> Result<Staged, Failure> {
-    let archive_bytes = client
-        .get(&pair.archive_url, token)
-        .map_err(Failure::ArchiveDownload)?;
-    let checksum_bytes = client
-        .get(&pair.checksum_url, token)
-        .map_err(Failure::ChecksumDownload)?;
+    let archive_bytes = github::download_asset(
+        client,
+        &pair.archive_url,
+        pair.archive_api_url.as_deref(),
+        token,
+    )
+    .map_err(Failure::ArchiveDownload)?;
+    let checksum_bytes = github::download_asset(
+        client,
+        &pair.checksum_url,
+        pair.checksum_api_url.as_deref(),
+        token,
+    )
+    .map_err(Failure::ChecksumDownload)?;
     let checksum_text = String::from_utf8_lossy(&checksum_bytes);
 
     if !checksum::verify(&checksum_text, &pair.archive_name, &archive_bytes) {
@@ -173,10 +182,7 @@ mod tests {
 
         assert_eq!(staged.tag, "v2026.05.24");
         assert_eq!(fs::read(staged.dir.join("shdeps")).unwrap(), b"binary");
-        assert_eq!(
-            client.tokens(),
-            vec![Some("token".to_owned()), Some("token".to_owned())]
-        );
+        assert_eq!(client.tokens(), vec![None, None]);
     }
 
     #[test]
@@ -245,8 +251,10 @@ mod tests {
                 parent,
                 pair: Pair {
                     archive_url: format!("https://example/{archive_name}"),
+                    archive_api_url: None,
                     archive_name,
                     checksum_url: format!("https://example/{checksum_name}"),
+                    checksum_api_url: None,
                     checksum_name,
                 },
             }

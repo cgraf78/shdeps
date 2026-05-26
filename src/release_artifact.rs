@@ -19,10 +19,14 @@ pub struct Pair {
     pub archive_name: String,
     /// Archive download URL.
     pub archive_url: String,
+    /// REST API URL for authenticated archive fallback.
+    pub archive_api_url: Option<String>,
     /// Expected checksum file name from the release contract.
     pub checksum_name: String,
     /// Checksum download URL.
     pub checksum_url: String,
+    /// REST API URL for authenticated checksum fallback.
+    pub checksum_api_url: Option<String>,
 }
 
 /// Returns the supported shdeps artifact label for the current host.
@@ -54,8 +58,10 @@ pub fn select_pair(release: &Release, platform_label: &str) -> Option<Pair> {
     Some(Pair {
         archive_name,
         archive_url: archive.url.clone(),
+        archive_api_url: archive.api_url.clone(),
         checksum_name,
         checksum_url: checksum.url.clone(),
+        checksum_api_url: checksum.api_url.clone(),
     })
 }
 
@@ -164,8 +170,10 @@ mod tests {
             Some(Pair {
                 archive_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz".to_owned(),
                 archive_url: "https://example/archive".to_owned(),
+                archive_api_url: None,
                 checksum_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256".to_owned(),
                 checksum_url: "https://example/checksum".to_owned(),
+                checksum_api_url: None,
             })
         );
         assert_eq!(select_pair(&release, "macos-aarch64"), None);
@@ -181,11 +189,13 @@ mod tests {
                 Asset {
                     name: String::new(),
                     url: "https://example/shdeps-v2026.05.24-macos-aarch64.tar.gz".to_owned(),
+                    api_url: None,
                 },
                 Asset {
                     name: String::new(),
                     url: "https://example/shdeps-v2026.05.24-macos-aarch64.tar.gz.sha256"
                         .to_owned(),
+                    api_url: None,
                 },
             ],
         };
@@ -213,6 +223,7 @@ mod tests {
                 .map(|(name, url)| Asset {
                     name: (*name).to_owned(),
                     url: (*url).to_owned(),
+                    api_url: None,
                 })
                 .collect(),
         }

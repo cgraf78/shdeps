@@ -14,6 +14,11 @@ use std::process::{Command, Stdio};
 pub trait Client: Sync {
     /// Downloads `url`, optionally adding a GitHub bearer token.
     fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>>;
+
+    /// Downloads a GitHub release asset through the REST asset endpoint.
+    fn get_github_asset(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+        self.get(url, token)
+    }
 }
 
 /// Production HTTP client backed by the host `curl` command.
@@ -22,7 +27,22 @@ pub struct Curl;
 
 impl Client for Curl {
     fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
-        let config = curl_config(url, token)?;
+        self.get_with_accept(url, token, GithubAccept::Json)
+    }
+
+    fn get_github_asset(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+        self.get_with_accept(url, token, GithubAccept::OctetStream)
+    }
+}
+
+impl Curl {
+    fn get_with_accept(
+        &self,
+        url: &str,
+        token: Option<&str>,
+        accept: GithubAccept,
+    ) -> io::Result<Vec<u8>> {
+        let config = curl_config(url, token, accept)?;
         let mut child = Command::new("curl")
             .args([
                 "--fail",
@@ -52,19 +72,40 @@ impl Client for Curl {
     }
 }
 
-fn curl_config(url: &str, token: Option<&str>) -> io::Result<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubAccept {
+    Json,
+    OctetStream,
+}
+
+impl GithubAccept {
+    const fn header(self) -> &'static str {
+        match self {
+            Self::Json => "Accept: application/vnd.github+json",
+            Self::OctetStream => "Accept: application/octet-stream",
+        }
+    }
+}
+
+fn curl_config(url: &str, token: Option<&str>, accept: GithubAccept) -> io::Result<String> {
     let mut config = String::new();
     push_config_line(&mut config, "url", url)?;
-    push_config_line(&mut config, "header", "User-Agent: shdeps")?;
-    push_config_line(&mut config, "header", "Accept: application/vnd.github+json")?;
-    if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
-        push_config_line(
-            &mut config,
-            "header",
-            &format!("Authorization: Bearer {}", token.trim()),
-        )?;
+    push_config_line(&mut config, "user-agent", "shdeps")?;
+    if is_github_api_url(url) {
+        push_config_line(&mut config, "header", accept.header())?;
+        if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
+            push_config_line(
+                &mut config,
+                "header",
+                &format!("Authorization: Bearer {}", token.trim()),
+            )?;
+        }
     }
     Ok(config)
+}
+
+fn is_github_api_url(url: &str) -> bool {
+    url.starts_with("https://api.github.com/")
 }
 
 fn push_config_line(config: &mut String, key: &str, value: &str) -> io::Result<()> {
@@ -95,31 +136,69 @@ fn curl_quote(value: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::curl_config;
+    use super::{GithubAccept, curl_config};
 
     #[test]
-    fn curl_config_keeps_token_in_stdin_config_not_process_args() {
+    fn curl_config_keeps_api_token_in_stdin_config_not_process_args() {
         let config = curl_config(
             "https://api.github.com/repos/cgraf78/shdeps/releases",
             Some(" t "),
+            GithubAccept::Json,
         )
         .unwrap();
 
         assert!(config.contains("url = \"https://api.github.com/repos/cgraf78/shdeps/releases\""));
         assert!(config.contains("header = \"Authorization: Bearer t\""));
-        assert!(config.contains("header = \"User-Agent: shdeps\""));
+        assert!(config.contains("header = \"Accept: application/vnd.github+json\""));
+        assert!(config.contains("user-agent = \"shdeps\""));
+        assert!(!config.contains("header = \"User-Agent: shdeps\""));
+    }
+
+    #[test]
+    fn curl_config_uses_octet_stream_for_github_asset_api_downloads() {
+        let config = curl_config(
+            "https://api.github.com/repos/owner/repo/releases/assets/123",
+            Some("t"),
+            GithubAccept::OctetStream,
+        )
+        .unwrap();
+
+        assert!(config.contains("header = \"Accept: application/octet-stream\""));
+        assert!(config.contains("header = \"Authorization: Bearer t\""));
+        assert!(!config.contains("Accept: application/vnd.github+json"));
+    }
+
+    #[test]
+    fn curl_config_omits_github_api_headers_for_asset_downloads() {
+        let config = curl_config(
+            "https://github.com/owner/repo/releases/download/v1.0.0/tool.tar.gz",
+            Some("t"),
+            GithubAccept::Json,
+        )
+        .unwrap();
+
+        assert!(config.contains("user-agent = \"shdeps\""));
+        assert!(!config.contains("header = \"User-Agent: shdeps\""));
+        assert!(!config.contains("Authorization: Bearer"));
+        assert!(!config.contains("Accept: application/vnd.github+json"));
     }
 
     #[test]
     fn curl_config_escapes_quotes_and_backslashes() {
-        let config = curl_config("https://example/path\"with\\chars", None).unwrap();
+        let config = curl_config(
+            "https://example/path\"with\\chars",
+            None,
+            GithubAccept::Json,
+        )
+        .unwrap();
 
         assert!(config.contains("url = \"https://example/path\\\"with\\\\chars\""));
     }
 
     #[test]
     fn curl_config_rejects_multiline_values() {
-        let error = curl_config("https://example/\nheader = bad", None).unwrap_err();
+        let error =
+            curl_config("https://example/\nheader = bad", None, GithubAccept::Json).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }

@@ -4926,7 +4926,7 @@ SH
   PATH="$_release_fakebin:/usr/bin:/bin" SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_RELEASE_TAG="$_release_tag" \
     SHDEPS_TEST_CURL_LOG="$_release_log" GH_TOKEN="release-token" \
-    SHDEPS_RELEASE_API_URL="https://api.example.test/latest" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/latest" \
     SHDEPS_DIR="$_release_inst" SHDEPS_BIN="$_release_bin/shdeps" \
     "$_release_installer/install.sh" >/dev/null 2>&1
   _assert_file_exists "install release: root binary installed" "$_release_inst/shdeps"
@@ -4934,7 +4934,7 @@ SH
   _assert_symlink "install release: CLI symlinked" "$_release_bin/shdeps"
   _release_link=$(readlink "$_release_bin/shdeps")
   _assert_eq "install release: CLI points at release binary" "$_release_inst/shdeps" "$_release_link"
-  _assert_contains "install release: sends GitHub token" "Authorization: Bearer release-token" "$(cat "$_release_log")"
+  _assert_contains "install release: sends GitHub token to metadata" "Authorization: Bearer release-token" "$(cat "$_release_log")"
 
   cat >"$_release_fakebin/cargo" <<'SH'
 #!/usr/bin/env bash

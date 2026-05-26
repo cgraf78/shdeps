@@ -2678,7 +2678,7 @@ _shdeps_github_release_find_asset() {
       )
       local c
       for c in "${candidates[@]}"; do
-        if curl -fsSL --no-netrc --head "$c" &>/dev/null; then
+        if curl -fsSL --no-netrc -A shdeps --head "$c" &>/dev/null; then
           echo "$c"
           return 0
         fi
@@ -2861,11 +2861,9 @@ _shdeps_github_release_install() {
   if [[ "${_SHDEPS_PREFETCH_READY:-}" == 1 && -n "${_SHDEPS_PREFETCHED[$name]+x}" ]]; then
     release_json="${_SHDEPS_PREFETCHED[$name]}"
   elif command -v curl &>/dev/null; then
-    local -a _gh_curl_args=(curl -fsSL --no-netrc)
+    local -a _gh_curl_args=(curl -fsSL --no-netrc -A shdeps -H "Accept: application/vnd.github+json")
     if [[ -n "${_SHDEPS_GH_TOKEN:-}" ]]; then
-      _gh_curl_args+=(-H "Authorization: token $_SHDEPS_GH_TOKEN")
-    else
-      _gh_curl_args+=(-H "Authorization:")
+      _gh_curl_args+=(-H "Authorization: Bearer $_SHDEPS_GH_TOKEN")
     fi
     release_json=$("${_gh_curl_args[@]}" \
       "https://api.github.com/repos/$gh_repo/releases/latest" 2>/dev/null || true)
@@ -2911,7 +2909,7 @@ _shdeps_github_release_install() {
 
   if [[ -n "${log:-}" ]]; then : >"$log"; fi
   _shdeps_log_status "  $name: downloading $latest_ver..."
-  if ! _shdeps_run_logged curl -fsSL --no-netrc "$asset_url" -o "$tmp_file"; then
+  if ! _shdeps_run_logged curl -fsSL --no-netrc -A shdeps "$asset_url" -o "$tmp_file"; then
     _shdeps_logfile_print "$name download" "$log"
     rm -f "$tmp_file" "$log"
     _shdeps_warn "  warning: failed to download $name $latest_ver"
@@ -3266,11 +3264,9 @@ _shdeps_github_release_prefetch() {
   command -v curl &>/dev/null || return 0
 
   local -a _pf_names=() _pf_tmpfiles=() _pf_pids=()
-  local -a _pf_curl_args=(curl -fsSL --no-netrc)
+  local -a _pf_curl_args=(curl -fsSL --no-netrc -A shdeps -H "Accept: application/vnd.github+json")
   if [[ -n "${_SHDEPS_GH_TOKEN:-}" ]]; then
-    _pf_curl_args+=(-H "Authorization: token $_SHDEPS_GH_TOKEN")
-  else
-    _pf_curl_args+=(-H "Authorization:")
+    _pf_curl_args+=(-H "Authorization: Bearer $_SHDEPS_GH_TOKEN")
   fi
 
   local entry

@@ -111,11 +111,44 @@ _github_token() {
 
 _curl_get() {
   local url="$1" out="$2" token="${3:-}"
-  if [[ -n "$token" ]]; then
-    curl -fsSL -H "Authorization: Bearer $token" -o "$out" "$url"
-  else
-    curl -fsSL -o "$out" "$url"
+  local -a args=(curl -fsSL -A shdeps)
+  case "$url" in
+    https://api.github.com/*)
+      args+=(-H "Accept: application/vnd.github+json")
+      if [[ -n "$token" ]]; then
+        args+=(-H "Authorization: Bearer $token")
+      fi
+      ;;
+  esac
+  "${args[@]}" -o "$out" "$url"
+}
+
+_curl_get_release_asset() {
+  local browser_url="$1" out="$2" token="${3:-}" api_url="${4:-}"
+
+  # Public `browser_download_url` downloads must look like ordinary browser
+  # downloads; GitHub's signed storage redirects reject forwarded API headers.
+  if [[ -n "$token" && -n "$api_url" ]]; then
+    if _curl_get "$browser_url" "$out" "" 2>/dev/null; then
+      return 0
+    fi
+  elif _curl_get "$browser_url" "$out" ""; then
+    return 0
   fi
+
+  # Private release assets need GitHub's REST asset endpoint instead. Keep the
+  # API-only headers on that first-hop URL, matching GitHub's documented private
+  # asset download flow.
+  if [[ -n "$token" && -n "$api_url" ]]; then
+    curl -fsSL -A shdeps \
+      -H "Accept: application/octet-stream" \
+      -H "Authorization: Bearer $token" \
+      -o "$out" \
+      "$api_url"
+    return
+  fi
+
+  return 1
 }
 
 _repo_slug() {
@@ -203,6 +236,25 @@ _asset_url() {
   ' "$file"
 }
 
+_asset_api_url() {
+  local file="$1" name="$2"
+
+  awk -v wanted="$name" '
+    /"url"[[:space:]]*:/ {
+      value = $0
+      sub(/^.*"url"[[:space:]]*:[[:space:]]*"/, "", value)
+      sub(/".*$/, "", value)
+      if (value ~ /^https:\/\/api\.github\.com\/repos\/.*\/releases\/assets\/[0-9]+$/) {
+        asset_api_url = value
+      }
+    }
+    $0 ~ "\"name\"[[:space:]]*:[[:space:]]*\"" wanted "\"" && asset_api_url != "" {
+      print asset_api_url
+      exit
+    }
+  ' "$file"
+}
+
 _latest_release_tag() {
   local repo="$1" effective tag
 
@@ -210,7 +262,7 @@ _latest_release_tag() {
   # unauthenticated GitHub API quota just to learn the current tag. The normal
   # release page redirects to `/releases/tag/<tag>` and works for curl-pipe
   # installs without requiring `gh`, JSON parsing, or a token.
-  effective=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+  effective=$(curl -fsSL -A shdeps -o /dev/null -w '%{url_effective}' \
     "https://github.com/$repo/releases/latest") || return 1
   case "$effective" in
     */releases/tag/*) ;;
@@ -411,7 +463,8 @@ _refresh_release_install_if_stale() {
 }
 
 _install_release() {
-  local platform repo api_url token tmp json tag archive checksum archive_url checksum_url bundle
+  local platform repo api_url token tmp json tag archive checksum
+  local archive_url checksum_url archive_api_url checksum_api_url bundle
   _SHDEPS_RELEASE_FAILURE_KIND=""
   platform=$(_release_platform) || return 1
   repo=$(_repo_slug)
@@ -439,6 +492,8 @@ _install_release() {
     checksum="${archive}.sha256"
     archive_url=$(_asset_url "$json" "$archive")
     checksum_url=$(_asset_url "$json" "$checksum")
+    archive_api_url=$(_asset_api_url "$json" "$archive")
+    checksum_api_url=$(_asset_api_url "$json" "$checksum")
     if [[ -z "$archive_url" || -z "$checksum_url" ]]; then
       _install_release_fail "$tmp" "metadata" "release $tag does not contain assets for $platform"
       return 1
@@ -456,17 +511,19 @@ _install_release() {
     checksum="${archive}.sha256"
     archive_url="https://github.com/$repo/releases/download/$tag/$archive"
     checksum_url="https://github.com/$repo/releases/download/$tag/$checksum"
+    archive_api_url=""
+    checksum_api_url=""
     # Browser download URLs for this public repo do not need API auth. Avoid
     # forwarding a caller's unrelated or expired GitHub token to github.com,
     # because a bad token should not make public bootstrap fail.
     token=""
   fi
 
-  if ! _curl_get "$archive_url" "$tmp/$archive" "$token"; then
+  if ! _curl_get_release_asset "$archive_url" "$tmp/$archive" "$token" "$archive_api_url"; then
     _install_release_fail "$tmp" "download" "failed to download $archive"
     return 1
   fi
-  if ! _curl_get "$checksum_url" "$tmp/$checksum" "$token"; then
+  if ! _curl_get_release_asset "$checksum_url" "$tmp/$checksum" "$token" "$checksum_api_url"; then
     _install_release_fail "$tmp" "download" "failed to download $checksum"
     return 1
   fi

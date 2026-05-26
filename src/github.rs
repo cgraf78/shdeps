@@ -8,6 +8,7 @@
 //! without touching the network.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,6 +29,9 @@ pub struct Asset {
     pub name: String,
     /// Browser download URL returned by the GitHub release API.
     pub url: String,
+    /// REST API URL for authenticated asset downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
 }
 
 /// GitHub release data after API parsing and compatibility filtering.
@@ -69,6 +73,31 @@ pub fn fetch_releases(
     let bytes = client.get(&url, token.as_deref())?;
     let json = String::from_utf8_lossy(&bytes);
     parse_releases(&json)
+}
+
+/// Downloads a release asset using browser semantics before API fallback.
+///
+/// Public GitHub release assets should be fetched from `browser_download_url`
+/// without API headers because signed storage redirects reject forwarded raw
+/// headers. Private release assets need the REST asset endpoint instead, so use
+/// it only after the browser URL fails and a token is available.
+pub fn download_asset(
+    client: &dyn Client,
+    browser_url: &str,
+    api_url: Option<&str>,
+    token: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    match client.get(browser_url, None) {
+        Ok(bytes) => Ok(bytes),
+        Err(browser_error) => {
+            let Some((api_url, token)) =
+                api_url.zip(token.filter(|token| !token.trim().is_empty()))
+            else {
+                return Err(browser_error);
+            };
+            client.get_github_asset(api_url, Some(token))
+        }
+    }
 }
 
 /// Returns the GitHub API releases URL for `owner/repo`.
@@ -173,6 +202,7 @@ impl ApiRelease {
 
 #[derive(Debug, Deserialize)]
 struct ApiAsset {
+    url: Option<String>,
     name: Option<String>,
     browser_download_url: Option<String>,
 }
@@ -187,6 +217,10 @@ impl ApiAsset {
         Some(Asset {
             name: self.name.unwrap_or_default(),
             url,
+            api_url: self
+                .url
+                .map(|url| url.trim().to_owned())
+                .filter(|url| !url.is_empty()),
         })
     }
 }
@@ -199,7 +233,9 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Asset, Release, fetch_releases, parse_releases, releases_url, token};
+    use super::{
+        Asset, Release, download_asset, fetch_releases, parse_releases, releases_url, token,
+    };
     use crate::http::Client;
     use crate::process::{Output, Runner};
     use crate::runtime::Env;
@@ -215,6 +251,7 @@ mod tests {
                 "extra": "ignored",
                 "assets": [
                   {
+                    "url": "https://api.github.com/repos/owner/repo/releases/assets/1",
                     "name": "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz",
                     "browser_download_url": "https://example/archive.tar.gz"
                   },
@@ -236,6 +273,9 @@ mod tests {
                 assets: vec![Asset {
                     name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz".to_owned(),
                     url: "https://example/archive.tar.gz".to_owned(),
+                    api_url: Some(
+                        "https://api.github.com/repos/owner/repo/releases/assets/1".to_owned(),
+                    ),
                 }],
             }]
         );
@@ -261,6 +301,62 @@ mod tests {
         let releases = fetch_releases("cgraf78/shdeps", &env, &runner, &client).unwrap();
 
         assert_eq!(releases, vec![release("v2026.05.24")]);
+    }
+
+    #[test]
+    fn download_asset_uses_browser_url_without_token_first() {
+        let client = MapClient::new().with("https://downloads.example/tool", b"public".to_vec());
+
+        let bytes = download_asset(
+            &client,
+            "https://downloads.example/tool",
+            Some("https://api.github.com/repos/owner/tool/releases/assets/1"),
+            Some("token"),
+        )
+        .unwrap();
+
+        assert_eq!(bytes, b"public");
+        assert_eq!(
+            client.calls(),
+            vec![Call {
+                kind: "get",
+                url: "https://downloads.example/tool".to_owned(),
+                token: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn download_asset_falls_back_to_api_asset_url_for_private_releases() {
+        let client = MapClient::new().with_api(
+            "https://api.github.com/repos/owner/tool/releases/assets/1",
+            b"private".to_vec(),
+        );
+
+        let bytes = download_asset(
+            &client,
+            "https://downloads.example/private-tool",
+            Some("https://api.github.com/repos/owner/tool/releases/assets/1"),
+            Some(" token "),
+        )
+        .unwrap();
+
+        assert_eq!(bytes, b"private");
+        assert_eq!(
+            client.calls(),
+            vec![
+                Call {
+                    kind: "get",
+                    url: "https://downloads.example/private-tool".to_owned(),
+                    token: None,
+                },
+                Call {
+                    kind: "asset",
+                    url: "https://api.github.com/repos/owner/tool/releases/assets/1".to_owned(),
+                    token: Some(" token ".to_owned()),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -410,6 +506,66 @@ mod tests {
             draft: false,
             prerelease: false,
             assets: Vec::new(),
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Call {
+        kind: &'static str,
+        url: String,
+        token: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct MapClient {
+        browser: BTreeMap<String, Vec<u8>>,
+        api: BTreeMap<String, Vec<u8>>,
+        calls: std::sync::Mutex<Vec<Call>>,
+    }
+
+    impl MapClient {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with(mut self, url: &str, body: Vec<u8>) -> Self {
+            self.browser.insert(url.to_owned(), body);
+            self
+        }
+
+        fn with_api(mut self, url: &str, body: Vec<u8>) -> Self {
+            self.api.insert(url.to_owned(), body);
+            self
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Client for MapClient {
+        fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+            self.calls.lock().unwrap().push(Call {
+                kind: "get",
+                url: url.to_owned(),
+                token: token.map(ToOwned::to_owned),
+            });
+            self.browser
+                .get(url)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, url.to_owned()))
+        }
+
+        fn get_github_asset(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+            self.calls.lock().unwrap().push(Call {
+                kind: "asset",
+                url: url.to_owned(),
+                token: token.map(ToOwned::to_owned),
+            });
+            self.api
+                .get(url)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, url.to_owned()))
         }
     }
 }

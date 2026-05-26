@@ -1102,10 +1102,12 @@ mod tests {
                     archive_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz".to_owned(),
                     archive_url: "https://example/shdeps-v2026.05.24-linux-x86_64-musl.tar.gz"
                         .to_owned(),
+                    archive_api_url: None,
                     checksum_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256".to_owned(),
                     checksum_url:
                         "https://example/shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256"
                             .to_owned(),
+                    checksum_api_url: None,
                 },
             }
         );
@@ -1247,14 +1249,7 @@ mod tests {
                 if metadata.tag.as_deref() == Some("v2026.05.24")
                     && metadata.artifact_platform.as_deref() == Some("linux-x86_64-musl"))
         );
-        assert_eq!(
-            client.tokens(),
-            vec![
-                Some("token".to_owned()),
-                Some("token".to_owned()),
-                Some("token".to_owned())
-            ]
-        );
+        assert_eq!(client.tokens(), vec![Some("token".to_owned()), None, None]);
     }
 
     #[test]
@@ -1345,10 +1340,12 @@ mod tests {
                     Asset {
                         name: archive.clone(),
                         url: format!("https://example/{archive}"),
+                        api_url: None,
                     },
                     Asset {
                         name: checksum.clone(),
                         url: format!("https://example/{checksum}"),
+                        api_url: None,
                     },
                 ]
             })

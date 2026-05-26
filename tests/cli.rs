@@ -349,7 +349,7 @@ esac
     let log = fs::read_to_string(curl_log).unwrap();
     assert!(log.contains("url = \"https://api.github.com/repos/owner/mytool/releases\""));
     assert!(!log.contains("owner/mytool.git/releases"));
-    assert_eq!(log.matches("Authorization: Bearer bridge-token").count(), 2);
+    assert_eq!(log.matches("Authorization: Bearer bridge-token").count(), 1);
 }
 
 #[test]

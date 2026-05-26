@@ -1726,7 +1726,7 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
-    fn update_github_release_sends_token_to_metadata_and_asset_download() {
+    fn update_github_release_sends_token_to_metadata_only() {
         let mut fixture = Fixture::new("release-token");
         fixture.write_lib();
         fixture
@@ -1766,8 +1766,59 @@ version() { printf 'saw-pkg\n'; }
                     "https://api.github.com/repos/owner/tool/releases".to_owned(),
                     Some("ci-token".to_owned())
                 ),
+                ("https://example/tool-linux-x86_64".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn update_github_release_uses_api_asset_fallback_for_private_releases() {
+        let mut fixture = Fixture::new("release-private-asset");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("GH_TOKEN".to_owned(), "ci-token".to_owned());
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "url":"https://api.github.com/repos/owner/tool/releases/assets/7",
+                        "name":"tool-linux-x86_64",
+                        "browser_download_url":"https://private.example/tool-linux-x86_64"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://api.github.com/repos/owner/tool/releases/assets/7",
+                b"binary".to_vec(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            fixture.client.requests(),
+            vec![
                 (
-                    "https://example/tool-linux-x86_64".to_owned(),
+                    "https://api.github.com/repos/owner/tool/releases".to_owned(),
+                    Some("ci-token".to_owned())
+                ),
+                ("https://private.example/tool-linux-x86_64".to_owned(), None),
+                (
+                    "https://api.github.com/repos/owner/tool/releases/assets/7".to_owned(),
                     Some("ci-token".to_owned())
                 )
             ]
@@ -1940,7 +1991,7 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
-    fn update_github_release_reuses_gh_token_across_metadata_and_assets() {
+    fn update_github_release_reuses_gh_token_for_metadata_only() {
         let mut fixture = Fixture::new("release-token-prefetch");
         fixture.write_lib();
         fixture
@@ -1983,14 +2034,22 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert_eq!(
             token_calls, 1,
-            "`gh auth token` can be noticeably slow; shdeps should resolve it once per update run and reuse it for every release request"
+            "`gh auth token` can be noticeably slow; shdeps should resolve it once per update run and reuse it for every release metadata request"
         );
-        assert!(
-            fixture
-                .client
-                .requests()
-                .iter()
-                .all(|(_, token)| token.as_deref() == Some("gh-token"))
+        assert_eq!(
+            fixture.client.requests(),
+            vec![
+                (
+                    "https://api.github.com/repos/owner/tool-a/releases".to_owned(),
+                    Some("gh-token".to_owned())
+                ),
+                ("https://example/tool-a-linux-x86_64".to_owned(), None),
+                (
+                    "https://api.github.com/repos/owner/tool-b/releases".to_owned(),
+                    Some("gh-token".to_owned())
+                ),
+                ("https://example/tool-b-linux-x86_64".to_owned(), None),
+            ]
         );
     }
 
