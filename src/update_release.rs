@@ -48,7 +48,19 @@ pub(crate) fn install_with_prefetch(
     };
     let outcome = install_request(&request, &request_context)?;
     if !outcome.failed {
+        // Ordering matters: write the manifest record BEFORE refreshing the
+        // TTL stamp. If a crash/SIGINT lands between the two writes, the next
+        // shdeps run must see "stamp older than manifest" (re-evaluate) rather
+        // than "fresh stamp pointing at a dep the manifest does not know" —
+        // the latter shape lets the TTL fast path skip the dep while
+        // `manifest.get(name)` keeps returning `None`. The stamp is the
+        // freshness gate; the manifest is the durable record. Always write
+        // the durable record first.
         write_manifest(entry, context)?;
+        if outcome.stamp {
+            let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "release");
+            stamp::remote_touch(&stamp_path, options.now)?;
+        }
     }
 
     Ok(Item {
@@ -199,6 +211,13 @@ pub(crate) struct ReleaseOutcome {
     pub(crate) changed: bool,
     pub(crate) failed: bool,
     pub(crate) detail: String,
+    /// True when the caller should refresh the TTL stamp after writing the
+    /// manifest record. Set to `true` only for paths that confirmed the
+    /// remote check (either a fresh install or a `--force`-triggered
+    /// re-check that found the latest tag already installed). The
+    /// TTL-fast-path ("fresh") and all failure paths leave this `false` so
+    /// the stamp remains exactly as observed.
+    pub(crate) stamp: bool,
 }
 
 pub(crate) fn install_request(
@@ -224,6 +243,9 @@ pub(crate) fn install_request(
             changed: false,
             failed: false,
             detail: "fresh".to_owned(),
+            // The TTL stamp is already fresh in this branch; nothing to
+            // refresh.
+            stamp: false,
         });
     }
 
@@ -272,6 +294,10 @@ pub(crate) fn install_request(
                         changed: false,
                         failed: false,
                         detail,
+                        // Transient metadata failure: preserve the working
+                        // binary but do NOT refresh the TTL stamp so the
+                        // next run will retry the network check.
+                        stamp: false,
                     });
                 }
                 return Ok(failed("release metadata fetch failed"));
@@ -292,12 +318,17 @@ pub(crate) fn install_request(
             // changed. Bash compared the probed command version to the latest
             // release tag before asset selection, so keep that no-op path even
             // if the release has no asset we would install from scratch today.
-            stamp::remote_touch(&stamp_path, context.options.now)?;
             link_existing_extras(context.roots, request.name)?;
             return Ok(ReleaseOutcome {
                 changed: false,
                 failed: false,
                 detail: current_version.unwrap_or_else(|| latest.tag.clone()),
+                // The remote was checked and confirms the installed tag is
+                // current. Refresh the stamp — but only after the caller
+                // has upserted the manifest record, so that a crash
+                // between manifest and stamp can never leave a fresh
+                // stamp paired with a stale or missing manifest entry.
+                stamp: true,
             });
         }
     }
@@ -351,6 +382,10 @@ pub(crate) fn install_request(
                     changed: false,
                     failed: false,
                     detail: format!("{}: checksum unavailable", selection.tag),
+                    // No install ran and the integrity check could not be
+                    // performed; do not refresh the stamp so the next run
+                    // retries the verification.
+                    stamp: false,
                 });
             }
         }
@@ -422,12 +457,17 @@ pub(crate) fn install_request(
             return Ok(failed("release asset type is not implemented yet"));
         }
     }
-    stamp::remote_touch(&stamp_path, context.options.now)?;
+    // The TTL stamp is intentionally NOT refreshed here. The caller writes
+    // the manifest record first and then touches the stamp, so a crash in
+    // between leaves the dep "needs work" rather than "fresh but unknown".
+    // See the matching comment in `install_with_prefetch`.
+    let _ = stamp_path;
 
     Ok(ReleaseOutcome {
         changed: true,
         failed: false,
         detail: selection.tag,
+        stamp: true,
     })
 }
 
@@ -494,6 +534,9 @@ fn failed(detail: &str) -> ReleaseOutcome {
         changed: false,
         failed: true,
         detail: detail.to_owned(),
+        // A failed run must not refresh the TTL stamp; otherwise the next
+        // run's fast path could mask the persistent failure.
+        stamp: false,
     }
 }
 
