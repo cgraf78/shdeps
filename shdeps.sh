@@ -70,7 +70,16 @@ _shdepsw_resolve_binary() {
     return 0
   fi
 
-  command -v shdeps 2>/dev/null
+  # Last-resort fallback: any `shdeps` found on `$PATH`. This is opt-in
+  # because in shared environments (CI containers, multi-tenant
+  # devservers) the `shdeps` on PATH may belong to a different user or
+  # repo than the `shdeps.sh` being sourced. Silently picking it up has
+  # caused mysterious config mismatches and the wrong-binary's ABI to
+  # leak into the caller. Operators who genuinely want that fallback
+  # opt in with `SHDEPS_ALLOW_PATH_FALLBACK=1`.
+  if [[ "${SHDEPS_ALLOW_PATH_FALLBACK:-0}" == "1" ]]; then
+    command -v shdeps 2>/dev/null
+  fi
 }
 
 _SHDEPSW_BIN="$(_shdepsw_resolve_binary)" || {
