@@ -326,6 +326,14 @@ chmod +x "$_path_dir/shdeps"
 _isolation_dir=$(mktemp -d)
 cp "$_repo_root/shdeps.sh" "$_isolation_dir/shdeps.sh"
 
+# Invoke the *current* bash interpreter via `$BASH` rather than a bare
+# `bash`. On macOS the system `/bin/bash` is 3.2, and the restricted PATH
+# below (`/usr/bin:/bin`) leaves the bash-3.2 binary as the only `bash`
+# the subshell could find. `shdeps.sh` requires 4.3+ and would abort at
+# its version-guard before ever reaching the PATH-fallback branch, so the
+# test would assert against an unrelated failure mode. `$BASH` always
+# points at the interpreter running this script, which the outer
+# `#!/usr/bin/env bash` resolves to a 4.3+ binary on every CI runner.
 _path_default=$(
   # Use newline-separated commands so the echo runs regardless of
   # source's exit code. The earlier audit flagged a hypothetical
@@ -333,7 +341,7 @@ _path_default=$(
   # against that. Also capture the source exit code separately so we
   # can assert source actually FAILED (a vacuous pass would be the
   # source succeeding with an empty `_SHDEPSW_BIN`).
-  PATH="$_path_dir:/usr/bin:/bin" bash -c "
+  PATH="$_path_dir:/usr/bin:/bin" "$BASH" -c "
     source '$_isolation_dir/shdeps.sh' 2>/dev/null
     _src_rc=\$?
     echo \"BIN=\${_SHDEPSW_BIN:-NONE} SRC_RC=\$_src_rc\"
@@ -344,7 +352,7 @@ _assert_eq "PATH fallback off by default: source fails AND BIN unset" \
 
 _path_opted_in=$(
   PATH="$_path_dir:/usr/bin:/bin" SHDEPS_ALLOW_PATH_FALLBACK=1 \
-    bash -c "
+    "$BASH" -c "
       source '$_isolation_dir/shdeps.sh'
       echo \"BIN=\$_SHDEPSW_BIN\"
     " 2>/dev/null
