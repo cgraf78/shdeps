@@ -125,30 +125,38 @@ _curl_get() {
 
 _curl_get_release_asset() {
   local browser_url="$1" out="$2" token="${3:-}" api_url="${4:-}"
-
-  # Public `browser_download_url` downloads must look like ordinary browser
-  # downloads; GitHub's signed storage redirects reject forwarded API headers.
+  local have_api_fallback=0
   if [[ -n "$token" && -n "$api_url" ]]; then
+    have_api_fallback=1
+  fi
+
+  # Public `browser_download_url` downloads must look like ordinary
+  # browser downloads; GitHub's signed storage redirects reject
+  # forwarded API headers. Try the browser URL first regardless of
+  # whether a token is available. Suppress stderr only when we have a
+  # private-release API fallback available — otherwise the user
+  # should see the underlying curl error message so a permanent
+  # network problem is not swallowed.
+  if [[ "$have_api_fallback" -eq 1 ]]; then
     if _curl_get "$browser_url" "$out" "" 2>/dev/null; then
       return 0
     fi
-  elif _curl_get "$browser_url" "$out" ""; then
-    return 0
+  else
+    if _curl_get "$browser_url" "$out" ""; then
+      return 0
+    fi
+    # No API fallback to try — propagate the browser failure.
+    return 1
   fi
 
-  # Private release assets need GitHub's REST asset endpoint instead. Keep the
-  # API-only headers on that first-hop URL, matching GitHub's documented private
-  # asset download flow.
-  if [[ -n "$token" && -n "$api_url" ]]; then
-    curl -fsSL -A shdeps \
-      -H "Accept: application/octet-stream" \
-      -H "Authorization: Bearer $token" \
-      -o "$out" \
-      "$api_url"
-    return
-  fi
-
-  return 1
+  # Browser URL failed; try GitHub's REST asset endpoint with the
+  # private-asset headers, matching GitHub's documented private
+  # release download flow.
+  curl -fsSL -A shdeps \
+    -H "Accept: application/octet-stream" \
+    -H "Authorization: Bearer $token" \
+    -o "$out" \
+    "$api_url"
 }
 
 _repo_slug() {
