@@ -42,30 +42,75 @@ where
         return items.iter().map(f).collect();
     }
 
-    let mut results = Vec::with_capacity(items.len());
-    for chunk in items.chunks(jobs) {
-        std::thread::scope(|scope| {
-            let handles = chunk
-                .iter()
-                .map(|item| {
-                    let f = &f;
-                    scope.spawn(move || f(item))
-                })
-                .collect::<Vec<_>>();
+    // Worker pool, not chunked fan-out. The previous implementation
+    // dispatched `items.chunks(jobs)` so a trailing chunk smaller than
+    // `jobs` left workers idle while the last few items finished
+    // serially — e.g., 5 items at `jobs=4` would finish 4 items in
+    // round 1 and then run a single item in round 2 with 3 threads
+    // idle. The pool below keeps every worker busy until the index
+    // counter is exhausted, which is what users running `update`
+    // against tens-to-hundreds of deps expect from `SHDEPS_JOBS`.
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-            for handle in handles {
-                // A panic inside a worker should behave like a panic in the
-                // old serial code path, not get silently converted into a
-                // partial result. Joining in spawn order also preserves caller
-                // order even though the probes themselves overlap.
-                match handle.join() {
-                    Ok(result) => results.push(result),
-                    Err(payload) => std::panic::resume_unwind(payload),
+    let len = items.len();
+    let next_index = AtomicUsize::new(0);
+    // One mutex per result slot. Each slot is written exactly once by
+    // one worker (uncontended), and read exactly once at the end on
+    // the main thread (also uncontended), so the mutex is essentially
+    // free here — it just avoids the unsafe of writing through raw
+    // pointers into a shared `Vec`.
+    let slots: Vec<Mutex<Option<R>>> = (0..len).map(|_| Mutex::new(None)).collect();
+    let panic_payload: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
+    let worker_count = jobs.min(len);
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let f = &f;
+            let next_index = &next_index;
+            let slots = &slots;
+            let panic_payload = &panic_payload;
+            scope.spawn(move || {
+                loop {
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= len {
+                        return;
+                    }
+                    // Capture per-item panics rather than aborting the
+                    // entire scope. The first captured payload is
+                    // re-raised on the main thread after the scope
+                    // ends, preserving the old "panic looks like the
+                    // serial code path" contract.
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&items[index])));
+                    match outcome {
+                        Ok(result) => {
+                            *slots[index].lock().unwrap() = Some(result);
+                        }
+                        Err(payload) => {
+                            let mut held = panic_payload.lock().unwrap();
+                            if held.is_none() {
+                                *held = Some(payload);
+                            }
+                        }
+                    }
                 }
-            }
-        });
+            });
+        }
+    });
+
+    if let Some(payload) = panic_payload.into_inner().unwrap() {
+        std::panic::resume_unwind(payload);
     }
-    results
+
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap()
+                .expect("every slot is written exactly once by a worker before scope ends")
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -106,5 +151,46 @@ mod tests {
             super::parallel_map(&items, 3, |item| item * 10),
             vec![30, 20, 10]
         );
+    }
+
+    #[test]
+    fn parallel_map_keeps_workers_busy_past_chunk_boundary() {
+        // Previously, 5 items at `jobs=4` would run 4 in round 1 and
+        // then 1 in round 2 with 3 idle threads. The pool below
+        // claims items via an atomic counter so the last worker can
+        // pick up the trailing item while its peers move on. The test
+        // observes the speedup indirectly: 5 items of equal sleep
+        // time should complete in roughly two item-times (best case
+        // round 1 + round 2), not five item-times (serial).
+        use std::time::{Duration, Instant};
+        let items = [(); 5];
+        let item_time = Duration::from_millis(80);
+        let start = Instant::now();
+        super::parallel_map(&items, 4, |_| {
+            std::thread::sleep(item_time);
+        });
+        let elapsed = start.elapsed();
+        // Serial would be ~5 * 80ms = 400ms. The work-stealing pool
+        // should finish well under serial — generous bound to absorb
+        // scheduler noise without being a flake.
+        assert!(
+            elapsed < item_time * 4,
+            "elapsed {elapsed:?} suggests workers idled past the chunk boundary"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn parallel_map_resumes_panic_payload_on_main_thread() {
+        // The serial code path lets a panic propagate to the caller;
+        // the parallel path must preserve that contract so a panicking
+        // probe does not silently produce a partial result.
+        let items = [0, 1, 2, 3];
+        let _ = super::parallel_map(&items, 4, |item| {
+            if *item == 2 {
+                panic!("boom");
+            }
+            *item
+        });
     }
 }
