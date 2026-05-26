@@ -166,11 +166,20 @@ where
     // (e.g., a user-triggered run racing a periodic timer, or two
     // panes that both source the dotfiles entry point) could
     // interleave manifest writes and link-state mutations and leave
-    // shdeps in a half-applied state. The lock is held for the
-    // duration of the run; package-manager and network calls happen
-    // inside, but they all flow through the Rust planner so this is
-    // the right scope. The handle is bound to a local so its `Drop`
-    // releases the lock when `run` returns by any path.
+    // shdeps in a half-applied state.
+    //
+    // Re-entry safety: when a hook subprocess calls back into shdeps
+    // (e.g., a `post()` hook that runs `shdeps update some-other-dep`),
+    // the inner acquire sees `SHDEPS_STATE_LOCK_HELD` in its env (set
+    // by `apply_hook_env`) and returns a no-op guard instead of
+    // deadlocking against the parent's flock. The doc comment on
+    // `StateLock` warns against holding the lock across hooks — that
+    // warning predates the re-entry env-var contract added here, which
+    // makes the broader scope safe. Concurrent top-level invocations
+    // still serialize because they do not inherit the env var.
+    //
+    // The handle is bound to a local so its `Drop` releases the lock
+    // when `run` returns by any path.
     let _lock = crate::state::StateLock::acquire(&context.roots.state_dir)?;
 
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;

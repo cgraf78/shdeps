@@ -17,6 +17,19 @@ use std::os::fd::AsRawFd;
 
 const LOCK_FILE: &str = ".lock";
 
+/// Env var set by a lock holder before spawning hook subprocesses.
+///
+/// When a hook invokes shdeps recursively (e.g., a `post()` hook that
+/// runs `shdeps update some-other-dep`), the inner `StateLock::acquire`
+/// must NOT try to re-acquire the same `flock` — `flock` is not
+/// reentrant for a different file descriptor from the same process
+/// tree, and the inner process would deadlock waiting for itself.
+/// `SHDEPS_STATE_LOCK_HELD` is the cooperative signal that a parent
+/// already holds the lock; the inner acquire returns a no-op guard
+/// instead. Hooks inherit the env var transparently, so any depth of
+/// re-entry from a single top-level `shdeps update` is covered.
+pub const REENTRY_ENV: &str = "SHDEPS_STATE_LOCK_HELD";
+
 /// Per-state-directory advisory lock.
 ///
 /// Hold this only around short read-modify-write windows. The lock exists to
@@ -26,12 +39,23 @@ const LOCK_FILE: &str = ".lock";
 /// call back into shdeps.
 #[derive(Debug)]
 pub struct StateLock {
-    file: File,
+    /// `None` means this is a re-entry no-op guard: a parent shdeps
+    /// already holds the file lock, so we did not open/lock the file
+    /// ourselves and `Drop` does nothing.
+    file: Option<File>,
 }
 
 impl StateLock {
     /// Acquires the per-state-dir lock, waiting for any current holder.
     pub fn acquire(state_dir: &Path) -> Result<Self> {
+        if std::env::var_os(REENTRY_ENV).is_some() {
+            // Hook re-entry path: the parent shdeps that spawned this
+            // subprocess already holds the flock. Acquiring our own
+            // would deadlock the parent (it is waiting for the hook
+            // to finish, but the hook is waiting for the lock the
+            // parent holds). Return a no-op guard.
+            return Ok(StateLock { file: None });
+        }
         acquire_impl(state_dir, LockMode::Blocking)
             .map(|lock| lock.expect("blocking state lock acquisition always returns a lock"))
     }
@@ -42,6 +66,12 @@ impl StateLock {
     /// code should use the blocking variant so concurrent invocations serialize
     /// instead of failing spuriously on a busy developer machine.
     pub fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
+        if std::env::var_os(REENTRY_ENV).is_some() {
+            // Same re-entry rule as `acquire`: report success without
+            // actually acquiring so callers gated on `Some(_)` proceed
+            // normally.
+            return Ok(Some(StateLock { file: None }));
+        }
         acquire_impl(state_dir, LockMode::NonBlocking)
     }
 
@@ -156,7 +186,7 @@ fn acquire_impl(state_dir: &Path, mode: LockMode) -> Result<Option<StateLock>> {
         .open(&path)?;
 
     match lock_file(&file, mode)? {
-        LockResult::Acquired => Ok(Some(StateLock { file })),
+        LockResult::Acquired => Ok(Some(StateLock { file: Some(file) })),
         LockResult::WouldBlock => Ok(None),
     }
 }
@@ -198,7 +228,14 @@ impl Drop for StateLock {
         // the descriptor immediately after this anyway. Calling `flock(UN)`
         // keeps tests and long-lived processes from holding the lock until file
         // descriptor teardown if future code wraps this guard in another owner.
-        let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        //
+        // `self.file` is `None` for re-entry no-op guards (a hook
+        // subprocess that inherited `SHDEPS_STATE_LOCK_HELD`); in that
+        // case the parent owns the real lock and we have nothing to
+        // unlock here.
+        if let Some(file) = self.file.as_ref() {
+            let _ = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+        }
     }
 }
 
@@ -240,6 +277,44 @@ mod tests {
 
         drop(lock);
         assert!(StateLock::try_acquire(&fixture.dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn reentry_env_short_circuits_acquire_to_no_op_guard() {
+        // Hook subprocesses inherit `SHDEPS_STATE_LOCK_HELD` from
+        // `apply_hook_env`; the inner `acquire` must NOT try to
+        // re-take the parent's flock or it deadlocks against itself.
+        // Verifying with a real lock held: while a primary holder is
+        // alive on this thread, a second `acquire` with the env var
+        // set must succeed immediately and produce a no-op guard
+        // (the existing holder's lock stays unaffected).
+        let fixture = Fixture::new("reentry");
+        let primary = StateLock::acquire(&fixture.dir).unwrap();
+
+        // Use `temp_env`-style scoped set/unset: we set the env var,
+        // call acquire, and unset before yielding. `set_var` is safe
+        // here because the test is single-threaded and we revert.
+        // SAFETY: `set_var`/`remove_var` are marked unsafe in recent
+        // Rust nightlies but stable as of this writing; single-threaded
+        // test context, value reverted before exit.
+        unsafe {
+            std::env::set_var(super::REENTRY_ENV, "1");
+        }
+        let reentry = StateLock::acquire(&fixture.dir).unwrap();
+        unsafe {
+            std::env::remove_var(super::REENTRY_ENV);
+        }
+
+        // Both guards exist simultaneously without deadlock — the
+        // re-entry guard would have blocked the test thread forever
+        // pre-fix.
+        drop(reentry);
+        // The primary still holds the real lock (re-entry was a no-op).
+        assert!(
+            StateLock::try_acquire(&fixture.dir).unwrap().is_none(),
+            "primary lock must still be held after re-entry guard drops"
+        );
+        drop(primary);
     }
 
     #[test]
