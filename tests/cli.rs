@@ -293,7 +293,7 @@ set -e
 config=$(cat)
 printf '%s\n---\n' "$config" >>"$SHDEPS_TEST_CURL_LOG"
 case "$config" in
-  *'url = "https://api.github.com/repos/owner/mytool/releases"'*)
+  *'url = "https://api.github.com/repos/owner/mytool/releases?per_page=100"'*)
     printf '[{"tag_name":"v1.0.0","assets":[{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"}]}]\n' \
       "$SHDEPS_TEST_ASSET" "$SHDEPS_TEST_ASSET"
     ;;
@@ -347,7 +347,9 @@ esac
     );
 
     let log = fs::read_to_string(curl_log).unwrap();
-    assert!(log.contains("url = \"https://api.github.com/repos/owner/mytool/releases\""));
+    assert!(
+        log.contains("url = \"https://api.github.com/repos/owner/mytool/releases?per_page=100\"")
+    );
     assert!(!log.contains("owner/mytool.git/releases"));
     assert_eq!(log.matches("Authorization: Bearer bridge-token").count(), 1);
 }
@@ -1235,7 +1237,7 @@ config=$(cat)
 # process argv. The fake keeps that contract visible instead of accepting argv
 # shortcuts that the real transport does not use.
 case "$config" in
-  *'url = "https://api.github.com/repos/cgraf78/shdeps/releases"'*)
+  *'url = "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100"'*)
     printf '[{"tag_name":"20260524-120000-deadbeef","draft":false,"prerelease":false,"assets":[{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"},{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"}]}]\n' \
       "$SHDEPS_TEST_ARCHIVE_NAME" "$SHDEPS_TEST_ARCHIVE_NAME" \
       "$SHDEPS_TEST_CHECKSUM_NAME" "$SHDEPS_TEST_CHECKSUM_NAME"
@@ -1446,7 +1448,7 @@ impl Fixture {
 set -euo pipefail
 config=$(cat)
 case "$config" in
-  *'url = "https://api.github.com/repos/owner/tool/releases"'*)
+  *'url = "https://api.github.com/repos/owner/tool/releases?per_page=100"'*)
     if [[ -n "${SHDEPS_TEST_CURL_LOG:-}" ]]; then
       printf 'api\n' >>"$SHDEPS_TEST_CURL_LOG"
     fi

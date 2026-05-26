@@ -971,7 +971,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         write_executable(&local_clone.join("bin/ds"));
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/cgraf78/ds/releases",
+                "https://api.github.com/repos/cgraf78/ds/releases?per_page=100",
                 release_response(
                     "ds",
                     "v1.2.3",
@@ -1024,7 +1024,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         .unwrap();
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/cgraf78/ds/releases",
+                "https://api.github.com/repos/cgraf78/ds/releases?per_page=100",
                 release_response(
                     "ds",
                     "v1.2.3",
@@ -1098,7 +1098,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         ]);
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/cgraf78/ds/releases",
+                "https://api.github.com/repos/cgraf78/ds/releases?per_page=100",
                 release_response(
                     "ds",
                     "v1.2.3",
@@ -1688,7 +1688,7 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -1756,7 +1756,7 @@ version() { printf 'saw-pkg\n'; }
         );
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -1827,7 +1827,7 @@ version() { printf 'saw-pkg\n'; }
         );
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -1878,7 +1878,7 @@ version() { printf 'saw-pkg\n'; }
             .insert("GH_TOKEN".to_owned(), "ci-token".to_owned());
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -1907,7 +1907,7 @@ version() { printf 'saw-pkg\n'; }
             fixture.client.requests(),
             vec![
                 (
-                    "https://api.github.com/repos/owner/tool/releases".to_owned(),
+                    "https://api.github.com/repos/owner/tool/releases?per_page=100".to_owned(),
                     Some("ci-token".to_owned())
                 ),
                 (
@@ -1928,7 +1928,7 @@ version() { printf 'saw-pkg\n'; }
             .insert("GH_TOKEN".to_owned(), "ci-token".to_owned());
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -1965,7 +1965,7 @@ version() { printf 'saw-pkg\n'; }
             fixture.client.requests(),
             vec![
                 (
-                    "https://api.github.com/repos/owner/tool/releases".to_owned(),
+                    "https://api.github.com/repos/owner/tool/releases?per_page=100".to_owned(),
                     Some("ci-token".to_owned())
                 ),
                 (
@@ -1991,7 +1991,7 @@ version() { printf 'saw-pkg\n'; }
         fixture.client = FakeClient::default()
             .with_delay(Duration::from_millis(25))
             .with(
-                "https://api.github.com/repos/owner/tool-a/releases",
+                "https://api.github.com/repos/owner/tool-a/releases?per_page=100",
                 release_response(
                     "tool-a",
                     "v1.0.0",
@@ -2003,7 +2003,7 @@ version() { printf 'saw-pkg\n'; }
                 b"tool-a".to_vec(),
             )
             .with(
-                "https://api.github.com/repos/owner/tool-b/releases",
+                "https://api.github.com/repos/owner/tool-b/releases?per_page=100",
                 release_response(
                     "tool-b",
                     "v1.0.0",
@@ -2015,7 +2015,7 @@ version() { printf 'saw-pkg\n'; }
                 b"tool-b".to_vec(),
             )
             .with(
-                "https://api.github.com/repos/owner/tool-c/releases",
+                "https://api.github.com/repos/owner/tool-c/releases?per_page=100",
                 release_response(
                     "tool-c",
                     "v1.0.0",
@@ -2079,7 +2079,7 @@ version() { printf 'saw-pkg\n'; }
             .insert("GH_TOKEN".to_owned(), "ci-token".to_owned());
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool-a/releases",
+                "https://api.github.com/repos/owner/tool-a/releases?per_page=100",
                 release_response(
                     "tool-a",
                     "v1.0.0",
@@ -2087,7 +2087,7 @@ version() { printf 'saw-pkg\n'; }
                 ),
             )
             .with(
-                "https://api.github.com/repos/owner/tool-b/releases",
+                "https://api.github.com/repos/owner/tool-b/releases?per_page=100",
                 release_response(
                     "tool-b",
                     "v2.0.0",
@@ -2148,7 +2148,7 @@ version() { printf 'saw-pkg\n'; }
         fixture.client = FakeClient::default()
             .with_delay(Duration::from_millis(5))
             .with(
-                "https://api.github.com/repos/owner/tool-a/releases",
+                "https://api.github.com/repos/owner/tool-a/releases?per_page=100",
                 release_response(
                     "tool-a",
                     "v1.0.0",
@@ -2160,7 +2160,7 @@ version() { printf 'saw-pkg\n'; }
                 b"tool-a".to_vec(),
             )
             .with(
-                "https://api.github.com/repos/owner/tool-b/releases",
+                "https://api.github.com/repos/owner/tool-b/releases?per_page=100",
                 release_response(
                     "tool-b",
                     "v1.0.0",
@@ -2202,7 +2202,7 @@ version() { printf 'saw-pkg\n'; }
             .insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool-a/releases",
+                "https://api.github.com/repos/owner/tool-a/releases?per_page=100",
                 release_response(
                     "tool-a",
                     "v1.0.0",
@@ -2214,7 +2214,7 @@ version() { printf 'saw-pkg\n'; }
                 b"tool-a".to_vec(),
             )
             .with(
-                "https://api.github.com/repos/owner/tool-b/releases",
+                "https://api.github.com/repos/owner/tool-b/releases?per_page=100",
                 release_response(
                     "tool-b",
                     "v1.0.0",
@@ -2257,7 +2257,7 @@ version() { printf 'saw-pkg\n'; }
             fixture.client.requests(),
             vec![
                 (
-                    "https://api.github.com/repos/owner/tool-a/releases".to_owned(),
+                    "https://api.github.com/repos/owner/tool-a/releases?per_page=100".to_owned(),
                     Some("gh-token".to_owned())
                 ),
                 (
@@ -2266,7 +2266,7 @@ version() { printf 'saw-pkg\n'; }
                     None
                 ),
                 (
-                    "https://api.github.com/repos/owner/tool-b/releases".to_owned(),
+                    "https://api.github.com/repos/owner/tool-b/releases?per_page=100".to_owned(),
                     Some("gh-token".to_owned())
                 ),
                 (
@@ -2284,7 +2284,7 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -2330,7 +2330,7 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -2376,7 +2376,7 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -2549,7 +2549,7 @@ version() { printf 'saw-pkg\n'; }
         let mut fixture = Fixture::new("release-force-current");
         fixture.write_lib();
         fixture.client = FakeClient::default().with(
-            "https://api.github.com/repos/owner/tool/releases",
+            "https://api.github.com/repos/owner/tool/releases?per_page=100",
             br#"[{
                 "tag_name":"v1.2.3",
                 "draft":false,
@@ -2593,7 +2593,7 @@ version() { printf 'saw-pkg\n'; }
         assert_eq!(
             fixture.client.requests(),
             vec![(
-                "https://api.github.com/repos/owner/tool/releases".to_owned(),
+                "https://api.github.com/repos/owner/tool/releases?per_page=100".to_owned(),
                 None
             )],
             "force should refresh metadata but must not download a release asset when the installed version is current"
@@ -2615,7 +2615,7 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -2654,7 +2654,7 @@ version() { printf 'saw-pkg\n'; }
             fixture.client.requests(),
             vec![
                 (
-                    "https://api.github.com/repos/owner/tool/releases".to_owned(),
+                    "https://api.github.com/repos/owner/tool/releases?per_page=100".to_owned(),
                     None
                 ),
                 (
@@ -2681,7 +2681,7 @@ version() { printf 'saw-pkg\n'; }
         ]);
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -2743,7 +2743,7 @@ version() { printf 'saw-pkg\n'; }
         ]);
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
@@ -2801,7 +2801,7 @@ version() { printf 'saw-pkg\n'; }
         ]);
         fixture.client = FakeClient::default()
             .with(
-                "https://api.github.com/repos/owner/tool/releases",
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
                 br#"[{
                     "tag_name":"v1.2.3",
                     "draft":false,
