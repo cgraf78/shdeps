@@ -1658,6 +1658,46 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_external_failed_first_install_cleans_up_empty_install_root() {
+        // When a fresh external install (cargo/go/uv/npm) fails before
+        // producing any binary, the create_dir_all stub directories
+        // would otherwise linger under the managed install tree. They
+        // are visually misleading (`ls share/owner/tool/` shows an
+        // empty `bin/`) and confuse later prune/transition heuristics.
+        // A failed reinstall (where install_root had prior content)
+        // must NOT be touched — `remove_dir` only removes empty dirs,
+        // which gives exactly the right shape.
+        let fixture = Fixture::new("external-failed-cleanup");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        // `cargo` exists on PATH but the install command exits non-zero.
+        let runner = FakeRunner::default().with_failure(
+            "cargo",
+            [
+                "install",
+                "--root",
+                &fixture.roots.install_dir.join("ripgrep").to_string_lossy(),
+                "rg",
+            ],
+        );
+
+        let install_root = fixture.roots.install_dir.join("ripgrep");
+        let summary = run(
+            &[parse_entry("ripgrep|cargo|rg|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors(), "expected failed install to surface");
+        assert!(
+            !install_root.exists(),
+            "empty install_root must be cleaned up after first-time install failure"
+        );
+    }
+
+    #[test]
     fn update_external_reinstall_uses_force_argument() {
         let fixture = Fixture::new("external-reinstall");
         fixture.write_lib();
