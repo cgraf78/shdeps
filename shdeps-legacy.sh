@@ -514,6 +514,20 @@ _shdeps_load() {
       local fields
       # shellcheck disable=SC2086  # intentional word splitting
       set -- $line
+      # Strip trailing inline `#` comments. Any whitespace-separated token
+      # starting with `#` introduces a comment that runs to end-of-line, so
+      # `tool pkg # personal pref` parses identically to `tool pkg`. Mirrors
+      # `config::parse_config_line` in the Rust port: keeping the two parsers
+      # in agreement is what lets the shell and CLI agree on the active dep
+      # set when both implementations are sourced into the same shell.
+      local arg
+      local -a kept=()
+      for arg in "$@"; do
+        if [[ "$arg" == \#* ]]; then break; fi
+        kept+=("$arg")
+      done
+      if [[ ${#kept[@]} -eq 0 ]]; then continue; fi
+      set -- "${kept[@]}"
       if [[ $# -ge 2 ]]; then
         local dep_name
         dep_name=$(_shdeps_canonical_github_name "$1" "$2")
