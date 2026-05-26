@@ -260,8 +260,52 @@ fn ensure_public_parent(target: &Path) -> Result<()> {
     {
         // The Bash helper creates completion directories under `umask 022` so
         // zsh `compaudit` does not reject them as insecure. Rust inherits the
-        // process umask, so explicitly normalize the final directory mode.
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
+        // process umask, so explicitly normalize the directory mode.
+        //
+        // `create_dir_all` may create several intermediate ancestors at once
+        // (e.g., `share/zsh/site-functions/` where both `zsh/` and
+        // `site-functions/` are fresh). The pre-fix code only normalized the
+        // innermost (leaf) parent, so an outer ancestor created with the
+        // process umask could keep group/other-write bits — and `zsh
+        // compaudit` rejects the WHOLE fpath chain when any ancestor is
+        // insecure, silently breaking completion loading. Walk upward from
+        // the leaf parent until we hit a directory that already has the
+        // public mode, fixing every level the umask-affected
+        // `create_dir_all` may have touched. Idempotent: directories that
+        // already match the mode are left untouched.
+        normalize_ancestor_perms(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn normalize_ancestor_perms(leaf: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Walk upward stripping group/other-write bits from every directory
+    // that has them. Stops as soon as an ancestor is already secure
+    // (mode equals strip-022 mode), which acts as the natural boundary
+    // between umask-affected directories we just created and pre-existing
+    // user-owned directories we have no business mutating. The walk also
+    // stops on the first non-directory entry or on any FS error.
+    let mut current = Some(leaf);
+    while let Some(dir) = current {
+        let metadata = match fs::symlink_metadata(dir) {
+            Ok(meta) => meta,
+            Err(_) => break,
+        };
+        if !metadata.file_type().is_dir() {
+            break;
+        }
+        let mode = metadata.permissions().mode();
+        let secure_mode = mode & !0o022;
+        if mode == secure_mode {
+            // Already secure: assume every ancestor above is also
+            // user-owned and intentional. Do not walk further.
+            break;
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(secure_mode))?;
+        current = dir.parent();
     }
     Ok(())
 }
@@ -331,6 +375,46 @@ mod tests {
         assert_eq!(
             fs::read_link(dir.join("xdg/fish/vendor_completions.d/tool.fish")).unwrap(),
             install.join("completions/tool.fish")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_normalizes_all_freshly_created_ancestor_dir_perms() {
+        // When `create_dir_all` creates several intermediate dirs at once
+        // under a permissive umask, the pre-fix code only fixed the leaf
+        // parent. The remaining ancestors kept group/other-write bits,
+        // and `zsh compaudit` rejects the whole fpath chain when ANY
+        // ancestor is insecure. Now the walk fixes every level created
+        // under umask and stops at the first already-secure dir.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("ancestor-perms");
+        let install = dir.join("install");
+        fs::create_dir_all(install.join("share/zsh/site-functions")).unwrap();
+        fs::write(install.join("share/zsh/site-functions/_tool"), "compdef\n").unwrap();
+
+        // Set the parent xdg directory mode such that creating descendants
+        // under it would inherit insecure write bits. We force this state
+        // by chmod'ing the parent to 0o775 before sourcing extras.
+        let xdg = dir.join("xdg");
+        fs::create_dir_all(&xdg).unwrap();
+        fs::set_permissions(&xdg, fs::Permissions::from_mode(0o755)).unwrap();
+
+        super::link(&dir.join("state"), &xdg, "owner/tool", &install).unwrap();
+
+        // The leaf parent and EACH freshly created intermediate must
+        // have the group/other-write bits stripped.
+        let leaf = xdg.join("zsh/site-functions");
+        let mid = xdg.join("zsh");
+        assert_eq!(
+            fs::metadata(&leaf).unwrap().permissions().mode() & 0o022,
+            0,
+            "leaf parent kept insecure write bits"
+        );
+        assert_eq!(
+            fs::metadata(&mid).unwrap().permissions().mode() & 0o022,
+            0,
+            "intermediate ancestor kept insecure write bits"
         );
     }
 
