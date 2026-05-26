@@ -25,7 +25,12 @@ use crate::process::Runner;
 use crate::runtime::Roots;
 use crate::state;
 
-const CACHE_VERSION: &str = "shdeps-pkg-check-cache-v3";
+// Bumped to v4 when the in-memory fingerprint hasher switched from a
+// hand-rolled FNV-1a-ish stream cipher (with a state-reset-on-zero bug
+// and no real collision resistance) to truncated SHA-256. Existing v3
+// cache files compute stored hashes the old way, so a version mismatch
+// is the safest way to force a one-time cache refresh on upgrade.
+const CACHE_VERSION: &str = "shdeps-pkg-check-cache-v4";
 const CACHE_FILE: &str = "pkg-check-cache-v3";
 
 /// Inputs that decide whether a package-check cache entry is still valid.
@@ -918,24 +923,46 @@ fn hash_path(path: &Path, metadata: &fs::Metadata) -> Result<String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
+/// `std::hash::Hasher` adapter backed by SHA-256.
+///
+/// The previous in-house hasher had a state-reset-on-zero bug (the
+/// first `write` re-seeded the FNV offset basis only if `state == 0`,
+/// but a real input could legitimately drive the state to zero between
+/// writes and trigger another re-seed mid-stream). It also offered no
+/// collision resistance: two inputs whose byte sequences happened to
+/// XOR/multiply to the same state would silently produce identical
+/// cache hashes, letting a stale package scan be reused.
+///
+/// SHA-256 is overkill for a content-change fingerprint, but the
+/// `sha2` crate is already a project dependency for checksum
+/// verification, and "truncated SHA-256" is a well-known, vetted
+/// choice for non-cryptographic-but-collision-resistant hashing. We
+/// truncate to 64 bits because the existing on-disk cache format is
+/// `{:016x}` (16 hex chars = 64 bits) and we want the new hash to
+/// fit the same column without a wider schema change.
 #[derive(Default)]
 struct StableHasher {
-    state: u64,
+    hasher: sha2::Sha256,
 }
 
 impl Hasher for StableHasher {
     fn finish(&self) -> u64 {
-        self.state
+        use sha2::Digest;
+        // Clone so `finish` stays semantically `&self`; the underlying
+        // SHA-256 `finalize` consumes the state.
+        let digest = self.hasher.clone().finalize();
+        // Take the first 8 bytes as a little-endian u64. Endianness is
+        // arbitrary here — what matters is that the same input always
+        // yields the same u64, which `from_le_bytes` guarantees across
+        // platforms.
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        u64::from_le_bytes(bytes)
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        if self.state == 0 {
-            self.state = 0xcbf29ce484222325;
-        }
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(0x100000001b3);
-        }
+        use sha2::Digest;
+        self.hasher.update(bytes);
     }
 }
 
@@ -947,6 +974,35 @@ mod tests {
     use std::time::Duration;
 
     use super::{Inputs, Status, current, path, write};
+
+    #[test]
+    fn stable_hasher_is_deterministic_and_distinguishes_distinct_inputs() {
+        // Pure unit test of the hasher's properties: deterministic
+        // across calls with the same input, and produces different
+        // outputs for plausibly-confusable inputs that the old
+        // FNV-1a-ish hasher could collide on.
+        use std::hash::Hasher;
+        let make = |bytes: &[u8]| {
+            let mut h = super::StableHasher::default();
+            h.write(bytes);
+            h.finish()
+        };
+        // Determinism: same input → same hash on repeated calls.
+        assert_eq!(make(b"shdeps"), make(b"shdeps"));
+        // Distinct inputs produce distinct hashes — sha2 makes this a
+        // near-certainty for any pair we'd plausibly compare in cache
+        // fingerprinting.
+        assert_ne!(make(b"shdeps"), make(b"shdep"));
+        assert_ne!(make(b""), make(b"x"));
+        // Streaming writes commute: writing the same bytes in one
+        // call vs two calls produces the same hash. This is the
+        // property the previous hasher's state-reset-on-zero bug
+        // could violate.
+        let mut split = super::StableHasher::default();
+        split.write(b"shd");
+        split.write(b"eps");
+        assert_eq!(split.finish(), make(b"shdeps"));
+    }
 
     #[test]
     fn write_and_validate_cache_hit() {
