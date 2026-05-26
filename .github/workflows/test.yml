@@ -41,12 +41,18 @@ jobs:
         # release binary just to run wrapper smoke tests.
         SHDEPS_IMPL=rust SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-test
         SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-wrapper-test
+        # install-sh-test sources install.sh in isolation to exercise
+        # helpers like `_refresh_release_install_if_stale` that the Rust
+        # suite and the curl-pipe bash32 smoke test cannot cover.
+        ./test/install-sh-test
 
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@main # zizmor: ignore[unpinned-uses]
     with:
       profiles: base,shellcheck
-      test-command: ./test/shdeps-test
+      # Chain both shell-side suites: shdeps-test covers shdeps.sh and the
+      # legacy reference, install-sh-test covers install.sh helpers.
+      test-command: ./test/shdeps-test && ./test/install-sh-test
 
   bash32:
     uses: cgraf78/actions/.github/workflows/bash32-ci.yml@main # zizmor: ignore[unpinned-uses]

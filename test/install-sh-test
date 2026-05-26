@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1091
+# install-sh-test — focused tests for install.sh helper functions.
+#
+# install.sh is the curl-pipe bootstrap script; its helpers cannot be
+# covered by the Rust test suite. This file sources install.sh in a
+# controlled subshell (which is safe because the dispatch is guarded by a
+# sourced-vs-executed check at the bottom of the script) and exercises the
+# helpers directly. Test cases stay small and focused; behavioral coverage
+# of the full install/bootstrap path lives in `scripts/smoke-install-bash32.sh`
+# and the Rust integration suite.
+
+set -euo pipefail
+
+_script_dir() {
+  local src dir
+  src="${BASH_SOURCE[0]}"
+  case "$src" in
+    */*) dir="${src%/*}" ;;
+    *) dir="." ;;
+  esac
+  cd -P -- "$dir" && pwd
+}
+
+_repo_root=$(cd -P -- "$(_script_dir)/.." && pwd)
+
+_pass_count=0
+_fail_count=0
+
+_pass() {
+  printf '  PASS: %s\n' "$*"
+  _pass_count=$((_pass_count + 1))
+}
+
+_fail() {
+  printf '  FAIL: %s\n' "$*"
+  _fail_count=$((_fail_count + 1))
+}
+
+_assert_true() {
+  local label="$1"
+  shift
+  if "$@"; then
+    _pass "$label"
+  else
+    _fail "$label (expected success; exit $?)"
+  fi
+}
+
+_assert_false() {
+  local label="$1"
+  shift
+  if "$@"; then
+    _fail "$label (expected failure but command succeeded)"
+  else
+    _pass "$label"
+  fi
+}
+
+_assert_eq() {
+  local label="$1" expected="$2" actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    _pass "$label"
+  else
+    _fail "$label (expected: $expected, actual: $actual)"
+  fi
+}
+
+# Source install.sh in this shell with the dispatch suppressed via the
+# documented opt-out env var. The opt-out is necessary because
+# `. install.sh --bootstrap` is a real invocation pattern that the
+# script supports; the BASH_SOURCE-vs-$0 trick would silently disable
+# bootstrap as well. With the env var set, sourcing only loads helper
+# definitions.
+SHDEPS_INSTALL_SH_NO_DISPATCH=1
+export SHDEPS_INSTALL_SH_NO_DISPATCH
+# shellcheck source=../install.sh
+source "$_repo_root/install.sh"
+unset SHDEPS_INSTALL_SH_NO_DISPATCH
+
+echo "=== install.sh: _release_tag_newer ==="
+
+_assert_true "newer tag returns success" \
+  _release_tag_newer "20260101-000000-abc" "20260100-000000-abc"
+_assert_false "same tag returns failure" \
+  _release_tag_newer "20260101-000000-abc" "20260101-000000-abc"
+_assert_false "older latest returns failure" \
+  _release_tag_newer "20260100-000000-abc" "20260101-000000-abc"
+_assert_false "empty latest returns failure" \
+  _release_tag_newer "" "20260101-000000-abc"
+
+echo "=== install.sh: _refresh_release_install_if_stale guards ==="
+
+# When the local install metadata is missing the `tag` field,
+# `_refresh_release_install_if_stale` must NOT trigger a re-install on
+# every shell startup. The pre-fix behavior fired `_install_release` on
+# every call because `_release_tag_newer "$latest" ""` returned true; the
+# guard inside the function short-circuits before the network step.
+_install_release_called=0
+_install_release() {
+  # Stub: record invocation so the test can assert it never ran.
+  _install_release_called=$((_install_release_called + 1))
+  return 0
+}
+_latest_release_tag() {
+  # Stub: pretend GitHub published a clearly-newer tag so any guard
+  # failure would manifest as a recorded `_install_release` call.
+  printf '20990101-000000-future\n'
+}
+_uses_default_repo_slug() { return 0; }
+_repo_slug() { printf 'owner/repo\n'; }
+
+_fixture_dir=$(mktemp -d)
+trap 'rm -rf "$_fixture_dir"' EXIT
+SHDEPS_DIR="$_fixture_dir/release-install"
+mkdir -p "$SHDEPS_DIR"
+touch "$SHDEPS_DIR/shdeps"
+# A `.shdeps-install.json` with only `method` (no `tag`) — mirrors the
+# corrupted-or-old state where the bug used to loop the download.
+printf '{"method": "release"}\n' >"$SHDEPS_DIR/.shdeps-install.json"
+
+_install_release_called=0
+_refresh_release_install_if_stale
+_assert_eq "missing tag does not fire install" "0" "$_install_release_called"
+
+# Sanity check: with a valid older `tag`, the function DOES fire the
+# install. This proves the guard is the only thing preventing the call.
+printf '{"method": "release", "tag": "20260101-000000-abc"}\n' \
+  >"$SHDEPS_DIR/.shdeps-install.json"
+_install_release_called=0
+_refresh_release_install_if_stale
+_assert_eq "stale tag fires install" "1" "$_install_release_called"
+
+echo ""
+echo "================================"
+echo "Results: $_pass_count passed, $_fail_count failed"
+echo "================================"
+
+if [[ $_fail_count -gt 0 ]]; then
+  exit 1
+fi
