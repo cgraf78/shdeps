@@ -196,7 +196,11 @@ fn manifest_path(path: &str, home: &Path) -> PathBuf {
 /// known-good roots. Note that `install_dir` is normally a descendant of
 /// `home`, but we list both to support test fixtures and custom layouts
 /// where they live in independent locations.
-fn safe_managed_path(install_path: &str, roots: &Roots) -> Option<PathBuf> {
+/// Visible to `update_transition::cleanup_snapshot`, which has its own
+/// `github:repo` cleanup path and must apply the same containment
+/// hardening. Without sharing this predicate, the second consumer
+/// silently bypasses the install-path guard.
+pub(crate) fn safe_managed_path(install_path: &str, roots: &Roots) -> Option<PathBuf> {
     let path = manifest_path(install_path, &roots.home);
     // Refuse `..` (parent-dir escape). `.` components are benign on
     // their own — `join("a/", "./b")` resolves to `a/b` — and an
