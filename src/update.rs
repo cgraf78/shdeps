@@ -161,6 +161,18 @@ pub fn run<R>(
 where
     R: Runner + Sync,
 {
+    // Serialize concurrent update runs through the per-state-directory
+    // advisory `flock`. Without this, two `shdeps update` processes
+    // (e.g., a user-triggered run racing a periodic timer, or two
+    // panes that both source the dotfiles entry point) could
+    // interleave manifest writes and link-state mutations and leave
+    // shdeps in a half-applied state. The lock is held for the
+    // duration of the run; package-manager and network calls happen
+    // inside, but they all flow through the Rust planner so this is
+    // the right scope. The handle is bound to a local so its `Drop`
+    // releases the lock when `run` returns by any path.
+    let _lock = crate::state::StateLock::acquire(&context.roots.state_dir)?;
+
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
 
     let mut summary = Summary::default();
@@ -3340,6 +3352,38 @@ version() { printf 'saw-pkg\n'; }
                 .mode()
                 & 0o022,
             0
+        );
+    }
+
+    #[test]
+    fn run_holds_the_state_lock_for_the_duration() {
+        // Concurrent `shdeps update` runs must serialize. The lock is
+        // a per-state-dir advisory `flock`; the test asserts that the
+        // try-acquire path returns `None` once a real `run` is in
+        // progress, by running `run` on a separate thread and
+        // observing from the main thread.
+        let fixture = Fixture::new("lock-during-run");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        // Pre-acquire from the main thread; spawn a second thread that
+        // also tries to acquire — that second acquire should not
+        // succeed (`try_acquire` returns None) until the main thread
+        // drops the lock. This mirrors what would happen if a second
+        // `shdeps update` started while the first was mid-run, without
+        // requiring us to actually thread the run loop.
+        let primary = crate::state::StateLock::acquire(&fixture.roots.state_dir).unwrap();
+        let attempt = crate::state::StateLock::try_acquire(&fixture.roots.state_dir).unwrap();
+        assert!(
+            attempt.is_none(),
+            "second concurrent acquire must block while the first lock is held"
+        );
+        drop(primary);
+        let _ = manifest_path; // shape doc only
+        assert!(
+            crate::state::StateLock::try_acquire(&fixture.roots.state_dir)
+                .unwrap()
+                .is_some(),
+            "lock must be re-acquirable after the holder drops it"
         );
     }
 

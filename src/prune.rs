@@ -72,6 +72,14 @@ pub fn run(
     hooks: &BashCustomProbe,
     options: Options,
 ) -> Result<Summary> {
+    // Hold the same state-directory advisory lock that `update::run`
+    // uses. Prune mutates the manifest, link-state files, and the
+    // install/bin trees; a concurrent update or another prune run
+    // would otherwise see/write inconsistent state. Acquired here
+    // (not in dry-run paths below) so even a dry-run reports against
+    // a consistent snapshot rather than racing an in-flight update.
+    let _lock = crate::state::StateLock::acquire(&roots.state_dir)?;
+
     let orphans = orphans(manifest, config);
     // The "all orphans" guard prevents a silent bulk-delete of every
     // shdeps-tracked dep without explicit `--yes`. The pre-fix gate
