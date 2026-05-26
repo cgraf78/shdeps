@@ -1741,6 +1741,135 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_verifies_sibling_sha256_checksum_when_published() {
+        // When the release publishes a `<asset>.sha256` sibling, the
+        // installer must fetch it and verify the downloaded binary before
+        // landing it on disk. Successful verification produces the same
+        // observable behavior as the no-checksum path — but the request log
+        // confirms the checksum download did happen.
+        let mut fixture = Fixture::new("release-checksum-ok");
+        fixture.write_lib();
+        let binary = b"binary".to_vec();
+        let checksum_text = format!(
+            "{}  tool-linux-x86_64\n",
+            crate::checksum::sha256_hex(&binary)
+        );
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[
+                        {
+                            "name":"tool-linux-x86_64",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        },
+                        {
+                            "name":"tool-linux-x86_64.sha256",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256"
+                        }
+                    ]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                binary.clone(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256",
+                checksum_text.into_bytes(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read(fixture.roots.bin_dir.join("tool")).unwrap(),
+            binary
+        );
+        let urls: Vec<String> = fixture
+            .client
+            .requests()
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect();
+        assert!(
+            urls.iter().any(|url| url.ends_with(".sha256")),
+            "checksum sibling must have been fetched: {urls:?}"
+        );
+    }
+
+    #[test]
+    fn update_github_release_refuses_install_on_sha256_mismatch() {
+        // If the sibling checksum is published but mismatches the
+        // downloaded binary, the install must be refused outright and the
+        // existing public bin must remain untouched. A failed run is
+        // surfaced in the summary so callers (and `dot update`) gate on
+        // it instead of silently shipping the bad binary.
+        let mut fixture = Fixture::new("release-checksum-bad");
+        fixture.write_lib();
+        let binary = b"binary".to_vec();
+        let wrong_checksum_text = format!(
+            "{}  tool-linux-x86_64\n",
+            crate::checksum::sha256_hex(b"different-bytes"),
+        );
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[
+                        {
+                            "name":"tool-linux-x86_64",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        },
+                        {
+                            "name":"tool-linux-x86_64.sha256",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256"
+                        }
+                    ]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                binary,
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256",
+                wrong_checksum_text.into_bytes(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].detail, "release asset checksum mismatch");
+        assert!(!fixture.roots.bin_dir.join("tool").exists());
+    }
+
+    #[test]
     fn update_github_release_sends_token_to_metadata_only() {
         let mut fixture = Fixture::new("release-token");
         fixture.write_lib();
