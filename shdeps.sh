@@ -105,6 +105,7 @@ _shdepsw_ensure_abi() {
 
   version=$(_shdepsw_call __api version 2>/dev/null) || {
     _shdepsw_source_fail "Rust shdeps binary does not expose the wrapper ABI"
+    return 1
   }
   case "$version" in
     abi:1)
@@ -156,7 +157,7 @@ _shdepsw_valid_marker_component() {
 
 _shdepsw_valid_dep_name() {
   local name="$1"
-  [[ -n "$name" && "$name" != /* && "$name" != *\\* && "$name" != "." && "$name" != ".." && "$name" != ../* && "$name" != */../* && "$name" != */.. ]]
+  [[ -n "$name" && "$name" != /* && "$name" != *\\* && "$name" != "." && "$name" != ".." && "$name" != ../* && "$name" != */../* && "$name" != */.. && "$name" != *\|* ]]
 }
 
 _shdepsw_state_dir() {

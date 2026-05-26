@@ -174,15 +174,11 @@ where
                 overrides.reinstall = true;
                 index += 1;
             }
-            "-q" | "--quiet" | "-v" | "--verbose" | "-y" | "--dry-run" => {
+            "-q" | "--quiet" | "-v" | "--verbose" => {
                 match arg.as_str() {
                     "-q" | "--quiet" => quiet = true,
                     "-v" | "--verbose" => {}
-                    _ => {
-                        writeln!(stderr, "error: unknown option '{arg}'")?;
-                        writeln!(stderr, "Run 'shdeps help' for usage.")?;
-                        return Ok(ParseOutcome::Exit(2));
-                    }
+                    _ => unreachable!(),
                 }
                 index += 1;
             }

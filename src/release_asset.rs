@@ -100,12 +100,16 @@ enum Pass {
 
 impl Pass {
     fn matches(self, url_lower: &str) -> bool {
+        // Match against the filename component only. The repo/org path segments
+        // can contain substrings like ".tar.gz" or ".pkg" on repos with unusual
+        // names, and testing the full URL would misclassify those assets.
+        let filename = url_lower.rsplit('/').next().unwrap_or(url_lower);
         match self {
             Self::Plain => {
-                !TAR_EXTS.iter().any(|ext| url_lower.contains(ext)) && !url_lower.contains(".zip")
+                !TAR_EXTS.iter().any(|ext| filename.ends_with(ext)) && !filename.ends_with(".zip")
             }
-            Self::Tar => TAR_EXTS.iter().any(|ext| url_lower.contains(ext)),
-            Self::Zip => url_lower.ends_with(".zip"),
+            Self::Tar => TAR_EXTS.iter().any(|ext| filename.ends_with(ext)),
+            Self::Zip => filename.ends_with(".zip"),
         }
     }
 }
@@ -144,7 +148,11 @@ const TAR_EXTS: &[&str] = &[
 ];
 
 fn should_skip(url_lower: &str) -> bool {
-    SKIP_EXTS.iter().any(|ext| url_lower.contains(ext))
+    // Match only the filename component — the same reasoning as Pass::matches.
+    // A repo named e.g. "my.deb.tool" would cause the full URL to contain
+    // ".deb" even though the asset itself is a plain binary.
+    let filename = url_lower.rsplit('/').next().unwrap_or(url_lower);
+    SKIP_EXTS.iter().any(|ext| filename.ends_with(ext))
 }
 
 fn matches_any(url_lower: &str, patterns: &[String]) -> bool {
@@ -153,10 +161,8 @@ fn matches_any(url_lower: &str, patterns: &[String]) -> bool {
 
 fn os_patterns(os: &str) -> Vec<String> {
     let mut patterns = vec![os.to_owned()];
-    match os {
-        "darwin" => patterns.extend(["macos", "apple", "osx"].map(str::to_owned)),
-        "linux" => patterns.push("linux".to_owned()),
-        _ => {}
+    if os == "darwin" {
+        patterns.extend(["macos", "apple", "osx"].map(str::to_owned));
     }
     patterns
 }
