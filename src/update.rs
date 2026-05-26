@@ -93,6 +93,10 @@ pub struct Summary {
     /// At that point the dependency should remain usable even if deleting old
     /// artifacts fails, so cleanup failures are tracked separately from
     /// install failures instead of rolling back the successful method switch.
+    /// Note: these are real I/O failures from `cleanup_snapshot` (permission
+    /// denied, read-only filesystem, etc.) — not "expected-leftover" cases.
+    /// They gate the run's exit code via `has_errors` so an operator who
+    /// trusts the exit code does not miss a silently-broken transition.
     pub leftovers: Vec<String>,
 }
 
@@ -135,9 +139,15 @@ where
 
 impl Summary {
     /// Returns whether the update had any failure.
+    ///
+    /// Both install failures and cleanup-step leftovers gate the exit
+    /// code: a leftover means an I/O error left old-method artifacts on
+    /// disk, which is a state operators must repair. Pretending the run
+    /// succeeded would let the leftover accumulate silently until the
+    /// next manual audit.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        !self.failed.is_empty()
+        !self.failed.is_empty() || !self.leftovers.is_empty()
     }
 }
 
@@ -573,7 +583,7 @@ mod tests {
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{Context, Options, run};
+    use super::{Context, Options, Summary, run};
     use bzip2::Compression as BzCompression;
     use bzip2::write::BzEncoder;
     use flate2::Compression;
@@ -3290,6 +3300,22 @@ version() { printf 'saw-pkg\n'; }
                 .mode()
                 & 0o022,
             0
+        );
+    }
+
+    #[test]
+    fn summary_has_errors_promotes_leftovers_to_run_exit_signal() {
+        // Pure unit test of the Summary contract: a leftover means a
+        // real I/O error in cleanup_snapshot left old-method artifacts
+        // on disk. That state must gate the run's exit code so a script
+        // that trusts `shdeps update` exit 0 does not accumulate
+        // unreachable state.
+        let mut summary = Summary::default();
+        assert!(!summary.has_errors());
+        summary.leftovers.push("owner/tool".to_owned());
+        assert!(
+            summary.has_errors(),
+            "a leftover must surface through has_errors so the run exits non-zero"
         );
     }
 
