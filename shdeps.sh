@@ -80,7 +80,21 @@ _SHDEPSW_BIN="$(_shdepsw_resolve_binary)" || {
 }
 
 _shdepsw_call() {
+  # Lazy-init the ABI handshake and env-snapshot cache on first use
+  # instead of at source time. Sourcing this file used to spawn two
+  # `shdeps __api ...` subprocesses on every cold shell startup even
+  # when the user never invoked any `shdeps_*` function in that shell.
+  # The `_SHDEPS_ABI_CHECKED` / `_SHDEPSW_ENV_CACHED` guards inside
+  # `_shdepsw_ensure_abi` / `_shdepsw_cache_env` make subsequent calls
+  # near-free, so every binary-backed public function still gets the
+  # safety check, just at the point where the work is actually needed.
+  _shdepsw_lazy_init || return $?
   command "$_SHDEPSW_BIN" "$@"
+}
+
+_shdepsw_lazy_init() {
+  _shdepsw_ensure_abi || return $?
+  _shdepsw_cache_env || return $?
 }
 
 _shdepsw_prepend_bin_dir() {
@@ -103,7 +117,12 @@ _shdepsw_ensure_abi() {
   local version
   [[ "${_SHDEPS_ABI_CHECKED:-}" == "1" ]] && return 0
 
-  version=$(_shdepsw_call __api version 2>/dev/null) || {
+  # Invoke the binary directly here instead of through `_shdepsw_call`.
+  # `_shdepsw_call` now triggers lazy init, which calls this function —
+  # routing through it would recurse indefinitely. The whole point of
+  # the lazy-init layer is to defer this single subprocess until first
+  # use, so calling the binary by path is exactly correct.
+  version=$(command "$_SHDEPSW_BIN" __api version 2>/dev/null) || {
     _shdepsw_source_fail "Rust shdeps binary does not expose the wrapper ABI"
     return 1
   }
@@ -121,7 +140,9 @@ _shdepsw_cache_env() {
   local snapshot line key value
   [[ "${_SHDEPSW_ENV_CACHED:-}" == "1" ]] && return 0
 
-  snapshot=$(_shdepsw_call __api env-snapshot) || return $?
+  # Same recursion concern as `_shdepsw_ensure_abi`: call the binary
+  # directly rather than through `_shdepsw_call`.
+  snapshot=$(command "$_SHDEPSW_BIN" __api env-snapshot) || return $?
   while IFS= read -r line; do
     key=${line%%=*}
     value=${line#*=}
@@ -164,9 +185,6 @@ _shdepsw_state_dir() {
   printf '%s\n' "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}"
 }
 
-_shdepsw_ensure_abi || return 1 2>/dev/null || exit 1
-_shdepsw_cache_env || return 1 2>/dev/null || exit 1
-
 # ---------------------------------------------------------------------------
 # Public API — stable sourceable interface for callers and hook authors.
 # ---------------------------------------------------------------------------
@@ -186,9 +204,24 @@ shdeps_host_match() { _shdepsw_call __api host-match "$@"; }
 shdeps_filter_match() { _shdepsw_call __api filter-match "$@"; }
 
 shdeps_platform() { printf '%s\n' "${_SHDEPSW_PLATFORM:-$(_shdepsw_call __api platform)}"; }
-shdeps_force() { [[ "${SHDEPS_FORCE:-${_SHDEPSW_FORCE:-0}}" == "1" ]]; }
-shdeps_reinstall() { [[ "${SHDEPS_REINSTALL:-${_SHDEPSW_REINSTALL:-0}}" == "1" ]]; }
-shdeps_pkg_mgr() { printf '%s\n' "${_SHDEPS_PKG_MGR:-${SHDEPS_PKG_MGR:-${_SHDEPSW_PKG_MGR:-}}}"; }
+# `shdeps_force` / `shdeps_reinstall` / `shdeps_pkg_mgr` read cached env
+# vars populated by `_shdepsw_cache_env`. With lazy init they need to
+# trigger the cache themselves; otherwise the first call after sourcing
+# would compare against an empty cache and silently report the wrong
+# default. `_shdepsw_lazy_init` is gated by a one-shot flag so the
+# repeated calls cost nothing after the first.
+shdeps_force() {
+  _shdepsw_lazy_init || return $?
+  [[ "${SHDEPS_FORCE:-${_SHDEPSW_FORCE:-0}}" == "1" ]]
+}
+shdeps_reinstall() {
+  _shdepsw_lazy_init || return $?
+  [[ "${SHDEPS_REINSTALL:-${_SHDEPSW_REINSTALL:-0}}" == "1" ]]
+}
+shdeps_pkg_mgr() {
+  _shdepsw_lazy_init || return $?
+  printf '%s\n' "${_SHDEPS_PKG_MGR:-${SHDEPS_PKG_MGR:-${_SHDEPSW_PKG_MGR:-}}}"
+}
 shdeps_pkg_install() { SHDEPS_PKG_MGR="$(shdeps_pkg_mgr)" _shdepsw_call __api pkg-install "$@"; }
 shdeps_pkg_install_for_mgr() { SHDEPS_PKG_MGR="$(shdeps_pkg_mgr)" _shdepsw_call __api pkg-install-for-mgr "$@"; }
 shdeps_require_sudo() { _shdepsw_call __api require-sudo "$@"; }
