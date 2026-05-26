@@ -72,6 +72,18 @@ where
             let panic_payload = &panic_payload;
             scope.spawn(move || {
                 loop {
+                    // Stop claiming new work as soon as ANY worker has
+                    // recorded a panic. The serial path (`items.iter().map(f).collect()`)
+                    // stops on first panic because `collect` drives the
+                    // map lazily; the worker pool must match that
+                    // "stop on first panic" contract so callers do not
+                    // observe a wider blast radius when SHDEPS_JOBS goes
+                    // from 1 to 2. In-flight items still complete (we
+                    // cannot interrupt `f` once it has started), but no
+                    // new index is claimed once a panic is recorded.
+                    if panic_payload.lock().unwrap().is_some() {
+                        return;
+                    }
                     let index = next_index.fetch_add(1, Ordering::Relaxed);
                     if index >= len {
                         return;
@@ -192,5 +204,49 @@ mod tests {
             }
             *item
         });
+    }
+
+    #[test]
+    fn parallel_map_stops_claiming_new_items_after_a_panic() {
+        // Round-6 finding: the serial `items.iter().map(f).collect()`
+        // path stops on first panic because `collect` drives the map
+        // lazily. The worker pool must match that "stop on first
+        // panic" contract so callers do not observe a wider blast
+        // radius when SHDEPS_JOBS goes from 1 to 2+. This test
+        // tracks how many items each closure call processes; after
+        // the panic, no NEW indices should be claimed (in-flight
+        // items still complete because we cannot interrupt `f`
+        // mid-run).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let processed = AtomicUsize::new(0);
+        // Many items so a "keep claiming after panic" bug would be
+        // obvious in the processed count.
+        let items: Vec<usize> = (0..1000).collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::parallel_map(&items, 4, |item| {
+                // First worker to reach this point panics; the
+                // others are sleeping so they reliably see the
+                // recorded panic before claiming new indices.
+                if *item == 0 {
+                    // Brief sleep to give peers time to enter their
+                    // first claim loop before the panic is recorded.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    panic!("boom-on-zero");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                processed.fetch_add(1, Ordering::Relaxed);
+                *item
+            })
+        }));
+        assert!(result.is_err(), "panic must propagate");
+        // Without the fix, processed would approach 1000. With the
+        // fix, at most one round of in-flight items per worker (~4)
+        // completes after the panic. Generous bound to absorb
+        // scheduler noise without flaking.
+        let count = processed.load(Ordering::Relaxed);
+        assert!(
+            count < 50,
+            "expected at most a handful of in-flight items past the panic, got {count}"
+        );
     }
 }
