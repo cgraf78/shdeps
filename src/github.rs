@@ -81,12 +81,27 @@ pub fn fetch_releases(
 /// without API headers because signed storage redirects reject forwarded raw
 /// headers. Private release assets need the REST asset endpoint instead, so use
 /// it only after the browser URL fails and a token is available.
+///
+/// Both URLs originate from the GitHub release JSON, which shdeps fetched but
+/// could in principle have been tampered with (malformed payload, a tampered
+/// cache file, a MITM on an upstream proxy). Before contacting either URL the
+/// caller-supplied hosts are validated against known-good GitHub prefixes so a
+/// corrupted asset record cannot redirect the download — or the bearer token
+/// — to an arbitrary host. The HTTP layer additionally only attaches the auth
+/// header to api.github.com URLs, so this is defense-in-depth against the same
+/// confused-deputy class of bug.
 pub fn download_asset(
     client: &dyn Client,
     browser_url: &str,
     api_url: Option<&str>,
     token: Option<&str>,
 ) -> io::Result<Vec<u8>> {
+    if !is_safe_release_asset_url(browser_url) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to download release asset from non-GitHub host: {browser_url}"),
+        ));
+    }
     match client.get(browser_url, None) {
         Ok(bytes) => Ok(bytes),
         Err(browser_error) => {
@@ -95,9 +110,43 @@ pub fn download_asset(
             else {
                 return Err(browser_error);
             };
+            if !is_safe_api_asset_url(api_url) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("refusing authenticated download from non-GitHub API host: {api_url}"),
+                ));
+            }
             client.get_github_asset(api_url, Some(token))
         }
     }
+}
+
+/// True for URLs that look like a legitimate GitHub-issued asset download.
+///
+/// `browser_download_url` in the GitHub API is canonically
+/// `https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`; the
+/// 30x redirect into `objects.githubusercontent.com` happens at the HTTP
+/// layer where curl follows it transparently, so callers only ever supply
+/// the `https://github.com/` form. Any other host implies a corrupted or
+/// hostile asset record.
+#[must_use]
+pub fn is_safe_release_asset_url(url: &str) -> bool {
+    // `starts_with` is sufficient here: the prefix includes the scheme and
+    // the trailing `/`, so it cannot be subverted by a host like
+    // `https://github.com.attacker.example/...`.
+    url.starts_with("https://github.com/")
+        || url.starts_with("https://objects.githubusercontent.com/")
+}
+
+/// True for URLs that look like a legitimate GitHub REST asset endpoint.
+///
+/// The REST asset URL is always under `https://api.github.com/repos/`; the
+/// auth bearer token is only attached when the URL passes this check, so a
+/// crafted `api_url` value cannot trick shdeps into sending the bearer to a
+/// third-party host.
+#[must_use]
+pub fn is_safe_api_asset_url(url: &str) -> bool {
+    url.starts_with("https://api.github.com/")
 }
 
 /// Returns the GitHub API releases URL for `owner/repo`.
@@ -305,11 +354,14 @@ mod tests {
 
     #[test]
     fn download_asset_uses_browser_url_without_token_first() {
-        let client = MapClient::new().with("https://downloads.example/tool", b"public".to_vec());
+        let client = MapClient::new().with(
+            "https://github.com/owner/tool/releases/download/v1/tool",
+            b"public".to_vec(),
+        );
 
         let bytes = download_asset(
             &client,
-            "https://downloads.example/tool",
+            "https://github.com/owner/tool/releases/download/v1/tool",
             Some("https://api.github.com/repos/owner/tool/releases/assets/1"),
             Some("token"),
         )
@@ -320,7 +372,7 @@ mod tests {
             client.calls(),
             vec![Call {
                 kind: "get",
-                url: "https://downloads.example/tool".to_owned(),
+                url: "https://github.com/owner/tool/releases/download/v1/tool".to_owned(),
                 token: None,
             }]
         );
@@ -335,7 +387,7 @@ mod tests {
 
         let bytes = download_asset(
             &client,
-            "https://downloads.example/private-tool",
+            "https://github.com/owner/tool/releases/download/v1/private-tool",
             Some("https://api.github.com/repos/owner/tool/releases/assets/1"),
             Some(" token "),
         )
@@ -347,7 +399,8 @@ mod tests {
             vec![
                 Call {
                     kind: "get",
-                    url: "https://downloads.example/private-tool".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1/private-tool"
+                        .to_owned(),
                     token: None,
                 },
                 Call {
@@ -357,6 +410,74 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn download_asset_refuses_browser_url_outside_github_host() {
+        // A tampered or malformed release JSON could plant any URL into the
+        // `browser_download_url` field. shdeps must refuse to fetch from
+        // unrelated hosts even when the path looks plausible.
+        let client = MapClient::new().with("https://evil.example/payload", b"bad".to_vec());
+
+        let error = download_asset(
+            &client,
+            "https://evil.example/payload",
+            Some("https://api.github.com/repos/owner/tool/releases/assets/1"),
+            Some("token"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // No GET should have been issued at all — the validation runs before
+        // any network call so the bearer token cannot leak even partially.
+        assert!(client.calls().is_empty());
+    }
+
+    #[test]
+    fn download_asset_refuses_api_fallback_outside_github_api_host() {
+        // The browser URL is genuine (so the first call is made) but the
+        // private-fallback `api_url` points to a third-party host. shdeps
+        // must refuse to send the bearer token to that host. The original
+        // browser error is surfaced via the validation error instead of the
+        // bearer ever being placed on the wire.
+        let client = MapClient::new();
+
+        let error = download_asset(
+            &client,
+            "https://github.com/owner/tool/releases/download/v1/tool.tar.gz",
+            Some("https://attacker.example/api"),
+            Some("token"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // The browser GET attempt was made (and failed with NotFound), but
+        // no authenticated asset call to the malicious host was issued.
+        let calls = client.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].kind, "get");
+        assert_eq!(calls[0].token, None);
+    }
+
+    #[test]
+    fn download_asset_accepts_objects_githubusercontent_url() {
+        // Some upstream tooling references the redirect target host
+        // directly (e.g., precomputed signed URLs in third-party mirrors).
+        // It must be accepted alongside the canonical `github.com` host.
+        let client = MapClient::new().with(
+            "https://objects.githubusercontent.com/release/payload",
+            b"ok".to_vec(),
+        );
+
+        let bytes = download_asset(
+            &client,
+            "https://objects.githubusercontent.com/release/payload",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(bytes, b"ok");
     }
 
     #[test]

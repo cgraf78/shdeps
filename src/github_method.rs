@@ -1027,7 +1027,7 @@ mod tests {
         let assets = assets
             .iter()
             .map(|asset| {
-                format!(r#"{{"name":"{asset}","browser_download_url":"https://example/{asset}"}}"#)
+                format!(r#"{{"name":"{asset}","browser_download_url":"https://github.com/owner/tool/releases/download/v1/{asset}"}}"#)
             })
             .collect::<Vec<_>>()
             .join(",");

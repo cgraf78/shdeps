@@ -153,15 +153,15 @@ mod tests {
         let release = release(&[
             (
                 "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz",
-                "https://example/archive",
+                "https://github.com/owner/tool/releases/download/v1/archive",
             ),
             (
                 "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256",
-                "https://example/checksum",
+                "https://github.com/owner/tool/releases/download/v1/checksum",
             ),
             (
                 "shdeps-v2026.05.24-linux-aarch64-musl.tar.gz",
-                "https://example/wrong-arch",
+                "https://github.com/owner/tool/releases/download/v1/wrong-arch",
             ),
         ]);
 
@@ -169,10 +169,10 @@ mod tests {
             select_pair(&release, "linux-x86_64-musl"),
             Some(Pair {
                 archive_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz".to_owned(),
-                archive_url: "https://example/archive".to_owned(),
+                archive_url: "https://github.com/owner/tool/releases/download/v1/archive".to_owned(),
                 archive_api_url: None,
                 checksum_name: "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz.sha256".to_owned(),
-                checksum_url: "https://example/checksum".to_owned(),
+                checksum_url: "https://github.com/owner/tool/releases/download/v1/checksum".to_owned(),
                 checksum_api_url: None,
             })
         );
@@ -188,12 +188,12 @@ mod tests {
             assets: vec![
                 Asset {
                     name: String::new(),
-                    url: "https://example/shdeps-v2026.05.24-macos-aarch64.tar.gz".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1/shdeps-v2026.05.24-macos-aarch64.tar.gz".to_owned(),
                     api_url: None,
                 },
                 Asset {
                     name: String::new(),
-                    url: "https://example/shdeps-v2026.05.24-macos-aarch64.tar.gz.sha256"
+                    url: "https://github.com/owner/tool/releases/download/v1/shdeps-v2026.05.24-macos-aarch64.tar.gz.sha256"
                         .to_owned(),
                     api_url: None,
                 },
@@ -207,7 +207,7 @@ mod tests {
     fn select_pair_rejects_missing_checksum() {
         let release = release(&[(
             "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz",
-            "https://example/archive",
+            "https://github.com/owner/tool/releases/download/v1/archive",
         )]);
 
         assert_eq!(select_pair(&release, "linux-x86_64-musl"), None);

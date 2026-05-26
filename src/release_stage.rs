@@ -250,10 +250,10 @@ mod tests {
             Self {
                 parent,
                 pair: Pair {
-                    archive_url: format!("https://example/{archive_name}"),
+                    archive_url: format!("https://github.com/owner/tool/releases/download/v1/{archive_name}"),
                     archive_api_url: None,
                     archive_name,
-                    checksum_url: format!("https://example/{checksum_name}"),
+                    checksum_url: format!("https://github.com/owner/tool/releases/download/v1/{checksum_name}"),
                     checksum_api_url: None,
                     checksum_name,
                 },
