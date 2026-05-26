@@ -183,41 +183,43 @@ fn manifest_path(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// Returns a manifest-supplied install path only when it lexically resolves
-/// inside one of the shdeps-managed trees (`install_dir` or `home`).
+/// Returns a manifest-supplied install path only when it lexically
+/// resolves inside the shdeps-managed install tree.
 ///
-/// The manifest is a human-readable text file with no schema enforcement, so
-/// a corrupt record or a hand edit could plant any absolute path or a
-/// `..`-escape into `entry.install_path`. Without this guard, the cleanup
-/// path would hand that value straight to `remove_dir_all`. Rather than
-/// canonicalize (which would follow symlinks and could mask escapes through
-/// link targets), this check rejects anything with a `..` or `.` component
-/// after resolution and requires lexical containment under one of the
-/// known-good roots. Note that `install_dir` is normally a descendant of
-/// `home`, but we list both to support test fixtures and custom layouts
-/// where they live in independent locations.
-/// Visible to `update_transition::cleanup_snapshot`, which has its own
-/// `github:repo` cleanup path and must apply the same containment
-/// hardening. Without sharing this predicate, the second consumer
-/// silently bypasses the install-path guard.
+/// The manifest is a human-readable text file with no schema
+/// enforcement, so a corrupt record or a hand edit could plant any
+/// absolute path or a `..`-escape into `entry.install_path`. Without
+/// this guard, the cleanup path would hand that value straight to
+/// `remove_dir_all`. Rather than canonicalize (which would follow
+/// symlinks and could mask escapes through link targets), the check
+/// rejects anything with a `..` component and requires lexical
+/// containment under `install_dir`.
+///
+/// Earlier versions of this predicate also accepted any path under
+/// `$HOME`. That was overly permissive: a tampered manifest entry
+/// pointing at, say, `$HOME/.ssh` or `$HOME/Documents/project` would
+/// pass the guard and be removed during prune. shdeps's own writes
+/// always target `install_dir` (configurable via `SHDEPS_INSTALL_DIR`,
+/// defaulting to `$HOME/.local/share`), so the install-tree
+/// containment is sufficient for legitimate entries. Relative paths
+/// written by older fleet bootstraps (e.g., `.local/share/<dep>`)
+/// still work in the default configuration because they resolve to
+/// `$HOME/.local/share/<dep>` which IS under the default
+/// `install_dir`.
+///
+/// Visible to `update_transition::cleanup_snapshot`, which has its
+/// own `github:repo` cleanup path and must apply the same
+/// containment hardening. Without sharing this predicate, the
+/// second consumer silently bypasses the install-path guard.
 pub(crate) fn safe_managed_path(install_path: &str, roots: &Roots) -> Option<PathBuf> {
     let path = manifest_path(install_path, &roots.home);
-    // Refuse `..` (parent-dir escape). `.` components are benign on
-    // their own — `join("a/", "./b")` resolves to `a/b` — and an
-    // older fleet bootstrap could legitimately have written paths
-    // like `./local/share/...` into the manifest. Rejecting `CurDir`
-    // along with `ParentDir` would silently skip cleanup for those
-    // entries. The `starts_with` check below is the load-bearing
-    // containment guard; refusing `..` keeps that check sound by
-    // preventing lexical-prefix bypass.
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
         return None;
     }
-    let safe = path.starts_with(&roots.install_dir) || path.starts_with(&roots.home);
-    safe.then_some(path)
+    path.starts_with(&roots.install_dir).then_some(path)
 }
 
 fn remove_any(path: &Path, summary: &mut Summary) -> Result<()> {
@@ -306,9 +308,15 @@ mod tests {
     fn github_repo_cleanup_removes_symlink_install_and_tracked_links_but_preserves_target() {
         let fixture = Fixture::new("repo-symlink");
         let target = fixture.dir.join("target");
-        let install_link = fixture.roots.home.join(".local/share/repo-tool");
+        // Install path is under `install_dir` (the only tree
+        // `safe_managed_path` accepts since the round-6 tightening
+        // of the `$HOME` acceptance).
+        let install_link = fixture.roots.install_dir.join("repo-tool");
         let short_bin = fixture.roots.bin_dir.join("repo-tool");
         let extra_bin = fixture.roots.bin_dir.join("repo-extra");
+        // Extras live wherever the linker placed them. `man_link` is
+        // just a tracked symlink used to verify unlink_tracked clears
+        // it; the path does not need to be in install_dir.
         let man_link = fixture.roots.home.join(".local/share/man/man1/repo-tool.1");
         fs::create_dir_all(&target).unwrap();
         fs::create_dir_all(install_link.parent().unwrap()).unwrap();
@@ -335,7 +343,7 @@ mod tests {
                 "repo-tool",
                 "github:repo",
                 "repo-tool",
-                ".local/share/repo-tool",
+                install_link.to_string_lossy(),
             ),
             &fixture.roots,
         )
@@ -449,13 +457,54 @@ mod tests {
     }
 
     #[test]
-    fn safe_managed_path_accepts_relative_paths_under_home() {
-        // The historical Bash layout stored install paths as `.local/share/...`
-        // strings relative to `$HOME`. These must continue to resolve into the
-        // home-rooted location they always have.
-        let fixture = Fixture::new("safe-rel-home");
-        let resolved = safe_managed_path(".local/share/repo-tool", &fixture.roots).unwrap();
-        assert_eq!(resolved, fixture.roots.home.join(".local/share/repo-tool"));
+    fn safe_managed_path_accepts_relative_paths_that_resolve_under_install_dir() {
+        // The historical Bash layout stored install paths as
+        // `.local/share/...` relative to `$HOME`. In a real shdeps
+        // configuration `install_dir` defaults to
+        // `$HOME/.local/share`, so the relative path resolves UNDER
+        // `install_dir` and remains acceptable. The fixture below
+        // mirrors that real-world overlap so the legacy entry passes.
+        let dir = std::env::temp_dir().join(format!(
+            "shdeps-cleanup-safe-rel-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let roots = Roots {
+            state_dir: dir.join("state"),
+            install_dir: dir.join("home/.local/share"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let resolved = safe_managed_path(".local/share/repo-tool", &roots).unwrap();
+        assert_eq!(resolved, roots.home.join(".local/share/repo-tool"));
+        // Sanity-check that the resolved path is indeed under
+        // install_dir (the load-bearing containment).
+        assert!(resolved.starts_with(&roots.install_dir));
+    }
+
+    #[test]
+    fn safe_managed_path_rejects_paths_under_home_but_outside_install_dir() {
+        // Round-6 codex finding: a tampered manifest record pointing
+        // at e.g. `$HOME/.ssh` or `$HOME/Documents/private-project`
+        // used to pass the guard because the predicate accepted any
+        // path under `$HOME`. The new predicate restricts to
+        // `install_dir`, which keeps sensitive home subdirs out of
+        // reach of the prune cleanup loop.
+        let fixture = Fixture::new("safe-home-but-not-install");
+        // The Fixture's `install_dir` is `dir/share`; `home` is
+        // `dir/home`. Both `.ssh/id_rsa` and a sibling under home
+        // resolve outside install_dir.
+        assert!(safe_managed_path(".ssh/id_rsa", &fixture.roots).is_none());
+        assert!(safe_managed_path("Documents/project", &fixture.roots).is_none());
+        let abs_home_sensitive = fixture
+            .roots
+            .home
+            .join(".gnupg")
+            .to_string_lossy()
+            .into_owned();
+        assert!(safe_managed_path(&abs_home_sensitive, &fixture.roots).is_none());
     }
 
     #[test]
@@ -492,15 +541,28 @@ mod tests {
     #[test]
     fn safe_managed_path_accepts_curdir_components_in_legitimate_paths() {
         // An older fleet bootstrap could have written paths like
-        // `./local/share/...` into the manifest. `.` components are
-        // benign on their own (`join` resolves them away), so
-        // rejecting them along with `..` would silently skip cleanup
-        // for legitimate older entries. Only `..` is the real escape
-        // vector.
-        let fixture = Fixture::new("safe-curdir");
-        let resolved = safe_managed_path("./local/share/repo-tool", &fixture.roots).unwrap();
-        // The resolved path lives under home and is therefore safe.
-        assert!(resolved.starts_with(&fixture.roots.home));
+        // `./<dep>` (with a leading CurDir) into the manifest. `.`
+        // components are benign on their own (`join` resolves them
+        // away), so rejecting them along with `..` would silently
+        // skip cleanup for legitimate older entries. Only `..` is
+        // the real escape vector. The fixture below uses an
+        // install_dir-rooted relative path so the post-round-6
+        // containment guard accepts it.
+        let dir = std::env::temp_dir().join(format!(
+            "shdeps-cleanup-safe-curdir-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let roots = Roots {
+            state_dir: dir.join("state"),
+            install_dir: dir.join("home/.local/share"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let resolved = safe_managed_path("./.local/share/repo-tool", &roots).unwrap();
+        assert!(resolved.starts_with(&roots.install_dir));
     }
 
     #[test]
