@@ -105,6 +105,47 @@ pub struct Summary {
     pub leftovers: Vec<String>,
 }
 
+/// Progress sink for user-facing update renderers.
+///
+/// The updater owns real phase knowledge (package cache, release prefetch,
+/// repo updates, language tools, hooks). Keeping progress events here lets the
+/// CLI render a live TTY view and lets parent commands consume
+/// machine-readable events without scraping prose.
+pub trait Progress {
+    /// Reports that a phase is running or has advanced.
+    fn phase(
+        &mut self,
+        group: &'static str,
+        status: &'static str,
+        detail: &str,
+        done: usize,
+        total: usize,
+    ) -> Result<()>;
+
+    /// Reports the final item status for one dependency.
+    fn item(&mut self, group: &'static str, item: &Item) -> Result<()>;
+}
+
+/// Progress sink used by library callers that only need the final summary.
+pub struct NoProgress;
+
+impl Progress for NoProgress {
+    fn phase(
+        &mut self,
+        _group: &'static str,
+        _status: &'static str,
+        _detail: &str,
+        _done: usize,
+        _total: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn item(&mut self, _group: &'static str, _item: &Item) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Shared inputs for one update run.
 ///
 /// `update` is the first command that touches every expensive boundary:
@@ -193,6 +234,20 @@ pub fn run<R>(
 where
     R: Runner + Sync,
 {
+    run_with_progress(entries, manifest, context, options, &mut NoProgress)
+}
+
+/// Runs update while reporting phase and item progress to `progress`.
+pub fn run_with_progress<R>(
+    entries: &[Entry],
+    manifest: &Manifest,
+    context: &Context<'_, R>,
+    options: Options,
+    progress: &mut dyn Progress,
+) -> Result<Summary>
+where
+    R: Runner + Sync,
+{
     // Serialize concurrent update runs through the per-state-directory
     // advisory `flock`. Without this, two `shdeps update` processes
     // (e.g., a user-triggered run racing a periodic timer, or two
@@ -232,6 +287,13 @@ where
         })
         .count();
     if active_package_entries {
+        progress.phase(
+            "packages",
+            "running",
+            "checking package deps",
+            0,
+            package_count,
+        )?;
         let package_cache = if package_count == 0 {
             package_cache::Status::Hit { count: 0 }
         } else {
@@ -244,14 +306,16 @@ where
             // replay the same per-entry "installed/skipped" items but avoid
             // package-manager probes and manifest rewrites. Non-package
             // methods still run normally below.
-            summary
-                .items
-                .extend(update_pkg::cached_items(entries, context));
+            for item in update_pkg::cached_items(entries, context) {
+                progress.item("packages", &item)?;
+                summary.items.push(item);
+            }
         } else {
             let package_versions = update_pkg::package_versions(entries, context);
             update_pkg::prepare(entries, context, &package_versions);
 
             let mut package_clean = true;
+            let mut package_done = 0usize;
 
             for entry in entries {
                 if entry.method != "pkg" || !active(entry, context.env) {
@@ -287,6 +351,15 @@ where
                 if item.failed {
                     summary.failed.push(entry.name.clone());
                 }
+                package_done += 1;
+                progress.item("packages", &item)?;
+                progress.phase(
+                    "packages",
+                    "running",
+                    "checking package deps",
+                    package_done,
+                    package_count,
+                )?;
                 summary.items.push(item);
             }
 
@@ -336,6 +409,15 @@ where
         .iter()
         .filter(|entry| entry.method == "github:release" && active(entry, context.env))
         .collect::<Vec<_>>();
+    if !release_entries.is_empty() {
+        progress.phase(
+            "github-releases",
+            "running",
+            "checking GitHub releases",
+            0,
+            release_entries.len(),
+        )?;
+    }
     let release_prefetch = update_release::prefetch(
         &release_entries,
         context.roots,
@@ -345,10 +427,34 @@ where
         context.client,
         options,
     );
+    if !release_entries.is_empty() {
+        progress.phase(
+            "github-releases",
+            "running",
+            "checking GitHub releases",
+            release_entries.len(),
+            release_entries.len(),
+        )?;
+    }
+
+    let group_totals = group_totals(entries, context.env);
+    let mut group_done = BTreeMap::<&'static str, usize>::new();
+    let mut announced = BTreeSet::<&'static str>::new();
 
     for entry in entries {
         if entry.method == "pkg" || !active(entry, context.env) {
             continue;
+        }
+
+        let group = group_for_method(&entry.method);
+        if announced.insert(group) {
+            progress.phase(
+                group,
+                "running",
+                group_detail(group),
+                0,
+                group_totals[group],
+            )?;
         }
 
         match entry.method.as_str() {
@@ -380,6 +486,8 @@ where
                 if item.changed {
                     changed.push(entry.name.clone());
                 }
+                progress.item(group, &item)?;
+                advance_group(progress, &mut group_done, &group_totals, group)?;
                 summary.items.push(item);
             }
             "github:repo" => {
@@ -403,6 +511,8 @@ where
                 if item.changed {
                     changed.push(entry.name.clone());
                 }
+                progress.item(group, &item)?;
+                advance_group(progress, &mut group_done, &group_totals, group)?;
                 summary.items.push(item);
             }
             "cargo" | "go" | "uv" | "npm" => {
@@ -426,6 +536,8 @@ where
                 if item.changed {
                     changed.push(entry.name.clone());
                 }
+                progress.item(group, &item)?;
+                advance_group(progress, &mut group_done, &group_totals, group)?;
                 summary.items.push(item);
             }
             "custom" => {
@@ -451,16 +563,21 @@ where
                 for marker in outcome.marked {
                     record_changed(&mut changed, marker);
                 }
+                progress.item(group, &item)?;
+                advance_group(progress, &mut group_done, &group_totals, group)?;
                 summary.items.push(item);
             }
             method => {
-                summary.failed.push(entry.name.clone());
-                summary.items.push(Item {
+                let item = Item {
                     name: entry.name.clone(),
                     changed: false,
                     failed: true,
                     detail: format!("{method} update is not implemented yet"),
-                });
+                };
+                summary.failed.push(entry.name.clone());
+                progress.item(group, &item)?;
+                advance_group(progress, &mut group_done, &group_totals, group)?;
+                summary.items.push(item);
             }
         }
     }
@@ -477,6 +594,57 @@ where
         &mut summary,
     )?;
     Ok(summary)
+}
+
+fn advance_group(
+    progress: &mut dyn Progress,
+    group_done: &mut BTreeMap<&'static str, usize>,
+    group_totals: &BTreeMap<&'static str, usize>,
+    group: &'static str,
+) -> Result<()> {
+    let done = group_done.entry(group).or_insert(0);
+    *done += 1;
+    progress.phase(
+        group,
+        "running",
+        group_detail(group),
+        *done,
+        group_totals[group],
+    )
+}
+
+fn group_totals(entries: &[Entry], env: &RuntimeEnv) -> BTreeMap<&'static str, usize> {
+    let mut totals = BTreeMap::new();
+    for entry in entries {
+        if entry.method == "pkg" || !active(entry, env) {
+            continue;
+        }
+        *totals.entry(group_for_method(&entry.method)).or_insert(0) += 1;
+    }
+    totals
+}
+
+/// Returns the display/progress group for an update method.
+pub fn group_for_method(method: &str) -> &'static str {
+    match method {
+        "pkg" => "packages",
+        "github:release" => "github-releases",
+        "github:repo" => "repo-deps",
+        "cargo" | "go" | "uv" | "npm" => "language-tools",
+        "custom" => "hooks",
+        _ => "other",
+    }
+}
+
+fn group_detail(group: &str) -> &'static str {
+    match group {
+        "packages" => "checking package deps",
+        "github-releases" => "checking GitHub releases",
+        "repo-deps" => "checking repo deps",
+        "language-tools" => "checking language tools",
+        "hooks" => "checking custom hooks",
+        _ => "checking dependencies",
+    }
 }
 
 pub(crate) fn active(entry: &Entry, env: &RuntimeEnv) -> bool {

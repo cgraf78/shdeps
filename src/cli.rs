@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,7 @@ use crate::self_update::{self, Outcome, ReleaseArchiveOutcome, Target};
 use crate::status::{self, Context as StatusContext, DependencyStatus, SkipReason, State};
 use crate::update::{self, Context as UpdateContext, Options as UpdateOptions};
 use crate::version;
+use serde_json::json;
 
 /// Compatibility help text for the `shdeps` CLI.
 ///
@@ -141,6 +143,7 @@ struct ParsedOptions {
     command_index: usize,
     overrides: Overrides,
     quiet: bool,
+    verbose: bool,
 }
 
 fn parse_options<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<ParseOutcome>
@@ -155,6 +158,7 @@ where
     // rather than spelling `shdeps -q update`, so the environment must be
     // equivalent to the flag at the command boundary.
     let mut quiet = env::var("SHDEPS_QUIET").as_deref() == Ok("1");
+    let mut verbose = env::var("SHDEPS_LOG_LEVEL").as_deref() == Ok("2");
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
             "-c" | "--config" => {
@@ -177,7 +181,7 @@ where
             "-q" | "--quiet" | "-v" | "--verbose" => {
                 match arg.as_str() {
                     "-q" | "--quiet" => quiet = true,
-                    "-v" | "--verbose" => {}
+                    "-v" | "--verbose" => verbose = true,
                     _ => unreachable!(),
                 }
                 index += 1;
@@ -196,6 +200,7 @@ where
                     command_index: index,
                     overrides,
                     quiet,
+                    verbose,
                 }));
             }
         }
@@ -436,26 +441,103 @@ where
         env_vars: &env_vars,
         client: &Curl,
     };
-    if !options.quiet {
-        // This line looks cosmetic, but it is part of the legacy bootstrap
-        // contract. dotfiles and humans both use it as the boundary between
-        // repository sync/merge work and shdeps-managed dependency work, so
-        // omitting it makes successful installs look like the update skipped
-        // package/tool installation entirely.
-        writeln!(stdout, "==> Installing/upgrading tools...")?;
+    let active_count = entries
+        .iter()
+        .filter(|entry| update::active(entry, &env))
+        .count();
+    let progress_jsonl = std::env::var_os("SHDEPS_PROGRESS").is_some_and(|value| value == "jsonl");
+    let nested = std::env::var_os("SHDEPS_NESTED").is_some_and(|value| value == "1");
+    if !options.quiet && !progress_jsonl {
+        if !nested {
+            write_heading(stdout, "Tools")?;
+        }
+        write_row(stdout, "running", "checking configured dependencies")?;
     }
 
-    let summary = update::run(&entries, &manifest, &context, update_options)?;
-    write_update_summary(&summary, options.quiet, stdout, stderr)?;
+    let summary = if progress_jsonl {
+        let mut progress = JsonlProgress { out: stdout };
+        update::run_with_progress(&entries, &manifest, &context, update_options, &mut progress)?
+    } else {
+        let summary = update::run(&entries, &manifest, &context, update_options)?;
+        write_update_summary(
+            &summary,
+            &entries,
+            active_count,
+            options.quiet,
+            options.verbose,
+            stdout,
+            stderr,
+        )?;
+        summary
+    };
 
     let manifest = manifest::read(&manifest_path)?;
     let orphans = manifest.orphans(&entries);
     if !orphans.is_empty() && !options.quiet {
-        write_prune_orphans(&orphans, stderr)?;
-        writeln!(stderr, "Run `shdeps prune` to remove orphaned artifacts.")?;
+        if progress_jsonl {
+            let mut progress = JsonlProgress { out: stdout };
+            write_prune_orphans_jsonl(&orphans, &mut progress)?;
+        } else {
+            write_prune_orphans(&orphans, true, stderr)?;
+        }
+    }
+    if progress_jsonl {
+        let mut progress = JsonlProgress { out: stdout };
+        write_update_summary_jsonl(&summary, active_count, &mut progress)?;
     }
 
     Ok(if summary.has_errors() { 1 } else { 0 })
+}
+
+struct JsonlProgress<'a, W>
+where
+    W: Write,
+{
+    out: &'a mut W,
+}
+
+impl<W> JsonlProgress<'_, W>
+where
+    W: Write,
+{
+    fn event(&mut self, value: serde_json::Value) -> Result<()> {
+        serde_json::to_writer(&mut self.out, &value)?;
+        writeln!(self.out)?;
+        Ok(())
+    }
+}
+
+impl<W> update::Progress for JsonlProgress<'_, W>
+where
+    W: Write,
+{
+    fn phase(
+        &mut self,
+        group: &'static str,
+        status: &'static str,
+        detail: &str,
+        done: usize,
+        total: usize,
+    ) -> Result<()> {
+        self.event(json!({
+            "event": "phase",
+            "group": group,
+            "status": status,
+            "detail": detail,
+            "done": done,
+            "total": total,
+        }))
+    }
+
+    fn item(&mut self, group: &'static str, item: &update::Item) -> Result<()> {
+        self.event(json!({
+            "event": "item",
+            "group": group,
+            "status": item_status(item),
+            "name": item.name.as_str(),
+            "detail": item.detail.as_str(),
+        }))
+    }
 }
 
 fn prune_cmd<W, E>(
@@ -524,7 +606,7 @@ where
         return Ok(0);
     }
 
-    write_prune_orphans(&detected.orphans, stdout)?;
+    write_prune_orphans(&detected.orphans, false, stdout)?;
     if prune_options.dry_run {
         writeln!(stdout, "Dry run — nothing removed.")?;
         return Ok(0);
@@ -805,7 +887,107 @@ where
 
 fn write_update_summary<W, E>(
     summary: &update::Summary,
+    entries: &[Entry],
+    active_count: usize,
     quiet: bool,
+    verbose: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<()>
+where
+    W: Write,
+    E: Write,
+{
+    if verbose && !quiet {
+        return write_verbose_update_summary(summary, entries, active_count, stdout, stderr);
+    }
+
+    let mut item_failures = std::collections::BTreeSet::new();
+    for item in &summary.items {
+        if item.failed {
+            item_failures.insert(item.name.as_str());
+            write_row(stderr, "failed", &format!("{}: {}", item.name, item.detail))?;
+        }
+    }
+
+    for name in &summary.failed {
+        if !item_failures.contains(name.as_str()) {
+            write_row(stderr, "failed", &format!("{name}: post hook failed"))?;
+        }
+    }
+
+    for name in &summary.leftovers {
+        write_row(
+            stderr,
+            "warning",
+            &format!("{name}: old-method cleanup left artifacts behind"),
+        )?;
+    }
+
+    if !quiet {
+        write_normal_group_summaries(summary, entries, stdout)?;
+        let counts = update_counts(summary, active_count);
+        if counts.failed == 0 {
+            write_row(
+                stdout,
+                update_status(counts),
+                &update_ok_summary(counts.changed, counts.current, counts.skipped),
+            )?;
+        } else {
+            write_row(stderr, "failed", &format!("{} failed", counts.failed))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_normal_group_summaries<W>(
+    summary: &update::Summary,
+    entries: &[Entry],
+    stdout: &mut W,
+) -> Result<()>
+where
+    W: Write,
+{
+    for group in update_group_order() {
+        let items = summary
+            .items
+            .iter()
+            .filter(|item| group_for_name(entries, &item.name) == group)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            continue;
+        }
+        let counts = update_counts_for_items(&items);
+        let status = if counts.failed > 0 {
+            "failed"
+        } else if counts.changed > 0 {
+            "changed"
+        } else {
+            "ok"
+        };
+        write_row(
+            stdout,
+            status,
+            &format!("{}: {}", group_label(group), update_count_summary(counts)),
+        )?;
+        for item in items {
+            if item.changed && !item.failed {
+                write_nested_row(
+                    stdout,
+                    "changed",
+                    &format!("{}: {}", item.name, item.detail),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_verbose_update_summary<W, E>(
+    summary: &update::Summary,
+    entries: &[Entry],
+    active_count: usize,
     stdout: &mut W,
     stderr: &mut E,
 ) -> Result<()>
@@ -814,44 +996,341 @@ where
     E: Write,
 {
     let mut item_failures = std::collections::BTreeSet::new();
-    for item in &summary.items {
-        if item.failed {
-            item_failures.insert(item.name.as_str());
-            writeln!(stderr, "  {} failed: {}", item.name, item.detail)?;
-        } else if item.changed && !quiet {
-            writeln!(stdout, "  {}: {}", item.name, item.detail)?;
+    for group in update_group_order() {
+        let items = summary
+            .items
+            .iter()
+            .filter(|item| group_for_name(entries, &item.name) == group)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            continue;
+        }
+        write_group(stdout, group_label(group))?;
+        for item in items {
+            if item.failed {
+                item_failures.insert(item.name.as_str());
+                write_nested_row(stderr, "failed", &format!("{}: {}", item.name, item.detail))?;
+            } else {
+                write_nested_row(
+                    stdout,
+                    item_status(item),
+                    &format!("{}: {}", item.name, item.detail),
+                )?;
+            }
         }
     }
 
     for name in &summary.failed {
         if !item_failures.contains(name.as_str()) {
-            writeln!(stderr, "  {name} post hook failed")?;
+            write_row(stderr, "failed", &format!("{name}: post hook failed"))?;
         }
     }
 
     for name in &summary.leftovers {
-        writeln!(
+        write_row(
             stderr,
-            "  warning: {name} old-method cleanup left artifacts behind"
+            "warning",
+            &format!("{name}: old-method cleanup left artifacts behind"),
         )?;
     }
 
+    let counts = update_counts(summary, active_count);
+    if counts.failed == 0 {
+        write_row(
+            stdout,
+            update_status(counts),
+            &update_ok_summary(counts.changed, counts.current, counts.skipped),
+        )?;
+    } else {
+        write_row(stderr, "failed", &format!("{} failed", counts.failed))?;
+    }
     Ok(())
 }
 
-fn write_prune_orphans<W>(orphans: &[manifest::ManifestEntry], stdout: &mut W) -> Result<()>
+fn update_group_order() -> [&'static str; 6] {
+    [
+        "packages",
+        "github-releases",
+        "repo-deps",
+        "language-tools",
+        "hooks",
+        "other",
+    ]
+}
+
+fn group_for_name(entries: &[Entry], name: &str) -> &'static str {
+    entries
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| update::group_for_method(&entry.method))
+        .unwrap_or("other")
+}
+
+fn group_label(group: &str) -> &'static str {
+    match group {
+        "packages" => "Packages",
+        "github-releases" => "GitHub releases",
+        "repo-deps" => "Repo deps",
+        "language-tools" => "Language tools",
+        "hooks" => "Hooks",
+        _ => "Other",
+    }
+}
+
+fn write_update_summary_jsonl<W>(
+    summary: &update::Summary,
+    active_count: usize,
+    progress: &mut JsonlProgress<'_, W>,
+) -> Result<()>
+where
+    W: Write,
+{
+    let counts = update_counts(summary, active_count);
+    let status = update_status(counts);
+    progress.event(json!({
+        "event": "summary",
+        "status": status,
+        "changed": counts.changed,
+        "current": counts.current,
+        "skipped": counts.skipped,
+        "failed": counts.failed,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UpdateCounts {
+    changed: usize,
+    current: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+fn update_counts(summary: &update::Summary, active_count: usize) -> UpdateCounts {
+    let changed = summary
+        .items
+        .iter()
+        .filter(|item| item.changed && !item.failed)
+        .count();
+    let skipped = summary
+        .items
+        .iter()
+        .filter(|item| !item.failed && is_skipped_detail(&item.detail))
+        .count();
+    let failed = summary
+        .failed
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let current = active_count.saturating_sub(changed + skipped + failed);
+    UpdateCounts {
+        changed,
+        current,
+        skipped,
+        failed,
+    }
+}
+
+fn update_counts_for_items(items: &[&update::Item]) -> UpdateCounts {
+    let changed = items
+        .iter()
+        .filter(|item| item.changed && !item.failed)
+        .count();
+    let skipped = items
+        .iter()
+        .filter(|item| !item.failed && is_skipped_detail(&item.detail))
+        .count();
+    let failed = items.iter().filter(|item| item.failed).count();
+    let current = items.len().saturating_sub(changed + skipped + failed);
+    UpdateCounts {
+        changed,
+        current,
+        skipped,
+        failed,
+    }
+}
+
+fn update_count_summary(counts: UpdateCounts) -> String {
+    if counts.failed > 0 {
+        let mut parts = vec![format!("{} failed", counts.failed)];
+        if counts.changed > 0 {
+            parts.push(format!("{} changed", counts.changed));
+        }
+        if counts.current > 0 {
+            parts.push(format!("{} current", counts.current));
+        }
+        if counts.skipped > 0 {
+            parts.push(format!("{} skipped", counts.skipped));
+        }
+        parts.join(", ")
+    } else {
+        update_ok_summary(counts.changed, counts.current, counts.skipped)
+    }
+}
+
+fn item_status(item: &update::Item) -> &'static str {
+    if item.failed {
+        "failed"
+    } else if is_skipped_detail(&item.detail) {
+        "skipped"
+    } else if item.changed {
+        "changed"
+    } else {
+        "ok"
+    }
+}
+
+fn update_status(counts: UpdateCounts) -> &'static str {
+    if counts.failed > 0 {
+        "failed"
+    } else if counts.changed > 0 {
+        "changed"
+    } else {
+        "ok"
+    }
+}
+
+fn is_skipped_detail(detail: &str) -> bool {
+    detail.starts_with("skipped")
+        || detail == "not available"
+        || detail == "custom hook missing or unusable"
+}
+
+fn update_ok_summary(changed: usize, current: usize, skipped: usize) -> String {
+    let mut parts = Vec::new();
+    if changed > 0 {
+        parts.push(format!("{changed} changed"));
+    }
+    if current > 0 || parts.is_empty() {
+        parts.push(format!("{current} current"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    parts.join(", ")
+}
+
+fn write_prune_orphans<W>(
+    orphans: &[manifest::ManifestEntry],
+    include_hint: bool,
+    stdout: &mut W,
+) -> Result<()>
+where
+    W: Write,
+{
+    write_heading(stdout, "Warnings")?;
+    let noun = if orphans.len() == 1 { "dep" } else { "deps" };
+    write_row(
+        stdout,
+        "warning",
+        &format!("{} orphaned {noun} no longer in config", orphans.len()),
+    )?;
+    for orphan in orphans {
+        write_row(
+            stdout,
+            "detail",
+            &format!("{} ({})", orphan.name, orphan.method),
+        )?;
+    }
+    if include_hint {
+        write_row(
+            stdout,
+            "hint",
+            "run `shdeps prune` to remove orphaned artifacts",
+        )?;
+    }
+    Ok(())
+}
+
+fn write_prune_orphans_jsonl<W>(
+    orphans: &[manifest::ManifestEntry],
+    progress: &mut JsonlProgress<'_, W>,
+) -> Result<()>
+where
+    W: Write,
+{
+    let noun = if orphans.len() == 1 { "dep" } else { "deps" };
+    progress.event(json!({
+        "event": "warning",
+        "status": "warning",
+        "detail": format!("{} orphaned {noun} no longer in config", orphans.len()),
+    }))?;
+    for orphan in orphans {
+        progress.event(json!({
+            "event": "detail",
+            "status": "detail",
+            "detail": format!("{} ({})", orphan.name, orphan.method),
+        }))?;
+    }
+    progress.event(json!({
+        "event": "hint",
+        "status": "hint",
+        "detail": "run `shdeps prune` to remove orphaned artifacts",
+    }))?;
+    Ok(())
+}
+
+fn write_heading<W>(stdout: &mut W, label: &str) -> Result<()>
+where
+    W: Write,
+{
+    writeln!(stdout, "{}{label}{}", color("heading"), color("reset"))?;
+    Ok(())
+}
+
+fn write_group<W>(stdout: &mut W, label: &str) -> Result<()>
+where
+    W: Write,
+{
+    writeln!(stdout, "  {}{label}{}", color("detail"), color("reset"))?;
+    Ok(())
+}
+
+fn write_row<W>(stdout: &mut W, status: &str, detail: &str) -> Result<()>
 where
     W: Write,
 {
     writeln!(
         stdout,
-        "==> {} orphaned dep(s) no longer in config:",
-        orphans.len()
+        "  {}{status:<8}{} {detail}",
+        color(status),
+        color("reset")
     )?;
-    for orphan in orphans {
-        writeln!(stdout, "  {} ({})", orphan.name, orphan.method)?;
-    }
     Ok(())
+}
+
+fn write_nested_row<W>(stdout: &mut W, status: &str, detail: &str) -> Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        stdout,
+        "    {}{status:<8}{} {detail}",
+        color(status),
+        color("reset")
+    )?;
+    Ok(())
+}
+
+fn color(status: &str) -> &'static str {
+    if !color_enabled() {
+        return "";
+    }
+    match status {
+        "heading" => "\x1b[1;36m",
+        "ok" => "\x1b[32m",
+        "changed" => "\x1b[34m",
+        "running" => "\x1b[36m",
+        "skipped" => "\x1b[2m",
+        "warning" => "\x1b[33m",
+        "failed" => "\x1b[31m",
+        "detail" | "hint" => "\x1b[2m",
+        "reset" => "\x1b[0m",
+        _ => "",
+    }
+}
+
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
 }
 
 fn write_prune_results<W, E>(items: &[prune::Item], stdout: &mut W, stderr: &mut E) -> Result<()>
