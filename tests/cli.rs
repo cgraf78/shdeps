@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
+
 fn shdeps() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shdeps"))
 }
@@ -455,7 +457,7 @@ install() {
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "==> Installing/upgrading tools...\n  tool: installed\n"
+        "Tools\n  running  checking configured dependencies\n  changed  Hooks: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
     );
     assert_eq!(text(&output.stderr), "");
     assert_eq!(
@@ -599,7 +601,10 @@ fn no_op_manifest_backed_update_stays_fast_and_skips_network_and_tools() {
     let (output, elapsed) = timed(&mut command);
 
     assert_success(&output);
-    assert_eq!(text(&output.stdout), "==> Installing/upgrading tools...\n");
+    assert_eq!(
+        text(&output.stdout),
+        "Tools\n  running  checking configured dependencies\n  ok       GitHub releases: 1 current\n  ok       Language tools: 4 current\n  ok       5 current\n"
+    );
     assert_eq!(text(&output.stderr), "");
     assert!(
         elapsed <= Duration::from_secs(1),
@@ -607,6 +612,75 @@ fn no_op_manifest_backed_update_stays_fast_and_skips_network_and_tools() {
         text(&output.stdout),
         text(&output.stderr)
     );
+}
+
+#[test]
+fn update_jsonl_progress_reports_machine_readable_events() {
+    let fixture = Fixture::new("update-jsonl-progress");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() { printf 'installed\n'; }
+"#,
+    );
+
+    let output = run(fixture.command(["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
+    let events = jsonl(&output.stdout);
+    assert!(
+        events.iter().any(|event| event["event"] == "phase"
+            && event["group"] == "hooks"
+            && event["status"] == "running"
+            && event["detail"] == "checking custom hooks"),
+        "expected a hooks phase event in {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "item"
+            && event["group"] == "hooks"
+            && event["status"] == "changed"
+            && event["name"] == "tool"
+            && event["detail"] == "installed"),
+        "expected a changed item event in {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "summary"
+            && event["status"] == "changed"
+            && event["changed"] == 1
+            && event["current"] == 0
+            && event["skipped"] == 0
+            && event["failed"] == 0),
+        "expected a changed summary event in {events:#?}"
+    );
+}
+
+#[test]
+fn update_verbose_groups_items_by_update_area() {
+    let fixture = Fixture::new("update-verbose-groups");
+    fixture.write(
+        "conf/deps.conf",
+        "owner/tool github:repo tool\ncustom-tool custom\n",
+    );
+    fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\n");
+    fixture.write(
+        "conf/hooks.d/custom-tool.sh",
+        r#"
+exists() { return 0; }
+version() { printf '9.9.9\n'; }
+"#,
+    );
+
+    let output = run(&mut fixture.command(["-v", "update"]));
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout),
+        "Tools\n  running  checking configured dependencies\n  Repo deps\n    changed  owner/tool: local clone\n  Hooks\n    ok       custom-tool: 9.9.9\n  changed  1 changed, 1 current\n"
+    );
+    assert_eq!(text(&output.stderr), "");
 }
 
 #[test]
@@ -1044,7 +1118,7 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-pos
     assert_success(&first);
     assert_eq!(
         text(&first.stdout),
-        "==> Installing/upgrading tools...\n  tool: 1.2.3\n"
+        "Tools\n  running  checking configured dependencies\n  changed  Hooks: 1 changed\n    changed  tool: 1.2.3\n  changed  1 changed\n"
     );
     assert_eq!(text(&first.stderr), "");
     assert_eq!(
@@ -1059,8 +1133,55 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-pos
     let second = run(&mut fixture.command(["update"]));
 
     assert_success(&second);
-    assert_eq!(text(&second.stdout), "==> Installing/upgrading tools...\n");
+    assert_eq!(
+        text(&second.stdout),
+        "Tools\n  running  checking configured dependencies\n  ok       Hooks: 1 current\n  ok       1 current\n"
+    );
     assert_eq!(text(&second.stderr), "");
+}
+
+#[test]
+fn update_nested_output_omits_standalone_heading() {
+    let fixture = Fixture::new("update-nested");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() { printf 'installed\n'; }
+"#,
+    );
+
+    let output = run(fixture.command(["update"]).env("SHDEPS_NESTED", "1"));
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout),
+        "  running  checking configured dependencies\n  changed  Hooks: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
+    );
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn update_verbose_reports_current_items() {
+    let fixture = Fixture::new("update-verbose-current");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 0; }
+version() { printf '9.9.9\n'; }
+"#,
+    );
+
+    let output = run(&mut fixture.command(["-v", "update"]));
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout),
+        "Tools\n  running  checking configured dependencies\n  Hooks\n    ok       tool: 9.9.9\n  ok       1 current\n"
+    );
+    assert_eq!(text(&output.stderr), "");
 }
 
 #[test]
@@ -1075,10 +1196,13 @@ fn update_fails_when_custom_install_fails() {
     let output = run(&mut fixture.command(["update"]));
 
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(text(&output.stdout), "==> Installing/upgrading tools...\n");
+    assert_eq!(
+        text(&output.stdout),
+        "Tools\n  running  checking configured dependencies\n  failed   Hooks: 1 failed\n"
+    );
     assert_eq!(
         text(&output.stderr),
-        "  broken failed: custom install failed\n"
+        "  failed   broken: custom install failed\n  failed   1 failed\n"
     );
     assert!(!fixture.dir.join("state/manifest").exists());
 }
@@ -1108,17 +1232,40 @@ install() { printf 'installed\n'; }
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "==> Installing/upgrading tools...\n  tool: installed\n"
+        "Tools\n  running  checking configured dependencies\n  changed  Hooks: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
     );
     assert_eq!(
         text(&output.stderr),
-        "==> 1 orphaned dep(s) no longer in config:\n  old (github:release)\nRun `shdeps prune` to remove orphaned artifacts.\n"
+        "Warnings\n  warning  1 orphaned dep no longer in config\n  detail   old (github:release)\n  hint     run `shdeps prune` to remove orphaned artifacts\n"
     );
     assert!(fixture.dir.join("bin/old").exists());
     assert!(
         fs::read_to_string(fixture.dir.join("state/manifest"))
             .unwrap()
             .contains("old|github:release|old|")
+    );
+
+    let json_output = run(fixture.command(["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+    assert_success(&json_output);
+    assert_eq!(text(&json_output.stderr), "");
+    let events = jsonl(&json_output.stdout);
+    assert!(
+        events.iter().any(|event| event["event"] == "warning"
+            && event["status"] == "warning"
+            && event["detail"] == "1 orphaned dep no longer in config"),
+        "expected an orphan warning event in {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "detail"
+            && event["status"] == "detail"
+            && event["detail"] == "old (github:release)"),
+        "expected an orphan detail event in {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "summary"
+            && event["status"] == "changed"
+            && event["changed"] == 1),
+        "expected final summary after orphan events in {events:#?}"
     );
 }
 
@@ -1141,7 +1288,7 @@ fn prune_lists_dry_runs_and_removes_orphans() {
     assert_success(&dry);
     assert_eq!(
         text(&dry.stdout),
-        "==> 1 orphaned dep(s) no longer in config:\n  old (github:release)\nDry run — nothing removed.\n"
+        "Warnings\n  warning  1 orphaned dep no longer in config\n  detail   old (github:release)\nDry run — nothing removed.\n"
     );
     assert_eq!(text(&dry.stderr), "");
     assert!(fixture.dir.join("bin/old").exists());
@@ -1151,7 +1298,7 @@ fn prune_lists_dry_runs_and_removes_orphans() {
     assert_success(&removed);
     assert_eq!(
         text(&removed.stdout),
-        "==> 1 orphaned dep(s) no longer in config:\n  old (github:release)\n  old removed\n"
+        "Warnings\n  warning  1 orphaned dep no longer in config\n  detail   old (github:release)\n  old removed\n"
     );
     assert_eq!(text(&removed.stderr), "");
     assert!(!fixture.dir.join("bin/old").exists());
@@ -1188,7 +1335,7 @@ fn prune_preserves_packages_and_guards_empty_config() {
     assert_success(&removed_tracking);
     assert_eq!(
         text(&removed_tracking.stdout),
-        "==> 1 orphaned dep(s) no longer in config:\n  pkg-tool (pkg)\n"
+        "Warnings\n  warning  1 orphaned dep no longer in config\n  detail   pkg-tool (pkg)\n"
     );
     assert_eq!(
         text(&removed_tracking.stderr),
@@ -1359,6 +1506,13 @@ fn assert_success(output: &Output) {
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).expect("command output should be UTF-8")
+}
+
+fn jsonl(bytes: &[u8]) -> Vec<Value> {
+    text(bytes)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("progress line should be valid JSON"))
+        .collect()
 }
 
 fn host_arch() -> String {
