@@ -483,7 +483,7 @@ where
     }
     if progress_jsonl {
         let mut progress = JsonlProgress { out: stdout };
-        write_update_summary_jsonl(&summary, active_count, &mut progress)?;
+        write_update_summary_jsonl(&summary, &entries, active_count, &mut progress)?;
     }
 
     Ok(if summary.has_errors() { 1 } else { 0 })
@@ -1079,12 +1079,14 @@ fn group_label(group: &str) -> &'static str {
 
 fn write_update_summary_jsonl<W>(
     summary: &update::Summary,
+    entries: &[Entry],
     active_count: usize,
     progress: &mut JsonlProgress<'_, W>,
 ) -> Result<()>
 where
     W: Write,
 {
+    write_group_summaries_jsonl(summary, entries, progress)?;
     let counts = update_counts(summary, active_count);
     let status = update_status(counts);
     progress.event(json!({
@@ -1095,6 +1097,44 @@ where
         "skipped": counts.skipped,
         "failed": counts.failed,
     }))
+}
+
+fn write_group_summaries_jsonl<W>(
+    summary: &update::Summary,
+    entries: &[Entry],
+    progress: &mut JsonlProgress<'_, W>,
+) -> Result<()>
+where
+    W: Write,
+{
+    let elapsed = summary
+        .groups
+        .iter()
+        .map(|group| (group.group, group.elapsed_ms))
+        .collect::<BTreeMap<_, _>>();
+    for group in update_group_order() {
+        let items = summary
+            .items
+            .iter()
+            .filter(|item| group_for_name(entries, &item.name) == group)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            continue;
+        }
+        let counts = update_counts_for_items(&items);
+        progress.event(json!({
+            "event": "group_summary",
+            "group": group,
+            "label": group_label(group),
+            "status": update_status(counts),
+            "changed": counts.changed,
+            "current": counts.current,
+            "skipped": counts.skipped,
+            "failed": counts.failed,
+            "elapsed_ms": elapsed.get(group).copied().unwrap_or(0),
+        }))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -655,6 +655,122 @@ install() { printf 'installed\n'; }
             && event["failed"] == 0),
         "expected a changed summary event in {events:#?}"
     );
+    assert!(
+        events.iter().any(|event| event["event"] == "group_summary"
+            && event["group"] == "hooks"
+            && event["label"] == "Hooks"
+            && event["status"] == "changed"
+            && event["changed"] == 1
+            && event["current"] == 0
+            && event["skipped"] == 0
+            && event["failed"] == 0
+            && event["elapsed_ms"].is_number()),
+        "expected a hooks group summary event in {events:#?}"
+    );
+    let group_summary_index = events
+        .iter()
+        .position(|event| event["event"] == "group_summary")
+        .expect("expected group summary event");
+    let summary_index = events
+        .iter()
+        .position(|event| event["event"] == "summary")
+        .expect("expected summary event");
+    assert!(
+        group_summary_index < summary_index,
+        "group summaries should arrive before final summary in {events:#?}"
+    );
+}
+
+#[test]
+fn update_jsonl_package_progress_includes_manager_override_skips() {
+    let fixture = Fixture::new("update-jsonl-pkg-progress");
+    fixture.write(
+        "conf/deps.conf",
+        "tool pkg tool apt:NONE\nother pkg other\n",
+    );
+    fixture.write_executable("fakebin/other", "#!/bin/sh\n");
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_PROGRESS", "jsonl");
+    command.env("SHDEPS_LOG_LEVEL", "2");
+    command.env("SHDEPS_PKG_MGR", "apt");
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
+    let events = jsonl(&output.stdout);
+    for event in events
+        .iter()
+        .filter(|event| event["event"] == "phase" && event["group"] == "packages")
+    {
+        let done = event["done"]
+            .as_u64()
+            .expect("phase done should be a number");
+        let total = event["total"]
+            .as_u64()
+            .expect("phase total should be a number");
+        assert!(
+            done <= total,
+            "package progress should never exceed total in {events:#?}"
+        );
+    }
+    assert!(
+        events.iter().any(|event| event["event"] == "item"
+            && event["group"] == "packages"
+            && event["name"] == "tool"
+            && event["status"] == "skipped"),
+        "expected skipped package override item in {events:#?}"
+    );
+}
+
+#[test]
+fn update_jsonl_splits_github_release_metadata_from_install_checks() {
+    let fixture = Fixture::new("update-jsonl-release-progress");
+    fixture.write("conf/deps.conf", "owner/tool github:release tool\n");
+    fixture.write_executable("bin/tool", "#!/bin/sh\nprintf 'tool v0.9.0\\n'\n");
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &[host_linux_asset("tool", "v1.0.0").as_str()]),
+        "#!/bin/sh\nprintf 'tool v1.0.0\\n'\n",
+    );
+    let mut command = fixture.command(["--force", "update"]);
+    command.env("SHDEPS_PROGRESS", "jsonl");
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
+    let events = jsonl(&output.stdout);
+    assert!(
+        events.iter().any(|event| event["event"] == "phase"
+            && event["group"] == "github-releases"
+            && event["detail"] == "fetching GitHub release metadata"
+            && event["done"] == 0
+            && event["total"] == 1),
+        "expected release metadata phase in {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "phase"
+            && event["group"] == "github-releases"
+            && event["detail"] == "checking GitHub release installs"
+            && event["done"] == 0
+            && event["total"] == 1),
+        "expected release install-check phase in {events:#?}"
+    );
+    assert!(
+        !events.iter().any(|event| event["event"] == "phase"
+            && event["group"] == "github-releases"
+            && event["detail"] == "checking GitHub releases"
+            && event["done"] == event["total"]),
+        "release progress should not end metadata and restart the same phase in {events:#?}"
+    );
 }
 
 #[test]

@@ -7,6 +7,7 @@
 //! rules here avoids each install method learning partial transaction policy.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use crate::Result;
 use crate::cleanup;
@@ -80,6 +81,15 @@ pub struct Item {
     pub detail: String,
 }
 
+/// Runtime data for one completed update group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSummary {
+    /// Progress group identifier, such as `packages` or `github-releases`.
+    pub group: &'static str,
+    /// Wall-clock time spent in this group.
+    pub elapsed_ms: u128,
+}
+
 /// Summary of an update run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Summary {
@@ -103,6 +113,8 @@ pub struct Summary {
     /// can opt in with `SHDEPS_STRICT_LEFTOVERS=1`, which is checked by
     /// `has_errors`.
     pub leftovers: Vec<String>,
+    /// Per-group runtime summaries for renderers that want compact detail.
+    pub groups: Vec<GroupSummary>,
 }
 
 /// Progress sink for user-facing update renderers.
@@ -279,7 +291,11 @@ where
     let active_package_entries = entries
         .iter()
         .any(|entry| entry.method == "pkg" && active(entry, context.env));
-    let package_count = entries
+    let package_total = entries
+        .iter()
+        .filter(|entry| entry.method == "pkg" && active(entry, context.env))
+        .count();
+    let installable_package_count = entries
         .iter()
         .filter(|entry| entry.method == "pkg" && active(entry, context.env))
         .filter(|entry| {
@@ -287,17 +303,18 @@ where
         })
         .count();
     if active_package_entries {
+        let group_started = Instant::now();
         progress.phase(
             "packages",
             "running",
             "checking package deps",
             0,
-            package_count,
+            package_total,
         )?;
-        let package_cache = if package_count == 0 {
+        let package_cache = if installable_package_count == 0 {
             package_cache::Status::Hit { count: 0 }
         } else {
-            update_pkg::cache_status(entries, context, package_count, options)?
+            update_pkg::cache_status(entries, context, installable_package_count, options)?
         };
         if package_cache.is_hit() {
             // The package cache is stronger than a TTL: it records the package
@@ -306,8 +323,17 @@ where
             // replay the same per-entry "installed/skipped" items but avoid
             // package-manager probes and manifest rewrites. Non-package
             // methods still run normally below.
+            let mut package_done = 0usize;
             for item in update_pkg::cached_items(entries, context) {
+                package_done += 1;
                 progress.item("packages", &item)?;
+                progress.phase(
+                    "packages",
+                    "running",
+                    "checking package deps",
+                    package_done,
+                    package_total,
+                )?;
                 summary.items.push(item);
             }
         } else {
@@ -358,7 +384,7 @@ where
                     "running",
                     "checking package deps",
                     package_done,
-                    package_count,
+                    package_total,
                 )?;
                 summary.items.push(item);
             }
@@ -400,20 +426,28 @@ where
                 package_clean = false;
             }
             if package_clean {
-                update_pkg::write_cache(entries, context, package_count, options)?;
+                update_pkg::write_cache(entries, context, installable_package_count, options)?;
             }
         }
+        finish_group(&mut summary, "packages", group_started);
     }
+
+    let group_totals = group_totals(entries, context.env);
+    let mut group_done = BTreeMap::<&'static str, usize>::new();
+    let mut group_started = BTreeMap::<&'static str, Instant>::new();
+    let mut announced = BTreeSet::<&'static str>::new();
 
     let release_entries = entries
         .iter()
         .filter(|entry| entry.method == "github:release" && active(entry, context.env))
         .collect::<Vec<_>>();
     if !release_entries.is_empty() {
+        announced.insert("github-releases");
+        group_started.insert("github-releases", Instant::now());
         progress.phase(
             "github-releases",
             "running",
-            "checking GitHub releases",
+            "fetching GitHub release metadata",
             0,
             release_entries.len(),
         )?;
@@ -431,15 +465,11 @@ where
         progress.phase(
             "github-releases",
             "running",
-            "checking GitHub releases",
-            release_entries.len(),
+            group_detail("github-releases"),
+            0,
             release_entries.len(),
         )?;
     }
-
-    let group_totals = group_totals(entries, context.env);
-    let mut group_done = BTreeMap::<&'static str, usize>::new();
-    let mut announced = BTreeSet::<&'static str>::new();
 
     for entry in entries {
         if entry.method == "pkg" || !active(entry, context.env) {
@@ -448,6 +478,7 @@ where
 
         let group = group_for_method(&entry.method);
         if announced.insert(group) {
+            group_started.insert(group, Instant::now());
             progress.phase(
                 group,
                 "running",
@@ -487,7 +518,11 @@ where
                     changed.push(entry.name.clone());
                 }
                 progress.item(group, &item)?;
-                advance_group(progress, &mut group_done, &group_totals, group)?;
+                if advance_group(progress, &mut group_done, &group_totals, group)? {
+                    if let Some(started) = group_started.remove(group) {
+                        finish_group(&mut summary, group, started);
+                    }
+                }
                 summary.items.push(item);
             }
             "github:repo" => {
@@ -512,7 +547,11 @@ where
                     changed.push(entry.name.clone());
                 }
                 progress.item(group, &item)?;
-                advance_group(progress, &mut group_done, &group_totals, group)?;
+                if advance_group(progress, &mut group_done, &group_totals, group)? {
+                    if let Some(started) = group_started.remove(group) {
+                        finish_group(&mut summary, group, started);
+                    }
+                }
                 summary.items.push(item);
             }
             "cargo" | "go" | "uv" | "npm" => {
@@ -537,7 +576,11 @@ where
                     changed.push(entry.name.clone());
                 }
                 progress.item(group, &item)?;
-                advance_group(progress, &mut group_done, &group_totals, group)?;
+                if advance_group(progress, &mut group_done, &group_totals, group)? {
+                    if let Some(started) = group_started.remove(group) {
+                        finish_group(&mut summary, group, started);
+                    }
+                }
                 summary.items.push(item);
             }
             "custom" => {
@@ -564,7 +607,11 @@ where
                     record_changed(&mut changed, marker);
                 }
                 progress.item(group, &item)?;
-                advance_group(progress, &mut group_done, &group_totals, group)?;
+                if advance_group(progress, &mut group_done, &group_totals, group)? {
+                    if let Some(started) = group_started.remove(group) {
+                        finish_group(&mut summary, group, started);
+                    }
+                }
                 summary.items.push(item);
             }
             method => {
@@ -576,7 +623,11 @@ where
                 };
                 summary.failed.push(entry.name.clone());
                 progress.item(group, &item)?;
-                advance_group(progress, &mut group_done, &group_totals, group)?;
+                if advance_group(progress, &mut group_done, &group_totals, group)? {
+                    if let Some(started) = group_started.remove(group) {
+                        finish_group(&mut summary, group, started);
+                    }
+                }
                 summary.items.push(item);
             }
         }
@@ -601,16 +652,19 @@ fn advance_group(
     group_done: &mut BTreeMap<&'static str, usize>,
     group_totals: &BTreeMap<&'static str, usize>,
     group: &'static str,
-) -> Result<()> {
+) -> Result<bool> {
     let done = group_done.entry(group).or_insert(0);
     *done += 1;
-    progress.phase(
+    let total = group_totals[group];
+    progress.phase(group, "running", group_detail(group), *done, total)?;
+    Ok(*done >= total)
+}
+
+fn finish_group(summary: &mut Summary, group: &'static str, started: Instant) {
+    summary.groups.push(GroupSummary {
         group,
-        "running",
-        group_detail(group),
-        *done,
-        group_totals[group],
-    )
+        elapsed_ms: started.elapsed().as_millis(),
+    });
 }
 
 fn group_totals(entries: &[Entry], env: &RuntimeEnv) -> BTreeMap<&'static str, usize> {
@@ -639,7 +693,7 @@ pub fn group_for_method(method: &str) -> &'static str {
 fn group_detail(group: &str) -> &'static str {
     match group {
         "packages" => "checking package deps",
-        "github-releases" => "checking GitHub releases",
+        "github-releases" => "checking GitHub release installs",
         "repo-deps" => "checking repo deps",
         "language-tools" => "checking language tools",
         "hooks" => "checking custom hooks",
@@ -3650,6 +3704,8 @@ version() { printf 'saw-pkg\n'; }
         // drops the lock. This mirrors what would happen if a second
         // `shdeps update` started while the first was mid-run, without
         // requiring us to actually thread the run loop.
+        let _env_guard = crate::state::lock_reentry_env_for_test();
+        crate::state::clear_reentry_env_for_test();
         let primary = crate::state::StateLock::acquire(&fixture.roots.state_dir).unwrap();
         let attempt = crate::state::StateLock::try_acquire(&fixture.roots.state_dir).unwrap();
         assert!(
@@ -3681,7 +3737,7 @@ version() { printf 'saw-pkg\n'; }
         // tests in parallel within the same process; `set_var`
         // mutates process-global state, so without a mutex two
         // tests can see each other's transient values and silently
-        // mis-classify.
+        // classify incorrectly.
         let _env_guard = STRICT_LEFTOVERS_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
