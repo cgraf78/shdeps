@@ -329,6 +329,30 @@ fn is_legitimate_reentry() -> bool {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn lock_reentry_env_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn clear_reentry_env_for_test() {
+    // SAFETY: all tests that call this helper hold `lock_reentry_env_for_test`.
+    unsafe {
+        std::env::remove_var(REENTRY_ENV);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_reentry_env_for_test(value: impl AsRef<std::ffi::OsStr>) {
+    // SAFETY: all tests that call this helper hold `lock_reentry_env_for_test`.
+    unsafe {
+        std::env::set_var(REENTRY_ENV, value);
+    }
+}
+
 #[cfg(not(unix))]
 fn lock_file(_file: &File, _mode: LockMode) -> Result<LockResult> {
     Err(std::io::Error::new(
@@ -347,6 +371,8 @@ mod tests {
 
     #[test]
     fn lock_serializes_state_dir_access() {
+        let _env_guard = super::lock_reentry_env_for_test();
+        super::clear_reentry_env_for_test();
         let fixture = Fixture::new("lock");
 
         let lock = StateLock::acquire(&fixture.dir).unwrap();
@@ -375,17 +401,12 @@ mod tests {
         // mutex is intentionally module-private; callers in other
         // modules that need the same guarantee should use a similar
         // pattern.
-        let _env_guard = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_guard = super::lock_reentry_env_for_test();
         // Defensive reset: if a previous test panicked while holding
         // the env mutated, the recovered (poisoned) mutex hands us
         // control but the env var is still set. Clear it explicitly
         // before any acquire so we never inherit stale state.
-        // SAFETY: env mutation is serialized by `ENV_TEST_LOCK`.
-        unsafe {
-            std::env::remove_var(super::REENTRY_ENV);
-        }
+        super::clear_reentry_env_for_test();
 
         let fixture = Fixture::new("reentry");
         let primary = StateLock::acquire(&fixture.dir).unwrap();
@@ -395,15 +416,9 @@ mod tests {
         // directly rather than a literal "1" so the test exercises
         // the PID-binding contract, not just env-presence.
         let parent_pid = unsafe { libc::getppid() };
-        // SAFETY: env mutation is serialized by `ENV_TEST_LOCK`;
-        // value is reverted before the lock is released.
-        unsafe {
-            std::env::set_var(super::REENTRY_ENV, parent_pid.to_string());
-        }
+        super::set_reentry_env_for_test(parent_pid.to_string());
         let reentry = StateLock::acquire(&fixture.dir).unwrap();
-        unsafe {
-            std::env::remove_var(super::REENTRY_ENV);
-        }
+        super::clear_reentry_env_for_test();
 
         // Both guards exist simultaneously without deadlock — the
         // re-entry guard would have blocked the test thread forever
@@ -423,15 +438,10 @@ mod tests {
         // shell init sets `SHDEPS_STATE_LOCK_HELD=1` (or any value
         // not equal to `getppid()`). The reentry guard must NOT
         // fire; locking must still be enforced.
-        let _env_guard = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_guard = super::lock_reentry_env_for_test();
         // Same defensive reset as the sibling reentry test — clear
         // stale env state from any previously-panicking test.
-        // SAFETY: env mutation is serialized by `ENV_TEST_LOCK`.
-        unsafe {
-            std::env::remove_var(super::REENTRY_ENV);
-        }
+        super::clear_reentry_env_for_test();
 
         let fixture = Fixture::new("reentry-wrong-pid");
         let primary = StateLock::acquire(&fixture.dir).unwrap();
@@ -439,13 +449,9 @@ mod tests {
         // Use a sentinel value that definitely won't match getppid.
         // Both `1` (a literal that a hostile env-export might use)
         // and `0` (invalid PID) should be refused.
-        unsafe {
-            std::env::set_var(super::REENTRY_ENV, "1");
-        }
+        super::set_reentry_env_for_test("1");
         let try_acquire_with_wrong_pid = StateLock::try_acquire(&fixture.dir).unwrap();
-        unsafe {
-            std::env::remove_var(super::REENTRY_ENV);
-        }
+        super::clear_reentry_env_for_test();
 
         assert!(
             try_acquire_with_wrong_pid.is_none(),
@@ -453,13 +459,6 @@ mod tests {
         );
         drop(primary);
     }
-
-    /// Process-wide mutex that serializes env-mutating tests in this
-    /// module. Without it, parallel `#[test]` threads racing on
-    /// `SHDEPS_STATE_LOCK_HELD` would see each other's set/unset
-    /// transient values and silently miss the reentry guard for
-    /// unrelated tests.
-    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn temp_nonce_is_unique_across_consecutive_calls() {
