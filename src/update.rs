@@ -2384,6 +2384,7 @@ version() { printf 'saw-pkg\n'; }
             .env_vars
             .insert("SHDEPS_JOBS".to_owned(), "2".to_owned());
         fixture.client = FakeClient::default()
+            .with_overlap_gate(2)
             .with_delay(Duration::from_millis(25))
             .with(
                 "https://api.github.com/repos/owner/tool-a/releases?per_page=100",
@@ -2495,6 +2496,7 @@ version() { printf 'saw-pkg\n'; }
         let runner = FakeRunner::default()
             .with_success("tool-a", ["--version"], "tool-a 1.0.0\n")
             .with_success("tool-b", ["--version"], "tool-b 2.0.0\n")
+            .with_overlap_gate(2)
             .with_delay(Duration::from_millis(25));
 
         let summary = run(
@@ -4062,12 +4064,57 @@ version() { printf 'saw-pkg\n'; }
 
     type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
     type AtomicCounter = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+    type OverlapGate = std::sync::Arc<OverlapGateState>;
+
+    #[derive(Debug)]
+    struct OverlapGateState {
+        target: usize,
+        highest: std::sync::Mutex<usize>,
+        ready: std::sync::Condvar,
+    }
+
+    impl OverlapGateState {
+        fn new(target: usize) -> Self {
+            Self {
+                target,
+                highest: std::sync::Mutex::new(0),
+                ready: std::sync::Condvar::new(),
+            }
+        }
+
+        fn observe(&self, active: usize) {
+            let mut highest = self.highest.lock().unwrap();
+            *highest = (*highest).max(active);
+            if *highest >= self.target {
+                self.ready.notify_all();
+                return;
+            }
+
+            // Sleep-based overlap assertions are scheduler-sensitive. Hold the
+            // first worker briefly so the second worker can prove parallelism;
+            // if it never arrives, the caller's max-active assertion still
+            // fails instead of deadlocking the test.
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while *highest < self.target {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, wait) = self.ready.wait_timeout(highest, remaining).unwrap();
+                highest = next;
+                if wait.timed_out() {
+                    break;
+                }
+            }
+        }
+    }
 
     #[derive(Debug, Clone, Default)]
     struct FakeClient {
         responses: std::collections::BTreeMap<String, Vec<u8>>,
         requests: RequestLog,
         delay: Option<Duration>,
+        overlap_gate: Option<OverlapGate>,
         active: AtomicCounter,
         max_active: AtomicCounter,
     }
@@ -4080,6 +4127,11 @@ version() { printf 'saw-pkg\n'; }
 
         fn with_delay(mut self, delay: Duration) -> Self {
             self.delay = Some(delay);
+            self
+        }
+
+        fn with_overlap_gate(mut self, target: usize) -> Self {
+            self.overlap_gate = Some(std::sync::Arc::new(OverlapGateState::new(target)));
             self
         }
 
@@ -4103,6 +4155,9 @@ version() { printf 'saw-pkg\n'; }
             let _guard = ActiveGuard {
                 active: &self.active,
             };
+            if let Some(gate) = &self.overlap_gate {
+                gate.observe(active);
+            }
             if let Some(delay) = self.delay {
                 std::thread::sleep(delay);
             }
@@ -4135,6 +4190,7 @@ version() { printf 'saw-pkg\n'; }
         creates_dirs: std::collections::BTreeMap<String, Vec<PathBuf>>,
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         delay: Option<Duration>,
+        overlap_gate: Option<OverlapGate>,
         active: AtomicCounter,
         max_active: AtomicCounter,
     }
@@ -4225,6 +4281,11 @@ version() { printf 'saw-pkg\n'; }
             self
         }
 
+        fn with_overlap_gate(mut self, target: usize) -> Self {
+            self.overlap_gate = Some(std::sync::Arc::new(OverlapGateState::new(target)));
+            self
+        }
+
         fn push_output(&mut self, key: String, output: Output) {
             self.outputs
                 .entry(key)
@@ -4264,6 +4325,9 @@ version() { printf 'saw-pkg\n'; }
             let _guard = ActiveGuard {
                 active: &self.active,
             };
+            if let Some(gate) = &self.overlap_gate {
+                gate.observe(active);
+            }
             if let Some(delay) = self.delay {
                 std::thread::sleep(delay);
             }

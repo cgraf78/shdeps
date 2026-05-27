@@ -688,11 +688,11 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
         "conf/deps.conf",
         "tool pkg tool apt:NONE\nother pkg other\n",
     );
+    fixture.write_executable("fakebin/apt-get", "#!/bin/sh\n");
     fixture.write_executable("fakebin/other", "#!/bin/sh\n");
     let mut command = fixture.command(["update"]);
     command.env("SHDEPS_PROGRESS", "jsonl");
     command.env("SHDEPS_LOG_LEVEL", "2");
-    command.env("SHDEPS_PKG_MGR", "apt");
     command.env(
         "PATH",
         format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
