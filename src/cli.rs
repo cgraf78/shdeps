@@ -780,10 +780,12 @@ where
             let cleared_rows = line_count.saturating_sub(rows.len());
             if rows.is_empty() {
                 writeln!(self.out)?;
+                writeln!(self.out)?;
             } else {
                 if cleared_rows > 0 {
                     write!(self.out, "\x1b[{}A", cleared_rows)?;
                 }
+                writeln!(self.out)?;
                 writeln!(self.out)?;
             }
         } else if line_count > rows.len() && !rows.is_empty() {
@@ -2065,13 +2067,14 @@ fn spinner_frame(done: usize) -> &'static str {
 }
 
 fn tty_row(status: &str, detail: &str, elapsed: &str) -> String {
+    const DETAIL_WIDTH: usize = 46;
     let color_status = match status {
         "pending" => "detail",
         "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧" | "⠇" | "⠏" => "running",
         _ => status,
     };
     format!(
-        "  {}{status:<8}{} {detail:<54} {elapsed:>6}",
+        "  {}{status:<8}{} {detail:<DETAIL_WIDTH$} {elapsed:>6}",
         color(color_status),
         color("reset")
     )
@@ -2518,7 +2521,17 @@ mod tests {
     fn terminal_progress_rows_include_elapsed_column() {
         assert_eq!(
             super::tty_row("running", "Hooks              [━━━━····] 1/2", "12s"),
-            "  running  Hooks              [━━━━····] 1/2                         12s"
+            "  running  Hooks              [━━━━····] 1/2                 12s"
+        );
+    }
+
+    #[test]
+    fn terminal_progress_rows_fit_narrow_tmux_panes() {
+        let row = super::tty_row("ok", "Hooks: 9 current, 1 skipped", "1s");
+
+        assert!(
+            row.len() < 73,
+            "row should leave room for tmux panes narrower than a full terminal"
         );
     }
 
@@ -2602,7 +2615,7 @@ mod tests {
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(stdout.contains("GitHub releases"));
         assert!(stdout.contains("Hooks: 1 current"));
-        assert!(stdout.ends_with("\n\r\x1b[K\x1b[1A\n"));
+        assert!(stdout.ends_with("\n\r\x1b[K\x1b[1A\n\n"));
     }
 
     #[test]
