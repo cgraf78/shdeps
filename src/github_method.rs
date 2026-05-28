@@ -17,6 +17,7 @@ use crate::config::Entry;
 use crate::github;
 use crate::github_release;
 use crate::http::Client;
+use crate::jobs;
 use crate::manifest::Manifest;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
@@ -98,6 +99,104 @@ where
         .collect()
 }
 
+/// Resolves bare `github` entries while reporting active dependency progress.
+///
+/// Cache checks and cache writes stay on the caller thread. Only the remote
+/// metadata fetches run in worker threads, which keeps state mutation ordered
+/// while still overlapping the rate-limited network work that dominates forced
+/// updates.
+pub fn resolve_entries_with_progress<R, P>(
+    entries: &[Entry],
+    context: &Context<'_, R>,
+    options: Options,
+    max_jobs: usize,
+    mut progress: P,
+) -> Result<Vec<Entry>>
+where
+    R: Runner + Sync,
+    P: FnMut(usize, usize) -> Result<()>,
+{
+    let total = entries
+        .iter()
+        .filter(|entry| entry.method == "github" && active(entry, context.env))
+        .count();
+    if total == 0 {
+        return resolve_entries(entries, context, options);
+    }
+
+    progress(0, total)?;
+
+    let mut done = 0usize;
+    let mut resolved = vec![None; entries.len()];
+    let mut remote = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.method != "github" {
+            resolved[index] = Some(entry.clone());
+            continue;
+        }
+        if !active(entry, context.env) {
+            resolved[index] = Some(resolved_entry(entry, METHOD_REPO));
+            continue;
+        }
+
+        let cache = Cache::new(&context.roots.state_dir, &entry.name);
+        if let Some(method) = resolve_local_method(entry, context, &cache, options)? {
+            resolved[index] = Some(resolved_entry(entry, method));
+            done += 1;
+            progress(done, total)?;
+        } else {
+            remote.push(RemoteCandidate {
+                index,
+                name: entry.name.clone(),
+            });
+        }
+    }
+
+    if remote.is_empty() {
+        return Ok(collect_resolved(resolved));
+    }
+
+    let env = EnvVars {
+        vars: context.env_vars,
+        runtime: context.env,
+    };
+    let token = github::token(&env, context.runner);
+    let remote_results = jobs::parallel_map_with_progress(
+        &remote,
+        max_jobs,
+        |candidate| RemoteProbe {
+            index: candidate.index,
+            releases: github::fetch_releases_with_token(
+                &candidate.name,
+                context.client,
+                token.as_deref(),
+            )
+            .ok(),
+        },
+        |completed| progress(done + completed, total),
+    )?;
+
+    for probe in remote_results {
+        let entry = &entries[probe.index];
+        let cache = Cache::new(&context.roots.state_dir, &entry.name);
+        let method = resolve_remote_method(entry, context, &cache, options, probe.releases)?;
+        resolved[probe.index] = Some(resolved_entry(entry, method));
+    }
+
+    Ok(collect_resolved(resolved))
+}
+
+#[derive(Debug, Clone)]
+struct RemoteCandidate {
+    index: usize,
+    name: String,
+}
+
+struct RemoteProbe {
+    index: usize,
+    releases: Option<Vec<github::Release>>,
+}
+
 /// Resolves one entry, leaving explicit concrete methods untouched.
 pub fn resolve_entry<R>(entry: &Entry, context: &Context<'_, R>, options: Options) -> Result<Entry>
 where
@@ -129,14 +228,7 @@ where
     }
 
     let cache = Cache::new(&context.roots.state_dir, &entry.name);
-    if stamp::remote_fresh(&cache.stamp, options.freshness()) {
-        if let Some(method) = cache.read_method()? {
-            if let Some(method) = usable_cached_method(method, entry, context) {
-                return Ok(method);
-            }
-        }
-    }
-    if let Some(method) = seed_method_from_manifest(entry, context, &cache, options)? {
+    if let Some(method) = resolve_local_method(entry, context, &cache, options)? {
         return Ok(method);
     }
 
@@ -144,8 +236,50 @@ where
         vars: context.env_vars,
         runtime: context.env,
     };
-    let method = match github::fetch_releases(&entry.name, &env, context.runner, context.client) {
-        Ok(releases) => {
+    resolve_remote_method(
+        entry,
+        context,
+        &cache,
+        options,
+        github::fetch_releases(&entry.name, &env, context.runner, context.client).ok(),
+    )
+}
+
+fn resolve_local_method<R>(
+    entry: &Entry,
+    context: &Context<'_, R>,
+    cache: &Cache,
+    options: Options,
+) -> Result<Option<&'static str>>
+where
+    R: Runner,
+{
+    if stamp::remote_fresh(&cache.stamp, options.freshness()) {
+        if let Some(method) = cache.read_method()? {
+            if let Some(method) = usable_cached_method(method, entry, context) {
+                return Ok(Some(method));
+            }
+        }
+    }
+    if let Some(method) = seed_method_from_manifest(entry, context, cache, options)? {
+        return Ok(Some(method));
+    }
+
+    Ok(None)
+}
+
+fn resolve_remote_method<R>(
+    entry: &Entry,
+    context: &Context<'_, R>,
+    cache: &Cache,
+    options: Options,
+    releases: Option<Vec<github::Release>>,
+) -> Result<&'static str>
+where
+    R: Runner,
+{
+    let method = match releases {
+        Some(releases) => {
             if github_release::select(&entry.cmd, &releases, context.env, context.runner).is_some()
             {
                 // Release assets are the preferred fleet path because they
@@ -169,7 +303,7 @@ where
                 METHOD_REPO
             }
         }
-        Err(_) => {
+        None => {
             // Prefer the last proven concrete method during transient GitHub
             // failures. A stale cache is not authoritative enough to skip a
             // successful remote re-check, but it is much better than flipping
@@ -186,6 +320,19 @@ where
         }
     };
     Ok(method)
+}
+
+fn resolved_entry(entry: &Entry, method: &str) -> Entry {
+    let mut resolved = entry.clone();
+    resolved.method = method.to_owned();
+    resolved
+}
+
+fn collect_resolved(entries: Vec<Option<Entry>>) -> Vec<Entry> {
+    entries
+        .into_iter()
+        .map(|entry| entry.expect("every entry is resolved before collection"))
+        .collect()
 }
 
 fn active(entry: &Entry, env: &RuntimeEnv) -> bool {
@@ -405,7 +552,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{Context, Options, resolve_entries};
+    use super::{Context, Options, resolve_entries, resolve_entries_with_progress};
     use crate::config::parse_entry;
     use crate::github;
     use crate::http::Client;
@@ -809,6 +956,60 @@ mod tests {
         assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
     }
 
+    #[test]
+    fn progress_resolution_parallelizes_remote_fetches_but_writes_cache_in_order() {
+        let fixture = Fixture::new("progress-parallel");
+        let client = FakeClient::new()
+            .with_delay(Duration::from_millis(25))
+            .with_releases(
+                "owner/tool-a",
+                releases_json("v1.0.0", &["tool-a-v1.0.0-linux-x86_64.tar.gz"]),
+            )
+            .with_releases(
+                "owner/tool-b",
+                releases_json("v1.0.0", &["tool-b-v1.0.0-linux-x86_64.tar.gz"]),
+            )
+            .with_releases(
+                "owner/tool-c",
+                releases_json("v1.0.0", &["tool-c-v1.0.0-linux-x86_64.tar.gz"]),
+            );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![
+            parse_entry("owner/tool-a|github|tool-a|-|-", None),
+            parse_entry("owner/tool-b|github|tool-b|-|-", None),
+            parse_entry("owner/tool-c|github|tool-c|-|-", None),
+        ];
+        let mut progress = Vec::new();
+
+        let resolved = resolve_entries_with_progress(
+            &entries,
+            &fixture.context(&runner, &client),
+            fixture.options(true),
+            2,
+            |done, total| {
+                progress.push((done, total));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            resolved
+                .iter()
+                .all(|entry| entry.method == "github:release")
+        );
+        assert_eq!(progress.first(), Some(&(0, 3)));
+        assert_eq!(progress.last(), Some(&(3, 3)));
+        assert_eq!(fixture.cached_method("owner/tool-a"), "github:release");
+        assert_eq!(fixture.cached_method("owner/tool-b"), "github:release");
+        assert_eq!(fixture.cached_method("owner/tool-c"), "github:release");
+        assert_eq!(
+            client.max_active(),
+            2,
+            "bare-github method resolution should obey the requested job bound"
+        );
+    }
+
     struct Fixture {
         root: PathBuf,
         roots: Roots,
@@ -928,6 +1129,9 @@ mod tests {
     struct FakeClient {
         responses: BTreeMap<String, Vec<u8>>,
         urls: Arc<Mutex<Vec<String>>>,
+        delay: Option<Duration>,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeClient {
@@ -941,17 +1145,49 @@ mod tests {
             self
         }
 
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
+        }
+
         fn urls(&self) -> Vec<String> {
             self.urls.lock().unwrap().clone()
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
     impl Client for FakeClient {
         fn get(&self, url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+            let active = self
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_active
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            let _guard = ActiveGuard {
+                active: &self.active,
+            };
+            if let Some(delay) = self.delay {
+                std::thread::sleep(delay);
+            }
             self.urls.lock().unwrap().push(url.to_owned());
             self.responses.get(url).cloned().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
             })
+        }
+    }
+
+    struct ActiveGuard<'a> {
+        active: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl Drop for ActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 

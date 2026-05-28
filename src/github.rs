@@ -68,9 +68,22 @@ pub fn fetch_releases(
     runner: &impl Runner,
     client: &(impl Client + ?Sized),
 ) -> Result<Vec<Release>> {
-    let url = releases_url(repo);
     let token = token(env, runner);
-    let bytes = client.get(&url, token.as_deref())?;
+    fetch_releases_with_token(repo, client, token.as_deref())
+}
+
+/// Fetches and parses releases using a caller-resolved token.
+///
+/// Forced updates can touch many GitHub repos. Callers that already know they
+/// are entering a remote-heavy phase should resolve `gh auth token` once and
+/// pass it through here instead of spawning `gh` once per repository.
+pub fn fetch_releases_with_token(
+    repo: &str,
+    client: &(impl Client + ?Sized),
+    token: Option<&str>,
+) -> Result<Vec<Release>> {
+    let url = releases_url(repo);
+    let bytes = client.get(&url, token)?;
     let json = String::from_utf8_lossy(&bytes);
     parse_releases(&json)
 }

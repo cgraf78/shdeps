@@ -22,7 +22,7 @@ use crate::process::{self, Runner};
 use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::tool_version;
-use crate::update::{Context, Item, Options};
+use crate::update::{Context, Item, Options, Progress};
 
 pub(crate) fn install_with_prefetch(
     entry: &Entry,
@@ -99,69 +99,116 @@ struct Candidate {
 
 pub(crate) fn prefetch<R>(
     entries: &[&Entry],
-    roots: &Roots,
-    runtime_env: &RuntimeEnv,
-    env_vars: &BTreeMap<String, String>,
-    runner: &R,
-    client: &dyn Client,
+    context: &Context<'_, R>,
     options: Options,
-) -> Prefetch
+    progress: &mut dyn Progress,
+) -> Result<Prefetch>
 where
     R: Runner + Sync,
 {
-    let candidates = prefetch_candidates(entries, roots, options);
+    let candidates = prefetch_candidates(entries, context.roots, options);
     if candidates.is_empty() {
-        return Prefetch::default();
+        return Ok(Prefetch::default());
     }
 
     let env = EnvVars {
-        vars: env_vars,
-        runtime: runtime_env,
+        vars: context.env_vars,
+        runtime: context.env,
     };
-    let token = github::token(&env, runner);
+    let token = github::token(&env, context.runner);
     let mut prefetch = Prefetch {
         releases: BTreeMap::new(),
         versions: BTreeMap::new(),
         token: token.clone(),
         token_resolved: true,
     };
-    let jobs = jobs::max(env_vars);
+    let jobs = jobs::github_max(context.env_vars);
     if jobs <= 1 || candidates.len() <= 1 {
         // Still cache the token in the sequential path. The old Bash
         // implementation naturally held this in shell state, but the Rust port
         // otherwise probes `gh auth token` once per metadata/asset request.
         // Avoiding that subprocess fan-out is a warm-path performance win and
         // also keeps CI logs quieter when GitHub credentials are present.
-        return prefetch;
+        return Ok(prefetch);
     }
 
-    // Prefetch only read-only release facts: GitHub metadata and the currently
-    // installed command version. Installation order is part of the public
-    // behavior because post hooks and method-transition cleanup are observable.
-    // These probes are safe to overlap because they have no local mutation. A
-    // failed metadata prefetch is deliberately not cached so the normal
-    // per-dependency path can retry and report the same failure it would have
-    // reported without this optimization. Version probes are cached only when
-    // they succeed; a missing/odd tool gets the old serial second chance.
-    for fetched in jobs::parallel_map(&candidates, jobs, |candidate| {
-        let releases = cached_releases(&candidate.repo, roots, options)
-            .or_else(|| fetch_releases_with_token(&candidate.repo, client, token.as_deref()).ok())
-            .map(|releases| (candidate.repo.clone(), releases));
-        let version = process::executable_path(&candidate.public_bin)
-            .then(|| process::dep_version(runner, &candidate.cmd))
-            .flatten()
-            .map(|version| (candidate.name.clone(), version));
-        (releases, version)
-    }) {
-        if let Some((repo, releases)) = fetched.0 {
-            prefetch.releases.insert(repo, releases);
-        }
-        if let Some((name, version)) = fetched.1 {
+    // Prefetch only read-only release facts. Installation order is part of the
+    // public behavior because post hooks and method-transition cleanup are
+    // observable, but metadata reads are safe to overlap because they have no
+    // local mutation. A failed metadata prefetch is deliberately not cached so
+    // the normal per-dependency path can retry and report the same failure it
+    // would have reported without this optimization.
+    for (repo, releases) in jobs::parallel_map_with_progress(
+        &candidates,
+        jobs,
+        |candidate| {
+            cached_releases(&candidate.repo, context.roots, options)
+                .or_else(|| {
+                    github::fetch_releases_with_token(
+                        &candidate.repo,
+                        context.client,
+                        token.as_deref(),
+                    )
+                    .ok()
+                })
+                .map(|releases| (candidate.repo.clone(), releases))
+        },
+        |done| {
+            progress.phase(
+                "github-releases",
+                "running",
+                "fetching GitHub release metadata",
+                done,
+                candidates.len(),
+            )
+        },
+    )?
+    .into_iter()
+    .flatten()
+    {
+        prefetch.releases.insert(repo, releases);
+    }
+
+    let version_candidates = candidates
+        .iter()
+        .filter(|candidate| process::executable_path(&candidate.public_bin))
+        .collect::<Vec<_>>();
+    if !version_candidates.is_empty() {
+        // Version probes are local-only and cached only when they succeed; a
+        // missing or odd tool gets the old serial second chance during install.
+        for fetched in jobs::parallel_map_with_progress(
+            &version_candidates,
+            jobs,
+            |candidate| {
+                process::dep_version(context.runner, &candidate.cmd)
+                    .map(|version| (candidate.name.clone(), version))
+            },
+            |done| {
+                progress.phase(
+                    "github-releases",
+                    "running",
+                    "checking current GitHub release versions",
+                    done,
+                    version_candidates.len(),
+                )
+            },
+        )? {
+            let Some((name, version)) = fetched else {
+                continue;
+            };
             prefetch.versions.insert(name, version);
         }
     }
 
-    prefetch
+    Ok(prefetch)
+}
+
+pub(crate) fn prefetch_progress_total(
+    entries: &[&Entry],
+    roots: &Roots,
+    options: Options,
+) -> usize {
+    prefetch_candidates(entries, roots, options).len()
 }
 
 fn prefetch_candidates(entries: &[&Entry], roots: &Roots, options: Options) -> Vec<Candidate> {
@@ -473,7 +520,9 @@ pub(crate) fn install_request(
 
 fn cached_releases(repo: &str, roots: &Roots, options: Options) -> Option<Vec<github::Release>> {
     let stamp_path = stamp::remote_path(&roots.state_dir, repo, "github");
-    if !stamp::remote_fresh(&stamp_path, options.freshness()) {
+    if !stamp::remote_fresh(&stamp_path, options.freshness())
+        && !stamp::remote_checked_at(&stamp_path, options.now)
+    {
         return None;
     }
 
@@ -488,20 +537,10 @@ fn fetch_releases_with_prefetch_token(
     prefetch: &Prefetch,
 ) -> Result<Vec<github::Release>> {
     if prefetch.token_resolved {
-        fetch_releases_with_token(repo, client, prefetch.token.as_deref())
+        github::fetch_releases_with_token(repo, client, prefetch.token.as_deref())
     } else {
         github::fetch_releases(repo, env, runner, client)
     }
-}
-
-fn fetch_releases_with_token(
-    repo: &str,
-    client: &dyn Client,
-    token: Option<&str>,
-) -> Result<Vec<github::Release>> {
-    let bytes = client.get(&github::releases_url(repo), token)?;
-    let json = String::from_utf8_lossy(&bytes);
-    github::parse_releases(&json)
 }
 
 fn github_token(env: &impl Env, context: &RequestContext<'_, impl Runner>) -> Option<String> {

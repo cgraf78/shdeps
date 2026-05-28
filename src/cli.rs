@@ -423,14 +423,27 @@ where
         remote_ttl: remote_ttl(),
         ..UpdateOptions::default()
     };
-    let entries = resolve_github_entries_with_options(
-        &entries,
-        &roots,
-        Some(&manifest),
-        &env,
-        &env_vars,
-        github_options_from_update(update_options),
-    )?;
+    let progress_jsonl = std::env::var_os("SHDEPS_PROGRESS").is_some_and(|value| value == "jsonl");
+    let entries = if progress_jsonl {
+        resolve_github_entries_with_progress(
+            &entries,
+            &roots,
+            Some(&manifest),
+            &env,
+            &env_vars,
+            github_options_from_update(update_options),
+            stdout,
+        )?
+    } else {
+        resolve_github_entries_with_options(
+            &entries,
+            &roots,
+            Some(&manifest),
+            &env,
+            &env_vars,
+            github_options_from_update(update_options),
+        )?
+    };
     let context = UpdateContext {
         manifest_path: &manifest_path,
         roots: &roots,
@@ -445,7 +458,6 @@ where
         .iter()
         .filter(|entry| update::active(entry, &env))
         .count();
-    let progress_jsonl = std::env::var_os("SHDEPS_PROGRESS").is_some_and(|value| value == "jsonl");
     let nested = std::env::var_os("SHDEPS_NESTED").is_some_and(|value| value == "1");
     if !options.quiet && !progress_jsonl {
         if !nested {
@@ -787,7 +799,52 @@ fn resolve_github_entries_with_options(
         runner: &Process,
         client: &Curl,
     };
-    github_method::resolve_entries(entries, &context, options)
+    github_method::resolve_entries_with_progress(
+        entries,
+        &context,
+        options,
+        jobs::github_max(env_vars),
+        |_done, _total| Ok(()),
+    )
+}
+
+fn resolve_github_entries_with_progress<W>(
+    entries: &[Entry],
+    roots: &runtime::Roots,
+    manifest: Option<&Manifest>,
+    env: &crate::platform::RuntimeEnv,
+    env_vars: &BTreeMap<String, String>,
+    options: github_method::Options,
+    stdout: &mut W,
+) -> Result<Vec<Entry>>
+where
+    W: Write,
+{
+    let context = github_method::Context {
+        roots,
+        manifest,
+        env,
+        env_vars,
+        runner: &Process,
+        client: &Curl,
+    };
+    let mut progress = JsonlProgress { out: stdout };
+    github_method::resolve_entries_with_progress(
+        entries,
+        &context,
+        options,
+        jobs::github_max(env_vars),
+        |done, total| {
+            update::Progress::phase(
+                &mut progress,
+                "github-methods",
+                "running",
+                "resolving GitHub methods",
+                done,
+                total,
+            )
+        },
+    )
 }
 
 fn github_options(options: &ParsedOptions) -> github_method::Options {

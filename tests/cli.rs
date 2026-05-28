@@ -728,6 +728,62 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
 }
 
 #[test]
+fn update_jsonl_reports_bare_github_method_resolution() {
+    let fixture = Fixture::new("update-jsonl-github-method-progress");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_fake_curl(
+        &release_json("v1.0.0", &[host_linux_asset("tool", "v1.0.0").as_str()]),
+        "#!/bin/sh\nprintf 'tool v1.0.0\\n'\n",
+    );
+    let mut command = fixture.command(["--force", "update"]);
+    command.env("SHDEPS_PROGRESS", "jsonl");
+    command.env("SHDEPS_TEST_CURL_LOG", fixture.dir.join("curl.log"));
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("fakebin").display()),
+    );
+
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
+    let events = jsonl(&output.stdout);
+    assert!(
+        events.iter().any(|event| event["event"] == "phase"
+            && event["group"] == "github-methods"
+            && event["detail"] == "resolving GitHub methods"
+            && event["done"] == 0
+            && event["total"] == 1),
+        "expected GitHub method resolution start phase in {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "phase"
+            && event["group"] == "github-methods"
+            && event["detail"] == "resolving GitHub methods"
+            && event["done"] == 1
+            && event["total"] == 1),
+        "expected GitHub method resolution completion phase in {events:#?}"
+    );
+    let method_index = events
+        .iter()
+        .position(|event| event["event"] == "phase" && event["group"] == "github-methods")
+        .expect("expected GitHub method phase");
+    let release_index = events
+        .iter()
+        .position(|event| event["event"] == "phase" && event["group"] == "github-releases")
+        .expect("expected GitHub release phase");
+    assert!(
+        method_index < release_index,
+        "method resolution should be visible before release install checks in {events:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("curl.log")).unwrap(),
+        "api\nasset\n",
+        "forced bare-github resolution should share the release metadata it already fetched instead of hitting the GitHub API again"
+    );
+}
+
+#[test]
 fn update_jsonl_splits_github_release_metadata_from_install_checks() {
     let fixture = Fixture::new("update-jsonl-release-progress");
     fixture.write("conf/deps.conf", "owner/tool github:release tool\n");

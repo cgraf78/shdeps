@@ -441,26 +441,22 @@ where
         .iter()
         .filter(|entry| entry.method == "github:release" && active(entry, context.env))
         .collect::<Vec<_>>();
+    let release_prefetch_total =
+        update_release::prefetch_progress_total(&release_entries, context.roots, options);
     if !release_entries.is_empty() {
         announced.insert("github-releases");
         group_started.insert("github-releases", Instant::now());
-        progress.phase(
-            "github-releases",
-            "running",
-            "fetching GitHub release metadata",
-            0,
-            release_entries.len(),
-        )?;
+        if release_prefetch_total > 0 {
+            progress.phase(
+                "github-releases",
+                "running",
+                "fetching GitHub release metadata",
+                0,
+                release_prefetch_total,
+            )?;
+        }
     }
-    let release_prefetch = update_release::prefetch(
-        &release_entries,
-        context.roots,
-        context.env,
-        context.env_vars,
-        context.runner,
-        context.client,
-        options,
-    );
+    let release_prefetch = update_release::prefetch(&release_entries, context, options, progress)?;
     if !release_entries.is_empty() {
         progress.phase(
             "github-releases",
@@ -858,7 +854,7 @@ mod tests {
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{Context, Options, Summary, run};
+    use super::{Context, Item, Options, Summary, run, run_with_progress};
     use bzip2::Compression as BzCompression;
     use bzip2::write::BzEncoder;
     use flate2::Compression;
@@ -875,6 +871,40 @@ mod tests {
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
     use crate::runtime::Roots;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PhaseRecord {
+        detail: String,
+        done: usize,
+        total: usize,
+    }
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        phases: Vec<PhaseRecord>,
+    }
+
+    impl super::Progress for RecordingProgress {
+        fn phase(
+            &mut self,
+            _group: &'static str,
+            _status: &'static str,
+            detail: &str,
+            done: usize,
+            total: usize,
+        ) -> crate::Result<()> {
+            self.phases.push(PhaseRecord {
+                detail: detail.to_owned(),
+                done,
+                total,
+            });
+            Ok(())
+        }
+
+        fn item(&mut self, _group: &'static str, _item: &Item) -> crate::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn update_installs_custom_dep_records_manifest_and_runs_post() {
@@ -2464,6 +2494,142 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_prefetch_reports_completion_progress() {
+        let mut fixture = Fixture::new("release-prefetch-progress");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "2".to_owned());
+        fixture.client = FakeClient::default()
+            .with_delay(Duration::from_millis(10))
+            .with(
+                "https://api.github.com/repos/owner/tool-a/releases?per_page=100",
+                release_response(
+                    "tool-a",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                ),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
+                b"tool-a".to_vec(),
+            )
+            .with(
+                "https://api.github.com/repos/owner/tool-b/releases?per_page=100",
+                release_response(
+                    "tool-b",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                ),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                b"tool-b".to_vec(),
+            )
+            .with(
+                "https://api.github.com/repos/owner/tool-c/releases?per_page=100",
+                release_response(
+                    "tool-c",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-c-linux-x86_64",
+                ),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-c-linux-x86_64",
+                b"tool-c".to_vec(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+        let mut progress = RecordingProgress::default();
+
+        let summary = run_with_progress(
+            &[
+                parse_entry("owner/tool-a|github:release|tool-a|-|-", None),
+                parse_entry("owner/tool-b|github:release|tool-b|-|-", None),
+                parse_entry("owner/tool-c|github:release|tool-c|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &mut progress,
+        )
+        .unwrap();
+
+        let metadata_progress = progress
+            .phases
+            .iter()
+            .filter(|phase| phase.detail == "fetching GitHub release metadata")
+            .map(|phase| (phase.done, phase.total))
+            .collect::<Vec<_>>();
+
+        assert!(!summary.has_errors());
+        assert!(
+            metadata_progress.contains(&(1, 3))
+                && metadata_progress.contains(&(2, 3))
+                && metadata_progress.contains(&(3, 3)),
+            "metadata prefetch should report each completed worker result: {metadata_progress:?}"
+        );
+    }
+
+    #[test]
+    fn update_github_release_metadata_progress_uses_prefetch_candidate_total() {
+        let mut fixture = Fixture::new("release-prefetch-candidate-total");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "2".to_owned());
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool-b/releases?per_page=100",
+                release_response(
+                    "tool-b",
+                    "v1.0.0",
+                    "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                ),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
+                b"tool-b".to_vec(),
+            );
+        write_executable(&fixture.roots.bin_dir.join("tool-a"));
+        let options = Options::default();
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool-a", "release"),
+            options.now,
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+        let mut progress = RecordingProgress::default();
+
+        let summary = run_with_progress(
+            &[
+                parse_entry("owner/tool-a|github:release|tool-a|-|-", None),
+                parse_entry("owner/tool-b|github:release|tool-b|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            options,
+            &mut progress,
+        )
+        .unwrap();
+
+        let metadata_progress = progress
+            .phases
+            .iter()
+            .filter(|phase| phase.detail == "fetching GitHub release metadata")
+            .map(|phase| (phase.done, phase.total))
+            .collect::<Vec<_>>();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            metadata_progress,
+            vec![(0, 1)],
+            "metadata progress should use the prefetch candidate count, not all release entries"
+        );
+    }
+
+    #[test]
     fn update_github_release_prefetches_current_versions_with_bounded_parallelism() {
         let mut fixture = Fixture::new("release-version-prefetch");
         fixture.write_lib();
@@ -2498,8 +2664,9 @@ version() { printf 'saw-pkg\n'; }
             .with_success("tool-b", ["--version"], "tool-b 2.0.0\n")
             .with_overlap_gate(2)
             .with_delay(Duration::from_millis(25));
+        let mut progress = RecordingProgress::default();
 
-        let summary = run(
+        let summary = run_with_progress(
             &[
                 parse_entry("owner/tool-a|github:release|tool-a|-|-", None),
                 parse_entry("owner/tool-b|github:release|tool-b|-|-", None),
@@ -2510,9 +2677,16 @@ version() { printf 'saw-pkg\n'; }
                 force: true,
                 ..Options::default()
             },
+            &mut progress,
         )
         .unwrap();
 
+        let version_progress = progress
+            .phases
+            .iter()
+            .filter(|phase| phase.detail == "checking current GitHub release versions")
+            .map(|phase| (phase.done, phase.total))
+            .collect::<Vec<_>>();
         let asset_count = fixture
             .client
             .requests()
@@ -2532,6 +2706,10 @@ version() { printf 'saw-pkg\n'; }
             runner.max_active(),
             2,
             "installed-version probes are read-only and should overlap with the same SHDEPS_JOBS bound as release metadata"
+        );
+        assert!(
+            version_progress.contains(&(1, 2)) && version_progress.contains(&(2, 2)),
+            "version prefetch should be split from GitHub metadata progress: {version_progress:?}"
         );
     }
 

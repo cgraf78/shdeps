@@ -32,6 +32,22 @@ pub fn max(env_vars: &BTreeMap<String, String>) -> usize {
         .max(1)
 }
 
+/// Returns the maximum parallel jobs for GitHub API reads.
+#[must_use]
+pub fn github_max(env_vars: &BTreeMap<String, String>) -> usize {
+    const AUTO_CAP: usize = 4;
+
+    let configured = env_vars
+        .get("SHDEPS_JOBS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if configured > 0 {
+        return configured;
+    }
+
+    max(env_vars).min(AUTO_CAP)
+}
+
 pub(crate) fn parallel_map<T, R, F>(items: &[T], jobs: usize, f: F) -> Vec<R>
 where
     T: Sync,
@@ -125,6 +141,106 @@ where
         .collect()
 }
 
+pub(crate) fn parallel_map_with_progress<T, R, F, P>(
+    items: &[T],
+    jobs: usize,
+    f: F,
+    mut progress: P,
+) -> crate::Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+    P: FnMut(usize) -> crate::Result<()>,
+{
+    if jobs <= 1 || items.len() <= 1 {
+        let mut results = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            results.push(f(item));
+            progress(index + 1)?;
+        }
+        return Ok(results);
+    }
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let len = items.len();
+    let next_index = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<R>>> = (0..len).map(|_| Mutex::new(None)).collect();
+    let panic_payload: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
+    let worker_count = jobs.min(len);
+    let (completed_tx, completed_rx) = mpsc::channel::<usize>();
+    let mut progress_error = None;
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let f = &f;
+            let next_index = &next_index;
+            let slots = &slots;
+            let panic_payload = &panic_payload;
+            let completed_tx = completed_tx.clone();
+            scope.spawn(move || {
+                loop {
+                    if panic_payload.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= len {
+                        return;
+                    }
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&items[index])));
+                    match outcome {
+                        Ok(result) => {
+                            *slots[index].lock().unwrap() = Some(result);
+                            let _ = completed_tx.send(index);
+                        }
+                        Err(payload) => {
+                            let mut held = panic_payload.lock().unwrap();
+                            if held.is_none() {
+                                *held = Some(payload);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        drop(completed_tx);
+
+        let mut completed = 0usize;
+        while completed < len {
+            match completed_rx.recv() {
+                Ok(_) => {
+                    completed += 1;
+                    if let Err(error) = progress(completed) {
+                        progress_error = Some(error);
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    if let Some(payload) = panic_payload.into_inner().unwrap() {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some(error) = progress_error {
+        return Err(error);
+    }
+
+    Ok(slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap()
+                .expect("every slot is written exactly once by a worker before scope ends")
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -153,6 +269,26 @@ mod tests {
 
             assert!(super::max(&env) >= 1);
         }
+    }
+
+    #[test]
+    fn github_max_caps_auto_mode() {
+        let env = BTreeMap::new();
+
+        assert!(super::github_max(&env) <= 4);
+        assert!(super::github_max(&env) >= 1);
+    }
+
+    #[test]
+    fn github_max_respects_explicit_operator_choice() {
+        let mut env = BTreeMap::new();
+        env.insert("SHDEPS_JOBS".to_owned(), "8".to_owned());
+
+        assert_eq!(super::github_max(&env), 8);
+
+        env.insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
+
+        assert_eq!(super::github_max(&env), 1);
     }
 
     #[test]
