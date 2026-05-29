@@ -426,6 +426,8 @@ where
     W: Write,
     E: Write,
 {
+    let update_started = Instant::now();
+
     if let Some(arg) = args.first() {
         writeln!(stderr, "error: unknown update argument '{arg}'")?;
         return Ok(2);
@@ -581,6 +583,9 @@ where
     if progress_jsonl {
         let mut progress = JsonlProgress { out: stdout };
         write_update_summary_jsonl(&summary, &entries, active_count, &mut progress)?;
+    }
+    if terminal_progress && !nested {
+        write_done(stdout, update_started.elapsed().as_millis())?;
     }
 
     Ok(if summary.has_errors() { 1 } else { 0 })
@@ -788,12 +793,10 @@ where
             let cleared_rows = line_count.saturating_sub(rows.len());
             if rows.is_empty() {
                 writeln!(self.out)?;
-                writeln!(self.out)?;
             } else {
                 if cleared_rows > 0 {
                     write!(self.out, "\x1b[{}A", cleared_rows)?;
                 }
-                writeln!(self.out)?;
                 writeln!(self.out)?;
             }
         } else if line_count > rows.len() && !rows.is_empty() {
@@ -2144,6 +2147,14 @@ fn tty_row(status: &str, detail: &str, elapsed: &str) -> String {
     )
 }
 
+fn write_done<W>(stdout: &mut W, elapsed_ms: u128) -> Result<()>
+where
+    W: Write,
+{
+    writeln!(stdout, "Done in {}", elapsed_label_ms(elapsed_ms))?;
+    Ok(())
+}
+
 fn elapsed_label_ms(ms: u128) -> String {
     format!("{}s", ms / 1000)
 }
@@ -2669,7 +2680,50 @@ mod tests {
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(stdout.contains("GitHub"));
         assert!(stdout.contains("Custom: 1 current"));
-        assert!(stdout.ends_with("\n\r\x1b[K\x1b[1A\n\n"));
+        assert!(stdout.ends_with("\n\r\x1b[K\x1b[1A\n"));
+    }
+
+    #[test]
+    fn terminal_progress_footer_follows_finished_rows() {
+        let entries = vec![Entry {
+            name: "widget".to_owned(),
+            method: "custom".to_owned(),
+            cmd: "widget".to_owned(),
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        let summary = Summary {
+            items: vec![Item {
+                name: "widget".to_owned(),
+                changed: false,
+                failed: false,
+                detail: "current".to_owned(),
+            }],
+            groups: vec![GroupSummary {
+                group: "hooks",
+                elapsed_ms: 0,
+            }],
+            ..Summary::default()
+        };
+        let mut stdout = Vec::new();
+
+        {
+            let mut progress = super::TtyProgress::new(
+                &mut stdout,
+                vec![super::TtyProgressStage {
+                    stage: "custom",
+                    total: 1,
+                }],
+            );
+            progress.start().unwrap();
+            progress.finish(&summary, &entries).unwrap();
+        }
+        super::write_done(&mut stdout, 2_000).unwrap();
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("  ok       Custom: 1 current"));
+        assert!(stdout.contains("0s\nDone in 2s\n"));
+        assert!(!stdout.contains("0s\n\nDone in 2s\n"));
     }
 
     #[test]
