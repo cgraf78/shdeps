@@ -2152,6 +2152,7 @@ where
     W: Write,
 {
     writeln!(stdout, "Done in {}", elapsed_label_ms(elapsed_ms))?;
+    writeln!(stdout)?;
     Ok(())
 }
 
@@ -2724,6 +2725,7 @@ mod tests {
         assert!(stdout.contains("  ok       Custom: 1 current"));
         assert!(stdout.contains("0s\nDone in 2s\n"));
         assert!(!stdout.contains("0s\n\nDone in 2s\n"));
+        assert!(stdout.ends_with("Done in 2s\n\n"));
     }
 
     #[test]
