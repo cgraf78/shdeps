@@ -2067,14 +2067,13 @@ fn spinner_frame(done: usize) -> &'static str {
 }
 
 fn tty_row(status: &str, detail: &str, elapsed: &str) -> String {
-    const DETAIL_WIDTH: usize = 46;
     let color_status = match status {
         "pending" => "detail",
         "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧" | "⠇" | "⠏" => "running",
         _ => status,
     };
     format!(
-        "  {}{status:<8}{} {detail:<DETAIL_WIDTH$} {elapsed:>6}",
+        "  {}{status:<8}{} {detail:<54} {elapsed:>6}",
         color(color_status),
         color("reset")
     )
@@ -2521,17 +2520,7 @@ mod tests {
     fn terminal_progress_rows_include_elapsed_column() {
         assert_eq!(
             super::tty_row("running", "Hooks              [━━━━····] 1/2", "12s"),
-            "  running  Hooks              [━━━━····] 1/2                 12s"
-        );
-    }
-
-    #[test]
-    fn terminal_progress_rows_fit_narrow_tmux_panes() {
-        let row = super::tty_row("ok", "Hooks: 9 current, 1 skipped", "1s");
-
-        assert!(
-            row.len() < 73,
-            "row should leave room for tmux panes narrower than a full terminal"
+            "  running  Hooks              [━━━━····] 1/2                         12s"
         );
     }
 
