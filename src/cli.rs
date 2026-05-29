@@ -498,7 +498,15 @@ where
             update_options,
             &mut progress,
         )?;
-        progress.finish(&summary, &entries)?;
+        let footer = if nested {
+            None
+        } else {
+            Some(format!(
+                "Done in {}",
+                elapsed_label_ms(update_started.elapsed().as_millis())
+            ))
+        };
+        progress.finish(&summary, &entries, footer.as_deref())?;
         drop(progress);
         write_update_terminal_summary(
             &summary,
@@ -583,9 +591,6 @@ where
     if progress_jsonl {
         let mut progress = JsonlProgress { out: stdout };
         write_update_summary_jsonl(&summary, &entries, active_count, &mut progress)?;
-    }
-    if terminal_progress && !nested {
-        write_done(stdout, update_started.elapsed().as_millis())?;
     }
 
     Ok(if summary.has_errors() { 1 } else { 0 })
@@ -695,10 +700,15 @@ where
             return Ok(());
         }
         let rows = self.live_rows();
-        self.rewrite_rows(&rows, false)
+        self.rewrite_rows(&rows, false, None)
     }
 
-    fn finish(&mut self, summary: &update::Summary, entries: &[Entry]) -> Result<()> {
+    fn finish(
+        &mut self,
+        summary: &update::Summary,
+        entries: &[Entry],
+        footer: Option<&str>,
+    ) -> Result<()> {
         if self.rows.is_empty() {
             self.finished = true;
             self.active = false;
@@ -707,7 +717,7 @@ where
         }
 
         let final_rows = self.final_rows(summary, entries);
-        self.rewrite_rows(&final_rows, true)?;
+        self.rewrite_rows(&final_rows, true, footer)?;
         self.finished = true;
         self.active = false;
         self.rendered_rows = 0;
@@ -765,7 +775,12 @@ where
         rows
     }
 
-    fn rewrite_rows(&mut self, rows: &[RenderedTtyRow], finish_line: bool) -> Result<()> {
+    fn rewrite_rows(
+        &mut self,
+        rows: &[RenderedTtyRow],
+        finish_line: bool,
+        footer: Option<&str>,
+    ) -> Result<()> {
         let previous_rows = self.rendered_rows;
         if self.active {
             write!(self.out, "\r\x1b[K")?;
@@ -774,7 +789,10 @@ where
             }
         }
 
-        let line_count = rows.len().max(previous_rows);
+        // Keep a cleared row after the footer so shell prompt redraws cannot
+        // consume the last visible line after long-running updates.
+        let rendered_rows = rows.len() + if footer.is_some() { 2 } else { 0 };
+        let line_count = rendered_rows.max(previous_rows);
         for index in 0..line_count {
             write!(self.out, "\r\x1b[K")?;
             if let Some(row) = rows.get(index) {
@@ -783,6 +801,10 @@ where
                     "{}",
                     tty_row(&row.status, &row.detail, &row.elapsed)
                 )?;
+            } else if index == rows.len()
+                && let Some(footer) = footer
+            {
+                write!(self.out, "{footer}")?;
             }
             if index + 1 < line_count {
                 writeln!(self.out)?;
@@ -790,7 +812,7 @@ where
         }
 
         if finish_line {
-            let cleared_rows = line_count.saturating_sub(rows.len());
+            let cleared_rows = line_count.saturating_sub(rendered_rows);
             if rows.is_empty() {
                 writeln!(self.out)?;
             } else {
@@ -799,12 +821,12 @@ where
                 }
                 writeln!(self.out)?;
             }
-        } else if line_count > rows.len() && !rows.is_empty() {
-            write!(self.out, "\x1b[{}A", line_count - rows.len())?;
+        } else if line_count > rendered_rows && !rows.is_empty() {
+            write!(self.out, "\x1b[{}A", line_count - rendered_rows)?;
         }
         self.out.flush()?;
         self.active = !finish_line;
-        self.rendered_rows = if finish_line { 0 } else { rows.len() };
+        self.rendered_rows = if finish_line { 0 } else { rendered_rows };
         Ok(())
     }
 
@@ -846,7 +868,7 @@ where
         }
 
         let rows = self.live_rows();
-        self.rewrite_rows(&rows, false)
+        self.rewrite_rows(&rows, false, None)
     }
 
     fn clear_unfinished(&mut self) -> Result<()> {
@@ -2147,15 +2169,6 @@ fn tty_row(status: &str, detail: &str, elapsed: &str) -> String {
     )
 }
 
-fn write_done<W>(stdout: &mut W, elapsed_ms: u128) -> Result<()>
-where
-    W: Write,
-{
-    writeln!(stdout, "Done in {}", elapsed_label_ms(elapsed_ms))?;
-    writeln!(stdout)?;
-    Ok(())
-}
-
 fn elapsed_label_ms(ms: u128) -> String {
     format!("{}s", ms / 1000)
 }
@@ -2675,7 +2688,7 @@ mod tests {
                 ],
             );
             progress.start().unwrap();
-            progress.finish(&summary, &entries).unwrap();
+            progress.finish(&summary, &entries, None).unwrap();
         }
 
         let stdout = String::from_utf8(stdout).unwrap();
@@ -2717,15 +2730,15 @@ mod tests {
                 }],
             );
             progress.start().unwrap();
-            progress.finish(&summary, &entries).unwrap();
+            progress
+                .finish(&summary, &entries, Some("Done in 2s"))
+                .unwrap();
         }
-        super::write_done(&mut stdout, 2_000).unwrap();
 
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(stdout.contains("  ok       Custom: 1 current"));
-        assert!(stdout.contains("0s\nDone in 2s\n"));
-        assert!(!stdout.contains("0s\n\nDone in 2s\n"));
-        assert!(stdout.ends_with("Done in 2s\n\n"));
+        assert!(stdout.contains("0s\n\r\x1b[KDone in 2s\n"));
+        assert!(stdout.ends_with("Done in 2s\n\r\x1b[K\n"));
     }
 
     #[test]
