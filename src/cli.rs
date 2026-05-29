@@ -656,6 +656,7 @@ struct TtyProgressRow {
     done: usize,
     total: usize,
     touched: bool,
+    components: BTreeMap<&'static str, (usize, usize)>,
 }
 
 impl<W> TtyProgress<'_, W>
@@ -675,6 +676,7 @@ where
                     done: 0,
                     total: stage.total,
                     touched: false,
+                    components: BTreeMap::new(),
                 })
                 .collect(),
             active: false,
@@ -709,34 +711,40 @@ where
 
     fn final_rows(&self, summary: &update::Summary, entries: &[Entry]) -> Vec<RenderedTtyRow> {
         let mut summaries = BTreeMap::new();
-        let elapsed = summary
-            .groups
-            .iter()
-            .map(|group| (group.group, group.elapsed_ms))
-            .collect::<BTreeMap<_, _>>();
-        for group in update_group_order() {
+        for group in dashboard_group_order() {
             let items = summary
                 .items
                 .iter()
-                .filter(|item| group_for_name(entries, &item.name) == group)
+                .filter(|item| dashboard_group_for_name(entries, &item.name) == group)
                 .collect::<Vec<_>>();
             if items.is_empty() {
                 continue;
             }
             let counts = update_counts_for_items(&items);
+            let elapsed_ms = dashboard_elapsed_ms(summary, group);
             summaries.insert(
                 group,
                 RenderedTtyRow {
                     status: update_status(counts).to_owned(),
-                    detail: format!("{}: {}", group_label(group), update_count_summary(counts)),
-                    elapsed: elapsed_label_ms(elapsed.get(group).copied().unwrap_or(0)),
+                    detail: format!(
+                        "{}: {}",
+                        dashboard_group_label(group),
+                        update_count_summary(counts)
+                    ),
+                    elapsed: elapsed_label_ms(elapsed_ms),
                 },
             );
         }
 
         let mut rows = Vec::new();
         for row in self.ordered_rows() {
-            if let Some(summary) = summaries.remove(row.stage) {
+            if let Some(mut summary) = summaries.remove(row.stage) {
+                if row.touched {
+                    summary.elapsed = elapsed_label_ms(row.elapsed_ms.unwrap_or_else(|| {
+                        row.started
+                            .map_or(0, |started| started.elapsed().as_millis())
+                    }));
+                }
                 rows.push(summary);
             } else if row.touched {
                 rows.push(RenderedTtyRow {
@@ -799,6 +807,7 @@ where
 
     fn progress_row(&mut self, detail: &str, done: usize, total: usize) -> Result<()> {
         let stage = progress_stage(detail);
+        let component = progress_component(detail);
         let label = progress_label(detail);
         let index = match self.rows.iter().position(|row| row.stage == stage) {
             Some(index) => index,
@@ -811,6 +820,7 @@ where
                     done,
                     total,
                     touched: false,
+                    components: BTreeMap::new(),
                 });
                 self.rows.len() - 1
             }
@@ -819,8 +829,15 @@ where
         {
             let row = &mut self.rows[index];
             let started = *row.started.get_or_insert_with(Instant::now);
-            row.done = done;
-            row.total = total;
+            row.components.insert(component, (done, total));
+            row.done = row
+                .components
+                .values()
+                .map(|(component_done, _)| *component_done)
+                .sum();
+            row.total = row
+                .total
+                .max(row.components.values().map(|(_, total)| *total).sum());
             row.touched = true;
             row.elapsed_ms = Some(started.elapsed().as_millis());
         }
@@ -1456,11 +1473,11 @@ where
     E: Write,
 {
     let mut item_failures = std::collections::BTreeSet::new();
-    for group in update_group_order() {
+    for group in dashboard_group_order() {
         let items = summary
             .items
             .iter()
-            .filter(|item| group_for_name(entries, &item.name) == group)
+            .filter(|item| dashboard_group_for_name(entries, &item.name) == group)
             .collect::<Vec<_>>();
         if items.is_empty() {
             continue;
@@ -1512,15 +1529,15 @@ fn terminal_progress_plan(
         .filter(active)
         .filter(|entry| entry.method == "pkg")
         .count();
-    let release_possible = entries
+    let github = entries
         .iter()
         .filter(active)
-        .filter(|entry| entry.method == "github" || entry.method == "github:release")
-        .count();
-    let repo_possible = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| entry.method == "github" || entry.method == "github:repo")
+        .filter(|entry| {
+            matches!(
+                entry.method.as_str(),
+                "github" | "github:release" | "github:repo"
+            )
+        })
         .count();
     let language_tools = entries
         .iter()
@@ -1536,7 +1553,7 @@ fn terminal_progress_plan(
     let mut stages = Vec::new();
     if bare_github > 0 {
         stages.push(TtyProgressStage {
-            stage: "github-methods",
+            stage: "method-resolution",
             total: bare_github,
         });
     }
@@ -1546,16 +1563,10 @@ fn terminal_progress_plan(
             total: packages,
         });
     }
-    if release_possible > 0 {
+    if github > 0 {
         stages.push(TtyProgressStage {
-            stage: "github-releases",
-            total: release_possible,
-        });
-    }
-    if repo_possible > 0 {
-        stages.push(TtyProgressStage {
-            stage: "repo-deps",
-            total: repo_possible,
+            stage: "github",
+            total: github,
         });
     }
     if language_tools > 0 {
@@ -1566,7 +1577,7 @@ fn terminal_progress_plan(
     }
     if hooks > 0 {
         stages.push(TtyProgressStage {
-            stage: "hooks",
+            stage: "custom",
             total: hooks,
         });
     }
@@ -1581,11 +1592,11 @@ fn write_normal_group_summaries<W>(
 where
     W: Write,
 {
-    for group in update_group_order() {
+    for group in dashboard_group_order() {
         let items = summary
             .items
             .iter()
-            .filter(|item| group_for_name(entries, &item.name) == group)
+            .filter(|item| dashboard_group_for_name(entries, &item.name) == group)
             .collect::<Vec<_>>();
         if items.is_empty() {
             continue;
@@ -1601,7 +1612,11 @@ where
         write_row(
             stdout,
             status,
-            &format!("{}: {}", group_label(group), update_count_summary(counts)),
+            &format!(
+                "{}: {}",
+                dashboard_group_label(group),
+                update_count_summary(counts)
+            ),
         )?;
         for item in items {
             if item.changed && !item.failed {
@@ -1628,16 +1643,16 @@ where
     E: Write,
 {
     let mut item_failures = std::collections::BTreeSet::new();
-    for group in update_group_order() {
+    for group in dashboard_group_order() {
         let items = summary
             .items
             .iter()
-            .filter(|item| group_for_name(entries, &item.name) == group)
+            .filter(|item| dashboard_group_for_name(entries, &item.name) == group)
             .collect::<Vec<_>>();
         if items.is_empty() {
             continue;
         }
-        write_group(stdout, group_label(group))?;
+        write_group(stdout, dashboard_group_label(group))?;
         for item in items {
             if item.failed {
                 item_failures.insert(item.name.as_str());
@@ -1690,12 +1705,20 @@ fn update_group_order() -> [&'static str; 6] {
     ]
 }
 
+fn dashboard_group_order() -> [&'static str; 5] {
+    ["packages", "github", "language-tools", "custom", "other"]
+}
+
 fn group_for_name(entries: &[Entry], name: &str) -> &'static str {
     entries
         .iter()
         .find(|entry| entry.name == name)
         .map(|entry| update::group_for_method(&entry.method))
         .unwrap_or("other")
+}
+
+fn dashboard_group_for_name(entries: &[Entry], name: &str) -> &'static str {
+    display_group_for_update_group(group_for_name(entries, name))
 }
 
 fn group_label(group: &str) -> &'static str {
@@ -1707,6 +1730,36 @@ fn group_label(group: &str) -> &'static str {
         "hooks" => "Hooks",
         _ => "Other",
     }
+}
+
+fn dashboard_group_label(group: &str) -> &'static str {
+    match group {
+        "packages" => "Packages",
+        "github" => "GitHub",
+        "language-tools" => "Language tools",
+        "custom" => "Custom",
+        _ => "Other",
+    }
+}
+
+fn display_group_for_update_group(group: &str) -> &'static str {
+    match group {
+        "github-releases" | "repo-deps" => "github",
+        "hooks" => "custom",
+        "packages" => "packages",
+        "language-tools" => "language-tools",
+        _ => "other",
+    }
+}
+
+fn dashboard_elapsed_ms(summary: &update::Summary, group: &str) -> u128 {
+    summary
+        .groups
+        .iter()
+        .filter(|summary| display_group_for_update_group(summary.group) == group)
+        .map(|summary| summary.elapsed_ms)
+        .max()
+        .unwrap_or(0)
 }
 
 fn write_update_summary_jsonl<W>(
@@ -1986,13 +2039,13 @@ where
 fn progress_label(detail: &str) -> String {
     let label = match detail {
         "checking package deps" => "Packages",
-        "resolving GitHub methods" => "GitHub methods",
-        "fetching GitHub release metadata" => "GitHub releases",
-        "checking current GitHub release versions" => "GitHub releases",
-        "checking GitHub release installs" => "GitHub releases",
-        "checking repo deps" => "Repo deps",
+        "resolving GitHub methods" => "Resolve methods",
+        "fetching GitHub release metadata" => "GitHub",
+        "checking current GitHub release versions" => "GitHub",
+        "checking GitHub release installs" => "GitHub",
+        "checking repo deps" => "GitHub",
         "checking language tools" => "Language tools",
-        "checking custom hooks" => "Hooks",
+        "checking custom hooks" => "Custom",
         _ => detail,
     };
     format!("{label:<18}")
@@ -2001,17 +2054,30 @@ fn progress_label(detail: &str) -> String {
 fn progress_label_for_stage(stage: &str) -> String {
     let label = match stage {
         "packages" => "Packages",
-        "github-methods" => "GitHub methods",
-        "github-releases" => "GitHub releases",
-        "repo-deps" => "Repo deps",
+        "method-resolution" => "Resolve methods",
+        "github" => "GitHub",
         "language-tools" => "Language tools",
-        "hooks" => "Hooks",
+        "custom" => "Custom",
         _ => "Other",
     };
     format!("{label:<18}")
 }
 
 fn progress_stage(detail: &str) -> &'static str {
+    match detail {
+        "checking package deps" => "packages",
+        "resolving GitHub methods" => "method-resolution",
+        "fetching GitHub release metadata" => "github",
+        "checking current GitHub release versions" => "github",
+        "checking GitHub release installs" => "github",
+        "checking repo deps" => "github",
+        "checking language tools" => "language-tools",
+        "checking custom hooks" => "custom",
+        _ => "other-progress",
+    }
+}
+
+fn progress_component(detail: &str) -> &'static str {
     match detail {
         "checking package deps" => "packages",
         "resolving GitHub methods" => "github-methods",
@@ -2027,12 +2093,11 @@ fn progress_stage(detail: &str) -> &'static str {
 
 fn progress_stage_index(stage: &str) -> usize {
     match stage {
-        "github-methods" => 0,
+        "method-resolution" => 0,
         "packages" => 1,
-        "github-releases" => 2,
-        "repo-deps" => 3,
-        "language-tools" => 4,
-        "hooks" => 5,
+        "github" => 2,
+        "language-tools" => 3,
+        "custom" => 4,
         _ => 8,
     }
 }
@@ -2040,7 +2105,7 @@ fn progress_stage_index(stage: &str) -> usize {
 fn progress_done_detail(stage: &str, label: &str, total: usize) -> String {
     let label = label.trim();
     let action = match stage {
-        "github-methods" => "resolved",
+        "method-resolution" => "resolved",
         _ => "checked",
     };
     format!("{label}: {total} {action}")
@@ -2504,23 +2569,23 @@ mod tests {
     fn terminal_progress_labels_match_update_phases() {
         assert_eq!(
             super::progress_label("fetching GitHub release metadata"),
-            "GitHub releases   "
+            "GitHub            "
         );
         assert_eq!(
             super::progress_label("checking current GitHub release versions"),
-            "GitHub releases   "
+            "GitHub            "
         );
         assert_eq!(
             super::progress_stage("fetching GitHub release metadata"),
-            "github-releases"
+            "github"
         );
     }
 
     #[test]
     fn terminal_progress_rows_include_elapsed_column() {
         assert_eq!(
-            super::tty_row("running", "Hooks              [━━━━····] 1/2", "12s"),
-            "  running  Hooks              [━━━━····] 1/2                         12s"
+            super::tty_row("running", "Custom            [━━━━····] 1/2", "12s"),
+            "  running  Custom            [━━━━····] 1/2                          12s"
         );
     }
 
@@ -2588,11 +2653,11 @@ mod tests {
                 &mut stdout,
                 vec![
                     super::TtyProgressStage {
-                        stage: "github-releases",
+                        stage: "github",
                         total: 1,
                     },
                     super::TtyProgressStage {
-                        stage: "hooks",
+                        stage: "custom",
                         total: 1,
                     },
                 ],
@@ -2602,8 +2667,8 @@ mod tests {
         }
 
         let stdout = String::from_utf8(stdout).unwrap();
-        assert!(stdout.contains("GitHub releases"));
-        assert!(stdout.contains("Hooks: 1 current"));
+        assert!(stdout.contains("GitHub"));
+        assert!(stdout.contains("Custom: 1 current"));
         assert!(stdout.ends_with("\n\r\x1b[K\x1b[1A\n\n"));
     }
 
@@ -2623,7 +2688,7 @@ mod tests {
             .map(|stage| stage.stage)
             .collect::<Vec<_>>();
 
-        assert_eq!(stages, vec!["github-releases"]);
+        assert_eq!(stages, vec!["github"]);
     }
 
     fn run_capture<const N: usize>(args: [&str; N]) -> (i32, String, String) {

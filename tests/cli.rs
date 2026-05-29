@@ -457,7 +457,7 @@ install() {
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  changed  Hooks: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
+        "Tools\n  running  checking configured dependencies\n  changed  Custom: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
     );
     assert_eq!(text(&output.stderr), "");
     assert_eq!(
@@ -603,7 +603,7 @@ fn no_op_manifest_backed_update_stays_fast_and_skips_network_and_tools() {
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  ok       GitHub releases: 1 current\n  ok       Language tools: 4 current\n  ok       5 current\n"
+        "Tools\n  running  checking configured dependencies\n  ok       GitHub: 1 current\n  ok       Language tools: 4 current\n  ok       5 current\n"
     );
     assert_eq!(text(&output.stderr), "");
     assert!(
@@ -850,7 +850,7 @@ version() { printf '9.9.9\n'; }
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  Repo deps\n    changed  owner/tool: local clone\n  Hooks\n    ok       custom-tool: 9.9.9\n  changed  1 changed, 1 current\n"
+        "Tools\n  running  checking configured dependencies\n  GitHub\n    changed  owner/tool: local clone\n  Custom\n    ok       custom-tool: 9.9.9\n  changed  1 changed, 1 current\n"
     );
     assert_eq!(text(&output.stderr), "");
 }
@@ -1290,7 +1290,7 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-pos
     assert_success(&first);
     assert_eq!(
         text(&first.stdout),
-        "Tools\n  running  checking configured dependencies\n  changed  Hooks: 1 changed\n    changed  tool: 1.2.3\n  changed  1 changed\n"
+        "Tools\n  running  checking configured dependencies\n  changed  Custom: 1 changed\n    changed  tool: 1.2.3\n  changed  1 changed\n"
     );
     assert_eq!(text(&first.stderr), "");
     assert_eq!(
@@ -1307,7 +1307,7 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-pos
     assert_success(&second);
     assert_eq!(
         text(&second.stdout),
-        "Tools\n  running  checking configured dependencies\n  ok       Hooks: 1 current\n  ok       1 current\n"
+        "Tools\n  running  checking configured dependencies\n  ok       Custom: 1 current\n  ok       1 current\n"
     );
     assert_eq!(text(&second.stderr), "");
 }
@@ -1329,7 +1329,7 @@ install() { printf 'installed\n'; }
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "  running  checking configured dependencies\n  changed  Hooks: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
+        "  running  checking configured dependencies\n  changed  Custom: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
     );
     assert_eq!(text(&output.stderr), "");
 }
@@ -1351,7 +1351,7 @@ version() { printf '9.9.9\n'; }
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  Hooks\n    ok       tool: 9.9.9\n  ok       1 current\n"
+        "Tools\n  running  checking configured dependencies\n  Custom\n    ok       tool: 9.9.9\n  ok       1 current\n"
     );
     assert_eq!(text(&output.stderr), "");
 }
@@ -1370,7 +1370,7 @@ fn update_fails_when_custom_install_fails() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  failed   Hooks: 1 failed\n"
+        "Tools\n  running  checking configured dependencies\n  failed   Custom: 1 failed\n"
     );
     assert_eq!(
         text(&output.stderr),
@@ -1404,7 +1404,7 @@ install() { printf 'installed\n'; }
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  changed  Hooks: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
+        "Tools\n  running  checking configured dependencies\n  changed  Custom: 1 changed\n    changed  tool: installed\n  changed  1 changed\n"
     );
     assert_eq!(
         text(&output.stderr),
