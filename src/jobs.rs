@@ -304,27 +304,55 @@ mod tests {
     #[test]
     fn parallel_map_keeps_workers_busy_past_chunk_boundary() {
         // Previously, 5 items at `jobs=4` would run 4 in round 1 and
-        // then 1 in round 2 with 3 idle threads. The pool below
-        // claims items via an atomic counter so the last worker can
-        // pick up the trailing item while its peers move on. The test
-        // observes the speedup indirectly: 5 items of equal sleep
-        // time should complete in roughly two item-times (best case
-        // round 1 + round 2), not five item-times (serial).
-        use std::time::{Duration, Instant};
-        let items = [(); 5];
-        let item_time = Duration::from_millis(80);
-        let start = Instant::now();
-        super::parallel_map(&items, 4, |_| {
-            std::thread::sleep(item_time);
+        // then 1 in round 2 with 3 idle threads. Hold three first-wave
+        // items until the trailing item starts; a chunked
+        // implementation would deadlock and time out here because it
+        // cannot start item 4 before items 1-3 finish.
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+
+        let items = [0, 1, 2, 3, 4];
+        let first_wave_blocked = (Mutex::new(0usize), Condvar::new());
+        let trailing_started = (Mutex::new(false), Condvar::new());
+        let result = super::parallel_map(&items, 4, |item| {
+            match *item {
+                0 => {
+                    let (lock, cvar) = &first_wave_blocked;
+                    let blocked = lock.lock().unwrap();
+                    let (blocked, _) = cvar
+                        .wait_timeout_while(blocked, Duration::from_secs(5), |blocked| *blocked < 3)
+                        .unwrap();
+                    assert_eq!(
+                        *blocked, 3,
+                        "first-wave workers did not reach the blocking point"
+                    );
+                }
+                1..=3 => {
+                    let (lock, cvar) = &first_wave_blocked;
+                    *lock.lock().unwrap() += 1;
+                    cvar.notify_all();
+
+                    let (lock, cvar) = &trailing_started;
+                    let started = lock.lock().unwrap();
+                    let (started, _) = cvar
+                        .wait_timeout_while(started, Duration::from_secs(5), |started| !*started)
+                        .unwrap();
+                    assert!(
+                        *started,
+                        "trailing item was not claimed while first-wave workers were blocked"
+                    );
+                }
+                4 => {
+                    let (lock, cvar) = &trailing_started;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_all();
+                }
+                _ => unreachable!(),
+            }
+            *item
         });
-        let elapsed = start.elapsed();
-        // Serial would be ~5 * 80ms = 400ms. The work-stealing pool
-        // should finish well under serial — generous bound to absorb
-        // scheduler noise without being a flake.
-        assert!(
-            elapsed < item_time * 4,
-            "elapsed {elapsed:?} suggests workers idled past the chunk boundary"
-        );
+
+        assert_eq!(result, items);
     }
 
     #[test]
