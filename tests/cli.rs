@@ -1228,7 +1228,7 @@ fn update_requires_configured_method_tools_before_dependency_checks() {
     let fixture = Fixture::new("update-prereqs");
     fixture.write(
         "conf/deps.conf",
-        "owner/tool github:release tool\nripgrep cargo rg\nruff uv\ncustom custom\n",
+        "owner/tool github:release tool\nripgrep cargo rg\ngithub.com/junegunn/fzf go fzf\nruff uv\nprettier npm\ncustom custom\n",
     );
     let missing_path = fixture.dir.join("missing-path");
     fs::create_dir_all(&missing_path).unwrap();
@@ -1241,7 +1241,7 @@ fn update_requires_configured_method_tools_before_dependency_checks() {
     assert_eq!(text(&output.stdout), "");
     assert_eq!(
         text(&output.stderr),
-        "error: shdeps update is missing required tools for configured deps: cargo (cargo installs), curl (GitHub release metadata and downloads), gh (authenticated GitHub API access), uv (uv installs)\n"
+        "error: shdeps update is missing required tools for configured deps: cargo (cargo installs), curl (GitHub release metadata and downloads), gh (authenticated GitHub API access), go (go installs), npm (npm installs), uv (uv installs)\n"
     );
 }
 
@@ -1277,6 +1277,44 @@ fn update_requires_git_for_configured_repo_deps() {
     assert_eq!(
         text(&output.stderr),
         "error: shdeps update is missing required tools for configured deps: git (GitHub repo installs)\n"
+    );
+}
+
+#[test]
+fn update_prerequisites_ignore_filtered_inactive_methods() {
+    let fixture = Fixture::new("update-prereqs-filtered");
+    fixture.write(
+        "conf/deps.conf",
+        "ripgrep cargo rg - os:macos\nprettier npm - - host:other-host\ntool custom\n",
+    );
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &missing_path);
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert!(!text(&output.stderr).contains("missing required tools"));
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn update_requires_all_bare_github_candidate_tools_upfront() {
+    let fixture = Fixture::new("update-prereqs-bare-github");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &missing_path);
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        "error: shdeps update is missing required tools for configured deps: curl (GitHub release metadata and downloads), gh (authenticated GitHub API access), git (GitHub repo installs)\n"
     );
 }
 

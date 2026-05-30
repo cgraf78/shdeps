@@ -473,19 +473,6 @@ where
         .filter(|entry| entry.method != "pkg" && entry.method != "custom")
         .filter(|entry| active(entry, context.env))
         .collect::<Vec<_>>();
-    for entry in &builtin_entries {
-        let group = group_for_method(&entry.method);
-        if announced.insert(group) {
-            group_started.insert(group, Instant::now());
-            progress.phase(
-                group,
-                "running",
-                group_detail(group),
-                0,
-                group_totals[group],
-            )?;
-        }
-    }
 
     let builtin_outcomes = jobs::parallel_map_with_item_progress(
         &builtin_entries,
@@ -499,13 +486,33 @@ where
                 transitions.get(&entry.name),
             )
         },
-        |index, outcome| {
-            let group = group_for_method(&builtin_entries[index].method);
-            progress.item(group, &outcome.item)?;
-            if advance_group(progress, &mut group_done, &group_totals, group)?
-                && let Some(started) = group_started.remove(group)
-            {
-                finish_group(&mut summary, group, started);
+        |event| {
+            match event {
+                jobs::ItemProgressEvent::Started(index) => {
+                    let group = group_for_method(&builtin_entries[index].method);
+                    if announced.insert(group) {
+                        group_started.insert(group, Instant::now());
+                        progress.phase(
+                            group,
+                            "running",
+                            group_detail(group),
+                            0,
+                            group_totals[group],
+                        )?;
+                    }
+                }
+                jobs::ItemProgressEvent::Completed {
+                    index,
+                    result: outcome,
+                } => {
+                    let group = group_for_method(&builtin_entries[index].method);
+                    progress.item(group, &outcome.item)?;
+                    if advance_group(progress, &mut group_done, &group_totals, group)?
+                        && let Some(started) = group_started.remove(group)
+                    {
+                        finish_group(&mut summary, group, started);
+                    }
+                }
             }
             Ok(())
         },
@@ -2047,6 +2054,95 @@ version() { printf 'saw-pkg\n'; }
                     .display()
                     .to_string(),
             ))
+        );
+    }
+
+    #[test]
+    fn update_builtin_progress_starts_queued_groups_when_worker_starts() {
+        let mut fixture = Fixture::new("builtin-progress-starts");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let rg_bin = fixture.roots.install_dir.join("ripgrep/bin/rg");
+        let fzf_bin = fixture
+            .roots
+            .install_dir
+            .join("github.com/junegunn/fzf/bin/fzf");
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_command("go")
+            .with_created_binary(
+                "cargo",
+                [
+                    "install",
+                    "--locked",
+                    "--root",
+                    fixture.roots.install_dir.join("ripgrep").to_str().unwrap(),
+                    "ripgrep",
+                ],
+                rg_bin,
+            )
+            .with_created_binary(
+                "env",
+                [
+                    &format!(
+                        "GOBIN={}",
+                        fixture
+                            .roots
+                            .install_dir
+                            .join("github.com/junegunn/fzf/bin")
+                            .display()
+                    ),
+                    "go",
+                    "install",
+                    "github.com/junegunn/fzf@latest",
+                ],
+                fzf_bin,
+            );
+        let mut progress = RecordingProgress::default();
+
+        let summary = run_with_progress(
+            &[
+                parse_entry("ripgrep|cargo|rg|-|-", None),
+                parse_entry("github.com/junegunn/fzf|go|fzf|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+            &mut progress,
+        )
+        .unwrap();
+
+        let cargo_start = progress
+            .phases
+            .iter()
+            .position(|phase| phase.detail == "checking cargo deps" && phase.done == 0)
+            .unwrap();
+        let cargo_done = progress
+            .phases
+            .iter()
+            .position(|phase| phase.detail == "checking cargo deps" && phase.done == 1)
+            .unwrap();
+        let go_start = progress
+            .phases
+            .iter()
+            .position(|phase| phase.detail == "checking go deps" && phase.done == 0)
+            .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(
+            cargo_start < cargo_done && cargo_done < go_start,
+            "queued groups should not start progress timers before a worker reaches them: {:?}",
+            progress
+                .phases
+                .iter()
+                .map(|phase| (&phase.detail, phase.done, phase.total))
+                .collect::<Vec<_>>()
         );
     }
 
