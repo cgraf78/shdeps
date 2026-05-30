@@ -3258,6 +3258,51 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_verbose_fast_path_reports_local_version_without_network() {
+        let fixture = Fixture::new("release-fast-verbose-version");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release"),
+            1_700_000_000,
+        )
+        .unwrap();
+        let runner = FakeRunner::default().with_success("tool", ["--version"], "tool 1.2.3\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                verbose: true,
+                now: 1_700_000_100,
+                remote_ttl: 3600,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "1.2.3");
+        assert_eq!(
+            fixture.client.requests(),
+            Vec::<(String, Option<String>)>::new()
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_github_release_keeps_existing_binary_when_metadata_fetch_fails() {
         let fixture = Fixture::new("release-metadata-outage");
         fixture.write_lib();

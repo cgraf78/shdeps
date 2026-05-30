@@ -286,10 +286,15 @@ pub(crate) fn install_request(
             request.name,
             &install_dir,
         )?;
+        let detail = if verbose_enabled(context.options, context.env_vars) {
+            process::dep_version(context.runner, request.cmd).unwrap_or_else(|| "fresh".to_owned())
+        } else {
+            "fresh".to_owned()
+        };
         return Ok(ReleaseOutcome {
             changed: false,
             failed: false,
-            detail: "fresh".to_owned(),
+            detail,
             // The TTL stamp is already fresh in this branch; nothing to
             // refresh.
             stamp: false,
