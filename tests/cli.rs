@@ -1224,9 +1224,12 @@ fn update_reports_empty_config_without_touching_installers() {
 }
 
 #[test]
-fn update_requires_curl_and_gh_before_dependency_checks() {
+fn update_requires_configured_method_tools_before_dependency_checks() {
     let fixture = Fixture::new("update-prereqs");
-    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/deps.conf",
+        "owner/tool github:release tool\nripgrep cargo rg\nruff uv\ncustom custom\n",
+    );
     let missing_path = fixture.dir.join("missing-path");
     fs::create_dir_all(&missing_path).unwrap();
 
@@ -1238,7 +1241,42 @@ fn update_requires_curl_and_gh_before_dependency_checks() {
     assert_eq!(text(&output.stdout), "");
     assert_eq!(
         text(&output.stderr),
-        "error: shdeps update requires curl and gh; install curl and gh so shdeps can fetch GitHub metadata and use authenticated GitHub API access\n"
+        "error: shdeps update is missing required tools for configured deps: cargo (cargo installs), curl (GitHub release metadata and downloads), gh (authenticated GitHub API access), uv (uv installs)\n"
+    );
+}
+
+#[test]
+fn update_prerequisites_ignore_unconfigured_methods() {
+    let fixture = Fixture::new("update-prereqs-custom");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &missing_path);
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert!(!text(&output.stderr).contains("missing required tools"));
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn update_requires_git_for_configured_repo_deps() {
+    let fixture = Fixture::new("update-prereqs-git");
+    fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &missing_path);
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        "error: shdeps update is missing required tools for configured deps: git (GitHub repo installs)\n"
     );
 }
 

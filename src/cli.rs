@@ -432,11 +432,6 @@ where
         writeln!(stderr, "error: unknown update argument '{arg}'")?;
         return Ok(2);
     }
-    if let Some(message) = update_prerequisite_error(&Process) {
-        writeln!(stderr, "{message}")?;
-        return Ok(1);
-    }
-
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     ensure_bin_dir_on_path(&roots.bin_dir);
 
@@ -456,6 +451,10 @@ where
     let hooks = custom_probe();
     let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    if let Some(message) = update_prerequisite_error(&entries, &env, &Process) {
+        writeln!(stderr, "{message}")?;
+        return Ok(1);
+    }
     let update_options = UpdateOptions {
         reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
         force: runtime::force(&ProcessEnv, &options.overrides),
@@ -600,20 +599,99 @@ where
     Ok(if summary.has_errors() { 1 } else { 0 })
 }
 
-fn update_prerequisite_error(runner: &impl process::Runner) -> Option<String> {
-    let missing = ["curl", "gh"]
+fn update_prerequisite_error(
+    entries: &[Entry],
+    env: &crate::platform::RuntimeEnv,
+    runner: &impl process::Runner,
+) -> Option<String> {
+    let missing = update_prerequisites(entries, env)
         .into_iter()
-        .filter(|command| !runner.exists(command))
+        .filter(|prereq| !runner.exists(prereq.command))
         .collect::<Vec<_>>();
     if missing.is_empty() {
         return None;
     }
 
+    let details = missing
+        .iter()
+        .map(|prereq| format!("{} ({})", prereq.command, prereq.reason))
+        .collect::<Vec<_>>()
+        .join(", ");
     Some(format!(
-        "error: shdeps update requires {}; install {} so shdeps can fetch GitHub metadata and use authenticated GitHub API access",
-        missing.join(" and "),
-        missing.join(" and ")
+        "error: shdeps update is missing required tools for configured deps: {details}"
     ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UpdatePrerequisite {
+    command: &'static str,
+    reason: &'static str,
+}
+
+fn update_prerequisites(
+    entries: &[Entry],
+    env: &crate::platform::RuntimeEnv,
+) -> Vec<UpdatePrerequisite> {
+    let mut required = BTreeMap::<&'static str, UpdatePrerequisite>::new();
+    for entry in entries {
+        if !update::active(entry, env) {
+            continue;
+        }
+        for prereq in prerequisites_for_method(&entry.method) {
+            required.entry(prereq.command).or_insert(*prereq);
+        }
+    }
+    required.into_values().collect()
+}
+
+fn prerequisites_for_method(method: &str) -> &'static [UpdatePrerequisite] {
+    match method {
+        "github" => &[
+            UpdatePrerequisite {
+                command: "curl",
+                reason: "GitHub release metadata and downloads",
+            },
+            UpdatePrerequisite {
+                command: "gh",
+                reason: "authenticated GitHub API access",
+            },
+            UpdatePrerequisite {
+                command: "git",
+                reason: "GitHub repo installs",
+            },
+        ],
+        "github:release" => &[
+            UpdatePrerequisite {
+                command: "curl",
+                reason: "GitHub release metadata and downloads",
+            },
+            UpdatePrerequisite {
+                command: "gh",
+                reason: "authenticated GitHub API access",
+            },
+        ],
+        "github:repo" => &[UpdatePrerequisite {
+            command: "git",
+            reason: "GitHub repo installs",
+        }],
+        "cargo" => &[UpdatePrerequisite {
+            command: "cargo",
+            reason: "cargo installs",
+        }],
+        "go" => &[UpdatePrerequisite {
+            command: "go",
+            reason: "go installs",
+        }],
+        "uv" => &[UpdatePrerequisite {
+            command: "uv",
+            reason: "uv installs",
+        }],
+        "npm" => &[UpdatePrerequisite {
+            command: "npm",
+            reason: "npm installs",
+        }],
+        _ => &[],
+    }
 }
 
 struct JsonlProgress<'a, W>
