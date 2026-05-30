@@ -854,7 +854,7 @@ version() { printf '9.9.9\n'; }
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  GitHub\n    changed  owner/tool: local clone\n  Custom\n    ok       custom-tool: 9.9.9\n  changed  1 changed, 1 current\n"
+        "Tools\n  running  checking configured dependencies\n  GitHub\n    changed  owner/tool: added (local clone)\n  Custom\n    ok       custom-tool: 9.9.9\n  changed  1 changed, 1 current\n"
     );
     assert_eq!(text(&output.stderr), "");
 }
@@ -1241,7 +1241,7 @@ fn update_requires_configured_method_tools_before_dependency_checks() {
     assert_eq!(text(&output.stdout), "");
     assert_eq!(
         text(&output.stderr),
-        "error: shdeps update is missing required tools for configured deps: cargo (cargo installs), curl (GitHub release metadata and downloads), gh (authenticated GitHub API access), go (go installs), npm (npm installs), uv (uv installs)\n"
+        "error: shdeps update is missing required tools for configured deps: cargo (cargo installs), curl (GitHub release metadata and downloads), go (go installs), npm (npm installs), uv (uv installs)\n"
     );
 }
 
@@ -1300,7 +1300,7 @@ fn update_prerequisites_ignore_filtered_inactive_methods() {
 }
 
 #[test]
-fn update_requires_all_bare_github_candidate_tools_upfront() {
+fn update_requires_curl_for_bare_github_resolution_upfront() {
     let fixture = Fixture::new("update-prereqs-bare-github");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
     let missing_path = fixture.dir.join("missing-path");
@@ -1314,7 +1314,34 @@ fn update_requires_all_bare_github_candidate_tools_upfront() {
     assert_eq!(text(&output.stdout), "");
     assert_eq!(
         text(&output.stderr),
-        "error: shdeps update is missing required tools for configured deps: curl (GitHub release metadata and downloads), gh (authenticated GitHub API access), git (GitHub repo installs)\n"
+        "error: shdeps update is missing required tools for configured deps: curl (GitHub release metadata and downloads)\n"
+    );
+}
+
+#[test]
+fn update_requires_git_after_bare_github_resolves_to_repo() {
+    let fixture = Fixture::new("update-prereqs-bare-github-repo");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write(
+        "fake/release.json",
+        &release_json("v1.0.0", &["tool-v1.0.0-darwin-aarch64"]),
+    );
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+    fixture.write_executable(
+        "missing-path/curl",
+        "#!/bin/sh\ncat \"$SHDEPS_TEST_RELEASE_JSON\"\n",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &missing_path);
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        "error: shdeps update is missing required tools for configured deps: git (GitHub repo installs)\n"
     );
 }
 
@@ -1455,6 +1482,49 @@ version() { printf '9.9.9\n'; }
     assert_eq!(
         text(&output.stdout),
         "Tools\n  running  checking configured dependencies\n  Custom\n    ok       tool: 9.9.9\n  ok       1 current\n"
+    );
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn update_verbose_reports_changed_action_details() {
+    let fixture = Fixture::new("update-verbose-changed-details");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() { return 0; }
+version() { printf '1.2.3\n'; }
+"#,
+    );
+
+    let output = run(&mut fixture.command(["-v", "update"]));
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout),
+        "Tools\n  running  checking configured dependencies\n  Custom\n    changed  tool: added -- 1.2.3\n  changed  1 changed\n"
+    );
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn update_verbose_reports_package_versions_only_when_verbose() {
+    let fixture = Fixture::new("update-verbose-pkg-version");
+    fixture.write("conf/deps.conf", "tool pkg tool\n");
+    fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
+    fixture.write_executable(
+        "fakebin/tool",
+        "#!/bin/sh\n[ \"$1\" = --version ] && printf 'tool 1.2.3\\n'\n",
+    );
+
+    let output = run(&mut fixture.command(["-v", "update"]));
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout),
+        "Tools\n  running  checking configured dependencies\n  Packages\n    ok       tool: installed -- 1.2.3\n  ok       1 current\n"
     );
     assert_eq!(text(&output.stderr), "");
 }

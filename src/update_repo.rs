@@ -18,7 +18,7 @@ use crate::manifest::{self, ManifestEntry};
 use crate::process::Runner;
 use crate::repo;
 use crate::stamp;
-use crate::update::{Context, Item, Options};
+use crate::update::{Context, Item, Options, detail_with_action, verbose_enabled};
 
 pub(crate) fn install(
     entry: &Entry,
@@ -76,14 +76,29 @@ pub(crate) fn install(
 
     record_success(entry, context, &install_dir)?;
 
+    let changed = options.reinstall
+        || status.dirty
+        || previous_target.as_ref() != Some(&local_clone)
+        || rev_before != rev_after;
+    let action = if previous_target.as_ref() != Some(&local_clone) {
+        Some("added")
+    } else if rev_before != rev_after {
+        Some("updated")
+    } else if options.reinstall || status.dirty {
+        Some("reinstalled")
+    } else {
+        None
+    };
+    let mut detail = verbose_repo_detail(action, &local_clone, context, options, "local clone");
+    if verbose_enabled(options, context.env_vars) && detail != "local clone" {
+        detail = format!("{detail} (local clone)");
+    }
+
     Ok(Item {
         name: entry.name.clone(),
-        changed: options.reinstall
-            || status.dirty
-            || previous_target.as_ref() != Some(&local_clone)
-            || rev_before != rev_after,
+        changed,
         failed: false,
-        detail: "local clone".to_owned(),
+        detail,
     })
 }
 
@@ -99,11 +114,12 @@ fn install_existing(
     if stamp::remote_fresh(&stamp_path, options.freshness()) {
         secure_managed_clone_permissions(install_dir)?;
         record_success(entry, context, install_dir)?;
+        let detail = verbose_repo_detail(None, install_dir, context, options, "fresh");
         return Ok(Item {
             name: entry.name.clone(),
             changed: false,
             failed: false,
-            detail: "fresh".to_owned(),
+            detail,
         });
     }
 
@@ -155,11 +171,20 @@ fn install_existing(
     stamp::remote_touch(&stamp_path, options.now)?;
     secure_managed_clone_permissions(install_dir)?;
     record_success(entry, context, install_dir)?;
+    let changed = options.reinstall || head_before != head_after;
+    let action = if head_before != head_after {
+        Some("updated")
+    } else if options.reinstall {
+        Some("reinstalled")
+    } else {
+        None
+    };
+    let detail = verbose_repo_detail(action, install_dir, context, options, "updated");
     Ok(Item {
         name: entry.name.clone(),
-        changed: options.reinstall || head_before != head_after,
+        changed,
         failed: false,
-        detail: "updated".to_owned(),
+        detail,
     })
 }
 
@@ -207,6 +232,7 @@ fn install_fresh(
     stamp::remote_touch(&stamp_path, options.now)?;
     record_success(entry, context, install_dir)?;
 
+    let detail = verbose_repo_detail(Some("added"), install_dir, context, options, "added");
     Ok(Item {
         name: entry.name.clone(),
         changed: true,
@@ -216,8 +242,38 @@ fn install_fresh(
         // public install contract, while "cloned" is only the implementation
         // mechanism. Keep the user-facing status stable so a Rust binary can
         // replace the shell CLI without forcing client repos to relearn it.
-        detail: "added".to_owned(),
+        detail,
     })
+}
+
+fn verbose_repo_detail(
+    action: Option<&str>,
+    install_dir: &Path,
+    context: &Context<'_, impl Runner>,
+    options: Options,
+    fallback: &str,
+) -> String {
+    if !verbose_enabled(options, context.env_vars) {
+        return fallback.to_owned();
+    }
+
+    let version = repo_version(install_dir, context.runner);
+    match action {
+        Some(action) => detail_with_action(action, version.unwrap_or_default()),
+        None => version.unwrap_or_else(|| fallback.to_owned()),
+    }
+}
+
+fn repo_version(dir: &Path, runner: &impl Runner) -> Option<String> {
+    let version_path = dir.join("VERSION");
+    if let Ok(version) = fs::read_to_string(version_path) {
+        let version = version.trim_end_matches(['\r', '\n']).to_owned();
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+
+    git_head(runner, dir).map(|head| format!("commit {head}"))
 }
 
 fn secure_managed_clone_permissions(install_dir: &Path) -> Result<()> {

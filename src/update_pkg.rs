@@ -11,7 +11,7 @@ use crate::manifest::{self, ManifestEntry};
 use crate::package_cache;
 use crate::pkg;
 use crate::process::{self, Output, Runner};
-use crate::update::{Context, Item, Options, Summary, active};
+use crate::update::{Context, Item, Options, Summary, active, detail_with_action, verbose_enabled};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Queued {
@@ -86,13 +86,7 @@ fn cache_disabled<R: Runner>(context: &Context<'_, R>, options: Options) -> Opti
         || context.env_vars.get("SHDEPS_REINSTALL").map(String::as_str) == Some("1")
     {
         Some("reinstall enabled")
-    } else if context
-        .env_vars
-        .get("SHDEPS_LOG_LEVEL")
-        .and_then(|value| value.parse::<u8>().ok())
-        .unwrap_or(1)
-        >= 2
-    {
+    } else if verbose_enabled(options, context.env_vars) {
         Some("verbose logging enabled")
     } else {
         None
@@ -128,8 +122,9 @@ pub(crate) fn cached_items(entries: &[Entry], context: &Context<'_, impl Runner>
 pub(crate) fn package_versions(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
+    options: Options,
 ) -> std::collections::BTreeMap<String, String> {
-    if !needs_package_version_snapshot(entries, context) {
+    if !needs_package_version_snapshot(entries, context, options) {
         return std::collections::BTreeMap::new();
     }
     process::package_versions(context.runner, context.pkg_mgr)
@@ -148,7 +143,11 @@ pub(crate) fn prepare(
     refresh_metadata(context);
 }
 
-fn needs_package_version_snapshot(entries: &[Entry], context: &Context<'_, impl Runner>) -> bool {
+fn needs_package_version_snapshot(
+    entries: &[Entry],
+    context: &Context<'_, impl Runner>,
+    _options: Options,
+) -> bool {
     // Batch package versions are useful only when command lookup alone cannot
     // prove every active package dependency. Avoiding the manager-wide query on
     // the common "all commands are on PATH" path keeps forced updates snappy
@@ -166,6 +165,7 @@ fn needs_package_version_snapshot(entries: &[Entry], context: &Context<'_, impl 
 pub(crate) fn install(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
+    options: Options,
     queued: &mut Vec<Queued>,
     package_versions: &std::collections::BTreeMap<String, String>,
 ) -> Result<Item> {
@@ -190,11 +190,18 @@ pub(crate) fn install(
             context.manifest_path,
             ManifestEntry::new(&entry.name, "pkg", &entry.cmd, ""),
         )?;
+        let detail = if verbose_enabled(options, context.env_vars) {
+            let version = process::dep_version(context.runner, &entry.cmd)
+                .or_else(|| package_versions.get(&resolved).cloned());
+            detail_with_action("installed", version.unwrap_or_default())
+        } else {
+            "installed".to_owned()
+        };
         return Ok(Item {
             name: entry.name.clone(),
             changed: missing_command_needs_repair(entry, context),
             failed: false,
-            detail: "installed".to_owned(),
+            detail,
         });
     }
 

@@ -268,6 +268,7 @@ where
         // whether the caller used Bash shdeps or the Rust prelude.
         force: runtime::force(&ProcessEnv, overrides),
         reinstall: runtime::reinstall(&ProcessEnv, overrides),
+        verbose: false,
         now: default_options.now,
         remote_ttl: default_options.remote_ttl,
     };

@@ -16,7 +16,7 @@ use crate::manifest::{self, ManifestEntry};
 use crate::pkg::CommandSpec;
 use crate::process::{self, Output, Runner};
 use crate::stamp;
-use crate::update::{Context, Item, Options};
+use crate::update::{Context, Item, Options, detail_with_action, verbose_enabled};
 
 pub(crate) fn install(
     entry: &Entry,
@@ -43,11 +43,16 @@ pub(crate) fn install(
     {
         bin_link::one(&context.roots.bin_dir, &entry.cmd, &plan.bin_path)?;
         write_manifest(entry, context, &plan)?;
+        let detail = if verbose_enabled(options, context.env_vars) {
+            process::dep_version(context.runner, &entry.cmd).unwrap_or_else(|| "fresh".to_owned())
+        } else {
+            "fresh".to_owned()
+        };
         return Ok(Item {
             name: entry.name.clone(),
             changed: false,
             failed: false,
-            detail: "fresh".to_owned(),
+            detail,
         });
     }
 
@@ -117,11 +122,31 @@ pub(crate) fn install(
             .zip(version.as_ref())
             .is_some_and(|(before, after)| before != after);
 
+    let detail = if verbose_enabled(options, context.env_vars) {
+        if !already_installed {
+            detail_with_action("installed", version.clone().unwrap_or_default())
+        } else if let Some((before, after)) = previous_version.as_ref().zip(version.as_ref()) {
+            if before != after {
+                format!("updated -- {before} -> {after}")
+            } else if options.reinstall {
+                detail_with_action("reinstalled", version.clone().unwrap_or_default())
+            } else {
+                version.clone().unwrap_or_else(|| "installed".to_owned())
+            }
+        } else if options.reinstall {
+            detail_with_action("reinstalled", version.clone().unwrap_or_default())
+        } else {
+            version.clone().unwrap_or_else(|| "installed".to_owned())
+        }
+    } else {
+        version.unwrap_or_else(|| "installed".to_owned())
+    };
+
     Ok(Item {
         name: entry.name.clone(),
         changed,
         failed: false,
-        detail: version.unwrap_or_else(|| "installed".to_owned()),
+        detail,
     })
 }
 
