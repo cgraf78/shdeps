@@ -450,7 +450,11 @@ install() {
     let mut command = fixture.command(["update"]);
     command.env(
         "PATH",
-        format!("{}:/usr/bin:/bin", shdeps_exe_dir().display()),
+        format!(
+            "{}:{}:/usr/bin:/bin",
+            fixture.dir.join("fakebin").display(),
+            shdeps_exe_dir().display()
+        ),
     );
     let output = run(&mut command);
 
@@ -1256,7 +1260,11 @@ install() {
     let mut command = fixture.command(["update"]);
     command.env("SHDEPS_QUIET", "1").env(
         "PATH",
-        format!("{}:/usr/bin:/bin", shdeps_exe_dir().display()),
+        format!(
+            "{}:{}:/usr/bin:/bin",
+            fixture.dir.join("fakebin").display(),
+            shdeps_exe_dir().display()
+        ),
     );
     let output = run(&mut command);
 
