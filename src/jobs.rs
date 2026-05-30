@@ -241,6 +241,104 @@ where
         .collect())
 }
 
+/// Runs work in parallel, reports each completed item, and returns input order.
+pub(crate) fn parallel_map_with_item_progress<T, R, F, P>(
+    items: &[T],
+    jobs: usize,
+    f: F,
+    mut progress: P,
+) -> crate::Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+    P: FnMut(usize, &R) -> crate::Result<()>,
+{
+    if jobs <= 1 || items.len() <= 1 {
+        let mut results = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let result = f(item);
+            progress(index, &result)?;
+            results.push(result);
+        }
+        return Ok(results);
+    }
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let len = items.len();
+    let next_index = AtomicUsize::new(0);
+    let mut slots: Vec<Option<R>> = (0..len).map(|_| None).collect();
+    let panic_payload: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
+    let worker_count = jobs.min(len);
+    let (completed_tx, completed_rx) = mpsc::channel::<(usize, R)>();
+    let mut progress_error = None;
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let f = &f;
+            let next_index = &next_index;
+            let panic_payload = &panic_payload;
+            let completed_tx = completed_tx.clone();
+            scope.spawn(move || {
+                loop {
+                    if panic_payload.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= len {
+                        return;
+                    }
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&items[index])));
+                    match outcome {
+                        Ok(result) => {
+                            let _ = completed_tx.send((index, result));
+                        }
+                        Err(payload) => {
+                            let mut held = panic_payload.lock().unwrap();
+                            if held.is_none() {
+                                *held = Some(payload);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        drop(completed_tx);
+
+        let mut completed = 0usize;
+        while completed < len {
+            match completed_rx.recv() {
+                Ok((index, result)) => {
+                    if progress_error.is_none()
+                        && let Err(error) = progress(index, &result)
+                    {
+                        progress_error = Some(error);
+                    }
+                    slots[index] = Some(result);
+                    completed += 1;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    if let Some(payload) = panic_payload.into_inner().unwrap() {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some(error) = progress_error {
+        return Err(error);
+    }
+
+    Ok(slots
+        .into_iter()
+        .map(|slot| slot.expect("every slot is written exactly once by a worker before scope ends"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

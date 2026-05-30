@@ -603,7 +603,7 @@ fn no_op_manifest_backed_update_stays_fast_and_skips_network_and_tools() {
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  ok       GitHub: 1 current\n  ok       Language tools: 4 current\n  ok       5 current\n"
+        "Tools\n  running  checking configured dependencies\n  ok       GitHub: 1 current\n  ok       Cargo: 1 current\n  ok       Go: 1 current\n  ok       UV: 1 current\n  ok       NPM: 1 current\n  ok       5 current\n"
     );
     assert_eq!(text(&output.stderr), "");
     assert!(
@@ -1220,6 +1220,25 @@ fn update_reports_empty_config_without_touching_installers() {
 }
 
 #[test]
+fn update_requires_curl_and_gh_before_dependency_checks() {
+    let fixture = Fixture::new("update-prereqs");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &missing_path);
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        "error: shdeps update requires curl and gh; install curl and gh so shdeps can fetch GitHub metadata and use authenticated GitHub API access\n"
+    );
+}
+
+#[test]
 fn update_quiet_environment_suppresses_normal_output() {
     let fixture = Fixture::new("update-quiet-env");
     fixture.write("conf/deps.conf", "tool custom\n");
@@ -1767,6 +1786,7 @@ impl Fixture {
     }
 
     fn command<const N: usize>(&self, args: [&str; N]) -> Command {
+        self.write_default_update_prereqs();
         let mut command = shdeps();
         command
             .env_clear()
@@ -1779,12 +1799,33 @@ impl Fixture {
             .env("SHDEPS_TEST_PLATFORM", "linux")
             .env("SHDEPS_TEST_HOST", "test-host")
             .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.dir.join("fakebin").display()),
+            )
+            .env(
                 "SHDEPS_TEST_RELEASE_JSON",
                 self.dir.join("fake/release.json"),
             )
             .env("SHDEPS_TEST_RELEASE_ASSET", self.dir.join("fake/asset"))
             .args(args);
         command
+    }
+
+    fn write_default_update_prereqs(&self) {
+        let curl = self.dir.join("fakebin/curl");
+        if !curl.exists() {
+            self.write_executable(
+                "fakebin/curl",
+                "#!/bin/sh\nprintf 'unexpected default fake curl\\n' >&2\nexit 99\n",
+            );
+        }
+        let gh = self.dir.join("fakebin/gh");
+        if !gh.exists() {
+            self.write_executable(
+                "fakebin/gh",
+                "#!/bin/sh\n[ \"$1\" = auth ] && [ \"$2\" = token ] && exit 1\nexit 1\n",
+            );
+        }
     }
 
     fn write(&self, rel: impl AsRef<Path>, content: &str) {

@@ -432,6 +432,10 @@ where
         writeln!(stderr, "error: unknown update argument '{arg}'")?;
         return Ok(2);
     }
+    if let Some(message) = update_prerequisite_error(&Process) {
+        writeln!(stderr, "{message}")?;
+        return Ok(1);
+    }
 
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     ensure_bin_dir_on_path(&roots.bin_dir);
@@ -594,6 +598,22 @@ where
     }
 
     Ok(if summary.has_errors() { 1 } else { 0 })
+}
+
+fn update_prerequisite_error(runner: &impl process::Runner) -> Option<String> {
+    let missing = ["curl", "gh"]
+        .into_iter()
+        .filter(|command| !runner.exists(command))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "error: shdeps update requires {}; install {} so shdeps can fetch GitHub metadata and use authenticated GitHub API access",
+        missing.join(" and "),
+        missing.join(" and ")
+    ))
 }
 
 struct JsonlProgress<'a, W>
@@ -1507,7 +1527,7 @@ where
         if items.is_empty() {
             continue;
         }
-        write_group(stdout, group_label(group))?;
+        write_group(stdout, dashboard_group_label(group))?;
         for item in items {
             if item.failed {
                 item_failures.insert(item.name.as_str());
@@ -1564,10 +1584,25 @@ fn terminal_progress_plan(
             )
         })
         .count();
-    let language_tools = entries
+    let cargo = entries
         .iter()
         .filter(active)
-        .filter(|entry| matches!(entry.method.as_str(), "cargo" | "go" | "uv" | "npm"))
+        .filter(|entry| entry.method == "cargo")
+        .count();
+    let go = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "go")
+        .count();
+    let uv = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "uv")
+        .count();
+    let npm = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "npm")
         .count();
     let hooks = entries
         .iter()
@@ -1594,10 +1629,28 @@ fn terminal_progress_plan(
             total: github,
         });
     }
-    if language_tools > 0 {
+    if cargo > 0 {
         stages.push(TtyProgressStage {
-            stage: "language-tools",
-            total: language_tools,
+            stage: "cargo",
+            total: cargo,
+        });
+    }
+    if go > 0 {
+        stages.push(TtyProgressStage {
+            stage: "go",
+            total: go,
+        });
+    }
+    if uv > 0 {
+        stages.push(TtyProgressStage {
+            stage: "uv",
+            total: uv,
+        });
+    }
+    if npm > 0 {
+        stages.push(TtyProgressStage {
+            stage: "npm",
+            total: npm,
         });
     }
     if hooks > 0 {
@@ -1719,19 +1772,24 @@ where
     Ok(())
 }
 
-fn update_group_order() -> [&'static str; 6] {
+fn update_group_order() -> [&'static str; 9] {
     [
         "packages",
         "github-releases",
         "repo-deps",
-        "language-tools",
+        "cargo",
+        "go",
+        "uv",
+        "npm",
         "hooks",
         "other",
     ]
 }
 
-fn dashboard_group_order() -> [&'static str; 5] {
-    ["packages", "github", "language-tools", "custom", "other"]
+fn dashboard_group_order() -> [&'static str; 8] {
+    [
+        "packages", "github", "cargo", "go", "uv", "npm", "custom", "other",
+    ]
 }
 
 fn group_for_name(entries: &[Entry], name: &str) -> &'static str {
@@ -1751,7 +1809,10 @@ fn group_label(group: &str) -> &'static str {
         "packages" => "Packages",
         "github-releases" => "GitHub releases",
         "repo-deps" => "Repo deps",
-        "language-tools" => "Language tools",
+        "cargo" => "Cargo",
+        "go" => "Go",
+        "uv" => "UV",
+        "npm" => "NPM",
         "hooks" => "Hooks",
         _ => "Other",
     }
@@ -1761,7 +1822,10 @@ fn dashboard_group_label(group: &str) -> &'static str {
     match group {
         "packages" => "Packages",
         "github" => "GitHub",
-        "language-tools" => "Language tools",
+        "cargo" => "Cargo",
+        "go" => "Go",
+        "uv" => "UV",
+        "npm" => "NPM",
         "custom" => "Custom",
         _ => "Other",
     }
@@ -1772,7 +1836,10 @@ fn display_group_for_update_group(group: &str) -> &'static str {
         "github-releases" | "repo-deps" => "github",
         "hooks" => "custom",
         "packages" => "packages",
-        "language-tools" => "language-tools",
+        "cargo" => "cargo",
+        "go" => "go",
+        "uv" => "uv",
+        "npm" => "npm",
         _ => "other",
     }
 }
@@ -2069,7 +2136,10 @@ fn progress_label(detail: &str) -> String {
         "checking current GitHub release versions" => "GitHub",
         "checking GitHub release installs" => "GitHub",
         "checking repo deps" => "GitHub",
-        "checking language tools" => "Language tools",
+        "checking cargo deps" => "Cargo",
+        "checking go deps" => "Go",
+        "checking uv deps" => "UV",
+        "checking npm deps" => "NPM",
         "checking custom hooks" => "Custom",
         _ => detail,
     };
@@ -2081,7 +2151,10 @@ fn progress_label_for_stage(stage: &str) -> String {
         "packages" => "Packages",
         "method-resolution" => "Resolve methods",
         "github" => "GitHub",
-        "language-tools" => "Language tools",
+        "cargo" => "Cargo",
+        "go" => "Go",
+        "uv" => "UV",
+        "npm" => "NPM",
         "custom" => "Custom",
         _ => "Other",
     };
@@ -2096,7 +2169,10 @@ fn progress_stage(detail: &str) -> &'static str {
         "checking current GitHub release versions" => "github",
         "checking GitHub release installs" => "github",
         "checking repo deps" => "github",
-        "checking language tools" => "language-tools",
+        "checking cargo deps" => "cargo",
+        "checking go deps" => "go",
+        "checking uv deps" => "uv",
+        "checking npm deps" => "npm",
         "checking custom hooks" => "custom",
         _ => "other-progress",
     }
@@ -2110,7 +2186,10 @@ fn progress_component(detail: &str) -> &'static str {
         "checking current GitHub release versions" => "github-releases",
         "checking GitHub release installs" => "github-releases",
         "checking repo deps" => "repo-deps",
-        "checking language tools" => "language-tools",
+        "checking cargo deps" => "cargo",
+        "checking go deps" => "go",
+        "checking uv deps" => "uv",
+        "checking npm deps" => "npm",
         "checking custom hooks" => "hooks",
         _ => "other-progress",
     }
@@ -2121,8 +2200,11 @@ fn progress_stage_index(stage: &str) -> usize {
         "method-resolution" => 0,
         "packages" => 1,
         "github" => 2,
-        "language-tools" => 3,
-        "custom" => 4,
+        "cargo" => 3,
+        "go" => 4,
+        "uv" => 5,
+        "npm" => 6,
+        "custom" => 7,
         _ => 8,
     }
 }
