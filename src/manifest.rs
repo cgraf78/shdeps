@@ -9,10 +9,15 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::Result;
 use crate::config::Entry;
 use crate::state;
+
+// Built-in install methods can complete in parallel, but manifest updates are
+// read-modify-write operations against one plain-text file.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One manifest row: `name|method|cmd|install_path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +214,7 @@ pub fn read(path: &Path) -> Result<Manifest> {
 
 /// Upserts one manifest row, preserving the file when the row is already unique.
 pub fn upsert(path: &Path, entry: ManifestEntry) -> Result<()> {
+    let _guard = WRITE_LOCK.lock().unwrap();
     let mut manifest = read(path)?;
     if manifest.is_current_unique(&entry.name, &entry.method, &entry.cmd, &entry.install_path) {
         // This is a performance invariant, not only an optimization. `pkg`
@@ -224,6 +230,7 @@ pub fn upsert(path: &Path, entry: ManifestEntry) -> Result<()> {
 
 /// Removes all rows for a manifest key. Missing files are a successful no-op.
 pub fn remove(path: &Path, name: &str) -> Result<()> {
+    let _guard = WRITE_LOCK.lock().unwrap();
     let mut manifest = read(path)?;
     if manifest.entries.is_empty() {
         return Ok(());

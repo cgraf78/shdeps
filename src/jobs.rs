@@ -241,6 +241,130 @@ where
         .collect())
 }
 
+/// Progress event for `parallel_map_with_item_progress`.
+pub(crate) enum ItemProgressEvent<'a, R> {
+    Started(usize),
+    Completed { index: usize, result: &'a R },
+}
+
+/// Runs work in parallel, reports each started/completed item, and returns input order.
+pub(crate) fn parallel_map_with_item_progress<T, R, F, P>(
+    items: &[T],
+    jobs: usize,
+    f: F,
+    mut progress: P,
+) -> crate::Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+    P: FnMut(ItemProgressEvent<'_, R>) -> crate::Result<()>,
+{
+    if jobs <= 1 || items.len() <= 1 {
+        let mut results = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            progress(ItemProgressEvent::Started(index))?;
+            let result = f(item);
+            progress(ItemProgressEvent::Completed {
+                index,
+                result: &result,
+            })?;
+            results.push(result);
+        }
+        return Ok(results);
+    }
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let len = items.len();
+    let next_index = AtomicUsize::new(0);
+    let mut slots: Vec<Option<R>> = (0..len).map(|_| None).collect();
+    let panic_payload: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
+    let worker_count = jobs.min(len);
+    enum WorkerEvent<R> {
+        Started(usize),
+        Completed(usize, R),
+    }
+
+    let (completed_tx, completed_rx) = mpsc::channel::<WorkerEvent<R>>();
+    let mut callback_error = None;
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let f = &f;
+            let next_index = &next_index;
+            let panic_payload = &panic_payload;
+            let completed_tx = completed_tx.clone();
+            scope.spawn(move || {
+                loop {
+                    if panic_payload.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= len {
+                        return;
+                    }
+                    let _ = completed_tx.send(WorkerEvent::Started(index));
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&items[index])));
+                    match outcome {
+                        Ok(result) => {
+                            let _ = completed_tx.send(WorkerEvent::Completed(index, result));
+                        }
+                        Err(payload) => {
+                            let mut held = panic_payload.lock().unwrap();
+                            if held.is_none() {
+                                *held = Some(payload);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        drop(completed_tx);
+
+        let mut completed = 0usize;
+        while completed < len {
+            match completed_rx.recv() {
+                Ok(WorkerEvent::Started(index)) => {
+                    if callback_error.is_none()
+                        && let Err(error) = progress(ItemProgressEvent::Started(index))
+                    {
+                        callback_error = Some(error);
+                    }
+                }
+                Ok(WorkerEvent::Completed(index, result)) => {
+                    if callback_error.is_none()
+                        && let Err(error) = progress(ItemProgressEvent::Completed {
+                            index,
+                            result: &result,
+                        })
+                    {
+                        callback_error = Some(error);
+                    }
+                    slots[index] = Some(result);
+                    completed += 1;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    if let Some(payload) = panic_payload.into_inner().unwrap() {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+
+    Ok(slots
+        .into_iter()
+        .map(|slot| slot.expect("every slot is written exactly once by a worker before scope ends"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

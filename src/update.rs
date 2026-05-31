@@ -14,6 +14,7 @@ use crate::cleanup;
 use crate::config::{self, Entry};
 use crate::hooks::{BashCustomProbe, Install, Post, Txn};
 use crate::http::Client;
+use crate::jobs;
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::package_cache;
 use crate::platform::{self, RuntimeEnv};
@@ -467,8 +468,70 @@ where
         )?;
     }
 
+    let builtin_entries = entries
+        .iter()
+        .filter(|entry| entry.method != "pkg" && entry.method != "custom")
+        .filter(|entry| active(entry, context.env))
+        .collect::<Vec<_>>();
+
+    let builtin_outcomes = jobs::parallel_map_with_item_progress(
+        &builtin_entries,
+        jobs::max(context.env_vars),
+        |entry| {
+            install_builtin(
+                entry,
+                context,
+                options,
+                &release_prefetch,
+                transitions.get(&entry.name),
+            )
+        },
+        |event| {
+            match event {
+                jobs::ItemProgressEvent::Started(index) => {
+                    let group = group_for_method(&builtin_entries[index].method);
+                    if announced.insert(group) {
+                        group_started.insert(group, Instant::now());
+                        progress.phase(
+                            group,
+                            "running",
+                            group_detail(group),
+                            0,
+                            group_totals[group],
+                        )?;
+                    }
+                }
+                jobs::ItemProgressEvent::Completed {
+                    index,
+                    result: outcome,
+                } => {
+                    let group = group_for_method(&builtin_entries[index].method);
+                    progress.item(group, &outcome.item)?;
+                    if advance_group(progress, &mut group_done, &group_totals, group)?
+                        && let Some(started) = group_started.remove(group)
+                    {
+                        finish_group(&mut summary, group, started);
+                    }
+                }
+            }
+            Ok(())
+        },
+    )?;
+    for outcome in builtin_outcomes {
+        if outcome.cleanup_leftover {
+            summary.leftovers.push(outcome.item.name.clone());
+        }
+        if outcome.item.failed {
+            summary.failed.push(outcome.item.name.clone());
+        }
+        if outcome.item.changed {
+            changed.push(outcome.item.name.clone());
+        }
+        summary.items.push(outcome.item);
+    }
+
     for entry in entries {
-        if entry.method == "pkg" || !active(entry, context.env) {
+        if entry.method != "custom" || !active(entry, context.env) {
             continue;
         }
 
@@ -483,150 +546,35 @@ where
                 group_totals[group],
             )?;
         }
-
-        match entry.method.as_str() {
-            "github:release" => {
-                let item = update_transition::install_with_prepared(
-                    entry,
-                    transitions.get(&entry.name),
-                    context.roots,
-                    || {
-                        update_release::install_with_prefetch(
-                            entry,
-                            context,
-                            options,
-                            &release_prefetch,
-                        )
-                    },
-                )?;
-                if !item.failed {
-                    cleanup_successful_transition(
-                        entry,
-                        transitions.get(&entry.name),
-                        context,
-                        &mut summary,
-                    )?;
-                }
-                if item.failed {
-                    summary.failed.push(entry.name.clone());
-                }
-                if item.changed {
-                    changed.push(entry.name.clone());
-                }
-                progress.item(group, &item)?;
-                if advance_group(progress, &mut group_done, &group_totals, group)? {
-                    if let Some(started) = group_started.remove(group) {
-                        finish_group(&mut summary, group, started);
-                    }
-                }
-                summary.items.push(item);
-            }
-            "github:repo" => {
-                let item = update_transition::install_with_prepared(
-                    entry,
-                    transitions.get(&entry.name),
-                    context.roots,
-                    || update_repo::install(entry, context, options),
-                )?;
-                if !item.failed {
-                    cleanup_successful_transition(
-                        entry,
-                        transitions.get(&entry.name),
-                        context,
-                        &mut summary,
-                    )?;
-                }
-                if item.failed {
-                    summary.failed.push(entry.name.clone());
-                }
-                if item.changed {
-                    changed.push(entry.name.clone());
-                }
-                progress.item(group, &item)?;
-                if advance_group(progress, &mut group_done, &group_totals, group)? {
-                    if let Some(started) = group_started.remove(group) {
-                        finish_group(&mut summary, group, started);
-                    }
-                }
-                summary.items.push(item);
-            }
-            "cargo" | "go" | "uv" | "npm" => {
-                let item = update_transition::install_with_prepared(
-                    entry,
-                    transitions.get(&entry.name),
-                    context.roots,
-                    || update_external::install(entry, context, options),
-                )?;
-                if !item.failed {
-                    cleanup_successful_transition(
-                        entry,
-                        transitions.get(&entry.name),
-                        context,
-                        &mut summary,
-                    )?;
-                }
-                if item.failed {
-                    summary.failed.push(entry.name.clone());
-                }
-                if item.changed {
-                    changed.push(entry.name.clone());
-                }
-                progress.item(group, &item)?;
-                if advance_group(progress, &mut group_done, &group_totals, group)? {
-                    if let Some(started) = group_started.remove(group) {
-                        finish_group(&mut summary, group, started);
-                    }
-                }
-                summary.items.push(item);
-            }
-            "custom" => {
-                let outcome = install_custom(
-                    entry,
-                    context.manifest_path,
-                    context.roots,
-                    context.hooks,
-                    &hook_txn,
-                    options,
-                    transitions.get(&entry.name).map(update_transition::old),
-                )?;
-                let item = outcome.item;
-                if outcome.cleanup_leftover {
-                    summary.leftovers.push(entry.name.clone());
-                }
-                if item.failed {
-                    summary.failed.push(entry.name.clone());
-                }
-                if item.changed {
-                    record_changed(&mut changed, entry.name.clone());
-                }
-                for marker in outcome.marked {
-                    record_changed(&mut changed, marker);
-                }
-                progress.item(group, &item)?;
-                if advance_group(progress, &mut group_done, &group_totals, group)? {
-                    if let Some(started) = group_started.remove(group) {
-                        finish_group(&mut summary, group, started);
-                    }
-                }
-                summary.items.push(item);
-            }
-            method => {
-                let item = Item {
-                    name: entry.name.clone(),
-                    changed: false,
-                    failed: true,
-                    detail: format!("{method} update is not implemented yet"),
-                };
-                summary.failed.push(entry.name.clone());
-                progress.item(group, &item)?;
-                if advance_group(progress, &mut group_done, &group_totals, group)? {
-                    if let Some(started) = group_started.remove(group) {
-                        finish_group(&mut summary, group, started);
-                    }
-                }
-                summary.items.push(item);
-            }
+        let outcome = install_custom(
+            entry,
+            context.manifest_path,
+            context.roots,
+            context.hooks,
+            &hook_txn,
+            options,
+            transitions.get(&entry.name).map(update_transition::old),
+        )?;
+        let item = outcome.item;
+        if outcome.cleanup_leftover {
+            summary.leftovers.push(entry.name.clone());
         }
+        if item.failed {
+            summary.failed.push(entry.name.clone());
+        }
+        if item.changed {
+            record_changed(&mut changed, entry.name.clone());
+        }
+        for marker in outcome.marked {
+            record_changed(&mut changed, marker);
+        }
+        progress.item(group, &item)?;
+        if advance_group(progress, &mut group_done, &group_totals, group)?
+            && let Some(started) = group_started.remove(group)
+        {
+            finish_group(&mut summary, group, started);
+        }
+        summary.items.push(item);
     }
 
     // Post hooks deliberately run after every install decision rather than
@@ -680,7 +628,10 @@ pub fn group_for_method(method: &str) -> &'static str {
         "pkg" => "packages",
         "github:release" => "github-releases",
         "github:repo" => "repo-deps",
-        "cargo" | "go" | "uv" | "npm" => "language-tools",
+        "cargo" => "cargo",
+        "go" => "go",
+        "uv" => "uv",
+        "npm" => "npm",
         "custom" => "hooks",
         _ => "other",
     }
@@ -691,7 +642,10 @@ fn group_detail(group: &str) -> &'static str {
         "packages" => "checking package deps",
         "github-releases" => "checking GitHub release installs",
         "repo-deps" => "checking repo deps",
-        "language-tools" => "checking language tools",
+        "cargo" => "checking cargo deps",
+        "go" => "checking go deps",
+        "uv" => "checking uv deps",
+        "npm" => "checking npm deps",
         "hooks" => "checking custom hooks",
         _ => "checking dependencies",
     }
@@ -708,6 +662,67 @@ struct CustomOutcome {
     item: Item,
     cleanup_leftover: bool,
     marked: Vec<String>,
+}
+
+struct BuiltinOutcome {
+    item: Item,
+    cleanup_leftover: bool,
+}
+
+fn install_builtin<R>(
+    entry: &Entry,
+    context: &Context<'_, R>,
+    options: Options,
+    release_prefetch: &update_release::Prefetch,
+    transition: Option<&update_transition::Transition>,
+) -> BuiltinOutcome
+where
+    R: Runner + Sync,
+{
+    let result = match entry.method.as_str() {
+        "github:release" => {
+            update_transition::install_with_prepared(entry, transition, context.roots, || {
+                update_release::install_with_prefetch(entry, context, options, release_prefetch)
+            })
+        }
+        "github:repo" => {
+            update_transition::install_with_prepared(entry, transition, context.roots, || {
+                update_repo::install(entry, context, options)
+            })
+        }
+        "cargo" | "go" | "uv" | "npm" => {
+            update_transition::install_with_prepared(entry, transition, context.roots, || {
+                update_external::install(entry, context, options)
+            })
+        }
+        method => Ok(Item {
+            name: entry.name.clone(),
+            changed: false,
+            failed: true,
+            detail: format!("{method} update is not implemented yet"),
+        }),
+    };
+
+    let item = match result {
+        Ok(item) => item,
+        Err(error) => Item {
+            name: entry.name.clone(),
+            changed: false,
+            failed: true,
+            detail: error.to_string(),
+        },
+    };
+
+    let cleanup_leftover = if item.failed {
+        false
+    } else {
+        update_transition::cleanup_successful(entry, transition, context.roots).unwrap_or(true)
+    };
+
+    BuiltinOutcome {
+        item,
+        cleanup_leftover,
+    }
 }
 
 fn successful_custom(
@@ -1959,6 +1974,175 @@ version() { printf 'saw-pkg\n'; }
                 .unwrap()
                 .get("ripgrep")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn update_builtin_methods_continue_after_one_install_fails() {
+        let fixture = Fixture::new("builtin-failure-isolation");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let fzf_bin = fixture
+            .roots
+            .install_dir
+            .join("github.com/junegunn/fzf/bin/fzf");
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_command("go")
+            .with_failure(
+                "cargo",
+                [
+                    "install",
+                    "--locked",
+                    "--root",
+                    fixture.roots.install_dir.join("ripgrep").to_str().unwrap(),
+                    "ripgrep",
+                ],
+            )
+            .with_created_binary(
+                "env",
+                [
+                    &format!(
+                        "GOBIN={}",
+                        fixture
+                            .roots
+                            .install_dir
+                            .join("github.com/junegunn/fzf/bin")
+                            .display()
+                    ),
+                    "go",
+                    "install",
+                    "github.com/junegunn/fzf@latest",
+                ],
+                fzf_bin.clone(),
+            );
+
+        let summary = run(
+            &[
+                parse_entry("ripgrep|cargo|rg|-|-", None),
+                parse_entry("github.com/junegunn/fzf|go|fzf|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["ripgrep"]);
+        assert_eq!(summary.items[0].detail, "cargo install failed");
+        assert!(summary.items[1].changed);
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("fzf")).unwrap(),
+            fzf_bin
+        );
+        let manifest = manifest::read(&manifest_path).unwrap();
+        assert!(manifest.get("ripgrep").is_none());
+        assert_eq!(
+            manifest.get("github.com/junegunn/fzf"),
+            Some(&ManifestEntry::new(
+                "github.com/junegunn/fzf",
+                "go",
+                "fzf",
+                fixture
+                    .roots
+                    .install_dir
+                    .join("github.com/junegunn/fzf/bin/fzf")
+                    .display()
+                    .to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn update_builtin_progress_starts_queued_groups_when_worker_starts() {
+        let mut fixture = Fixture::new("builtin-progress-starts");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let rg_bin = fixture.roots.install_dir.join("ripgrep/bin/rg");
+        let fzf_bin = fixture
+            .roots
+            .install_dir
+            .join("github.com/junegunn/fzf/bin/fzf");
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_command("go")
+            .with_created_binary(
+                "cargo",
+                [
+                    "install",
+                    "--locked",
+                    "--root",
+                    fixture.roots.install_dir.join("ripgrep").to_str().unwrap(),
+                    "ripgrep",
+                ],
+                rg_bin,
+            )
+            .with_created_binary(
+                "env",
+                [
+                    &format!(
+                        "GOBIN={}",
+                        fixture
+                            .roots
+                            .install_dir
+                            .join("github.com/junegunn/fzf/bin")
+                            .display()
+                    ),
+                    "go",
+                    "install",
+                    "github.com/junegunn/fzf@latest",
+                ],
+                fzf_bin,
+            );
+        let mut progress = RecordingProgress::default();
+
+        let summary = run_with_progress(
+            &[
+                parse_entry("ripgrep|cargo|rg|-|-", None),
+                parse_entry("github.com/junegunn/fzf|go|fzf|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+            &mut progress,
+        )
+        .unwrap();
+
+        let cargo_start = progress
+            .phases
+            .iter()
+            .position(|phase| phase.detail == "checking cargo deps" && phase.done == 0)
+            .unwrap();
+        let cargo_done = progress
+            .phases
+            .iter()
+            .position(|phase| phase.detail == "checking cargo deps" && phase.done == 1)
+            .unwrap();
+        let go_start = progress
+            .phases
+            .iter()
+            .position(|phase| phase.detail == "checking go deps" && phase.done == 0)
+            .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(
+            cargo_start < cargo_done && cargo_done < go_start,
+            "queued groups should not start progress timers before a worker reaches them: {:?}",
+            progress
+                .phases
+                .iter()
+                .map(|phase| (&phase.detail, phase.done, phase.total))
+                .collect::<Vec<_>>()
         );
     }
 

@@ -432,7 +432,6 @@ where
         writeln!(stderr, "error: unknown update argument '{arg}'")?;
         return Ok(2);
     }
-
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     ensure_bin_dir_on_path(&roots.bin_dir);
 
@@ -452,6 +451,10 @@ where
     let hooks = custom_probe();
     let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    if let Some(message) = update_prerequisite_error(&entries, &env, &Process) {
+        writeln!(stderr, "{message}")?;
+        return Ok(1);
+    }
     let update_options = UpdateOptions {
         reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
         force: runtime::force(&ProcessEnv, &options.overrides),
@@ -594,6 +597,101 @@ where
     }
 
     Ok(if summary.has_errors() { 1 } else { 0 })
+}
+
+fn update_prerequisite_error(
+    entries: &[Entry],
+    env: &crate::platform::RuntimeEnv,
+    runner: &impl process::Runner,
+) -> Option<String> {
+    let missing = update_prerequisites(entries, env)
+        .into_iter()
+        .filter(|prereq| !runner.exists(prereq.command))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let details = missing
+        .iter()
+        .map(|prereq| format!("{} ({})", prereq.command, prereq.reason))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "error: shdeps update is missing required tools for configured deps: {details}"
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UpdatePrerequisite {
+    command: &'static str,
+    reason: &'static str,
+}
+
+fn update_prerequisites(
+    entries: &[Entry],
+    env: &crate::platform::RuntimeEnv,
+) -> Vec<UpdatePrerequisite> {
+    let mut required = BTreeMap::<&'static str, UpdatePrerequisite>::new();
+    for entry in entries {
+        if !update::active(entry, env) {
+            continue;
+        }
+        for prereq in prerequisites_for_method(&entry.method) {
+            required.entry(prereq.command).or_insert(*prereq);
+        }
+    }
+    required.into_values().collect()
+}
+
+fn prerequisites_for_method(method: &str) -> &'static [UpdatePrerequisite] {
+    match method {
+        "github" => &[
+            UpdatePrerequisite {
+                command: "curl",
+                reason: "GitHub release metadata and downloads",
+            },
+            UpdatePrerequisite {
+                command: "gh",
+                reason: "authenticated GitHub API access",
+            },
+            UpdatePrerequisite {
+                command: "git",
+                reason: "GitHub repo installs",
+            },
+        ],
+        "github:release" => &[
+            UpdatePrerequisite {
+                command: "curl",
+                reason: "GitHub release metadata and downloads",
+            },
+            UpdatePrerequisite {
+                command: "gh",
+                reason: "authenticated GitHub API access",
+            },
+        ],
+        "github:repo" => &[UpdatePrerequisite {
+            command: "git",
+            reason: "GitHub repo installs",
+        }],
+        "cargo" => &[UpdatePrerequisite {
+            command: "cargo",
+            reason: "cargo installs",
+        }],
+        "go" => &[UpdatePrerequisite {
+            command: "go",
+            reason: "go installs",
+        }],
+        "uv" => &[UpdatePrerequisite {
+            command: "uv",
+            reason: "uv installs",
+        }],
+        "npm" => &[UpdatePrerequisite {
+            command: "npm",
+            reason: "npm installs",
+        }],
+        _ => &[],
+    }
 }
 
 struct JsonlProgress<'a, W>
@@ -1507,7 +1605,7 @@ where
         if items.is_empty() {
             continue;
         }
-        write_group(stdout, group_label(group))?;
+        write_group(stdout, dashboard_group_label(group))?;
         for item in items {
             if item.failed {
                 item_failures.insert(item.name.as_str());
@@ -1564,10 +1662,25 @@ fn terminal_progress_plan(
             )
         })
         .count();
-    let language_tools = entries
+    let cargo = entries
         .iter()
         .filter(active)
-        .filter(|entry| matches!(entry.method.as_str(), "cargo" | "go" | "uv" | "npm"))
+        .filter(|entry| entry.method == "cargo")
+        .count();
+    let go = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "go")
+        .count();
+    let uv = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "uv")
+        .count();
+    let npm = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "npm")
         .count();
     let hooks = entries
         .iter()
@@ -1594,10 +1707,28 @@ fn terminal_progress_plan(
             total: github,
         });
     }
-    if language_tools > 0 {
+    if cargo > 0 {
         stages.push(TtyProgressStage {
-            stage: "language-tools",
-            total: language_tools,
+            stage: "cargo",
+            total: cargo,
+        });
+    }
+    if go > 0 {
+        stages.push(TtyProgressStage {
+            stage: "go",
+            total: go,
+        });
+    }
+    if uv > 0 {
+        stages.push(TtyProgressStage {
+            stage: "uv",
+            total: uv,
+        });
+    }
+    if npm > 0 {
+        stages.push(TtyProgressStage {
+            stage: "npm",
+            total: npm,
         });
     }
     if hooks > 0 {
@@ -1719,19 +1850,24 @@ where
     Ok(())
 }
 
-fn update_group_order() -> [&'static str; 6] {
+fn update_group_order() -> [&'static str; 9] {
     [
         "packages",
         "github-releases",
         "repo-deps",
-        "language-tools",
+        "cargo",
+        "go",
+        "uv",
+        "npm",
         "hooks",
         "other",
     ]
 }
 
-fn dashboard_group_order() -> [&'static str; 5] {
-    ["packages", "github", "language-tools", "custom", "other"]
+fn dashboard_group_order() -> [&'static str; 8] {
+    [
+        "packages", "github", "cargo", "go", "uv", "npm", "custom", "other",
+    ]
 }
 
 fn group_for_name(entries: &[Entry], name: &str) -> &'static str {
@@ -1751,7 +1887,10 @@ fn group_label(group: &str) -> &'static str {
         "packages" => "Packages",
         "github-releases" => "GitHub releases",
         "repo-deps" => "Repo deps",
-        "language-tools" => "Language tools",
+        "cargo" => "Cargo",
+        "go" => "Go",
+        "uv" => "UV",
+        "npm" => "NPM",
         "hooks" => "Hooks",
         _ => "Other",
     }
@@ -1761,7 +1900,10 @@ fn dashboard_group_label(group: &str) -> &'static str {
     match group {
         "packages" => "Packages",
         "github" => "GitHub",
-        "language-tools" => "Language tools",
+        "cargo" => "Cargo",
+        "go" => "Go",
+        "uv" => "UV",
+        "npm" => "NPM",
         "custom" => "Custom",
         _ => "Other",
     }
@@ -1772,7 +1914,10 @@ fn display_group_for_update_group(group: &str) -> &'static str {
         "github-releases" | "repo-deps" => "github",
         "hooks" => "custom",
         "packages" => "packages",
-        "language-tools" => "language-tools",
+        "cargo" => "cargo",
+        "go" => "go",
+        "uv" => "uv",
+        "npm" => "npm",
         _ => "other",
     }
 }
@@ -2069,7 +2214,10 @@ fn progress_label(detail: &str) -> String {
         "checking current GitHub release versions" => "GitHub",
         "checking GitHub release installs" => "GitHub",
         "checking repo deps" => "GitHub",
-        "checking language tools" => "Language tools",
+        "checking cargo deps" => "Cargo",
+        "checking go deps" => "Go",
+        "checking uv deps" => "UV",
+        "checking npm deps" => "NPM",
         "checking custom hooks" => "Custom",
         _ => detail,
     };
@@ -2081,7 +2229,10 @@ fn progress_label_for_stage(stage: &str) -> String {
         "packages" => "Packages",
         "method-resolution" => "Resolve methods",
         "github" => "GitHub",
-        "language-tools" => "Language tools",
+        "cargo" => "Cargo",
+        "go" => "Go",
+        "uv" => "UV",
+        "npm" => "NPM",
         "custom" => "Custom",
         _ => "Other",
     };
@@ -2096,7 +2247,10 @@ fn progress_stage(detail: &str) -> &'static str {
         "checking current GitHub release versions" => "github",
         "checking GitHub release installs" => "github",
         "checking repo deps" => "github",
-        "checking language tools" => "language-tools",
+        "checking cargo deps" => "cargo",
+        "checking go deps" => "go",
+        "checking uv deps" => "uv",
+        "checking npm deps" => "npm",
         "checking custom hooks" => "custom",
         _ => "other-progress",
     }
@@ -2110,7 +2264,10 @@ fn progress_component(detail: &str) -> &'static str {
         "checking current GitHub release versions" => "github-releases",
         "checking GitHub release installs" => "github-releases",
         "checking repo deps" => "repo-deps",
-        "checking language tools" => "language-tools",
+        "checking cargo deps" => "cargo",
+        "checking go deps" => "go",
+        "checking uv deps" => "uv",
+        "checking npm deps" => "npm",
         "checking custom hooks" => "hooks",
         _ => "other-progress",
     }
@@ -2121,8 +2278,11 @@ fn progress_stage_index(stage: &str) -> usize {
         "method-resolution" => 0,
         "packages" => 1,
         "github" => 2,
-        "language-tools" => 3,
-        "custom" => 4,
+        "cargo" => 3,
+        "go" => 4,
+        "uv" => 5,
+        "npm" => 6,
+        "custom" => 7,
         _ => 8,
     }
 }
