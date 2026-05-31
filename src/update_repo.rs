@@ -15,10 +15,11 @@ use crate::bin_link;
 use crate::config::Entry;
 use crate::extras;
 use crate::manifest::{self, ManifestEntry};
+use crate::method;
 use crate::process::Runner;
 use crate::repo;
 use crate::stamp;
-use crate::update::{Context, Item, Options, detail_with_action, verbose_enabled};
+use crate::update::{Context, Item, ItemReason, Options, detail_with_action, verbose_enabled};
 
 pub(crate) fn install(
     entry: &Entry,
@@ -94,11 +95,10 @@ pub(crate) fn install(
         detail = format!("{detail} (local clone)");
     }
 
-    Ok(Item {
-        name: entry.name.clone(),
-        changed,
-        failed: false,
-        detail,
+    Ok(if changed {
+        Item::changed(entry.name.clone(), ItemReason::Installed, detail)
+    } else {
+        Item::current(entry.name.clone(), ItemReason::Installed, detail)
     })
 }
 
@@ -115,12 +115,7 @@ fn install_existing(
         secure_managed_clone_permissions(install_dir)?;
         record_success(entry, context, install_dir)?;
         let detail = verbose_repo_detail(None, install_dir, context, options, "fresh");
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: false,
-            detail,
-        });
+        return Ok(Item::current(entry.name.clone(), ItemReason::Fresh, detail));
     }
 
     let head_before = git_head(context.runner, install_dir);
@@ -159,12 +154,7 @@ fn install_existing(
         };
         secure_managed_clone_permissions(install_dir)?;
         record_success(entry, context, install_dir)?;
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: false,
-            detail,
-        });
+        return Ok(Item::current(entry.name.clone(), ItemReason::Other, detail));
     }
 
     let head_after = git_head(context.runner, install_dir);
@@ -180,11 +170,10 @@ fn install_existing(
         None
     };
     let detail = verbose_repo_detail(action, install_dir, context, options, "updated");
-    Ok(Item {
-        name: entry.name.clone(),
-        changed,
-        failed: false,
-        detail,
+    Ok(if changed {
+        Item::changed(entry.name.clone(), ItemReason::Installed, detail)
+    } else {
+        Item::current(entry.name.clone(), ItemReason::Installed, detail)
     })
 }
 
@@ -196,12 +185,11 @@ fn install_fresh(
     url: &str,
 ) -> Result<Item> {
     if !context.runner.exists("git") {
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: true,
-            detail: "git not available".to_owned(),
-        });
+        return Ok(Item::failed(
+            entry.name.clone(),
+            ItemReason::MissingTool,
+            "git not available",
+        ));
     }
 
     let clone_tmp = temp_clone_path(install_dir);
@@ -216,12 +204,11 @@ fn install_fresh(
             .is_some_and(|fallback| clone_repo(context.runner, fallback, &clone_tmp));
     if !cloned || !clone_tmp.is_dir() {
         remove_any(&clone_tmp)?;
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: true,
-            detail: "clone failed".to_owned(),
-        });
+        return Ok(Item::failed(
+            entry.name.clone(),
+            ItemReason::InstallFailed,
+            "clone failed",
+        ));
     }
 
     remove_any(install_dir)?;
@@ -233,17 +220,11 @@ fn install_fresh(
     record_success(entry, context, install_dir)?;
 
     let detail = verbose_repo_detail(Some("added"), install_dir, context, options, "added");
-    Ok(Item {
-        name: entry.name.clone(),
-        changed: true,
-        failed: false,
-        // Bash reported a newly materialized repo dependency as "added".
-        // Downstream bootstrap tests and log triage treat that word as the
-        // public install contract, while "cloned" is only the implementation
-        // mechanism. Keep the user-facing status stable so a Rust binary can
-        // replace the shell CLI without forcing client repos to relearn it.
+    Ok(Item::changed(
+        entry.name.clone(),
+        ItemReason::Installed,
         detail,
-    })
+    ))
 }
 
 fn verbose_repo_detail(
@@ -327,7 +308,7 @@ fn record_success(
         context.manifest_path,
         ManifestEntry::new(
             &entry.name,
-            "github:repo",
+            method::GITHUB_REPO,
             &entry.cmd,
             install_dir.display().to_string(),
         ),

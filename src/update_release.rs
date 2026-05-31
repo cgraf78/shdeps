@@ -17,12 +17,15 @@ use crate::github_release_install;
 use crate::http::Client;
 use crate::jobs;
 use crate::manifest::{self, ManifestEntry};
+use crate::method;
 use crate::platform::RuntimeEnv;
 use crate::process::{self, Runner};
 use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::tool_version;
-use crate::update::{Context, Item, Options, Phase, Progress, detail_with_action, verbose_enabled};
+use crate::update::{
+    self, Context, Item, ItemReason, Options, Progress, detail_with_action, verbose_enabled,
+};
 
 pub(crate) fn install_with_prefetch(
     entry: &Entry,
@@ -63,11 +66,14 @@ pub(crate) fn install_with_prefetch(
         }
     }
 
-    Ok(Item {
-        name: entry.name.clone(),
-        changed: outcome.changed,
-        failed: outcome.failed,
-        detail: outcome.detail,
+    Ok(match (outcome.failed, outcome.changed) {
+        (true, _) => Item::failed(
+            entry.name.clone(),
+            ItemReason::InstallFailed,
+            outcome.detail,
+        ),
+        (false, true) => Item::changed(entry.name.clone(), ItemReason::Installed, outcome.detail),
+        (false, false) => Item::current(entry.name.clone(), ItemReason::Installed, outcome.detail),
     })
 }
 
@@ -154,15 +160,11 @@ where
                 .map(|releases| (candidate.repo.clone(), releases))
         },
         |done| {
-            progress.phase(Phase {
-                group: "github-releases",
-                key: "github-release-metadata",
-                status: "running",
-                label: "GitHub",
-                detail: "fetching GitHub release metadata",
+            progress.phase(update::running_phase(
+                update::PHASE_GITHUB_RELEASE_METADATA,
                 done,
-                total: candidates.len(),
-            })
+                candidates.len(),
+            ))
         },
     )?
     .into_iter()
@@ -186,15 +188,11 @@ where
                     .map(|version| (candidate.name.clone(), version))
             },
             |done| {
-                progress.phase(Phase {
-                    group: "github-releases",
-                    key: "github-release-versions",
-                    status: "running",
-                    label: "GitHub",
-                    detail: "checking current GitHub release versions",
+                progress.phase(update::running_phase(
+                    update::PHASE_GITHUB_RELEASE_VERSIONS,
                     done,
-                    total: version_candidates.len(),
-                })
+                    version_candidates.len(),
+                ))
             },
         )? {
             let Some((name, version)) = fetched else {
@@ -540,7 +538,7 @@ pub(crate) fn install_request(
 }
 
 fn cached_releases(repo: &str, roots: &Roots, options: Options) -> Option<Vec<github::Release>> {
-    let stamp_path = stamp::remote_path(&roots.state_dir, repo, "github");
+    let stamp_path = stamp::remote_path(&roots.state_dir, repo, method::GITHUB);
     if !stamp::remote_fresh(&stamp_path, options.freshness())
         && !stamp::remote_checked_at(&stamp_path, options.now)
     {
@@ -582,7 +580,7 @@ fn write_manifest(entry: &Entry, context: &Context<'_, impl Runner>) -> Result<(
         context.manifest_path,
         ManifestEntry::new(
             &entry.name,
-            "github:release",
+            method::GITHUB_RELEASE,
             &entry.cmd,
             context.roots.bin_dir.join(&entry.cmd).display().to_string(),
         ),

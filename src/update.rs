@@ -16,6 +16,7 @@ use crate::hooks::{BashCustomProbe, Install, Post, Txn};
 use crate::http::Client;
 use crate::jobs;
 use crate::manifest::{self, Manifest, ManifestEntry};
+use crate::method;
 use crate::package_cache;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
@@ -81,8 +82,133 @@ pub struct Item {
     /// returning non-zero is different because the user explicitly attempted
     /// work and the CLI must return failure.
     pub failed: bool,
+    /// Structured status used for summaries and rendering.
+    pub status: ItemStatus,
+    /// Structured reason used by update orchestration.
+    pub reason: ItemReason,
     /// Human-readable status detail for CLI output.
     pub detail: String,
+}
+
+/// Machine-readable update item status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemStatus {
+    /// Dependency is installed/current and did not change.
+    Current,
+    /// Dependency changed and should be counted as changed.
+    Changed,
+    /// Dependency was intentionally skipped.
+    Skipped,
+    /// Dependency failed.
+    Failed,
+    /// Dependency was queued for later batch work.
+    Pending,
+}
+
+/// Machine-readable reason for an update item status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemReason {
+    /// Installed/current dependency.
+    Installed,
+    /// Package manager override disabled this dependency.
+    PackageManagerOverride,
+    /// Package is unavailable on this host/package manager.
+    PackageUnavailable,
+    /// Package was queued for a later batch install.
+    PackageQueued,
+    /// Remote freshness stamp was current.
+    Fresh,
+    /// Required installer tool was missing.
+    MissingTool,
+    /// Installer failed.
+    InstallFailed,
+    /// Installer succeeded but produced no binary.
+    MissingBinary,
+    /// Custom hook was missing or unusable.
+    CustomUnavailable,
+    /// Custom install hook failed.
+    CustomInstallFailed,
+    /// Unsupported update method.
+    UnsupportedMethod,
+    /// Generic fallback for details that are already self-explanatory.
+    Other,
+}
+
+impl Item {
+    pub(crate) fn current(
+        name: impl Into<String>,
+        reason: ItemReason,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            changed: false,
+            failed: false,
+            status: ItemStatus::Current,
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn changed(
+        name: impl Into<String>,
+        reason: ItemReason,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            changed: true,
+            failed: false,
+            status: ItemStatus::Changed,
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn skipped(
+        name: impl Into<String>,
+        reason: ItemReason,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            changed: false,
+            failed: false,
+            status: ItemStatus::Skipped,
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn failed(
+        name: impl Into<String>,
+        reason: ItemReason,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            changed: false,
+            failed: true,
+            status: ItemStatus::Failed,
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn pending(
+        name: impl Into<String>,
+        reason: ItemReason,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            changed: false,
+            failed: false,
+            status: ItemStatus::Pending,
+            reason,
+            detail: detail.into(),
+        }
+    }
 }
 
 /// Runtime data for one completed update group.
@@ -152,6 +278,157 @@ pub struct Phase<'a> {
     pub done: usize,
     /// Total units.
     pub total: usize,
+}
+
+pub(crate) const GROUP_METHODS: &str = "github-methods";
+pub(crate) const GROUP_PACKAGES: &str = "packages";
+pub(crate) const GROUP_GITHUB_RELEASES: &str = "github-releases";
+pub(crate) const GROUP_GITHUB_REPOS: &str = "github-repos";
+pub(crate) const GROUP_CARGO: &str = "cargo";
+pub(crate) const GROUP_GO: &str = "go";
+pub(crate) const GROUP_UV: &str = "uv";
+pub(crate) const GROUP_NPM: &str = "npm";
+pub(crate) const GROUP_CUSTOM: &str = "custom";
+pub(crate) const GROUP_OTHER: &str = "other";
+
+pub(crate) const DASH_METHOD_RESOLUTION: &str = "method-resolution";
+pub(crate) const DASH_GITHUB: &str = "github";
+
+pub(crate) const PHASE_GITHUB_METHODS: &str = "github-methods";
+pub(crate) const PHASE_PACKAGES: &str = "packages";
+pub(crate) const PHASE_GITHUB_RELEASE_METADATA: &str = "github-release-metadata";
+pub(crate) const PHASE_GITHUB_RELEASE_VERSIONS: &str = "github-release-versions";
+pub(crate) const PHASE_GITHUB_RELEASE_INSTALLS: &str = "github-release-installs";
+pub(crate) const PHASE_GITHUB_REPOS: &str = "github-repos";
+pub(crate) const PHASE_CARGO: &str = "cargo";
+pub(crate) const PHASE_GO: &str = "go";
+pub(crate) const PHASE_UV: &str = "uv";
+pub(crate) const PHASE_NPM: &str = "npm";
+pub(crate) const PHASE_CUSTOM: &str = "custom";
+pub(crate) const PHASE_OTHER: &str = "other-progress";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PhaseSpec {
+    pub(crate) group: &'static str,
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) detail: &'static str,
+    pub(crate) dashboard_group: &'static str,
+    pub(crate) dashboard_stage: &'static str,
+    pub(crate) component: &'static str,
+}
+
+pub(crate) fn running_phase(key: &'static str, done: usize, total: usize) -> Phase<'static> {
+    let spec = phase_spec(key);
+    Phase {
+        group: spec.group,
+        key: spec.key,
+        status: "running",
+        label: spec.label,
+        detail: spec.detail,
+        done,
+        total,
+    }
+}
+
+pub(crate) fn phase_for_group(group: &'static str, done: usize, total: usize) -> Phase<'static> {
+    running_phase(phase_key_for_group(group), done, total)
+}
+
+pub(crate) fn phase_spec(key: &str) -> PhaseSpec {
+    match key {
+        PHASE_GITHUB_METHODS => PhaseSpec {
+            group: GROUP_METHODS,
+            key: PHASE_GITHUB_METHODS,
+            label: "Resolve sources",
+            detail: "resolving GitHub methods",
+            dashboard_group: DASH_METHOD_RESOLUTION,
+            dashboard_stage: DASH_METHOD_RESOLUTION,
+            component: PHASE_GITHUB_METHODS,
+        },
+        PHASE_PACKAGES => group_spec(GROUP_PACKAGES),
+        PHASE_GITHUB_RELEASE_METADATA => PhaseSpec {
+            group: GROUP_GITHUB_RELEASES,
+            key: PHASE_GITHUB_RELEASE_METADATA,
+            label: "GitHub",
+            detail: "fetching GitHub release metadata",
+            dashboard_group: DASH_GITHUB,
+            dashboard_stage: DASH_GITHUB,
+            component: PHASE_GITHUB_RELEASE_METADATA,
+        },
+        PHASE_GITHUB_RELEASE_VERSIONS => PhaseSpec {
+            group: GROUP_GITHUB_RELEASES,
+            key: PHASE_GITHUB_RELEASE_VERSIONS,
+            label: "GitHub",
+            detail: "checking current GitHub release versions",
+            dashboard_group: DASH_GITHUB,
+            dashboard_stage: DASH_GITHUB,
+            component: PHASE_GITHUB_RELEASE_VERSIONS,
+        },
+        PHASE_GITHUB_RELEASE_INSTALLS => group_spec(GROUP_GITHUB_RELEASES),
+        PHASE_GITHUB_REPOS => group_spec(GROUP_GITHUB_REPOS),
+        PHASE_CARGO => group_spec(GROUP_CARGO),
+        PHASE_GO => group_spec(GROUP_GO),
+        PHASE_UV => group_spec(GROUP_UV),
+        PHASE_NPM => group_spec(GROUP_NPM),
+        PHASE_CUSTOM => group_spec(GROUP_CUSTOM),
+        _ => group_spec(GROUP_OTHER),
+    }
+}
+
+pub(crate) fn group_spec(group: &str) -> PhaseSpec {
+    match group {
+        GROUP_PACKAGES => PhaseSpec {
+            group: GROUP_PACKAGES,
+            key: PHASE_PACKAGES,
+            label: "Packages",
+            detail: "checking package deps",
+            dashboard_group: GROUP_PACKAGES,
+            dashboard_stage: GROUP_PACKAGES,
+            component: PHASE_PACKAGES,
+        },
+        GROUP_GITHUB_RELEASES => PhaseSpec {
+            group: GROUP_GITHUB_RELEASES,
+            key: PHASE_GITHUB_RELEASE_INSTALLS,
+            label: "GitHub",
+            detail: "checking GitHub release installs",
+            dashboard_group: DASH_GITHUB,
+            dashboard_stage: DASH_GITHUB,
+            component: PHASE_GITHUB_RELEASE_INSTALLS,
+        },
+        GROUP_GITHUB_REPOS => PhaseSpec {
+            group: GROUP_GITHUB_REPOS,
+            key: PHASE_GITHUB_REPOS,
+            label: "GitHub",
+            detail: "checking GitHub repo installs",
+            dashboard_group: DASH_GITHUB,
+            dashboard_stage: DASH_GITHUB,
+            component: PHASE_GITHUB_REPOS,
+        },
+        GROUP_CARGO => simple_group(GROUP_CARGO, PHASE_CARGO, "Cargo", "checking cargo deps"),
+        GROUP_GO => simple_group(GROUP_GO, PHASE_GO, "Go", "checking go deps"),
+        GROUP_UV => simple_group(GROUP_UV, PHASE_UV, "UV", "checking uv deps"),
+        GROUP_NPM => simple_group(GROUP_NPM, PHASE_NPM, "NPM", "checking npm deps"),
+        GROUP_CUSTOM => simple_group(GROUP_CUSTOM, PHASE_CUSTOM, "Custom", "checking custom deps"),
+        _ => simple_group(GROUP_OTHER, PHASE_OTHER, "Other", "checking dependencies"),
+    }
+}
+
+fn simple_group(
+    group: &'static str,
+    key: &'static str,
+    label: &'static str,
+    detail: &'static str,
+) -> PhaseSpec {
+    PhaseSpec {
+        group,
+        key,
+        label,
+        detail,
+        dashboard_group: group,
+        dashboard_stage: group,
+        component: key,
+    }
 }
 
 /// Progress sink used by library callers that only need the final summary.
@@ -299,29 +576,21 @@ where
 
     let active_package_entries = entries
         .iter()
-        .any(|entry| entry.method == "pkg" && active(entry, context.env));
+        .any(|entry| entry.method == method::PKG && active(entry, context.env));
     let package_total = entries
         .iter()
-        .filter(|entry| entry.method == "pkg" && active(entry, context.env))
+        .filter(|entry| entry.method == method::PKG && active(entry, context.env))
         .count();
     let installable_package_count = entries
         .iter()
-        .filter(|entry| entry.method == "pkg" && active(entry, context.env))
+        .filter(|entry| entry.method == method::PKG && active(entry, context.env))
         .filter(|entry| {
             config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr)) != "NONE"
         })
         .count();
     if active_package_entries {
         let group_started = Instant::now();
-        progress.phase(Phase {
-            group: "packages",
-            key: "packages",
-            status: "running",
-            label: group_label("packages"),
-            detail: "checking package deps",
-            done: 0,
-            total: package_total,
-        })?;
+        progress.phase(phase_for_group(GROUP_PACKAGES, 0, package_total))?;
         let package_cache = if installable_package_count == 0 {
             package_cache::Status::Hit { count: 0 }
         } else {
@@ -339,16 +608,8 @@ where
                 .enumerate()
             {
                 let package_done = index + 1;
-                progress.item("packages", &item)?;
-                progress.phase(Phase {
-                    group: "packages",
-                    key: "packages",
-                    status: "running",
-                    label: group_label("packages"),
-                    detail: "checking package deps",
-                    done: package_done,
-                    total: package_total,
-                })?;
+                progress.item(GROUP_PACKAGES, &item)?;
+                progress.phase(phase_for_group(GROUP_PACKAGES, package_done, package_total))?;
                 summary.items.push(item);
             }
         } else {
@@ -359,30 +620,31 @@ where
             let mut package_done = 0usize;
 
             for entry in entries {
-                if entry.method != "pkg" || !active(entry, context.env) {
+                if entry.method != method::PKG || !active(entry, context.env) {
                     continue;
                 }
 
                 let item =
                     update_pkg::install(entry, context, options, &mut queued, &package_versions)?;
                 if !item.failed {
-                    match item.detail.as_str() {
-                        detail if detail.starts_with("installed") => cleanup_successful_transition(
+                    match item.reason {
+                        ItemReason::Installed => cleanup_successful_transition(
                             entry,
                             transitions.get(&entry.name),
                             context,
                             &mut summary,
                         )?,
-                        "not available" => update_transition::restore_failed(
+                        ItemReason::PackageUnavailable => update_transition::restore_failed(
                             transitions.get(&entry.name),
                             context.manifest_path,
                         )?,
                         _ => {}
                     }
                 }
-                if (item.detail != "installed"
-                    && item.detail != "skipped by package-manager override")
-                    || item.changed
+                if !matches!(
+                    item.reason,
+                    ItemReason::Installed | ItemReason::PackageManagerOverride
+                ) || item.changed
                     || item.failed
                 {
                     package_clean = false;
@@ -394,16 +656,8 @@ where
                     summary.failed.push(entry.name.clone());
                 }
                 package_done += 1;
-                progress.item("packages", &item)?;
-                progress.phase(Phase {
-                    group: "packages",
-                    key: "packages",
-                    status: "running",
-                    label: group_label("packages"),
-                    detail: "checking package deps",
-                    done: package_done,
-                    total: package_total,
-                })?;
+                progress.item(GROUP_PACKAGES, &item)?;
+                progress.phase(phase_for_group(GROUP_PACKAGES, package_done, package_total))?;
                 summary.items.push(item);
             }
 
@@ -418,6 +672,7 @@ where
                 .iter()
                 .cloned()
                 .collect::<BTreeSet<_>>();
+            mark_queued_packages(&mut summary, &successful_packages, &failed_packages);
             for item in &queued {
                 if successful_packages.contains(&item.name) {
                     let Some(entry) = entries.iter().find(|entry| entry.name == item.name) else {
@@ -447,7 +702,7 @@ where
                 update_pkg::write_cache(entries, context, installable_package_count, options)?;
             }
         }
-        finish_group(&mut summary, "packages", group_started);
+        finish_group(&mut summary, GROUP_PACKAGES, group_started);
     }
 
     let group_totals = group_totals(entries, context.env);
@@ -457,41 +712,33 @@ where
 
     let release_entries = entries
         .iter()
-        .filter(|entry| entry.method == "github:release" && active(entry, context.env))
+        .filter(|entry| entry.method == method::GITHUB_RELEASE && active(entry, context.env))
         .collect::<Vec<_>>();
     let release_prefetch_total =
         update_release::prefetch_progress_total(&release_entries, context.roots, options);
     if !release_entries.is_empty() {
-        announced.insert("github-releases");
-        group_started.insert("github-releases", Instant::now());
+        announced.insert(GROUP_GITHUB_RELEASES);
+        group_started.insert(GROUP_GITHUB_RELEASES, Instant::now());
         if release_prefetch_total > 0 {
-            progress.phase(Phase {
-                group: "github-releases",
-                key: "github-release-metadata",
-                status: "running",
-                label: group_label("github-releases"),
-                detail: "fetching GitHub release metadata",
-                done: 0,
-                total: release_prefetch_total,
-            })?;
+            progress.phase(running_phase(
+                PHASE_GITHUB_RELEASE_METADATA,
+                0,
+                release_prefetch_total,
+            ))?;
         }
     }
     let release_prefetch = update_release::prefetch(&release_entries, context, options, progress)?;
     if !release_entries.is_empty() {
-        progress.phase(Phase {
-            group: "github-releases",
-            key: group_phase("github-releases"),
-            status: "running",
-            label: group_label("github-releases"),
-            detail: group_detail("github-releases"),
-            done: 0,
-            total: release_entries.len(),
-        })?;
+        progress.phase(phase_for_group(
+            GROUP_GITHUB_RELEASES,
+            0,
+            release_entries.len(),
+        ))?;
     }
 
     let builtin_entries = entries
         .iter()
-        .filter(|entry| entry.method != "pkg" && entry.method != "custom")
+        .filter(|entry| method::active_non_package_builtin(entry))
         .filter(|entry| active(entry, context.env))
         .collect::<Vec<_>>();
 
@@ -513,15 +760,7 @@ where
                     let group = group_for_method(&builtin_entries[index].method);
                     if announced.insert(group) {
                         group_started.insert(group, Instant::now());
-                        progress.phase(Phase {
-                            group,
-                            key: group_phase(group),
-                            status: "running",
-                            label: group_label(group),
-                            detail: group_detail(group),
-                            done: 0,
-                            total: group_totals[group],
-                        })?;
+                        progress.phase(phase_for_group(group, 0, group_totals[group]))?;
                     }
                 }
                 jobs::ItemProgressEvent::Completed {
@@ -554,22 +793,14 @@ where
     }
 
     for entry in entries {
-        if entry.method != "custom" || !active(entry, context.env) {
+        if entry.method != method::CUSTOM || !active(entry, context.env) {
             continue;
         }
 
         let group = group_for_method(&entry.method);
         if announced.insert(group) {
             group_started.insert(group, Instant::now());
-            progress.phase(Phase {
-                group,
-                key: group_phase(group),
-                status: "running",
-                label: group_label(group),
-                detail: group_detail(group),
-                done: 0,
-                total: group_totals[group],
-            })?;
+            progress.phase(phase_for_group(group, 0, group_totals[group]))?;
         }
         let outcome = install_custom(
             entry,
@@ -623,16 +854,31 @@ fn advance_group(
     let done = group_done.entry(group).or_insert(0);
     *done += 1;
     let total = group_totals[group];
-    progress.phase(Phase {
-        group,
-        key: group_phase(group),
-        status: "running",
-        label: group_label(group),
-        detail: group_detail(group),
-        done: *done,
-        total,
-    })?;
+    progress.phase(phase_for_group(group, *done, total))?;
     Ok(*done >= total)
+}
+
+fn mark_queued_packages(
+    summary: &mut Summary,
+    successful_packages: &BTreeSet<String>,
+    failed_packages: &BTreeSet<String>,
+) {
+    for item in &mut summary.items {
+        if item.reason != ItemReason::PackageQueued {
+            continue;
+        }
+        if successful_packages.contains(&item.name) {
+            item.changed = true;
+            item.status = ItemStatus::Changed;
+            item.reason = ItemReason::Installed;
+            item.detail = "installed".to_owned();
+        } else if failed_packages.contains(&item.name) {
+            item.failed = true;
+            item.status = ItemStatus::Failed;
+            item.reason = ItemReason::InstallFailed;
+            item.detail = "package install failed".to_owned();
+        }
+    }
 }
 
 fn finish_group(summary: &mut Summary, group: &'static str, started: Instant) {
@@ -645,7 +891,7 @@ fn finish_group(summary: &mut Summary, group: &'static str, started: Instant) {
 fn group_totals(entries: &[Entry], env: &RuntimeEnv) -> BTreeMap<&'static str, usize> {
     let mut totals = BTreeMap::new();
     for entry in entries {
-        if entry.method == "pkg" || !active(entry, env) {
+        if entry.method == method::PKG || !active(entry, env) {
             continue;
         }
         *totals.entry(group_for_method(&entry.method)).or_insert(0) += 1;
@@ -656,56 +902,86 @@ fn group_totals(entries: &[Entry], env: &RuntimeEnv) -> BTreeMap<&'static str, u
 /// Returns the display/progress group for an update method.
 pub fn group_for_method(method: &str) -> &'static str {
     match method {
-        "pkg" => "packages",
-        "github:release" => "github-releases",
-        "github:repo" => "github-repos",
-        "cargo" => "cargo",
-        "go" => "go",
-        "uv" => "uv",
-        "npm" => "npm",
-        "custom" => "custom",
-        _ => "other",
+        method::PKG => GROUP_PACKAGES,
+        method::GITHUB_RELEASE => GROUP_GITHUB_RELEASES,
+        method::GITHUB_REPO => GROUP_GITHUB_REPOS,
+        method::CARGO => GROUP_CARGO,
+        method::GO => GROUP_GO,
+        method::UV => GROUP_UV,
+        method::NPM => GROUP_NPM,
+        method::CUSTOM => GROUP_CUSTOM,
+        _ => GROUP_OTHER,
     }
 }
 
-fn group_detail(group: &str) -> &'static str {
+pub(crate) fn phase_key_for_group(group: &str) -> &'static str {
+    group_spec(group).key
+}
+
+pub(crate) fn display_group_for_update_group(group: &str) -> &'static str {
+    group_spec(group).dashboard_group
+}
+
+pub(crate) fn label_for_display_group(group: &str) -> &'static str {
     match group {
-        "packages" => "checking package deps",
-        "github-releases" => "checking GitHub release installs",
-        "github-repos" => "checking GitHub repo installs",
-        "cargo" => "checking cargo deps",
-        "go" => "checking go deps",
-        "uv" => "checking uv deps",
-        "npm" => "checking npm deps",
-        "custom" => "checking custom deps",
-        _ => "checking dependencies",
+        DASH_METHOD_RESOLUTION => phase_spec(PHASE_GITHUB_METHODS).label,
+        DASH_GITHUB => group_spec(GROUP_GITHUB_RELEASES).label,
+        _ => group_spec(group).label,
     }
 }
 
-fn group_phase(group: &str) -> &'static str {
-    match group {
-        "packages" => "packages",
-        "github-releases" => "github-release-installs",
-        "github-repos" => "github-repos",
-        "cargo" => "cargo",
-        "go" => "go",
-        "uv" => "uv",
-        "npm" => "npm",
-        "custom" => "custom",
-        _ => "other-progress",
-    }
+pub(crate) fn update_group_order() -> &'static [&'static str] {
+    &[
+        GROUP_PACKAGES,
+        GROUP_GITHUB_RELEASES,
+        GROUP_GITHUB_REPOS,
+        GROUP_CARGO,
+        GROUP_GO,
+        GROUP_UV,
+        GROUP_NPM,
+        GROUP_CUSTOM,
+        GROUP_OTHER,
+    ]
 }
 
-fn group_label(group: &str) -> &'static str {
-    match group {
-        "packages" => "Packages",
-        "github-releases" | "github-repos" => "GitHub",
-        "cargo" => "Cargo",
-        "go" => "Go",
-        "uv" => "UV",
-        "npm" => "NPM",
-        "custom" => "Custom",
-        _ => "Other",
+pub(crate) fn dashboard_group_order() -> &'static [&'static str] {
+    &[
+        GROUP_PACKAGES,
+        DASH_GITHUB,
+        GROUP_CARGO,
+        GROUP_GO,
+        GROUP_UV,
+        GROUP_NPM,
+        GROUP_CUSTOM,
+        GROUP_OTHER,
+    ]
+}
+
+pub(crate) fn dashboard_stage_order() -> &'static [&'static str] {
+    &[
+        DASH_METHOD_RESOLUTION,
+        GROUP_PACKAGES,
+        DASH_GITHUB,
+        GROUP_CARGO,
+        GROUP_GO,
+        GROUP_UV,
+        GROUP_NPM,
+        GROUP_CUSTOM,
+        GROUP_OTHER,
+    ]
+}
+
+pub(crate) fn dashboard_stage_index(stage: &str) -> usize {
+    match stage {
+        DASH_METHOD_RESOLUTION => 0,
+        GROUP_PACKAGES => 1,
+        DASH_GITHUB => 2,
+        GROUP_CARGO => 3,
+        GROUP_GO => 4,
+        GROUP_UV => 5,
+        GROUP_NPM => 6,
+        GROUP_CUSTOM => 7,
+        _ => 8,
     }
 }
 
@@ -738,37 +1014,35 @@ where
     R: Runner + Sync,
 {
     let result = match entry.method.as_str() {
-        "github:release" => {
+        method::GITHUB_RELEASE => {
             update_transition::install_with_prepared(entry, transition, context.roots, || {
                 update_release::install_with_prefetch(entry, context, options, release_prefetch)
             })
         }
-        "github:repo" => {
+        method::GITHUB_REPO => {
             update_transition::install_with_prepared(entry, transition, context.roots, || {
                 update_repo::install(entry, context, options)
             })
         }
-        "cargo" | "go" | "uv" | "npm" => {
+        candidate if method::requires_external_plan(candidate) => {
             update_transition::install_with_prepared(entry, transition, context.roots, || {
                 update_external::install(entry, context, options)
             })
         }
-        method => Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: true,
-            detail: format!("{method} update is not implemented yet"),
-        }),
+        method => Ok(Item::failed(
+            entry.name.clone(),
+            ItemReason::UnsupportedMethod,
+            format!("{method} update is not implemented yet"),
+        )),
     };
 
     let item = match result {
         Ok(item) => item,
-        Err(error) => Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: true,
-            detail: error.to_string(),
-        },
+        Err(error) => Item::failed(
+            entry.name.clone(),
+            ItemReason::InstallFailed,
+            error.to_string(),
+        ),
     };
 
     let cleanup_leftover = if item.failed {
@@ -793,7 +1067,7 @@ fn successful_custom(
 ) -> Result<CustomOutcome> {
     manifest::upsert(
         manifest_path,
-        ManifestEntry::new(&entry.name, "custom", &entry.cmd, ""),
+        ManifestEntry::new(&entry.name, method::CUSTOM, &entry.cmd, ""),
     )?;
 
     let cleanup_leftover = match transition {
@@ -802,11 +1076,10 @@ fn successful_custom(
     };
 
     Ok(CustomOutcome {
-        item: Item {
-            name: entry.name.clone(),
-            changed,
-            failed: false,
-            detail,
+        item: if changed {
+            Item::changed(entry.name.clone(), ItemReason::Installed, detail)
+        } else {
+            Item::current(entry.name.clone(), ItemReason::Installed, detail)
         },
         cleanup_leftover,
         marked: Vec::new(),
@@ -885,23 +1158,21 @@ fn install_custom(
         }
         Install::MissingHook | Install::MissingFunction | Install::SourceFailed => {
             Ok(CustomOutcome {
-                item: Item {
-                    name: entry.name.clone(),
-                    changed: false,
-                    failed: false,
-                    detail: "custom hook missing or unusable".to_owned(),
-                },
+                item: Item::skipped(
+                    entry.name.clone(),
+                    ItemReason::CustomUnavailable,
+                    "custom hook missing or unusable",
+                ),
                 cleanup_leftover: false,
                 marked,
             })
         }
         Install::Failed => Ok(CustomOutcome {
-            item: Item {
-                name: entry.name.clone(),
-                changed: false,
-                failed: true,
-                detail: "custom install failed".to_owned(),
-            },
+            item: Item::failed(
+                entry.name.clone(),
+                ItemReason::CustomInstallFailed,
+                "custom install failed",
+            ),
             cleanup_leftover: false,
             marked,
         }),
@@ -988,6 +1259,8 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PhaseRecord {
+        key: &'static str,
+        label: String,
         detail: String,
         done: usize,
         total: usize,
@@ -1001,6 +1274,8 @@ mod tests {
     impl super::Progress for RecordingProgress {
         fn phase(&mut self, phase: super::Phase<'_>) -> crate::Result<()> {
             self.phases.push(PhaseRecord {
+                key: phase.key,
+                label: phase.label.to_owned(),
                 detail: phase.detail.to_owned(),
                 done: phase.done,
                 total: phase.total,
@@ -1741,7 +2016,9 @@ install() { return 42; }
         .unwrap();
 
         assert_eq!(summary.items.len(), 2);
-        assert!(summary.items.iter().all(|item| item.detail == "installed"));
+        assert!(summary.items.iter().all(|item| {
+            item.status == super::ItemStatus::Current && item.reason == super::ItemReason::Installed
+        }));
         assert!(
             !runner
                 .calls()
@@ -2213,17 +2490,17 @@ version() { printf 'saw-pkg\n'; }
         let cargo_start = progress
             .phases
             .iter()
-            .position(|phase| phase.detail == "checking cargo deps" && phase.done == 0)
+            .position(|phase| phase.key == super::PHASE_CARGO && phase.done == 0)
             .unwrap();
         let cargo_done = progress
             .phases
             .iter()
-            .position(|phase| phase.detail == "checking cargo deps" && phase.done == 1)
+            .position(|phase| phase.key == super::PHASE_CARGO && phase.done == 1)
             .unwrap();
         let go_start = progress
             .phases
             .iter()
-            .position(|phase| phase.detail == "checking go deps" && phase.done == 0)
+            .position(|phase| phase.key == super::PHASE_GO && phase.done == 0)
             .unwrap();
 
         assert!(!summary.has_errors());
@@ -2233,7 +2510,7 @@ version() { printf 'saw-pkg\n'; }
             progress
                 .phases
                 .iter()
-                .map(|phase| (&phase.detail, phase.done, phase.total))
+                .map(|phase| (&phase.key, phase.done, phase.total))
                 .collect::<Vec<_>>()
         );
     }
@@ -2834,7 +3111,7 @@ version() { printf 'saw-pkg\n'; }
         let metadata_progress = progress
             .phases
             .iter()
-            .filter(|phase| phase.detail == "fetching GitHub release metadata")
+            .filter(|phase| phase.key == super::PHASE_GITHUB_RELEASE_METADATA)
             .map(|phase| (phase.done, phase.total))
             .collect::<Vec<_>>();
 
@@ -2893,7 +3170,7 @@ version() { printf 'saw-pkg\n'; }
         let metadata_progress = progress
             .phases
             .iter()
-            .filter(|phase| phase.detail == "fetching GitHub release metadata")
+            .filter(|phase| phase.key == super::PHASE_GITHUB_RELEASE_METADATA)
             .map(|phase| (phase.done, phase.total))
             .collect::<Vec<_>>();
 
@@ -2960,7 +3237,7 @@ version() { printf 'saw-pkg\n'; }
         let version_progress = progress
             .phases
             .iter()
-            .filter(|phase| phase.detail == "checking current GitHub release versions")
+            .filter(|phase| phase.key == super::PHASE_GITHUB_RELEASE_VERSIONS)
             .map(|phase| (phase.done, phase.total))
             .collect::<Vec<_>>();
         let asset_count = fixture

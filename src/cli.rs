@@ -21,6 +21,7 @@ use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::http::Curl;
 use crate::jobs;
 use crate::manifest::{self, Manifest};
+use crate::method;
 use crate::process::{self, Process};
 use crate::prune::{self, Options as PruneOptions};
 use crate::runtime::{self, Overrides, ProcessEnv};
@@ -329,7 +330,7 @@ where
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let entries =
         resolve_github_entries(&entries, &roots, Some(&manifest), &env, &env_vars, options)?;
-    let package_versions = if entries.iter().any(|entry| entry.method == "pkg") {
+    let package_versions = if entries.iter().any(|entry| entry.method == method::PKG) {
         process::package_versions(&Process, &pkg_mgr)
     } else {
         BTreeMap::new()
@@ -377,7 +378,7 @@ where
     };
 
     let probe_entry = config::parse_entry(raw_entry, None);
-    let pkg_mgr = if probe_entry.method == "pkg" {
+    let pkg_mgr = if probe_entry.method == method::PKG {
         process::detect_package_manager(&Process)
     } else {
         String::new()
@@ -394,7 +395,7 @@ where
     let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let entry = resolve_github_entry(&entry, &roots, Some(&manifest), &env, &env_vars, options)?;
-    let package_versions = if entry.method == "pkg" {
+    let package_versions = if entry.method == method::PKG {
         process::package_versions(&Process, &pkg_mgr)
     } else {
         BTreeMap::new()
@@ -645,7 +646,7 @@ fn update_prerequisite_error(
     ))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum UpdatePrerequisitePhase {
     /// Checks tools needed before bare `github` methods have concrete owners.
     Initial,
@@ -669,49 +670,18 @@ fn update_prerequisites(
         if !update::active(entry, env) {
             continue;
         }
-        for prereq in prerequisites_for_method(&entry.method, phase) {
-            required.entry(prereq.command).or_insert(*prereq);
+        if let Some(prereq) =
+            method::prerequisite(&entry.method, phase == UpdatePrerequisitePhase::Initial)
+        {
+            required
+                .entry(prereq.command)
+                .or_insert(UpdatePrerequisite {
+                    command: prereq.command,
+                    reason: prereq.reason,
+                });
         }
     }
     required.into_values().collect()
-}
-
-fn prerequisites_for_method(
-    method: &str,
-    phase: UpdatePrerequisitePhase,
-) -> &'static [UpdatePrerequisite] {
-    match (method, phase) {
-        ("github", UpdatePrerequisitePhase::Initial) => &[UpdatePrerequisite {
-            command: "curl",
-            reason: "GitHub release metadata and downloads",
-        }],
-        ("github", UpdatePrerequisitePhase::ConcreteOnly) => &[],
-        ("github:release", _) => &[UpdatePrerequisite {
-            command: "curl",
-            reason: "GitHub release metadata and downloads",
-        }],
-        ("github:repo", _) => &[UpdatePrerequisite {
-            command: "git",
-            reason: "GitHub repo installs",
-        }],
-        ("cargo", _) => &[UpdatePrerequisite {
-            command: "cargo",
-            reason: "cargo installs",
-        }],
-        ("go", _) => &[UpdatePrerequisite {
-            command: "go",
-            reason: "go installs",
-        }],
-        ("uv", _) => &[UpdatePrerequisite {
-            command: "uv",
-            reason: "uv installs",
-        }],
-        ("npm", _) => &[UpdatePrerequisite {
-            command: "npm",
-            reason: "npm installs",
-        }],
-        _ => &[],
-    }
 }
 
 struct JsonlProgress<'a, W>
@@ -793,7 +763,7 @@ where
                 .into_iter()
                 .map(|stage| TtyProgressRow {
                     stage: stage.stage,
-                    label: progress_label_for_stage(stage.stage),
+                    label: progress_label(update::label_for_display_group(stage.stage)),
                     started: None,
                     elapsed_ms: None,
                     done: 0,
@@ -839,7 +809,7 @@ where
 
     fn final_rows(&self, summary: &update::Summary, entries: &[Entry]) -> Vec<RenderedTtyRow> {
         let mut summaries = BTreeMap::new();
-        for group in dashboard_group_order() {
+        for group in update::dashboard_group_order().iter().copied() {
             let items = summary
                 .items
                 .iter()
@@ -856,7 +826,7 @@ where
                     status: update_status(counts).to_owned(),
                     detail: format!(
                         "{}: {}",
-                        dashboard_group_label(group),
+                        update::label_for_display_group(group),
                         update_count_summary(counts)
                     ),
                     elapsed: elapsed_label_ms(elapsed_ms),
@@ -942,8 +912,9 @@ where
     }
 
     fn progress_row(&mut self, label: &str, phase: &str, done: usize, total: usize) -> Result<()> {
-        let stage = progress_stage(phase);
-        let component = progress_component(phase);
+        let spec = update::phase_spec(phase);
+        let stage = spec.dashboard_stage;
+        let component = spec.component;
         let label = progress_label(label);
         let index = match self.rows.iter().position(|row| row.stage == stage) {
             Some(index) => index,
@@ -998,7 +969,7 @@ where
 
     fn ordered_rows(&self) -> Vec<&TtyProgressRow> {
         let mut rows = self.rows.iter().collect::<Vec<_>>();
-        rows.sort_by_key(|row| progress_stage_index(row.stage));
+        rows.sort_by_key(|row| update::dashboard_stage_index(row.stage));
         rows
     }
 
@@ -1343,15 +1314,11 @@ fn resolve_github_entries_with_progress_sink(
         options,
         jobs::github_max(env_vars),
         |done, total| {
-            progress.phase(update::Phase {
-                group: "github-methods",
-                key: "github-methods",
-                status: "running",
-                label: "Resolve sources",
-                detail: "resolving GitHub methods",
+            progress.phase(update::running_phase(
+                update::PHASE_GITHUB_METHODS,
                 done,
                 total,
-            })
+            ))
         },
     )
 }
@@ -1385,15 +1352,7 @@ where
         |done, total| {
             update::Progress::phase(
                 &mut progress,
-                update::Phase {
-                    group: "github-methods",
-                    key: "github-methods",
-                    status: "running",
-                    label: "Resolve sources",
-                    detail: "resolving GitHub methods",
-                    done,
-                    total,
-                },
+                update::running_phase(update::PHASE_GITHUB_METHODS, done, total),
             )
         },
     )
@@ -1602,7 +1561,7 @@ where
     E: Write,
 {
     let mut item_failures = std::collections::BTreeSet::new();
-    for group in dashboard_group_order() {
+    for group in update::dashboard_group_order().iter().copied() {
         let items = summary
             .items
             .iter()
@@ -1611,7 +1570,7 @@ where
         if items.is_empty() {
             continue;
         }
-        write_group(stdout, dashboard_group_label(group))?;
+        write_group(stdout, update::label_for_display_group(group))?;
         for item in items {
             if item.failed {
                 item_failures.insert(item.name.as_str());
@@ -1647,103 +1606,33 @@ fn terminal_progress_plan(
     entries: &[Entry],
     env: &crate::platform::RuntimeEnv,
 ) -> Vec<TtyProgressStage> {
-    let active = |entry: &&Entry| update::active(entry, env);
-    let bare_github = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| entry.method == "github")
-        .count();
-    let packages = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| entry.method == "pkg")
-        .count();
-    let github = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| {
-            matches!(
-                entry.method.as_str(),
-                "github" | "github:release" | "github:repo"
-            )
-        })
-        .count();
-    let cargo = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| entry.method == "cargo")
-        .count();
-    let go = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| entry.method == "go")
-        .count();
-    let uv = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| entry.method == "uv")
-        .count();
-    let npm = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| entry.method == "npm")
-        .count();
-    let custom = entries
-        .iter()
-        .filter(active)
-        .filter(|entry| entry.method == "custom")
-        .count();
+    let mut totals = BTreeMap::<&'static str, usize>::new();
+    for entry in entries.iter().filter(|entry| update::active(entry, env)) {
+        if entry.method == method::GITHUB {
+            *totals.entry(update::DASH_METHOD_RESOLUTION).or_insert(0) += 1;
+            *totals.entry(update::DASH_GITHUB).or_insert(0) += 1;
+            continue;
+        }
 
-    let mut stages = Vec::new();
-    if bare_github > 0 {
-        stages.push(TtyProgressStage {
-            stage: "method-resolution",
-            total: bare_github,
-        });
+        if method::is_github_config(&entry.method) {
+            *totals.entry(update::DASH_GITHUB).or_insert(0) += 1;
+            continue;
+        }
+
+        let stage = update::display_group_for_update_group(update::group_for_method(&entry.method));
+        *totals.entry(stage).or_insert(0) += 1;
     }
-    if packages > 0 {
-        stages.push(TtyProgressStage {
-            stage: "packages",
-            total: packages,
-        });
-    }
-    if github > 0 {
-        stages.push(TtyProgressStage {
-            stage: "github",
-            total: github,
-        });
-    }
-    if cargo > 0 {
-        stages.push(TtyProgressStage {
-            stage: "cargo",
-            total: cargo,
-        });
-    }
-    if go > 0 {
-        stages.push(TtyProgressStage {
-            stage: "go",
-            total: go,
-        });
-    }
-    if uv > 0 {
-        stages.push(TtyProgressStage {
-            stage: "uv",
-            total: uv,
-        });
-    }
-    if npm > 0 {
-        stages.push(TtyProgressStage {
-            stage: "npm",
-            total: npm,
-        });
-    }
-    if custom > 0 {
-        stages.push(TtyProgressStage {
-            stage: "custom",
-            total: custom,
-        });
-    }
-    stages
+
+    update::dashboard_stage_order()
+        .iter()
+        .filter_map(|stage| {
+            totals
+                .get(stage)
+                .copied()
+                .filter(|total| *total > 0)
+                .map(|total| TtyProgressStage { stage, total })
+        })
+        .collect()
 }
 
 fn write_normal_group_summaries<W>(
@@ -1754,7 +1643,7 @@ fn write_normal_group_summaries<W>(
 where
     W: Write,
 {
-    for group in dashboard_group_order() {
+    for group in update::dashboard_group_order().iter().copied() {
         let items = summary
             .items
             .iter()
@@ -1776,7 +1665,7 @@ where
             status,
             &format!(
                 "{}: {}",
-                dashboard_group_label(group),
+                update::label_for_display_group(group),
                 update_count_summary(counts)
             ),
         )?;
@@ -1805,7 +1694,7 @@ where
     E: Write,
 {
     let mut item_failures = std::collections::BTreeSet::new();
-    for group in dashboard_group_order() {
+    for group in update::dashboard_group_order().iter().copied() {
         let items = summary
             .items
             .iter()
@@ -1814,7 +1703,7 @@ where
         if items.is_empty() {
             continue;
         }
-        write_group(stdout, dashboard_group_label(group))?;
+        write_group(stdout, update::label_for_display_group(group))?;
         for item in items {
             if item.failed {
                 item_failures.insert(item.name.as_str());
@@ -1856,69 +1745,23 @@ where
     Ok(())
 }
 
-fn update_group_order() -> [&'static str; 9] {
-    [
-        "packages",
-        "github-releases",
-        "github-repos",
-        "cargo",
-        "go",
-        "uv",
-        "npm",
-        "custom",
-        "other",
-    ]
-}
-
-fn dashboard_group_order() -> [&'static str; 8] {
-    [
-        "packages", "github", "cargo", "go", "uv", "npm", "custom", "other",
-    ]
-}
-
 fn group_for_name(entries: &[Entry], name: &str) -> &'static str {
     entries
         .iter()
         .find(|entry| entry.name == name)
         .map(|entry| update::group_for_method(&entry.method))
-        .unwrap_or("other")
+        .unwrap_or(update::GROUP_OTHER)
 }
 
 fn dashboard_group_for_name(entries: &[Entry], name: &str) -> &'static str {
-    display_group_for_update_group(group_for_name(entries, name))
-}
-
-fn dashboard_group_label(group: &str) -> &'static str {
-    match group {
-        "packages" => "Packages",
-        "github" => "GitHub",
-        "cargo" => "Cargo",
-        "go" => "Go",
-        "uv" => "UV",
-        "npm" => "NPM",
-        "custom" => "Custom",
-        _ => "Other",
-    }
-}
-
-fn display_group_for_update_group(group: &str) -> &'static str {
-    match group {
-        "github-releases" | "github-repos" => "github",
-        "custom" => "custom",
-        "packages" => "packages",
-        "cargo" => "cargo",
-        "go" => "go",
-        "uv" => "uv",
-        "npm" => "npm",
-        _ => "other",
-    }
+    update::display_group_for_update_group(group_for_name(entries, name))
 }
 
 fn dashboard_elapsed_ms(summary: &update::Summary, group: &str) -> u128 {
     summary
         .groups
         .iter()
-        .filter(|summary| display_group_for_update_group(summary.group) == group)
+        .filter(|summary| update::display_group_for_update_group(summary.group) == group)
         .map(|summary| summary.elapsed_ms)
         .max()
         .unwrap_or(0)
@@ -1959,7 +1802,7 @@ where
         .iter()
         .map(|group| (group.group, group.elapsed_ms))
         .collect::<BTreeMap<_, _>>();
-    for group in update_group_order() {
+    for group in update::update_group_order().iter().copied() {
         let items = summary
             .items
             .iter()
@@ -1972,7 +1815,7 @@ where
         progress.event(json!({
             "event": "group_summary",
             "group": group,
-            "label": dashboard_group_label(display_group_for_update_group(group)),
+            "label": update::label_for_display_group(update::display_group_for_update_group(group)),
             "status": update_status(counts),
             "changed": counts.changed,
             "current": counts.current,
@@ -1996,12 +1839,12 @@ fn update_counts(summary: &update::Summary, active_count: usize) -> UpdateCounts
     let changed = summary
         .items
         .iter()
-        .filter(|item| item.changed && !item.failed)
+        .filter(|item| item.status == update::ItemStatus::Changed)
         .count();
     let skipped = summary
         .items
         .iter()
-        .filter(|item| !item.failed && is_skipped_detail(&item.detail))
+        .filter(|item| item.status == update::ItemStatus::Skipped)
         .count();
     let failed = summary
         .failed
@@ -2020,13 +1863,16 @@ fn update_counts(summary: &update::Summary, active_count: usize) -> UpdateCounts
 fn update_counts_for_items(items: &[&update::Item]) -> UpdateCounts {
     let changed = items
         .iter()
-        .filter(|item| item.changed && !item.failed)
+        .filter(|item| item.status == update::ItemStatus::Changed)
         .count();
     let skipped = items
         .iter()
-        .filter(|item| !item.failed && is_skipped_detail(&item.detail))
+        .filter(|item| item.status == update::ItemStatus::Skipped)
         .count();
-    let failed = items.iter().filter(|item| item.failed).count();
+    let failed = items
+        .iter()
+        .filter(|item| item.status == update::ItemStatus::Failed)
+        .count();
     let current = items.len().saturating_sub(changed + skipped + failed);
     UpdateCounts {
         changed,
@@ -2055,14 +1901,11 @@ fn update_count_summary(counts: UpdateCounts) -> String {
 }
 
 fn item_status(item: &update::Item) -> &'static str {
-    if item.failed {
-        "failed"
-    } else if is_skipped_detail(&item.detail) {
-        "skipped"
-    } else if item.changed {
-        "changed"
-    } else {
-        "ok"
+    match item.status {
+        update::ItemStatus::Changed => "changed",
+        update::ItemStatus::Skipped => "skipped",
+        update::ItemStatus::Failed => "failed",
+        update::ItemStatus::Current | update::ItemStatus::Pending => "ok",
     }
 }
 
@@ -2074,12 +1917,6 @@ fn update_status(counts: UpdateCounts) -> &'static str {
     } else {
         "ok"
     }
-}
-
-fn is_skipped_detail(detail: &str) -> bool {
-    detail.starts_with("skipped")
-        || detail == "not available"
-        || detail == "custom hook missing or unusable"
 }
 
 fn update_ok_summary(changed: usize, current: usize, skipped: usize) -> String {
@@ -2202,61 +2039,12 @@ fn progress_label(label: &str) -> String {
     format!("{label:<18}")
 }
 
-fn progress_label_for_stage(stage: &str) -> String {
-    let label = match stage {
-        "packages" => "Packages",
-        "method-resolution" => "Resolve sources",
-        "github" => "GitHub",
-        "cargo" => "Cargo",
-        "go" => "Go",
-        "uv" => "UV",
-        "npm" => "NPM",
-        "custom" => "Custom",
-        _ => "Other",
-    };
-    format!("{label:<18}")
-}
-
-fn progress_stage(phase: &str) -> &'static str {
-    match phase {
-        "packages" => "packages",
-        "github-methods" => "method-resolution",
-        "github-release-metadata" => "github",
-        "github-release-versions" => "github",
-        "github-release-installs" => "github",
-        "github-repos" => "github",
-        "cargo" => "cargo",
-        "go" => "go",
-        "uv" => "uv",
-        "npm" => "npm",
-        "custom" => "custom",
-        _ => "other-progress",
-    }
-}
-
-fn progress_component(phase: &str) -> &'static str {
-    match phase {
-        "packages" => "packages",
-        "github-methods" => "github-methods",
-        "github-release-metadata" => "github-release-metadata",
-        "github-release-versions" => "github-release-versions",
-        "github-release-installs" => "github-release-installs",
-        "github-repos" => "github-repos",
-        "cargo" => "cargo",
-        "go" => "go",
-        "uv" => "uv",
-        "npm" => "npm",
-        "custom" => "custom",
-        _ => "other-progress",
-    }
-}
-
 fn progress_done(row: &TtyProgressRow) -> usize {
-    let done = if row.stage == "github" {
+    let done = if row.stage == update::DASH_GITHUB {
         let release_done = [
-            "github-release-metadata",
-            "github-release-versions",
-            "github-release-installs",
+            update::PHASE_GITHUB_RELEASE_METADATA,
+            update::PHASE_GITHUB_RELEASE_VERSIONS,
+            update::PHASE_GITHUB_RELEASE_INSTALLS,
         ]
         .into_iter()
         .filter_map(|component| row.components.get(component).map(|(done, _)| *done))
@@ -2264,7 +2052,7 @@ fn progress_done(row: &TtyProgressRow) -> usize {
         .unwrap_or(0);
         let repo_done = row
             .components
-            .get("github-repos")
+            .get(update::PHASE_GITHUB_REPOS)
             .map(|(done, _)| *done)
             .unwrap_or(0);
         release_done + repo_done
@@ -2282,14 +2070,14 @@ fn progress_complete(row: &TtyProgressRow) -> bool {
     if row.total == 0 || row.done < row.total {
         return false;
     }
-    if row.stage != "github" {
+    if row.stage != update::DASH_GITHUB {
         return true;
     }
 
     let release_expected = [
-        "github-release-metadata",
-        "github-release-versions",
-        "github-release-installs",
+        update::PHASE_GITHUB_RELEASE_METADATA,
+        update::PHASE_GITHUB_RELEASE_VERSIONS,
+        update::PHASE_GITHUB_RELEASE_INSTALLS,
     ]
     .into_iter()
     .filter_map(|component| row.components.get(component).map(|(_, total)| *total))
@@ -2297,31 +2085,17 @@ fn progress_complete(row: &TtyProgressRow) -> bool {
     .unwrap_or(0);
     let release_done = row
         .components
-        .get("github-release-installs")
+        .get(update::PHASE_GITHUB_RELEASE_INSTALLS)
         .map(|(done, _)| *done)
         .unwrap_or(0);
 
     release_expected == 0 || release_done >= release_expected
 }
 
-fn progress_stage_index(stage: &str) -> usize {
-    match stage {
-        "method-resolution" => 0,
-        "packages" => 1,
-        "github" => 2,
-        "cargo" => 3,
-        "go" => 4,
-        "uv" => 5,
-        "npm" => 6,
-        "custom" => 7,
-        _ => 8,
-    }
-}
-
 fn progress_done_detail(stage: &str, label: &str, total: usize) -> String {
     let label = label.trim();
     let action = match stage {
-        "method-resolution" => "resolved",
+        update::DASH_METHOD_RESOLUTION => "resolved",
         _ => "checked",
     };
     format!("{label}: {total} {action}")
@@ -2393,12 +2167,12 @@ where
 {
     for item in items {
         match item.hook {
-            Uninstall::MissingHook if item.entry.method == "custom" => writeln!(
+            Uninstall::MissingHook if item.entry.method == method::CUSTOM => writeln!(
                 stderr,
                 "  warning: {} hook file missing — manual cleanup may be needed",
                 item.entry.name
             )?,
-            Uninstall::MissingFunction if item.entry.method == "custom" => writeln!(
+            Uninstall::MissingFunction if item.entry.method == method::CUSTOM => writeln!(
                 stderr,
                 "  warning: {} has no uninstall() hook — manual cleanup may be needed",
                 item.entry.name
@@ -2648,7 +2422,7 @@ mod tests {
 
     use super::{run, source_checkout_dir_from_target};
     use crate::config::Entry;
-    use crate::update::{GroupSummary, Item, Summary};
+    use crate::update::{GroupSummary, Item, ItemReason, Summary};
     use crate::version;
 
     #[test]
@@ -2788,8 +2562,14 @@ mod tests {
             "Resolve sources   "
         );
         assert_eq!(super::progress_label("GitHub"), "GitHub            ");
-        assert_eq!(super::progress_stage("github-release-metadata"), "github");
-        assert_eq!(super::progress_stage("github-repos"), "github");
+        assert_eq!(
+            crate::update::phase_spec(crate::update::PHASE_GITHUB_RELEASE_METADATA).dashboard_stage,
+            crate::update::DASH_GITHUB
+        );
+        assert_eq!(
+            crate::update::phase_spec(crate::update::PHASE_GITHUB_REPOS).dashboard_stage,
+            crate::update::DASH_GITHUB
+        );
     }
 
     #[test]
@@ -2803,12 +2583,7 @@ mod tests {
     #[test]
     fn terminal_summary_omits_aggregate_status_line() {
         let summary = Summary {
-            items: vec![Item {
-                name: "jq".to_owned(),
-                changed: false,
-                failed: false,
-                detail: "current".to_owned(),
-            }],
+            items: vec![Item::current("jq", ItemReason::Installed, "current")],
             ..Summary::default()
         };
         let entries = vec![Entry {
@@ -2845,12 +2620,7 @@ mod tests {
             filter: String::new(),
         }];
         let summary = Summary {
-            items: vec![Item {
-                name: "widget".to_owned(),
-                changed: false,
-                failed: false,
-                detail: "current".to_owned(),
-            }],
+            items: vec![Item::current("widget", ItemReason::Installed, "current")],
             groups: vec![GroupSummary {
                 group: "custom",
                 elapsed_ms: 0,
@@ -2893,12 +2663,7 @@ mod tests {
             filter: String::new(),
         }];
         let summary = Summary {
-            items: vec![Item {
-                name: "widget".to_owned(),
-                changed: false,
-                failed: false,
-                detail: "current".to_owned(),
-            }],
+            items: vec![Item::current("widget", ItemReason::Installed, "current")],
             groups: vec![GroupSummary {
                 group: "custom",
                 elapsed_ms: 0,
@@ -2941,11 +2706,21 @@ mod tests {
             );
             progress.start().unwrap();
             progress
-                .progress_row("GitHub", "github-release-metadata", 15, 15)
+                .progress_row(
+                    "GitHub",
+                    crate::update::PHASE_GITHUB_RELEASE_METADATA,
+                    15,
+                    15,
+                )
                 .unwrap();
             let metadata_done = progress.rows[0].done;
             progress
-                .progress_row("GitHub", "github-release-installs", 0, 15)
+                .progress_row(
+                    "GitHub",
+                    crate::update::PHASE_GITHUB_RELEASE_INSTALLS,
+                    0,
+                    15,
+                )
                 .unwrap();
 
             assert_eq!(metadata_done, 15);
@@ -2956,7 +2731,7 @@ mod tests {
             assert_eq!(progress.live_rows()[0].status, "⠴");
 
             progress
-                .progress_row("GitHub", "github-repos", 13, 13)
+                .progress_row("GitHub", crate::update::PHASE_GITHUB_REPOS, 13, 13)
                 .unwrap();
             assert_eq!(progress.rows[0].done, 28);
             assert_eq!(
@@ -2966,7 +2741,12 @@ mod tests {
             );
 
             progress
-                .progress_row("GitHub", "github-release-installs", 15, 15)
+                .progress_row(
+                    "GitHub",
+                    crate::update::PHASE_GITHUB_RELEASE_INSTALLS,
+                    15,
+                    15,
+                )
                 .unwrap();
             assert_eq!(progress.rows[0].done, 28);
             assert_eq!(progress.live_rows()[0].status, "ok");

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::config::{self, Entry};
 use crate::manifest;
+use crate::method;
 use crate::platform::{self, RuntimeEnv};
 
 /// Filesystem/config roots used to resolve dependency paths.
@@ -110,9 +111,9 @@ pub fn find_entry(target: &str, conf_dir: &Path, env: &RuntimeEnv) -> Result<Opt
 
 fn root_for_entry(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
     match entry.method.as_str() {
-        "github" => github_root(entry, roots),
-        "github:repo" => repo_root(entry, roots),
-        "github:release" | "cargo" | "go" | "uv" | "npm" => install_root(entry, roots),
+        method::GITHUB => github_root(entry, roots),
+        method::GITHUB_REPO => repo_root(entry, roots),
+        binary if method::is_binary_install_root(binary) => install_root(entry, roots),
         _ => None,
     }
 }
@@ -129,8 +130,8 @@ fn github_root(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
         .and_then(|manifest| manifest.get(&entry.name).map(|entry| entry.method.clone()))
     {
         return match method.as_str() {
-            "github:repo" => repo_root(entry, roots),
-            "github:release" => install_root(entry, roots),
+            method::GITHUB_REPO => repo_root(entry, roots),
+            method::GITHUB_RELEASE => install_root(entry, roots),
             _ => None,
         };
     }

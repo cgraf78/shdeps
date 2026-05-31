@@ -16,7 +16,7 @@ use crate::manifest::{self, ManifestEntry};
 use crate::pkg::CommandSpec;
 use crate::process::{self, Output, Runner};
 use crate::stamp;
-use crate::update::{Context, Item, Options, detail_with_action, verbose_enabled};
+use crate::update::{Context, Item, ItemReason, Options, detail_with_action, verbose_enabled};
 
 pub(crate) fn install(
     entry: &Entry,
@@ -29,12 +29,11 @@ pub(crate) fn install(
         &entry.cmd,
         &context.roots.install_dir,
     ) else {
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: true,
-            detail: "unsupported external method".to_owned(),
-        });
+        return Ok(Item::failed(
+            entry.name.clone(),
+            ItemReason::UnsupportedMethod,
+            "unsupported external method",
+        ));
     };
 
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, &entry.method);
@@ -48,21 +47,15 @@ pub(crate) fn install(
         } else {
             "fresh".to_owned()
         };
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: false,
-            detail,
-        });
+        return Ok(Item::current(entry.name.clone(), ItemReason::Fresh, detail));
     }
 
     if !context.runner.exists(&plan.tool) {
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: true,
-            detail: format!("{} not found", plan.tool),
-        });
+        return Ok(Item::failed(
+            entry.name.clone(),
+            ItemReason::MissingTool,
+            format!("{} not found", plan.tool),
+        ));
     }
 
     let already_installed = process::executable_path(&plan.bin_path);
@@ -93,21 +86,19 @@ pub(crate) fn install(
         //    `install_root`) untouched.
         remove_dir_if_real_dir(&plan.install_root.join("bin"));
         remove_dir_if_real_dir(&plan.install_root);
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: true,
-            detail: format!("{} install failed", plan.tool),
-        });
+        return Ok(Item::failed(
+            entry.name.clone(),
+            ItemReason::InstallFailed,
+            format!("{} install failed", plan.tool),
+        ));
     }
 
     if !process::executable_path(&plan.bin_path) {
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: true,
-            detail: "install produced no binary".to_owned(),
-        });
+        return Ok(Item::failed(
+            entry.name.clone(),
+            ItemReason::MissingBinary,
+            "install produced no binary",
+        ));
     }
 
     bin_link::one(&context.roots.bin_dir, &entry.cmd, &plan.bin_path)?;
@@ -142,11 +133,10 @@ pub(crate) fn install(
         version.unwrap_or_else(|| "installed".to_owned())
     };
 
-    Ok(Item {
-        name: entry.name.clone(),
-        changed,
-        failed: false,
-        detail,
+    Ok(if changed {
+        Item::changed(entry.name.clone(), ItemReason::Installed, detail)
+    } else {
+        Item::current(entry.name.clone(), ItemReason::Installed, detail)
     })
 }
 

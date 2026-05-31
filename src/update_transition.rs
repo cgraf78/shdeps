@@ -15,6 +15,7 @@ use crate::cleanup;
 use crate::config::{self, Entry};
 use crate::link_state::{self, Kind};
 use crate::manifest::{self, Manifest, ManifestEntry};
+use crate::method;
 use crate::runtime::Roots;
 use crate::update::Item;
 
@@ -114,12 +115,9 @@ fn prepare_public_bin(
         return Ok(None);
     };
 
-    if transition.old.method != "github:release"
+    if transition.old.method != method::GITHUB_RELEASE
         || transition.old.cmd != entry.cmd
-        || !matches!(
-            entry.method.as_str(),
-            "github:repo" | "cargo" | "go" | "uv" | "npm"
-        )
+        || !method::is_symlink_install_root(&entry.method)
     {
         return Ok(None);
     }
@@ -177,12 +175,12 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
     let preserve = preserve_paths(entry, roots);
 
     match transition.old.method.as_str() {
-        "pkg" => {
+        method::PKG => {
             // System packages are not shdeps-owned. Once another method has
             // succeeded, the manifest swap is enough; the OS package remains
             // available for anything else on the machine that might use it.
         }
-        "github:repo" => {
+        method::GITHUB_REPO => {
             unlink_snapshot(
                 &roots.state_dir,
                 &transition.old.name,
@@ -229,7 +227,7 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
             remove_any_unless_preserved(&legacy_bin, &preserve)?;
             remove_stamps(&roots.state_dir, &transition.old.name)?;
         }
-        "github:release" | "cargo" | "go" | "uv" | "npm" => {
+        binary if method::is_binary_install_root(binary) => {
             unlink_snapshot(
                 &roots.state_dir,
                 &transition.old.name,
@@ -246,7 +244,7 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
             }
             remove_stamps(&roots.state_dir, &transition.old.name)?;
         }
-        "custom" => remove_stamps(&roots.state_dir, &transition.old.name)?,
+        method::CUSTOM => remove_stamps(&roots.state_dir, &transition.old.name)?,
         _ => {}
     }
 
@@ -268,11 +266,11 @@ fn preserve_paths(entry: &Entry, roots: &Roots) -> BTreeSet<PathBuf> {
     }
 
     match entry.method.as_str() {
-        "github:repo" | "cargo" | "go" | "uv" | "npm" => {
+        symlink if method::is_symlink_install_root(symlink) => {
             preserve.insert(roots.bin_dir.join(&entry.cmd));
             preserve.insert(roots.install_dir.join(&entry.name));
         }
-        "github:release" => {
+        method::GITHUB_RELEASE => {
             let public_bin = roots.bin_dir.join(&entry.cmd);
             preserve.insert(public_bin.clone());
 

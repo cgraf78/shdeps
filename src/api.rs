@@ -18,6 +18,7 @@ use crate::errors::Error;
 use crate::extras;
 use crate::http::Curl;
 use crate::link_state::{self, Kind};
+use crate::method;
 use crate::pkg::{self, CommandSpec};
 use crate::platform;
 use crate::process::{self, Process, Runner};
@@ -230,8 +231,8 @@ where
 {
     let roots = runtime::roots(&ProcessEnv, overrides);
     let runtime_env = runtime::runtime_env(&ProcessEnv);
-    let name = config::canonical_name(name, "github:release");
-    let repo = config::canonical_name(repo.unwrap_or(&name), "github:release");
+    let name = config::canonical_name(name, method::GITHUB_RELEASE);
+    let repo = config::canonical_name(repo.unwrap_or(&name), method::GITHUB_RELEASE);
     // Apply the same basename validator the config-side `parse_entry`
     // path uses (see `config::valid_cmd_basename`). Without this guard
     // the hidden API would be a second, looser entry point: a hook —

@@ -35,6 +35,7 @@ pub mod install_metadata;
 pub mod jobs;
 pub mod link_state;
 pub mod manifest;
+mod method;
 pub mod package_cache;
 pub mod pkg;
 pub mod platform;
