@@ -124,36 +124,41 @@ pub struct Summary {
 /// Progress sink for user-facing update renderers.
 ///
 /// The updater owns real phase knowledge (package cache, release prefetch,
-/// repo updates, language tools, hooks). Keeping progress events here lets the
-/// CLI render a live TTY view and lets parent commands consume
+/// repo updates, language tools, custom installs). Keeping progress events here
+/// lets the CLI render a live TTY view and lets parent commands consume
 /// machine-readable events without scraping prose.
 pub trait Progress {
     /// Reports that a phase is running or has advanced.
-    fn phase(
-        &mut self,
-        group: &'static str,
-        status: &'static str,
-        detail: &str,
-        done: usize,
-        total: usize,
-    ) -> Result<()>;
+    fn phase(&mut self, phase: Phase<'_>) -> Result<()>;
 
     /// Reports the final item status for one dependency.
     fn item(&mut self, group: &'static str, item: &Item) -> Result<()>;
+}
+
+/// One progress update for an update phase.
+#[derive(Debug, Clone, Copy)]
+pub struct Phase<'a> {
+    /// Stable machine group used for summaries.
+    pub group: &'static str,
+    /// Stable machine phase key used by renderers.
+    pub key: &'static str,
+    /// Phase status.
+    pub status: &'static str,
+    /// User-facing row label.
+    pub label: &'a str,
+    /// Descriptive detail for diagnostics.
+    pub detail: &'a str,
+    /// Completed units.
+    pub done: usize,
+    /// Total units.
+    pub total: usize,
 }
 
 /// Progress sink used by library callers that only need the final summary.
 pub struct NoProgress;
 
 impl Progress for NoProgress {
-    fn phase(
-        &mut self,
-        _group: &'static str,
-        _status: &'static str,
-        _detail: &str,
-        _done: usize,
-        _total: usize,
-    ) -> Result<()> {
+    fn phase(&mut self, _phase: Phase<'_>) -> Result<()> {
         Ok(())
     }
 
@@ -308,13 +313,15 @@ where
         .count();
     if active_package_entries {
         let group_started = Instant::now();
-        progress.phase(
-            "packages",
-            "running",
-            "checking package deps",
-            0,
-            package_total,
-        )?;
+        progress.phase(Phase {
+            group: "packages",
+            key: "packages",
+            status: "running",
+            label: group_label("packages"),
+            detail: "checking package deps",
+            done: 0,
+            total: package_total,
+        })?;
         let package_cache = if installable_package_count == 0 {
             package_cache::Status::Hit { count: 0 }
         } else {
@@ -327,17 +334,21 @@ where
             // replay the same per-entry "installed/skipped" items but avoid
             // package-manager probes and manifest rewrites. Non-package
             // methods still run normally below.
-            let mut package_done = 0usize;
-            for item in update_pkg::cached_items(entries, context) {
-                package_done += 1;
+            for (index, item) in update_pkg::cached_items(entries, context)
+                .into_iter()
+                .enumerate()
+            {
+                let package_done = index + 1;
                 progress.item("packages", &item)?;
-                progress.phase(
-                    "packages",
-                    "running",
-                    "checking package deps",
-                    package_done,
-                    package_total,
-                )?;
+                progress.phase(Phase {
+                    group: "packages",
+                    key: "packages",
+                    status: "running",
+                    label: group_label("packages"),
+                    detail: "checking package deps",
+                    done: package_done,
+                    total: package_total,
+                })?;
                 summary.items.push(item);
             }
         } else {
@@ -384,13 +395,15 @@ where
                 }
                 package_done += 1;
                 progress.item("packages", &item)?;
-                progress.phase(
-                    "packages",
-                    "running",
-                    "checking package deps",
-                    package_done,
-                    package_total,
-                )?;
+                progress.phase(Phase {
+                    group: "packages",
+                    key: "packages",
+                    status: "running",
+                    label: group_label("packages"),
+                    detail: "checking package deps",
+                    done: package_done,
+                    total: package_total,
+                })?;
                 summary.items.push(item);
             }
 
@@ -452,24 +465,28 @@ where
         announced.insert("github-releases");
         group_started.insert("github-releases", Instant::now());
         if release_prefetch_total > 0 {
-            progress.phase(
-                "github-releases",
-                "running",
-                "fetching GitHub release metadata",
-                0,
-                release_prefetch_total,
-            )?;
+            progress.phase(Phase {
+                group: "github-releases",
+                key: "github-release-metadata",
+                status: "running",
+                label: group_label("github-releases"),
+                detail: "fetching GitHub release metadata",
+                done: 0,
+                total: release_prefetch_total,
+            })?;
         }
     }
     let release_prefetch = update_release::prefetch(&release_entries, context, options, progress)?;
     if !release_entries.is_empty() {
-        progress.phase(
-            "github-releases",
-            "running",
-            group_detail("github-releases"),
-            0,
-            release_entries.len(),
-        )?;
+        progress.phase(Phase {
+            group: "github-releases",
+            key: group_phase("github-releases"),
+            status: "running",
+            label: group_label("github-releases"),
+            detail: group_detail("github-releases"),
+            done: 0,
+            total: release_entries.len(),
+        })?;
     }
 
     let builtin_entries = entries
@@ -496,13 +513,15 @@ where
                     let group = group_for_method(&builtin_entries[index].method);
                     if announced.insert(group) {
                         group_started.insert(group, Instant::now());
-                        progress.phase(
+                        progress.phase(Phase {
                             group,
-                            "running",
-                            group_detail(group),
-                            0,
-                            group_totals[group],
-                        )?;
+                            key: group_phase(group),
+                            status: "running",
+                            label: group_label(group),
+                            detail: group_detail(group),
+                            done: 0,
+                            total: group_totals[group],
+                        })?;
                     }
                 }
                 jobs::ItemProgressEvent::Completed {
@@ -542,13 +561,15 @@ where
         let group = group_for_method(&entry.method);
         if announced.insert(group) {
             group_started.insert(group, Instant::now());
-            progress.phase(
+            progress.phase(Phase {
                 group,
-                "running",
-                group_detail(group),
-                0,
-                group_totals[group],
-            )?;
+                key: group_phase(group),
+                status: "running",
+                label: group_label(group),
+                detail: group_detail(group),
+                done: 0,
+                total: group_totals[group],
+            })?;
         }
         let outcome = install_custom(
             entry,
@@ -602,7 +623,15 @@ fn advance_group(
     let done = group_done.entry(group).or_insert(0);
     *done += 1;
     let total = group_totals[group];
-    progress.phase(group, "running", group_detail(group), *done, total)?;
+    progress.phase(Phase {
+        group,
+        key: group_phase(group),
+        status: "running",
+        label: group_label(group),
+        detail: group_detail(group),
+        done: *done,
+        total,
+    })?;
     Ok(*done >= total)
 }
 
@@ -629,12 +658,12 @@ pub fn group_for_method(method: &str) -> &'static str {
     match method {
         "pkg" => "packages",
         "github:release" => "github-releases",
-        "github:repo" => "repo-deps",
+        "github:repo" => "github-repos",
         "cargo" => "cargo",
         "go" => "go",
         "uv" => "uv",
         "npm" => "npm",
-        "custom" => "hooks",
+        "custom" => "custom",
         _ => "other",
     }
 }
@@ -643,13 +672,40 @@ fn group_detail(group: &str) -> &'static str {
     match group {
         "packages" => "checking package deps",
         "github-releases" => "checking GitHub release installs",
-        "repo-deps" => "checking repo deps",
+        "github-repos" => "checking GitHub repo installs",
         "cargo" => "checking cargo deps",
         "go" => "checking go deps",
         "uv" => "checking uv deps",
         "npm" => "checking npm deps",
-        "hooks" => "checking custom hooks",
+        "custom" => "checking custom deps",
         _ => "checking dependencies",
+    }
+}
+
+fn group_phase(group: &str) -> &'static str {
+    match group {
+        "packages" => "packages",
+        "github-releases" => "github-release-installs",
+        "github-repos" => "github-repos",
+        "cargo" => "cargo",
+        "go" => "go",
+        "uv" => "uv",
+        "npm" => "npm",
+        "custom" => "custom",
+        _ => "other-progress",
+    }
+}
+
+fn group_label(group: &str) -> &'static str {
+    match group {
+        "packages" => "Packages",
+        "github-releases" | "github-repos" => "GitHub",
+        "cargo" => "Cargo",
+        "go" => "Go",
+        "uv" => "UV",
+        "npm" => "NPM",
+        "custom" => "Custom",
+        _ => "Other",
     }
 }
 
@@ -943,18 +999,11 @@ mod tests {
     }
 
     impl super::Progress for RecordingProgress {
-        fn phase(
-            &mut self,
-            _group: &'static str,
-            _status: &'static str,
-            detail: &str,
-            done: usize,
-            total: usize,
-        ) -> crate::Result<()> {
+        fn phase(&mut self, phase: super::Phase<'_>) -> crate::Result<()> {
             self.phases.push(PhaseRecord {
-                detail: detail.to_owned(),
-                done,
-                total,
+                detail: phase.detail.to_owned(),
+                done: phase.done,
+                total: phase.total,
             });
             Ok(())
         }

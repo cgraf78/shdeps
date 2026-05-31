@@ -736,21 +736,16 @@ impl<W> update::Progress for JsonlProgress<'_, W>
 where
     W: Write,
 {
-    fn phase(
-        &mut self,
-        group: &'static str,
-        status: &'static str,
-        detail: &str,
-        done: usize,
-        total: usize,
-    ) -> Result<()> {
+    fn phase(&mut self, phase: update::Phase<'_>) -> Result<()> {
         self.event(json!({
             "event": "phase",
-            "group": group,
-            "status": status,
-            "detail": detail,
-            "done": done,
-            "total": total,
+            "group": phase.group,
+            "phase": phase.key,
+            "label": phase.label,
+            "status": phase.status,
+            "detail": phase.detail,
+            "done": phase.done,
+            "total": phase.total,
         }))
     }
 
@@ -946,10 +941,10 @@ where
         Ok(())
     }
 
-    fn progress_row(&mut self, detail: &str, done: usize, total: usize) -> Result<()> {
-        let stage = progress_stage(detail);
-        let component = progress_component(detail);
-        let label = progress_label(detail);
+    fn progress_row(&mut self, label: &str, phase: &str, done: usize, total: usize) -> Result<()> {
+        let stage = progress_stage(phase);
+        let component = progress_component(phase);
+        let label = progress_label(label);
         let index = match self.rows.iter().position(|row| row.stage == stage) {
             Some(index) => index,
             None => {
@@ -971,14 +966,8 @@ where
             let row = &mut self.rows[index];
             let started = *row.started.get_or_insert_with(Instant::now);
             row.components.insert(component, (done, total));
-            row.done = row
-                .components
-                .values()
-                .map(|(component_done, _)| *component_done)
-                .sum();
-            row.total = row
-                .total
-                .max(row.components.values().map(|(_, total)| *total).sum());
+            row.total = row.total.max(total);
+            row.done = progress_done(row);
             row.touched = true;
             row.elapsed_ms = Some(started.elapsed().as_millis());
         }
@@ -1017,8 +1006,8 @@ where
         self.ordered_rows()
             .into_iter()
             .map(|row| {
-                let done = row.touched && row.total > 0 && row.done >= row.total;
-                let status = if done {
+                let complete = row.touched && progress_complete(row);
+                let status = if complete {
                     "ok".to_owned()
                 } else if row.touched {
                     spinner_frame(row.done).to_owned()
@@ -1063,18 +1052,11 @@ impl<W> update::Progress for TtyProgress<'_, W>
 where
     W: Write,
 {
-    fn phase(
-        &mut self,
-        _group: &'static str,
-        status: &'static str,
-        detail: &str,
-        done: usize,
-        total: usize,
-    ) -> Result<()> {
-        if total == 0 || status != "running" {
+    fn phase(&mut self, phase: update::Phase<'_>) -> Result<()> {
+        if phase.total == 0 || phase.status != "running" {
             return Ok(());
         }
-        self.progress_row(detail, done, total)
+        self.progress_row(phase.label, phase.key, phase.done, phase.total)
     }
 
     fn item(&mut self, _group: &'static str, _item: &update::Item) -> Result<()> {
@@ -1361,13 +1343,15 @@ fn resolve_github_entries_with_progress_sink(
         options,
         jobs::github_max(env_vars),
         |done, total| {
-            progress.phase(
-                "github-methods",
-                "running",
-                "resolving GitHub methods",
+            progress.phase(update::Phase {
+                group: "github-methods",
+                key: "github-methods",
+                status: "running",
+                label: "Resolve sources",
+                detail: "resolving GitHub methods",
                 done,
                 total,
-            )
+            })
         },
     )
 }
@@ -1401,11 +1385,15 @@ where
         |done, total| {
             update::Progress::phase(
                 &mut progress,
-                "github-methods",
-                "running",
-                "resolving GitHub methods",
-                done,
-                total,
+                update::Phase {
+                    group: "github-methods",
+                    key: "github-methods",
+                    status: "running",
+                    label: "Resolve sources",
+                    detail: "resolving GitHub methods",
+                    done,
+                    total,
+                },
             )
         },
     )
@@ -1700,7 +1688,7 @@ fn terminal_progress_plan(
         .filter(active)
         .filter(|entry| entry.method == "npm")
         .count();
-    let hooks = entries
+    let custom = entries
         .iter()
         .filter(active)
         .filter(|entry| entry.method == "custom")
@@ -1749,10 +1737,10 @@ fn terminal_progress_plan(
             total: npm,
         });
     }
-    if hooks > 0 {
+    if custom > 0 {
         stages.push(TtyProgressStage {
             stage: "custom",
-            total: hooks,
+            total: custom,
         });
     }
     stages
@@ -1872,12 +1860,12 @@ fn update_group_order() -> [&'static str; 9] {
     [
         "packages",
         "github-releases",
-        "repo-deps",
+        "github-repos",
         "cargo",
         "go",
         "uv",
         "npm",
-        "hooks",
+        "custom",
         "other",
     ]
 }
@@ -1900,20 +1888,6 @@ fn dashboard_group_for_name(entries: &[Entry], name: &str) -> &'static str {
     display_group_for_update_group(group_for_name(entries, name))
 }
 
-fn group_label(group: &str) -> &'static str {
-    match group {
-        "packages" => "Packages",
-        "github-releases" => "GitHub releases",
-        "repo-deps" => "Repo deps",
-        "cargo" => "Cargo",
-        "go" => "Go",
-        "uv" => "UV",
-        "npm" => "NPM",
-        "hooks" => "Hooks",
-        _ => "Other",
-    }
-}
-
 fn dashboard_group_label(group: &str) -> &'static str {
     match group {
         "packages" => "Packages",
@@ -1929,8 +1903,8 @@ fn dashboard_group_label(group: &str) -> &'static str {
 
 fn display_group_for_update_group(group: &str) -> &'static str {
     match group {
-        "github-releases" | "repo-deps" => "github",
-        "hooks" => "custom",
+        "github-releases" | "github-repos" => "github",
+        "custom" => "custom",
         "packages" => "packages",
         "cargo" => "cargo",
         "go" => "go",
@@ -1998,7 +1972,7 @@ where
         progress.event(json!({
             "event": "group_summary",
             "group": group,
-            "label": group_label(group),
+            "label": dashboard_group_label(display_group_for_update_group(group)),
             "status": update_status(counts),
             "changed": counts.changed,
             "current": counts.current,
@@ -2224,28 +2198,14 @@ where
     Ok(())
 }
 
-fn progress_label(detail: &str) -> String {
-    let label = match detail {
-        "checking package deps" => "Packages",
-        "resolving GitHub methods" => "Resolve methods",
-        "fetching GitHub release metadata" => "GitHub",
-        "checking current GitHub release versions" => "GitHub",
-        "checking GitHub release installs" => "GitHub",
-        "checking repo deps" => "GitHub",
-        "checking cargo deps" => "Cargo",
-        "checking go deps" => "Go",
-        "checking uv deps" => "UV",
-        "checking npm deps" => "NPM",
-        "checking custom hooks" => "Custom",
-        _ => detail,
-    };
+fn progress_label(label: &str) -> String {
     format!("{label:<18}")
 }
 
 fn progress_label_for_stage(stage: &str) -> String {
     let label = match stage {
         "packages" => "Packages",
-        "method-resolution" => "Resolve methods",
+        "method-resolution" => "Resolve sources",
         "github" => "GitHub",
         "cargo" => "Cargo",
         "go" => "Go",
@@ -2257,38 +2217,91 @@ fn progress_label_for_stage(stage: &str) -> String {
     format!("{label:<18}")
 }
 
-fn progress_stage(detail: &str) -> &'static str {
-    match detail {
-        "checking package deps" => "packages",
-        "resolving GitHub methods" => "method-resolution",
-        "fetching GitHub release metadata" => "github",
-        "checking current GitHub release versions" => "github",
-        "checking GitHub release installs" => "github",
-        "checking repo deps" => "github",
-        "checking cargo deps" => "cargo",
-        "checking go deps" => "go",
-        "checking uv deps" => "uv",
-        "checking npm deps" => "npm",
-        "checking custom hooks" => "custom",
+fn progress_stage(phase: &str) -> &'static str {
+    match phase {
+        "packages" => "packages",
+        "github-methods" => "method-resolution",
+        "github-release-metadata" => "github",
+        "github-release-versions" => "github",
+        "github-release-installs" => "github",
+        "github-repos" => "github",
+        "cargo" => "cargo",
+        "go" => "go",
+        "uv" => "uv",
+        "npm" => "npm",
+        "custom" => "custom",
         _ => "other-progress",
     }
 }
 
-fn progress_component(detail: &str) -> &'static str {
-    match detail {
-        "checking package deps" => "packages",
-        "resolving GitHub methods" => "github-methods",
-        "fetching GitHub release metadata" => "github-releases",
-        "checking current GitHub release versions" => "github-releases",
-        "checking GitHub release installs" => "github-releases",
-        "checking repo deps" => "repo-deps",
-        "checking cargo deps" => "cargo",
-        "checking go deps" => "go",
-        "checking uv deps" => "uv",
-        "checking npm deps" => "npm",
-        "checking custom hooks" => "hooks",
+fn progress_component(phase: &str) -> &'static str {
+    match phase {
+        "packages" => "packages",
+        "github-methods" => "github-methods",
+        "github-release-metadata" => "github-release-metadata",
+        "github-release-versions" => "github-release-versions",
+        "github-release-installs" => "github-release-installs",
+        "github-repos" => "github-repos",
+        "cargo" => "cargo",
+        "go" => "go",
+        "uv" => "uv",
+        "npm" => "npm",
+        "custom" => "custom",
         _ => "other-progress",
     }
+}
+
+fn progress_done(row: &TtyProgressRow) -> usize {
+    let done = if row.stage == "github" {
+        let release_done = [
+            "github-release-metadata",
+            "github-release-versions",
+            "github-release-installs",
+        ]
+        .into_iter()
+        .filter_map(|component| row.components.get(component).map(|(done, _)| *done))
+        .max()
+        .unwrap_or(0);
+        let repo_done = row
+            .components
+            .get("github-repos")
+            .map(|(done, _)| *done)
+            .unwrap_or(0);
+        release_done + repo_done
+    } else {
+        row.components
+            .values()
+            .map(|(component_done, _)| *component_done)
+            .sum()
+    };
+
+    done.min(row.total)
+}
+
+fn progress_complete(row: &TtyProgressRow) -> bool {
+    if row.total == 0 || row.done < row.total {
+        return false;
+    }
+    if row.stage != "github" {
+        return true;
+    }
+
+    let release_expected = [
+        "github-release-metadata",
+        "github-release-versions",
+        "github-release-installs",
+    ]
+    .into_iter()
+    .filter_map(|component| row.components.get(component).map(|(_, total)| *total))
+    .max()
+    .unwrap_or(0);
+    let release_done = row
+        .components
+        .get("github-release-installs")
+        .map(|(done, _)| *done)
+        .unwrap_or(0);
+
+    release_expected == 0 || release_done >= release_expected
 }
 
 fn progress_stage_index(stage: &str) -> usize {
@@ -2771,17 +2784,12 @@ mod tests {
     #[test]
     fn terminal_progress_labels_match_update_phases() {
         assert_eq!(
-            super::progress_label("fetching GitHub release metadata"),
-            "GitHub            "
+            super::progress_label("Resolve sources"),
+            "Resolve sources   "
         );
-        assert_eq!(
-            super::progress_label("checking current GitHub release versions"),
-            "GitHub            "
-        );
-        assert_eq!(
-            super::progress_stage("fetching GitHub release metadata"),
-            "github"
-        );
+        assert_eq!(super::progress_label("GitHub"), "GitHub            ");
+        assert_eq!(super::progress_stage("github-release-metadata"), "github");
+        assert_eq!(super::progress_stage("github-repos"), "github");
     }
 
     #[test]
@@ -2844,7 +2852,7 @@ mod tests {
                 detail: "current".to_owned(),
             }],
             groups: vec![GroupSummary {
-                group: "hooks",
+                group: "custom",
                 elapsed_ms: 0,
             }],
             ..Summary::default()
@@ -2892,7 +2900,7 @@ mod tests {
                 detail: "current".to_owned(),
             }],
             groups: vec![GroupSummary {
-                group: "hooks",
+                group: "custom",
                 elapsed_ms: 0,
             }],
             ..Summary::default()
@@ -2917,6 +2925,52 @@ mod tests {
         assert!(stdout.contains("  ok       Custom: 1 current"));
         assert!(stdout.contains("0s\n\r\x1b[KDone in 2s\n"));
         assert!(stdout.ends_with("Done in 2s\n"));
+    }
+
+    #[test]
+    fn terminal_github_progress_does_not_regress_between_hidden_subphases() {
+        let mut stdout = Vec::new();
+
+        {
+            let mut progress = super::TtyProgress::new(
+                &mut stdout,
+                vec![super::TtyProgressStage {
+                    stage: "github",
+                    total: 28,
+                }],
+            );
+            progress.start().unwrap();
+            progress
+                .progress_row("GitHub", "github-release-metadata", 15, 15)
+                .unwrap();
+            let metadata_done = progress.rows[0].done;
+            progress
+                .progress_row("GitHub", "github-release-installs", 0, 15)
+                .unwrap();
+
+            assert_eq!(metadata_done, 15);
+            assert_eq!(
+                progress.rows[0].done, metadata_done,
+                "collapsed GitHub progress should not move backward when release installs start"
+            );
+            assert_eq!(progress.live_rows()[0].status, "⠴");
+
+            progress
+                .progress_row("GitHub", "github-repos", 13, 13)
+                .unwrap();
+            assert_eq!(progress.rows[0].done, 28);
+            assert_eq!(
+                progress.live_rows()[0].status,
+                "⠇",
+                "the row should keep spinning until release install checks finish"
+            );
+
+            progress
+                .progress_row("GitHub", "github-release-installs", 15, 15)
+                .unwrap();
+            assert_eq!(progress.rows[0].done, 28);
+            assert_eq!(progress.live_rows()[0].status, "ok");
+        }
     }
 
     #[test]
