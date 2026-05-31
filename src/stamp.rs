@@ -77,6 +77,19 @@ pub fn remote_touch(path: &Path, now: u64) -> Result<()> {
     state::write_atomic(path, &format!("{now}\n"))
 }
 
+/// Returns whether a remote stamp was written for this update's timestamp.
+///
+/// This is deliberately narrower than `remote_fresh`: force/reinstall should
+/// still bypass old TTL state, but two phases inside the same `shdeps update`
+/// may share a remote fact that was fetched seconds earlier in the same run.
+#[must_use]
+pub fn remote_checked_at(path: &Path, now: u64) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    content.trim_end().parse::<u64>().ok() == Some(now)
+}
+
 /// Returns a dependency's cached git revision stamp path.
 #[must_use]
 pub fn revision_path(state_dir: &Path, name: &str) -> PathBuf {

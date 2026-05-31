@@ -9,6 +9,7 @@ use std::env;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::Result;
 use crate::api;
@@ -87,6 +88,37 @@ where
     W: Write,
     E: Write,
 {
+    run_inner(args, stdout, stderr, false)
+}
+
+/// Runs the CLI with optional live terminal progress for interactive callers.
+pub fn run_terminal<I, S, W, E>(
+    args: I,
+    stdout: &mut W,
+    stderr: &mut E,
+    live_progress: bool,
+) -> Result<i32>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+    W: Write,
+    E: Write,
+{
+    run_inner(args, stdout, stderr, live_progress)
+}
+
+fn run_inner<I, S, W, E>(
+    args: I,
+    stdout: &mut W,
+    stderr: &mut E,
+    live_progress: bool,
+) -> Result<i32>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+    W: Write,
+    E: Write,
+{
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let parsed = match parse_options(&args, stdout, stderr)? {
         ParseOutcome::Command(parsed) => parsed,
@@ -124,7 +156,7 @@ where
         }
         "prune" => prune_cmd(rest, &parsed, stdout, stderr),
         "self-update" => self_update_cmd(rest, &parsed, stdout, stderr),
-        "update" => update_cmd(rest, &parsed, stdout, stderr),
+        "update" => update_cmd(rest, &parsed, stdout, stderr, live_progress),
         other => {
             writeln!(stderr, "error: unknown command '{other}'")?;
             writeln!(stderr, "Run 'shdeps help' for usage.")?;
@@ -388,11 +420,14 @@ fn update_cmd<W, E>(
     options: &ParsedOptions,
     stdout: &mut W,
     stderr: &mut E,
+    live_progress: bool,
 ) -> Result<i32>
 where
     W: Write,
     E: Write,
 {
+    let update_started = Instant::now();
+
     if let Some(arg) = args.first() {
         writeln!(stderr, "error: unknown update argument '{arg}'")?;
         return Ok(2);
@@ -423,52 +458,124 @@ where
         remote_ttl: remote_ttl(),
         ..UpdateOptions::default()
     };
-    let entries = resolve_github_entries_with_options(
-        &entries,
-        &roots,
-        Some(&manifest),
-        &env,
-        &env_vars,
-        github_options_from_update(update_options),
-    )?;
-    let context = UpdateContext {
-        manifest_path: &manifest_path,
-        roots: &roots,
-        env: &env,
-        hooks: &hooks,
-        runner: &Process,
-        pkg_mgr: &pkg_mgr,
-        env_vars: &env_vars,
-        client: &Curl,
-    };
-    let active_count = entries
-        .iter()
-        .filter(|entry| update::active(entry, &env))
-        .count();
     let progress_jsonl = std::env::var_os("SHDEPS_PROGRESS").is_some_and(|value| value == "jsonl");
     let nested = std::env::var_os("SHDEPS_NESTED").is_some_and(|value| value == "1");
-    if !options.quiet && !progress_jsonl {
-        if !nested {
-            write_heading(stdout, "Tools")?;
-        }
-        write_row(stdout, "running", "checking configured dependencies")?;
+    let terminal_progress = live_progress && !options.quiet && !progress_jsonl;
+    if terminal_progress && !nested {
+        write_heading(stdout, "Tools")?;
     }
 
-    let summary = if progress_jsonl {
-        let mut progress = JsonlProgress { out: stdout };
-        update::run_with_progress(&entries, &manifest, &context, update_options, &mut progress)?
-    } else {
-        let summary = update::run(&entries, &manifest, &context, update_options)?;
-        write_update_summary(
+    let (entries, summary, active_count) = if terminal_progress {
+        let mut progress = TtyProgress::new(stdout, terminal_progress_plan(&entries, &env));
+        progress.start()?;
+        let entries = resolve_github_entries_with_progress_sink(
+            &entries,
+            &roots,
+            Some(&manifest),
+            &env,
+            &env_vars,
+            github_options_from_update(update_options),
+            &mut progress,
+        )?;
+        let context = UpdateContext {
+            manifest_path: &manifest_path,
+            roots: &roots,
+            env: &env,
+            hooks: &hooks,
+            runner: &Process,
+            pkg_mgr: &pkg_mgr,
+            env_vars: &env_vars,
+            client: &Curl,
+        };
+        let active_count = entries
+            .iter()
+            .filter(|entry| update::active(entry, &env))
+            .count();
+        let summary = update::run_with_progress(
+            &entries,
+            &manifest,
+            &context,
+            update_options,
+            &mut progress,
+        )?;
+        let footer = if nested {
+            None
+        } else {
+            Some(format!(
+                "Done in {}",
+                elapsed_label_ms(update_started.elapsed().as_millis())
+            ))
+        };
+        progress.finish(&summary, &entries, footer.as_deref())?;
+        drop(progress);
+        write_update_terminal_summary(
             &summary,
             &entries,
-            active_count,
             options.quiet,
             options.verbose,
             stdout,
             stderr,
         )?;
-        summary
+        (entries, summary, active_count)
+    } else {
+        let entries = if progress_jsonl {
+            resolve_github_entries_with_progress(
+                &entries,
+                &roots,
+                Some(&manifest),
+                &env,
+                &env_vars,
+                github_options_from_update(update_options),
+                stdout,
+            )?
+        } else {
+            resolve_github_entries_with_options(
+                &entries,
+                &roots,
+                Some(&manifest),
+                &env,
+                &env_vars,
+                github_options_from_update(update_options),
+            )?
+        };
+        let context = UpdateContext {
+            manifest_path: &manifest_path,
+            roots: &roots,
+            env: &env,
+            hooks: &hooks,
+            runner: &Process,
+            pkg_mgr: &pkg_mgr,
+            env_vars: &env_vars,
+            client: &Curl,
+        };
+        let active_count = entries
+            .iter()
+            .filter(|entry| update::active(entry, &env))
+            .count();
+        if !options.quiet && !progress_jsonl {
+            if !nested {
+                write_heading(stdout, "Tools")?;
+            }
+            write_row(stdout, "running", "checking configured dependencies")?;
+        }
+
+        let summary = if progress_jsonl {
+            let mut progress = JsonlProgress { out: stdout };
+            update::run_with_progress(&entries, &manifest, &context, update_options, &mut progress)?
+        } else {
+            let summary = update::run(&entries, &manifest, &context, update_options)?;
+            write_update_summary(
+                &summary,
+                &entries,
+                active_count,
+                options.quiet,
+                options.verbose,
+                stdout,
+                stderr,
+            )?;
+            summary
+        };
+        (entries, summary, active_count)
     };
 
     let manifest = manifest::read(&manifest_path)?;
@@ -537,6 +644,325 @@ where
             "name": item.name.as_str(),
             "detail": item.detail.as_str(),
         }))
+    }
+}
+
+struct TtyProgress<'a, W>
+where
+    W: Write,
+{
+    out: &'a mut W,
+    rows: Vec<TtyProgressRow>,
+    active: bool,
+    finished: bool,
+    rendered_rows: usize,
+}
+
+struct TtyProgressRow {
+    stage: &'static str,
+    label: String,
+    started: Option<Instant>,
+    elapsed_ms: Option<u128>,
+    done: usize,
+    total: usize,
+    touched: bool,
+    components: BTreeMap<&'static str, (usize, usize)>,
+}
+
+impl<W> TtyProgress<'_, W>
+where
+    W: Write,
+{
+    fn new(out: &mut W, stages: Vec<TtyProgressStage>) -> TtyProgress<'_, W> {
+        TtyProgress {
+            out,
+            rows: stages
+                .into_iter()
+                .map(|stage| TtyProgressRow {
+                    stage: stage.stage,
+                    label: progress_label_for_stage(stage.stage),
+                    started: None,
+                    elapsed_ms: None,
+                    done: 0,
+                    total: stage.total,
+                    touched: false,
+                    components: BTreeMap::new(),
+                })
+                .collect(),
+            active: false,
+            finished: false,
+            rendered_rows: 0,
+        }
+    }
+
+    fn start(&mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let rows = self.live_rows();
+        self.rewrite_rows(&rows, false, None)
+    }
+
+    fn finish(
+        &mut self,
+        summary: &update::Summary,
+        entries: &[Entry],
+        footer: Option<&str>,
+    ) -> Result<()> {
+        if self.rows.is_empty() {
+            self.finished = true;
+            self.active = false;
+            self.rendered_rows = 0;
+            return Ok(());
+        }
+
+        let final_rows = self.final_rows(summary, entries);
+        self.rewrite_rows(&final_rows, true, footer)?;
+        self.finished = true;
+        self.active = false;
+        self.rendered_rows = 0;
+        Ok(())
+    }
+
+    fn final_rows(&self, summary: &update::Summary, entries: &[Entry]) -> Vec<RenderedTtyRow> {
+        let mut summaries = BTreeMap::new();
+        for group in dashboard_group_order() {
+            let items = summary
+                .items
+                .iter()
+                .filter(|item| dashboard_group_for_name(entries, &item.name) == group)
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                continue;
+            }
+            let counts = update_counts_for_items(&items);
+            let elapsed_ms = dashboard_elapsed_ms(summary, group);
+            summaries.insert(
+                group,
+                RenderedTtyRow {
+                    status: update_status(counts).to_owned(),
+                    detail: format!(
+                        "{}: {}",
+                        dashboard_group_label(group),
+                        update_count_summary(counts)
+                    ),
+                    elapsed: elapsed_label_ms(elapsed_ms),
+                },
+            );
+        }
+
+        let mut rows = Vec::new();
+        for row in self.ordered_rows() {
+            if let Some(mut summary) = summaries.remove(row.stage) {
+                if row.touched {
+                    summary.elapsed = elapsed_label_ms(row.elapsed_ms.unwrap_or_else(|| {
+                        row.started
+                            .map_or(0, |started| started.elapsed().as_millis())
+                    }));
+                }
+                rows.push(summary);
+            } else if row.touched {
+                rows.push(RenderedTtyRow {
+                    status: "ok".to_owned(),
+                    detail: progress_done_detail(row.stage, &row.label, row.total),
+                    elapsed: elapsed_label_ms(row.elapsed_ms.unwrap_or_else(|| {
+                        row.started
+                            .map_or(0, |started| started.elapsed().as_millis())
+                    })),
+                });
+            }
+        }
+        rows
+    }
+
+    fn rewrite_rows(
+        &mut self,
+        rows: &[RenderedTtyRow],
+        finish_line: bool,
+        footer: Option<&str>,
+    ) -> Result<()> {
+        let previous_rows = self.rendered_rows;
+        if self.active {
+            write!(self.out, "\r\x1b[K")?;
+            if previous_rows > 1 {
+                write!(self.out, "\x1b[{}A", previous_rows - 1)?;
+            }
+        }
+
+        // Keep a cleared row after the footer so shell prompt redraws cannot
+        // consume the last visible line after long-running updates.
+        let rendered_rows = rows.len() + if footer.is_some() { 2 } else { 0 };
+        let line_count = rendered_rows.max(previous_rows);
+        for index in 0..line_count {
+            write!(self.out, "\r\x1b[K")?;
+            if let Some(row) = rows.get(index) {
+                write!(
+                    self.out,
+                    "{}",
+                    tty_row(&row.status, &row.detail, &row.elapsed)
+                )?;
+            } else if index == rows.len()
+                && let Some(footer) = footer
+            {
+                write!(self.out, "{footer}")?;
+            }
+            if index + 1 < line_count {
+                writeln!(self.out)?;
+            }
+        }
+
+        if finish_line {
+            let cleared_rows = line_count.saturating_sub(rendered_rows);
+            if rows.is_empty() {
+                writeln!(self.out)?;
+            } else {
+                if cleared_rows > 0 {
+                    write!(self.out, "\x1b[{}A", cleared_rows)?;
+                }
+                writeln!(self.out)?;
+            }
+        } else if line_count > rendered_rows && !rows.is_empty() {
+            write!(self.out, "\x1b[{}A", line_count - rendered_rows)?;
+        }
+        self.out.flush()?;
+        self.active = !finish_line;
+        self.rendered_rows = if finish_line { 0 } else { rendered_rows };
+        Ok(())
+    }
+
+    fn progress_row(&mut self, detail: &str, done: usize, total: usize) -> Result<()> {
+        let stage = progress_stage(detail);
+        let component = progress_component(detail);
+        let label = progress_label(detail);
+        let index = match self.rows.iter().position(|row| row.stage == stage) {
+            Some(index) => index,
+            None => {
+                self.rows.push(TtyProgressRow {
+                    stage,
+                    label,
+                    started: None,
+                    elapsed_ms: None,
+                    done,
+                    total,
+                    touched: false,
+                    components: BTreeMap::new(),
+                });
+                self.rows.len() - 1
+            }
+        };
+
+        {
+            let row = &mut self.rows[index];
+            let started = *row.started.get_or_insert_with(Instant::now);
+            row.components.insert(component, (done, total));
+            row.done = row
+                .components
+                .values()
+                .map(|(component_done, _)| *component_done)
+                .sum();
+            row.total = row
+                .total
+                .max(row.components.values().map(|(_, total)| *total).sum());
+            row.touched = true;
+            row.elapsed_ms = Some(started.elapsed().as_millis());
+        }
+
+        let rows = self.live_rows();
+        self.rewrite_rows(&rows, false, None)
+    }
+
+    fn clear_unfinished(&mut self) -> Result<()> {
+        if !self.active || self.finished || self.rows.is_empty() {
+            return Ok(());
+        }
+        write!(self.out, "\r\x1b[K")?;
+        if self.rendered_rows > 1 {
+            write!(self.out, "\x1b[{}A", self.rendered_rows - 1)?;
+        }
+        for index in 0..self.rendered_rows {
+            write!(self.out, "\r\x1b[K")?;
+            if index + 1 < self.rendered_rows {
+                writeln!(self.out)?;
+            }
+        }
+        self.out.flush()?;
+        self.active = false;
+        self.rendered_rows = 0;
+        Ok(())
+    }
+
+    fn ordered_rows(&self) -> Vec<&TtyProgressRow> {
+        let mut rows = self.rows.iter().collect::<Vec<_>>();
+        rows.sort_by_key(|row| progress_stage_index(row.stage));
+        rows
+    }
+
+    fn live_rows(&self) -> Vec<RenderedTtyRow> {
+        self.ordered_rows()
+            .into_iter()
+            .map(|row| {
+                let done = row.touched && row.total > 0 && row.done >= row.total;
+                let status = if done {
+                    "ok".to_owned()
+                } else if row.touched {
+                    spinner_frame(row.done).to_owned()
+                } else {
+                    "pending".to_owned()
+                };
+                let elapsed_ms = row.elapsed_ms.unwrap_or_else(|| {
+                    row.started
+                        .map_or(0, |started| started.elapsed().as_millis())
+                });
+                RenderedTtyRow {
+                    status,
+                    detail: format!("{} {}", row.label, progress_bar(row.done, row.total, 8)),
+                    elapsed: elapsed_label_ms(elapsed_ms),
+                }
+            })
+            .collect()
+    }
+}
+
+struct TtyProgressStage {
+    stage: &'static str,
+    total: usize,
+}
+
+struct RenderedTtyRow {
+    status: String,
+    detail: String,
+    elapsed: String,
+}
+
+impl<W> Drop for TtyProgress<'_, W>
+where
+    W: Write,
+{
+    fn drop(&mut self) {
+        let _ = self.clear_unfinished();
+    }
+}
+
+impl<W> update::Progress for TtyProgress<'_, W>
+where
+    W: Write,
+{
+    fn phase(
+        &mut self,
+        _group: &'static str,
+        status: &'static str,
+        detail: &str,
+        done: usize,
+        total: usize,
+    ) -> Result<()> {
+        if total == 0 || status != "running" {
+            return Ok(());
+        }
+        self.progress_row(detail, done, total)
+    }
+
+    fn item(&mut self, _group: &'static str, _item: &update::Item) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -787,7 +1213,86 @@ fn resolve_github_entries_with_options(
         runner: &Process,
         client: &Curl,
     };
-    github_method::resolve_entries(entries, &context, options)
+    github_method::resolve_entries_with_progress(
+        entries,
+        &context,
+        options,
+        jobs::github_max(env_vars),
+        |_done, _total| Ok(()),
+    )
+}
+
+fn resolve_github_entries_with_progress_sink(
+    entries: &[Entry],
+    roots: &runtime::Roots,
+    manifest: Option<&Manifest>,
+    env: &crate::platform::RuntimeEnv,
+    env_vars: &BTreeMap<String, String>,
+    options: github_method::Options,
+    progress: &mut dyn update::Progress,
+) -> Result<Vec<Entry>> {
+    let context = github_method::Context {
+        roots,
+        manifest,
+        env,
+        env_vars,
+        runner: &Process,
+        client: &Curl,
+    };
+    github_method::resolve_entries_with_progress(
+        entries,
+        &context,
+        options,
+        jobs::github_max(env_vars),
+        |done, total| {
+            progress.phase(
+                "github-methods",
+                "running",
+                "resolving GitHub methods",
+                done,
+                total,
+            )
+        },
+    )
+}
+
+fn resolve_github_entries_with_progress<W>(
+    entries: &[Entry],
+    roots: &runtime::Roots,
+    manifest: Option<&Manifest>,
+    env: &crate::platform::RuntimeEnv,
+    env_vars: &BTreeMap<String, String>,
+    options: github_method::Options,
+    stdout: &mut W,
+) -> Result<Vec<Entry>>
+where
+    W: Write,
+{
+    let context = github_method::Context {
+        roots,
+        manifest,
+        env,
+        env_vars,
+        runner: &Process,
+        client: &Curl,
+    };
+    let mut progress = JsonlProgress { out: stdout };
+    github_method::resolve_entries_with_progress(
+        entries,
+        &context,
+        options,
+        jobs::github_max(env_vars),
+        |done, total| {
+            update::Progress::phase(
+                &mut progress,
+                "github-methods",
+                "running",
+                "resolving GitHub methods",
+                done,
+                total,
+            )
+        },
+    )
 }
 
 fn github_options(options: &ParsedOptions) -> github_method::Options {
@@ -941,6 +1446,169 @@ where
     Ok(())
 }
 
+fn write_update_terminal_summary<W, E>(
+    summary: &update::Summary,
+    entries: &[Entry],
+    quiet: bool,
+    verbose: bool,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<()>
+where
+    W: Write,
+    E: Write,
+{
+    if verbose && !quiet {
+        return write_verbose_update_terminal_summary(summary, entries, stdout, stderr);
+    }
+
+    let mut item_failures = std::collections::BTreeSet::new();
+    for item in &summary.items {
+        if item.failed {
+            item_failures.insert(item.name.as_str());
+            write_row(stderr, "failed", &format!("{}: {}", item.name, item.detail))?;
+        }
+    }
+
+    for name in &summary.failed {
+        if !item_failures.contains(name.as_str()) {
+            write_row(stderr, "failed", &format!("{name}: post hook failed"))?;
+        }
+    }
+
+    for name in &summary.leftovers {
+        write_row(
+            stderr,
+            "warning",
+            &format!("{name}: old-method cleanup left artifacts behind"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_verbose_update_terminal_summary<W, E>(
+    summary: &update::Summary,
+    entries: &[Entry],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<()>
+where
+    W: Write,
+    E: Write,
+{
+    let mut item_failures = std::collections::BTreeSet::new();
+    for group in dashboard_group_order() {
+        let items = summary
+            .items
+            .iter()
+            .filter(|item| dashboard_group_for_name(entries, &item.name) == group)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            continue;
+        }
+        write_group(stdout, group_label(group))?;
+        for item in items {
+            if item.failed {
+                item_failures.insert(item.name.as_str());
+                write_nested_row(stderr, "failed", &format!("{}: {}", item.name, item.detail))?;
+            } else {
+                write_nested_row(
+                    stdout,
+                    item_status(item),
+                    &format!("{}: {}", item.name, item.detail),
+                )?;
+            }
+        }
+    }
+
+    for name in &summary.failed {
+        if !item_failures.contains(name.as_str()) {
+            write_row(stderr, "failed", &format!("{name}: post hook failed"))?;
+        }
+    }
+
+    for name in &summary.leftovers {
+        write_row(
+            stderr,
+            "warning",
+            &format!("{name}: old-method cleanup left artifacts behind"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn terminal_progress_plan(
+    entries: &[Entry],
+    env: &crate::platform::RuntimeEnv,
+) -> Vec<TtyProgressStage> {
+    let active = |entry: &&Entry| update::active(entry, env);
+    let bare_github = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "github")
+        .count();
+    let packages = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "pkg")
+        .count();
+    let github = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| {
+            matches!(
+                entry.method.as_str(),
+                "github" | "github:release" | "github:repo"
+            )
+        })
+        .count();
+    let language_tools = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| matches!(entry.method.as_str(), "cargo" | "go" | "uv" | "npm"))
+        .count();
+    let hooks = entries
+        .iter()
+        .filter(active)
+        .filter(|entry| entry.method == "custom")
+        .count();
+
+    let mut stages = Vec::new();
+    if bare_github > 0 {
+        stages.push(TtyProgressStage {
+            stage: "method-resolution",
+            total: bare_github,
+        });
+    }
+    if packages > 0 {
+        stages.push(TtyProgressStage {
+            stage: "packages",
+            total: packages,
+        });
+    }
+    if github > 0 {
+        stages.push(TtyProgressStage {
+            stage: "github",
+            total: github,
+        });
+    }
+    if language_tools > 0 {
+        stages.push(TtyProgressStage {
+            stage: "language-tools",
+            total: language_tools,
+        });
+    }
+    if hooks > 0 {
+        stages.push(TtyProgressStage {
+            stage: "custom",
+            total: hooks,
+        });
+    }
+    stages
+}
+
 fn write_normal_group_summaries<W>(
     summary: &update::Summary,
     entries: &[Entry],
@@ -949,11 +1617,11 @@ fn write_normal_group_summaries<W>(
 where
     W: Write,
 {
-    for group in update_group_order() {
+    for group in dashboard_group_order() {
         let items = summary
             .items
             .iter()
-            .filter(|item| group_for_name(entries, &item.name) == group)
+            .filter(|item| dashboard_group_for_name(entries, &item.name) == group)
             .collect::<Vec<_>>();
         if items.is_empty() {
             continue;
@@ -969,7 +1637,11 @@ where
         write_row(
             stdout,
             status,
-            &format!("{}: {}", group_label(group), update_count_summary(counts)),
+            &format!(
+                "{}: {}",
+                dashboard_group_label(group),
+                update_count_summary(counts)
+            ),
         )?;
         for item in items {
             if item.changed && !item.failed {
@@ -996,16 +1668,16 @@ where
     E: Write,
 {
     let mut item_failures = std::collections::BTreeSet::new();
-    for group in update_group_order() {
+    for group in dashboard_group_order() {
         let items = summary
             .items
             .iter()
-            .filter(|item| group_for_name(entries, &item.name) == group)
+            .filter(|item| dashboard_group_for_name(entries, &item.name) == group)
             .collect::<Vec<_>>();
         if items.is_empty() {
             continue;
         }
-        write_group(stdout, group_label(group))?;
+        write_group(stdout, dashboard_group_label(group))?;
         for item in items {
             if item.failed {
                 item_failures.insert(item.name.as_str());
@@ -1058,12 +1730,20 @@ fn update_group_order() -> [&'static str; 6] {
     ]
 }
 
+fn dashboard_group_order() -> [&'static str; 5] {
+    ["packages", "github", "language-tools", "custom", "other"]
+}
+
 fn group_for_name(entries: &[Entry], name: &str) -> &'static str {
     entries
         .iter()
         .find(|entry| entry.name == name)
         .map(|entry| update::group_for_method(&entry.method))
         .unwrap_or("other")
+}
+
+fn dashboard_group_for_name(entries: &[Entry], name: &str) -> &'static str {
+    display_group_for_update_group(group_for_name(entries, name))
 }
 
 fn group_label(group: &str) -> &'static str {
@@ -1075,6 +1755,36 @@ fn group_label(group: &str) -> &'static str {
         "hooks" => "Hooks",
         _ => "Other",
     }
+}
+
+fn dashboard_group_label(group: &str) -> &'static str {
+    match group {
+        "packages" => "Packages",
+        "github" => "GitHub",
+        "language-tools" => "Language tools",
+        "custom" => "Custom",
+        _ => "Other",
+    }
+}
+
+fn display_group_for_update_group(group: &str) -> &'static str {
+    match group {
+        "github-releases" | "repo-deps" => "github",
+        "hooks" => "custom",
+        "packages" => "packages",
+        "language-tools" => "language-tools",
+        _ => "other",
+    }
+}
+
+fn dashboard_elapsed_ms(summary: &update::Summary, group: &str) -> u128 {
+    summary
+        .groups
+        .iter()
+        .filter(|summary| display_group_for_update_group(summary.group) == group)
+        .map(|summary| summary.elapsed_ms)
+        .max()
+        .unwrap_or(0)
 }
 
 fn write_update_summary_jsonl<W>(
@@ -1349,6 +2059,118 @@ where
         color("reset")
     )?;
     Ok(())
+}
+
+fn progress_label(detail: &str) -> String {
+    let label = match detail {
+        "checking package deps" => "Packages",
+        "resolving GitHub methods" => "Resolve methods",
+        "fetching GitHub release metadata" => "GitHub",
+        "checking current GitHub release versions" => "GitHub",
+        "checking GitHub release installs" => "GitHub",
+        "checking repo deps" => "GitHub",
+        "checking language tools" => "Language tools",
+        "checking custom hooks" => "Custom",
+        _ => detail,
+    };
+    format!("{label:<18}")
+}
+
+fn progress_label_for_stage(stage: &str) -> String {
+    let label = match stage {
+        "packages" => "Packages",
+        "method-resolution" => "Resolve methods",
+        "github" => "GitHub",
+        "language-tools" => "Language tools",
+        "custom" => "Custom",
+        _ => "Other",
+    };
+    format!("{label:<18}")
+}
+
+fn progress_stage(detail: &str) -> &'static str {
+    match detail {
+        "checking package deps" => "packages",
+        "resolving GitHub methods" => "method-resolution",
+        "fetching GitHub release metadata" => "github",
+        "checking current GitHub release versions" => "github",
+        "checking GitHub release installs" => "github",
+        "checking repo deps" => "github",
+        "checking language tools" => "language-tools",
+        "checking custom hooks" => "custom",
+        _ => "other-progress",
+    }
+}
+
+fn progress_component(detail: &str) -> &'static str {
+    match detail {
+        "checking package deps" => "packages",
+        "resolving GitHub methods" => "github-methods",
+        "fetching GitHub release metadata" => "github-releases",
+        "checking current GitHub release versions" => "github-releases",
+        "checking GitHub release installs" => "github-releases",
+        "checking repo deps" => "repo-deps",
+        "checking language tools" => "language-tools",
+        "checking custom hooks" => "hooks",
+        _ => "other-progress",
+    }
+}
+
+fn progress_stage_index(stage: &str) -> usize {
+    match stage {
+        "method-resolution" => 0,
+        "packages" => 1,
+        "github" => 2,
+        "language-tools" => 3,
+        "custom" => 4,
+        _ => 8,
+    }
+}
+
+fn progress_done_detail(stage: &str, label: &str, total: usize) -> String {
+    let label = label.trim();
+    let action = match stage {
+        "method-resolution" => "resolved",
+        _ => "checked",
+    };
+    format!("{label}: {total} {action}")
+}
+
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let filled = ((done.saturating_mul(width)) / total).min(width);
+    let empty = width.saturating_sub(filled);
+    let digits = total.to_string().len().max(done.to_string().len());
+    format!(
+        "[{}{}] {:>digits$}/{total}",
+        "━".repeat(filled),
+        "·".repeat(empty),
+        done
+    )
+}
+
+fn spinner_frame(done: usize) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[done % FRAMES.len()]
+}
+
+fn tty_row(status: &str, detail: &str, elapsed: &str) -> String {
+    let color_status = match status {
+        "pending" => "detail",
+        "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧" | "⠇" | "⠏" => "running",
+        _ => status,
+    };
+    format!(
+        "  {}{status:<8}{} {detail:<54} {elapsed:>6}",
+        color(color_status),
+        color("reset")
+    )
+}
+
+fn elapsed_label_ms(ms: u128) -> String {
+    format!("{}s", ms / 1000)
 }
 
 fn color(status: &str) -> &'static str {
@@ -1634,6 +2456,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{run, source_checkout_dir_from_target};
+    use crate::config::Entry;
+    use crate::update::{GroupSummary, Item, Summary};
     use crate::version;
 
     #[test]
@@ -1757,6 +2581,183 @@ mod tests {
             source_checkout_dir_from_target(&release_dir),
             Some(checkout)
         );
+    }
+
+    #[test]
+    fn terminal_progress_bar_preserves_width_and_counts() {
+        assert_eq!(super::progress_bar(0, 10, 8), "[········]  0/10");
+        assert_eq!(super::progress_bar(5, 10, 8), "[━━━━····]  5/10");
+        assert_eq!(super::progress_bar(10, 10, 8), "[━━━━━━━━] 10/10");
+    }
+
+    #[test]
+    fn terminal_progress_labels_match_update_phases() {
+        assert_eq!(
+            super::progress_label("fetching GitHub release metadata"),
+            "GitHub            "
+        );
+        assert_eq!(
+            super::progress_label("checking current GitHub release versions"),
+            "GitHub            "
+        );
+        assert_eq!(
+            super::progress_stage("fetching GitHub release metadata"),
+            "github"
+        );
+    }
+
+    #[test]
+    fn terminal_progress_rows_include_elapsed_column() {
+        assert_eq!(
+            super::tty_row("running", "Custom            [━━━━····] 1/2", "12s"),
+            "  running  Custom            [━━━━····] 1/2                          12s"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_omits_aggregate_status_line() {
+        let summary = Summary {
+            items: vec![Item {
+                name: "jq".to_owned(),
+                changed: false,
+                failed: false,
+                detail: "current".to_owned(),
+            }],
+            ..Summary::default()
+        };
+        let entries = vec![Entry {
+            name: "jq".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "jq".to_owned(),
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        super::write_update_terminal_summary(
+            &summary,
+            &entries,
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert!(String::from_utf8(stdout).unwrap().is_empty());
+        assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn terminal_progress_finish_clears_dropped_rows() {
+        let entries = vec![Entry {
+            name: "widget".to_owned(),
+            method: "custom".to_owned(),
+            cmd: "widget".to_owned(),
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        let summary = Summary {
+            items: vec![Item {
+                name: "widget".to_owned(),
+                changed: false,
+                failed: false,
+                detail: "current".to_owned(),
+            }],
+            groups: vec![GroupSummary {
+                group: "hooks",
+                elapsed_ms: 0,
+            }],
+            ..Summary::default()
+        };
+        let mut stdout = Vec::new();
+
+        {
+            let mut progress = super::TtyProgress::new(
+                &mut stdout,
+                vec![
+                    super::TtyProgressStage {
+                        stage: "github",
+                        total: 1,
+                    },
+                    super::TtyProgressStage {
+                        stage: "custom",
+                        total: 1,
+                    },
+                ],
+            );
+            progress.start().unwrap();
+            progress.finish(&summary, &entries, None).unwrap();
+        }
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("GitHub"));
+        assert!(stdout.contains("Custom: 1 current"));
+        assert!(stdout.ends_with("\n\r\x1b[K\x1b[1A\n"));
+    }
+
+    #[test]
+    fn terminal_progress_footer_follows_finished_rows() {
+        let entries = vec![Entry {
+            name: "widget".to_owned(),
+            method: "custom".to_owned(),
+            cmd: "widget".to_owned(),
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        let summary = Summary {
+            items: vec![Item {
+                name: "widget".to_owned(),
+                changed: false,
+                failed: false,
+                detail: "current".to_owned(),
+            }],
+            groups: vec![GroupSummary {
+                group: "hooks",
+                elapsed_ms: 0,
+            }],
+            ..Summary::default()
+        };
+        let mut stdout = Vec::new();
+
+        {
+            let mut progress = super::TtyProgress::new(
+                &mut stdout,
+                vec![super::TtyProgressStage {
+                    stage: "custom",
+                    total: 1,
+                }],
+            );
+            progress.start().unwrap();
+            progress
+                .finish(&summary, &entries, Some("Done in 2s"))
+                .unwrap();
+        }
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(stdout.contains("  ok       Custom: 1 current"));
+        assert!(stdout.contains("0s\n\r\x1b[KDone in 2s\n"));
+        assert!(stdout.ends_with("Done in 2s\n\r\x1b[K\n"));
+    }
+
+    #[test]
+    fn terminal_progress_plan_uses_one_github_release_row() {
+        let entries = vec![Entry {
+            name: "owner/repo".to_owned(),
+            method: "github:release".to_owned(),
+            cmd: "repo".to_owned(),
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        let env = crate::platform::RuntimeEnv::new("linux", "host");
+
+        let stages = super::terminal_progress_plan(&entries, &env)
+            .into_iter()
+            .map(|stage| stage.stage)
+            .collect::<Vec<_>>();
+
+        assert_eq!(stages, vec!["github"]);
     }
 
     fn run_capture<const N: usize>(args: [&str; N]) -> (i32, String, String) {
