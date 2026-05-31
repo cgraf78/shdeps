@@ -3762,6 +3762,49 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_repo_verbose_reports_short_local_clone_commit() {
+        let fixture = Fixture::new("repo-local-verbose-commit");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success(
+                "git",
+                ["-C", local_clone.to_str().unwrap(), "rev-parse", "HEAD"],
+                "abc1234567890\n",
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    local_clone.to_str().unwrap(),
+                    "rev-parse",
+                    "--short",
+                    "HEAD",
+                ],
+                "abc1234\n",
+            );
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                verbose: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            summary.items[0].detail,
+            "added -- commit abc1234 (local clone)"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn update_github_repo_reuses_existing_local_clone_symlink() {
         let fixture = Fixture::new("repo-local-unchanged");

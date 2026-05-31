@@ -257,23 +257,11 @@ fn verbose_repo_detail(
         return fallback.to_owned();
     }
 
-    let version = repo_version(install_dir, context.runner);
+    let version = repo::version(install_dir, context.runner);
     match action {
         Some(action) => detail_with_action(action, version.unwrap_or_default()),
         None => version.unwrap_or_else(|| fallback.to_owned()),
     }
-}
-
-fn repo_version(dir: &Path, runner: &impl Runner) -> Option<String> {
-    let version_path = dir.join("VERSION");
-    if let Ok(version) = fs::read_to_string(version_path) {
-        let version = version.trim_end_matches(['\r', '\n']).to_owned();
-        if !version.is_empty() {
-            return Some(version);
-        }
-    }
-
-    git_head(runner, dir).map(|head| format!("commit {head}"))
 }
 
 fn secure_managed_clone_permissions(install_dir: &Path) -> Result<()> {
