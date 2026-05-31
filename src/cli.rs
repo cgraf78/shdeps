@@ -907,9 +907,7 @@ where
             }
         }
 
-        // Keep a cleared row after the footer so shell prompt redraws cannot
-        // consume the last visible line after long-running updates.
-        let rendered_rows = rows.len() + if footer.is_some() { 2 } else { 0 };
+        let rendered_rows = rows.len() + usize::from(footer.is_some());
         let line_count = rendered_rows.max(previous_rows);
         for index in 0..line_count {
             write!(self.out, "\r\x1b[K")?;
@@ -2918,7 +2916,7 @@ mod tests {
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(stdout.contains("  ok       Custom: 1 current"));
         assert!(stdout.contains("0s\n\r\x1b[KDone in 2s\n"));
-        assert!(stdout.ends_with("Done in 2s\n\r\x1b[K\n"));
+        assert!(stdout.ends_with("Done in 2s\n"));
     }
 
     #[test]
