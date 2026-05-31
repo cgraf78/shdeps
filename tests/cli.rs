@@ -637,14 +637,16 @@ install() { printf 'installed\n'; }
     let events = jsonl(&output.stdout);
     assert!(
         events.iter().any(|event| event["event"] == "phase"
-            && event["group"] == "hooks"
+            && event["group"] == "custom"
+            && event["phase"] == "custom"
+            && event["label"] == "Custom"
             && event["status"] == "running"
-            && event["detail"] == "checking custom hooks"),
-        "expected a hooks phase event in {events:#?}"
+            && event["detail"] == "checking custom deps"),
+        "expected a custom phase event in {events:#?}"
     );
     assert!(
         events.iter().any(|event| event["event"] == "item"
-            && event["group"] == "hooks"
+            && event["group"] == "custom"
             && event["status"] == "changed"
             && event["name"] == "tool"
             && event["detail"] == "installed"),
@@ -661,15 +663,15 @@ install() { printf 'installed\n'; }
     );
     assert!(
         events.iter().any(|event| event["event"] == "group_summary"
-            && event["group"] == "hooks"
-            && event["label"] == "Hooks"
+            && event["group"] == "custom"
+            && event["label"] == "Custom"
             && event["status"] == "changed"
             && event["changed"] == 1
             && event["current"] == 0
             && event["skipped"] == 0
             && event["failed"] == 0
             && event["elapsed_ms"].is_number()),
-        "expected a hooks group summary event in {events:#?}"
+        "expected a custom group summary event in {events:#?}"
     );
     let group_summary_index = events
         .iter()
@@ -755,6 +757,8 @@ fn update_jsonl_reports_bare_github_method_resolution() {
     assert!(
         events.iter().any(|event| event["event"] == "phase"
             && event["group"] == "github-methods"
+            && event["phase"] == "github-methods"
+            && event["label"] == "Resolve sources"
             && event["detail"] == "resolving GitHub methods"
             && event["done"] == 0
             && event["total"] == 1),
@@ -763,6 +767,8 @@ fn update_jsonl_reports_bare_github_method_resolution() {
     assert!(
         events.iter().any(|event| event["event"] == "phase"
             && event["group"] == "github-methods"
+            && event["phase"] == "github-methods"
+            && event["label"] == "Resolve sources"
             && event["detail"] == "resolving GitHub methods"
             && event["done"] == 1
             && event["total"] == 1),
@@ -811,6 +817,8 @@ fn update_jsonl_splits_github_release_metadata_from_install_checks() {
     assert!(
         events.iter().any(|event| event["event"] == "phase"
             && event["group"] == "github-releases"
+            && event["phase"] == "github-release-metadata"
+            && event["label"] == "GitHub"
             && event["detail"] == "fetching GitHub release metadata"
             && event["done"] == 0
             && event["total"] == 1),
@@ -819,6 +827,8 @@ fn update_jsonl_splits_github_release_metadata_from_install_checks() {
     assert!(
         events.iter().any(|event| event["event"] == "phase"
             && event["group"] == "github-releases"
+            && event["phase"] == "github-release-installs"
+            && event["label"] == "GitHub"
             && event["detail"] == "checking GitHub release installs"
             && event["done"] == 0
             && event["total"] == 1),

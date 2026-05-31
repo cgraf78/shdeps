@@ -22,7 +22,7 @@ use crate::process::{self, Runner};
 use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::tool_version;
-use crate::update::{Context, Item, Options, Progress, detail_with_action, verbose_enabled};
+use crate::update::{Context, Item, Options, Phase, Progress, detail_with_action, verbose_enabled};
 
 pub(crate) fn install_with_prefetch(
     entry: &Entry,
@@ -154,13 +154,15 @@ where
                 .map(|releases| (candidate.repo.clone(), releases))
         },
         |done| {
-            progress.phase(
-                "github-releases",
-                "running",
-                "fetching GitHub release metadata",
+            progress.phase(Phase {
+                group: "github-releases",
+                key: "github-release-metadata",
+                status: "running",
+                label: "GitHub",
+                detail: "fetching GitHub release metadata",
                 done,
-                candidates.len(),
-            )
+                total: candidates.len(),
+            })
         },
     )?
     .into_iter()
@@ -184,13 +186,15 @@ where
                     .map(|version| (candidate.name.clone(), version))
             },
             |done| {
-                progress.phase(
-                    "github-releases",
-                    "running",
-                    "checking current GitHub release versions",
+                progress.phase(Phase {
+                    group: "github-releases",
+                    key: "github-release-versions",
+                    status: "running",
+                    label: "GitHub",
+                    detail: "checking current GitHub release versions",
                     done,
-                    version_candidates.len(),
-                )
+                    total: version_candidates.len(),
+                })
             },
         )? {
             let Some((name, version)) = fetched else {
