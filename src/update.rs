@@ -34,6 +34,8 @@ pub struct Options {
     pub reinstall: bool,
     /// Bypass remote freshness stamps.
     pub force: bool,
+    /// Include per-dependency detail that is too expensive for normal output.
+    pub verbose: bool,
     /// Current epoch seconds used when checking and writing stamps.
     pub now: u64,
     /// Remote freshness TTL in seconds.
@@ -45,6 +47,7 @@ impl Default for Options {
         Self {
             reinstall: false,
             force: false,
+            verbose: false,
             now: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs()),
@@ -338,7 +341,7 @@ where
                 summary.items.push(item);
             }
         } else {
-            let package_versions = update_pkg::package_versions(entries, context);
+            let package_versions = update_pkg::package_versions(entries, context, options);
             update_pkg::prepare(entries, context, &package_versions);
 
             let mut package_clean = true;
@@ -349,10 +352,11 @@ where
                     continue;
                 }
 
-                let item = update_pkg::install(entry, context, &mut queued, &package_versions)?;
+                let item =
+                    update_pkg::install(entry, context, options, &mut queued, &package_versions)?;
                 if !item.failed {
                     match item.detail.as_str() {
-                        "installed" => cleanup_successful_transition(
+                        detail if detail.starts_with("installed") => cleanup_successful_transition(
                             entry,
                             transitions.get(&entry.name),
                             context,
@@ -548,9 +552,7 @@ where
         }
         let outcome = install_custom(
             entry,
-            context.manifest_path,
-            context.roots,
-            context.hooks,
+            context,
             &hook_txn,
             options,
             transitions.get(&entry.name).map(update_transition::old),
@@ -779,25 +781,49 @@ fn cleanup_successful_transition(
 
 fn install_custom(
     entry: &Entry,
-    manifest_path: &std::path::Path,
-    roots: &Roots,
-    hooks: &BashCustomProbe,
+    context: &Context<'_, impl Runner>,
     txn: &Txn,
     options: Options,
     transition: Option<&ManifestEntry>,
 ) -> Result<CustomOutcome> {
-    let install = hooks.install_with_txn(&entry.name, roots, options.reinstall, Some(txn))?;
+    let install =
+        context
+            .hooks
+            .install_with_txn(&entry.name, context.roots, options.reinstall, Some(txn))?;
     let marked = txn.collect()?;
+    let verbose = verbose_enabled(options, context.env_vars);
     match install {
         Install::Already { detail } => {
-            let mut outcome =
-                successful_custom(entry, manifest_path, roots, false, detail, transition)?;
+            let mut outcome = successful_custom(
+                entry,
+                context.manifest_path,
+                context.roots,
+                false,
+                detail,
+                transition,
+            )?;
             outcome.marked = marked;
             Ok(outcome)
         }
         Install::Installed { detail } => {
-            let mut outcome =
-                successful_custom(entry, manifest_path, roots, true, detail, transition)?;
+            let detail = if verbose {
+                let action = if options.reinstall {
+                    "reinstalled"
+                } else {
+                    "added"
+                };
+                detail_with_action(action, detail)
+            } else {
+                detail
+            };
+            let mut outcome = successful_custom(
+                entry,
+                context.manifest_path,
+                context.roots,
+                true,
+                detail,
+                transition,
+            )?;
             outcome.marked = marked;
             Ok(outcome)
         }
@@ -823,6 +849,23 @@ fn install_custom(
             cleanup_leftover: false,
             marked,
         }),
+    }
+}
+
+pub(crate) fn verbose_enabled(options: Options, env_vars: &BTreeMap<String, String>) -> bool {
+    options.verbose
+        || env_vars
+            .get("SHDEPS_LOG_LEVEL")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(1)
+            >= 2
+}
+
+pub(crate) fn detail_with_action(action: &str, detail: String) -> String {
+    if detail.is_empty() {
+        action.to_owned()
+    } else {
+        format!("{action} -- {detail}")
     }
 }
 
@@ -3215,6 +3258,51 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_verbose_fast_path_reports_local_version_without_network() {
+        let fixture = Fixture::new("release-fast-verbose-version");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release"),
+            1_700_000_000,
+        )
+        .unwrap();
+        let runner = FakeRunner::default().with_success("tool", ["--version"], "tool 1.2.3\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                verbose: true,
+                now: 1_700_000_100,
+                remote_ttl: 3600,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "1.2.3");
+        assert_eq!(
+            fixture.client.requests(),
+            Vec::<(String, Option<String>)>::new()
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_github_release_keeps_existing_binary_when_metadata_fetch_fails() {
         let fixture = Fixture::new("release-metadata-outage");
         fixture.write_lib();
@@ -3646,6 +3734,73 @@ version() { printf 'saw-pkg\n'; }
                 "ds",
                 install_link.display().to_string(),
             ))
+        );
+    }
+
+    #[test]
+    fn update_github_repo_verbose_reports_local_clone_version() {
+        let fixture = Fixture::new("repo-local-verbose");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        fs::write(local_clone.join("VERSION"), "1.2.3\n").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                verbose: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].detail, "added -- 1.2.3 (local clone)");
+    }
+
+    #[test]
+    fn update_github_repo_verbose_reports_short_local_clone_commit() {
+        let fixture = Fixture::new("repo-local-verbose-commit");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success(
+                "git",
+                ["-C", local_clone.to_str().unwrap(), "rev-parse", "HEAD"],
+                "abc1234567890\n",
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    local_clone.to_str().unwrap(),
+                    "rev-parse",
+                    "--short",
+                    "HEAD",
+                ],
+                "abc1234\n",
+            );
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                verbose: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            summary.items[0].detail,
+            "added -- commit abc1234 (local clone)"
         );
     }
 

@@ -22,7 +22,7 @@ use crate::process::{self, Runner};
 use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::tool_version;
-use crate::update::{Context, Item, Options, Progress};
+use crate::update::{Context, Item, Options, Progress, detail_with_action, verbose_enabled};
 
 pub(crate) fn install_with_prefetch(
     entry: &Entry,
@@ -286,10 +286,15 @@ pub(crate) fn install_request(
             request.name,
             &install_dir,
         )?;
+        let detail = if verbose_enabled(context.options, context.env_vars) {
+            process::dep_version(context.runner, request.cmd).unwrap_or_else(|| "fresh".to_owned())
+        } else {
+            "fresh".to_owned()
+        };
         return Ok(ReleaseOutcome {
             changed: false,
             failed: false,
-            detail: "fresh".to_owned(),
+            detail,
             // The TTL stamp is already fresh in this branch; nothing to
             // refresh.
             stamp: false,
@@ -510,10 +515,22 @@ pub(crate) fn install_request(
     // See the matching comment in `install_with_prefetch`.
     let _ = stamp_path;
 
+    let detail = if verbose_enabled(context.options, context.env_vars) {
+        match current_version {
+            Some(current) if installed_matches_tag(&current, &selection.tag) => {
+                detail_with_action("reinstalled", selection.tag.clone())
+            }
+            Some(current) => format!("updated -- {current} -> {}", selection.tag),
+            None => detail_with_action("added", selection.tag.clone()),
+        }
+    } else {
+        selection.tag.clone()
+    };
+
     Ok(ReleaseOutcome {
         changed: true,
         failed: false,
-        detail: selection.tag,
+        detail,
         stamp: true,
     })
 }

@@ -8,7 +8,6 @@
 //! stay cheap.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use crate::Result;
@@ -17,6 +16,7 @@ use crate::jobs;
 use crate::manifest::Manifest;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::{self, Runner};
+use crate::repo;
 use crate::runtime::Roots;
 
 /// Why a configured dependency was skipped instead of checked for install state.
@@ -241,7 +241,7 @@ fn github_repo_state(entry: &Entry, roots: &Roots, runner: &impl Runner) -> Stat
     }
 
     State::Installed {
-        detail: repo_version(&root, runner),
+        detail: repo::version(&root, runner),
     }
 }
 
@@ -267,32 +267,6 @@ fn installed_or_missing(detail: Option<String>) -> State {
         },
         None => State::Missing,
     }
-}
-
-fn repo_version(root: &Path, runner: &impl Runner) -> Option<String> {
-    let version_path = root.join("VERSION");
-    if let Ok(version) = fs::read_to_string(&version_path) {
-        // Current Bash reports VERSION verbatim. Trim only trailing newlines so
-        // CLI formatting can add its own line ending without doubling blanks.
-        return Some(version.trim_end_matches(['\r', '\n']).to_owned());
-    }
-
-    runner
-        .run(
-            "git",
-            &[
-                "-C",
-                &root.display().to_string(),
-                "rev-parse",
-                "--short",
-                "HEAD",
-            ],
-            None,
-        )
-        .ok()
-        .filter(|output| output.success)
-        .map(|output| format!("commit {}", output.stdout.trim()))
-        .and_then(non_empty)
 }
 
 fn non_empty(value: String) -> Option<String> {
@@ -597,6 +571,43 @@ mod tests {
             status.state,
             State::Installed {
                 detail: Some("2.0.0".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn github_repo_reports_short_git_commit_without_version_file() {
+        let roots = roots();
+        let repo = roots.install_dir.join("cgraf78/tool");
+        fs::create_dir_all(&repo).unwrap();
+        let manifest = Manifest::default();
+        let env = RuntimeEnv::new("linux", "workstation");
+        let runner = FakeRunner::default().with_output(
+            "git",
+            ["-C", repo.to_str().unwrap(), "rev-parse", "--short", "HEAD"],
+            "abc1234\n",
+        );
+        let package_versions = BTreeMap::new();
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &NoCustomProbe,
+            "",
+            &package_versions,
+        );
+
+        let status = classify(
+            &parse_entry("cgraf78/tool|github:repo|-|-|-", None),
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(
+            status.state,
+            State::Installed {
+                detail: Some("commit abc1234".to_owned())
             }
         );
     }

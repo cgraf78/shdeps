@@ -7,8 +7,11 @@
 //! re-encoding them in clone, pull, status, and tests.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 
 use crate::config;
+use crate::process::Runner;
 
 /// GitHub repository source decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +62,41 @@ pub fn ssh_fallback(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("git@github.com:{path}.git"))
+}
+
+/// Returns the display version for an installed repository checkout.
+///
+/// A repository-managed dependency reports a checked-in `VERSION` file when
+/// present, matching the Bash implementation. Repositories without one fall
+/// back to Git's short commit abbreviation so `list` and verbose `update`
+/// output stay compact and consistent.
+pub(crate) fn version(root: &Path, runner: &impl Runner) -> Option<String> {
+    let version_path = root.join("VERSION");
+    if let Ok(version) = fs::read_to_string(&version_path) {
+        let version = version.trim_end_matches(['\r', '\n']).to_owned();
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+
+    runner
+        .run(
+            "git",
+            &[
+                "-C",
+                &root.display().to_string(),
+                "rev-parse",
+                "--short",
+                "HEAD",
+            ],
+            None,
+        )
+        .ok()
+        .filter(|output| output.success)
+        .and_then(|output| {
+            let commit = output.stdout.trim();
+            (!commit.is_empty()).then(|| format!("commit {commit}"))
+        })
 }
 
 fn canonical(name: &str) -> String {

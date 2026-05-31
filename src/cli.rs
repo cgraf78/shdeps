@@ -451,13 +451,16 @@ where
     let hooks = custom_probe();
     let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
-    if let Some(message) = update_prerequisite_error(&entries, &env, &Process) {
+    if let Some(message) =
+        update_prerequisite_error(&entries, &env, &Process, UpdatePrerequisitePhase::Initial)
+    {
         writeln!(stderr, "{message}")?;
         return Ok(1);
     }
     let update_options = UpdateOptions {
         reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
         force: runtime::force(&ProcessEnv, &options.overrides),
+        verbose: options.verbose,
         remote_ttl: remote_ttl(),
         ..UpdateOptions::default()
     };
@@ -480,6 +483,16 @@ where
             github_options_from_update(update_options),
             &mut progress,
         )?;
+        if let Some(message) = update_prerequisite_error(
+            &entries,
+            &env,
+            &Process,
+            UpdatePrerequisitePhase::ConcreteOnly,
+        ) {
+            progress.clear_unfinished()?;
+            writeln!(stderr, "{message}")?;
+            return Ok(1);
+        }
         let context = UpdateContext {
             manifest_path: &manifest_path,
             roots: &roots,
@@ -541,6 +554,15 @@ where
                 github_options_from_update(update_options),
             )?
         };
+        if let Some(message) = update_prerequisite_error(
+            &entries,
+            &env,
+            &Process,
+            UpdatePrerequisitePhase::ConcreteOnly,
+        ) {
+            writeln!(stderr, "{message}")?;
+            return Ok(1);
+        }
         let context = UpdateContext {
             manifest_path: &manifest_path,
             roots: &roots,
@@ -603,8 +625,9 @@ fn update_prerequisite_error(
     entries: &[Entry],
     env: &crate::platform::RuntimeEnv,
     runner: &impl process::Runner,
+    phase: UpdatePrerequisitePhase,
 ) -> Option<String> {
-    let missing = update_prerequisites(entries, env)
+    let missing = update_prerequisites(entries, env, phase)
         .into_iter()
         .filter(|prereq| !runner.exists(prereq.command))
         .collect::<Vec<_>>();
@@ -622,6 +645,14 @@ fn update_prerequisite_error(
     ))
 }
 
+#[derive(Clone, Copy)]
+enum UpdatePrerequisitePhase {
+    /// Checks tools needed before bare `github` methods have concrete owners.
+    Initial,
+    /// Checks only concrete install methods after bare `github` resolution.
+    ConcreteOnly,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct UpdatePrerequisite {
     command: &'static str,
@@ -631,62 +662,51 @@ struct UpdatePrerequisite {
 fn update_prerequisites(
     entries: &[Entry],
     env: &crate::platform::RuntimeEnv,
+    phase: UpdatePrerequisitePhase,
 ) -> Vec<UpdatePrerequisite> {
     let mut required = BTreeMap::<&'static str, UpdatePrerequisite>::new();
     for entry in entries {
         if !update::active(entry, env) {
             continue;
         }
-        for prereq in prerequisites_for_method(&entry.method) {
+        for prereq in prerequisites_for_method(&entry.method, phase) {
             required.entry(prereq.command).or_insert(*prereq);
         }
     }
     required.into_values().collect()
 }
 
-fn prerequisites_for_method(method: &str) -> &'static [UpdatePrerequisite] {
-    match method {
-        "github" => &[
-            UpdatePrerequisite {
-                command: "curl",
-                reason: "GitHub release metadata and downloads",
-            },
-            UpdatePrerequisite {
-                command: "gh",
-                reason: "authenticated GitHub API access",
-            },
-            UpdatePrerequisite {
-                command: "git",
-                reason: "GitHub repo installs",
-            },
-        ],
-        "github:release" => &[
-            UpdatePrerequisite {
-                command: "curl",
-                reason: "GitHub release metadata and downloads",
-            },
-            UpdatePrerequisite {
-                command: "gh",
-                reason: "authenticated GitHub API access",
-            },
-        ],
-        "github:repo" => &[UpdatePrerequisite {
+fn prerequisites_for_method(
+    method: &str,
+    phase: UpdatePrerequisitePhase,
+) -> &'static [UpdatePrerequisite] {
+    match (method, phase) {
+        ("github", UpdatePrerequisitePhase::Initial) => &[UpdatePrerequisite {
+            command: "curl",
+            reason: "GitHub release metadata and downloads",
+        }],
+        ("github", UpdatePrerequisitePhase::ConcreteOnly) => &[],
+        ("github:release", _) => &[UpdatePrerequisite {
+            command: "curl",
+            reason: "GitHub release metadata and downloads",
+        }],
+        ("github:repo", _) => &[UpdatePrerequisite {
             command: "git",
             reason: "GitHub repo installs",
         }],
-        "cargo" => &[UpdatePrerequisite {
+        ("cargo", _) => &[UpdatePrerequisite {
             command: "cargo",
             reason: "cargo installs",
         }],
-        "go" => &[UpdatePrerequisite {
+        ("go", _) => &[UpdatePrerequisite {
             command: "go",
             reason: "go installs",
         }],
-        "uv" => &[UpdatePrerequisite {
+        ("uv", _) => &[UpdatePrerequisite {
             command: "uv",
             reason: "uv installs",
         }],
-        "npm" => &[UpdatePrerequisite {
+        ("npm", _) => &[UpdatePrerequisite {
             command: "npm",
             reason: "npm installs",
         }],
@@ -887,9 +907,7 @@ where
             }
         }
 
-        // Keep a cleared row after the footer so shell prompt redraws cannot
-        // consume the last visible line after long-running updates.
-        let rendered_rows = rows.len() + if footer.is_some() { 2 } else { 0 };
+        let rendered_rows = rows.len() + usize::from(footer.is_some());
         let line_count = rendered_rows.max(previous_rows);
         for index in 0..line_count {
             write!(self.out, "\r\x1b[K")?;
@@ -2898,7 +2916,7 @@ mod tests {
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(stdout.contains("  ok       Custom: 1 current"));
         assert!(stdout.contains("0s\n\r\x1b[KDone in 2s\n"));
-        assert!(stdout.ends_with("Done in 2s\n\r\x1b[K\n"));
+        assert!(stdout.ends_with("Done in 2s\n"));
     }
 
     #[test]
