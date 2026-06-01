@@ -24,7 +24,7 @@ _test_dir=$(
   esac
   cd -P -- "$dir" && pwd
 )
-_repo_root=$(cd -P -- "$_test_dir/.." && pwd)
+_repo_root=$(cd -P -- "$_test_dir/../.." && pwd)
 
 _pass_count=0
 _fail_count=0

@@ -18,22 +18,14 @@ changes.
 - **`shdeps.sh`** — sourceable Bash compatibility wrapper for the Rust
   implementation. Existing callers still do:
   `source shdeps.sh; shdeps_update`.
-- **`shdeps-legacy.sh`** — preserved Bash reference implementation. Keep it
-  available for parity tests and emergency comparison, but do not add new
-  behavior here unless a test explicitly needs to pin legacy behavior.
-- **`bin/shdeps-legacy`** — temporary legacy Bash CLI wrapper that sources
-  `shdeps-legacy.sh`. Release archives and normal installs should use the
-  Rust `shdeps` binary instead, and `bin/` must not contain a `shdeps`
-  executable that can shadow the Rust CLI when `.envrc` adds `./bin` to `PATH`.
+- **`tests/shell/`** — shell-owned test suites for the sourceable wrapper,
+  installer, and release scripts.
 - **`install.sh`** — curl-pipeable installer and bootstrap script. It installs
   release archives when available, can build explicit source checkouts, symlinks
   the CLI into `~/.local/bin`, and supports `--uninstall` plus sourceable
   `--bootstrap` for client integration.
-- **`test/shdeps-test`** — parity test runner. Run Bash reference coverage with
-  `./test/shdeps-test` and Rust CLI parity with
-  `SHDEPS_IMPL=rust ./test/shdeps-test`.
-- **`test/shdeps-wrapper-test`** — focused tests for the sourceable Rust-era
-  wrapper API.
+- **`tests/shell/shdeps-wrapper-test`** — focused tests for the sourceable
+  Rust-era wrapper API.
 
 ## Code Organization
 
@@ -146,5 +138,9 @@ and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
 Run the test suite:
 
 ```bash
-./test/shdeps-test
+cargo test --locked
+tests/shell/install-sh-test
+tests/shell/installer-flow-test
+tests/shell/release-scripts-test
+SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
 ```

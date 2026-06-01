@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1091
+# End-to-end shell coverage for install.sh and bootstrap behavior. The Rust
+# suite owns shdeps behavior; this file protects the still-shell installer.
+
+set -uo pipefail
+
+SHDEPS_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# shellcheck source=helpers.sh
+. "$(dirname "$0")/helpers.sh"
+
+_write_fake_shdeps() {
+  local path="$1" version="$2"
+
+  cat >"$path" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  version)
+    printf '%s\n' "shdeps $version"
+    ;;
+  __api)
+    case "\${2:-}" in
+      version)
+        printf '%s\n' "abi:1"
+        ;;
+      env-snapshot)
+        printf '%s\n' \\
+          "install_dir=\${SHDEPS_INSTALL_DIR:-\$HOME/.local/share}" \\
+          "bin_dir=\${SHDEPS_BIN_DIR:-\$HOME/.local/bin}" \\
+          "git_dev_dir=\${SHDEPS_GIT_DEV_DIR:-\$HOME/git}" \\
+          "platform=linux" \\
+          "pkg_mgr=" \\
+          "force=\${SHDEPS_FORCE:-0}" \\
+          "reinstall=\${SHDEPS_REINSTALL:-0}"
+        ;;
+      link-extras | unlink-extras)
+        ;;
+    esac
+    ;;
+esac
+SH
+  chmod +x "$path"
+}
+
+_write_fake_cargo_build() {
+  local path="$1"
+
+  cat >"$path" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" != build ]]; then
+  printf 'mock cargo: unsupported subcmd %s\n' "${1:-}" >&2
+  exit 2
+fi
+printf 'cargo %s\n' "$*" >>"${SHDEPS_TEST_CARGO_LOG:-/dev/null}"
+mkdir -p target/release
+cp "$SHDEPS_TEST_FAKE_SHDEPS" target/release/shdeps
+chmod +x target/release/shdeps
+SH
+  chmod +x "$path"
+}
+
+_platform_label() {
+  local os arch
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m | tr '[:upper:]' '[:lower:]')
+  case "$arch" in
+    amd64) arch=x86_64 ;;
+    arm64) arch=aarch64 ;;
+  esac
+
+  case "$os:$arch" in
+    linux:x86_64) printf '%s\n' "linux-x86_64-musl" ;;
+    linux:aarch64) printf '%s\n' "linux-aarch64-musl" ;;
+    darwin:x86_64) printf '%s\n' "macos-x86_64" ;;
+    darwin:aarch64) printf '%s\n' "macos-aarch64" ;;
+    *) return 1 ;;
+  esac
+}
+
+_sha256_line() {
+  local file="$1" name="$2"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | sed "s| .*$|  $name|"
+  else
+    shasum -a 256 "$file" | sed "s| .*$|  $name|"
+  fi
+}
+
+_release_fixture() {
+  local release_dir="$1" payload="$2" tag="$3" platform="$4"
+  local archive="shdeps-${tag}-${platform}.tar.gz"
+
+  mkdir -p "$release_dir" "$payload/man/man1" "$payload/completions"
+  _write_fake_shdeps "$payload/shdeps" "$tag"
+  cp "$SHDEPS_DIR/shdeps.sh" "$payload/shdeps.sh"
+  cp "$SHDEPS_DIR/install.sh" "$payload/install.sh"
+  chmod +x "$payload/install.sh"
+  cp "$SHDEPS_DIR/README.md" "$payload/README.md"
+  cp "$SHDEPS_DIR/LICENSE" "$payload/LICENSE"
+  cp "$SHDEPS_DIR/man/man1/shdeps.1" "$payload/man/man1/shdeps.1"
+  cp "$SHDEPS_DIR/completions/shdeps.bash" "$payload/completions/shdeps.bash"
+  cp "$SHDEPS_DIR/completions/shdeps.zsh" "$payload/completions/shdeps.zsh"
+  cp "$SHDEPS_DIR/completions/shdeps.fish" "$payload/completions/shdeps.fish"
+  cat >"$payload/.shdeps-install.json" <<JSON
+{"schema":1,"method":"release","artifact_platform":"$platform","version":"$tag","tag":"$tag","commit":"abcdef123456","repo":"cgraf78/shdeps"}
+JSON
+
+  tar -C "$payload" -czf "$release_dir/$archive" .
+  _sha256_line "$release_dir/$archive" "$archive" >"$release_dir/$archive.sha256"
+  cat >"$release_dir/latest.json" <<JSON
+{
+  "tag_name": "$tag",
+  "assets": [
+    {"name": "$archive", "browser_download_url": "https://example.test/$archive"},
+    {"name": "$archive.sha256", "browser_download_url": "https://example.test/$archive.sha256"}
+  ]
+}
+JSON
+}
+
+_write_fixture_curl() {
+  local path="$1"
+
+  cat >"$path" <<'SH'
+#!/usr/bin/env bash
+set -eu
+out=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o)
+      out="$2"
+      shift 2
+      ;;
+    -w)
+      shift 2
+      ;;
+    -H)
+      printf '%s\n' "$2" >>"${SHDEPS_TEST_CURL_LOG:-/dev/null}"
+      shift 2
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+case "$url" in
+  */releases/latest)
+    if [[ -n "${SHDEPS_TEST_MARKER_DIR:-}" ]]; then
+      mkdir -p "$SHDEPS_TEST_MARKER_DIR"
+      : >"$SHDEPS_TEST_MARKER_DIR/latest"
+    fi
+    if [[ "$out" == "/dev/null" ]]; then
+      printf '%s' "https://github.com/cgraf78/shdeps/releases/tag/$SHDEPS_TEST_RELEASE_TAG"
+    else
+      cp "$SHDEPS_TEST_RELEASE_DIR/latest.json" "$out"
+    fi
+    ;;
+  */latest)
+    cp "$SHDEPS_TEST_RELEASE_DIR/latest.json" "$out"
+    ;;
+  *.tar.gz)
+    if [[ -n "${SHDEPS_TEST_MARKER_DIR:-}" ]]; then
+      mkdir -p "$SHDEPS_TEST_MARKER_DIR"
+      : >"$SHDEPS_TEST_MARKER_DIR/archive"
+    fi
+    cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out"
+    ;;
+  *.sha256)
+    if [[ -n "${SHDEPS_TEST_MARKER_DIR:-}" ]]; then
+      mkdir -p "$SHDEPS_TEST_MARKER_DIR"
+      : >"$SHDEPS_TEST_MARKER_DIR/checksum"
+    fi
+    cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out"
+    ;;
+  *)
+    printf 'unexpected url: %s\n' "$url" >&2
+    exit 1
+    ;;
+esac
+SH
+  chmod +x "$path"
+}
+
+_assert_no_backups() {
+  local label="$1" install_dir="$2"
+  if compgen -G "${install_dir}.shdeps-backup.*" >/dev/null; then
+    _fail "$label"
+  else
+    _pass "$label"
+  fi
+}
+
+echo "=== install.sh source installs ==="
+
+_install_script="$SHDEPS_DIR/install.sh"
+_source_repo="$SHDEPS_DIR"
+_build_bin=$(_mock_bin)
+_fake_shdeps="$_build_bin/shdeps-built"
+_write_fake_shdeps "$_fake_shdeps" "20990203-040506-abc12345"
+_write_fake_cargo_build "$_build_bin/cargo"
+
+_inst_dir=$(_tmpdir)/shdeps-fresh
+_inst_bin=$(_tmpdir)/bin
+_cargo_log=$(_tmpdir)/cargo.log
+mkdir -p "$_inst_bin"
+PATH="$_build_bin:/usr/bin:/bin" \
+  SHDEPS_TEST_FAKE_SHDEPS="$_fake_shdeps" \
+  SHDEPS_TEST_CARGO_LOG="$_cargo_log" \
+  SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
+  SHDEPS_REPO="$_source_repo" "$_install_script" >/dev/null 2>&1
+_assert_dir_exists "install source: clone dir created" "$_inst_dir"
+_assert_file_exists "install source: wrapper present" "$_inst_dir/shdeps.sh"
+_assert_symlink "install source: CLI symlinked" "$_inst_bin/shdeps"
+_assert_contains "install source: cargo build ran locked" \
+  "cargo build --release --locked" "$(cat "$_cargo_log")"
+
+: >"$_cargo_log"
+PATH="$_build_bin:/usr/bin:/bin" \
+  SHDEPS_TEST_FAKE_SHDEPS="$_fake_shdeps" \
+  SHDEPS_TEST_CARGO_LOG="$_cargo_log" \
+  SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
+  SHDEPS_REPO="$_source_repo" "$_install_script" >/dev/null 2>&1
+_assert_dir_exists "install source: idempotent rerun keeps clone" "$_inst_dir"
+
+printf '%s\n' dirty >>"$_inst_dir/shdeps.sh"
+_dirty_out=$(
+  PATH="$_build_bin:/usr/bin:/bin" \
+    SHDEPS_TEST_FAKE_SHDEPS="$_fake_shdeps" \
+    SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
+    SHDEPS_REPO="$_source_repo" "$_install_script" 2>&1
+)
+_assert_contains "install source: dirty checkout skips pull" "dirty" "$_dirty_out"
+git -C "$_inst_dir" checkout -- shdeps.sh >/dev/null 2>&1
+
+_nongit_dir=$(_tmpdir)/shdeps-nongit
+mkdir -p "$_nongit_dir"
+printf '%s\n' "not a repo" >"$_nongit_dir/file"
+rc=0
+SHDEPS_DIR="$_nongit_dir" "$_install_script" >/dev/null 2>&1 || rc=$?
+_assert_exit "install source: existing non-git dir exits 1" 1 "$rc"
+
+SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
+  "$_install_script" --uninstall >/dev/null 2>&1
+_assert_file_missing "install source: uninstall removes symlink" "$_inst_bin/shdeps"
+_assert_dir_missing "install source: uninstall removes clone" "$_inst_dir"
+
+_uninstall_out=$(SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
+  "$_install_script" --uninstall 2>&1)
+_assert_contains "install source: uninstall noop explains state" \
+  "nothing to uninstall" "$_uninstall_out"
+
+echo "=== install.sh release installs ==="
+
+_platform=$(_platform_label || true)
+if [[ -z "$_platform" ]]; then
+  _pass "install release: unsupported host platform skipped"
+else
+  _tag="20990101-020304-fedcba98"
+  _release_dir=$(_tmpdir)/release
+  _payload=$(_tmpdir)/release-payload
+  _release_bin_dir=$(_tmpdir)/release-bin
+  _release_inst=$(_tmpdir)/release-install
+  _release_script_dir=$(_tmpdir)/release-script
+  _release_fakebin=$(_mock_bin)
+  _release_log=$(_tmpdir)/curl.log
+  mkdir -p "$_release_bin_dir" "$_release_script_dir"
+  _release_fixture "$_release_dir" "$_payload" "$_tag" "$_platform"
+  _write_fixture_curl "$_release_fakebin/curl"
+  cp "$SHDEPS_DIR/install.sh" "$_release_script_dir/install.sh"
+  chmod +x "$_release_script_dir/install.sh"
+  _release_install_script="$_release_script_dir/install.sh"
+
+  PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_tag" \
+    SHDEPS_TEST_CURL_LOG="$_release_log" \
+    GH_TOKEN="release-token" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_release_inst" SHDEPS_BIN="$_release_bin_dir/shdeps" \
+    "$_release_install_script" >/dev/null 2>&1
+  _assert_file_exists "install release: binary installed" "$_release_inst/shdeps"
+  _assert_file_exists "install release: metadata installed" \
+    "$_release_inst/.shdeps-install.json"
+  _assert_symlink "install release: CLI symlinked" "$_release_bin_dir/shdeps"
+  _assert_eq "install release: CLI points at release binary" \
+    "$_release_inst/shdeps" "$(readlink "$_release_bin_dir/shdeps")"
+  _assert_contains "install release: token sent to metadata" \
+    "Authorization: Bearer release-token" "$(cat "$_release_log")"
+
+  _updated_tag="20990102-030405-22222222"
+  _updated_payload=$(_tmpdir)/release-update-payload
+  _release_fixture "$_release_dir" "$_updated_payload" "$_updated_tag" "$_platform"
+  PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_release_inst" SHDEPS_BIN="$_release_bin_dir/shdeps" \
+    "$_release_install_script" >/dev/null 2>&1
+  _assert_eq "install release: replacement updates binary" \
+    "shdeps $_updated_tag" "$("$_release_bin_dir/shdeps" version)"
+
+  _bad_release_dir=$(_tmpdir)/bad-release
+  cp "$_release_dir/shdeps-${_updated_tag}-${_platform}.tar.gz" "$_bad_release_dir.tar.gz"
+  mkdir -p "$_bad_release_dir"
+  cp "$_bad_release_dir.tar.gz" \
+    "$_bad_release_dir/shdeps-${_updated_tag}-${_platform}.tar.gz"
+  printf '%s\n' "bad  shdeps-${_updated_tag}-${_platform}.tar.gz" \
+    >"$_bad_release_dir/shdeps-${_updated_tag}-${_platform}.tar.gz.sha256"
+  cp "$_release_dir/latest.json" "$_bad_release_dir/latest.json"
+  _bad_inst=$(_tmpdir)/bad-install
+  _bad_bin=$(_tmpdir)/bad-bin
+  mkdir -p "$_bad_bin"
+  rc=0
+  PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_RELEASE_DIR="$_bad_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_bad_inst" SHDEPS_BIN="$_bad_bin/shdeps" \
+    "$_release_install_script" >/dev/null 2>&1 || rc=$?
+  _assert_exit "install release: checksum failure exits 1" 1 "$rc"
+  _assert_dir_missing "install release: checksum failure leaves no live dir" "$_bad_inst"
+  _assert_not_exists "install release: checksum failure leaves no CLI link" "$_bad_bin/shdeps"
+
+  _migrate_inst=$(_tmpdir)/source-to-release
+  _migrate_bin=$(_tmpdir)/source-to-release-bin
+  mkdir -p "$_migrate_inst" "$_migrate_bin"
+  git -C "$_migrate_inst" init >/dev/null 2>&1
+  git -C "$_migrate_inst" config user.email "test@test.com"
+  git -C "$_migrate_inst" config user.name "Test"
+  git -C "$_migrate_inst" remote add origin "https://github.com/cgraf78/shdeps.git"
+  printf '%s\n' "old source checkout" >"$_migrate_inst/shdeps.sh"
+  git -C "$_migrate_inst" add shdeps.sh
+  git -C "$_migrate_inst" commit -m "source install" >/dev/null 2>&1
+  printf '%s\n' '{"schema":1,"method":"source-build"}' \
+    >"$_migrate_inst/.shdeps-install.json"
+  PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_REPO="ssh://git@github.com/cgraf78/shdeps.git" \
+    SHDEPS_DIR="$_migrate_inst" SHDEPS_BIN="$_migrate_bin/shdeps" \
+    "$_release_install_script" >/dev/null 2>&1
+  _assert_file_missing "install release migration: source checkout replaced" \
+    "$_migrate_inst/.git/config"
+  _assert_file_exists "install release migration: metadata installed" \
+    "$_migrate_inst/.shdeps-install.json"
+  _assert_eq "install release migration: CLI runs release binary" \
+    "shdeps $_updated_tag" "$("$_migrate_bin/shdeps" version)"
+  _assert_no_backups "install release migration: backup cleaned" "$_migrate_inst"
+
+  _dirty_inst=$(_tmpdir)/dirty-source
+  _dirty_bin=$(_tmpdir)/dirty-source-bin
+  mkdir -p "$_dirty_inst" "$_dirty_bin"
+  git -C "$_dirty_inst" init >/dev/null 2>&1
+  git -C "$_dirty_inst" config user.email "test@test.com"
+  git -C "$_dirty_inst" config user.name "Test"
+  git -C "$_dirty_inst" remote add origin "https://github.com/cgraf78/shdeps.git"
+  printf '%s\n' "old source checkout" >"$_dirty_inst/shdeps.sh"
+  git -C "$_dirty_inst" add shdeps.sh
+  git -C "$_dirty_inst" commit -m "source install" >/dev/null 2>&1
+  printf '%s\n' "local edit" >>"$_dirty_inst/shdeps.sh"
+  rc=0
+  PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_dirty_inst" SHDEPS_BIN="$_dirty_bin/shdeps" \
+    "$_release_install_script" >/dev/null 2>&1 || rc=$?
+  _assert_exit "install release migration dirty: exits 1" 1 "$rc"
+  _assert_file_exists "install release migration dirty: source checkout preserved" \
+    "$_dirty_inst/.git/config"
+
+  echo "=== install.sh bootstrap release refresh ==="
+
+  unset -f shdeps_update 2>/dev/null
+  _bootstrap_state=$(_tmpdir)/bootstrap-current
+  _bootstrap_bin=$(_tmpdir)/bootstrap-bin
+  _bootstrap_markers=$(_tmpdir)/bootstrap-markers
+  _bootstrap_home=$(_mock_home)
+  mkdir -p "$_bootstrap_state" "$_bootstrap_bin"
+  cp -R "$_updated_payload/." "$_bootstrap_state/"
+  HOME="$_bootstrap_home" PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
+    SHDEPS_TEST_MARKER_DIR="$_bootstrap_markers" \
+    SHDEPS_GIT_DEV_DIR="$_bootstrap_home/git" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_bootstrap_state" SHDEPS_BIN="$_bootstrap_bin/shdeps" \
+    . "$_bootstrap_state/install.sh" --bootstrap
+  _assert_eq "bootstrap current release: CLI stays current" \
+    "shdeps $_updated_tag" "$("$_bootstrap_bin/shdeps" version)"
+  _assert_file_exists "bootstrap current release: checks latest" \
+    "$_bootstrap_markers/latest"
+  _assert_file_missing "bootstrap current release: skips archive download" \
+    "$_bootstrap_markers/archive"
+
+  unset -f shdeps_update 2>/dev/null
+  _bootstrap_stale=$(_tmpdir)/bootstrap-stale
+  _bootstrap_stale_bin=$(_tmpdir)/bootstrap-stale-bin
+  _bootstrap_stale_markers=$(_tmpdir)/bootstrap-stale-markers
+  mkdir -p "$_bootstrap_stale" "$_bootstrap_stale_bin"
+  cp -R "$_payload/." "$_bootstrap_stale/"
+  HOME="$_bootstrap_home" PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
+    SHDEPS_TEST_MARKER_DIR="$_bootstrap_stale_markers" \
+    SHDEPS_GIT_DEV_DIR="$_bootstrap_home/git" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_bootstrap_stale" SHDEPS_BIN="$_bootstrap_stale_bin/shdeps" \
+    . "$_bootstrap_stale/install.sh" --bootstrap
+  _assert_eq "bootstrap stale release: CLI updates to latest" \
+    "shdeps $_updated_tag" "$("$_bootstrap_stale_bin/shdeps" version)"
+  _assert_file_exists "bootstrap stale release: downloads archive" \
+    "$_bootstrap_stale_markers/archive"
+  _assert_file_exists "bootstrap stale release: downloads checksum" \
+    "$_bootstrap_stale_markers/checksum"
+fi
+
+_test_summary

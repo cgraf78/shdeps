@@ -463,6 +463,132 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn links_documented_upstream_layouts_without_false_positives() {
+        let cases = [
+            (
+                "goreleaser",
+                vec![
+                    ("manpages/gum.1.gz", "man"),
+                    ("completions/gum.bash", "bash"),
+                    ("completions/gum.zsh", "zsh"),
+                    ("completions/gum.fish", "fish"),
+                ],
+                vec![
+                    "xdg/man/man1/gum.1.gz",
+                    "xdg/bash-completion/completions/gum",
+                    "xdg/zsh/site-functions/_gum",
+                    "xdg/fish/vendor_completions.d/gum.fish",
+                ],
+            ),
+            (
+                "rust",
+                vec![
+                    ("doc/rg.1", "man"),
+                    ("complete/rg.bash", "bash"),
+                    ("complete/_rg", "zsh"),
+                    ("complete/rg.fish", "fish"),
+                ],
+                vec![
+                    "xdg/man/man1/rg.1",
+                    "xdg/bash-completion/completions/rg",
+                    "xdg/zsh/site-functions/_rg",
+                    "xdg/fish/vendor_completions.d/rg.fish",
+                ],
+            ),
+            (
+                "autocomplete",
+                vec![
+                    ("fd.1", "man"),
+                    ("autocomplete/fd.bash", "bash"),
+                    ("autocomplete/_fd", "zsh"),
+                    ("autocomplete/fd.fish", "fish"),
+                ],
+                vec![
+                    "xdg/man/man1/fd.1",
+                    "xdg/bash-completion/completions/fd",
+                    "xdg/zsh/site-functions/_fd",
+                    "xdg/fish/vendor_completions.d/fd.fish",
+                ],
+            ),
+            (
+                "zoxide",
+                vec![
+                    ("man/man1/zoxide.1", "man"),
+                    ("completions/zoxide.bash", "bash"),
+                    ("completions/_zoxide", "zsh"),
+                    ("completions/zoxide.fish", "fish"),
+                ],
+                vec![
+                    "xdg/man/man1/zoxide.1",
+                    "xdg/bash-completion/completions/zoxide",
+                    "xdg/zsh/site-functions/_zoxide",
+                    "xdg/fish/vendor_completions.d/zoxide.fish",
+                ],
+            ),
+        ];
+
+        for (name, sources, expected_targets) in cases {
+            let dir = temp_dir(name);
+            let install = dir.join("install");
+            for (path, marker) in sources {
+                let source = install.join(path);
+                fs::create_dir_all(source.parent().unwrap()).unwrap();
+                fs::write(source, marker).unwrap();
+            }
+
+            let created = super::link(&dir.join("state"), &dir.join("xdg"), name, &install)
+                .unwrap()
+                .into_iter()
+                .map(|path| path.strip_prefix(&dir).unwrap().to_path_buf())
+                .collect::<Vec<_>>();
+
+            assert_eq!(created.len(), expected_targets.len(), "{name}");
+            for expected in expected_targets {
+                assert!(
+                    dir.join(expected).is_symlink(),
+                    "{name}: expected symlink {expected}"
+                );
+            }
+        }
+
+        let dir = temp_dir("false-positive");
+        let install = dir.join("install");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("README.1st"), "not a man page").unwrap();
+        fs::write(install.join("version.0"), "not a man page").unwrap();
+        fs::write(install.join("notes.txt"), "notes").unwrap();
+        fs::create_dir_all(install.join("fake.1")).unwrap();
+
+        let created =
+            super::link(&dir.join("state"), &dir.join("xdg"), "fp-tool", &install).unwrap();
+        assert!(created.is_empty());
+        assert!(!dir.join("state/fp-tool.links").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn links_multiple_man_sections_and_unlinks_dangling_targets() {
+        let dir = temp_dir("multi-man");
+        let install = dir.join("install");
+        fs::create_dir_all(install.join("manpages")).unwrap();
+        fs::write(install.join("manpages/tool.1"), ".TH TOOL 1\n").unwrap();
+        fs::write(install.join("manpages/tool_colors.5"), ".TH TOOL 5\n").unwrap();
+
+        super::link(&dir.join("state"), &dir.join("xdg"), "multi-man", &install).unwrap();
+
+        assert!(dir.join("xdg/man/man1/tool.1").is_symlink());
+        assert!(dir.join("xdg/man/man5/tool_colors.5").is_symlink());
+
+        fs::remove_dir_all(&install).unwrap();
+        link_state::unlink_tracked(&dir.join("state/multi-man.links")).unwrap();
+
+        assert!(!dir.join("xdg/man/man1/tool.1").exists());
+        assert!(!dir.join("xdg/man/man5/tool_colors.5").exists());
+        assert!(!dir.join("state/multi-man.links").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn link_normalizes_all_freshly_created_ancestor_dir_perms() {
         // When `create_dir_all` creates several intermediate dirs at once
         // under a permissive umask, the pre-fix code only fixed the leaf
