@@ -2776,6 +2776,85 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_refuses_release_wide_checksum_mismatch() {
+        let binary = b"binary".to_vec();
+        let checksum_text = format!(
+            "{}  tool-linux-x86_64\n",
+            crate::checksum::sha256_hex(b"different-bytes"),
+        );
+
+        assert_release_wide_checksum_failure("release-checksum-wide-bad", binary, checksum_text);
+    }
+
+    #[test]
+    fn update_github_release_refuses_release_wide_checksum_for_wrong_asset() {
+        let binary = b"binary".to_vec();
+        let checksum_text = format!(
+            "{}  other-linux-x86_64\n",
+            crate::checksum::sha256_hex(&binary),
+        );
+
+        assert_release_wide_checksum_failure(
+            "release-checksum-wide-wrong-name",
+            binary,
+            checksum_text,
+        );
+    }
+
+    fn assert_release_wide_checksum_failure(name: &str, binary: Vec<u8>, checksum_text: String) {
+        let mut fixture = Fixture::new(name);
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[
+                        {
+                            "name":"tool-linux-x86_64",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        },
+                        {
+                            "name":"SHA256SUMS",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/SHA256SUMS"
+                        }
+                    ]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                binary,
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/SHA256SUMS",
+                checksum_text.into_bytes(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].detail, "release asset checksum mismatch");
+        assert!(!fixture.roots.bin_dir.join("tool").exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn update_github_release_refuses_install_on_sha256_mismatch() {
         // If the sibling checksum is published but mismatches the
         // downloaded binary, the install must be refused outright and the
