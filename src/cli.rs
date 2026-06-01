@@ -473,7 +473,7 @@ where
     }
 
     let (entries, summary, active_count) = if terminal_progress {
-        let mut progress = TtyProgress::new(stdout, terminal_progress_plan(&entries, &env));
+        let mut progress = TtyProgress::new_colored(stdout, terminal_progress_plan(&entries, &env));
         progress.start()?;
         let entries = resolve_github_entries_with_progress_sink(
             &entries,
@@ -739,6 +739,7 @@ where
     active: bool,
     finished: bool,
     rendered_rows: usize,
+    color: bool,
 }
 
 struct TtyProgressRow {
@@ -756,7 +757,20 @@ impl<W> TtyProgress<'_, W>
 where
     W: Write,
 {
+    #[cfg(test)]
     fn new(out: &mut W, stages: Vec<TtyProgressStage>) -> TtyProgress<'_, W> {
+        TtyProgress::new_with_color(out, stages, false)
+    }
+
+    fn new_colored(out: &mut W, stages: Vec<TtyProgressStage>) -> TtyProgress<'_, W> {
+        TtyProgress::new_with_color(out, stages, color_enabled())
+    }
+
+    fn new_with_color(
+        out: &mut W,
+        stages: Vec<TtyProgressStage>,
+        color: bool,
+    ) -> TtyProgress<'_, W> {
         TtyProgress {
             out,
             rows: stages
@@ -775,6 +789,7 @@ where
             active: false,
             finished: false,
             rendered_rows: 0,
+            color,
         }
     }
 
@@ -880,7 +895,7 @@ where
                 write!(
                     self.out,
                     "{}",
-                    tty_row(&row.status, &row.detail, &row.elapsed)
+                    tty_row_with_color(&row.status, &row.detail, &row.elapsed, self.color)
                 )?;
             } else if index == rows.len()
                 && let Some(footer) = footer
@@ -2121,7 +2136,12 @@ fn spinner_frame(done: usize) -> &'static str {
     FRAMES[done % FRAMES.len()]
 }
 
+#[cfg(test)]
 fn tty_row(status: &str, detail: &str, elapsed: &str) -> String {
+    tty_row_with_color(status, detail, elapsed, false)
+}
+
+fn tty_row_with_color(status: &str, detail: &str, elapsed: &str, enabled: bool) -> String {
     let color_status = match status {
         "pending" => "detail",
         "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧" | "⠇" | "⠏" => "running",
@@ -2129,8 +2149,8 @@ fn tty_row(status: &str, detail: &str, elapsed: &str) -> String {
     };
     format!(
         "  {}{status:<8}{} {detail:<54} {elapsed:>6}",
-        color(color_status),
-        color("reset")
+        color_when(color_status, enabled),
+        color_when("reset", enabled)
     )
 }
 
@@ -2139,7 +2159,11 @@ fn elapsed_label_ms(ms: u128) -> String {
 }
 
 fn color(status: &str) -> &'static str {
-    if !color_enabled() {
+    color_when(status, color_enabled())
+}
+
+fn color_when(status: &str, enabled: bool) -> &'static str {
+    if !enabled {
         return "";
     }
     match status {
