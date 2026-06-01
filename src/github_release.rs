@@ -26,11 +26,11 @@ pub struct Selection {
     /// asset name (the same filename appears as the second field in standard
     /// `sha256sum` output) instead of relying on positional trust.
     pub asset_name: String,
-    /// Browser URL of the sibling SHA-256 checksum asset if the upstream
-    /// release published one (looked up as `<asset_name>.sha256`). `None`
-    /// when the release does not include a per-asset digest, in which case
-    /// installation proceeds unverified for backward compatibility — see
-    /// the comment in `update_release::install_request`.
+    /// Browser URL of a checksum asset if the upstream release published one.
+    /// `None` when the release does not include a recognized per-asset or
+    /// release-wide checksum file, in which case installation proceeds
+    /// unverified for backward compatibility — see the comment in
+    /// `update_release::install_request`.
     pub checksum_url: Option<String>,
     /// REST API URL for the sibling checksum asset (private-release fallback).
     pub checksum_api_url: Option<String>,
@@ -72,18 +72,10 @@ pub fn select(
     let url = release_asset::select(cmd, &urls, &target)?.to_owned();
     let primary = release.assets.iter().find(|asset| asset.url == url)?;
     let api_url = primary.api_url.clone();
-    // Standard practice for third-party GitHub releases is to publish a
-    // sibling checksum asset named `<asset>.sha256` (sometimes `.sha512`,
-    // but `.sha256` is overwhelmingly the common form). When the upstream
-    // publishes one, install code uses it to verify the binary before
-    // landing it on disk. We do not invent or fall back to other digests:
-    // a mismatched name silently downgrading the trust model is exactly
-    // the failure shape we want to avoid.
-    let checksum_name = format!("{}.sha256", primary.name);
-    let checksum_asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == checksum_name);
+    // Prefer asset-specific checksums, then release-wide checksum files whose
+    // contents still bind each digest to an exact filename. The install layer
+    // verifies that named binding before landing bytes on disk.
+    let checksum_asset = checksum_asset(&release.assets, &primary.name);
 
     Some(Selection {
         tag: release.tag.clone(),
@@ -92,6 +84,38 @@ pub fn select(
         asset_name: primary.name.clone(),
         checksum_url: checksum_asset.map(|asset| asset.url.clone()),
         checksum_api_url: checksum_asset.and_then(|asset| asset.api_url.clone()),
+    })
+}
+
+fn checksum_asset<'a>(
+    assets: &'a [crate::github::Asset],
+    primary_name: &str,
+) -> Option<&'a crate::github::Asset> {
+    let sibling_names = [
+        format!("{primary_name}.sha256"),
+        format!("{primary_name}.sha256sum"),
+        format!("{primary_name}.sha512"),
+        format!("{primary_name}.sha512sum"),
+    ];
+    if let Some(asset) = assets
+        .iter()
+        .find(|asset| sibling_names.contains(&asset.name))
+    {
+        return Some(asset);
+    }
+
+    assets.iter().find(|asset| {
+        matches!(
+            asset.name.to_ascii_lowercase().as_str(),
+            "sha256sums"
+                | "sha256sums.txt"
+                | "sha512sums"
+                | "sha512sums.txt"
+                | "checksums"
+                | "checksums.txt"
+                | "checksum"
+                | "checksum.txt"
+        )
     })
 }
 
@@ -305,6 +329,73 @@ mod tests {
             )
         );
         assert_eq!(selection.asset_name, "tool-v1.0.0-linux-x86_64.tar.gz");
+    }
+
+    #[test]
+    fn select_finds_common_checksum_asset_variants() {
+        let runner = FakeRunner::new("x86_64", "");
+
+        let sibling_sha512 = vec![Release {
+            tag: "v1.0.0".to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                Asset {
+                    name: "tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    api_url: None,
+                },
+                Asset {
+                    name: "tool-v1.0.0-linux-x86_64.tar.gz.sha512sum".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.sha512sum".to_owned(),
+                    api_url: None,
+                },
+            ],
+        }];
+        assert_eq!(
+            select(
+                "tool",
+                &sibling_sha512,
+                &RuntimeEnv::new("linux", "host"),
+                &runner
+            )
+            .unwrap()
+            .checksum_url
+            .as_deref(),
+            Some(
+                "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.sha512sum"
+            )
+        );
+
+        let release_wide = vec![Release {
+            tag: "v1.0.0".to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                Asset {
+                    name: "tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    api_url: None,
+                },
+                Asset {
+                    name: "SHA256SUMS".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/SHA256SUMS".to_owned(),
+                    api_url: None,
+                },
+            ],
+        }];
+        assert_eq!(
+            select(
+                "tool",
+                &release_wide,
+                &RuntimeEnv::new("linux", "host"),
+                &runner
+            )
+            .unwrap()
+            .checksum_url
+            .as_deref(),
+            Some("https://github.com/owner/tool/releases/download/v1.0.0/SHA256SUMS")
+        );
     }
 
     #[test]

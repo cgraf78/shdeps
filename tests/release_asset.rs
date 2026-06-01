@@ -8,6 +8,10 @@ fn darwin() -> Target {
     Target::new("darwin", "aarch64", "gnu")
 }
 
+fn linux_musl() -> Target {
+    Target::new("linux", "x86_64", "musl")
+}
+
 #[test]
 fn matches_rust_triple_for_platform_and_arch() {
     let urls = [
@@ -55,7 +59,24 @@ fn matching_is_case_insensitive() {
 fn skips_metadata_and_package_assets() {
     let urls = [
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz.sha256",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.sha256sum",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-checksums",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.intoto.jsonl",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.deb",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz")
+    );
+}
+
+#[test]
+fn skips_unsupported_archives_instead_of_treating_them_as_plain_binaries() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.7z",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.lz4",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
     ];
 
@@ -80,6 +101,39 @@ fn supports_os_aliases() {
         select("tool", &urls, &linux()),
         Some("https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.tar.gz")
     );
+}
+
+#[test]
+fn supports_more_archive_and_arch_aliases() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x86-64.txz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tbz2",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-x86-64.txz")
+    );
+}
+
+#[test]
+fn supports_macos_universal_assets() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-mac-universal.zip",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &darwin()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-mac-universal.zip")
+    );
+}
+
+#[test]
+fn short_macos_alias_requires_token_boundary() {
+    let urls = ["https://github.com/owner/emacs/releases/download/v1/emacs-linux-arm64.tar.gz"];
+
+    assert_eq!(select("emacs", &urls, &darwin()), None);
 }
 
 #[test]
@@ -198,6 +252,58 @@ fn falls_back_to_available_linux_libc() {
         Some(
             "https://github.com/owner/tool/releases/download/v1/tool-x86_64-unknown-linux-musl.tar.gz"
         )
+    );
+}
+
+#[test]
+fn prefers_generic_linux_asset_over_wrong_libc() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-musl.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz")
+    );
+}
+
+#[test]
+fn treats_glibc_as_gnu_libc() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-musl.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-glibc.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-glibc.tar.gz")
+    );
+}
+
+#[test]
+fn prefers_musl_asset_on_musl_hosts() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-musl.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux_musl()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-musl.tar.gz")
+    );
+}
+
+#[test]
+fn platform_tokens_in_repo_or_tag_path_do_not_make_filename_match() {
+    let urls = [
+        "https://github.com/linux-owner/tool/releases/download/x86_64/tool.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz")
     );
 }
 

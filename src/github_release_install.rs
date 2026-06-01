@@ -80,6 +80,20 @@ pub fn install_zst(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
     install_zst_to(&bin_dir.join(cmd), bytes)
 }
 
+/// Installs an xz-compressed standalone release binary.
+pub fn install_xz(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
+    install_xz_to(&bin_dir.join(cmd), bytes)
+}
+
+/// Installs an xz-compressed standalone release binary to an exact path.
+pub(crate) fn install_xz_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let mut decoder = xz2::read::XzDecoder::new(bytes);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded)?;
+
+    install_plain_to(target, &decoded)
+}
+
 /// Installs a zstd-compressed standalone release binary to an exact path.
 pub(crate) fn install_zst_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let decoded = zstd::stream::decode_all(bytes)?;
@@ -118,7 +132,7 @@ pub(crate) fn install_tar_gz_to(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, public, name, cmd, |dest| {
+    install_archive(state_dir, install_base, public, name, cmd, false, |dest| {
         archive::unpack_tar_gz(bytes, dest).map(|_| ())
     })
 }
@@ -151,7 +165,7 @@ pub(crate) fn install_tar_bz2_to(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, public, name, cmd, |dest| {
+    install_archive(state_dir, install_base, public, name, cmd, false, |dest| {
         archive::unpack_tar_bz2(bytes, dest).map(|_| ())
     })
 }
@@ -184,7 +198,7 @@ pub(crate) fn install_tar_zst_to(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, public, name, cmd, |dest| {
+    install_archive(state_dir, install_base, public, name, cmd, false, |dest| {
         archive::unpack_tar_zst(bytes, dest).map(|_| ())
     })
 }
@@ -217,7 +231,7 @@ pub(crate) fn install_tar_xz_to(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, public, name, cmd, |dest| {
+    install_archive(state_dir, install_base, public, name, cmd, false, |dest| {
         archive::unpack_tar_xz(bytes, dest).map(|_| ())
     })
 }
@@ -250,7 +264,7 @@ pub(crate) fn install_zip_to(
     cmd: &str,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    install_archive(state_dir, install_base, public, name, cmd, |dest| {
+    install_archive(state_dir, install_base, public, name, cmd, true, |dest| {
         archive::unpack_zip(bytes, dest).map(|_| ())
     })
 }
@@ -261,6 +275,7 @@ fn install_archive(
     public: &Path,
     name: &str,
     cmd: &str,
+    allow_non_executable_exact_binary: bool,
     extract: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<PathBuf> {
     let install_dir = install_base.join(name);
@@ -272,12 +287,16 @@ fn install_archive(
     // directory. shdeps stores installs at a stable dependency path, so peel
     // that wrapper when it is unambiguous and leave multi-root archives intact.
     let content_root = content_root(&extract_dir)?;
-    let binary = find_binary(&content_root, cmd).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{cmd} binary not found in release archive"),
-        )
-    })?;
+    let binary =
+        find_binary(&content_root, cmd, allow_non_executable_exact_binary).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{cmd} binary not found in release archive"),
+            )
+        })?;
+    if !process::executable_path(&binary) {
+        make_executable(&binary)?;
+    }
     let relative_binary = binary
         .strip_prefix(&content_root)
         .map(Path::to_path_buf)
@@ -409,22 +428,25 @@ fn content_root(extract_dir: &Path) -> Result<PathBuf> {
     Ok(extract_dir.to_path_buf())
 }
 
-fn find_binary(root: &Path, cmd: &str) -> Option<PathBuf> {
+fn find_binary(root: &Path, cmd: &str, allow_non_executable_exact_binary: bool) -> Option<PathBuf> {
     let mut prefixed = None;
     for path in walk_files(root) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        if name == cmd {
+            if process::executable_path(&path) || allow_non_executable_exact_binary {
+                return Some(path);
+            }
+            continue;
+        }
         if !process::executable_path(&path) {
             continue;
         }
-        if name == cmd {
-            return Some(path);
-        }
         // Some projects ship platform-suffixed binaries inside a generic
         // archive. Prefer the exact command when present, but keep the first
-        // executable `cmd-*`/`cmd_*` fallback to preserve the useful part of
-        // Bash's looser archive probing without guessing unrelated filenames.
+        // executable `cmd-*`/`cmd_*` fallback without guessing unrelated
+        // filenames.
         if prefixed.is_none()
             && (name.starts_with(&format!("{cmd}-")) || name.starts_with(&format!("{cmd}_")))
         {
@@ -616,6 +638,19 @@ mod tests {
         let bytes = bzip2(b"binary");
 
         let target = super::install_bz2(&dir, "tool", &bytes).unwrap();
+
+        assert_eq!(target, dir.join("tool"));
+        assert_eq!(fs::read(&target).unwrap(), b"binary");
+        assert!(fs::metadata(&target).unwrap().permissions().mode() & 0o111 != 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn xz_install_decompresses_single_binary_and_marks_executable() {
+        let dir = temp_dir("xz-single");
+        let bytes = xz(b"binary");
+
+        let target = super::install_xz(&dir, "tool", &bytes).unwrap();
 
         assert_eq!(target, dir.join("tool"));
         assert_eq!(fs::read(&target).unwrap(), b"binary");
@@ -992,6 +1027,27 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn zip_install_accepts_exact_binary_without_unix_mode_bits() {
+        let dir = temp_dir("zip-no-mode");
+        let bytes = zip(&[("tool-v1.0/bin/tool", b"binary".as_slice(), 0o644)]);
+
+        let public = super::install_zip(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+        let target = public.canonicalize().unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"binary");
+        assert!(fs::metadata(&target).unwrap().permissions().mode() & 0o111 != 0);
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
@@ -1006,6 +1062,12 @@ mod tests {
 
     fn zstd(bytes: &[u8]) -> Vec<u8> {
         zstd::stream::encode_all(bytes, 0).unwrap()
+    }
+
+    fn xz(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
@@ -1024,10 +1086,7 @@ mod tests {
     }
 
     fn tar_xz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
-        let tar = tar(entries);
-        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
-        encoder.write_all(&tar).unwrap();
-        encoder.finish().unwrap()
+        xz(&tar(entries))
     }
 
     fn tar(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {

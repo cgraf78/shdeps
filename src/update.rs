@@ -2720,6 +2720,62 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_verifies_release_wide_sha512_checksum() {
+        let mut fixture = Fixture::new("release-checksum-sha512");
+        fixture.write_lib();
+        let binary = b"binary".to_vec();
+        let checksum_text = format!(
+            "{}  tool-linux-x86_64\n",
+            crate::checksum::sha512_hex(&binary)
+        );
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[
+                        {
+                            "name":"tool-linux-x86_64",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        },
+                        {
+                            "name":"SHA512SUMS",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/SHA512SUMS"
+                        }
+                    ]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                binary.clone(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/SHA512SUMS",
+                checksum_text.into_bytes(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read(fixture.roots.bin_dir.join("tool")).unwrap(),
+            binary
+        );
+    }
+
+    #[test]
     fn update_github_release_refuses_install_on_sha256_mismatch() {
         // If the sibling checksum is published but mismatches the
         // downloaded binary, the install must be refused outright and the
@@ -3471,6 +3527,55 @@ version() { printf 'saw-pkg\n'; }
                 .to_vec(),
             )
             .with("https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.bz2", bzip2(b"binary"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "v1.2.3");
+        assert_eq!(fs::read(&bin_path).unwrap(), b"binary");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn update_github_release_decompresses_xz_single_binary() {
+        let mut fixture = Fixture::new("release-xz-single");
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-linux-x86_64.xz",
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.xz"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.xz",
+                xz(b"binary"),
+            );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
 
@@ -5270,6 +5375,12 @@ version() { printf 'saw-pkg\n'; }
         zstd::stream::encode_all(bytes, 0).unwrap()
     }
 
+    fn xz(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
     fn tar_gz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let tar = tar(entries);
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -5278,10 +5389,7 @@ version() { printf 'saw-pkg\n'; }
     }
 
     fn tar_xz(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
-        let tar = tar(entries);
-        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
-        encoder.write_all(&tar).unwrap();
-        encoder.finish().unwrap()
+        xz(&tar(entries))
     }
 
     fn tar(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {

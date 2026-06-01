@@ -20,6 +20,7 @@ use crate::manifest::{self, ManifestEntry};
 use crate::method;
 use crate::platform::RuntimeEnv;
 use crate::process::{self, Runner};
+use crate::release_asset::AssetKind;
 use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::tool_version;
@@ -402,13 +403,13 @@ pub(crate) fn install_request(
         Err(_) => return Ok(failed("release asset download failed")),
     };
     // Best-effort integrity verification: when the release publishes a
-    // sibling `<asset>.sha256`, verify the downloaded bytes against the
+    // recognized checksum asset, verify the downloaded bytes against the
     // expected digest before letting the binary touch the install dir.
-    // The verification binds to the asset filename (via `checksum::verify`)
-    // so a multi-asset release cannot accidentally accept a digest computed
-    // for a different platform's binary. When no checksum asset exists,
-    // installation continues unverified — many older third-party releases
-    // do not ship one and breaking those installs would be a regression.
+    // Verification binds to the asset filename so a multi-asset release cannot
+    // accidentally accept a digest computed for a different platform's binary.
+    // When no checksum asset exists, installation continues unverified — many
+    // older third-party releases do not ship one and breaking those installs
+    // would be a regression.
     // The shdeps self-update path (`release_stage`) uses a stricter
     // contract that requires the checksum and rejects on download failure;
     // the third-party path here intentionally diverges in failure mode.
@@ -421,7 +422,7 @@ pub(crate) fn install_request(
         ) {
             Ok(checksum_bytes) => {
                 let checksum_text = String::from_utf8_lossy(&checksum_bytes);
-                if !crate::checksum::verify(&checksum_text, &selection.asset_name, &bytes) {
+                if !crate::checksum::verify_any(&checksum_text, &selection.asset_name, &bytes) {
                     return Ok(failed("release asset checksum mismatch"));
                 }
             }
@@ -444,7 +445,10 @@ pub(crate) fn install_request(
             }
         }
     }
-    match asset_kind(&selection.url) {
+    let Some(asset_kind) = crate::release_asset::install_kind(&selection.url) else {
+        return Ok(failed("release asset type is not implemented yet"));
+    };
+    match asset_kind {
         AssetKind::Plain => {
             github_release_install::install_plain_to(request.public_bin, &bytes)?;
         }
@@ -453,6 +457,9 @@ pub(crate) fn install_request(
         }
         AssetKind::Bz2 => {
             github_release_install::install_bz2_to(request.public_bin, &bytes)?;
+        }
+        AssetKind::Xz => {
+            github_release_install::install_xz_to(request.public_bin, &bytes)?;
         }
         AssetKind::Zst => {
             github_release_install::install_zst_to(request.public_bin, &bytes)?;
@@ -506,9 +513,6 @@ pub(crate) fn install_request(
                 request.cmd,
                 &bytes,
             )?;
-        }
-        AssetKind::Unsupported => {
-            return Ok(failed("release asset type is not implemented yet"));
         }
     }
     // The TTL stamp is intentionally NOT refreshed here. The caller writes
@@ -628,56 +632,6 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     values.push(value.to_owned());
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AssetKind {
-    Plain,
-    Gz,
-    Bz2,
-    Zst,
-    TarGz,
-    TarBz2,
-    TarZst,
-    TarXz,
-    Zip,
-    Unsupported,
-}
-
-fn asset_kind(url: &str) -> AssetKind {
-    let lower = url.to_ascii_lowercase();
-    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        return AssetKind::TarGz;
-    }
-    if lower.ends_with(".tar.bz2") {
-        return AssetKind::TarBz2;
-    }
-    if lower.ends_with(".tar.zst") || lower.ends_with(".tzst") {
-        return AssetKind::TarZst;
-    }
-    if lower.ends_with(".tar.xz") {
-        return AssetKind::TarXz;
-    }
-    // The Bash reference supports xz only as a tar archive. Treating a bare
-    // `.xz` asset as a plain executable would publish compressed bytes into
-    // `SHDEPS_BIN`, so keep this explicitly unsupported until single-file xz
-    // installs are added to both implementations.
-    if lower.ends_with(".xz") {
-        return AssetKind::Unsupported;
-    }
-    if lower.ends_with(".gz") {
-        return AssetKind::Gz;
-    }
-    if lower.ends_with(".bz2") {
-        return AssetKind::Bz2;
-    }
-    if lower.ends_with(".zst") {
-        return AssetKind::Zst;
-    }
-    if lower.ends_with(".zip") {
-        return AssetKind::Zip;
-    }
-    AssetKind::Plain
-}
-
 struct EnvVars<'a> {
     vars: &'a std::collections::BTreeMap<String, String>,
     runtime: &'a RuntimeEnv,
@@ -703,95 +657,7 @@ impl Env for EnvVars<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetKind, asset_kind, comparable_versions, installed_matches_tag};
-
-    #[test]
-    fn asset_kind_accepts_raw_binary_urls() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64"),
-            AssetKind::Plain
-        );
-    }
-
-    #[test]
-    fn asset_kind_accepts_gzip_tar_archives() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.tar.gz"),
-            AssetKind::TarGz
-        );
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.tgz"),
-            AssetKind::TarGz
-        );
-    }
-
-    #[test]
-    fn asset_kind_accepts_bzip2_tar_archives() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.tar.bz2"),
-            AssetKind::TarBz2
-        );
-    }
-
-    #[test]
-    fn asset_kind_accepts_zstd_tar_archives() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.tar.zst"),
-            AssetKind::TarZst
-        );
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.tzst"),
-            AssetKind::TarZst
-        );
-    }
-
-    #[test]
-    fn asset_kind_accepts_xz_tar_archives() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.tar.xz"),
-            AssetKind::TarXz
-        );
-    }
-
-    #[test]
-    fn asset_kind_rejects_xz_compressed_singles_until_reference_supports_them() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.xz"),
-            AssetKind::Unsupported
-        );
-    }
-
-    #[test]
-    fn asset_kind_accepts_gzip_compressed_singles() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.gz"),
-            AssetKind::Gz
-        );
-    }
-
-    #[test]
-    fn asset_kind_accepts_bzip2_compressed_singles() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.bz2"),
-            AssetKind::Bz2
-        );
-    }
-
-    #[test]
-    fn asset_kind_accepts_zstd_compressed_singles() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.zst"),
-            AssetKind::Zst
-        );
-    }
-
-    #[test]
-    fn asset_kind_accepts_zip_archives() {
-        assert_eq!(
-            asset_kind("https://example.com/tool-linux-x86_64.zip"),
-            AssetKind::Zip
-        );
-    }
+    use super::{comparable_versions, installed_matches_tag};
 
     #[test]
     fn release_tag_comparison_accepts_common_github_prefixes() {
