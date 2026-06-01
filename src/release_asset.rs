@@ -61,6 +61,7 @@ pub fn select<'a>(cmd: &str, urls: &'a [&'a str], target: &Target) -> Option<&'a
             let score = Score {
                 exact: if exact { 0 } else { 1 },
                 libc: libc_score(&filename, target),
+                variant: variant_score(&filename),
             };
             if best.is_none_or(|(current, _)| score < current) {
                 best = Some((score, *url));
@@ -117,6 +118,7 @@ impl Pass {
 struct Score {
     exact: u8,
     libc: u8,
+    variant: u8,
 }
 
 const SKIP_SUFFIXES: &[&str] = &[
@@ -133,15 +135,18 @@ const SKIP_SUFFIXES: &[&str] = &[
     ".md5",
     ".md5sum",
     ".sig",
+    ".sign",
     ".asc",
     ".minisig",
     ".txt",
     ".json",
     ".jsonl",
+    ".xml",
     ".zsync",
     ".sigstore",
     ".proof",
     ".sbom",
+    ".spdx",
     ".attestation",
     ".cosign",
     ".intoto",
@@ -149,11 +154,18 @@ const SKIP_SUFFIXES: &[&str] = &[
     ".b3",
     ".pem",
     ".cert",
+    ".cer",
     ".crt",
+    ".key",
+    ".pub",
+    ".manifest",
     ".pkg.tar.gz",
     ".pkg.tar.bz2",
     ".pkg.tar.xz",
     ".pkg.tar.zst",
+    ".bsdiff",
+    ".diff",
+    ".patch",
     ".dmg",
     ".pkg",
     ".apk",
@@ -166,6 +178,8 @@ const SKIP_SUFFIXES: &[&str] = &[
     ".nupkg",
     ".whl",
     ".snap",
+    ".vsix",
+    ".artifactbundle",
 ];
 
 const SKIP_NAMES: &[&str] = &[
@@ -284,6 +298,22 @@ fn os_patterns(os: &str, arch: &str) -> Vec<String> {
     if os == "darwin" {
         patterns.extend(["macos", "apple", "osx", "mac"].map(str::to_owned));
     }
+    if os == "linux" {
+        patterns.extend(
+            [
+                "alpine",
+                "arch",
+                "centos",
+                "debian",
+                "fedora",
+                "manylinux",
+                "musllinux",
+                "rhel",
+                "ubuntu",
+            ]
+            .map(str::to_owned),
+        );
+    }
     if os == "linux" && matches!(arch, "x86_64" | "amd64") {
         patterns.push("linux64".to_owned());
     }
@@ -297,6 +327,16 @@ fn arch_patterns(arch: &str, os: &str) -> Vec<String> {
         "aarch64" => patterns.push("arm64".to_owned()),
         "amd64" => patterns.extend(["x86_64", "x64", "x86-64"].map(str::to_owned)),
         "arm64" => patterns.push("aarch64".to_owned()),
+        "i386" | "i686" => patterns.extend(["386", "x86"].map(str::to_owned)),
+        "386" | "x86" => patterns.extend(["i386", "i686"].map(str::to_owned)),
+        "armv6" => patterns.extend(["armv6l", "arm", "armhf"].map(str::to_owned)),
+        "armv6l" => patterns.extend(["armv6", "arm", "armhf"].map(str::to_owned)),
+        "armv7" => patterns.extend(["armv7l", "arm", "armhf"].map(str::to_owned)),
+        "armv7l" => patterns.extend(["armv7", "arm", "armhf"].map(str::to_owned)),
+        "loongarch64" => patterns.push("loong64".to_owned()),
+        "loong64" => patterns.push("loongarch64".to_owned()),
+        "riscv64" => patterns.push("riscv64gc".to_owned()),
+        "riscv64gc" => patterns.push("riscv64".to_owned()),
         _ => {}
     }
     if os == "darwin" && matches!(arch, "x86_64" | "amd64" | "aarch64" | "arm64") {
@@ -332,6 +372,16 @@ fn libc_patterns(libc: &str) -> Vec<&'static str> {
         "gnu" => vec!["gnu", "glibc"],
         "musl" => vec!["musl"],
         _ => Vec::new(),
+    }
+}
+
+fn variant_score(filename: &str) -> u8 {
+    if contains_token(filename, "profile") {
+        2
+    } else if contains_token(filename, "baseline") {
+        1
+    } else {
+        0
     }
 }
 
@@ -451,11 +501,15 @@ mod tests {
             "https://example.com/tool-linux-x86_64.sha1",
             "https://example.com/tool-linux-x86_64-checksums",
             "https://example.com/tool-linux-x86_64.intoto.jsonl",
+            "https://example.com/tool-linux-x86_64.bsdiff",
+            "https://example.com/tool-linux-x86_64.patch",
             "https://example.com/tool-linux-x86_64.minisig",
             "https://example.com/tool-linux-x86_64.pkg.tar.zst",
             "https://example.com/tool-linux-x86_64.deb",
             "https://example.com/tool-linux-x86_64.whl",
             "https://example.com/tool-linux-x86_64.appimage",
+            "https://example.com/tool-linux-x86_64.vsix",
+            "https://example.com/tool-linux-x86_64.artifactbundle",
             "https://example.com/tool-linux-x86_64.7z",
             "https://example.com/tool-linux-x86_64.tar.lz4",
         ] {

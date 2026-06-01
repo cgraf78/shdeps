@@ -79,14 +79,17 @@ pub fn verify_any(content: &str, file_name: &str, bytes: &[u8]) -> bool {
 fn parse_named_line(line: &str, file_name: &str, hex_len: usize) -> Option<String> {
     let (hash, rest) = line.split_once(char::is_whitespace)?;
     let hash = normalize_hash(hash, hex_len)?;
-    let candidate = rest
-        .trim_start()
-        .strip_prefix('*')
-        .unwrap_or(rest.trim_start());
+    let candidate = named_checksum_file(rest);
 
     // Match the checksum entry to the exact archive name so a multi-asset
     // release cannot accidentally verify Linux bytes with a macOS checksum.
     (candidate == file_name).then_some(hash)
+}
+
+fn named_checksum_file(value: &str) -> &str {
+    let value = value.trim_start();
+    let value = value.strip_prefix('*').unwrap_or(value).trim_end();
+    value.strip_prefix("./").unwrap_or(value)
 }
 
 fn normalize_hash(value: &str, hex_len: usize) -> Option<String> {
@@ -143,6 +146,22 @@ mod tests {
         assert_eq!(
             expected_sha256(
                 &format!("{EMPTY_SHA256} *shdeps-v1-linux-x86_64-musl.tar.gz\n"),
+                "shdeps-v1-linux-x86_64-musl.tar.gz",
+            )
+            .as_deref(),
+            Some(EMPTY_SHA256)
+        );
+        assert_eq!(
+            expected_sha256(
+                &format!("{EMPTY_SHA256}  ./shdeps-v1-linux-x86_64-musl.tar.gz\n"),
+                "shdeps-v1-linux-x86_64-musl.tar.gz",
+            )
+            .as_deref(),
+            Some(EMPTY_SHA256)
+        );
+        assert_eq!(
+            expected_sha256(
+                &format!("{EMPTY_SHA256} *./shdeps-v1-linux-x86_64-musl.tar.gz\n"),
                 "shdeps-v1-linux-x86_64-musl.tar.gz",
             )
             .as_deref(),

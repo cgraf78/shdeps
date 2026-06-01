@@ -12,6 +12,22 @@ fn linux_musl() -> Target {
     Target::new("linux", "x86_64", "musl")
 }
 
+fn linux_i686() -> Target {
+    Target::new("linux", "i686", "gnu")
+}
+
+fn linux_armv7() -> Target {
+    Target::new("linux", "armv7l", "gnu")
+}
+
+fn linux_loongarch64() -> Target {
+    Target::new("linux", "loongarch64", "gnu")
+}
+
+fn linux_riscv64() -> Target {
+    Target::new("linux", "riscv64", "gnu")
+}
+
 #[test]
 fn matches_rust_triple_for_platform_and_arch() {
     let urls = [
@@ -62,6 +78,8 @@ fn skips_metadata_and_package_assets() {
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.sha256sum",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-checksums",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.intoto.jsonl",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.bsdiff",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.patch",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.pkg.tar.zst",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.whl",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.sha",
@@ -129,6 +147,50 @@ fn supports_linux64_x86_64_alias() {
     assert_eq!(
         select("tool", &urls, &linux()),
         Some("https://github.com/owner/tool/releases/download/v1/tool-linux64.tar.gz")
+    );
+}
+
+#[test]
+fn supports_linux_distribution_os_aliases() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-darwin-arm64.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-ubuntu-amd64.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-ubuntu-amd64.tar.gz")
+    );
+}
+
+#[test]
+fn supports_additional_arch_aliases() {
+    let x86 = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-386.tar.gz",
+    ];
+    let arm = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-arm64.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-armv7.tar.gz",
+    ];
+    let loong = ["https://github.com/owner/tool/releases/download/v1/tool-linux-loong64.tar.gz"];
+    let riscv = ["https://github.com/owner/tool/releases/download/v1/tool-linux-riscv64gc.tar.gz"];
+
+    assert_eq!(
+        select("tool", &x86, &linux_i686()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-386.tar.gz")
+    );
+    assert_eq!(
+        select("tool", &arm, &linux_armv7()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-armv7.tar.gz")
+    );
+    assert_eq!(
+        select("tool", &loong, &linux_loongarch64()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-loong64.tar.gz")
+    );
+    assert_eq!(
+        select("tool", &riscv, &linux_riscv64()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-riscv64gc.tar.gz")
     );
 }
 
@@ -307,6 +369,47 @@ fn prefers_musl_asset_on_musl_hosts() {
     assert_eq!(
         select("tool", &urls, &linux_musl()),
         Some("https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-musl.tar.gz")
+    );
+}
+
+#[test]
+fn prefers_normal_asset_over_baseline_and_profile_variants() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x64-baseline-profile.zip",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x64-profile.zip",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x64-baseline.zip",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x64.zip",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-x64.zip")
+    );
+}
+
+#[test]
+fn keeps_baseline_asset_as_fallback_when_normal_variant_is_missing() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x64-profile.zip",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x64-baseline.zip",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-x64-baseline.zip")
+    );
+}
+
+#[test]
+fn libc_match_beats_build_variant_penalty() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x64.zip",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-x64-musl-baseline.zip",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux_musl()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-x64-musl-baseline.zip")
     );
 }
 

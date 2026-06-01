@@ -2776,6 +2776,62 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_verifies_release_wide_checksum_with_relative_name() {
+        let mut fixture = Fixture::new("release-checksum-relative-name");
+        fixture.write_lib();
+        let binary = b"binary".to_vec();
+        let checksum_text = format!(
+            "{}  ./tool-linux-x86_64\n",
+            crate::checksum::sha256_hex(&binary)
+        );
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[
+                        {
+                            "name":"tool-linux-x86_64",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        },
+                        {
+                            "name":"SHASUMS256.txt",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/SHASUMS256.txt"
+                        }
+                    ]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                binary.clone(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/SHASUMS256.txt",
+                checksum_text.into_bytes(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read(fixture.roots.bin_dir.join("tool")).unwrap(),
+            binary
+        );
+    }
+
+    #[test]
     fn update_github_release_refuses_release_wide_checksum_mismatch() {
         let binary = b"binary".to_vec();
         let checksum_text = format!(
