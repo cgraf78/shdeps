@@ -430,13 +430,17 @@ fn content_root(extract_dir: &Path) -> Result<PathBuf> {
 
 fn find_binary(root: &Path, cmd: &str, allow_non_executable_exact_binary: bool) -> Option<PathBuf> {
     let mut prefixed = None;
+    let mut non_executable_exact = None;
     for path in walk_files(root) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if name == cmd {
-            if process::executable_path(&path) || allow_non_executable_exact_binary {
+            if process::executable_path(&path) {
                 return Some(path);
+            }
+            if allow_non_executable_exact_binary && non_executable_exact.is_none() {
+                non_executable_exact = Some(path);
             }
             continue;
         }
@@ -453,7 +457,7 @@ fn find_binary(root: &Path, cmd: &str, allow_non_executable_exact_binary: bool) 
             prefixed = Some(path);
         }
     }
-    prefixed
+    prefixed.or(non_executable_exact)
 }
 
 fn walk_files(root: &Path) -> Vec<PathBuf> {
@@ -1046,6 +1050,29 @@ mod tests {
 
         assert_eq!(fs::read(&target).unwrap(), b"binary");
         assert!(fs::metadata(&target).unwrap().permissions().mode() & 0o111 != 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zip_install_prefers_executable_exact_binary_over_non_executable_collateral() {
+        let dir = temp_dir("zip-executable-exact");
+        let bytes = zip(&[
+            ("tool-v1.0/docs/tool", b"docs".as_slice(), 0o644),
+            ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+        ]);
+
+        let public = super::install_zip(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+        let target = public.canonicalize().unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"binary");
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
