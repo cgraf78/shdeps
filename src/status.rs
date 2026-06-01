@@ -14,6 +14,7 @@ use crate::Result;
 use crate::config::{self, Entry};
 use crate::jobs;
 use crate::manifest::Manifest;
+use crate::method;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::{self, Runner};
 use crate::repo;
@@ -139,14 +140,14 @@ where
     let mut statuses = Vec::with_capacity(entries.len());
     let mut index = 0;
     while index < entries.len() {
-        if entries[index].method == "custom" {
+        if entries[index].method == method::CUSTOM {
             statuses.push(classify(&entries[index], context)?);
             index += 1;
             continue;
         }
 
         let start = index;
-        while index < entries.len() && entries[index].method != "custom" {
+        while index < entries.len() && entries[index].method != method::CUSTOM {
             index += 1;
         }
 
@@ -189,19 +190,19 @@ where
     }
 
     match entry.method.as_str() {
-        "pkg" => Ok(pkg_state(
+        method::PKG => Ok(pkg_state(
             entry,
             context.runner,
             context.pkg_mgr,
             context.package_versions,
         )),
-        "github:repo" => Ok(github_repo_state(entry, context.roots, context.runner)),
-        "github:release" | "cargo" | "go" | "uv" | "npm" => Ok(manifest_backed_state(
+        method::GITHUB_REPO => Ok(github_repo_state(entry, context.roots, context.runner)),
+        binary if method::is_binary_install_root(binary) => Ok(manifest_backed_state(
             entry,
             context.manifest,
             context.runner,
         )),
-        "custom" => context
+        method::CUSTOM => context
             .custom
             .installed_detail(entry, context.roots)
             .map(installed_or_missing),

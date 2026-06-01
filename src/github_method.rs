@@ -19,17 +19,15 @@ use crate::github_release;
 use crate::http::Client;
 use crate::jobs;
 use crate::manifest::Manifest;
+use crate::method;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
 use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::state;
 
-const METHOD_RELEASE: &str = "github:release";
-const METHOD_REPO: &str = "github:repo";
 const METHOD_REPO_NO_ASSET: &str = "github:repo:no-compatible-release";
 const METHOD_REPO_LAST_KNOWN: &str = "github:repo:last-known";
-const RESOLVE_KIND: &str = "github";
 
 /// Runtime flags for `github` method resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +116,7 @@ where
 {
     let total = entries
         .iter()
-        .filter(|entry| entry.method == "github" && active(entry, context.env))
+        .filter(|entry| entry.method == method::GITHUB && active(entry, context.env))
         .count();
     if total == 0 {
         return resolve_entries(entries, context, options);
@@ -130,12 +128,12 @@ where
     let mut resolved = vec![None; entries.len()];
     let mut remote = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        if entry.method != "github" {
+        if entry.method != method::GITHUB {
             resolved[index] = Some(entry.clone());
             continue;
         }
         if !active(entry, context.env) {
-            resolved[index] = Some(resolved_entry(entry, METHOD_REPO));
+            resolved[index] = Some(resolved_entry(entry, method::GITHUB_REPO));
             continue;
         }
 
@@ -202,7 +200,7 @@ pub fn resolve_entry<R>(entry: &Entry, context: &Context<'_, R>, options: Option
 where
     R: Runner,
 {
-    if entry.method != "github" {
+    if entry.method != method::GITHUB {
         return Ok(entry.clone());
     }
 
@@ -224,7 +222,7 @@ where
         // A filtered dependency does not own artifacts on this host, so there
         // is no useful remote fact to learn. Still return a concrete method so
         // `shdeps list` never exposes the config-only meta-method.
-        return Ok(METHOD_REPO);
+        return Ok(method::GITHUB_REPO);
     }
 
     let cache = Cache::new(&context.roots.state_dir, &entry.name);
@@ -288,9 +286,9 @@ where
                 // this decision; users who want live-checkout behavior should
                 // ask for `github:repo` explicitly.
                 github::write_cached_releases(&context.roots.state_dir, &entry.name, &releases)?;
-                cache.write_method(METHOD_RELEASE)?;
+                cache.write_method(method::GITHUB_RELEASE)?;
                 stamp::remote_touch(&cache.stamp, options.now)?;
-                METHOD_RELEASE
+                method::GITHUB_RELEASE
             } else {
                 // This is the only repo fallback worth caching: GitHub
                 // answered successfully, and the current host has no matching
@@ -300,7 +298,7 @@ where
                 github::write_cached_releases(&context.roots.state_dir, &entry.name, &releases)?;
                 cache.write_method(METHOD_REPO_NO_ASSET)?;
                 stamp::remote_touch(&cache.stamp, options.now)?;
-                METHOD_REPO
+                method::GITHUB_REPO
             }
         }
         None => {
@@ -310,12 +308,12 @@ where
             // an installed release-backed CLI to a source checkout just
             // because the fleet exhausted the unauthenticated API quota.
             if let Some(method) = cache.read_stale_method()? {
-                usable_cached_method(method, entry, context).unwrap_or(METHOD_REPO)
+                usable_cached_method(method, entry, context).unwrap_or(method::GITHUB_REPO)
             } else {
                 // With no prior signal, keep the historical soft fallback so
                 // first-time installs can still try a source checkout when the
                 // API is unavailable.
-                METHOD_REPO
+                method::GITHUB_REPO
             }
         }
     };
@@ -355,7 +353,7 @@ impl Cache {
             // method that owns files; this cache only avoids repeating GitHub
             // release probes on warm `github` config entries.
             method: state_dir.join(format!("{name}.github.method")),
-            stamp: stamp::remote_path(state_dir, name, RESOLVE_KIND),
+            stamp: stamp::remote_path(state_dir, name, method::GITHUB),
         }
     }
 
@@ -374,16 +372,16 @@ impl Cache {
             Err(error) => return Err(error.into()),
         };
         Ok(match content.trim_end() {
-            METHOD_RELEASE => Some(METHOD_RELEASE),
-            METHOD_REPO_NO_ASSET => Some(METHOD_REPO),
+            method::GITHUB_RELEASE => Some(method::GITHUB_RELEASE),
+            METHOD_REPO_NO_ASSET => Some(method::GITHUB_REPO),
             METHOD_REPO_LAST_KNOWN => Some(METHOD_REPO_LAST_KNOWN),
             // Legacy cache files wrote plain `github:repo` for both "no
             // compatible release" and "metadata fetch failed". Re-probe those
             // once so hosts can recover after credentials or repo visibility
             // change, then rewrite successful no-asset fallbacks with the
             // reasoned marker above.
-            METHOD_REPO if allow_legacy_repo => Some(METHOD_REPO),
-            METHOD_REPO => None,
+            method::GITHUB_REPO if allow_legacy_repo => Some(method::GITHUB_REPO),
+            method::GITHUB_REPO => None,
             _ => None,
         })
     }
@@ -441,7 +439,7 @@ where
 {
     match method {
         METHOD_REPO_LAST_KNOWN if last_known_repo_still_matches(entry, context) => {
-            Some(METHOD_REPO)
+            Some(method::GITHUB_REPO)
         }
         METHOD_REPO_LAST_KNOWN => None,
         _ => Some(method),
@@ -470,8 +468,8 @@ where
     R: Runner,
 {
     match row.method.as_str() {
-        METHOD_REPO if manifest_repo_command_visible(row, roots, runner) => {
-            Some((METHOD_REPO_LAST_KNOWN, METHOD_REPO))
+        method::GITHUB_REPO if manifest_repo_command_visible(row, roots, runner) => {
+            Some((METHOD_REPO_LAST_KNOWN, method::GITHUB_REPO))
         }
         _ => None,
     }
@@ -1091,7 +1089,7 @@ mod tests {
             fs::create_dir_all(method_path.parent().unwrap()).unwrap();
             fs::write(method_path, format!("{method}\n")).unwrap();
             stamp::remote_touch(
-                &stamp::remote_path(&self.roots.state_dir, name, "github"),
+                &stamp::remote_path(&self.roots.state_dir, name, crate::method::GITHUB),
                 now,
             )
             .unwrap();

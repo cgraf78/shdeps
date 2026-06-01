@@ -8,10 +8,13 @@
 use crate::Result;
 use crate::config::{self, Entry};
 use crate::manifest::{self, ManifestEntry};
+use crate::method;
 use crate::package_cache;
 use crate::pkg;
 use crate::process::{self, Output, Runner};
-use crate::update::{Context, Item, Options, Summary, active, detail_with_action, verbose_enabled};
+use crate::update::{
+    Context, Item, ItemReason, Options, Summary, active, detail_with_action, verbose_enabled,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Queued {
@@ -96,24 +99,18 @@ fn cache_disabled<R: Runner>(context: &Context<'_, R>, options: Options) -> Opti
 pub(crate) fn cached_items(entries: &[Entry], context: &Context<'_, impl Runner>) -> Vec<Item> {
     entries
         .iter()
-        .filter(|entry| entry.method == "pkg" && active(entry, context.env))
+        .filter(|entry| entry.method == method::PKG && active(entry, context.env))
         .map(|entry| {
             let resolved =
                 config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
             if resolved == "NONE" {
-                Item {
-                    name: entry.name.clone(),
-                    changed: false,
-                    failed: false,
-                    detail: "skipped by package-manager override".to_owned(),
-                }
+                Item::skipped(
+                    entry.name.clone(),
+                    ItemReason::PackageManagerOverride,
+                    "skipped by package-manager override",
+                )
             } else {
-                Item {
-                    name: entry.name.clone(),
-                    changed: false,
-                    failed: false,
-                    detail: "installed".to_owned(),
-                }
+                Item::current(entry.name.clone(), ItemReason::Installed, "installed")
             }
         })
         .collect()
@@ -154,7 +151,7 @@ fn needs_package_version_snapshot(
     // while still collapsing the expensive fallback for fonts/data packages and
     // package-name/command-name mismatches.
     entries.iter().any(|entry| {
-        if entry.method != "pkg" || !active(entry, context.env) {
+        if entry.method != method::PKG || !active(entry, context.env) {
             return false;
         }
         let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
@@ -171,12 +168,11 @@ pub(crate) fn install(
 ) -> Result<Item> {
     let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
     if resolved == "NONE" {
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: false,
-            detail: "skipped by package-manager override".to_owned(),
-        });
+        return Ok(Item::skipped(
+            entry.name.clone(),
+            ItemReason::PackageManagerOverride,
+            "skipped by package-manager override",
+        ));
     }
 
     if process::dep_exists_with_versions(
@@ -188,7 +184,7 @@ pub(crate) fn install(
     ) {
         manifest::upsert(
             context.manifest_path,
-            ManifestEntry::new(&entry.name, "pkg", &entry.cmd, ""),
+            ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
         )?;
         let detail = if verbose_enabled(options, context.env_vars) {
             let version = process::dep_version(context.runner, &entry.cmd)
@@ -197,38 +193,35 @@ pub(crate) fn install(
         } else {
             "installed".to_owned()
         };
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: missing_command_needs_repair(entry, context),
-            failed: false,
-            detail,
+        return Ok(if missing_command_needs_repair(entry, context) {
+            Item::changed(entry.name.clone(), ItemReason::Installed, detail)
+        } else {
+            Item::current(entry.name.clone(), ItemReason::Installed, detail)
         });
     }
 
     manifest::upsert(
         context.manifest_path,
-        ManifestEntry::new(&entry.name, "pkg", &entry.cmd, ""),
+        ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
     )?;
 
     if !available(context.runner, context.pkg_mgr, &resolved)? {
-        return Ok(Item {
-            name: entry.name.clone(),
-            changed: false,
-            failed: false,
-            detail: "not available".to_owned(),
-        });
+        return Ok(Item::skipped(
+            entry.name.clone(),
+            ItemReason::PackageUnavailable,
+            "not available",
+        ));
     }
 
     queued.push(Queued {
         name: entry.name.clone(),
         package: resolved,
     });
-    Ok(Item {
-        name: entry.name.clone(),
-        changed: false,
-        failed: false,
-        detail: "queued".to_owned(),
-    })
+    Ok(Item::pending(
+        entry.name.clone(),
+        ItemReason::PackageQueued,
+        "queued",
+    ))
 }
 
 pub(crate) fn flush(
@@ -291,7 +284,7 @@ fn needs_package_work(
     }
 
     entries.iter().any(|entry| {
-        if entry.method != "pkg" || !active(entry, context.env) {
+        if entry.method != method::PKG || !active(entry, context.env) {
             return false;
         }
 

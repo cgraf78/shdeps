@@ -20,6 +20,7 @@ use std::os::unix::fs::MetadataExt;
 
 use crate::Result;
 use crate::config::{self, Entry};
+use crate::method;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
 use crate::runtime::Roots;
@@ -229,7 +230,7 @@ struct ActivePackage {
 fn active_packages(entries: &[Entry], env: &RuntimeEnv, pkg_mgr: &str) -> Vec<ActivePackage> {
     entries
         .iter()
-        .filter(|entry| entry.method == "pkg")
+        .filter(|entry| entry.method == method::PKG)
         .filter(|entry| {
             matches!(
                 platform::filter_match(&entry.filter, env),

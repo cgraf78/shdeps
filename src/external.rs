@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::method;
 use crate::pkg::CommandSpec;
 
 /// Planned external installer invocation and expected output path.
@@ -44,10 +45,10 @@ impl Plan {
 pub fn plan(method: &str, name: &str, cmd: &str, install_dir: &Path) -> Option<Plan> {
     let install_root = install_dir.join(name);
     let bin_path = install_root.join("bin").join(cmd);
+    let tool = method::external_tool(method)?;
 
-    let (tool, command, force_arg) = match method {
-        "cargo" => (
-            "cargo",
+    let (command, force_arg) = match method {
+        method::CARGO => (
             CommandSpec {
                 program: "cargo".to_owned(),
                 args: vec![
@@ -60,8 +61,7 @@ pub fn plan(method: &str, name: &str, cmd: &str, install_dir: &Path) -> Option<P
             },
             Some("--force".to_owned()),
         ),
-        "go" => (
-            "go",
+        method::GO => (
             CommandSpec {
                 program: "env".to_owned(),
                 args: vec![
@@ -73,8 +73,7 @@ pub fn plan(method: &str, name: &str, cmd: &str, install_dir: &Path) -> Option<P
             },
             None,
         ),
-        "uv" => (
-            "uv",
+        method::UV => (
             CommandSpec {
                 program: "env".to_owned(),
                 args: vec![
@@ -88,8 +87,7 @@ pub fn plan(method: &str, name: &str, cmd: &str, install_dir: &Path) -> Option<P
             },
             Some("--force".to_owned()),
         ),
-        "npm" => (
-            "npm",
+        method::NPM => (
             CommandSpec {
                 program: "npm".to_owned(),
                 args: vec![

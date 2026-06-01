@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
+use crate::method;
 
 /// Parsed dependency entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,13 +30,13 @@ pub struct Entry {
 /// Canonicalizes a dependency name for the install method.
 #[must_use]
 pub fn canonical_name(name: &str, method: &str) -> String {
-    match method {
-        "github" | "github:repo" | "github:release" => name
-            .strip_suffix(".git")
+    if method::canonicalizes_github_name(method) {
+        name.strip_suffix(".git")
             .filter(|_| name.contains('/'))
             .unwrap_or(name)
-            .to_owned(),
-        _ => name.to_owned(),
+            .to_owned()
+    } else {
+        name.to_owned()
     }
 }
 

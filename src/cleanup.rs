@@ -14,6 +14,7 @@ use crate::Result;
 use crate::config;
 use crate::link_state::{self, Kind};
 use crate::manifest::{Manifest, ManifestEntry};
+use crate::method;
 
 /// Filesystem roots needed for built-in artifact cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,14 +71,14 @@ pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
     let mut summary = Summary::default();
 
     match entry.method.as_str() {
-        "pkg" => {
+        method::PKG => {
             // System packages are explicitly not owned by shdeps. Migrating a
             // dependency from `pkg` to another method must clear shdeps tracking
             // later, but uninstalling the OS package would be surprising and
             // potentially destructive.
             summary.preserved_package = true;
         }
-        "github:repo" => {
+        method::GITHUB_REPO => {
             unlink_state(roots, &entry.name, Kind::Bin, &mut summary)?;
             unlink_state(roots, &entry.name, Kind::Extras, &mut summary)?;
 
@@ -101,7 +102,7 @@ pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
             )?;
             remove_stamps(&roots.state_dir, &entry.name, &mut summary)?;
         }
-        "github:release" | "cargo" | "go" | "uv" | "npm" => {
+        binary if method::is_binary_install_root(binary) => {
             unlink_state(roots, &entry.name, Kind::Extras, &mut summary)?;
             remove_any(&roots.bin_dir.join(&entry.cmd), &mut summary)?;
 
@@ -110,7 +111,7 @@ pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
             remove_empty_install_parents(&install_root, &roots.install_dir, &mut summary)?;
             remove_stamps(&roots.state_dir, &entry.name, &mut summary)?;
         }
-        "custom" => {
+        method::CUSTOM => {
             // Custom deps have no built-in ownership model. The hook runner owns
             // `uninstall()`; this function only clears shdeps' own stamps so a
             // future reinstall does not inherit stale remote/cache state.
