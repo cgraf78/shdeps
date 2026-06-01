@@ -2,9 +2,8 @@
 //!
 //! Network fetching and JSON decoding belong to later GitHub client code. This
 //! module takes already extracted asset URLs and applies the compatibility
-//! policy from the Bash reference: prefer standalone binaries, then tar
-//! archives, then zip archives while matching OS, architecture, libc, and
-//! command-name conventions.
+//! policy: prefer standalone binaries, then tar archives, then zip archives
+//! while matching OS, architecture, libc, and command-name conventions.
 
 /// Target machine identity used for release asset matching.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,8 +28,8 @@ impl Target {
 /// Selects the best release asset URL for the command and target.
 #[must_use]
 pub fn select<'a>(cmd: &str, urls: &'a [&'a str], target: &Target) -> Option<&'a str> {
-    let os_patterns = os_patterns(&target.os);
-    let arch_patterns = arch_patterns(&target.arch);
+    let os_patterns = os_patterns(&target.os, &target.arch);
+    let arch_patterns = arch_patterns(&target.arch, &target.os);
     let cmd_lower = cmd.to_lowercase();
 
     // The pass order is compatibility-sensitive. Many projects publish both a
@@ -40,55 +39,62 @@ pub fn select<'a>(cmd: &str, urls: &'a [&'a str], target: &Target) -> Option<&'a
     // and completions there first. Zip remains a fallback for projects that
     // only publish cross-platform archives.
     for pass in [Pass::Plain, Pass::Tar, Pass::Zip] {
-        let mut exact_fallback = None;
-        let mut other_match = None;
-        let mut other_fallback = None;
+        let mut best: Option<(Rank, &'a str)> = None;
 
         for url in urls {
-            let url_lower = url.to_lowercase();
-            if !matches_any(&url_lower, &os_patterns) {
+            let filename = filename_lower(url);
+            if !matches_any(&filename, &os_patterns) {
                 continue;
             }
-            // Release pages are crowded with checksums, signatures, packages,
-            // and installer formats. Treating those as install assets produces
-            // confusing failures later, so filter them before preference
-            // scoring instead of letting extension order decide accidentally.
-            if should_skip(&url_lower) || !pass.matches(&url_lower) {
+            let Some(kind) = install_kind_from_filename(&filename) else {
                 continue;
-            }
-
-            let exact = exact_cmd_match(&url_lower, &cmd_lower, &os_patterns, &arch_patterns);
-            if !matches_any(&url_lower, &arch_patterns) {
+            };
+            if !pass.matches(kind) {
                 continue;
             }
 
-            if target.os == "linux" && url_lower.contains(&target.libc) {
-                // GNU-vs-musl matters for runtime compatibility. If the asset
-                // explicitly matches the host libc and the command name is
-                // exact, return immediately. Otherwise remember it as a strong
-                // fallback, because multi-binary repositories can still publish
-                // a better exact command asset without a libc suffix.
-                if exact {
-                    return Some(*url);
-                }
-                if other_match.is_none() {
-                    other_match = Some(*url);
-                }
-            } else if exact {
-                if exact_fallback.is_none() {
-                    exact_fallback = Some(*url);
-                }
-            } else if other_fallback.is_none() {
-                other_fallback = Some(*url);
+            let exact = exact_cmd_match(&filename, &cmd_lower, &os_patterns, &arch_patterns);
+            if !matches_any(&filename, &arch_patterns) {
+                continue;
+            }
+
+            let score = Score {
+                exact: if exact { 0 } else { 1 },
+                libc: libc_score(&filename, target),
+                variant: variant_score(&filename),
+                build: build_score(&filename),
+            };
+            let rank = Rank {
+                score,
+                name_len: filename.len(),
+            };
+            if best.is_none_or(|(current, _)| rank < current) {
+                best = Some((rank, *url));
             }
         }
 
-        if let Some(result) = exact_fallback.or(other_match).or(other_fallback) {
+        if let Some((_, result)) = best {
             return Some(result);
         }
     }
 
     None
+}
+
+/// Install behavior for a selected release asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetKind {
+    Plain,
+    Gz,
+    Bz2,
+    Xz,
+    Zst,
+    TarGz,
+    Tar,
+    TarBz2,
+    TarZst,
+    TarXz,
+    Zip,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,35 +105,84 @@ enum Pass {
 }
 
 impl Pass {
-    fn matches(self, url_lower: &str) -> bool {
-        // Match against the filename component only. The repo/org path segments
-        // can contain substrings like ".tar.gz" or ".pkg" on repos with unusual
-        // names, and testing the full URL would misclassify those assets.
-        let filename = url_lower.rsplit('/').next().unwrap_or(url_lower);
+    fn matches(self, kind: AssetKind) -> bool {
         match self {
-            Self::Plain => {
-                !TAR_EXTS.iter().any(|ext| filename.ends_with(ext)) && !filename.ends_with(".zip")
-            }
-            Self::Tar => TAR_EXTS.iter().any(|ext| filename.ends_with(ext)),
-            Self::Zip => filename.ends_with(".zip"),
+            Self::Plain => matches!(
+                kind,
+                AssetKind::Plain | AssetKind::Gz | AssetKind::Bz2 | AssetKind::Xz | AssetKind::Zst
+            ),
+            Self::Tar => matches!(
+                kind,
+                AssetKind::Tar
+                    | AssetKind::TarGz
+                    | AssetKind::TarBz2
+                    | AssetKind::TarZst
+                    | AssetKind::TarXz
+            ),
+            Self::Zip => kind == AssetKind::Zip,
         }
     }
 }
 
-const SKIP_EXTS: &[&str] = &[
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Score {
+    exact: u8,
+    libc: u8,
+    variant: u8,
+    build: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank {
+    score: Score,
+    name_len: usize,
+}
+
+const SKIP_SUFFIXES: &[&str] = &[
     ".sha256",
+    ".sha256sum",
+    ".sha256sums",
     ".sha512",
+    ".sha512sum",
+    ".sha512sums",
+    ".sha",
+    ".sha1",
+    ".sha1sum",
+    ".sha1sums",
     ".md5",
+    ".md5sum",
     ".sig",
+    ".sign",
     ".asc",
+    ".minisig",
     ".txt",
     ".json",
+    ".jsonl",
+    ".xml",
     ".zsync",
     ".sigstore",
     ".proof",
     ".sbom",
+    ".spdx",
+    ".attestation",
+    ".cosign",
+    ".intoto",
+    ".dsse",
     ".b3",
     ".pem",
+    ".cert",
+    ".cer",
+    ".crt",
+    ".key",
+    ".pub",
+    ".manifest",
+    ".pkg.tar.gz",
+    ".pkg.tar.bz2",
+    ".pkg.tar.xz",
+    ".pkg.tar.zst",
+    ".bsdiff",
+    ".diff",
+    ".patch",
     ".dmg",
     ".pkg",
     ".apk",
@@ -137,46 +192,252 @@ const SKIP_EXTS: &[&str] = &[
     ".appimage",
     ".flatpak",
     ".mcpb",
+    ".nupkg",
+    ".whl",
+    ".snap",
+    ".vsix",
+    ".artifactbundle",
 ];
 
-// Single-file compression formats such as `.gz`, `.bz2`, and `.zst` are
-// intentionally not listed here. The Bash implementation treats them like
-// standalone binary downloads that need decompression, while `.tar.*` and zip
-// assets go through archive extraction with binary discovery.
-const TAR_EXTS: &[&str] = &[
-    ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".tzst",
+const SKIP_NAMES: &[&str] = &[
+    "sha256sums",
+    "sha512sums",
+    "sha1sums",
+    "md5sums",
+    "checksums",
+    "checksum",
+    "digests",
+    "digest",
 ];
 
-fn should_skip(url_lower: &str) -> bool {
-    // Match only the filename component — the same reasoning as Pass::matches.
-    // A repo named e.g. "my.deb.tool" would cause the full URL to contain
-    // ".deb" even though the asset itself is a plain binary.
-    let filename = url_lower.rsplit('/').next().unwrap_or(url_lower);
-    SKIP_EXTS.iter().any(|ext| filename.ends_with(ext))
+const UNSUPPORTED_ARCHIVE_SUFFIXES: &[&str] = &[
+    ".7z",
+    ".rar",
+    ".tar.lz4",
+    ".tar.br",
+    ".tar.lzma",
+    ".tar.lz",
+    ".tlz",
+    ".lz4",
+    ".br",
+    ".lzma",
+    ".lz",
+    ".tar.z",
+    ".z",
+];
+
+// Single-file compression formats such as `.gz`, `.bz2`, `.xz`, and `.zst`
+// behave like standalone binary downloads that need decompression, while
+// `.tar.*` and zip assets go through archive extraction with binary discovery.
+#[must_use]
+pub(crate) fn install_kind(url: &str) -> Option<AssetKind> {
+    install_kind_from_filename(&filename_lower(url))
+}
+
+fn install_kind_from_filename(filename: &str) -> Option<AssetKind> {
+    if should_skip(filename) || has_suffix(filename, UNSUPPORTED_ARCHIVE_SUFFIXES) {
+        return None;
+    }
+    if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+        return Some(AssetKind::TarGz);
+    }
+    if filename.ends_with(".tar") {
+        return Some(AssetKind::Tar);
+    }
+    if filename.ends_with(".tar.bz2") || filename.ends_with(".tbz") || filename.ends_with(".tbz2") {
+        return Some(AssetKind::TarBz2);
+    }
+    if filename.ends_with(".tar.zst") || filename.ends_with(".tzst") {
+        return Some(AssetKind::TarZst);
+    }
+    if filename.ends_with(".tar.xz") || filename.ends_with(".txz") {
+        return Some(AssetKind::TarXz);
+    }
+    if filename.ends_with(".gz") {
+        return Some(AssetKind::Gz);
+    }
+    if filename.ends_with(".bz2") {
+        return Some(AssetKind::Bz2);
+    }
+    if filename.ends_with(".xz") {
+        return Some(AssetKind::Xz);
+    }
+    if filename.ends_with(".zst") {
+        return Some(AssetKind::Zst);
+    }
+    if filename.ends_with(".zip") {
+        return Some(AssetKind::Zip);
+    }
+    Some(AssetKind::Plain)
+}
+
+fn should_skip(filename: &str) -> bool {
+    has_suffix(filename, SKIP_SUFFIXES)
+        || SKIP_NAMES.iter().any(|name| {
+            filename == *name
+                || filename.ends_with(&format!("-{name}"))
+                || filename.ends_with(&format!("_{name}"))
+                || filename.ends_with(&format!(".{name}"))
+        })
+}
+
+fn filename_lower(url: &str) -> String {
+    let basename = url
+        .split_once('?')
+        .map_or(url, |(path, _)| path)
+        .rsplit('/')
+        .next()
+        .unwrap_or(url);
+    basename.to_lowercase()
+}
+
+fn has_suffix(filename: &str, suffixes: &[&str]) -> bool {
+    suffixes.iter().any(|suffix| filename.ends_with(suffix))
 }
 
 fn matches_any(url_lower: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| url_lower.contains(pattern))
+    patterns
+        .iter()
+        .any(|pattern| pattern_match(url_lower, pattern))
 }
 
-fn os_patterns(os: &str) -> Vec<String> {
+fn pattern_match(value: &str, pattern: &str) -> bool {
+    match pattern {
+        "manylinux" | "musllinux" => contains_platform_prefix(value, pattern),
+        _ => contains_token(value, pattern),
+    }
+}
+
+fn contains_token(value: &str, token: &str) -> bool {
+    value.match_indices(token).any(|(start, _)| {
+        let before = value[..start].chars().next_back();
+        let after = value[start + token.len()..].chars().next();
+        before.is_none_or(is_boundary) && after.is_none_or(is_boundary)
+    })
+}
+
+fn is_boundary(ch: char) -> bool {
+    !ch.is_ascii_alphanumeric()
+}
+
+fn contains_platform_prefix(value: &str, prefix: &str) -> bool {
+    value.match_indices(prefix).any(|(start, _)| {
+        let before = value[..start].chars().next_back();
+        let suffix = &value[start + prefix.len()..];
+        before.is_none_or(is_boundary)
+            && (suffix.chars().next().is_none_or(is_boundary)
+                || starts_with_numeric_platform_suffix(suffix))
+    })
+}
+
+fn starts_with_numeric_platform_suffix(value: &str) -> bool {
+    let digit_bytes = value
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .map(char::len_utf8)
+        .sum();
+
+    digit_bytes > 0 && value[digit_bytes..].chars().next().is_none_or(is_boundary)
+}
+
+fn os_patterns(os: &str, arch: &str) -> Vec<String> {
     let mut patterns = vec![os.to_owned()];
     if os == "darwin" {
-        patterns.extend(["macos", "apple", "osx"].map(str::to_owned));
+        patterns.extend(["macos", "apple", "osx", "mac"].map(str::to_owned));
+    }
+    if os == "linux" {
+        patterns.extend(
+            [
+                "alpine",
+                "arch",
+                "centos",
+                "debian",
+                "fedora",
+                "manylinux",
+                "musllinux",
+                "rhel",
+                "ubuntu",
+            ]
+            .map(str::to_owned),
+        );
+    }
+    if os == "linux" && matches!(arch, "x86_64" | "amd64") {
+        patterns.push("linux64".to_owned());
     }
     patterns
 }
 
-fn arch_patterns(arch: &str) -> Vec<String> {
+fn arch_patterns(arch: &str, os: &str) -> Vec<String> {
     let mut patterns = vec![arch.to_owned()];
     match arch {
-        "x86_64" => patterns.extend(["amd64", "x64"].map(str::to_owned)),
+        "x86_64" => patterns.extend(["amd64", "x64", "x86-64"].map(str::to_owned)),
         "aarch64" => patterns.push("arm64".to_owned()),
-        "amd64" => patterns.extend(["x86_64", "x64"].map(str::to_owned)),
+        "amd64" => patterns.extend(["x86_64", "x64", "x86-64"].map(str::to_owned)),
         "arm64" => patterns.push("aarch64".to_owned()),
+        "i386" | "i686" => patterns.extend(["386", "x86"].map(str::to_owned)),
+        "386" | "x86" => patterns.extend(["i386", "i686"].map(str::to_owned)),
+        "armv6" => patterns.extend(["armv6l", "arm", "armhf"].map(str::to_owned)),
+        "armv6l" => patterns.extend(["armv6", "arm", "armhf"].map(str::to_owned)),
+        "armv7" => patterns.extend(["armv7l", "arm", "armhf"].map(str::to_owned)),
+        "armv7l" => patterns.extend(["armv7", "arm", "armhf"].map(str::to_owned)),
+        "loongarch64" => patterns.push("loong64".to_owned()),
+        "loong64" => patterns.push("loongarch64".to_owned()),
+        "riscv64" => patterns.push("riscv64gc".to_owned()),
+        "riscv64gc" => patterns.push("riscv64".to_owned()),
         _ => {}
     }
+    if os == "darwin" && matches!(arch, "x86_64" | "amd64" | "aarch64" | "arm64") {
+        patterns.extend(["universal", "universal2"].map(str::to_owned));
+    }
+    if os == "linux" && matches!(arch, "x86_64" | "amd64") {
+        patterns.push("linux64".to_owned());
+    }
     patterns
+}
+
+fn libc_score(filename: &str, target: &Target) -> u8 {
+    if target.os != "linux" {
+        return 0;
+    }
+    if libc_patterns(&target.libc)
+        .iter()
+        .any(|pattern| contains_token(filename, pattern))
+    {
+        return 0;
+    }
+    if ["musl", "gnu", "glibc"]
+        .iter()
+        .any(|pattern| contains_token(filename, pattern))
+    {
+        return 2;
+    }
+    1
+}
+
+fn libc_patterns(libc: &str) -> Vec<&'static str> {
+    match libc {
+        "gnu" => vec!["gnu", "glibc"],
+        "musl" => vec!["musl"],
+        _ => Vec::new(),
+    }
+}
+
+fn variant_score(filename: &str) -> u8 {
+    if contains_token(filename, "profile") {
+        2
+    } else if contains_token(filename, "baseline") {
+        1
+    } else {
+        0
+    }
+}
+
+fn build_score(filename: &str) -> u8 {
+    if contains_token(filename, "debug") {
+        1
+    } else {
+        0
+    }
 }
 
 fn exact_cmd_match(
@@ -216,4 +477,112 @@ fn exact_cmd_match(
 fn starts_with_version(suffix: &str) -> bool {
     let suffix = suffix.strip_prefix('v').unwrap_or(suffix);
     suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AssetKind, install_kind};
+
+    #[test]
+    fn install_kind_accepts_supported_release_formats() {
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64"),
+            Some(AssetKind::Plain)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.gz"),
+            Some(AssetKind::Gz)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.bz2"),
+            Some(AssetKind::Bz2)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.xz"),
+            Some(AssetKind::Xz)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.zst"),
+            Some(AssetKind::Zst)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tar.gz"),
+            Some(AssetKind::TarGz)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tgz"),
+            Some(AssetKind::TarGz)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tar"),
+            Some(AssetKind::Tar)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tar.bz2"),
+            Some(AssetKind::TarBz2)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tbz"),
+            Some(AssetKind::TarBz2)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tbz2"),
+            Some(AssetKind::TarBz2)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tar.zst"),
+            Some(AssetKind::TarZst)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tzst"),
+            Some(AssetKind::TarZst)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tar.xz"),
+            Some(AssetKind::TarXz)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.txz"),
+            Some(AssetKind::TarXz)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.zip"),
+            Some(AssetKind::Zip)
+        );
+    }
+
+    #[test]
+    fn install_kind_skips_metadata_packages_and_unsupported_archives() {
+        for url in [
+            "https://example.com/tool-linux-x86_64.sha256sum",
+            "https://example.com/tool-linux-x86_64.sha512",
+            "https://example.com/tool-linux-x86_64.sha",
+            "https://example.com/tool-linux-x86_64.sha1",
+            "https://example.com/tool-linux-x86_64-checksums",
+            "https://example.com/tool-linux-x86_64.intoto.jsonl",
+            "https://example.com/tool-linux-x86_64.bsdiff",
+            "https://example.com/tool-linux-x86_64.patch",
+            "https://example.com/tool-linux-x86_64.minisig",
+            "https://example.com/tool-linux-x86_64.pkg.tar.zst",
+            "https://example.com/tool-linux-x86_64.deb",
+            "https://example.com/tool-linux-x86_64.whl",
+            "https://example.com/tool-linux-x86_64.appimage",
+            "https://example.com/tool-linux-x86_64.vsix",
+            "https://example.com/tool-linux-x86_64.artifactbundle",
+            "https://example.com/tool-linux-x86_64.7z",
+            "https://example.com/tool-linux-x86_64.tar.lz4",
+        ] {
+            assert_eq!(install_kind(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn install_kind_uses_filename_not_repo_path_or_query() {
+        assert_eq!(
+            install_kind(
+                "https://github.com/owner/my.deb.tool/releases/download/v1/tool-linux-x86_64?download=1"
+            ),
+            Some(AssetKind::Plain)
+        );
+    }
 }

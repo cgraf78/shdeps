@@ -18,27 +18,32 @@ use tar::{Archive, EntryType};
 use xz2::read::XzDecoder;
 use zip::ZipArchive;
 
+/// Extracts an uncompressed tar archive into `dest`.
+pub fn unpack_tar(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
+    unpack_tar_reader(Cursor::new(bytes), dest)
+}
+
 /// Extracts a gzip-compressed tar archive into `dest`.
 pub fn unpack_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
-    unpack_tar(GzDecoder::new(Cursor::new(bytes)), dest)
+    unpack_tar_reader(GzDecoder::new(Cursor::new(bytes)), dest)
 }
 
 /// Extracts a bzip2-compressed tar archive into `dest`.
 pub fn unpack_tar_bz2(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
-    unpack_tar(BzDecoder::new(Cursor::new(bytes)), dest)
+    unpack_tar_reader(BzDecoder::new(Cursor::new(bytes)), dest)
 }
 
 /// Extracts a zstd-compressed tar archive into `dest`.
 pub fn unpack_tar_zst(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
-    unpack_tar(zstd::stream::read::Decoder::new(Cursor::new(bytes))?, dest)
+    unpack_tar_reader(zstd::stream::read::Decoder::new(Cursor::new(bytes))?, dest)
 }
 
 /// Extracts an xz-compressed tar archive into `dest`.
 pub fn unpack_tar_xz(bytes: &[u8], dest: &Path) -> io::Result<Vec<PathBuf>> {
-    unpack_tar(XzDecoder::new(Cursor::new(bytes)), dest)
+    unpack_tar_reader(XzDecoder::new(Cursor::new(bytes)), dest)
 }
 
-fn unpack_tar(reader: impl Read, dest: &Path) -> io::Result<Vec<PathBuf>> {
+fn unpack_tar_reader(reader: impl Read, dest: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(dest)?;
     let mut archive = Archive::new(reader);
     let mut extracted = Vec::new();
@@ -196,7 +201,8 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use super::{
-        safe_entry_path, unpack_tar_bz2, unpack_tar_gz, unpack_tar_xz, unpack_tar_zst, unpack_zip,
+        safe_entry_path, unpack_tar, unpack_tar_bz2, unpack_tar_gz, unpack_tar_xz, unpack_tar_zst,
+        unpack_zip,
     };
 
     #[test]
@@ -208,6 +214,22 @@ mod tests {
         ]);
 
         let extracted = unpack_tar_gz(&bytes, &dest).unwrap();
+
+        assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
+        assert_eq!(fs::read(dest.join("man/man1/shdeps.1")).unwrap(), b"man");
+        assert!(extracted.contains(&PathBuf::from("shdeps")));
+        assert!(extracted.contains(&PathBuf::from("man/man1/shdeps.1")));
+    }
+
+    #[test]
+    fn unpack_tar_extracts_safe_files() {
+        let dest = temp_dir("tar-safe");
+        let bytes = tar(&[
+            Entry::file("shdeps", b"binary"),
+            Entry::file("man/man1/shdeps.1", b"man"),
+        ]);
+
+        let extracted = unpack_tar(&bytes, &dest).unwrap();
 
         assert_eq!(fs::read(dest.join("shdeps")).unwrap(), b"binary");
         assert_eq!(fs::read(dest.join("man/man1/shdeps.1")).unwrap(), b"man");
