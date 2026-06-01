@@ -2,14 +2,13 @@
 # shellcheck disable=SC1091
 # Focused smoke tests for the Rust-era sourceable compatibility wrapper.
 #
-# The full shell parity suite still exercises many legacy `_shdeps_*` internals
-# while the Bash reference exists. This file targets the final public surface:
-# source `shdeps.sh`/wrapper, call public `shdeps_*` functions, and verify the
-# wrapper delegates to the Rust binary without requiring callers to change.
+# This file targets the public sourceable surface: source `shdeps.sh`, call
+# public `shdeps_*` functions, and verify the wrapper delegates to the Rust
+# binary without requiring callers to change.
 
 set -uo pipefail
 
-SHDEPS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SHDEPS_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 SHDEPS_RUST_CLI="${SHDEPS_RUST_CLI:-$SHDEPS_DIR/target/debug/shdeps}"
 # The Rust binary owns version formatting, and the wrapper must pass that exact
 # line through. The timestamp keeps release identities readable, while the
@@ -61,11 +60,16 @@ _git_dev=$(_tmpdir)
 
 cat >"$_conf/deps.conf" <<'EOF'
 owner/tool github:repo
+cgraf78/agentguard github
+cgraf78/cmdblocks github
 EOF
 mkdir -p "$_install/owner/tool/share"
 cat >"$_install/owner/tool/share/env.sh" <<'EOF'
 SHDEPS_WRAPPER_SOURCED=1
 EOF
+mkdir -p "$_git_dev/agentguard/lib/agentguard" "$_git_dev/cmdblocks/share/cmdblocks"
+printf '# agentguard\n' >"$_git_dev/agentguard/lib/agentguard/agentguard.sh"
+printf '%s\n' "CMDBLOCKS_SHELL_LOADED=1" >"$_git_dev/cmdblocks/share/cmdblocks/shell.sh"
 
 export SHDEPS_RUST_CLI
 export SHDEPS_CONF_DIR="$_conf"
@@ -97,6 +101,17 @@ fi
 _version=$(shdeps_version)
 _assert_match "wrapper: version delegates to Rust binary" "$_version_line_re" "$_version"
 
+_assert_eq "wrapper: shdeps_log prints at normal log level" \
+  "test message" "$(SHDEPS_LOG_LEVEL=1 shdeps_log "test message")"
+_assert_eq "wrapper: shdeps_log suppresses at quiet log level" \
+  "" "$(SHDEPS_LOG_LEVEL=0 shdeps_log "test message")"
+_warn_output=$(SHDEPS_LOG_LEVEL=1 shdeps_warn "test warning" 2>&1)
+_assert_eq "wrapper: shdeps_warn writes stderr" "test warning" "$_warn_output"
+_assert_eq "wrapper: shdeps_log_ok delegates to shdeps_log" \
+  "test ok" "$(SHDEPS_LOG_LEVEL=1 shdeps_log_ok "test ok")"
+_assert_eq "wrapper: shdeps_log_dim delegates to shdeps_log" \
+  "test dim" "$(SHDEPS_LOG_LEVEL=1 shdeps_log_dim "test dim")"
+
 _assert_eq "wrapper: install dir cached from Rust env" "$_install" "$(shdeps_install_dir)"
 _assert_eq "wrapper: bin dir cached from Rust env" "$_bin" "$(shdeps_bin_dir)"
 _assert_eq "wrapper: git dev dir cached from Rust env" "$_git_dev" "$(shdeps_git_dev_dir)"
@@ -122,6 +137,15 @@ fi
 unset SHDEPS_WRAPPER_SOURCED
 shdeps_dep_source owner/tool share/env.sh
 _assert_eq "wrapper: dep-source sources into current shell" "1" "${SHDEPS_WRAPPER_SOURCED:-}"
+
+_assert_eq "wrapper: bare github dep-file prefers local dev clone" \
+  "$_git_dev/agentguard/lib/agentguard/agentguard.sh" \
+  "$(shdeps_dep_file cgraf78/agentguard lib/agentguard/agentguard.sh)"
+
+unset CMDBLOCKS_SHELL_LOADED
+shdeps_dep_source cgraf78/cmdblocks share/cmdblocks/shell.sh
+_assert_eq "wrapper: bare github dep-source uses local dev clone" \
+  "1" "${CMDBLOCKS_SHELL_LOADED:-}"
 
 SHDEPS_UPDATE_TXN_ID=txn123 shdeps_mark_changed owner/tool
 _assert_file_exists "wrapper: mark-changed writes txn sentinel" "$_state/.changed-markers/txn123/owner/tool"

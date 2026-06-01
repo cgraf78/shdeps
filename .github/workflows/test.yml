@@ -35,24 +35,20 @@ jobs:
         scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
         scripts/smoke-release.sh linux-x86_64-musl
 
-        # The shell parity and wrapper checks use the optimized host binary from
-        # rust-ci's build gate. That keeps Rust behavior covered against the
-        # existing Bash suite without making every platform matrix job compile a
-        # release binary just to run wrapper smoke tests.
-        SHDEPS_IMPL=rust SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-test
-        SHDEPS_RUST_CLI=target/release/shdeps ./test/shdeps-wrapper-test
-        # install-sh-test sources install.sh in isolation to exercise
-        # helpers like `_refresh_release_install_if_stale` that the Rust
-        # suite and the curl-pipe bash32 smoke test cannot cover.
-        ./test/install-sh-test
+        # The sourceable wrapper needs the optimized host binary from rust-ci's
+        # build gate. Installer/release shell suites run in the shell job below.
+        SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@main # zizmor: ignore[unpinned-uses]
     with:
       profiles: base,shellcheck
-      # Chain both shell-side suites: shdeps-test covers shdeps.sh and the
-      # legacy reference, install-sh-test covers install.sh helpers.
-      test-command: ./test/shdeps-test && ./test/install-sh-test
+      # Shell-owned behavior lives under tests/shell. Cargo integration tests
+      # stay in the conventional tests/*.rs location.
+      test-command: >
+        tests/shell/install-sh-test &&
+        tests/shell/installer-flow-test &&
+        tests/shell/release-scripts-test
 
   bash32:
     uses: cgraf78/actions/.github/workflows/bash32-ci.yml@main # zizmor: ignore[unpinned-uses]

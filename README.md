@@ -465,10 +465,11 @@ static archive.
 ## Testing
 
 ```bash
-./test/shdeps-test
-SHDEPS_IMPL=rust ./test/shdeps-test
 cargo test --locked
-./test/shdeps-wrapper-test
+tests/shell/install-sh-test
+tests/shell/installer-flow-test
+tests/shell/release-scripts-test
+SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
 ```
 
 The standalone CLI is a Rust binary. The sourceable Bash API and hook prelude

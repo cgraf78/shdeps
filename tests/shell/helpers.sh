@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # helpers.sh — shared test framework for shdeps tests.
 #
-# Source this file from test scripts to get assertion helpers,
+# Source this file from shell test scripts to get assertion helpers,
 # temp directory management, and a summary reporter.
 #
 # Usage:
@@ -209,13 +209,10 @@ _mock_bin() {
 
 # Source the selected shdeps library with test-friendly defaults.
 #
-# The Rust port keeps this helper as the single handoff point between the shell
-# parity suite and the implementation under test. Most tests exercise sourced
-# Bash APIs, so callers still pass the repo root for legacy clarity, but the
-# actual library path comes from SHDEPS_TEST_LIB once the Rust compatibility
-# wrapper is available. Do not use the public SHDEPS_LIB bootstrap knob here:
-# this suite sources install.sh in-process, and a global SHDEPS_LIB would change
-# installer behavior instead of only selecting the implementation under test.
+# Test helpers still accept the repo root for callers that need to source the
+# checked-out wrapper. Do not use the public SHDEPS_LIB bootstrap knob here:
+# installer tests source install.sh in-process, and a global SHDEPS_LIB would
+# change installer behavior instead of only selecting the wrapper under test.
 _source_shdeps() {
   local shdeps_dir="${1:-$SHDEPS_DIR}"
   local shdeps_lib="${SHDEPS_TEST_LIB:-$shdeps_dir/shdeps.sh}"
