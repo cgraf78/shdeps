@@ -246,6 +246,19 @@ The `name` field is the PyPI package name. Override `cmd` when the package's exe
 
 Requires `uv` on `$PATH` (install via `pipx install uv`, `brew install uv`, or [Astral's installer](https://docs.astral.sh/uv/getting-started/installation/)). If absent, shdeps warns once at startup and skips all uv deps.
 
+### `npm` — Node CLI Packages
+
+Installs Node CLI packages from the npm registry via `npm install -g --prefix "$SHDEPS_INSTALL_DIR/<name>" <name>`. Binaries land under the per-dep install directory and are symlinked into `$SHDEPS_BIN_DIR`.
+
+```text
+prettier     npm
+typescript   npm   tsc
+```
+
+The `name` field is the npm package name. Override `cmd` when the package's executable name differs from the package name.
+
+Requires `npm` on `$PATH`. If absent, shdeps warns once at startup and skips all npm deps.
+
 ### `custom` — Hook-Only
 
 No built-in install logic. Entirely managed by a post-install hook file.
