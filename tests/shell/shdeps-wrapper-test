@@ -118,8 +118,9 @@ _assert_eq "wrapper: git dev dir cached from Rust env" "$_git_dev" "$(shdeps_git
 _assert_match "wrapper: platform available" '^(linux|macos|wsl)$' "$(shdeps_platform)"
 
 _assert_eq "wrapper: pkg mgr starts as cached empty read" "" "$(shdeps_pkg_mgr)"
-_SHDEPS_PKG_MGR=apt
-_assert_eq "wrapper: pkg mgr honors already-detected shell cache" "apt" "$(shdeps_pkg_mgr)"
+export SHDEPS_PKG_MGR=apt
+_assert_eq "wrapper: pkg mgr honors explicit shell cache" "apt" "$(shdeps_pkg_mgr)"
+unset SHDEPS_PKG_MGR
 
 export SHDEPS_FORCE=1
 if shdeps_force; then
@@ -294,7 +295,7 @@ else
   # CI usually runs the wrapper suite under a modern Linux Bash. Keep this as
   # an explicit skip/pass so macOS or local Bash-3.2 fixtures automatically
   # exercise the real source-time refusal without making Linux CI depend on an
-  # extra legacy shell package.
+  # extra old-shell package.
   _pass "wrapper: old Bash refusal skipped (no Bash <4.3 found)"
 fi
 

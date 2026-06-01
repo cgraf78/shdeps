@@ -32,7 +32,7 @@ SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
 _info() { printf '%s\n' "$*" >&2; }
 _error() { printf 'error: %s\n' "$*" >&2; }
 
-_bash_supports_legacy_library() {
+_bash_supports_sourceable_wrapper() {
   ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3)))
 }
 
@@ -892,12 +892,9 @@ _source_checkout_binary_matches_head() {
 _bootstrap_self_update() {
   local shdeps_dir="$1"
 
-  if declare -f _shdeps_self_update &>/dev/null; then
-    _shdeps_self_update "$shdeps_dir"
-  elif declare -f shdeps_self_update &>/dev/null; then
+  if declare -f shdeps_self_update &>/dev/null; then
     # The Rust public wrapper intentionally has a clean no-arg CLI surface, so
-    # pass the bootstrap-selected checkout through the environment instead of
-    # preserving the legacy private helper's positional argument shape.
+    # pass the bootstrap-selected checkout through the environment.
     local SHDEPS_DIR="$shdeps_dir"
     export SHDEPS_DIR
     shdeps_self_update
@@ -905,33 +902,22 @@ _bootstrap_self_update() {
 }
 
 # Symlink CLI into PATH and link man page + shell completions.
-#
-# Modern installs source the Rust compatibility wrapper, but old checkouts and
-# rollback fixtures may still expose the legacy Bash helper names. Keep this
-# helper bilingual so installer/bootstrap activation is tolerant during fleet
-# migration without spreading the legacy/private helper split to callers.
 _setup_links() {
   local shdeps_dir="$1"
-  local cli="$shdeps_dir/bin/shdeps-legacy"
+  local cli=""
 
   if [[ -x "$shdeps_dir/shdeps" ]]; then
     cli="$shdeps_dir/shdeps"
   elif [[ -x "$shdeps_dir/bin/shdeps" ]]; then
-    # Current source checkouts spell the preserved Bash entry point
-    # `shdeps-legacy` so repo-local direnv paths cannot shadow the Rust CLI.
-    # The historical name remains a fallback only for bootstrapping older
-    # installed checkouts while they are being replaced.
     cli="$shdeps_dir/bin/shdeps"
   fi
 
-  if [[ -x "$cli" ]]; then
+  if [[ -n "$cli" ]]; then
     mkdir -p "$(dirname "$SHDEPS_BIN")"
     ln -sf "$cli" "$SHDEPS_BIN"
   fi
 
-  if declare -f _shdeps_link_extras &>/dev/null; then
-    _shdeps_link_extras "shdeps" "$shdeps_dir"
-  elif declare -f shdeps_link_extras &>/dev/null; then
+  if declare -f shdeps_link_extras &>/dev/null; then
     shdeps_link_extras "shdeps" "$shdeps_dir"
   fi
 }
@@ -944,11 +930,10 @@ _source_installed_library_for_extras() {
   fi
 
   # `install.sh` is the bootstrap script users run before shdeps is installed,
-  # so it must stay usable with stock macOS Bash 3.2. The sourceable legacy
-  # library still needs Bash 4.3+ until the Rust wrapper cutover. Release
-  # installs can still activate the Rust binary and CLI symlink under Bash 3.2;
-  # they only skip optional extras linking that depends on sourcing shdeps.sh.
-  if ! _bash_supports_legacy_library; then
+  # so it must stay usable with stock macOS Bash 3.2. Release installs can
+  # still activate the Rust binary and CLI symlink under Bash 3.2; they only
+  # skip optional extras linking that depends on sourcing shdeps.sh.
+  if ! _bash_supports_sourceable_wrapper; then
     return 0
   fi
 
@@ -1040,7 +1025,7 @@ _install() {
 #
 # Finds shdeps.sh, sources it, symlinks the CLI, and runs self-update.
 # Clients set env vars (SHDEPS_CONF_DIR, SHDEPS_HOOKS_DIR, etc.) before
-# sourcing. Pre-defined _shdeps_log* functions are respected by shdeps.sh.
+# sourcing.
 #
 # Returns 0 if shdeps is ready, 1 if bootstrap failed.
 
@@ -1140,9 +1125,7 @@ _uninstall() {
   if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
     # shellcheck source=/dev/null
     . "$SHDEPS_DIR/shdeps.sh"
-    if declare -f _shdeps_unlink_extras &>/dev/null; then
-      _shdeps_unlink_extras "shdeps"
-    elif declare -f shdeps_unlink_extras &>/dev/null; then
+    if declare -f shdeps_unlink_extras &>/dev/null; then
       shdeps_unlink_extras "shdeps"
     fi
   fi

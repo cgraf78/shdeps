@@ -208,7 +208,7 @@ shdeps_filter_match() { _shdepsw_call __api filter-match "$@"; }
 shdeps_platform() { printf '%s\n' "${_SHDEPSW_PLATFORM:-$(_shdepsw_call __api platform)}"; }
 shdeps_force() { [[ "${SHDEPS_FORCE:-${_SHDEPSW_FORCE:-0}}" == "1" ]]; }
 shdeps_reinstall() { [[ "${SHDEPS_REINSTALL:-${_SHDEPSW_REINSTALL:-0}}" == "1" ]]; }
-shdeps_pkg_mgr() { printf '%s\n' "${_SHDEPS_PKG_MGR:-${SHDEPS_PKG_MGR:-${_SHDEPSW_PKG_MGR:-}}}"; }
+shdeps_pkg_mgr() { printf '%s\n' "${SHDEPS_PKG_MGR:-${_SHDEPSW_PKG_MGR:-}}"; }
 shdeps_pkg_install() { SHDEPS_PKG_MGR="$(shdeps_pkg_mgr)" _shdepsw_call __api pkg-install "$@"; }
 shdeps_pkg_install_for_mgr() { SHDEPS_PKG_MGR="$(shdeps_pkg_mgr)" _shdepsw_call __api pkg-install-for-mgr "$@"; }
 shdeps_require_sudo() { _shdepsw_call __api require-sudo "$@"; }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC1091
 # Focused coverage for release helper scripts. These are shell-owned contracts,
-# so they stay in a shell suite after the legacy shdeps implementation is gone.
+# so they stay in a shell suite.
 
 set -uo pipefail
 

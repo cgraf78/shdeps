@@ -77,7 +77,7 @@ chmod +x "$_payload/shdeps"
 cat >"$_payload/shdeps.sh" <<'SH'
 # This release fixture would fail if install.sh tried to source it with Bash
 # 3.2. The Rust-era installer must be able to activate the binary first and
-# treat legacy-library extras as optional on old system Bash.
+# treat sourceable-wrapper extras as optional on old system Bash.
 if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
   return 42
 fi
