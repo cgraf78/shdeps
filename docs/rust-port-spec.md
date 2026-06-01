@@ -1,9 +1,9 @@
 # shdeps Compatibility Specification
 
-This document defines the public behavior contract for `shdeps`. It is the
-normative target for the Rust port and for future implementations. The current
-Bash implementation is the reference implementation until the Rust
-implementation satisfies this specification and the parity test suite.
+This document defines the public behavior contract for `shdeps`. The Rust
+implementation now owns that behavior; references to Bash behavior describe
+compatibility constraints or migration history, not an active alternate
+implementation.
 
 This is a compatibility specification, not an implementation plan. The
 implementation roadmap lives in [rust-port-plan.md](rust-port-plan.md).
@@ -13,9 +13,8 @@ implementation roadmap lives in [rust-port-plan.md](rust-port-plan.md).
 Status: draft.
 
 The spec should be treated as binding for new Rust code once a section has
-tests. If this document and the current Bash implementation disagree before the
-Rust port is complete, treat the Bash implementation and existing tests as the
-source of truth, then update this spec or the tests intentionally.
+tests. If this document and the implementation disagree, update the spec or the
+tests intentionally.
 
 ## Implementation Workflow Contract
 
@@ -986,9 +985,9 @@ Bash compatibility:
 ## Bash API
 
 `shdeps.sh` is sourceable and MUST define a public API section. Every
-top-level function named `shdeps_*` in that section is public Bash API. Helpers
-with `_shdeps_*` names and `_SHDEPS_*` globals are private implementation
-details unless explicitly promoted in a future spec revision.
+top-level function named `shdeps_*` in that section is public Bash API.
+Wrapper-private names and globals are implementation details unless explicitly
+promoted in a future spec revision.
 
 The stable Bash API is:
 
@@ -997,7 +996,7 @@ The stable Bash API is:
 | `shdeps_version` | `shdeps YYYYMMDD-HHMMSS-<8hex>` | `0` when version resolved, non-zero if no concrete commit is available |
 | `shdeps_update [args...]` | human logs | `0` on successful update, `1` on runtime/install failure |
 | `shdeps_self_update [dir]` | human logs/warnings | non-zero when the target is not self-updatable; current Bash returns success for dirty-tree skips and non-destructive pull failures |
-| `shdeps_load` | configured dependency count | `0`; populates Bash reference internals but callers should prefer the count/output contract |
+| `shdeps_load` | configured dependency count | `0`; callers should prefer the count/output contract |
 | `shdeps_prune [-y] [--dry-run]` | human logs | same behavior as `shdeps prune` |
 | `shdeps_platform_match <spec>` | none | predicate: `0` match, `1` mismatch |
 | `shdeps_host_match <spec>` | none | predicate: `0` match, `1` mismatch |
@@ -1005,7 +1004,7 @@ The stable Bash API is:
 | `shdeps_platform` | normalized platform string | `0` |
 | `shdeps_force` | none | predicate: `0` when force mode active, `1` otherwise |
 | `shdeps_reinstall` | none | predicate: `0` when reinstall mode active, `1` otherwise |
-| `shdeps_pkg_mgr` | current detected package manager or empty string | `0`; MUST read the already-detected manager (Bash reference: `${_SHDEPS_PKG_MGR:-}`). MUST NOT trigger detection. Detection is owned by `update`/`list`/`check` paths; on-demand detection from this helper would fork the package-manager probe chain for every hook call, break perf budgets, and risk inconsistent answers if env mutates mid-update. Returns empty string if detection has not happened yet in the current process or its parent `__api` runtime context. |
+| `shdeps_pkg_mgr` | current detected package manager or empty string | `0`; MUST read the already-detected manager. MUST NOT trigger detection. Detection is owned by `update`/`list`/`check` paths; on-demand detection from this helper would fork the package-manager probe chain for every hook call, break perf budgets, and risk inconsistent answers if env mutates mid-update. Returns empty string if detection has not happened yet in the current process or its parent `__api` runtime context. |
 | `shdeps_pkg_install <package>` | human logs | `0` only when the package install succeeds |
 | `shdeps_pkg_install_for_mgr <mgr:package>...` | human logs | `0` when a spec for the active manager installs successfully |
 | `shdeps_require_sudo` | sudo prompt/output as needed | `0` if root or sudo was obtained |
@@ -1344,9 +1343,9 @@ Source builds are allowed only when the caller explicitly selects source mode:
 running `install.sh` from a real source checkout, pointing `SHDEPS_LIB` at one,
 or keeping a local development checkout under `SHDEPS_GIT_DEV_DIR`.
 
-### Reference Behavior
+### Source-Checkout Behavior
 
-Bash reference source-checkout install mode currently MUST:
+Source-checkout install mode MUST:
 
 - require `git`
 - clone `$SHDEPS_REPO` into `$SHDEPS_DIR` when missing
@@ -1360,7 +1359,7 @@ Bash reference source-checkout install mode currently MUST:
 
 Transparent legacy migration is required. Existing consumers, including
 dotfiles flows that already source `install.sh --bootstrap`, must migrate from
-the Bash implementation to the Rust implementation without changing their
+the Bash-era implementation to the Rust implementation without changing their
 config, hook files, environment variables, or bootstrap call site.
 
 Migration requirements:
@@ -1377,8 +1376,8 @@ Migration requirements:
   not need to change `PATH` or command names.
 - Preserve existing manifests, stamps, link state, config files, and hooks with
   no manual migration command.
-- Skip automatic conversion for dirty git checkouts and leave the Bash
-  implementation usable, because a dirty checkout is treated as active
+- Skip automatic conversion for dirty git checkouts and leave the existing
+  install usable, because a dirty checkout is treated as active
   development.
 - Treat explicit source/development overrides conservatively. When bootstrap is
   using `SHDEPS_LIB` or `$SHDEPS_GIT_DEV_DIR/shdeps`, automatic release
@@ -1387,23 +1386,22 @@ Migration requirements:
   installs.
 - Stage the Rust binary/wrapper and metadata before switching the public
   symlink or wrapper behavior.
-- Leave the previous Bash implementation usable if binary download, checksum
-  verification, extraction, smoke test, metadata write, or symlink replacement
-  fails.
+- Leave the previous install usable if binary download, checksum verification,
+  extraction, smoke test, metadata write, or symlink replacement fails.
 - Make the migration idempotent: rerunning `install.sh`, sourcing
   `install.sh --bootstrap`, or running `shdeps self-update` after a partial
   attempt must either complete migration or continue using the prior working
   install.
-- Do not strand a currently running shell. A shell that already sourced the
-  Bash implementation may keep those functions until the next bootstrap or
+- Do not strand a currently running shell. A shell that already sourced an
+  older implementation may keep those functions until the next bootstrap or
   shell session, but the on-disk install must remain internally consistent and
-  the next bootstrap must see either the old working Bash implementation or the
-  fully staged Rust implementation.
+  the next bootstrap must see either the old working install or the fully
+  staged Rust implementation.
 
 The migration cannot rely on an old Bash installer re-executing newly pulled
 installer code after `git pull`. The project therefore MUST ship either:
 
-- a bridge release where the Bash implementation remains functional but the
+- a bridge release where the installed implementation remains functional but the
   installer/self-update path learns how to stage and activate the Rust binary,
   followed by the Rust-default release after fleet machines have had a chance to
   pick up the bridge; or
@@ -1726,21 +1724,15 @@ final state must remain equivalent to current Bash behavior.
 
 ## Test Coverage Strategy
 
-The existing Bash test suite is not disposable. It is the reference parity
-suite for observable behavior and should continue to run during the Rust port.
+shdeps uses three complementary test layers:
 
-The Rust port MUST use three complementary test layers:
-
-1. **Reference/parity tests**: the existing `test/shdeps-test` shell suite,
-   adapted so public behavior can run against either the Bash reference or the
-   Rust implementation. This suite protects CLI behavior, shell return codes,
-   hook semantics, state compatibility, mocked install methods, and historical
-   edge cases discovered while shdeps was Bash-only.
-2. **Rust-native tests**: Rust unit and integration tests for parser logic,
+1. **Rust-native tests**: Rust unit and integration tests for parser logic,
    platform matching, ownership policy, state formats, GitHub asset matching,
    archive safety, installer metadata, error types, and performance-sensitive
    pure logic. These tests should live close to the Rust code and should not
    require shelling out when a direct library call is clearer.
+2. **Shell compatibility tests**: focused suites for the sourceable wrapper,
+   installer/bootstrap behavior, and shell-owned release scripts.
 3. **Compatibility smoke tests**: end-to-end tests against real packaging and
    downstream usage surfaces: `install.sh --bootstrap`, release archives,
    dotfiles integration, and recent repositories that call `shdeps dep-file`.
@@ -1755,56 +1747,18 @@ Golden tests MUST cover compatibility-sensitive CLI and Bash-wrapper output:
 - common install-method warnings that downstream scripts may notice
 - `shdeps.sh` public API helper stdout for path and predicate wrappers
 
-The existing Bash tests SHOULD be split as the port progresses:
-
-- public behavior tests that both implementations must pass
-- legacy-internal tests that may remain Bash-only until the internal Bash
-  helper they inspect is replaced by a Rust API, hidden bridge command, or
-  public behavior assertion
+The old Bash tests have been split into focused Rust and shell tests. New
+coverage should assert public behavior, Rust-owned pure logic, or hidden bridge
+contracts directly.
 
 Do not mechanically port every shell assertion into Rust. Prefer Rust-native
 tests for Rust-owned pure logic and keep the shell suite for compatibility
 surfaces where shell behavior itself is part of the contract.
 
-The Rust implementation is not complete until:
-
-- the public-behavior portion of the existing shell suite passes against Rust
-- Rust unit/integration tests cover the same core behavior at the library level
-- Bash compatibility wrapper tests prove existing `source shdeps.sh` callers and
-  hooks still work
-- release/install smoke tests pass on every supported platform artifact
-
-### Test Harness Implementation Selection
-
-`test/shdeps-test` MUST select the implementation under test through
-`SHDEPS_IMPL`.
-
-Supported values:
-
-| Value | Meaning |
-| --- | --- |
-| `bash` | Run against the Bash reference implementation. This is the default until Rust parity is complete. |
-| `rust` | Run against the Rust binary plus the Rust-era Bash compatibility wrapper. |
-
-Selection variables:
-
-| Variable | Meaning |
-| --- | --- |
-| `SHDEPS_IMPL` | Implementation selector: `bash` or `rust`. |
-| `SHDEPS_CLI` | Test harness path to the selected `shdeps` command. |
-| `SHDEPS_TEST_LIB` | Test harness path to the selected sourceable `shdeps.sh` API layer. |
-| `SHDEPS_RUST_CLI` | Optional override for the Rust binary path before the release layout exists. |
-| `SHDEPS_RUST_LIB` | Optional override for the Rust compatibility wrapper path before the release layout exists. |
-
-The harness MUST fail clearly for unsupported selectors or for `SHDEPS_IMPL=rust`
-before the Rust binary is built. Silent fallback to Bash would make parity
-results meaningless.
-
-The harness MUST NOT reuse the installer-facing `SHDEPS_LIB` variable for test
-implementation selection. `install.sh --bootstrap` already treats `SHDEPS_LIB`
-as a public override, and the shell parity suite sources the installer in the
-current process. Reusing that name would test a mutated bootstrap environment
-instead of the real user-facing behavior.
+The implementation is not complete until Rust unit/integration tests cover core
+behavior at the library level, Bash compatibility wrapper tests prove existing
+`source shdeps.sh` callers and hooks still work, and release/install smoke tests
+pass on every supported platform artifact.
 
 ### Current Test-only Environment Knobs
 

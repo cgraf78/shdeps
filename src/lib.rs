@@ -2,17 +2,14 @@
 
 //! Rust implementation core for `shdeps`.
 //!
-//! The Bash implementation remains the behavioral reference until the Rust
-//! port passes the full parity suite. This crate is intentionally split into
-//! small modules so config parsing, state mutation, process execution, hooks,
-//! install methods, and CLI formatting can each grow behind a single owner.
-//! Keeping those boundaries explicit avoids recreating the current Bash script
-//! as one large Rust translation unit.
+//! This crate owns the implementation behind the CLI and sourceable Bash
+//! wrapper. It is intentionally split into small modules so config parsing,
+//! state mutation, process execution, hooks, install methods, and CLI
+//! formatting each grow behind a single owner.
 //!
-//! Public Rust API stability begins after the Rust port becomes the default.
-//! During the port, exported items are documented so internal users understand
-//! the intended ownership boundaries, but downstream crates should not treat
-//! this API as semver-stable yet.
+//! Exported items are documented so internal users understand the intended
+//! ownership boundaries, but downstream crates should not treat this API as
+//! semver-stable yet.
 
 pub mod api;
 pub mod archive;

@@ -160,10 +160,9 @@ pub fn reinstall(env: &impl Env, overrides: &Overrides) -> bool {
 
 /// Returns the cached package manager without probing the host.
 ///
-/// The Bash helper reads `_SHDEPS_PKG_MGR` only after another path has already
-/// detected it. A Rust bridge subprocess cannot see private shell variables, so
-/// the wrapper/prelude will export this value when it has one; absent export
-/// means "unknown yet", not "go detect it now".
+/// The sourceable wrapper reads the package manager only after another path has
+/// already detected it. The wrapper/prelude exports this value when it has one;
+/// absent export means "unknown yet", not "go detect it now".
 #[must_use]
 pub fn pkg_mgr(env: &impl Env) -> String {
     env_string(env, "SHDEPS_PKG_MGR").unwrap_or_default()

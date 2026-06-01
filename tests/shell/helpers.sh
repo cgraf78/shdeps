@@ -216,10 +216,6 @@ _mock_bin() {
 _source_shdeps() {
   local shdeps_dir="${1:-$SHDEPS_DIR}"
   local shdeps_lib="${SHDEPS_TEST_LIB:-$shdeps_dir/shdeps.sh}"
-  # Reset any previously defined functions/vars
-  unset -f _shdeps_log _shdeps_warn _shdeps_log_ok _shdeps_log_dim _shdeps_log_header 2>/dev/null
-  unset _SHDEPS_DEPS _SHDEPS_PKG_MGR _SHDEPS_PKG_BATCH _SHDEPS_PKG_BATCH_NAMES 2>/dev/null
-  unset _SHDEPS_CHANGED 2>/dev/null
   # Suppress all output during tests
   export SHDEPS_LOG_LEVEL=0
   # shellcheck source=/dev/null

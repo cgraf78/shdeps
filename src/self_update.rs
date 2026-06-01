@@ -1,10 +1,9 @@
 //! `shdeps self-update` planning and update behavior.
 //!
 //! Release-archive self-update has stricter rollback and checksum requirements,
-//! so this module starts with the behavior the Bash implementation already owns:
-//! source checkouts. Keeping it separate from CLI dispatch lets the eventual
-//! release-install path share one summary type and one "do not break the
-//! existing install" contract.
+//! so this module keeps source-checkout behavior separate from release-install
+//! behavior. Keeping it separate from CLI dispatch lets both paths share one
+//! summary type and one "do not break the existing install" contract.
 
 use std::fmt;
 use std::fs;

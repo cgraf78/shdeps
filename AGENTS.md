@@ -36,8 +36,6 @@ changes.
   and Rust. Keep that bridge narrow, documented, and covered by wrapper tests.
 - Rust modules should own real behavior. Prefer adding Rust APIs and CLI/API
   tests over growing Bash wrapper logic.
-- Legacy Bash internals still use `_shdeps_` and `_SHDEPS_` names, but those are
-  reference implementation details, not new public API.
 
 ## Configuration
 
@@ -102,14 +100,14 @@ extras from the tool itself in a `post()` hook:
 | Zsh completions  | `~/.local/share/zsh/site-functions/`          | No — needs `fpath`   |
 | Fish completions | `~/.local/share/fish/vendor_completions.d/`   | Yes                  |
 
-Discovery uses four pattern arrays (`_SHDEPS_MAN_PATTERNS`, `_SHDEPS_BASH_COMP_PATTERNS`,
-`_SHDEPS_ZSH_COMP_PATTERNS`, `_SHDEPS_FISH_COMP_PATTERNS`) defined near the top of
-`shdeps.sh`. Adding a new convention = appending one glob to the appropriate array.
+Discovery uses pattern constants in `src/extras.rs`. Adding a new convention =
+appending one glob to the appropriate list and covering it with an extras unit
+test.
 
 State tracking: each dep's linked symlinks are recorded in
 `$SHDEPS_STATE_DIR/<name>.links`. On re-link (update), stale symlinks are
-cleaned before new ones are created. On prune, `_shdeps_unlink_extras` removes
-all tracked symlinks.
+cleaned before new ones are created. On prune, the hidden
+`shdeps __api unlink-extras` bridge removes all tracked symlinks.
 
 ## Hook Contract
 

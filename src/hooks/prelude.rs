@@ -1,10 +1,10 @@
 //! Generated Bash prelude used by Rust hook subprocesses.
 //!
-//! Hook files are still Bash, but their `shdeps_*` helpers should not source
-//! the old monolithic Bash implementation once the Rust binary owns behavior.
-//! The prelude keeps that boundary explicit: most helpers are one-line bridge
-//! calls into `shdeps __api`, while the few helpers that must act in the current
-//! shell stay local and deliberately tiny.
+//! Hook files are still Bash, but their `shdeps_*` helpers should bridge into
+//! the Rust binary instead of sourcing the public wrapper for every hook
+//! subprocess. The prelude keeps that boundary explicit: most helpers are
+//! one-line bridge calls into `shdeps __api`, while the few helpers that must
+//! act in the current shell stay local and deliberately tiny.
 
 /// Returns the Bash source text for the Rust hook compatibility prelude.
 #[must_use]

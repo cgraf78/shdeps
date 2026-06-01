@@ -1,14 +1,9 @@
 # Rust Port Plan
 
-This document defines the plan to port `shdeps` from Bash to Rust while
-preserving today's behavior exactly. The Rust `shdeps` binary must be a
-drop-in replacement for the current CLI, and the Rust crate API must expose the
-same operations for Rust callers.
-
-The current Bash implementation is the reference implementation until the Rust
-port passes the full parity suite. The goal is not a redesign. It is a careful
-implementation-language migration with compatible state, hooks, config, output,
-exit codes, and install behavior.
+This historical document defined the plan to port `shdeps` from Bash to Rust
+while preserving behavior. The Rust `shdeps` binary is now the implementation
+owner; remaining references to Bash behavior describe compatibility constraints
+or migration history, not an active alternate implementation.
 
 ## Goals
 
@@ -21,8 +16,8 @@ exit codes, and install behavior.
 - Provide a first-class Rust library crate that owns the implementation and is
   reused by the CLI and Bash compatibility wrapper.
 - Provide prebuilt binaries for every supported platform.
-- Keep the current test coverage, then extend it with Rust unit,
-  integration, parity, compatibility, and release smoke tests.
+- Keep useful test coverage, then extend it with Rust unit, integration,
+  compatibility, and release smoke tests.
 - Keep `shdeps version` readable and tied to a concrete git commit suffix. It
   must never degrade to `unknown`.
 
@@ -44,13 +39,14 @@ exit codes, and install behavior.
 
 ## Reference Inputs
 
-The Rust port is based on these existing sources:
+The Rust port was based on these existing sources:
 
 - `shdeps.sh`: current implementation and public Bash API.
-- `bin/shdeps-legacy`: legacy CLI argument parsing, command names, help text,
-  and output conventions.
+- The pre-Rust Bash implementation: CLI argument parsing, command names, help
+  text, and output conventions.
 - `install.sh`: current install, uninstall, and sourceable bootstrap behavior.
-- `test/shdeps-test`: current behavior suite and the primary parity oracle.
+- The pre-Rust shell test suite: behavior coverage and the primary parity
+  oracle.
 - `README.md` and `AGENTS.md`: documented user and agent-facing contracts.
 - `docs/rust-port-spec.md`: normative compatibility contract for CLI, config,
   state, hooks, installer, performance, and release behavior.
@@ -557,11 +553,11 @@ regression test verifies this works from inside a hook.
 
 The prelude/wrapper version of `shdeps_pkg_mgr` MUST NOT trigger detection.
 It returns the already-detected manager (empty string if detection has not
-run in the current process or parent runtime context). Current Bash
-behavior reads `${_SHDEPS_PKG_MGR:-}`. A naive Rust `__api pkg-mgr` that
-ran detection on every call would fork the package-manager probe chain per
-hook call, break perf budgets, and produce inconsistent answers if env
-mutates mid-update. Detection is owned by `update`/`list`/`check` paths only.
+run in the current process or parent runtime context). A naive Rust
+`__api pkg-mgr` that ran detection on every call would fork the package-manager
+probe chain per hook call, break perf budgets, and produce inconsistent answers
+if env mutates mid-update. Detection is owned by `update`/`list`/`check` paths
+only.
 
 ## Rust API Shape
 
@@ -857,8 +853,7 @@ The installer should therefore support this order:
 3. Download a matching public release artifact.
 4. Build from source over the configured repo URL when `cargo` is available,
    falling back to SSH only when the configured HTTPS repo cannot be cloned.
-5. Use the legacy Bash implementation only during the transition window.
-6. Fail clearly with remediation text when none of the above can work.
+5. Fail clearly with remediation text when none of the above can work.
 
 Release artifact credentials should be detected in this order:
 
@@ -936,8 +931,8 @@ Uninstall mode:
 - remove `$SHDEPS_DIR`
 - keep current idempotent behavior and wording
 
-During the transition, `install.sh` may still source the legacy Bash
-implementation. After cutover, it should source the compatibility wrapper.
+During the transition, `install.sh` sourced the Bash implementation. After
+cutover, it sources the compatibility wrapper.
 
 ### Transparent Bash-To-Rust Migration
 
@@ -953,7 +948,7 @@ machine with a wrapper that has nothing valid to delegate to.
 
 Use a two-stage migration:
 
-1. **Bridge release**: keep the Bash implementation functional, but update
+1. **Bridge release**: keep the installed command functional, but update
    `install.sh`, `shdeps_self_update`, and any bootstrap helpers so they can
    detect the Rust artifact for the host platform, download it, verify the
    checksum, stage it, smoke-test it, write install metadata, and switch the
@@ -974,7 +969,7 @@ The migration must preserve:
   target file
 - `source shdeps.sh` and `install.sh --bootstrap` behavior
 - existing config files, hooks, manifests, stamps, `.links`, and `.binlinks`
-- rollback to the prior Bash implementation if any migration step fails
+- rollback to the prior usable install if any migration step fails
 - developer-controlled source checkouts selected through `SHDEPS_LIB` or
   `$SHDEPS_GIT_DEV_DIR/shdeps`; skip automatic release conversion for those
   unless explicitly requested
@@ -1005,24 +1000,14 @@ Installer safety requirements:
 
 ## Test Strategy
 
-The existing Bash suite is the parity oracle. The Rust port should not be
-considered complete until the current suite can run against Rust with equivalent
-coverage.
+The old Bash suite was the parity oracle. Its useful coverage has been split
+into Rust-native tests and focused shell compatibility suites.
 
 ### Reference Harness
 
-Add a test switch:
-
-```bash
-SHDEPS_IMPL=bash ./test/shdeps-test
-SHDEPS_IMPL=rust ./test/shdeps-test
-```
-
-The harness should make the same assertions against both implementations where
-possible. Tests that inspect private Bash internals should be split into:
-
-- public behavior tests that Rust must pass
-- legacy-internal tests that remain only for the Bash reference until removed
+The old dual-implementation harness has been replaced by focused Rust and shell
+tests. Useful private-Bash assertions should now be represented as public
+behavior tests, Rust unit tests, or hidden bridge tests.
 
 ### Rust Unit Tests
 
@@ -1256,16 +1241,13 @@ Commit rules for the port:
 
 ### Phase 0: Freeze The Reference
 
-- Keep the current Bash implementation available as the reference.
 - Keep `docs/rust-port-spec.md` current as the normative compatibility contract.
-- Add the dual-implementation test harness.
 - Add golden outputs for compatibility-sensitive CLI commands.
 - Add downstream audit tests for sourced API usage.
-- Audit `SHDEPS_TEST_*` and `_SHDEPS_TEST_*` variables in `test/shdeps-test`
-  and document each in the spec as either: (a) drop after Bash retire,
-  (b) promote to a hidden `shdeps __api test-*` command for fixture use, or
-  (c) re-spec as a `RuntimeEnv` override. Without this audit, private impl
-  details bleed into the Rust port's surface.
+- Audit any remaining `SHDEPS_TEST_*` variables and document each in the spec
+  as either: (a) fixture-only test plumbing, (b) a hidden
+  `shdeps __api test-*` command, or (c) a `RuntimeEnv` override. Without this
+  audit, private impl details bleed into the Rust port's surface.
 - Audit `~/.config/shdeps/hooks.d/` (and dotfiles hook files) for actual
   public-API usage. Grep every `shdeps_*` invocation, every reliance on
   current working directory, every assumption about function leakage, every
@@ -1275,8 +1257,7 @@ Commit rules for the port:
 
 Acceptance:
 
-- Current Bash implementation still passes the full test suite.
-- CI proves the reference suite is stable before Rust behavior changes land.
+- CI proves compatibility coverage stays stable before behavior changes land.
 - `SHDEPS_TEST_*` enumeration is committed to the spec.
 - `hooks.d/` audit findings are reflected in the Bash API stability table.
 
@@ -1306,7 +1287,7 @@ Acceptance:
 
 Acceptance:
 
-- Rust unit tests match Bash reference cases.
+- Rust unit tests match historical compatibility cases.
 - No filesystem mutation is needed for these tests.
 
 ### Phase 3: State And Filesystem
@@ -1393,11 +1374,11 @@ Reordered ahead of wrapper cutover in eng review: the wrapper cannot land
 before the bridge migration machinery exists to install/find the Rust binary
 it delegates to. Without this ordering, Bash-era fleet checkouts get stranded.
 
-- Ship the bridge migration release. The Bash implementation remains the
-  authoritative `shdeps` while installer/self-update gains the ability to
-  detect the host platform, download the Rust binary, verify checksum, stage
-  it, smoke-test it, write install metadata, and prepare the public
-  `$SHDEPS_BIN` symlink to flip to Rust.
+- Ship the bridge migration release. The installed `shdeps` remains usable
+  while installer/self-update gains the ability to detect the host platform,
+  download the Rust binary, verify checksum, stage it, smoke-test it, write
+  install metadata, and prepare the public `$SHDEPS_BIN` symlink to flip to
+  Rust.
 - Add packaging script (`scripts/package-release.sh`).
 - Add release workflow.
 - Add installer artifact download (multi-platform).
@@ -1476,7 +1457,6 @@ Acceptance:
 - Keep Bash wrapper as the public sourceable API.
 - Update README badges and docs from Bash implementation to Rust binary plus
   Bash compatibility wrapper.
-- Keep the legacy Bash reference only as long as needed for confidence.
 
 Acceptance:
 
@@ -1484,7 +1464,7 @@ Acceptance:
 - Dotfiles and recent repo smoke tests are green.
 - Existing fleet state does not need manual migration.
 - Existing dotfiles bootstrap paths transparently activate the Rust
-  implementation or keep the prior Bash implementation usable on failure.
+  implementation or preserve the prior usable install on failure.
 
 ## Edge Cases To Pin In Tests
 
@@ -1735,29 +1715,25 @@ D21); the rest live here as the authoritative list for implementers.
 
 ## "What Already Exists" Section
 
-What's already partially or fully solved by current Bash:
+What was already partially or fully solved by the pre-Rust Bash implementation:
 
-- **CLI argument parsing, command dispatch, help text.** `bin/shdeps-legacy` (573
-  LOC) is the reference. Rust CLI just re-implements with same syntax/exit
-  codes/text. Reuse: behavior contract via golden tests; do not port code
-  line-for-line.
+- **CLI argument parsing, command dispatch, help text.** The Rust CLI
+  re-implements the same syntax/exit codes/text. Reuse: behavior contract via
+  golden tests; do not port code line-for-line.
 - **Config parsing (whitespace-separated fields, comments, aliases, filters,
-  `.git` canonicalization).** `_shdeps_load_config` and related helpers in
-  `shdeps.sh`. Rust `config` module rebuilds with same observable behavior
-  pinned by Bash parity tests.
+  `.git` canonicalization).** Rust `config` owns the observable behavior,
+  pinned by unit and integration tests.
 - **Platform/host filter matching.** Solid Bash impl, well-tested. Port
   to pure-logic Rust unit tests in Phase 2.
 - **GitHub asset selection (multi-pass OS/arch/libc/cmd-name).** Complex,
   well-loved Bash code. Port carefully with golden fixtures of historical
   asset names that selected correctly.
-- **Package-manager detection order + alias resolution.** `_shdeps_pkg_*`
-  helpers. Spec already documents the contract; Rust just re-implements.
+- **Package-manager detection order + alias resolution.** Spec already
+  documents the contract; Rust owns the implementation.
 - **Method-transition cleanup.** Recently added Bash logic (`0b5ae8f`).
   Reuse the test cases; refine ordering per D5.
-- **Test suite (5009 LOC `test/shdeps-test`).** This IS the parity oracle.
-  Do not discard or mechanically port; split into public-behavior tests
-  (run against both impls) and legacy-internal tests (Bash-only until
-  replaced).
+- **Shell test suite.** This was the parity oracle. Do not discard or
+  mechanically port; split useful coverage into focused public-behavior tests.
 - **`install.sh` bootstrap.** Reference behavior for SHDEPS_DIR/SHDEPS_BIN/
   etc. Rust-era installer preserves all of it.
 - **Hook lifecycle (`exists`, `install`, `post`, `uninstall`, `version`).**
@@ -1798,8 +1774,8 @@ Explicitly deferred:
 - **Removing the Bash compatibility wrapper.** Stays indefinitely. The
   wrapper IS the public sourceable API; removing it would break dotfiles
   and hooks.
-- **Rewriting the test runner.** `test/shdeps-test` extends with a Rust
-  switch; not rewritten as a Rust harness.
+- **Rewriting the test runner.** Replaced by focused Rust and shell suites
+  after the cutover instead of a permanent dual-implementation harness.
 - **Cheap-commands-only port slice.** Codex's minimum-risk alternative
   (D26). Rejected as the primary plan; kept as the Phase-6-stall fallback.
 - **Per-resource locking beyond state_dir.** Cross-state-dir install_dir

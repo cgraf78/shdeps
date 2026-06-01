@@ -33,9 +33,8 @@ use serde_json::json;
 
 /// Compatibility help text for the `shdeps` CLI.
 ///
-/// Phase 1 keeps this in Rust even before every command is implemented because
-/// help output is user-facing API. Later CLI parity work should update this
-/// constant and the Bash reference together when command support changes.
+/// Help output is user-facing API, so command support changes should update
+/// this constant and its tests together.
 pub const HELP: &str = "\
 Usage: shdeps [options] <command> [args]
 
@@ -2359,16 +2358,8 @@ fn custom_probe() -> BashCustomProbe {
 }
 
 fn shdeps_lib_path() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("SHDEPS_RUST_LIB").map(PathBuf::from) {
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
     // `SHDEPS_LIB` is installer-facing: dotfiles and bootstrap paths use it to
-    // pin a concrete sourceable library. Keep the Rust test/transition override
-    // above so test harnesses do not mutate the same variable that real
-    // bootstrap consumers rely on.
+    // pin a concrete sourceable library.
     if let Some(path) = env::var_os("SHDEPS_LIB").map(PathBuf::from) {
         if path.is_file() {
             return Some(path);
@@ -2378,7 +2369,7 @@ fn shdeps_lib_path() -> Option<PathBuf> {
     // The normal Rust path uses the generated hook prelude, not a nearby
     // checkout's `shdeps.sh`. That distinction matters for migration testing:
     // cargo integration-test binaries live under the repo and would otherwise
-    // accidentally keep exercising the legacy Bash library simply because it is
+    // accidentally keep exercising the sourceable wrapper simply because it is
     // discoverable from the executable path.
     None
 }
