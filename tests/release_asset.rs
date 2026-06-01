@@ -62,6 +62,9 @@ fn skips_metadata_and_package_assets() {
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.sha256sum",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-checksums",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.intoto.jsonl",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.pkg.tar.zst",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.whl",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.sha",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.deb",
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
     ];
@@ -113,6 +116,19 @@ fn supports_more_archive_and_arch_aliases() {
     assert_eq!(
         select("tool", &urls, &linux()),
         Some("https://github.com/owner/tool/releases/download/v1/tool-linux-x86-64.txz")
+    );
+}
+
+#[test]
+fn supports_linux64_x86_64_alias() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-arm64.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux64.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux64.tar.gz")
     );
 }
 

@@ -28,7 +28,7 @@ impl Target {
 /// Selects the best release asset URL for the command and target.
 #[must_use]
 pub fn select<'a>(cmd: &str, urls: &'a [&'a str], target: &Target) -> Option<&'a str> {
-    let os_patterns = os_patterns(&target.os);
+    let os_patterns = os_patterns(&target.os, &target.arch);
     let arch_patterns = arch_patterns(&target.arch, &target.os);
     let cmd_lower = cmd.to_lowercase();
 
@@ -126,6 +126,10 @@ const SKIP_SUFFIXES: &[&str] = &[
     ".sha512",
     ".sha512sum",
     ".sha512sums",
+    ".sha",
+    ".sha1",
+    ".sha1sum",
+    ".sha1sums",
     ".md5",
     ".md5sum",
     ".sig",
@@ -146,6 +150,10 @@ const SKIP_SUFFIXES: &[&str] = &[
     ".pem",
     ".cert",
     ".crt",
+    ".pkg.tar.gz",
+    ".pkg.tar.bz2",
+    ".pkg.tar.xz",
+    ".pkg.tar.zst",
     ".dmg",
     ".pkg",
     ".apk",
@@ -156,12 +164,15 @@ const SKIP_SUFFIXES: &[&str] = &[
     ".flatpak",
     ".mcpb",
     ".nupkg",
+    ".whl",
     ".snap",
 ];
 
 const SKIP_NAMES: &[&str] = &[
     "sha256sums",
     "sha512sums",
+    "sha1sums",
+    "md5sums",
     "checksums",
     "checksum",
     "digests",
@@ -268,10 +279,13 @@ fn is_boundary(ch: char) -> bool {
     !ch.is_ascii_alphanumeric()
 }
 
-fn os_patterns(os: &str) -> Vec<String> {
+fn os_patterns(os: &str, arch: &str) -> Vec<String> {
     let mut patterns = vec![os.to_owned()];
     if os == "darwin" {
         patterns.extend(["macos", "apple", "osx", "mac"].map(str::to_owned));
+    }
+    if os == "linux" && matches!(arch, "x86_64" | "amd64") {
+        patterns.push("linux64".to_owned());
     }
     patterns
 }
@@ -287,6 +301,9 @@ fn arch_patterns(arch: &str, os: &str) -> Vec<String> {
     }
     if os == "darwin" && matches!(arch, "x86_64" | "amd64" | "aarch64" | "arm64") {
         patterns.extend(["universal", "universal2"].map(str::to_owned));
+    }
+    if os == "linux" && matches!(arch, "x86_64" | "amd64") {
+        patterns.push("linux64".to_owned());
     }
     patterns
 }
@@ -430,10 +447,14 @@ mod tests {
         for url in [
             "https://example.com/tool-linux-x86_64.sha256sum",
             "https://example.com/tool-linux-x86_64.sha512",
+            "https://example.com/tool-linux-x86_64.sha",
+            "https://example.com/tool-linux-x86_64.sha1",
             "https://example.com/tool-linux-x86_64-checksums",
             "https://example.com/tool-linux-x86_64.intoto.jsonl",
             "https://example.com/tool-linux-x86_64.minisig",
+            "https://example.com/tool-linux-x86_64.pkg.tar.zst",
             "https://example.com/tool-linux-x86_64.deb",
+            "https://example.com/tool-linux-x86_64.whl",
             "https://example.com/tool-linux-x86_64.appimage",
             "https://example.com/tool-linux-x86_64.7z",
             "https://example.com/tool-linux-x86_64.tar.lz4",

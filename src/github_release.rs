@@ -104,19 +104,35 @@ fn checksum_asset<'a>(
         return Some(asset);
     }
 
-    assets.iter().find(|asset| {
-        matches!(
-            asset.name.to_ascii_lowercase().as_str(),
-            "sha256sums"
-                | "sha256sums.txt"
-                | "sha512sums"
-                | "sha512sums.txt"
-                | "checksums"
-                | "checksums.txt"
-                | "checksum"
-                | "checksum.txt"
-        )
-    })
+    assets
+        .iter()
+        .find(|asset| is_release_wide_checksum_name(&asset.name))
+}
+
+fn is_release_wide_checksum_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "sha256.sum"
+            | "sha256sum"
+            | "sha256sum.txt"
+            | "sha256sums"
+            | "sha256sums.txt"
+            | "sha512.sum"
+            | "sha512sum"
+            | "sha512sum.txt"
+            | "sha512sums"
+            | "sha512sums.txt"
+            | "shasums256"
+            | "shasums256.txt"
+            | "shasums512"
+            | "shasums512.txt"
+            | "checksums"
+            | "checksums.txt"
+            | "checksum"
+            | "checksum.txt"
+    ) || name.ends_with("_checksums.txt")
+        || name.ends_with("-checksums.txt")
 }
 
 fn target(env: &RuntimeEnv, runner: &impl Runner) -> Target {
@@ -396,6 +412,50 @@ mod tests {
             .as_deref(),
             Some("https://github.com/owner/tool/releases/download/v1.0.0/SHA256SUMS")
         );
+
+        for checksum_name in [
+            "sha256.sum",
+            "sha256sum.txt",
+            "SHASUMS256.txt",
+            "tool_1.2.3_checksums.txt",
+        ] {
+            let release_wide = vec![Release {
+                tag: "v1.0.0".to_owned(),
+                draft: false,
+                prerelease: false,
+                assets: vec![
+                    Asset {
+                        name: "tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                        url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                        api_url: None,
+                    },
+                    Asset {
+                        name: checksum_name.to_owned(),
+                        url: format!(
+                            "https://github.com/owner/tool/releases/download/v1.0.0/{checksum_name}"
+                        ),
+                        api_url: None,
+                    },
+                ],
+            }];
+
+            assert_eq!(
+                select(
+                    "tool",
+                    &release_wide,
+                    &RuntimeEnv::new("linux", "host"),
+                    &runner
+                )
+                .unwrap()
+                .checksum_url
+                .as_deref(),
+                Some(format!(
+                    "https://github.com/owner/tool/releases/download/v1.0.0/{checksum_name}"
+                ))
+                .as_deref(),
+                "{checksum_name}"
+            );
+        }
     }
 
     #[test]
