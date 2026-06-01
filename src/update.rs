@@ -4143,6 +4143,71 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
+    fn update_github_release_installs_tar_archive_and_links_extras() {
+        let mut fixture = Fixture::new("release-tar");
+        fixture.write_lib();
+        let archive = tar(&[
+            ("tool-v1.2.3/bin/tool", b"binary".as_slice(), 0o755),
+            (
+                "tool-v1.2.3/share/man/man1/tool.1",
+                b"man".as_slice(),
+                0o644,
+            ),
+        ]);
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-v1.2.3-linux-x86_64.tar",
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-v1.2.3-linux-x86_64.tar"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-v1.2.3-linux-x86_64.tar",
+                archive,
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read_link(&bin_path).unwrap(),
+            install_dir.join("bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.install_dir.join("man/man1/tool.1")).unwrap(),
+            install_dir.join("share/man/man1/tool.1")
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_github_release_installs_tar_xz_archive_and_links_extras() {
         let mut fixture = Fixture::new("release-tar-xz");
         fixture.write_lib();

@@ -90,6 +90,7 @@ pub(crate) enum AssetKind {
     Xz,
     Zst,
     TarGz,
+    Tar,
     TarBz2,
     TarZst,
     TarXz,
@@ -112,7 +113,11 @@ impl Pass {
             ),
             Self::Tar => matches!(
                 kind,
-                AssetKind::TarGz | AssetKind::TarBz2 | AssetKind::TarZst | AssetKind::TarXz
+                AssetKind::Tar
+                    | AssetKind::TarGz
+                    | AssetKind::TarBz2
+                    | AssetKind::TarZst
+                    | AssetKind::TarXz
             ),
             Self::Zip => kind == AssetKind::Zip,
         }
@@ -235,6 +240,9 @@ fn install_kind_from_filename(filename: &str) -> Option<AssetKind> {
     }
     if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
         return Some(AssetKind::TarGz);
+    }
+    if filename.ends_with(".tar") {
+        return Some(AssetKind::Tar);
     }
     if filename.ends_with(".tar.bz2") || filename.ends_with(".tbz") || filename.ends_with(".tbz2") {
         return Some(AssetKind::TarBz2);
@@ -504,6 +512,10 @@ mod tests {
         assert_eq!(
             install_kind("https://example.com/tool-linux-x86_64.tgz"),
             Some(AssetKind::TarGz)
+        );
+        assert_eq!(
+            install_kind("https://example.com/tool-linux-x86_64.tar"),
+            Some(AssetKind::Tar)
         );
         assert_eq!(
             install_kind("https://example.com/tool-linux-x86_64.tar.bz2"),

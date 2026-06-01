@@ -474,6 +474,16 @@ pub(crate) fn install_request(
                 &bytes,
             )?;
         }
+        AssetKind::Tar => {
+            github_release_install::install_tar_to(
+                &context.roots.state_dir,
+                &context.roots.install_dir,
+                request.public_bin,
+                request.name,
+                request.cmd,
+                &bytes,
+            )?;
+        }
         AssetKind::TarBz2 => {
             github_release_install::install_tar_bz2_to(
                 &context.roots.state_dir,

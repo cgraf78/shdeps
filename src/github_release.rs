@@ -91,27 +91,35 @@ fn checksum_asset<'a>(
     assets: &'a [crate::github::Asset],
     primary_name: &str,
 ) -> Option<&'a crate::github::Asset> {
+    let primary_name = primary_name.to_ascii_lowercase();
     let sibling_names = [
         format!("{primary_name}.sha256"),
         format!("{primary_name}.sha256sum"),
         format!("{primary_name}.sha512"),
         format!("{primary_name}.sha512sum"),
     ];
-    if let Some(asset) = assets
-        .iter()
-        .find(|asset| sibling_names.contains(&asset.name))
-    {
+    if let Some(asset) = assets.iter().find(|asset| {
+        let name = asset.name.to_ascii_lowercase();
+        sibling_names.contains(&name)
+    }) {
         return Some(asset);
     }
 
-    assets
-        .iter()
-        .find(|asset| is_release_wide_checksum_name(&asset.name))
+    let mut best = None;
+    for asset in assets {
+        let Some(priority) = release_wide_checksum_priority(&asset.name) else {
+            continue;
+        };
+        if best.is_none_or(|(_, best_priority)| priority < best_priority) {
+            best = Some((asset, priority));
+        }
+    }
+    best.map(|(asset, _)| asset)
 }
 
-fn is_release_wide_checksum_name(name: &str) -> bool {
+fn release_wide_checksum_priority(name: &str) -> Option<u8> {
     let name = name.to_ascii_lowercase();
-    matches!(
+    if matches!(
         name.as_str(),
         "sha256.sum"
             | "sha256sum"
@@ -127,12 +135,18 @@ fn is_release_wide_checksum_name(name: &str) -> bool {
             | "shasums256.txt"
             | "shasums512"
             | "shasums512.txt"
-            | "checksums"
-            | "checksums.txt"
-            | "checksum"
-            | "checksum.txt"
+    ) {
+        return Some(0);
+    }
+    if matches!(
+        name.as_str(),
+        "checksums" | "checksums.txt" | "checksum" | "checksum.txt"
     ) || name.ends_with("_checksums.txt")
         || name.ends_with("-checksums.txt")
+    {
+        return Some(1);
+    }
+    None
 }
 
 fn target(env: &RuntimeEnv, runner: &impl Runner) -> Target {
@@ -348,6 +362,43 @@ mod tests {
     }
 
     #[test]
+    fn select_finds_sibling_checksum_asset_case_insensitively() {
+        let releases = vec![Release {
+            tag: "v1.0.0".to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                Asset {
+                    name: "tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    api_url: None,
+                },
+                Asset {
+                    name: "tool-v1.0.0-linux-x86_64.tar.gz.SHA512SUM".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.SHA512SUM".to_owned(),
+                    api_url: None,
+                },
+            ],
+        }];
+        let runner = FakeRunner::new("x86_64", "");
+
+        let selection = select(
+            "tool",
+            &releases,
+            &RuntimeEnv::new("linux", "host"),
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection.checksum_url.as_deref(),
+            Some(
+                "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.SHA512SUM"
+            )
+        );
+    }
+
+    #[test]
     fn select_finds_common_checksum_asset_variants() {
         let runner = FakeRunner::new("x86_64", "");
 
@@ -456,6 +507,46 @@ mod tests {
                 "{checksum_name}"
             );
         }
+    }
+
+    #[test]
+    fn select_prefers_specific_release_wide_checksum_over_generic_manifest() {
+        let releases = vec![Release {
+            tag: "v1.0.0".to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                Asset {
+                    name: "tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz".to_owned(),
+                    api_url: None,
+                },
+                Asset {
+                    name: "checksums.txt".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/checksums.txt".to_owned(),
+                    api_url: None,
+                },
+                Asset {
+                    name: "SHA256SUMS".to_owned(),
+                    url: "https://github.com/owner/tool/releases/download/v1.0.0/SHA256SUMS".to_owned(),
+                    api_url: None,
+                },
+            ],
+        }];
+        let runner = FakeRunner::new("x86_64", "");
+
+        let selection = select(
+            "tool",
+            &releases,
+            &RuntimeEnv::new("linux", "host"),
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection.checksum_url.as_deref(),
+            Some("https://github.com/owner/tool/releases/download/v1.0.0/SHA256SUMS")
+        );
     }
 
     #[test]
