@@ -39,7 +39,7 @@ pub fn select<'a>(cmd: &str, urls: &'a [&'a str], target: &Target) -> Option<&'a
     // and completions there first. Zip remains a fallback for projects that
     // only publish cross-platform archives.
     for pass in [Pass::Plain, Pass::Tar, Pass::Zip] {
-        let mut best: Option<(Score, &'a str)> = None;
+        let mut best: Option<(Rank, &'a str)> = None;
 
         for url in urls {
             let filename = filename_lower(url);
@@ -62,9 +62,14 @@ pub fn select<'a>(cmd: &str, urls: &'a [&'a str], target: &Target) -> Option<&'a
                 exact: if exact { 0 } else { 1 },
                 libc: libc_score(&filename, target),
                 variant: variant_score(&filename),
+                build: build_score(&filename),
             };
-            if best.is_none_or(|(current, _)| score < current) {
-                best = Some((score, *url));
+            let rank = Rank {
+                score,
+                name_len: filename.len(),
+            };
+            if best.is_none_or(|(current, _)| rank < current) {
+                best = Some((rank, *url));
             }
         }
 
@@ -119,6 +124,13 @@ struct Score {
     exact: u8,
     libc: u8,
     variant: u8,
+    build: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank {
+    score: Score,
+    name_len: usize,
 }
 
 const SKIP_SUFFIXES: &[&str] = &[
@@ -278,7 +290,14 @@ fn has_suffix(filename: &str, suffixes: &[&str]) -> bool {
 fn matches_any(url_lower: &str, patterns: &[String]) -> bool {
     patterns
         .iter()
-        .any(|pattern| contains_token(url_lower, pattern))
+        .any(|pattern| pattern_match(url_lower, pattern))
+}
+
+fn pattern_match(value: &str, pattern: &str) -> bool {
+    match pattern {
+        "manylinux" | "musllinux" => contains_platform_prefix(value, pattern),
+        _ => contains_token(value, pattern),
+    }
 }
 
 fn contains_token(value: &str, token: &str) -> bool {
@@ -291,6 +310,26 @@ fn contains_token(value: &str, token: &str) -> bool {
 
 fn is_boundary(ch: char) -> bool {
     !ch.is_ascii_alphanumeric()
+}
+
+fn contains_platform_prefix(value: &str, prefix: &str) -> bool {
+    value.match_indices(prefix).any(|(start, _)| {
+        let before = value[..start].chars().next_back();
+        let suffix = &value[start + prefix.len()..];
+        before.is_none_or(is_boundary)
+            && (suffix.chars().next().is_none_or(is_boundary)
+                || starts_with_numeric_platform_suffix(suffix))
+    })
+}
+
+fn starts_with_numeric_platform_suffix(value: &str) -> bool {
+    let digit_bytes = value
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .map(char::len_utf8)
+        .sum();
+
+    digit_bytes > 0 && value[digit_bytes..].chars().next().is_none_or(is_boundary)
 }
 
 fn os_patterns(os: &str, arch: &str) -> Vec<String> {
@@ -379,6 +418,14 @@ fn variant_score(filename: &str) -> u8 {
     if contains_token(filename, "profile") {
         2
     } else if contains_token(filename, "baseline") {
+        1
+    } else {
+        0
+    }
+}
+
+fn build_score(filename: &str) -> u8 {
+    if contains_token(filename, "debug") {
         1
     } else {
         0

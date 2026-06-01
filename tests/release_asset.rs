@@ -164,6 +164,35 @@ fn supports_linux_distribution_os_aliases() {
 }
 
 #[test]
+fn supports_pep_platform_tag_linux_aliases() {
+    let manylinux = [
+        "https://github.com/owner/tool/releases/download/v1/tool-macos-arm64.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-manylinux2014_x86_64.tar.gz",
+    ];
+    let musllinux = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-aarch64.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-musllinux_1_2_x86_64.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &manylinux, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-manylinux2014_x86_64.tar.gz")
+    );
+    assert_eq!(
+        select("tool", &musllinux, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-musllinux_1_2_x86_64.tar.gz")
+    );
+}
+
+#[test]
+fn numbered_platform_aliases_require_boundaries() {
+    let urls =
+        ["https://github.com/owner/tool/releases/download/v1/tool-manylinux2014bad_x86_64.tar.gz"];
+
+    assert_eq!(select("tool", &urls, &linux()), None);
+}
+
+#[test]
 fn supports_additional_arch_aliases() {
     let x86 = [
         "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
@@ -410,6 +439,32 @@ fn libc_match_beats_build_variant_penalty() {
     assert_eq!(
         select("tool", &urls, &linux_musl()),
         Some("https://github.com/owner/tool/releases/download/v1/tool-linux-x64-musl-baseline.zip")
+    );
+}
+
+#[test]
+fn prefers_shorter_same_score_asset_over_arrival_order() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-extra.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz")
+    );
+}
+
+#[test]
+fn penalizes_debug_build_variants() {
+    let urls = [
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64-debug.tar.gz",
+        "https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz",
+    ];
+
+    assert_eq!(
+        select("tool", &urls, &linux()),
+        Some("https://github.com/owner/tool/releases/download/v1/tool-linux-amd64.tar.gz")
     );
 }
 
