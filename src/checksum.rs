@@ -2,10 +2,10 @@
 //!
 //! Release installers consume checksum files produced by different tools
 //! (`sha256sum`, `sha512sum`, `shasum`, and CI helpers). The formats are
-//! simple but slightly inconsistent around whitespace and binary-mode `*`
-//! prefixes. This module keeps those compatibility rules away from download
-//! and activation code so checksum failure can remain a precise bad-artifact
-//! reason.
+//! simple but slightly inconsistent around whitespace, binary-mode `*`
+//! prefixes, and whether the filename or digest comes first. This module keeps
+//! those compatibility rules away from download and activation code so
+//! checksum failure can remain a precise bad-artifact reason.
 
 use sha2::{Digest, Sha256, Sha512};
 
@@ -44,10 +44,6 @@ pub fn expected_sha256(content: &str, file_name: &str) -> Option<String> {
     expected_hex(content, file_name, 64)
 }
 
-fn expected_sha512(content: &str, file_name: &str) -> Option<String> {
-    expected_hex(content, file_name, 128)
-}
-
 fn expected_hex(content: &str, file_name: &str, hex_len: usize) -> Option<String> {
     for line in content.lines() {
         let line = line.trim();
@@ -63,17 +59,43 @@ fn expected_hex(content: &str, file_name: &str, hex_len: usize) -> Option<String
     None
 }
 
-/// Returns whether `bytes` match the expected checksum text for `file_name`.
+/// Returns whether `bytes` match the expected SHA-256 checksum text for
+/// `file_name`.
 #[must_use]
 pub fn verify(content: &str, file_name: &str, bytes: &[u8]) -> bool {
-    expected_sha256(content, file_name).is_some_and(|expected| sha256_hex(bytes) == expected)
+    let actual = sha256_hex(bytes);
+    verify_hex(content, file_name, 64, &actual)
 }
 
 /// Returns whether `bytes` match a named SHA-256 or SHA-512 checksum line.
 #[must_use]
 pub fn verify_any(content: &str, file_name: &str, bytes: &[u8]) -> bool {
-    expected_sha256(content, file_name).is_some_and(|expected| sha256_hex(bytes) == expected)
-        || expected_sha512(content, file_name).is_some_and(|expected| sha512_hex(bytes) == expected)
+    let actual_sha256 = sha256_hex(bytes);
+    if verify_hex(content, file_name, 64, &actual_sha256) {
+        return true;
+    }
+
+    let actual_sha512 = sha512_hex(bytes);
+    verify_hex(content, file_name, 128, &actual_sha512)
+}
+
+fn verify_hex(content: &str, file_name: &str, hex_len: usize, actual: &str) -> bool {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if parse_named_line(line, file_name, hex_len).is_some_and(|expected| expected == actual) {
+            return true;
+        }
+
+        if filename_first_line_matches(line, file_name, hex_len, actual) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn parse_named_line(line: &str, file_name: &str, hex_len: usize) -> Option<String> {
@@ -84,6 +106,22 @@ fn parse_named_line(line: &str, file_name: &str, hex_len: usize) -> Option<Strin
     // Match the checksum entry to the exact archive name so a multi-asset
     // release cannot accidentally verify Linux bytes with a macOS checksum.
     (candidate == file_name).then_some(hash)
+}
+
+fn filename_first_line_matches(line: &str, file_name: &str, hex_len: usize, actual: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let Some(candidate) = fields.next() else {
+        return false;
+    };
+
+    // Some projects publish release-wide manifests with the asset filename
+    // followed by several digest algorithms. Bind to the exact asset name
+    // first, then accept the digest token that actually matches the bytes.
+    if named_checksum_file(candidate) != file_name {
+        return false;
+    }
+
+    fields.any(|field| normalize_hash(field, hex_len).is_some_and(|hash| hash == actual))
 }
 
 fn named_checksum_file(value: &str) -> &str {
@@ -233,5 +271,19 @@ mod tests {
         assert!(verify_any(&sha512, "archive.tar.gz", b""));
         assert!(!verify_any(&sha512, "wrong.tar.gz", b""));
         assert!(!verify_any(EMPTY_SHA512, "archive.tar.gz", b""));
+    }
+
+    #[test]
+    fn verify_any_accepts_filename_first_multi_digest_rows() {
+        let wrong_sha256 = "0".repeat(64);
+        let wrong_sha512 = "1".repeat(128);
+        let manifest = format!(
+            "# release-wide checksums\narchive.tar.gz  {wrong_sha256}  {EMPTY_SHA256}  {wrong_sha512}  {EMPTY_SHA512}\n"
+        );
+
+        assert!(verify(&manifest, "archive.tar.gz", b""));
+        assert!(verify_any(&manifest, "archive.tar.gz", b""));
+        assert!(!verify_any(&manifest, "different.tar.gz", b""));
+        assert!(!verify_any(&manifest, "archive.tar.gz", b"not empty"));
     }
 }
