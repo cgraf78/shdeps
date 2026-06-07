@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+# shellcheck source=tests/shell/helpers.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/helpers.sh"
+
+if ! command -v lua >/dev/null 2>&1; then
+  echo "SKIP: lua-api-test (lua not found)"
+  exit 0
+fi
+
+fixture=$(_tmpdir)
+fake_bin=$(_tmpdir)
+fake_log=$(_tmpdir)/shdeps.log
+dep_root="$fixture/share/cgraf78/tool"
+mkdir -p "$dep_root/share/tool" "$fixture/.config/shdeps"
+printf 'api\n' >"$dep_root/share/tool/api.lua"
+printf 'quote\n' >"$dep_root/share/tool/quote'file.lua"
+
+cat >"$fake_bin/shdeps" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\t%s\t%s\n' "${HOME:-}" "${SHDEPS_CONF_DIR:-}" "$*" >>"$SHDEPS_FAKE_LOG"
+
+case "${1:-}" in
+  dep-root)
+    [[ "${2:-}" == "cgraf78/tool" ]] || exit 1
+    printf '%s\n' "$SHDEPS_FAKE_ROOT"
+    ;;
+  dep-path)
+    [[ "${2:-}" == "cgraf78/tool" ]] || exit 1
+    printf '%s/%s\n' "$SHDEPS_FAKE_ROOT" "${3:-}"
+    ;;
+  dep-file)
+    [[ "${2:-}" == "cgraf78/tool" ]] || exit 1
+    path="$SHDEPS_FAKE_ROOT/${3:-}"
+    [[ -f "$path" ]] || exit 1
+    printf '%s\n' "$path"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+SH
+chmod +x "$fake_bin/shdeps"
+
+result=$(
+  SHDEPS_LUA_MODULE="$REPO_ROOT/lua/shdeps.lua" \
+    SHDEPS_FAKE_ROOT="$dep_root" \
+    SHDEPS_FAKE_LOG="$fake_log" \
+    TEST_HOME="$fixture" \
+    FAKE_SHDEPS="$fake_bin/shdeps" \
+    lua <<'LUA'
+local module = dofile(os.getenv("SHDEPS_LUA_MODULE"))
+local api = module.new({
+  home = os.getenv("TEST_HOME"),
+  bin = os.getenv("FAKE_SHDEPS"),
+})
+
+local env = api.env()
+local bin_dir = os.getenv("FAKE_SHDEPS"):match("^(.*)/[^/]+$")
+if env.PATH:sub(1, #bin_dir) ~= bin_dir then
+  print("bad-path")
+  os.exit(1)
+end
+
+local values = {
+  tostring(module.API_VERSION),
+  api.dep_root("cgraf78/tool"),
+  api.dep_path("cgraf78/tool", "share/tool/generated.lua"),
+  api.dep_file("cgraf78/tool", "share/tool/api.lua"),
+  api.dep_file("cgraf78/tool", "share/tool/quote'file.lua"),
+  tostring(api.dep_file("cgraf78/tool", "share/tool/missing.lua")),
+  env.HOME,
+  env.SHDEPS_CONF_DIR,
+}
+print(table.concat(values, "|"))
+LUA
+)
+
+expected="1|$dep_root|$dep_root/share/tool/generated.lua|$dep_root/share/tool/api.lua|$dep_root/share/tool/quote'file.lua|nil|$fixture|$fixture/.config/shdeps"
+_assert_eq "lua api resolves dep roots, paths, readable files, and env" "$expected" "$result"
+
+log=$(cat "$fake_log")
+_assert_contains "lua api runs commands with configured HOME" "$fixture"$'\t' "$log"
+_assert_contains "lua api runs commands with configured SHDEPS_CONF_DIR" "$fixture/.config/shdeps" "$log"
+
+_test_summary

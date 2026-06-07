@@ -567,6 +567,9 @@ _install_bundle() {
     if [[ -d "$src_dir/completions" ]]; then
       cp -R "$src_dir/completions" "$staging/" || exit 1
     fi
+    if [[ -d "$src_dir/lua" ]]; then
+      cp -R "$src_dir/lua" "$staging/" || exit 1
+    fi
   ); then
     rm -rf "$staging"
     return 1

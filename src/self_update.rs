@@ -1477,6 +1477,7 @@ mod tests {
             ("README.md", &b"readme"[..]),
             ("LICENSE", &b"license"[..]),
             ("man/man1/shdeps.1", &b"man"[..]),
+            ("lua/shdeps.lua", &b"return {}"[..]),
         ];
         let mut tar = Vec::new();
         {

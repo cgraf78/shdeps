@@ -25,6 +25,7 @@ const REQUIRED_FILES: &[&str] = &[
     "README.md",
     "LICENSE",
     "man/man1/shdeps.1",
+    "lua/shdeps.lua",
 ];
 
 /// Successfully staged release archive.
@@ -307,6 +308,7 @@ mod tests {
             ("README.md", &b"readme"[..]),
             ("LICENSE", &b"license"[..]),
             ("man/man1/shdeps.1", &b"man"[..]),
+            ("lua/shdeps.lua", &b"return {}"[..]),
         ];
         let mut tar = Vec::new();
         {

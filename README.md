@@ -22,7 +22,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 - **TTL-based caching** — avoids redundant network calls
 - **Post-install hooks** — run arbitrary setup when a dependency changes
 - **Config composition** — split deps across multiple `*.conf` files in a config directory
-- **Usable from CLI, Bash, or Rust** — Rust `shdeps` CLI, stable Bash functions via `source shdeps.sh`, and a documented Rust crate API
+- **Usable from CLI, Bash, Lua, or Rust** — Rust `shdeps` CLI, stable Bash functions via `source shdeps.sh`, a Lua runtime asset API, and a documented Rust crate API
 
 ## How shdeps Compares
 
@@ -460,6 +460,56 @@ methods with per-dependency install directories (`cargo`, `go`, `uv`, `npm`,
 and archive-style `github:release` installs), it returns
 `$SHDEPS_INSTALL_DIR/<name>` when present. Raw single-binary `github:release`
 installs and package-manager deps do not have shdeps-owned roots.
+
+## Lua API
+
+shdeps ships a Lua module at `lua/shdeps.lua` inside the shdeps root. In a
+source checkout that is typically `~/git/shdeps/lua/shdeps.lua`; in a release
+install it is `$SHDEPS_DIR/lua/shdeps.lua` (for the default installer,
+`~/.local/share/shdeps/lua/shdeps.lua`). Release staging treats this file as a
+required public artifact.
+
+The Lua API is for runtime asset resolution from Lua hosts such as Neovim and
+WezTerm. It deliberately delegates to the `shdeps` CLI instead of parsing
+configuration itself, so install-root ownership, local development checkout
+preference, filters, and path validation remain single-sourced in the Rust
+implementation.
+
+```lua
+local shdeps = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps.lua")
+local api = shdeps.new({ home = os.getenv("HOME") })
+
+local setup = api.dep_file("cgraf78/termnav", "lib/termnav/nvim/setup.lua")
+local env = api.env()
+```
+
+`shdeps.new(options)` accepts:
+
+| Option     | Description                                                                 |
+| ---------- | --------------------------------------------------------------------------- |
+| `home`     | Home directory to use for child commands; also defaults `SHDEPS_CONF_DIR` to `<home>/.config/shdeps` |
+| `conf_dir` | Explicit shdeps config directory for child commands                         |
+| `bin`      | Explicit `shdeps` binary path; useful for tests and embedded launchers      |
+| `bin_dir`  | Directory containing the `shdeps` binary                                    |
+| `root`     | Explicit shdeps root containing `shdeps`, `shdeps.sh`, and `lua/shdeps.lua` |
+| `env`      | Table of extra environment overrides copied into child commands             |
+
+The returned object exposes:
+
+| Function                        | Description                                                                 |
+| ------------------------------- | --------------------------------------------------------------------------- |
+| `api.dep_root(name)`            | Return a configured dependency root, or `nil` when shdeps cannot resolve one |
+| `api.dep_path(name, rel)`       | Return a validated path below a dependency root, or `nil`                   |
+| `api.dep_file(name, rel)`       | Return a readable regular file below a dependency root, or `nil`            |
+| `api.env()`                     | Return a fresh table of environment overrides for shdeps-aware child tools   |
+
+The module also exposes default-object helpers with the same names:
+`shdeps.dep_root`, `shdeps.dep_path`, `shdeps.dep_file`, and `shdeps.env`.
+
+`api.env()` includes the selected `HOME`, `SHDEPS_CONF_DIR`, and a `PATH`
+prefixed with the selected shdeps binary directory when the binary is known by
+absolute path. That keeps dependency-owned child tools that shell out to
+`shdeps` aligned with the same install that Lua used for resolution.
 
 ## Rust API
 
