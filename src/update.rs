@@ -3572,7 +3572,8 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     fn update_github_release_reuses_gh_token_for_metadata_only() {
-        let mut fixture = Fixture::new("release-token-prefetch");
+        let mut fixture =
+            Fixture::new("release-token-prefetch").with_env_var("SHDEPS_ALLOW_GH_AUTH_TOKEN", "1");
         fixture.write_lib();
         fixture
             .env_vars
@@ -5247,6 +5248,11 @@ version() { printf 'saw-pkg\n'; }
             let mut perms = fs::metadata(&path).unwrap().permissions();
             perms.set_mode(0o755);
             fs::set_permissions(path, perms).unwrap();
+        }
+
+        fn with_env_var(mut self, name: &str, value: &str) -> Self {
+            self.env_vars.insert(name.to_owned(), value.to_owned());
+            self
         }
 
         fn context<'a>(

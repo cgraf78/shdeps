@@ -8,7 +8,7 @@
 //! without touching the network.
 
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -211,12 +211,14 @@ pub fn write_cached_releases(state_dir: &Path, repo: &str, releases: &[Release])
 /// `GH_TOKEN` wins because it is the most explicit runtime credential knob for
 /// shdeps and mirrors the fix used by related CI jobs to avoid rate limiting.
 /// `GITHUB_TOKEN` is a common Actions/default fallback. `gh auth token` is last
-/// because it can touch user configuration and may be slower, so warm commands
-/// should only pay for it on paths that are already doing network work.
+/// and interactive-only because it can touch user configuration, wake desktop
+/// credential helpers, and may be slower, so warm commands should only pay for
+/// it on paths that are already doing network work and are attached to a real
+/// terminal. Headless callers that need auth should pass GH_TOKEN/GITHUB_TOKEN.
 pub fn token(env: &impl Env, runner: &impl Runner) -> Option<String> {
     env_token(env, "GH_TOKEN")
         .or_else(|| env_token(env, "GITHUB_TOKEN"))
-        .or_else(|| gh_token(runner))
+        .or_else(|| gh_token_allowed(env).then(|| gh_token(runner)).flatten())
 }
 
 fn env_token(env: &impl Env, name: &str) -> Option<String> {
@@ -240,6 +242,13 @@ fn gh_token(runner: &impl Runner) -> Option<String> {
 
     let token = output.stdout.trim();
     (!token.is_empty()).then(|| token.to_owned())
+}
+
+fn gh_token_allowed(env: &impl Env) -> bool {
+    matches!(
+        env_token(env, "SHDEPS_ALLOW_GH_AUTH_TOKEN").as_deref(),
+        Some("1" | "true" | "yes")
+    ) || (io::stdin().is_terminal() && io::stdout().is_terminal())
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,7 +548,21 @@ mod tests {
             token(&FakeEnv::new().with_var("GITHUB_TOKEN", "actions"), &runner).as_deref(),
             Some("actions")
         );
-        assert_eq!(token(&FakeEnv::new(), &runner).as_deref(), Some("from-gh"));
+        assert_eq!(
+            token(
+                &FakeEnv::new().with_var("SHDEPS_ALLOW_GH_AUTH_TOKEN", "1"),
+                &runner
+            )
+            .as_deref(),
+            Some("from-gh")
+        );
+    }
+
+    #[test]
+    fn token_skips_gh_cli_in_headless_contexts() {
+        let runner = FakeRunner::new().with_gh_token("from-gh");
+
+        assert_eq!(token(&FakeEnv::new(), &runner).as_deref(), None);
     }
 
     #[test]

@@ -104,7 +104,11 @@ _github_token() {
     printf '%s\n' "$GH_TOKEN"
   elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
     printf '%s\n' "$GITHUB_TOKEN"
-  elif command -v gh >/dev/null 2>&1; then
+  elif [[ -t 0 && -t 1 ]] && command -v gh >/dev/null 2>&1; then
+    # `gh auth token` can wake desktop credential helpers. On headless cron
+    # runs, libsecret may autostart an orphan session bus/keyring pair for each
+    # call, eventually exhausting D-Bus connection limits. Non-interactive
+    # callers should provide GH_TOKEN/GITHUB_TOKEN explicitly when auth matters.
     gh auth token 2>/dev/null || true
   fi
 }

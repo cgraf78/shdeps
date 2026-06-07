@@ -195,6 +195,63 @@ _assert_eq 'quote: double-quote escaped' \
 _assert_eq 'quote: backslash before quote order-correct' \
   'a\\\"b' "$(_curl_config_quote 'a\"b')"
 
+echo "=== install.sh: _github_token ==="
+
+_gh_stub_dir=$(mktemp -d)
+cat >"$_gh_stub_dir/gh" <<'EOF'
+#!/usr/bin/env bash
+printf 'gh should not run in headless tests\n' >>"$SHDEPS_GH_STUB_LOG"
+printf 'stub-token\n'
+EOF
+chmod +x "$_gh_stub_dir/gh"
+_old_path="$PATH"
+PATH="$_gh_stub_dir:$PATH"
+export PATH
+SHDEPS_GH_STUB_LOG="$_gh_stub_dir/calls"
+export SHDEPS_GH_STUB_LOG
+
+_old_gh_token_set=0
+_old_github_token_set=0
+if [[ -n ${GH_TOKEN+x} ]]; then
+  _old_gh_token_set=1
+  _old_gh_token="$GH_TOKEN"
+fi
+if [[ -n ${GITHUB_TOKEN+x} ]]; then
+  _old_github_token_set=1
+  _old_github_token="$GITHUB_TOKEN"
+fi
+
+unset GH_TOKEN GITHUB_TOKEN
+_assert_eq "github token: headless skips gh credential helper" "" "$(_github_token)"
+_assert_false "github token: headless did not invoke gh" test -s "$SHDEPS_GH_STUB_LOG"
+
+GH_TOKEN="explicit-gh-token"
+export GH_TOKEN
+unset GITHUB_TOKEN
+_assert_eq "github token: GH_TOKEN wins" "explicit-gh-token" "$(_github_token)"
+
+GITHUB_TOKEN="explicit-github-token"
+export GITHUB_TOKEN
+unset GH_TOKEN
+_assert_eq "github token: GITHUB_TOKEN fallback" "explicit-github-token" "$(_github_token)"
+
+if [[ $_old_gh_token_set -eq 1 ]]; then
+  GH_TOKEN="$_old_gh_token"
+  export GH_TOKEN
+else
+  unset GH_TOKEN
+fi
+if [[ $_old_github_token_set -eq 1 ]]; then
+  GITHUB_TOKEN="$_old_github_token"
+  export GITHUB_TOKEN
+else
+  unset GITHUB_TOKEN
+fi
+
+PATH="$_old_path"
+export PATH
+rm -rf "$_gh_stub_dir"
+
 echo "=== install.sh: _archive_entries_safe ==="
 
 _archive_dir=$(mktemp -d)
