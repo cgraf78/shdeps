@@ -276,6 +276,56 @@ Fish completions ~/.local/share/fish/vendor_completions.d/
 .PP
 Tracked per-dep in
 .IR $SHDEPS_STATE_DIR/<name>.links .
+.SH LUA API
+shdeps ships a Lua module at
+.I lua/shdeps.lua
+inside the shdeps root.
+In a source checkout this is commonly
+.IR ~/git/shdeps/lua/shdeps.lua ;
+in a release install it is
+.IR $SHDEPS_DIR/lua/shdeps.lua
+(default:
+.IR ~/.local/share/shdeps/lua/shdeps.lua ).
+.PP
+The Lua module is a thin adapter over the shdeps CLI for runtime asset
+resolution from Lua hosts such as Neovim and WezTerm. It does not parse shdeps
+configuration itself.
+.PP
+.RS
+.nf
+local shdeps = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps.lua")
+local api = shdeps.new({ home = os.getenv("HOME") })
+local setup = api.dep_file("cgraf78/termnav", "lib/termnav/nvim/setup.lua")
+local env = api.env()
+.fi
+.RE
+.PP
+.B shdeps.new(options)
+accepts
+.BR home ,
+.BR conf_dir ,
+.BR bin ,
+.BR bin_dir ,
+.BR root ,
+and
+.B env
+options.
+The returned object exposes
+.BR dep_root(name) ,
+.BR dep_path(name,\ rel) ,
+.BR dep_file(name,\ rel) ,
+and
+.BR env() .
+Missing dependencies or unreadable files return nil.
+.PP
+.B env()
+returns a fresh table with child-process environment overrides, including
+.BR HOME ,
+.BR SHDEPS_CONF_DIR ,
+and a
+.B PATH
+prefixed with the selected shdeps binary directory when that binary is known by
+absolute path.
 .SH ENVIRONMENT
 .TP
 .B SHDEPS_CONF_DIR

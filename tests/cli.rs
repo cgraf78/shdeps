@@ -1756,6 +1756,7 @@ fn self_update_release_archive_install_updates_through_cli() {
             ("README.md", "readme\n", 0o644),
             ("LICENSE", "license\n", 0o644),
             ("man/man1/shdeps.1", ".TH SHDEPS 1\n", 0o644),
+            ("lua/shdeps.lua", "return {}\n", 0o644),
         ],
     );
     fs::write(
