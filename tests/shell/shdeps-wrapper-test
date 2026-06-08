@@ -221,7 +221,10 @@ case "${1:-}:${2:-}" in
       "reinstall=0"
     ;;
   update:)
-    printf '%s\n' "$PATH" >"${SHDEPS_WRAPPER_PATH_LOG:?missing path log}"
+    printf 'update path=%s dir=%s\n' "$PATH" "${SHDEPS_DIR:-}" >>"${SHDEPS_WRAPPER_PATH_LOG:?missing path log}"
+    ;;
+  self-update:)
+    printf 'self-update dir=%s\n' "${SHDEPS_DIR:-}" >>"${SHDEPS_WRAPPER_PATH_LOG:?missing path log}"
     ;;
   *)
     printf 'unexpected wrapper path call: %s\n' "$*" >&2
@@ -239,12 +242,18 @@ _path_output=$(
       unset SHDEPS_BIN_DIR
       . \"\$1\"
       shdeps_update
+      shdeps_self_update
       printf '%s\n' \"\$PATH\"
     " \
     bash "$SHDEPS_DIR/shdeps.sh"
 )
 _assert_eq "wrapper update: prepends cached bin dir in caller" "/path/bin:/usr/bin:/bin" "$_path_output"
-_assert_eq "wrapper update: child sees prepended bin dir" "/path/bin:/usr/bin:/bin" "$(cat "$_path_log")"
+_assert_contains "wrapper update: child sees prepended bin dir" \
+  "update path=/path/bin:/usr/bin:/bin" "$(cat "$_path_log")"
+_assert_contains "wrapper update: child sees source dir" \
+  "dir=$SHDEPS_DIR" "$(cat "$_path_log")"
+_assert_contains "wrapper self-update: child sees source dir" \
+  "self-update dir=$SHDEPS_DIR" "$(cat "$_path_log")"
 
 _fake=$(_tmpdir)/shdeps
 cat >"$_fake" <<'SH'

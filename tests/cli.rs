@@ -1234,6 +1234,409 @@ fn update_reports_empty_config_without_touching_installers() {
 }
 
 #[test]
+fn update_self_update_release_install_respects_ttl_and_force() {
+    let fixture = Fixture::new("update-self-update-ttl");
+    let fakebin = fixture.dir.join("fakebin");
+    let install = fixture.dir.join("release-install");
+    let log = fixture.dir.join("curl.log");
+    let tag = "20260524-120000-deadbeef";
+    let platform = format!("linux-{}-musl", host_arch());
+    fs::create_dir_all(&install).unwrap();
+    fixture.write(
+        "release-install/.shdeps-install.json",
+        &format!(
+            r#"{{"schema":1,"method":"release","artifact_platform":"{platform}","tag":"{tag}","repo":"cgraf78/shdeps"}}"#
+        ),
+    );
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+set -e
+config=$(cat)
+printf '%s\n' "$config" >>"$SHDEPS_TEST_CURL_LOG"
+case "$config" in
+  *'url = "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100"'*)
+    printf '[{"tag_name":"%s","draft":false,"prerelease":false,"assets":[]}]' "$SHDEPS_TEST_TAG"
+    ;;
+  *)
+    printf 'unexpected curl config\n%s\n' "$config" >&2
+    exit 22
+    ;;
+esac
+"#,
+    );
+
+    let mut first = fixture.command(["update"]);
+    first
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_TEST_TAG", tag)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let first = run(&mut first);
+
+    assert_success(&first);
+    assert_eq!(text(&first.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&first.stderr), "");
+    assert_eq!(count_release_fetches(&log), 1);
+
+    let mut second = fixture.command(["update"]);
+    second
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_TEST_TAG", tag)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let second = run(&mut second);
+
+    assert_success(&second);
+    assert_eq!(text(&second.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&second.stderr), "");
+    assert_eq!(count_release_fetches(&log), 1);
+
+    let mut forced = fixture.command(["--force", "update"]);
+    forced
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_TEST_TAG", tag)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let forced = run(&mut forced);
+
+    assert_success(&forced);
+    assert_eq!(text(&forced.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&forced.stderr), "");
+    assert_eq!(count_release_fetches(&log), 2);
+
+    let mut env_forced = fixture.command(["update"]);
+    env_forced
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_TEST_TAG", tag)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400")
+        .env("SHDEPS_FORCE", "1");
+    let env_forced = run(&mut env_forced);
+
+    assert_success(&env_forced);
+    assert_eq!(text(&env_forced.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&env_forced.stderr), "");
+    assert_eq!(count_release_fetches(&log), 3);
+
+    let mut ttl_zero = fixture.command(["update"]);
+    ttl_zero
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_TEST_TAG", tag)
+        .env("SHDEPS_SELF_UPDATE_TTL", "0");
+    let ttl_zero = run(&mut ttl_zero);
+
+    assert_success(&ttl_zero);
+    assert_eq!(text(&ttl_zero.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&ttl_zero.stderr), "");
+    assert_eq!(count_release_fetches(&log), 4);
+}
+
+#[test]
+fn update_self_update_source_checkout_pulls_clean_git_install() {
+    let fixture = Fixture::new("update-self-update-source");
+    let fakebin = fixture.dir.join("fakebin");
+    let install = fixture.dir.join("source-install");
+    let log = fixture.dir.join("git.log");
+    fs::create_dir_all(install.join(".git")).unwrap();
+    fixture.write_executable(
+        "fakebin/git",
+        r#"#!/usr/bin/env bash
+set -e
+printf '%s\n' "$*" >>"$SHDEPS_TEST_GIT_LOG"
+case "${1:-}:${3:-}" in
+  -C:status)
+    ;;
+  -C:pull)
+    ;;
+  *)
+    printf 'unexpected git call: %s\n' "$*" >&2
+    exit 9
+    ;;
+esac
+"#,
+    );
+
+    let mut first = fixture.command(["update"]);
+    first
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_GIT_LOG", &log)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let first = run(&mut first);
+
+    assert_success(&first);
+    assert_eq!(text(&first.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&first.stderr), "");
+    assert_eq!(count_git_pulls(&log), 1);
+
+    let mut second = fixture.command(["update"]);
+    second
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_GIT_LOG", &log)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let second = run(&mut second);
+
+    assert_success(&second);
+    assert_eq!(text(&second.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&second.stderr), "");
+    assert_eq!(count_git_pulls(&log), 1);
+
+    let mut forced = fixture.command(["--force", "update"]);
+    forced
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_GIT_LOG", &log)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let forced = run(&mut forced);
+
+    assert_success(&forced);
+    assert_eq!(text(&forced.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&forced.stderr), "");
+    assert_eq!(count_git_pulls(&log), 2);
+}
+
+#[test]
+fn update_self_update_source_checkout_dirty_skip_does_not_consume_ttl() {
+    let fixture = Fixture::new("update-self-update-source-dirty");
+    let fakebin = fixture.dir.join("fakebin");
+    let install = fixture.dir.join("source-install");
+    let log = fixture.dir.join("git.log");
+    fs::create_dir_all(install.join(".git")).unwrap();
+    fixture.write_executable(
+        "fakebin/git",
+        r#"#!/usr/bin/env bash
+set -e
+printf '%s\n' "$*" >>"$SHDEPS_TEST_GIT_LOG"
+case "${1:-}:${3:-}" in
+  -C:status)
+    if [ -f "$SHDEPS_TEST_DIRTY" ]; then
+      printf ' M src/lib.rs\n'
+    fi
+    ;;
+  -C:pull)
+    ;;
+  *)
+    printf 'unexpected git call: %s\n' "$*" >&2
+    exit 9
+    ;;
+esac
+"#,
+    );
+    let dirty = fixture.dir.join("dirty");
+    fs::write(&dirty, "dirty\n").unwrap();
+
+    let mut first = fixture.command(["update"]);
+    first
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_GIT_LOG", &log)
+        .env("SHDEPS_TEST_DIRTY", &dirty)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let first = run(&mut first);
+
+    assert_success(&first);
+    assert_eq!(text(&first.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&first.stderr), "");
+    assert_eq!(count_git_pulls(&log), 0);
+    assert!(!fixture.dir.join("state/shdeps.self-update.stamp").exists());
+
+    fs::remove_file(&dirty).unwrap();
+    let mut second = fixture.command(["update"]);
+    second
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_GIT_LOG", &log)
+        .env("SHDEPS_TEST_DIRTY", &dirty)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let second = run(&mut second);
+
+    assert_success(&second);
+    assert_eq!(text(&second.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&second.stderr), "");
+    assert_eq!(count_git_pulls(&log), 1);
+}
+
+#[test]
+fn update_self_update_release_failure_is_best_effort_and_stamped() {
+    let fixture = Fixture::new("update-self-update-failure");
+    let fakebin = fixture.dir.join("fakebin");
+    let install = fixture.dir.join("release-install");
+    let log = fixture.dir.join("curl.log");
+    let tag = "20260524-120000-deadbeef";
+    let platform = format!("linux-{}-musl", host_arch());
+    fs::create_dir_all(&install).unwrap();
+    fixture.write(
+        "release-install/.shdeps-install.json",
+        &format!(
+            r#"{{"schema":1,"method":"release","artifact_platform":"{platform}","tag":"{tag}","repo":"cgraf78/shdeps"}}"#
+        ),
+    );
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+config=$(cat)
+printf '%s\n' "$config" >>"$SHDEPS_TEST_CURL_LOG"
+printf 'transient github failure\n' >&2
+exit 22
+"#,
+    );
+
+    let mut first = fixture.command(["update"]);
+    first
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let first = run(&mut first);
+
+    assert_success(&first);
+    assert_eq!(text(&first.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&first.stderr), "");
+    assert_eq!(count_release_fetches(&log), 1);
+    assert!(fixture.dir.join("state/shdeps.self-update.stamp").is_file());
+
+    let mut second = fixture.command(["update"]);
+    second
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+    let second = run(&mut second);
+
+    assert_success(&second);
+    assert_eq!(text(&second.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&second.stderr), "");
+    assert_eq!(count_release_fetches(&log), 1);
+}
+
+#[test]
+fn update_self_update_release_install_activates_new_archive() {
+    let fixture = Fixture::new("update-self-update-archive");
+    let fakebin = fixture.dir.join("fakebin");
+    let install = fixture.dir.join("release-install");
+    let archive = fixture.dir.join("shdeps-release.tar.gz");
+    let checksum = fixture.dir.join("shdeps-release.tar.gz.sha256");
+    let arch = host_arch();
+    let platform = format!("linux-{arch}-musl");
+    fs::create_dir_all(&install).unwrap();
+    fixture.write("release-install/shdeps", "old binary\n");
+    fixture.write("release-install/shdeps.sh", "old shim\n");
+    fixture.write(
+        "release-install/.shdeps-install.json",
+        &format!(
+            r#"{{"schema":1,"method":"release","artifact_platform":"{platform}","tag":"20260523-120000-cafebabe","repo":"cgraf78/shdeps"}}"#
+        ),
+    );
+
+    let archive_name = format!("shdeps-20260524-120000-deadbeef-{platform}.tar.gz");
+    let checksum_name = format!("{archive_name}.sha256");
+    write_tar_gz(
+        &archive,
+        &[
+            (
+                "shdeps",
+                "#!/bin/sh\nprintf 'shdeps 20260524-120000-deadbeef\\n'\n",
+                0o755,
+            ),
+            ("shdeps.sh", "shdeps_version() { :; }\n", 0o644),
+            ("install.sh", "#!/bin/sh\nexit 0\n", 0o755),
+            ("README.md", "readme\n", 0o644),
+            ("LICENSE", "license\n", 0o644),
+            ("man/man1/shdeps.1", ".TH SHDEPS 1\n", 0o644),
+            ("lua/shdeps.lua", "return {}\n", 0o644),
+            ("lua/shdeps/core.lua", "return {}\n", 0o644),
+            ("lua/shdeps/bootstrap.lua", "return {}\n", 0o644),
+        ],
+    );
+    fs::write(
+        &checksum,
+        format!(
+            "{}  {archive_name}\n",
+            shdeps::checksum::sha256_hex(&fs::read(&archive).unwrap())
+        ),
+    )
+    .unwrap();
+
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+set -e
+config=$(cat)
+case "$config" in
+  *'url = "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100"'*)
+    printf '[{"tag_name":"20260524-120000-deadbeef","draft":false,"prerelease":false,"assets":[{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"},{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"}]}]\n' \
+      "$SHDEPS_TEST_ARCHIVE_NAME" "$SHDEPS_TEST_ARCHIVE_NAME" \
+      "$SHDEPS_TEST_CHECKSUM_NAME" "$SHDEPS_TEST_CHECKSUM_NAME"
+    ;;
+  *'url = "https://github.com/owner/tool/releases/download/v1/'"$SHDEPS_TEST_ARCHIVE_NAME"'"'*)
+    cat "$SHDEPS_TEST_ARCHIVE"
+    ;;
+  *'url = "https://github.com/owner/tool/releases/download/v1/'"$SHDEPS_TEST_CHECKSUM_NAME"'"'*)
+    cat "$SHDEPS_TEST_CHECKSUM"
+    ;;
+  *)
+    printf 'unexpected curl config\n%s\n' "$config" >&2
+    exit 22
+    ;;
+esac
+"#,
+    );
+
+    let mut update = fixture.command(["update"]);
+    update
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_ARCHIVE", &archive)
+        .env("SHDEPS_TEST_CHECKSUM", &checksum)
+        .env("SHDEPS_TEST_ARCHIVE_NAME", &archive_name)
+        .env("SHDEPS_TEST_CHECKSUM_NAME", &checksum_name);
+    let update = run(&mut update);
+
+    assert_success(&update);
+    assert_eq!(text(&update.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&update.stderr), "");
+    assert_eq!(
+        fs::read_to_string(install.join("shdeps")).unwrap(),
+        "#!/bin/sh\nprintf 'shdeps 20260524-120000-deadbeef\\n'\n"
+    );
+    let metadata = shdeps::install_metadata::read(&install).unwrap();
+    assert!(
+        matches!(metadata, shdeps::install_metadata::Read::Valid(metadata)
+            if metadata.tag.as_deref() == Some("20260524-120000-deadbeef")
+                && metadata.artifact_platform.as_deref() == Some(platform.as_str())
+                && metadata.repo.as_deref() == Some("cgraf78/shdeps"))
+    );
+}
+
+#[test]
+fn update_self_update_ignores_unsupported_install_metadata() {
+    let fixture = Fixture::new("update-self-update-unsupported");
+    let install = fixture.dir.join("release-install");
+    let log = fixture.dir.join("curl.log");
+    fs::create_dir_all(&install).unwrap();
+    fixture.write("release-install/.shdeps-install.json", "not json\n");
+
+    let mut update = fixture.command(["update"]);
+    update
+        .env("SHDEPS_DIR", &install)
+        .env("SHDEPS_TEST_CURL_LOG", &log);
+    let update = run(&mut update);
+
+    assert_success(&update);
+    assert_eq!(text(&update.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&update.stderr), "");
+    assert_eq!(count_release_fetches(&log), 0);
+}
+
+#[test]
 fn update_requires_configured_method_tools_before_dependency_checks() {
     let fixture = Fixture::new("update-prereqs");
     fixture.write(
@@ -1934,6 +2337,21 @@ fn release_json(tag: &str, assets: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(r#"[{{"tag_name":"{tag}","draft":false,"prerelease":false,"assets":[{assets}]}}]"#)
+}
+
+fn count_release_fetches(log: &Path) -> usize {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .matches("https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100")
+        .count()
+}
+
+fn count_git_pulls(log: &Path) -> usize {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(" pull --ff-only --quiet"))
+        .count()
 }
 
 struct Fixture {
