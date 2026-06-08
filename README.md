@@ -466,8 +466,8 @@ installs and package-manager deps do not have shdeps-owned roots.
 shdeps ships a Lua module at `lua/shdeps.lua` inside the shdeps root. In a
 source checkout that is typically `~/git/shdeps/lua/shdeps.lua`; in a release
 install it is `$SHDEPS_DIR/lua/shdeps.lua` (for the default installer,
-`~/.local/share/shdeps/lua/shdeps.lua`). Release staging treats this file as a
-required public artifact.
+`~/.local/share/shdeps/lua/shdeps.lua`). Release staging treats this file and
+its `lua/shdeps/` implementation modules as required public artifacts.
 
 The Lua API is for runtime asset resolution from Lua hosts such as Neovim and
 WezTerm. It deliberately delegates to the `shdeps` CLI instead of parsing
@@ -481,6 +481,16 @@ local api = shdeps.new({ home = os.getenv("HOME") })
 
 local setup = api.dep_file("cgraf78/termnav", "lib/termnav/nvim/setup.lua")
 local env = api.env()
+```
+
+Lua hosts that start before shell init has normalized PATH can load the
+bootstrap helper from any known shdeps root and let it locate the active API
+module:
+
+```lua
+local bootstrap = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps/bootstrap.lua")
+local shdeps = bootstrap.load({ home = os.getenv("HOME") })
+local api = shdeps.new({ home = os.getenv("HOME") })
 ```
 
 `shdeps.new(options)` accepts:
@@ -510,6 +520,19 @@ The module also exposes default-object helpers with the same names:
 prefixed with the selected shdeps binary directory when the binary is known by
 absolute path. That keeps dependency-owned child tools that shell out to
 `shdeps` aligned with the same install that Lua used for resolution.
+
+`lua/shdeps/bootstrap.lua` exposes:
+
+| Function                    | Description                                                                 |
+| --------------------------- | --------------------------------------------------------------------------- |
+| `bootstrap.load(options)`   | Locate and return the shdeps Lua API module                                 |
+| `bootstrap.new(options)`    | Locate the Lua API module and return `shdeps.new(options)`                  |
+| `bootstrap.paths(options)`  | Return candidate `lua/shdeps.lua` paths in the order they will be checked   |
+
+`bootstrap.load(options)` checks `options.lua`, `$SHDEPS_LUA`,
+`options.root`, `$SHDEPS_LIB`'s sibling root, `$SHDEPS_GIT_DEV_DIR/shdeps`,
+`<home>/git/shdeps`, `$SHDEPS_DIR`, `<home>/.local/share/shdeps`, and finally
+the bootstrap file's own root.
 
 ## Rust API
 

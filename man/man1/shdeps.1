@@ -286,6 +286,9 @@ in a release install it is
 .IR $SHDEPS_DIR/lua/shdeps.lua
 (default:
 .IR ~/.local/share/shdeps/lua/shdeps.lua ).
+The sibling
+.I lua/shdeps/
+modules are part of the same public release artifact.
 .PP
 The Lua module is a thin adapter over the shdeps CLI for runtime asset
 resolution from Lua hosts such as Neovim and WezTerm. It does not parse shdeps
@@ -297,6 +300,20 @@ local shdeps = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps.lua"
 local api = shdeps.new({ home = os.getenv("HOME") })
 local setup = api.dep_file("cgraf78/termnav", "lib/termnav/nvim/setup.lua")
 local env = api.env()
+.fi
+.RE
+.PP
+Lua hosts that start before shell init has normalized
+.B PATH
+can load
+.I lua/shdeps/bootstrap.lua
+from any known shdeps root:
+.PP
+.RS
+.nf
+local bootstrap = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps/bootstrap.lua")
+local shdeps = bootstrap.load({ home = os.getenv("HOME") })
+local api = shdeps.new({ home = os.getenv("HOME") })
 .fi
 .RE
 .PP
@@ -326,6 +343,25 @@ and a
 .B PATH
 prefixed with the selected shdeps binary directory when that binary is known by
 absolute path.
+.PP
+.B bootstrap.load(options)
+returns the located shdeps Lua API module.
+.B bootstrap.new(options)
+returns
+.BR shdeps.new(options) .
+.B bootstrap.paths(options)
+returns the candidate
+.I lua/shdeps.lua
+paths in search order. Discovery checks explicit
+.BR lua ,
+.BR root ,
+.BR lib ,
+.BR git_dev_dir ,
+and
+.B home
+options, the matching
+.B SHDEPS_*
+environment variables, and the bootstrap file's own root.
 .SH ENVIRONMENT
 .TP
 .B SHDEPS_CONF_DIR

@@ -92,7 +92,7 @@ _release_fixture() {
   local release_dir="$1" payload="$2" tag="$3" platform="$4"
   local archive="shdeps-${tag}-${platform}.tar.gz"
 
-  mkdir -p "$release_dir" "$payload/man/man1" "$payload/completions" "$payload/lua"
+  mkdir -p "$release_dir" "$payload/man/man1" "$payload/completions" "$payload/lua/shdeps"
   _write_fake_shdeps "$payload/shdeps" "$tag"
   cp "$SHDEPS_DIR/shdeps.sh" "$payload/shdeps.sh"
   cp "$SHDEPS_DIR/install.sh" "$payload/install.sh"
@@ -101,6 +101,8 @@ _release_fixture() {
   cp "$SHDEPS_DIR/LICENSE" "$payload/LICENSE"
   cp "$SHDEPS_DIR/man/man1/shdeps.1" "$payload/man/man1/shdeps.1"
   cp "$SHDEPS_DIR/lua/shdeps.lua" "$payload/lua/shdeps.lua"
+  cp "$SHDEPS_DIR/lua/shdeps/core.lua" "$payload/lua/shdeps/core.lua"
+  cp "$SHDEPS_DIR/lua/shdeps/bootstrap.lua" "$payload/lua/shdeps/bootstrap.lua"
   cp "$SHDEPS_DIR/completions/shdeps.bash" "$payload/completions/shdeps.bash"
   cp "$SHDEPS_DIR/completions/shdeps.zsh" "$payload/completions/shdeps.zsh"
   cp "$SHDEPS_DIR/completions/shdeps.fish" "$payload/completions/shdeps.fish"

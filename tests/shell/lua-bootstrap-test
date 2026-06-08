@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+# shellcheck source=tests/shell/helpers.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/helpers.sh"
+
+if ! command -v lua >/dev/null 2>&1; then
+  echo "SKIP: lua-bootstrap-test (lua not found)"
+  exit 0
+fi
+
+fixture=$(_tmpdir)
+bootstrap="$REPO_ROOT/lua/shdeps/bootstrap.lua"
+
+_write_fake_module() {
+  local root="$1" marker="$2"
+  mkdir -p "$root/lua"
+  cat >"$root/lua/shdeps.lua" <<LUA
+return {
+  marker = "$marker",
+  new = function(options)
+    return {
+      marker = "$marker:new",
+      home = options and options.home or "",
+    }
+  end,
+}
+LUA
+}
+
+explicit="$fixture/explicit.lua"
+cat >"$explicit" <<'LUA'
+return { marker = "explicit" }
+LUA
+
+result=$(
+  SHDEPS_BOOTSTRAP="$bootstrap" SHDEPS_EXPLICIT="$explicit" lua <<'LUA'
+local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))
+print(bootstrap.load({ lua = os.getenv("SHDEPS_EXPLICIT") }).marker)
+LUA
+)
+_assert_eq "lua bootstrap: explicit module path wins" "explicit" "$result"
+
+root="$fixture/root"
+_write_fake_module "$root" root
+result=$(
+  SHDEPS_BOOTSTRAP="$bootstrap" SHDEPS_ROOT="$root" lua <<'LUA'
+local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))
+print(bootstrap.load({ root = os.getenv("SHDEPS_ROOT") }).marker)
+LUA
+)
+_assert_eq "lua bootstrap: explicit root resolves lua/shdeps.lua" "root" "$result"
+
+lib_root="$fixture/lib-root"
+_write_fake_module "$lib_root" lib
+touch "$lib_root/shdeps.sh"
+result=$(
+  SHDEPS_BOOTSTRAP="$bootstrap" SHDEPS_LIB="$lib_root/shdeps.sh" lua <<'LUA'
+local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))
+print(bootstrap.load({}).marker)
+LUA
+)
+_assert_eq "lua bootstrap: SHDEPS_LIB resolves sibling root" "lib" "$result"
+
+git_root="$fixture/git/shdeps"
+_write_fake_module "$git_root" git
+result=$(
+  SHDEPS_BOOTSTRAP="$bootstrap" SHDEPS_GIT_DEV_DIR="$fixture/git" lua <<'LUA'
+local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))
+print(bootstrap.load({}).marker)
+LUA
+)
+_assert_eq "lua bootstrap: SHDEPS_GIT_DEV_DIR resolves shdeps checkout" "git" "$result"
+
+release_root="$fixture/home/.local/share/shdeps"
+_write_fake_module "$release_root" release
+result=$(
+  HOME="$fixture/home" SHDEPS_BOOTSTRAP="$bootstrap" TEST_HOME="$fixture/home" lua <<'LUA'
+local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))
+local api = bootstrap.new({ home = os.getenv("TEST_HOME") })
+print(api.marker .. "|" .. api.home)
+LUA
+)
+_assert_eq "lua bootstrap: home release install can create API object" \
+  "release:new|$fixture/home" "$result"
+
+result=$(
+  SHDEPS_BOOTSTRAP="$bootstrap" lua <<'LUA'
+local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))
+print(bootstrap.load({}).API_VERSION)
+LUA
+)
+_assert_eq "lua bootstrap: defaults to its own source root" "1" "$result"
+
+_test_summary

@@ -1478,6 +1478,8 @@ mod tests {
             ("LICENSE", &b"license"[..]),
             ("man/man1/shdeps.1", &b"man"[..]),
             ("lua/shdeps.lua", &b"return {}"[..]),
+            ("lua/shdeps/core.lua", &b"return {}"[..]),
+            ("lua/shdeps/bootstrap.lua", &b"return {}"[..]),
         ];
         let mut tar = Vec::new();
         {
