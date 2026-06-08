@@ -26,6 +26,7 @@ use crate::process::{self, Process};
 use crate::prune::{self, Options as PruneOptions};
 use crate::runtime::{self, Overrides, ProcessEnv};
 use crate::self_update::{self, Outcome, ReleaseArchiveOutcome, Target};
+use crate::stamp;
 use crate::status::{self, Context as StatusContext, DependencyStatus, SkipReason, State};
 use crate::update::{self, Context as UpdateContext, Options as UpdateOptions};
 use crate::version;
@@ -40,7 +41,7 @@ Usage: shdeps [options] <command> [args]
 
 Commands:
   update                 Install/update all dependencies
-  self-update            Update shdeps itself (git pull, skips dirty trees)
+  self-update            Update shdeps itself
   list                   List all configured dependencies with status
   check <name>           Check if a specific dependency is installed
   dep-root <name>        Print a configured dependency root directory
@@ -435,6 +436,15 @@ where
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     ensure_bin_dir_on_path(&roots.bin_dir);
 
+    let update_options = UpdateOptions {
+        reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
+        force: runtime::force(&ProcessEnv, &options.overrides),
+        verbose: options.verbose,
+        remote_ttl: remote_ttl(),
+        ..UpdateOptions::default()
+    };
+    self_update_before_update(&roots, update_options, options, stderr)?;
+
     let pkg_mgr = process::detect_package_manager(&Process);
     let raw_entries = config::load_dir(&roots.conf_dir)?;
     let entries = parse_entries(&raw_entries, &pkg_mgr);
@@ -457,13 +467,6 @@ where
         writeln!(stderr, "{message}")?;
         return Ok(1);
     }
-    let update_options = UpdateOptions {
-        reinstall: runtime::reinstall(&ProcessEnv, &options.overrides),
-        force: runtime::force(&ProcessEnv, &options.overrides),
-        verbose: options.verbose,
-        remote_ttl: remote_ttl(),
-        ..UpdateOptions::default()
-    };
     let progress_jsonl = std::env::var_os("SHDEPS_PROGRESS").is_some_and(|value| value == "jsonl");
     let nested = std::env::var_os("SHDEPS_NESTED").is_some_and(|value| value == "1");
     let terminal_progress = live_progress && !options.quiet && !progress_jsonl;
@@ -619,6 +622,128 @@ where
     }
 
     Ok(if summary.has_errors() { 1 } else { 0 })
+}
+
+fn self_update_before_update<E>(
+    roots: &runtime::Roots,
+    update_options: UpdateOptions,
+    options: &ParsedOptions,
+    stderr: &mut E,
+) -> Result<()>
+where
+    E: Write,
+{
+    let dir = match shdeps_install_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            if options.verbose {
+                writeln!(
+                    stderr,
+                    "shdeps: update self-check could not resolve install dir ({error}); continuing"
+                )?;
+            }
+            return Ok(());
+        }
+    };
+    let target = match self_update::target(&dir) {
+        Ok(target) => target,
+        Err(error) => {
+            if options.verbose {
+                writeln!(
+                    stderr,
+                    "shdeps: update self-check could not inspect install ({error}); continuing"
+                )?;
+            }
+            return Ok(());
+        }
+    };
+
+    if matches!(target, Target::SourceCheckout) && env::var_os("SHDEPS_DIR").is_none() {
+        return Ok(());
+    }
+
+    let stamp_path = stamp::remote_path(&roots.state_dir, "shdeps", "self-update");
+    let freshness = stamp::Freshness {
+        now: update_options.now,
+        ttl: self_update_ttl(),
+        force: update_options.force,
+        reinstall: update_options.reinstall,
+    };
+    if stamp::remote_fresh(&stamp_path, freshness) {
+        if options.verbose {
+            writeln!(stderr, "shdeps: update self-check skipped; stamp is fresh")?;
+        }
+        return Ok(());
+    }
+
+    match target {
+        Target::SourceCheckout => match self_update::source_checkout(&dir, &Process) {
+            Ok(summary) => {
+                if summary.outcome != Outcome::DirtySkipped {
+                    touch_self_update_stamp(&stamp_path, update_options.now, options, stderr)?;
+                }
+                write_update_source_self_update_result(&summary, options.verbose, stderr)?;
+            }
+            Err(error) => {
+                if options.verbose {
+                    writeln!(
+                        stderr,
+                        "shdeps: update self-check failed ({error}); continuing"
+                    )?;
+                }
+            }
+        },
+        Target::ReleaseArchive(metadata) => {
+            // Stamp release attempts before network I/O. If GitHub is
+            // unavailable or rate-limited, `shdeps update` should keep
+            // managing dependencies without making every subsequent run
+            // immediately retry the same failing endpoint.
+            touch_self_update_stamp(&stamp_path, update_options.now, options, stderr)?;
+            match self_update::release_archive(&dir, &metadata, &ProcessEnv, &Process, &Curl) {
+                Ok(summary) => {
+                    write_update_release_self_update_result(&summary, options.verbose, stderr)?;
+                }
+                Err(error) => {
+                    if options.verbose {
+                        writeln!(
+                            stderr,
+                            "shdeps: update self-check failed ({error}); continuing"
+                        )?;
+                    }
+                }
+            }
+        }
+        Target::Unsupported { .. } => {
+            if options.verbose {
+                writeln!(
+                    stderr,
+                    "shdeps: update self-check skipped; unsupported install"
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn touch_self_update_stamp<E>(
+    stamp_path: &Path,
+    now: u64,
+    options: &ParsedOptions,
+    stderr: &mut E,
+) -> Result<()>
+where
+    E: Write,
+{
+    if let Err(error) = stamp::remote_touch(stamp_path, now) {
+        if options.verbose {
+            writeln!(
+                stderr,
+                "shdeps: update self-check could not write stamp ({error})"
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn update_prerequisite_error(
@@ -2293,6 +2418,94 @@ where
     Ok(())
 }
 
+fn write_update_source_self_update_result<E>(
+    summary: &self_update::Summary,
+    verbose: bool,
+    stderr: &mut E,
+) -> Result<()>
+where
+    E: Write,
+{
+    if !verbose {
+        return Ok(());
+    }
+
+    match summary.outcome {
+        Outcome::Unsupported => {
+            writeln!(
+                stderr,
+                "shdeps: update self-check skipped; unsupported install"
+            )?;
+        }
+        Outcome::DirtySkipped => {
+            writeln!(stderr, "shdeps: update self-check skipped dirty checkout")?;
+        }
+        Outcome::Pulled => {
+            writeln!(stderr, "shdeps: update self-check pulled source checkout")?;
+        }
+        Outcome::BuildFailed => {
+            writeln!(
+                stderr,
+                "shdeps: update self-check pulled source checkout but build failed; continuing"
+            )?;
+        }
+        Outcome::PullFailed => {
+            writeln!(
+                stderr,
+                "shdeps: update self-check could not pull source checkout; continuing"
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_update_release_self_update_result<E>(
+    summary: &self_update::ReleaseArchiveSummary,
+    verbose: bool,
+    stderr: &mut E,
+) -> Result<()>
+where
+    E: Write,
+{
+    if !verbose {
+        return Ok(());
+    }
+
+    match &summary.outcome {
+        ReleaseArchiveOutcome::Updated { tag } => {
+            writeln!(stderr, "shdeps: update self-check installed {tag}")?;
+        }
+        ReleaseArchiveOutcome::NoUpdate { current, .. } => {
+            writeln!(
+                stderr,
+                "shdeps: update self-check found no newer release ({current})"
+            )?;
+        }
+        ReleaseArchiveOutcome::NoSelectableRelease => {
+            writeln!(
+                stderr,
+                "shdeps: update self-check found no stable release; continuing"
+            )?;
+        }
+        ReleaseArchiveOutcome::UnsupportedPlatform => {
+            writeln!(
+                stderr,
+                "shdeps: update self-check has no supported artifact for this platform; continuing"
+            )?;
+        }
+        ReleaseArchiveOutcome::NoSupportedArtifact {
+            tag,
+            platform_label,
+        } => {
+            writeln!(
+                stderr,
+                "shdeps: update self-check found no {platform_label} artifact in {tag}; continuing"
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn confirm_prune<W>(stdout: &mut W) -> Result<bool>
 where
     W: Write,
@@ -2349,6 +2562,13 @@ fn remote_ttl() -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3600)
+}
+
+fn self_update_ttl() -> u64 {
+    env::var("SHDEPS_SELF_UPDATE_TTL")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(86_400)
 }
 
 fn custom_probe() -> BashCustomProbe {

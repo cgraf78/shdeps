@@ -19,11 +19,12 @@ files within a config directory (default:
 .SH COMMANDS
 .TP
 .B update
-Install or update all configured dependencies.
+Install or update all configured dependencies. For supported shdeps installs,
+also performs a quiet, best-effort self-update check before dependency updates.
 .TP
 .B self\-update
-Update shdeps itself by pulling the latest from its git repository.
-Skips the update if the local tree has uncommitted changes.
+Update shdeps itself. Release installs update from the latest matching archive;
+source checkouts use git pull --ff-only and skip dirty trees.
 .TP
 .B list
 List all configured dependencies with columns for name, method, status,
@@ -400,6 +401,11 @@ to suppress non-result output and interactive prompts.
 .B SHDEPS_REMOTE_TTL
 Cache TTL in seconds.
 Default: 3600.
+.TP
+.B SHDEPS_SELF_UPDATE_TTL
+Self-update attempt TTL in seconds for
+.BR "shdeps update" .
+Default: 86400.
 .TP
 .B SHDEPS_GIT_DEV_DIR
 Dev clone directory for github:repo deps (prefers <dir>/<repo> over fresh clone).

@@ -103,6 +103,12 @@ _shdepsw_call() {
   command "$_SHDEPSW_BIN" "$@"
 }
 
+_shdepsw_call_from_dir() {
+  local dir
+  dir=$(_shdepsw_dir) || return 1
+  SHDEPS_DIR="$dir" command "$_SHDEPSW_BIN" "$@"
+}
+
 _shdepsw_prepend_bin_dir() {
   local bin_dir
   bin_dir="${SHDEPS_BIN_DIR:-${_SHDEPSW_BIN_DIR:-$(_shdepsw_call __api bin-dir)}}"
@@ -196,8 +202,8 @@ _shdepsw_cache_env || return 1 2>/dev/null || exit 1
 # alone.
 
 shdeps_version() { _shdepsw_call version "$@"; }
-shdeps_update() { _shdepsw_prepend_bin_dir && _shdepsw_call update "$@"; }
-shdeps_self_update() { _shdepsw_call self-update "$@"; }
+shdeps_update() { _shdepsw_prepend_bin_dir && _shdepsw_call_from_dir update "$@"; }
+shdeps_self_update() { _shdepsw_call_from_dir self-update "$@"; }
 shdeps_load() { _shdepsw_call __api load-count "$@"; }
 shdeps_prune() { _shdepsw_call prune "$@"; }
 

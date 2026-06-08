@@ -93,10 +93,13 @@ The CLI loads all `*.conf` files from `~/.config/shdeps/` (sorted alphabetically
 shdeps self-update
 ```
 
-Uses TTL-based caching to avoid redundant work. Release installs update from
-the latest matching archive, while source checkouts use `git pull --ff-only`
-and skip updates when the working tree has uncommitted changes (active
-development). Use `--force` to bypass the TTL cache.
+Release installs update from the latest matching archive, while source
+checkouts use `git pull --ff-only` and skip updates when the working tree has
+uncommitted changes (active development). `shdeps update` also performs a
+quiet, best-effort self-check for supported shdeps installs before dependency
+updates. That automatic check is TTL-gated by `SHDEPS_SELF_UPDATE_TTL`; use
+`--force` or `SHDEPS_FORCE=1` with `shdeps update` to bypass the self-update
+TTL.
 
 ### Uninstalling
 
@@ -135,6 +138,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_REINSTALL`   | `0`                                                     | Force reinstall all deps                                                                                                                                                              |
 | `SHDEPS_QUIET`       | `0`                                                     | Suppress non-result output and interactive prompts                                                                                                                                         |
 | `SHDEPS_REMOTE_TTL`  | `3600`                                                  | Cache TTL in seconds                                                                                                                                                                  |
+| `SHDEPS_SELF_UPDATE_TTL` | `86400`                                             | Self-update attempt TTL in seconds for `shdeps update`                                                                                                                               |
 | `SHDEPS_GIT_DEV_DIR` | `~/git`                                                 | Dev clone directory used only by `github:repo` deps (prefers `<dir>/<repo>` over a managed clone)                                                                                     |
 | `SHDEPS_INSTALL_DIR` | `~/.local/share`                                        | Base directory for shdeps-owned install roots (`github:repo`, archive-style `github:release`, `cargo`, `go`, `uv`, `npm`). Raw release binaries install into `SHDEPS_BIN_DIR` instead. |
 | `SHDEPS_BIN_DIR`     | `~/.local/bin`                                          | Directory for binary symlinks and raw `github:release` binaries                                                                                                                       |
@@ -388,7 +392,7 @@ shdeps_update
 
 ## Bootstrapping (Client Integration)
 
-For projects that embed shdeps (e.g., dotfiles managers), `install.sh --bootstrap` provides a single sourceable entry point that handles discovery, sourcing, CLI symlink, and self-update:
+For projects that embed shdeps (e.g., dotfiles managers), `install.sh --bootstrap` provides a single sourceable entry point that handles discovery, sourcing, and CLI symlink setup:
 
 ```bash
 # Set your project's config before bootstrapping
@@ -409,9 +413,12 @@ The `--bootstrap` flag:
 - **Finds shdeps.sh** via `$SHDEPS_LIB` → `$SHDEPS_GIT_DEV_DIR/shdeps/` → `$SHDEPS_DIR/` → fresh install
 - **Sources it** into the caller (all `shdeps_*` functions become available)
 - **Symlinks the CLI** into `$SHDEPS_BIN` (default `~/.local/bin/shdeps`)
-- **Runs `self-update`** (skips dirty working trees)
+- **Keeps bootstrap fast** by avoiding release freshness checks unless `SHDEPS_FORCE=1`
 - **Is idempotent** — safe to call multiple times
 - **Does not leak `set -e`** into the caller's shell
+
+Call `shdeps_update` after bootstrap to install dependencies and run the
+TTL-gated self-check.
 
 ## Public API
 
