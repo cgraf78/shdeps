@@ -49,6 +49,7 @@ jobs:
         tests/shell/install-sh-test &&
         tests/shell/installer-flow-test &&
         tests/shell/lua-api-test &&
+        tests/shell/lua-bootstrap-test &&
         tests/shell/release-scripts-test
 
   bash32:

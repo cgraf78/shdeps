@@ -59,12 +59,14 @@ install -m 0755 install.sh "$staging/install.sh"
 install -m 0644 README.md "$staging/README.md"
 install -m 0644 LICENSE "$staging/LICENSE"
 
-mkdir -p "$staging/man/man1" "$staging/completions" "$staging/lua"
+mkdir -p "$staging/man/man1" "$staging/completions" "$staging/lua/shdeps"
 install -m 0644 man/man1/shdeps.1 "$staging/man/man1/shdeps.1"
 install -m 0644 completions/shdeps.bash "$staging/completions/shdeps.bash"
 install -m 0644 completions/shdeps.zsh "$staging/completions/shdeps.zsh"
 install -m 0644 completions/shdeps.fish "$staging/completions/shdeps.fish"
 install -m 0644 lua/shdeps.lua "$staging/lua/shdeps.lua"
+install -m 0644 lua/shdeps/core.lua "$staging/lua/shdeps/core.lua"
+install -m 0644 lua/shdeps/bootstrap.lua "$staging/lua/shdeps/bootstrap.lua"
 
 # Include install metadata in the archive so an extracted release can be
 # identified without guessing from filesystem shape. Activation code may rewrite
