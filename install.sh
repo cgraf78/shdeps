@@ -257,144 +257,6 @@ _json_string() {
   sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
 }
 
-_installed_release_tag() {
-  local dir="$1"
-
-  _json_string "$dir/.shdeps-install.json" "tag"
-}
-
-_release_tag_newer() {
-  local latest="$1" current="$2"
-
-  [[ -n "$latest" ]] || return 1
-  # When no current tag exists we cannot compute "newer than"; let the
-  # caller decide whether to install. (The bootstrap refresh path already
-  # short-circuits this case; this branch is here for direct callers.)
-  [[ -n "$current" ]] || return 0
-  [[ "$(_natural_tag_cmp "$latest" "$current")" == "gt" ]]
-}
-
-# Natural-order tag comparison shared with the Rust self-update path.
-#
-# Stable lexical comparison of release tags works for shdeps' own
-# `YYYYMMDD-HHMMSS-<hash>` format because the timestamp prefix is
-# zero-padded. It silently breaks down for any tag scheme with a numeric
-# component that grows past 9 (e.g., `v1.10` vs `v1.9`, where lexical
-# comparison incorrectly orders `v1.10` before `v1.9`). The Rust
-# implementation in `src/self_update.rs::compare_tags` already does a
-# natural sort that treats numeric runs by trimmed length and then by
-# bytes, with numeric runs sorting after text runs. Mirror that here so
-# bootstrap-time and runtime self-update agree on which release is newer
-# for every possible tag scheme.
-#
-# Echoes one of `lt`, `eq`, `gt` to stdout. Stays Bash 3.2-compatible
-# because `install.sh` runs from the curl-pipe path on macOS's stock
-# /bin/bash.
-_natural_tag_cmp() {
-  local left="$1" right="$2"
-  local left_pos=0 right_pos=0
-  local left_len=${#left} right_len=${#right}
-  local lc rc l_run r_run l_digit r_digit l_trim r_trim
-
-  while [[ $left_pos -lt $left_len || $right_pos -lt $right_len ]]; do
-    if [[ $left_pos -ge $left_len ]]; then
-      echo "lt"
-      return
-    fi
-    if [[ $right_pos -ge $right_len ]]; then
-      echo "gt"
-      return
-    fi
-
-    # Determine whether the next run on each side is numeric or textual.
-    lc="${left:$left_pos:1}"
-    rc="${right:$right_pos:1}"
-    case "$lc" in [0-9]) l_digit=1 ;; *) l_digit=0 ;; esac
-    case "$rc" in [0-9]) r_digit=1 ;; *) r_digit=0 ;; esac
-
-    # Extract the maximal same-class run from each side.
-    l_run=""
-    if [[ $l_digit -eq 1 ]]; then
-      while [[ $left_pos -lt $left_len ]]; do
-        case "${left:$left_pos:1}" in [0-9]) ;; *) break ;; esac
-        l_run="$l_run${left:$left_pos:1}"
-        left_pos=$((left_pos + 1))
-      done
-    else
-      while [[ $left_pos -lt $left_len ]]; do
-        case "${left:$left_pos:1}" in [0-9]) break ;; esac
-        l_run="$l_run${left:$left_pos:1}"
-        left_pos=$((left_pos + 1))
-      done
-    fi
-    r_run=""
-    if [[ $r_digit -eq 1 ]]; then
-      while [[ $right_pos -lt $right_len ]]; do
-        case "${right:$right_pos:1}" in [0-9]) ;; *) break ;; esac
-        r_run="$r_run${right:$right_pos:1}"
-        right_pos=$((right_pos + 1))
-      done
-    else
-      while [[ $right_pos -lt $right_len ]]; do
-        case "${right:$right_pos:1}" in [0-9]) break ;; esac
-        r_run="$r_run${right:$right_pos:1}"
-        right_pos=$((right_pos + 1))
-      done
-    fi
-
-    # Cross-class: numeric runs sort AFTER text runs so `v10` > `vbeta`.
-    if [[ $l_digit -ne $r_digit ]]; then
-      if [[ $l_digit -eq 1 ]]; then echo "gt"; else echo "lt"; fi
-      return
-    fi
-
-    if [[ $l_digit -eq 1 ]]; then
-      # Numeric: trim leading zeros, compare by length first (so 10 > 9
-      # without ever fitting into a fixed-width integer), then by bytes
-      # for the same-length case.
-      l_trim="${l_run#"${l_run%%[!0]*}"}"
-      r_trim="${r_run#"${r_run%%[!0]*}"}"
-      [[ -z "$l_trim" ]] && l_trim="0"
-      [[ -z "$r_trim" ]] && r_trim="0"
-      if [[ ${#l_trim} -lt ${#r_trim} ]]; then
-        echo "lt"
-        return
-      fi
-      if [[ ${#l_trim} -gt ${#r_trim} ]]; then
-        echo "gt"
-        return
-      fi
-      # `<` / `>` inside `[[ ]]` is lexicographic; on equal-length pure
-      # digit strings that matches numeric ordering exactly. Use it
-      # instead of `(( ))` so the comparison stays correct for numbers
-      # that exceed bash's integer width. shellcheck SC2071 misreads
-      # the intent so disable it inline rather than reshape the code.
-      # shellcheck disable=SC2071
-      if [[ "$l_trim" < "$r_trim" ]]; then
-        echo "lt"
-        return
-      fi
-      # shellcheck disable=SC2071
-      if [[ "$l_trim" > "$r_trim" ]]; then
-        echo "gt"
-        return
-      fi
-    else
-      # shellcheck disable=SC2071
-      if [[ "$l_run" < "$r_run" ]]; then
-        echo "lt"
-        return
-      fi
-      # shellcheck disable=SC2071
-      if [[ "$l_run" > "$r_run" ]]; then
-        echo "gt"
-        return
-      fi
-    fi
-  done
-  echo "eq"
-}
-
 _asset_url() {
   local file="$1" name="$2"
 
@@ -690,34 +552,6 @@ _cleanup_installed_state_for_source_checkout() {
   if ! rm -rf "$SHDEPS_DIR"; then
     _error "failed to remove stale shdeps install at $SHDEPS_DIR"
     return 1
-  fi
-}
-
-_refresh_release_install_if_stale() {
-  local current latest repo
-
-  _uses_default_repo_slug || return 0
-  _is_release_install_dir "$SHDEPS_DIR" || return 0
-
-  repo=$(_repo_slug)
-  current=$(_installed_release_tag "$SHDEPS_DIR")
-  # When the local install metadata is missing a `tag` field, we have no
-  # comparison baseline. Treating "no current tag" as "always stale" used
-  # to fire a `_install_release` call on every shell startup, hammering
-  # GitHub for an install that was probably fine. A missing tag indicates
-  # either a fresh install (which `_install_release` ran moments ago) or
-  # a corrupted state file (which the user repairs by re-running the
-  # installer explicitly). Either way, the background refresh should be
-  # a no-op rather than a silent re-download loop.
-  [[ -n "$current" ]] || return 0
-  latest=$(_latest_release_tag "$repo") || return 0
-
-  # Bootstrap self-update has to be conservative but useful. Release tags are
-  # timestamp-prefixed (`YYYYMMDD-HHMMSS-<hash>`), so lexical ordering is enough
-  # to avoid replacing a newer local archive with an older or deleted GitHub
-  # "latest" release while still advancing normal fleet installs promptly.
-  if _release_tag_newer "$latest" "$current"; then
-    _install_release >/dev/null 2>&1 || true
   fi
 }
 
@@ -1030,7 +864,9 @@ _install() {
 # ---------------------------------------------------------------------------
 # Designed to be sourced: `. /path/to/install.sh --bootstrap`
 #
-# Finds shdeps.sh, sources it, symlinks the CLI, and runs self-update.
+# Finds shdeps.sh, sources it, and symlinks the CLI. Source checkouts still
+# self-update during bootstrap; release installs stay local unless forced so
+# callers are not blocked on GitHub before they can render their own UI.
 # Clients set env vars (SHDEPS_CONF_DIR, SHDEPS_HOOKS_DIR, etc.) before
 # sourcing.
 #
@@ -1040,7 +876,7 @@ _bootstrap() {
   # Idempotent — skip if already bootstrapped
   declare -f shdeps_update &>/dev/null && return 0
 
-  local _bs_lib="" _bs_dir=""
+  local _bs_lib="" _bs_dir="" _bs_release_install=0
   local _dev_dir="${SHDEPS_GIT_DEV_DIR:-$HOME/git}"
 
   # Find shdeps.sh: installed-tree env hint → env override → dev clone →
@@ -1051,8 +887,8 @@ _bootstrap() {
   if _bootstrap_lib_is_installed_tree; then
     if _uses_default_repo_slug && [[ -d "$SHDEPS_DIR/.git" ]]; then
       _install_release >/dev/null 2>&1 || true
-    else
-      _refresh_release_install_if_stale
+    elif [[ "${SHDEPS_FORCE:-0}" == 1 ]] && _is_release_install_dir "$SHDEPS_DIR"; then
+      _install_release >/dev/null 2>&1 || true
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
@@ -1070,8 +906,8 @@ _bootstrap() {
       # this opportunistic: failed downloads, dirty checkouts, or unsupported
       # platforms fall through to the source path so bootstrap still converges.
       _install_release >/dev/null 2>&1 || true
-    else
-      _refresh_release_install_if_stale
+    elif [[ "${SHDEPS_FORCE:-0}" == 1 ]] && _is_release_install_dir "$SHDEPS_DIR"; then
+      _install_release >/dev/null 2>&1 || true
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
@@ -1086,6 +922,10 @@ _bootstrap() {
     fi
   fi
 
+  if [[ -n "$_bs_dir" ]] && _is_release_install_dir "$_bs_dir"; then
+    _bs_release_install=1
+  fi
+
   # Bootstrap may discover a dev checkout that has not gone through install.sh
   # yet. Create the root binary link first so sourcing the Rust wrapper and
   # linking the CLI both target this checkout instead of an older PATH command.
@@ -1097,8 +937,12 @@ _bootstrap() {
   # shellcheck source=/dev/null
   . "$_bs_lib" || return 1
 
-  # Pull latest shdeps (skips dirty clones / active development)
-  if [[ -n "$_bs_dir" ]]; then
+  # Pull source checkouts during bootstrap, but keep release installs local.
+  # Release freshness checks can involve GitHub redirects or API calls; doing
+  # that before the caller has rendered any UI caused slow/noisy `dot update`
+  # startup during transient GitHub 504s. `SHDEPS_FORCE=1` still refreshes
+  # release installs above, which keeps explicit "check now" behavior.
+  if [[ -n "$_bs_dir" && "$_bs_release_install" -eq 0 ]]; then
     # Bootstrap is sourced into callers, so stdout belongs to the caller's
     # script. Self-update is opportunistic here and ignored on failure; keep it
     # quiet for the same reason so status chatter cannot pollute command

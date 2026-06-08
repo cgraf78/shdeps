@@ -397,7 +397,7 @@ else
     . "$_bootstrap_state/install.sh" --bootstrap
   _assert_eq "bootstrap current release: CLI stays current" \
     "shdeps $_updated_tag" "$("$_bootstrap_bin/shdeps" version)"
-  _assert_file_exists "bootstrap current release: checks latest" \
+  _assert_file_missing "bootstrap current release: skips latest check" \
     "$_bootstrap_markers/latest"
   _assert_file_missing "bootstrap current release: skips archive download" \
     "$_bootstrap_markers/archive"
@@ -416,12 +416,36 @@ else
     SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
     SHDEPS_DIR="$_bootstrap_stale" SHDEPS_BIN="$_bootstrap_stale_bin/shdeps" \
     . "$_bootstrap_stale/install.sh" --bootstrap
-  _assert_eq "bootstrap stale release: CLI updates to latest" \
-    "shdeps $_updated_tag" "$("$_bootstrap_stale_bin/shdeps" version)"
-  _assert_file_exists "bootstrap stale release: downloads archive" \
+  _assert_eq "bootstrap stale release: normal bootstrap keeps local binary" \
+    "shdeps $_tag" "$("$_bootstrap_stale_bin/shdeps" version)"
+  _assert_file_missing "bootstrap stale release: skips latest check" \
+    "$_bootstrap_stale_markers/latest"
+  _assert_file_missing "bootstrap stale release: skips archive download" \
     "$_bootstrap_stale_markers/archive"
-  _assert_file_exists "bootstrap stale release: downloads checksum" \
-    "$_bootstrap_stale_markers/checksum"
+
+  unset -f shdeps_update 2>/dev/null
+  _bootstrap_force=$(_tmpdir)/bootstrap-force
+  _bootstrap_force_bin=$(_tmpdir)/bootstrap-force-bin
+  _bootstrap_force_markers=$(_tmpdir)/bootstrap-force-markers
+  mkdir -p "$_bootstrap_force" "$_bootstrap_force_bin"
+  cp -R "$_payload/." "$_bootstrap_force/"
+  HOME="$_bootstrap_home" PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_FORCE=1 \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
+    SHDEPS_TEST_MARKER_DIR="$_bootstrap_force_markers" \
+    SHDEPS_GIT_DEV_DIR="$_bootstrap_home/git" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_bootstrap_force" SHDEPS_BIN="$_bootstrap_force_bin/shdeps" \
+    . "$_bootstrap_force/install.sh" --bootstrap
+  _assert_eq "bootstrap forced release: CLI updates to latest" \
+    "shdeps $_updated_tag" "$("$_bootstrap_force_bin/shdeps" version)"
+  _assert_file_exists "bootstrap forced release: checks latest" \
+    "$_bootstrap_force_markers/latest"
+  _assert_file_exists "bootstrap forced release: downloads archive" \
+    "$_bootstrap_force_markers/archive"
+  _assert_file_exists "bootstrap forced release: downloads checksum" \
+    "$_bootstrap_force_markers/checksum"
 fi
 
 _test_summary
