@@ -41,6 +41,7 @@ shdeps_bin_dir() { command shdeps __api bin-dir "$@"; }
 shdeps_dep_root() { command shdeps __api dep-root "$@"; }
 shdeps_dep_path() { command shdeps __api dep-path "$@"; }
 shdeps_dep_file() { command shdeps __api dep-file "$@"; }
+shdeps_dep_links() { command shdeps __api dep-links "$@"; }
 shdeps_dep_source() {
   local _shdeps_source_path
   _shdeps_source_path=$(command shdeps __api dep-file "$@") || return $?
@@ -90,6 +91,7 @@ mod tests {
         assert!(source.contains(
             r#"shdeps_github_release_install() { command shdeps __api github-release-install "$@"; }"#
         ));
+        assert!(source.contains(r#"shdeps_dep_links() { command shdeps __api dep-links "$@"; }"#));
         assert!(source.contains("shdeps_dep_source()"));
         assert!(source.contains("shdeps_mark_changed()"));
     }

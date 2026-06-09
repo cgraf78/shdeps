@@ -5,7 +5,7 @@ _shdeps() {
   local cur prev words cword
   _init_completion || return
 
-  local commands="update self-update list check prune version help"
+  local commands="update self-update list check dep-root dep-path dep-file dep-links prune version help"
   local global_opts="-c --config -f --force -R --reinstall -q --quiet -v --verbose -h --help"
 
   # Find the subcommand (skip options and their arguments)
@@ -45,7 +45,7 @@ _shdeps() {
 
   # Subcommand-specific completions
   case "$cmd" in
-    check)
+    check | dep-root | dep-path | dep-file | dep-links)
       # Complete with dependency names from config files
       local conf_dir="${SHDEPS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/shdeps}"
       if [[ -d "$conf_dir" ]]; then

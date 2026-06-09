@@ -16,6 +16,10 @@ _shdeps() {
     'self-update:Update shdeps itself'
     'list:List all configured dependencies with status'
     'check:Check if a specific dependency is installed'
+    'dep-root:Print a configured dependency root directory'
+    'dep-path:Print a path below a configured dependency root'
+    'dep-file:Print a readable regular file below a dependency root'
+    'dep-links:Print public command links owned by a dependency'
     'prune:Remove orphaned dependencies no longer in config'
     'version:Print shdeps version'
     'help:Show help message'
@@ -41,7 +45,7 @@ _shdeps() {
       ;;
     args)
       case "${words[1]}" in
-        check)
+        check | dep-root | dep-path | dep-file | dep-links)
           _arguments '1:dependency:_shdeps_dep_names'
           ;;
         prune)

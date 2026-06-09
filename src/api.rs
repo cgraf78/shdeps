@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::Result;
 use crate::config;
+use crate::dep_links;
 use crate::dep_path;
 use crate::errors::Error;
 use crate::extras;
@@ -145,6 +146,13 @@ where
                 return Ok(2);
             };
             dep_file(target, rel, overrides, stdout)
+        }
+        "dep-links" => {
+            let Some(target) = rest.first() else {
+                writeln!(stderr, "error: __api dep-links requires a dependency name")?;
+                return Ok(2);
+            };
+            dep_links(target, overrides, stdout)
         }
         "link-extras" => {
             let (Some(name), Some(install_dir)) = (rest.first(), rest.get(1)) else {
@@ -390,6 +398,21 @@ where
         ),
         stdout,
     )
+}
+
+fn dep_links<W>(target: &str, overrides: &Overrides, stdout: &mut W) -> Result<i32>
+where
+    W: Write,
+{
+    let roots = runtime::roots(&ProcessEnv, overrides);
+    match dep_links::links(target, &roots, &runtime::runtime_env(&ProcessEnv)) {
+        Ok(links) => {
+            dep_links::write_tsv(&links, stdout)?;
+            Ok(0)
+        }
+        Err(Error::Resolve(error)) => Ok(error.exit_code()),
+        Err(error) => Err(error),
+    }
 }
 
 fn pkg_install_for_mgr<E>(specs: &[String], stderr: &mut E) -> Result<i32>
