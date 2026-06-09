@@ -45,6 +45,15 @@ LUA
 )
 _assert_eq "lua bootstrap: explicit module path wins" "explicit" "$result"
 
+result=$(
+  SHDEPS_BOOTSTRAP="$bootstrap" SHDEPS_REAL_LUA="$REPO_ROOT/lua/shdeps.lua" lua <<'LUA'
+local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))
+debug = nil
+print(bootstrap.load({ lua = os.getenv("SHDEPS_REAL_LUA") }).API_VERSION)
+LUA
+)
+_assert_eq "lua bootstrap: explicit real module loads without debug source paths" "1" "$result"
+
 root="$fixture/root"
 _write_fake_module "$root" root
 result=$(
