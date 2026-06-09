@@ -67,6 +67,11 @@ mkdir -p "$_install/owner/tool/share"
 cat >"$_install/owner/tool/share/env.sh" <<'EOF'
 SHDEPS_WRAPPER_SOURCED=1
 EOF
+mkdir -p "$_install/owner/tool/bin"
+cat >"$_install/owner/tool/bin/tool" <<'EOF'
+#!/bin/sh
+EOF
+chmod +x "$_install/owner/tool/bin/tool"
 mkdir -p "$_git_dev/agentguard/lib/agentguard" "$_git_dev/cmdblocks/share/cmdblocks"
 printf '# agentguard\n' >"$_git_dev/agentguard/lib/agentguard/agentguard.sh"
 printf '%s\n' "CMDBLOCKS_SHELL_LOADED=1" >"$_git_dev/cmdblocks/share/cmdblocks/shell.sh"
@@ -142,6 +147,10 @@ _assert_eq "wrapper: dep-source sources into current shell" "1" "${SHDEPS_WRAPPE
 _assert_eq "wrapper: bare github dep-file prefers local dev clone" \
   "$_git_dev/agentguard/lib/agentguard/agentguard.sh" \
   "$(shdeps_dep_file cgraf78/agentguard lib/agentguard/agentguard.sh)"
+
+_assert_eq "wrapper: dep-links delegates to Rust binary" \
+  "tool	$_bin/tool	$_install/owner/tool/bin/tool" \
+  "$(shdeps_dep_links owner/tool)"
 
 unset CMDBLOCKS_SHELL_LOADED
 shdeps_dep_source cgraf78/cmdblocks share/cmdblocks/shell.sh

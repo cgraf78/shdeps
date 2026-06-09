@@ -225,6 +225,7 @@ shdeps_bin_dir() { printf '%s\n' "${SHDEPS_BIN_DIR:-${_SHDEPSW_BIN_DIR:-$(_shdep
 shdeps_dep_root() { _shdepsw_call __api dep-root "$@"; }
 shdeps_dep_path() { _shdepsw_call __api dep-path "$@"; }
 shdeps_dep_file() { _shdepsw_call __api dep-file "$@"; }
+shdeps_dep_links() { _shdepsw_call __api dep-links "$@"; }
 shdeps_dep_source() {
   local source_path
   source_path=$(_shdepsw_call __api dep-file "$@") || return $?

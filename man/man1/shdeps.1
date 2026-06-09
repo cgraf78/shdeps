@@ -34,6 +34,26 @@ and version details.
 Check whether a specific dependency is installed.
 Exits 0 if installed, 1 if not.
 .TP
+.BI dep-root " name"
+Print the local root directory for a configured dependency when shdeps owns one.
+.TP
+.BI dep-path " name rel"
+Print a path below a configured dependency root without requiring the final path
+to exist.
+.TP
+.BI dep-file " name rel"
+Print a path below a configured dependency root only when it is a readable
+regular file.
+.TP
+.BI dep-links " name"
+Print shdeps-owned public command links for a dependency as tab-separated
+.IR command ,
+.IR public-path ,
+and
+.I target-path
+rows. The lookup is local and does not run hooks, package-manager probes,
+network requests, or version commands.
+.TP
 .B prune
 Remove orphaned dependencies that are no longer present in any config file.
 Accepts
@@ -473,6 +493,12 @@ Check if a specific dependency is installed:
 .PP
 .RS
 .B shdeps check jq
+.RE
+.PP
+List public command links owned by a dependency:
+.PP
+.RS
+.B shdeps dep\-links cgraf78/sley
 .RE
 .PP
 Preview orphaned dependencies without removing:

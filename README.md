@@ -334,6 +334,7 @@ Commands:
   dep-root <name>        Print a configured dependency root directory
   dep-path <name> <rel>  Print a path below a configured dependency root
   dep-file <name> <rel>  Print a readable regular file below a dependency root
+  dep-links <name>       Print public command links owned by a dependency
   prune                  Remove orphaned deps no longer in config
   version                Print shdeps version
   help                   Show this help message
@@ -355,6 +356,7 @@ Examples:
   shdeps --force update
   shdeps list
   shdeps check jq
+  shdeps dep-links cgraf78/sley
   shdeps prune --dry-run
   shdeps prune -y
 
@@ -450,6 +452,7 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_dep_root <name>`          | Print a configured dependency root when shdeps owns one                                     |
 | `shdeps_dep_path <name> <rel>`    | Print a path below a dependency root; rejects absolute and parent-traversal paths           |
 | `shdeps_dep_file <name> <rel>`    | Print a dependency asset path only when it is a readable regular file                       |
+| `shdeps_dep_links <name>`         | Print shdeps-owned command links as `command<TAB>public-path<TAB>target-path` rows          |
 | `shdeps_dep_source <name> <rel>`  | Source an existing dependency asset into the current Bash process                           |
 | `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir                          |
 | `shdeps_unlink_extras <name>`     | Remove all extras symlinks tracked for a dep                                                |
@@ -467,6 +470,13 @@ methods with per-dependency install directories (`cargo`, `go`, `uv`, `npm`,
 and archive-style `github:release` installs), it returns
 `$SHDEPS_INSTALL_DIR/<name>` when present. Raw single-binary `github:release`
 installs and package-manager deps do not have shdeps-owned roots.
+
+`shdeps_dep_links` is for health checks and integrations that need to verify
+shdeps-owned public commands without duplicating shdeps' link rules. It is a
+cheap local lookup: no hooks, package-manager probes, GitHub calls, or version
+commands run. `github:repo` dependencies report every executable directly under
+the resolved dependency `bin/` directory; single-binary methods report the
+configured command and manifest target.
 
 ## Lua API
 

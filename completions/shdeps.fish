@@ -59,12 +59,20 @@ complete -c shdeps -n __shdeps_needs_command -a update -d "Install/update all de
 complete -c shdeps -n __shdeps_needs_command -a self-update -d "Update shdeps itself"
 complete -c shdeps -n __shdeps_needs_command -a list -d "List all configured dependencies"
 complete -c shdeps -n __shdeps_needs_command -a check -d "Check if a dependency is installed"
+complete -c shdeps -n __shdeps_needs_command -a dep-root -d "Print a dependency root"
+complete -c shdeps -n __shdeps_needs_command -a dep-path -d "Print a path below a dependency root"
+complete -c shdeps -n __shdeps_needs_command -a dep-file -d "Print a readable dependency file"
+complete -c shdeps -n __shdeps_needs_command -a dep-links -d "Print dependency command links"
 complete -c shdeps -n __shdeps_needs_command -a prune -d "Remove orphaned dependencies"
 complete -c shdeps -n __shdeps_needs_command -a version -d "Print shdeps version"
 complete -c shdeps -n __shdeps_needs_command -a help -d "Show help message"
 
 # check: complete with dependency names
 complete -c shdeps -n "__shdeps_using_command check" -a "(__shdeps_dep_names)" -d "Dependency name"
+complete -c shdeps -n "__shdeps_using_command dep-root" -a "(__shdeps_dep_names)" -d "Dependency name"
+complete -c shdeps -n "__shdeps_using_command dep-path" -a "(__shdeps_dep_names)" -d "Dependency name"
+complete -c shdeps -n "__shdeps_using_command dep-file" -a "(__shdeps_dep_names)" -d "Dependency name"
+complete -c shdeps -n "__shdeps_using_command dep-links" -a "(__shdeps_dep_names)" -d "Dependency name"
 
 # prune options
 complete -c shdeps -n "__shdeps_using_command prune" -s y -d "Skip confirmation prompt"

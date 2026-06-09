@@ -14,6 +14,7 @@ use std::time::Instant;
 use crate::Result;
 use crate::api;
 use crate::config::{self, Entry};
+use crate::dep_links;
 use crate::dep_path;
 use crate::errors::Error;
 use crate::github_method;
@@ -47,6 +48,7 @@ Commands:
   dep-root <name>        Print a configured dependency root directory
   dep-path <name> <rel>  Print a path below a configured dependency root
   dep-file <name> <rel>  Print a readable regular file below a dependency root
+  dep-links <name>       Print public command links owned by a dependency
   prune                  Remove orphaned deps no longer in config
   version                Print shdeps version
   help                   Show this help message
@@ -144,6 +146,7 @@ where
         "dep-root" => dep_root_cmd(rest, &parsed, stdout, stderr),
         "dep-path" => dep_path_cmd(rest, &parsed, stdout, stderr),
         "dep-file" => dep_file_cmd(rest, &parsed, stdout, stderr),
+        "dep-links" => dep_links_cmd(rest, &parsed, stdout, stderr),
         "list" => list_cmd(rest, &parsed, stdout, stderr),
         "check" => check_cmd(rest, &parsed, stdout, stderr),
         "__api" => api::run(rest, &parsed.overrides, stdout, stderr),
@@ -304,6 +307,29 @@ where
     };
 
     dep_file(target, rel, options, stdout)
+}
+
+fn dep_links_cmd<W, E>(
+    args: &[String],
+    options: &ParsedOptions,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    let Some(target) = args.first() else {
+        writeln!(stderr, "error: dep-links requires a dependency name")?;
+        writeln!(stderr, "Usage: shdeps dep-links <name>")?;
+        return Ok(2);
+    };
+
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    dep_links_result(
+        dep_links::links(target, &roots, &runtime::runtime_env(&ProcessEnv)),
+        stdout,
+    )
 }
 
 fn list_cmd<W, E>(
@@ -2643,6 +2669,23 @@ where
     match result {
         Ok(path) => {
             writeln!(stdout, "{}", path.display())?;
+            Ok(0)
+        }
+        Err(Error::Resolve(error)) => Ok(error.exit_code()),
+        Err(error) => Err(error),
+    }
+}
+
+fn dep_links_result<W>(
+    result: Result<Vec<dep_links::DependencyLink>>,
+    stdout: &mut W,
+) -> Result<i32>
+where
+    W: Write,
+{
+    match result {
+        Ok(links) => {
+            dep_links::write_tsv(&links, stdout)?;
             Ok(0)
         }
         Err(Error::Resolve(error)) => Ok(error.exit_code()),

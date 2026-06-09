@@ -50,6 +50,11 @@ fn help_output_is_stable_and_hides_removed_migrate_command() {
         "  dep-file <name> <rel>  Print a readable regular file below a dependency root\n"
     ));
     assert!(
+        stdout.contains(
+            "  dep-links <name>       Print public command links owned by a dependency\n"
+        )
+    );
+    assert!(
         !stdout.contains("migrate"),
         "removed migrate command must stay out of user-facing help"
     );
@@ -123,9 +128,83 @@ fn path_helpers_resolve_installed_assets_with_clean_stdout() {
 }
 
 #[test]
+fn dep_links_reports_repo_command_links_with_clean_tsv() {
+    let fixture = Fixture::new("dep-links-repo");
+    fixture.write("conf/deps.conf", "cgraf78/tool github:repo\n");
+    fixture.write_executable("share/cgraf78/tool/bin/tool-b", "#!/bin/sh\n");
+    fixture.write_executable("share/cgraf78/tool/bin/tool-a", "#!/bin/sh\n");
+    fixture.write("share/cgraf78/tool/bin/not-executable", "#!/bin/sh\n");
+
+    let output = run(&mut fixture.command(["dep-links", "cgraf78/tool"]));
+
+    assert_success(&output);
+    let root = fixture
+        .dir
+        .join("share/cgraf78/tool")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "tool-a\t{}\t{}\n\
+             tool-b\t{}\t{}\n",
+            fixture.dir.join("bin/tool-a").display(),
+            root.join("bin/tool-a").display(),
+            fixture.dir.join("bin/tool-b").display(),
+            root.join("bin/tool-b").display()
+        )
+    );
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn dep_links_reports_manifest_single_binary_target() {
+    let fixture = Fixture::new("dep-links-single");
+    let target = fixture.dir.join("share/owner/tool/bin/tool-real");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write(
+        "state/manifest",
+        &format!("owner/tool|github:release|tool|{}\n", target.display()),
+    );
+
+    let output = run(&mut fixture.command(["dep-links", "owner/tool"]));
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout),
+        format!(
+            "tool\t{}\t{}\n",
+            fixture.dir.join("bin/tool").display(),
+            target.display()
+        )
+    );
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
+fn dep_links_usage_and_missing_dependency_exit_codes_are_machine_clean() {
+    let fixture = Fixture::new("dep-links-errors");
+    fixture.write("conf/deps.conf", "owner/tool github:repo - - os:macos\n");
+
+    let usage = run(&mut fixture.command(["dep-links"]));
+    assert_eq!(usage.status.code(), Some(2));
+    assert_eq!(text(&usage.stdout), "");
+    assert_eq!(
+        text(&usage.stderr),
+        "error: dep-links requires a dependency name\nUsage: shdeps dep-links <name>\n"
+    );
+
+    let missing = run(&mut fixture.command(["dep-links", "owner/tool"]));
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(text(&missing.stdout), "");
+    assert_eq!(text(&missing.stderr), "");
+}
+
+#[test]
 fn read_only_api_outputs_machine_clean_lines() {
     let fixture = Fixture::new("api");
     fixture.write("conf/deps.conf", "owner/tool.git github:repo\njq pkg\n");
+    fixture.write_executable("share/owner/tool/bin/tool", "#!/bin/sh\n");
 
     let version = run(&mut fixture.command(["__api", "version"]));
     assert_success(&version);
@@ -149,6 +228,24 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert!(stdout.contains("reinstall=0\n"));
     assert!(stdout.contains("abi=1\n"));
     assert_eq!(text(&snapshot.stderr), "");
+
+    let links = run(&mut fixture.command(["__api", "dep-links", "owner/tool"]));
+    assert_success(&links);
+    assert_eq!(
+        text(&links.stdout),
+        format!(
+            "tool\t{}\t{}\n",
+            fixture.dir.join("bin/tool").display(),
+            fixture
+                .dir
+                .join("share/owner/tool")
+                .canonicalize()
+                .unwrap()
+                .join("bin/tool")
+                .display()
+        )
+    );
+    assert_eq!(text(&links.stderr), "");
 }
 
 #[test]
@@ -548,6 +645,16 @@ fn cheap_path_and_status_commands_stay_within_ci_budget() {
         "dep-path should stay under the CI cheap-command budget; elapsed={path_elapsed:?}, stdout={:?}, stderr={:?}",
         text(&dep_path.stdout),
         text(&dep_path.stderr)
+    );
+
+    fixture.write_executable("share/cgraf78/sley/bin/sley", "#!/bin/sh\n");
+    let (dep_links, links_elapsed) = timed(&mut fixture.command(["dep-links", "cgraf78/sley"]));
+    assert_success(&dep_links);
+    assert!(
+        links_elapsed <= Duration::from_millis(200),
+        "dep-links should stay under the CI cheap-command budget; elapsed={links_elapsed:?}, stdout={:?}, stderr={:?}",
+        text(&dep_links.stdout),
+        text(&dep_links.stderr)
     );
 
     let (check, check_elapsed) = timed(&mut fixture.command(["check", "asset"]));

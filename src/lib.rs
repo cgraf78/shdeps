@@ -18,6 +18,7 @@ pub mod checksum;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
+pub mod dep_links;
 pub mod dep_path;
 pub mod errors;
 pub mod external;
