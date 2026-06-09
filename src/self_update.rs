@@ -114,6 +114,13 @@ pub enum ReleaseArchiveOutcome {
         /// New active release tag.
         tag: String,
     },
+    /// The current release tag was reinstalled to restore missing payload files.
+    Repaired {
+        /// Active release tag that was reinstalled.
+        tag: String,
+        /// First required file that was missing from the live install.
+        missing: String,
+    },
     /// The selected release is not newer than the installed release.
     NoUpdate {
         /// Installed tag from metadata.
@@ -148,7 +155,9 @@ impl ReleaseArchiveSummary {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self.outcome {
-            ReleaseArchiveOutcome::Updated { .. } | ReleaseArchiveOutcome::NoUpdate { .. } => 0,
+            ReleaseArchiveOutcome::Updated { .. }
+            | ReleaseArchiveOutcome::Repaired { .. }
+            | ReleaseArchiveOutcome::NoUpdate { .. } => 0,
             ReleaseArchiveOutcome::NoSelectableRelease
             | ReleaseArchiveOutcome::UnsupportedPlatform
             | ReleaseArchiveOutcome::NoSupportedArtifact { .. } => 1,
@@ -486,6 +495,9 @@ pub fn release_archive(
     let releases = github::parse_releases(&String::from_utf8_lossy(&releases_json))
         .map_err(ReleaseArchiveFailure::Fetch)?;
 
+    let repair_missing = release_stage::missing_required_file(dir);
+    let mut repairing_current = None;
+
     let (release, pair) = match select_archive(&releases, metadata, env) {
         ArchiveDecision::Update { release, pair } => (release, pair),
         ArchiveDecision::NoSelectableRelease => {
@@ -495,10 +507,42 @@ pub fn release_archive(
             });
         }
         ArchiveDecision::NoUpdate { current, candidate } => {
-            return Ok(ReleaseArchiveSummary {
-                dir: dir.to_path_buf(),
-                outcome: ReleaseArchiveOutcome::NoUpdate { current, candidate },
-            });
+            if repair_missing.is_some() && current == candidate {
+                let Some(platform_label) = release_artifact::host_label(env) else {
+                    return Ok(ReleaseArchiveSummary {
+                        dir: dir.to_path_buf(),
+                        outcome: ReleaseArchiveOutcome::UnsupportedPlatform,
+                    });
+                };
+                let Some(release) = releases
+                    .iter()
+                    .find(|release| {
+                        release.tag == candidate && !release.draft && !release.prerelease
+                    })
+                    .cloned()
+                else {
+                    return Ok(ReleaseArchiveSummary {
+                        dir: dir.to_path_buf(),
+                        outcome: ReleaseArchiveOutcome::NoSelectableRelease,
+                    });
+                };
+                let Some(pair) = release_artifact::select_pair(&release, &platform_label) else {
+                    return Ok(ReleaseArchiveSummary {
+                        dir: dir.to_path_buf(),
+                        outcome: ReleaseArchiveOutcome::NoSupportedArtifact {
+                            tag: release.tag,
+                            platform_label,
+                        },
+                    });
+                };
+                repairing_current = repair_missing.map(str::to_owned);
+                (release, pair)
+            } else {
+                return Ok(ReleaseArchiveSummary {
+                    dir: dir.to_path_buf(),
+                    outcome: ReleaseArchiveOutcome::NoUpdate { current, candidate },
+                });
+            }
         }
         ArchiveDecision::UnsupportedPlatform => {
             return Ok(ReleaseArchiveSummary {
@@ -536,10 +580,20 @@ pub fn release_archive(
     crate::release_activate::activate(&staged, dir, &next_metadata)
         .map_err(ReleaseArchiveFailure::Activate)?;
 
-    Ok(ReleaseArchiveSummary {
-        dir: dir.to_path_buf(),
-        outcome: ReleaseArchiveOutcome::Updated { tag: release.tag },
-    })
+    if let Some(missing) = repairing_current {
+        Ok(ReleaseArchiveSummary {
+            dir: dir.to_path_buf(),
+            outcome: ReleaseArchiveOutcome::Repaired {
+                tag: release.tag,
+                missing,
+            },
+        })
+    } else {
+        Ok(ReleaseArchiveSummary {
+            dir: dir.to_path_buf(),
+            outcome: ReleaseArchiveOutcome::Updated { tag: release.tag },
+        })
+    }
 }
 
 fn artifact_platform_from_pair(pair: &Pair) -> Option<String> {
@@ -1171,6 +1225,17 @@ mod tests {
     #[test]
     fn release_archive_self_update_returns_no_update_without_download() {
         let dir = temp_dir("release-no-update");
+        fs::create_dir_all(dir.join("man/man1")).unwrap();
+        fs::create_dir_all(dir.join("lua/shdeps")).unwrap();
+        fs::write(dir.join("shdeps"), "current binary").unwrap();
+        fs::write(dir.join("shdeps.sh"), "current shim").unwrap();
+        fs::write(dir.join("install.sh"), "install").unwrap();
+        fs::write(dir.join("README.md"), "readme").unwrap();
+        fs::write(dir.join("LICENSE"), "license").unwrap();
+        fs::write(dir.join("man/man1/shdeps.1"), "man").unwrap();
+        fs::write(dir.join("lua/shdeps.lua"), "return {}").unwrap();
+        fs::write(dir.join("lua/shdeps/core.lua"), "return {}").unwrap();
+        fs::write(dir.join("lua/shdeps/bootstrap.lua"), "return {}").unwrap();
         let mut metadata = Metadata::new(Method::Release);
         metadata.tag = Some("v2026.05.24".to_owned());
         metadata.repo = Some("cgraf78/shdeps".to_owned());
@@ -1252,6 +1317,61 @@ mod tests {
                     && metadata.artifact_platform.as_deref() == Some("linux-x86_64-musl"))
         );
         assert_eq!(client.tokens(), vec![Some("token".to_owned()), None, None]);
+    }
+
+    #[test]
+    fn release_archive_self_update_repairs_current_tag_missing_required_payload() {
+        let root = temp_dir("release-repair-root");
+        let dir = root.join("shdeps");
+        fs::create_dir_all(dir.join("man/man1")).unwrap();
+        fs::create_dir_all(dir.join("lua/shdeps")).unwrap();
+        fs::write(dir.join("shdeps"), "current binary").unwrap();
+        fs::write(dir.join("shdeps.sh"), "current shim").unwrap();
+        fs::write(dir.join("install.sh"), "install").unwrap();
+        fs::write(dir.join("README.md"), "readme").unwrap();
+        fs::write(dir.join("LICENSE"), "license").unwrap();
+        fs::write(dir.join("man/man1/shdeps.1"), "man").unwrap();
+        fs::write(dir.join("lua/shdeps.lua"), "return {}").unwrap();
+        fs::write(dir.join("lua/shdeps/core.lua"), "return {}").unwrap();
+        let mut metadata = Metadata::new(Method::Release);
+        metadata.tag = Some("v2026.05.24".to_owned());
+        metadata.repo = Some("cgraf78/shdeps".to_owned());
+        let env = FakeEnv::new()
+            .with_var("SHDEPS_TEST_PLATFORM", "linux")
+            .with_command("uname -m", "x86_64");
+        let archive_name = "shdeps-v2026.05.24-linux-x86_64-musl.tar.gz";
+        let checksum_name = format!("{archive_name}.sha256");
+        let archive = release_tar();
+        let checksum = format!("{}  {archive_name}\n", checksum::sha256_hex(&archive));
+        let client = FakeClient::new()
+            .with(
+                "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100",
+                releases_json("v2026.05.24").into_bytes(),
+            )
+            .with(
+                &format!("https://github.com/owner/tool/releases/download/v1/{archive_name}"),
+                archive,
+            )
+            .with(
+                &format!("https://github.com/owner/tool/releases/download/v1/{checksum_name}"),
+                checksum.into_bytes(),
+            );
+
+        let summary =
+            release_archive(&dir, &metadata, &env, &FakeRunner::default(), &client).unwrap();
+
+        assert_eq!(
+            summary.outcome,
+            ReleaseArchiveOutcome::Repaired {
+                tag: "v2026.05.24".to_owned(),
+                missing: "lua/shdeps/bootstrap.lua".to_owned(),
+            }
+        );
+        assert!(dir.join("lua/shdeps/bootstrap.lua").is_file());
+        assert_eq!(
+            fs::read_to_string(dir.join("shdeps")).unwrap(),
+            "new binary"
+        );
     }
 
     #[test]

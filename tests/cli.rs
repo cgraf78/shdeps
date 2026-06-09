@@ -1724,6 +1724,112 @@ esac
 }
 
 #[test]
+fn update_self_update_release_install_repairs_missing_current_payload() {
+    let fixture = Fixture::new("update-self-update-repair");
+    let fakebin = fixture.dir.join("fakebin");
+    let install = fixture.dir.join("release-install");
+    let archive = fixture.dir.join("shdeps-release.tar.gz");
+    let checksum = fixture.dir.join("shdeps-release.tar.gz.sha256");
+    let arch = host_arch();
+    let platform = format!("linux-{arch}-musl");
+    fs::create_dir_all(install.join("man/man1")).unwrap();
+    fs::create_dir_all(install.join("lua/shdeps")).unwrap();
+    fixture.write(
+        "release-install/shdeps",
+        "#!/bin/sh\nprintf 'shdeps 20260524-120000-deadbeef\\n'\n",
+    );
+    fixture.write("release-install/shdeps.sh", "old shim\n");
+    fixture.write("release-install/install.sh", "#!/bin/sh\nexit 0\n");
+    fixture.write("release-install/README.md", "readme\n");
+    fixture.write("release-install/LICENSE", "license\n");
+    fixture.write("release-install/man/man1/shdeps.1", ".TH SHDEPS 1\n");
+    fixture.write("release-install/lua/shdeps.lua", "return {}\n");
+    fixture.write("release-install/lua/shdeps/core.lua", "return {}\n");
+    fixture.write(
+        "release-install/.shdeps-install.json",
+        &format!(
+            r#"{{"schema":1,"method":"release","artifact_platform":"{platform}","tag":"20260524-120000-deadbeef","repo":"cgraf78/shdeps"}}"#
+        ),
+    );
+
+    let archive_name = format!("shdeps-20260524-120000-deadbeef-{platform}.tar.gz");
+    let checksum_name = format!("{archive_name}.sha256");
+    write_tar_gz(
+        &archive,
+        &[
+            (
+                "shdeps",
+                "#!/bin/sh\nprintf 'shdeps 20260524-120000-deadbeef\\n'\n",
+                0o755,
+            ),
+            ("shdeps.sh", "shdeps_version() { :; }\n", 0o644),
+            ("install.sh", "#!/bin/sh\nexit 0\n", 0o755),
+            ("README.md", "readme\n", 0o644),
+            ("LICENSE", "license\n", 0o644),
+            ("man/man1/shdeps.1", ".TH SHDEPS 1\n", 0o644),
+            ("lua/shdeps.lua", "return {}\n", 0o644),
+            ("lua/shdeps/core.lua", "return {}\n", 0o644),
+            (
+                "lua/shdeps/bootstrap.lua",
+                "return { repaired = true }\n",
+                0o644,
+            ),
+        ],
+    );
+    fs::write(
+        &checksum,
+        format!(
+            "{}  {archive_name}\n",
+            shdeps::checksum::sha256_hex(&fs::read(&archive).unwrap())
+        ),
+    )
+    .unwrap();
+
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+set -e
+config=$(cat)
+case "$config" in
+  *'url = "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100"'*)
+    printf '[{"tag_name":"20260524-120000-deadbeef","draft":false,"prerelease":false,"assets":[{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"},{"name":"%s","browser_download_url":"https://github.com/owner/tool/releases/download/v1/%s"}]}]\n' \
+      "$SHDEPS_TEST_ARCHIVE_NAME" "$SHDEPS_TEST_ARCHIVE_NAME" \
+      "$SHDEPS_TEST_CHECKSUM_NAME" "$SHDEPS_TEST_CHECKSUM_NAME"
+    ;;
+  *'url = "https://github.com/owner/tool/releases/download/v1/'"$SHDEPS_TEST_ARCHIVE_NAME"'"'*)
+    cat "$SHDEPS_TEST_ARCHIVE"
+    ;;
+  *'url = "https://github.com/owner/tool/releases/download/v1/'"$SHDEPS_TEST_CHECKSUM_NAME"'"'*)
+    cat "$SHDEPS_TEST_CHECKSUM"
+    ;;
+  *)
+    printf 'unexpected curl config\n%s\n' "$config" >&2
+    exit 22
+    ;;
+esac
+"#,
+    );
+
+    let mut update = fixture.command(["update"]);
+    update
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_ARCHIVE", &archive)
+        .env("SHDEPS_TEST_CHECKSUM", &checksum)
+        .env("SHDEPS_TEST_ARCHIVE_NAME", &archive_name)
+        .env("SHDEPS_TEST_CHECKSUM_NAME", &checksum_name);
+    let update = run(&mut update);
+
+    assert_success(&update);
+    assert_eq!(text(&update.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&update.stderr), "");
+    assert_eq!(
+        fs::read_to_string(install.join("lua/shdeps/bootstrap.lua")).unwrap(),
+        "return { repaired = true }\n"
+    );
+}
+
+#[test]
 fn update_self_update_ignores_unsupported_install_metadata() {
     let fixture = Fixture::new("update-self-update-unsupported");
     let install = fixture.dir.join("release-install");
