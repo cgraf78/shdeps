@@ -116,7 +116,7 @@ pub fn stage(
         let _ = fs::remove_dir_all(&dir);
         return Err(Failure::Extract(error));
     }
-    if let Some(path) = missing_required(&dir) {
+    if let Some(path) = missing_required_file(&dir) {
         let _ = fs::remove_dir_all(&dir);
         return Err(Failure::MissingRequired { path });
     }
@@ -141,7 +141,13 @@ fn stage_dir(parent: &Path, tag: &str) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-fn missing_required(dir: &Path) -> Option<&'static str> {
+/// Returns the first required release payload file missing from `dir`.
+///
+/// Self-update uses the same checklist for both candidate archives and the
+/// live install. That keeps "is this install complete enough to skip a current
+/// release?" aligned with "is this archive complete enough to activate?".
+#[must_use]
+pub fn missing_required_file(dir: &Path) -> Option<&'static str> {
     REQUIRED_FILES
         .iter()
         .copied()

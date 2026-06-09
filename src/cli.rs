@@ -2417,6 +2417,11 @@ where
                 writeln!(stdout, "shdeps: updated to {tag}")?;
             }
         }
+        ReleaseArchiveOutcome::Repaired { tag, missing } => {
+            if !quiet {
+                writeln!(stdout, "shdeps: repaired {tag} (restored {missing})")?;
+            }
+        }
         ReleaseArchiveOutcome::NoUpdate { current, .. } => {
             if !quiet {
                 writeln!(stdout, "shdeps: no update available ({current})")?;
@@ -2500,6 +2505,12 @@ where
     match &summary.outcome {
         ReleaseArchiveOutcome::Updated { tag } => {
             writeln!(stderr, "shdeps: update self-check installed {tag}")?;
+        }
+        ReleaseArchiveOutcome::Repaired { tag, missing } => {
+            writeln!(
+                stderr,
+                "shdeps: update self-check repaired {tag} (restored {missing})"
+            )?;
         }
         ReleaseArchiveOutcome::NoUpdate { current, .. } => {
             writeln!(
