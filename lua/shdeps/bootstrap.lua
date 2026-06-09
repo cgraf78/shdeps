@@ -104,7 +104,19 @@ end
 function M.load(options)
   for _, path in ipairs(candidates(options)) do
     if readable(path) then
-      return dofile(path)
+      -- Some embedders compile configuration chunks without file-backed debug
+      -- metadata. Bootstrap already owns the selected candidate path, so pass
+      -- that path through the loaded chunk's varargs for sibling discovery.
+      local chunk, load_error = loadfile(path)
+      if not chunk then
+        error(load_error, 0)
+      end
+
+      local ok, module = pcall(chunk, path)
+      if ok then
+        return module
+      end
+      error(module, 0)
     end
   end
 

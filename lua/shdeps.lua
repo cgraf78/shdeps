@@ -17,7 +17,13 @@
 -- Runtime hosts that need to discover the installed shdeps module can load
 -- `lua/shdeps/bootstrap.lua` and call `bootstrap.load(options)`.
 
+local injected_source = ...
+
 local function source_path()
+  if type(injected_source) == "string" and injected_source:match("%.lua$") then
+    return (injected_source:gsub("^@", ""):gsub("\\", "/"))
+  end
+
   if type(debug) ~= "table" or type(debug.getinfo) ~= "function" then
     return nil
   end
