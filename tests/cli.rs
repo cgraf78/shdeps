@@ -1013,6 +1013,35 @@ fn list_reports_configured_dependency_statuses() {
 }
 
 #[test]
+fn list_preserves_hyphenated_release_version_details() {
+    let fixture = Fixture::new("list-hyphenated-release-version");
+    fixture.write("conf/deps.conf", "cgraf78/hive-memory github:release hm\n");
+    fixture.write_executable(
+        "bin/hm",
+        "#!/bin/sh\nprintf 'hm 20260611-142043-2c877b15 (schema 1)\\n'\n",
+    );
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "cgraf78/hive-memory|github:release|hm|{}\n",
+            fixture.dir.join("bin/hm").display()
+        ),
+    );
+
+    let mut command = fixture.command(["list"]);
+    command.env(
+        "PATH",
+        format!("{}:/usr/bin:/bin", fixture.dir.join("bin").display()),
+    );
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert!(text(&output.stdout).contains("20260611-142043-2c877b15"));
+    assert!(!text(&output.stdout).contains("20260611\n"));
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
 fn list_resolves_bare_github_to_concrete_release_method() {
     let fixture = Fixture::new("list-github-release");
     let asset = host_linux_asset("tool", "v1.0.0");
