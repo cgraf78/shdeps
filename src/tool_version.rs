@@ -103,16 +103,17 @@ fn first_integer_token(line: &str) -> Option<String> {
         }
 
         let start = index;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-        }
-        if bytes.get(index).is_some_and(u8::is_ascii_lowercase) {
+        while bytes.get(index).is_some_and(version_token_char) {
             index += 1;
         }
         return Some(line[start..index].to_owned());
     }
 
     None
+}
+
+fn version_token_char(byte: &u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-' | b'+')
 }
 
 fn command_name(command: &str) -> &str {
@@ -189,6 +190,16 @@ mod tests {
             )
             .as_deref(),
             Some("668")
+        );
+    }
+
+    #[test]
+    fn preserves_hyphenated_release_identity_near_command_name() {
+        let output = "hm 20260611-142043-2c877b15 (schema 1)";
+
+        assert_eq!(
+            extract(&[output], "hm").as_deref(),
+            Some("20260611-142043-2c877b15")
         );
     }
 
