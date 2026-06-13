@@ -1408,7 +1408,7 @@ esac
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_CURL_LOG", &log)
         .env("SHDEPS_TEST_TAG", tag)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let first = run(&mut first);
 
     assert_success(&first);
@@ -1422,7 +1422,7 @@ esac
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_CURL_LOG", &log)
         .env("SHDEPS_TEST_TAG", tag)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let second = run(&mut second);
 
     assert_success(&second);
@@ -1436,7 +1436,7 @@ esac
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_CURL_LOG", &log)
         .env("SHDEPS_TEST_TAG", tag)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let forced = run(&mut forced);
 
     assert_success(&forced);
@@ -1450,7 +1450,7 @@ esac
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_CURL_LOG", &log)
         .env("SHDEPS_TEST_TAG", tag)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400")
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600")
         .env("SHDEPS_FORCE", "1");
     let env_forced = run(&mut env_forced);
 
@@ -1472,6 +1472,70 @@ esac
     assert_eq!(text(&ttl_zero.stdout), "No dependencies configured.\n");
     assert_eq!(text(&ttl_zero.stderr), "");
     assert_eq!(count_release_fetches(&log), 4);
+}
+
+#[test]
+fn update_self_update_uses_one_hour_default_ttl() {
+    let fixture = Fixture::new("update-self-update-default-ttl");
+    let fakebin = fixture.dir.join("fakebin");
+    let install = fixture.dir.join("release-install");
+    let log = fixture.dir.join("curl.log");
+    let tag = "20260524-120000-deadbeef";
+    let platform = format!("linux-{}-musl", host_arch());
+    fs::create_dir_all(&install).unwrap();
+    fixture.write(
+        "release-install/.shdeps-install.json",
+        &format!(
+            r#"{{"schema":1,"method":"release","artifact_platform":"{platform}","tag":"{tag}","repo":"cgraf78/shdeps"}}"#
+        ),
+    );
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+set -e
+config=$(cat)
+printf '%s\n' "$config" >>"$SHDEPS_TEST_CURL_LOG"
+case "$config" in
+  *'url = "https://api.github.com/repos/cgraf78/shdeps/releases?per_page=100"'*)
+    printf '[{"tag_name":"%s","draft":false,"prerelease":false,"assets":[]}]' "$SHDEPS_TEST_TAG"
+    ;;
+  *)
+    printf 'unexpected curl config\n%s\n' "$config" >&2
+    exit 22
+    ;;
+esac
+"#,
+    );
+
+    // Straddling the default one-hour self-update TTL makes the public default
+    // observable without sleeping in the integration suite.
+    fixture.write_stamp_age("shdeps", "self-update", 3500);
+    let mut fresh = fixture.command(["update"]);
+    fresh
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_TEST_TAG", tag);
+    let fresh = run(&mut fresh);
+
+    assert_success(&fresh);
+    assert_eq!(text(&fresh.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&fresh.stderr), "");
+    assert_eq!(count_release_fetches(&log), 0);
+
+    fixture.write_stamp_age("shdeps", "self-update", 3700);
+    let mut stale = fixture.command(["update"]);
+    stale
+        .env("SHDEPS_DIR", &install)
+        .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
+        .env("SHDEPS_TEST_CURL_LOG", &log)
+        .env("SHDEPS_TEST_TAG", tag);
+    let stale = run(&mut stale);
+
+    assert_success(&stale);
+    assert_eq!(text(&stale.stdout), "No dependencies configured.\n");
+    assert_eq!(text(&stale.stderr), "");
+    assert_eq!(count_release_fetches(&log), 1);
 }
 
 #[test]
@@ -1504,7 +1568,7 @@ esac
         .env("SHDEPS_DIR", &install)
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_GIT_LOG", &log)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let first = run(&mut first);
 
     assert_success(&first);
@@ -1517,7 +1581,7 @@ esac
         .env("SHDEPS_DIR", &install)
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_GIT_LOG", &log)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let second = run(&mut second);
 
     assert_success(&second);
@@ -1530,7 +1594,7 @@ esac
         .env("SHDEPS_DIR", &install)
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_GIT_LOG", &log)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let forced = run(&mut forced);
 
     assert_success(&forced);
@@ -1575,7 +1639,7 @@ esac
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_GIT_LOG", &log)
         .env("SHDEPS_TEST_DIRTY", &dirty)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let first = run(&mut first);
 
     assert_success(&first);
@@ -1591,7 +1655,7 @@ esac
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_GIT_LOG", &log)
         .env("SHDEPS_TEST_DIRTY", &dirty)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let second = run(&mut second);
 
     assert_success(&second);
@@ -1630,7 +1694,7 @@ exit 22
         .env("SHDEPS_DIR", &install)
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_CURL_LOG", &log)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let first = run(&mut first);
 
     assert_success(&first);
@@ -1644,7 +1708,7 @@ exit 22
         .env("SHDEPS_DIR", &install)
         .env("PATH", format!("{}:/usr/bin:/bin", fakebin.display()))
         .env("SHDEPS_TEST_CURL_LOG", &log)
-        .env("SHDEPS_SELF_UPDATE_TTL", "86400");
+        .env("SHDEPS_SELF_UPDATE_TTL", "3600");
     let second = run(&mut second);
 
     assert_success(&second);
@@ -2701,10 +2765,15 @@ esac
     }
 
     fn write_fresh_stamp(&self, name: &str, kind: &str) {
+        self.write_stamp_age(name, kind, 0);
+    }
+
+    fn write_stamp_age(&self, name: &str, kind: &str, age_secs: u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after Unix epoch")
-            .as_secs();
+            .as_secs()
+            .saturating_sub(age_secs);
         let path = shdeps::stamp::remote_path(&self.dir.join("state"), name, kind);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, format!("{now}\n")).unwrap();

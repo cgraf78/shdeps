@@ -190,7 +190,7 @@ Output:
 `shdeps update` also owns automatic self-update. Before dependency updates, it
 SHOULD perform a quiet, best-effort self-update check for every supported
 install target. This check MUST be TTL-gated by
-`SHDEPS_SELF_UPDATE_TTL` (default: 86400 seconds), MUST stamp attempts rather
+`SHDEPS_SELF_UPDATE_TTL` (default: 3600 seconds), MUST stamp attempts rather
 than only successful updates, and MUST treat failures as non-fatal so a
 transient GitHub outage cannot block dependency updates. `--force`,
 `SHDEPS_FORCE=1`, and reinstall mode MUST bypass the self-update TTL. Explicit
@@ -404,7 +404,7 @@ Runtime environment variables:
 | `SHDEPS_REINSTALL` | `0` | Force reinstall behavior |
 | `SHDEPS_QUIET` | `0` | Suppress non-result logs and prompts |
 | `SHDEPS_REMOTE_TTL` | `3600` | Remote cache TTL seconds |
-| `SHDEPS_SELF_UPDATE_TTL` | `86400` | Self-update attempt TTL seconds for `shdeps update` |
+| `SHDEPS_SELF_UPDATE_TTL` | `3600` | Self-update attempt TTL seconds for `shdeps update` |
 | `SHDEPS_GIT_DEV_DIR` | `$HOME/git` | Local dev clone root |
 | `SHDEPS_INSTALL_DIR` | `$HOME/.local/share` | Dependency install root |
 | `SHDEPS_BIN_DIR` | `$HOME/.local/bin` | Public command symlink dir |
