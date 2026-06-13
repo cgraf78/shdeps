@@ -2605,7 +2605,7 @@ fn self_update_ttl() -> u64 {
     env::var("SHDEPS_SELF_UPDATE_TTL")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(86_400)
+        .unwrap_or(3600)
 }
 
 fn custom_probe() -> BashCustomProbe {
