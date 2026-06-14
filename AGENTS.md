@@ -125,6 +125,26 @@ and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
   For other methods, runs before the built-in cleanup — use it to reverse
   what `post()` created (symlinks, config files).
 
+### Hook helper toolkit
+
+Fallback-install hooks may call these public helpers instead of re-implementing
+the plumbing. Like every `shdeps_*` function they are thin one-line shims; the
+behavior lives in Rust (`src/hook_toolkit.rs`, bridged through `__api`).
+
+- `shdeps_skip <dep> [reason]` — record a `.skipped` marker (with an optional
+  reason) under the dependency's install dir, e.g. when no runtime is available.
+- `shdeps_skipped <dep>` — predicate: `0` if the dep is marked skipped.
+- `shdeps_skip_reason <dep>` — print the recorded reason; `1` if not skipped.
+- `shdeps_unskip <dep>` — remove the marker.
+- `shdeps_find_runtime [--path DIR]... [--reject SUBSTR] [--verify] <name>...` —
+  print the first executable found in the `--path` dirs then `$PATH`. `--reject`
+  drops a candidate whose `--version` output contains `SUBSTR`; `--verify`
+  requires a successful `--version`. Exit `1` when none qualifies.
+- `shdeps_write_wrapper [--env VAR=value]... <name> <interp> [args...] -- <payload>`
+  — write an executable `<bin_dir>/<name>` that execs
+  `<interp> <args...> <payload> "$@"`. `--env` lines are emitted before the exec
+  (e.g. a gem `PATH=...:$PATH`). Prints the wrapper path.
+
 ## Code Quality
 
 - shellcheck must pass on all `.sh` files

@@ -17,6 +17,7 @@ use crate::dep_links;
 use crate::dep_path;
 use crate::errors::Error;
 use crate::extras;
+use crate::hook_toolkit::{self, RuntimeQuery, WrapperSpec};
 use crate::http::Curl;
 use crate::link_state::{self, Kind};
 use crate::method;
@@ -217,6 +218,59 @@ where
                 stderr,
             )
         }
+        "skip-mark" => {
+            let Some(dep) = rest.first() else {
+                writeln!(stderr, "error: __api skip-mark requires a dependency name")?;
+                return Ok(2);
+            };
+            let reason = rest.get(1).map(String::as_str).unwrap_or("");
+            if hook_toolkit::skip_mark(&roots.install_dir, dep, reason)? {
+                Ok(0)
+            } else {
+                writeln!(
+                    stderr,
+                    "error: __api skip-mark received an invalid dependency name"
+                )?;
+                Ok(2)
+            }
+        }
+        "skip-check" => {
+            let Some(dep) = rest.first() else {
+                writeln!(stderr, "error: __api skip-check requires a dependency name")?;
+                return Ok(2);
+            };
+            Ok(if hook_toolkit::skip_check(&roots.install_dir, dep) {
+                0
+            } else {
+                1
+            })
+        }
+        "skip-reason" => {
+            let Some(dep) = rest.first() else {
+                writeln!(
+                    stderr,
+                    "error: __api skip-reason requires a dependency name"
+                )?;
+                return Ok(2);
+            };
+            match hook_toolkit::skip_reason(&roots.install_dir, dep) {
+                Some(reason) => {
+                    writeln!(stdout, "{reason}")?;
+                    Ok(0)
+                }
+                None => Ok(1),
+            }
+        }
+        "skip-clear" => {
+            let Some(dep) = rest.first() else {
+                writeln!(stderr, "error: __api skip-clear requires a dependency name")?;
+                return Ok(2);
+            };
+            hook_toolkit::skip_clear(&roots.install_dir, dep)?;
+            Ok(0)
+        }
+        "find-runtime" => find_runtime(rest, stdout, stderr),
+        "write-wrapper" => write_wrapper(rest, &roots.bin_dir, stdout, stderr),
         other => {
             writeln!(stderr, "error: unknown __api command '{other}'")?;
             Ok(2)
@@ -319,6 +373,140 @@ where
         writeln!(stdout, "  {name} -- {}", outcome.detail)?;
     }
     Ok(0)
+}
+
+fn find_runtime<W, E>(rest: &[String], stdout: &mut W, stderr: &mut E) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    let mut dirs: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut reject: Option<String> = None;
+    let mut verify = false;
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--path" => {
+                let Some(dir) = iter.next() else {
+                    writeln!(
+                        stderr,
+                        "error: __api find-runtime --path requires a directory"
+                    )?;
+                    return Ok(2);
+                };
+                dirs.push(dir.clone());
+            }
+            "--reject" => {
+                let Some(pattern) = iter.next() else {
+                    writeln!(
+                        stderr,
+                        "error: __api find-runtime --reject requires a value"
+                    )?;
+                    return Ok(2);
+                };
+                reject = Some(pattern.clone());
+            }
+            "--verify" => verify = true,
+            other => names.push(other.to_owned()),
+        }
+    }
+    if names.is_empty() {
+        writeln!(
+            stderr,
+            "error: __api find-runtime requires at least one name"
+        )?;
+        return Ok(2);
+    }
+    let query = RuntimeQuery {
+        names: &names,
+        dirs: &dirs,
+        reject: reject.as_deref(),
+        verify,
+    };
+    match hook_toolkit::find_runtime(&query, &Process) {
+        Some(path) => {
+            writeln!(stdout, "{}", path.display())?;
+            Ok(0)
+        }
+        None => Ok(1),
+    }
+}
+
+fn write_wrapper<W, E>(
+    rest: &[String],
+    bin_dir: &Path,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    let mut env: Vec<String> = Vec::new();
+    let mut head: Vec<String> = Vec::new();
+    let mut payload: Option<String> = None;
+    let mut saw_separator = false;
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        if saw_separator {
+            if payload.is_some() {
+                writeln!(
+                    stderr,
+                    "error: __api write-wrapper takes a single payload after --"
+                )?;
+                return Ok(2);
+            }
+            payload = Some(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--env" => {
+                let Some(assignment) = iter.next() else {
+                    writeln!(
+                        stderr,
+                        "error: __api write-wrapper --env requires VAR=value"
+                    )?;
+                    return Ok(2);
+                };
+                env.push(assignment.clone());
+            }
+            "--" => saw_separator = true,
+            other => head.push(other.to_owned()),
+        }
+    }
+    let Some(payload) = payload else {
+        writeln!(stderr, "error: __api write-wrapper requires '-- <payload>'")?;
+        return Ok(2);
+    };
+    let (Some(name), Some(interpreter)) = (head.first(), head.get(1)) else {
+        writeln!(
+            stderr,
+            "error: __api write-wrapper requires <name> <interpreter> [args...] -- <payload>"
+        )?;
+        return Ok(2);
+    };
+    let interp_args = head.get(2..).unwrap_or(&[]);
+    let spec = WrapperSpec {
+        name,
+        interpreter,
+        interp_args,
+        payload: &payload,
+        env: &env,
+    };
+    match hook_toolkit::write_wrapper(bin_dir, &spec)? {
+        Some(path) => {
+            writeln!(stdout, "{}", path.display())?;
+            Ok(0)
+        }
+        None => {
+            writeln!(
+                stderr,
+                "error: __api write-wrapper received an invalid wrapper name"
+            )?;
+            Ok(2)
+        }
+    }
 }
 
 fn mark_changed(state_dir: &Path, name: &str) -> Result<()> {

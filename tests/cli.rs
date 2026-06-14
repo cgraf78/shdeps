@@ -277,6 +277,123 @@ fn mutating_api_links_and_unlinks_extras() {
 }
 
 #[test]
+fn skip_marker_api_round_trips() {
+    let fixture = Fixture::new("api-skip");
+
+    let unmarked = run(&mut fixture.command(["__api", "skip-check", "owner/tool"]));
+    assert_eq!(unmarked.status.code(), Some(1));
+
+    let mark = run(&mut fixture.command(["__api", "skip-mark", "owner/tool", "no java runtime"]));
+    assert_success(&mark);
+    assert!(
+        fixture.dir.join("share/owner/tool/.skipped").exists(),
+        "skip marker should live under the install dir"
+    );
+
+    let check = run(&mut fixture.command(["__api", "skip-check", "owner/tool"]));
+    assert_success(&check);
+
+    let reason = run(&mut fixture.command(["__api", "skip-reason", "owner/tool"]));
+    assert_success(&reason);
+    assert_eq!(text(&reason.stdout), "no java runtime\n");
+
+    let clear = run(&mut fixture.command(["__api", "skip-clear", "owner/tool"]));
+    assert_success(&clear);
+    let recheck = run(&mut fixture.command(["__api", "skip-check", "owner/tool"]));
+    assert_eq!(recheck.status.code(), Some(1));
+    let gone = run(&mut fixture.command(["__api", "skip-reason", "owner/tool"]));
+    assert_eq!(gone.status.code(), Some(1));
+
+    // An unsafe dependency name is rejected without touching the filesystem.
+    let bad = run(&mut fixture.command(["__api", "skip-mark", "../escape", "x"]));
+    assert_eq!(bad.status.code(), Some(2));
+}
+
+#[test]
+fn find_runtime_api_searches_dirs_and_rejects() {
+    let fixture = Fixture::new("api-find-runtime");
+    fixture.write_executable("opt/jdk/bin/myjava", "#!/bin/sh\necho 'openjdk 21'\n");
+    let opt = fixture.dir.join("opt/jdk/bin");
+
+    let found = run(&mut fixture.command([
+        "__api",
+        "find-runtime",
+        "--path",
+        opt.to_str().unwrap(),
+        "myjava",
+    ]));
+    assert_success(&found);
+    assert_eq!(text(&found.stdout), format!("{}/myjava\n", opt.display()));
+
+    let missing = run(&mut fixture.command(["__api", "find-runtime", "definitely-absent-xyz"]));
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(text(&missing.stdout), "");
+
+    // --reject drops a candidate whose --version output matches the substring.
+    fixture.write_executable("opt/php/bin/myphp", "#!/bin/sh\necho 'HipHop VM 4'\n");
+    let php = fixture.dir.join("opt/php/bin");
+    let rejected = run(&mut fixture.command([
+        "__api",
+        "find-runtime",
+        "--path",
+        php.to_str().unwrap(),
+        "--reject",
+        "HipHop",
+        "myphp",
+    ]));
+    assert_eq!(rejected.status.code(), Some(1));
+}
+
+#[test]
+fn write_wrapper_api_generates_executable_launcher() {
+    let fixture = Fixture::new("api-write-wrapper");
+    let payload = fixture.dir.join("share/gjf/google-java-format.jar");
+
+    let wrapper = run(&mut fixture.command([
+        "__api",
+        "write-wrapper",
+        "google-java-format",
+        "java",
+        "-jar",
+        "--",
+        payload.to_str().unwrap(),
+    ]));
+    assert_success(&wrapper);
+    let wrapper_path = fixture.dir.join("bin/google-java-format");
+    assert_eq!(
+        text(&wrapper.stdout),
+        format!("{}\n", wrapper_path.display())
+    );
+    let mode = fs::metadata(&wrapper_path).unwrap().permissions().mode();
+    assert!(mode & 0o111 != 0, "wrapper should be executable");
+    let body = fs::read_to_string(&wrapper_path).unwrap();
+    assert!(body.starts_with("#!/usr/bin/env bash\n"));
+    assert!(body.contains(&format!(
+        "exec 'java' '-jar' '{}' \"$@\"",
+        payload.display()
+    )));
+
+    // --env lines are emitted before the exec so PATH-style values still expand.
+    let with_env = run(&mut fixture.command([
+        "__api",
+        "write-wrapper",
+        "--env",
+        "PATH=/x:$PATH",
+        "rubocop",
+        "ruby",
+        "--",
+        payload.to_str().unwrap(),
+    ]));
+    assert_success(&with_env);
+    let rb = fs::read_to_string(fixture.dir.join("bin/rubocop")).unwrap();
+    assert!(rb.contains("export PATH=/x:$PATH\n"));
+
+    // An unsafe wrapper name is rejected.
+    let bad = run(&mut fixture.command(["__api", "write-wrapper", "../evil", "ruby", "--", "x"]));
+    assert_eq!(bad.status.code(), Some(2));
+}
+
+#[test]
 fn mutating_api_installs_packages_with_cached_manager() {
     let fixture = Fixture::new("api-pkg-install");
     let fakebin = fixture.dir.join("fakebin");
