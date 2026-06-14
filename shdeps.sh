@@ -239,6 +239,13 @@ shdeps_link_extras() { _shdepsw_call __api link-extras "$@"; }
 shdeps_unlink_extras() { _shdepsw_call __api unlink-extras "$@"; }
 shdeps_github_release_install() { _shdepsw_call __api github-release-install "$@"; }
 
+shdeps_skip() { _shdepsw_call __api skip-mark "$@"; }
+shdeps_skipped() { _shdepsw_call __api skip-check "$@"; }
+shdeps_skip_reason() { _shdepsw_call __api skip-reason "$@"; }
+shdeps_unskip() { _shdepsw_call __api skip-clear "$@"; }
+shdeps_find_runtime() { _shdepsw_call __api find-runtime "$@"; }
+shdeps_write_wrapper() { _shdepsw_call __api write-wrapper "$@"; }
+
 shdeps_log() { if _shdepsw_should_log; then printf '%s\n' "$*"; fi; }
 shdeps_warn() { if _shdepsw_should_log; then printf '%s\n' "$*" >&2; fi; }
 shdeps_log_warn() { shdeps_warn "$@"; }

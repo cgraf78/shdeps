@@ -53,6 +53,13 @@ shdeps_unlink_extras() { command shdeps __api unlink-extras "$@"; }
 
 shdeps_github_release_install() { command shdeps __api github-release-install "$@"; }
 
+shdeps_skip() { command shdeps __api skip-mark "$@"; }
+shdeps_skipped() { command shdeps __api skip-check "$@"; }
+shdeps_skip_reason() { command shdeps __api skip-reason "$@"; }
+shdeps_unskip() { command shdeps __api skip-clear "$@"; }
+shdeps_find_runtime() { command shdeps __api find-runtime "$@"; }
+shdeps_write_wrapper() { command shdeps __api write-wrapper "$@"; }
+
 shdeps_log() { printf '%s\n' "$*"; }
 shdeps_warn() { printf '%s\n' "$*" >&2; }
 shdeps_log_warn() { shdeps_warn "$@"; }
@@ -92,6 +99,14 @@ mod tests {
             r#"shdeps_github_release_install() { command shdeps __api github-release-install "$@"; }"#
         ));
         assert!(source.contains(r#"shdeps_dep_links() { command shdeps __api dep-links "$@"; }"#));
+        assert!(source.contains(r#"shdeps_skip() { command shdeps __api skip-mark "$@"; }"#));
+        assert!(
+            source.contains(r#"shdeps_find_runtime() { command shdeps __api find-runtime "$@"; }"#)
+        );
+        assert!(
+            source
+                .contains(r#"shdeps_write_wrapper() { command shdeps __api write-wrapper "$@"; }"#)
+        );
         assert!(source.contains("shdeps_dep_source()"));
         assert!(source.contains("shdeps_mark_changed()"));
     }

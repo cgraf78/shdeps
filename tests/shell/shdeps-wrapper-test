@@ -350,4 +350,45 @@ _assert_symlink "bootstrap release wrapper: CLI linked" "$_bootstrap_bin"
 _assert_eq "bootstrap release wrapper: CLI points at sibling binary" "$_bootstrap_release/shdeps" "$(readlink "$_bootstrap_bin")"
 _assert_symlink "bootstrap release wrapper: man page linked through public helper" "$_bootstrap_share/man/man1/shdeps.1"
 
+echo ""
+echo "=== Hook toolkit shims ==="
+
+shdeps_skip owner/tool "no runtime available"
+if [[ -f "$_install/owner/tool/.skipped" ]]; then
+  _pass "wrapper: shdeps_skip writes marker under install dir"
+else
+  _fail "wrapper: shdeps_skip writes marker under install dir"
+fi
+if shdeps_skipped owner/tool; then
+  _pass "wrapper: shdeps_skipped detects marker"
+else
+  _fail "wrapper: shdeps_skipped detects marker"
+fi
+_assert_eq "wrapper: shdeps_skip_reason reads reason" \
+  "no runtime available" "$(shdeps_skip_reason owner/tool)"
+shdeps_unskip owner/tool
+if shdeps_skipped owner/tool; then
+  _fail "wrapper: shdeps_unskip clears marker"
+else
+  _pass "wrapper: shdeps_unskip clears marker"
+fi
+
+_rt_dir=$(_tmpdir)
+cat >"$_rt_dir/fakejava" <<'EOF'
+#!/bin/sh
+echo "openjdk 21"
+EOF
+chmod +x "$_rt_dir/fakejava"
+_assert_eq "wrapper: shdeps_find_runtime locates a --path binary" \
+  "$_rt_dir/fakejava" "$(shdeps_find_runtime --path "$_rt_dir" fakejava)"
+
+_wrapper_path=$(shdeps_write_wrapper toolwrap "$_rt_dir/fakejava" -- /opt/tool.jar)
+_assert_eq "wrapper: shdeps_write_wrapper reports bin path" \
+  "$_bin/toolwrap" "$_wrapper_path"
+if [[ -x "$_bin/toolwrap" ]]; then
+  _pass "wrapper: shdeps_write_wrapper output is executable"
+else
+  _fail "wrapper: shdeps_write_wrapper output is executable"
+fi
+
 _test_summary
