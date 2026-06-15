@@ -116,8 +116,8 @@ JSON
 {
   "tag_name": "$tag",
   "assets": [
-    {"name": "$archive", "browser_download_url": "https://example.test/$archive"},
-    {"name": "$archive.sha256", "browser_download_url": "https://example.test/$archive.sha256"}
+    {"name": "$archive", "browser_download_url": "https://github.com/cgraf78/shdeps/releases/download/$tag/$archive"},
+    {"name": "$archive.sha256", "browser_download_url": "https://github.com/cgraf78/shdeps/releases/download/$tag/$archive.sha256"}
   ]
 }
 JSON
@@ -131,6 +131,7 @@ _write_fixture_curl() {
 set -eu
 out=""
 url=""
+config=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o)
@@ -144,6 +145,10 @@ while [[ $# -gt 0 ]]; do
       printf '%s\n' "$2" >>"${SHDEPS_TEST_CURL_LOG:-/dev/null}"
       shift 2
       ;;
+    --config)
+      config="$2"
+      shift 2
+      ;;
     -*)
       shift
       ;;
@@ -153,6 +158,27 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+# When invoked with `--config -`, real curl reads the URL and headers from
+# stdin instead of argv (this is how install.sh keeps the bearer token out of
+# the command line). Mirror the subset shdeps emits: a `url = "..."` line and
+# `header = "..."` lines. Headers are logged like `-H` so token assertions hold.
+if [[ "$config" == "-" ]]; then
+  while IFS= read -r line; do
+    case "$line" in
+      'url = '*)
+        url="${line#url = }"
+        url="${url#\"}"
+        url="${url%\"}"
+        ;;
+      'header = '*)
+        header="${line#header = }"
+        header="${header#\"}"
+        header="${header%\"}"
+        printf '%s\n' "$header" >>"${SHDEPS_TEST_CURL_LOG:-/dev/null}"
+        ;;
+    esac
+  done
+fi
 case "$url" in
   */releases/latest)
     if [[ -n "${SHDEPS_TEST_MARKER_DIR:-}" ]]; then

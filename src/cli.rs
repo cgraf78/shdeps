@@ -371,7 +371,7 @@ where
         pkg_mgr: &pkg_mgr,
         package_versions: &package_versions,
     };
-    let statuses = status::list_with_jobs(&entries, &context, jobs::max(&env_vars))?;
+    let statuses = status::list_with_jobs(&entries, &context, jobs::max_jobs(&env_vars))?;
 
     write_list(&statuses, stdout)?;
     Ok(0)
