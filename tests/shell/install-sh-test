@@ -219,6 +219,126 @@ if tar -tzf "$_evil_dotdot" 2>/dev/null | grep -qE '(^|/)\.\.(/|$)'; then
     _archive_entries_safe "$_evil_dotdot"
 fi
 
+echo "=== install.sh: _archive_entries_safe link rejection ==="
+
+# Symlink entries can redirect an extracted file outside the bundle even
+# when the entry name looks benign, so the guard must reject them (parity
+# with `archive::reject_links`).
+_evil_symlink="$_archive_dir/evil-symlink.tar.gz"
+(
+  cd "$_archive_dir"
+  mkdir -p stage_sym
+  ln -s /etc/passwd stage_sym/link 2>/dev/null || ln -s target stage_sym/link
+  tar -czf evil-symlink.tar.gz -C stage_sym .
+)
+if tar -tzvf "$_evil_symlink" 2>/dev/null | grep -q '^l'; then
+  _assert_false "archive guard refuses symlink entries" \
+    _archive_entries_safe "$_evil_symlink"
+fi
+
+echo "=== install.sh: _curl_get_release_asset host validation ==="
+
+# The browser asset URL is parsed from release JSON on the
+# SHDEPS_RELEASE_API_URL path, so a tampered payload must not be able to
+# redirect the download to an arbitrary host. The guard returns before any
+# curl invocation, so these assertions need no network or curl stub.
+_assert_false "release asset guard refuses non-GitHub host" \
+  _curl_get_release_asset "https://evil.example/payload.tar.gz" "$_fixture_dir/host-out" "" ""
+_assert_false "release asset guard refuses non-https github URL" \
+  _curl_get_release_asset "http://github.com/x.tar.gz" "$_fixture_dir/host-out" "" ""
+
+echo "=== install.sh: _verify_checksum binds to the archive ==="
+
+_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$1" && sha256sum "$2") | awk '{ print $1 }'
+  else
+    (cd "$1" && shasum -a 256 "$2") | awk '{ print $1 }'
+  fi
+}
+
+_ck_dir=$(mktemp -d)
+printf 'payload\n' >"$_ck_dir/app.tar.gz"
+_ck_real=$(_digest "$_ck_dir" app.tar.gz)
+printf '%s  app.tar.gz\n' "$_ck_real" >"$_ck_dir/app.tar.gz.sha256"
+_assert_true "verify_checksum accepts the matching named line" \
+  _verify_checksum "$_ck_dir" app.tar.gz app.tar.gz.sha256
+
+# Binary-mode `*` prefix and `./` prefix must also be accepted.
+printf '%s *./app.tar.gz\n' "$_ck_real" >"$_ck_dir/app-binmode.sha256"
+_assert_true "verify_checksum accepts binary-mode and ./ prefixed names" \
+  _verify_checksum "$_ck_dir" app.tar.gz app-binmode.sha256
+
+# Wrong digest for the archive must fail.
+printf '%s  app.tar.gz\n' "$(printf '0%.0s' $(seq 1 64))" >"$_ck_dir/wrong.sha256"
+_assert_false "verify_checksum rejects a wrong digest" \
+  _verify_checksum "$_ck_dir" app.tar.gz wrong.sha256
+
+# The core fix: a checksum file that only names a DIFFERENT (present,
+# matching) file must NOT verify the archive. Plain `sha256sum -c` would
+# pass here because `other.tar.gz` checks out; binding to the archive name
+# makes it fail closed.
+printf 'payload\n' >"$_ck_dir/other.tar.gz"
+_ck_other=$(_digest "$_ck_dir" other.tar.gz)
+printf '%s  other.tar.gz\n' "$_ck_other" >"$_ck_dir/other-only.sha256"
+_assert_false "verify_checksum rejects a checksum file lacking the archive entry" \
+  _verify_checksum "$_ck_dir" app.tar.gz other-only.sha256
+
+# A bare-hash line (no filename) must not vacuously verify any archive.
+printf '%s\n' "$_ck_real" >"$_ck_dir/bare.sha256"
+_assert_false "verify_checksum rejects a bare-hash line" \
+  _verify_checksum "$_ck_dir" app.tar.gz bare.sha256
+
+rm -rf "$_ck_dir"
+
+echo "=== install.sh: _curl_get keeps the bearer token off argv ==="
+
+# The token must travel via `curl --config -` over stdin, never argv, so it
+# is not visible to `ps` / `/proc/<pid>/cmdline`.
+_curl_stub_dir=$(mktemp -d)
+cat >"$_curl_stub_dir/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SHDEPS_TEST_CURL_ARGV"
+_has_config=0
+_out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config) _has_config=1; shift 2 ;;
+    -o) _out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [[ "$_has_config" == 1 ]]; then
+  cat >>"$SHDEPS_TEST_CURL_STDIN"
+fi
+[[ -n "$_out" ]] && : >"$_out"
+exit 0
+EOF
+chmod +x "$_curl_stub_dir/curl"
+
+SHDEPS_TEST_CURL_ARGV="$_curl_stub_dir/argv"
+SHDEPS_TEST_CURL_STDIN="$_curl_stub_dir/stdin"
+export SHDEPS_TEST_CURL_ARGV SHDEPS_TEST_CURL_STDIN
+: >"$SHDEPS_TEST_CURL_ARGV"
+: >"$SHDEPS_TEST_CURL_STDIN"
+
+_old_path_curl="$PATH"
+PATH="$_curl_stub_dir:$PATH"
+export PATH
+_curl_get "https://api.github.com/repos/o/r/releases/latest" "$_curl_stub_dir/out" "secret-token-xyz"
+PATH="$_old_path_curl"
+export PATH
+
+_assert_false "curl_get: token absent from argv" \
+  grep -q "secret-token-xyz" "$SHDEPS_TEST_CURL_ARGV"
+_assert_true "curl_get: --config used on stdin" \
+  grep -q -- "--config" "$SHDEPS_TEST_CURL_ARGV"
+_assert_true "curl_get: token delivered via stdin config" \
+  grep -q "secret-token-xyz" "$SHDEPS_TEST_CURL_STDIN"
+
+unset SHDEPS_TEST_CURL_ARGV SHDEPS_TEST_CURL_STDIN
+rm -rf "$_curl_stub_dir"
+
 echo "=== shdeps.sh: PATH fallback opt-in ==="
 
 # The wrapper used to silently fall through to whatever `shdeps` happened

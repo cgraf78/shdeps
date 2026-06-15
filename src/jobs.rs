@@ -9,8 +9,11 @@
 use std::collections::BTreeMap;
 
 /// Returns the maximum parallel jobs for one shdeps operation.
+///
+/// Named `max_jobs` rather than `max` so call sites do not collide
+/// visually with the ubiquitous `Ord::max`/`Iterator::max`.
 #[must_use]
-pub fn max(env_vars: &BTreeMap<String, String>) -> usize {
+pub fn max_jobs(env_vars: &BTreeMap<String, String>) -> usize {
     let configured = env_vars
         .get("SHDEPS_JOBS")
         .and_then(|value| value.parse::<usize>().ok())
@@ -45,7 +48,7 @@ pub fn github_max(env_vars: &BTreeMap<String, String>) -> usize {
         return configured;
     }
 
-    max(env_vars).min(AUTO_CAP)
+    max_jobs(env_vars).min(AUTO_CAP)
 }
 
 pub(crate) fn parallel_map<T, R, F>(items: &[T], jobs: usize, f: F) -> Vec<R>
@@ -374,7 +377,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("SHDEPS_JOBS".to_owned(), "32".to_owned());
 
-        assert_eq!(super::max(&env), 32);
+        assert_eq!(super::max_jobs(&env), 32);
     }
 
     #[test]
@@ -382,7 +385,7 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("SHDEPS_JOBS".to_owned(), "1".to_owned());
 
-        assert_eq!(super::max(&env), 1);
+        assert_eq!(super::max_jobs(&env), 1);
     }
 
     #[test]
@@ -391,7 +394,7 @@ mod tests {
             let mut env = BTreeMap::new();
             env.insert("SHDEPS_JOBS".to_owned(), value.to_owned());
 
-            assert!(super::max(&env) >= 1);
+            assert!(super::max_jobs(&env) >= 1);
         }
     }
 

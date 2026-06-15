@@ -115,16 +115,34 @@ _github_token() {
 
 _curl_get() {
   local url="$1" out="$2" token="${3:-}"
-  local -a args=(curl -fsSL -A shdeps)
   case "$url" in
     https://api.github.com/*)
-      args+=(-H "Accept: application/vnd.github+json")
       if [[ -n "$token" ]]; then
-        args+=(-H "Authorization: Bearer $token")
+        # Feed the request via `curl --config -` over stdin so the bearer
+        # token never appears in argv, where `ps` / `/proc/<pid>/cmdline`
+        # would expose it to any other user on the host. `printf` is a
+        # Bash builtin, so the token stays inside this process and never
+        # reaches a child argv. Mirrors `_curl_get_release_asset` and the
+        # Rust `src/http.rs::curl_config` path; each value is wrapped in
+        # `"..."` with `\` and `"` escaped per curl's config syntax.
+        local _url_escaped _token_escaped
+        _url_escaped=$(_curl_config_quote "$url")
+        _token_escaped=$(_curl_config_quote "$token")
+        {
+          printf 'url = "%s"\n' "$_url_escaped"
+          printf 'user-agent = "shdeps"\n'
+          printf 'header = "Accept: application/vnd.github+json"\n'
+          printf 'header = "Authorization: Bearer %s"\n' "$_token_escaped"
+        } | curl -fsSL --config - -o "$out"
+        return
       fi
+      # No token: a plain header on argv is harmless (nothing secret).
+      curl -fsSL -A shdeps -H "Accept: application/vnd.github+json" -o "$out" "$url"
+      ;;
+    *)
+      curl -fsSL -A shdeps -o "$out" "$url"
       ;;
   esac
-  "${args[@]}" -o "$out" "$url"
 }
 
 _curl_get_release_asset() {
@@ -133,6 +151,21 @@ _curl_get_release_asset() {
   if [[ -n "$token" && -n "$api_url" ]]; then
     have_api_fallback=1
   fi
+
+  # Validate the browser URL host before any fetch, mirroring
+  # `is_safe_release_asset_url` in `src/github.rs`. For the SHDEPS_RELEASE_API_URL
+  # path the browser URL is parsed out of release JSON, so a tampered or
+  # malformed payload could otherwise redirect the archive/checksum download to
+  # an arbitrary host with only the checksum as a backstop. curl transparently
+  # follows GitHub's 30x into `objects.githubusercontent.com`, so callers only
+  # ever supply the canonical `github.com` form; accept both known-good hosts.
+  case "$browser_url" in
+    https://github.com/* | https://objects.githubusercontent.com/*) ;;
+    *)
+      _error "refusing to download release asset from non-GitHub host: $browser_url"
+      return 1
+      ;;
+  esac
 
   # Public `browser_download_url` downloads must look like ordinary
   # browser downloads; GitHub's signed storage redirects reject
@@ -316,55 +349,100 @@ _latest_release_tag() {
 
 _verify_checksum() {
   local dir="$1" archive="$2" checksum="$3"
+  local hasher="" actual="" expected=""
+
   if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$dir" && sha256sum -c "$checksum")
+    hasher="sha256sum"
   elif command -v shasum >/dev/null 2>&1; then
-    (cd "$dir" && shasum -a 256 -c "$checksum")
+    hasher="shasum -a 256"
   else
     _error "sha256sum or shasum is required to verify release archives"
+    return 1
+  fi
+
+  # Bind the digest to the exact archive we are about to extract. `<hasher> -c`
+  # alone would pass if ANY file named in the checksum file verifies, never
+  # binding the result to `$archive` — a malformed or release-wide checksum
+  # file could satisfy `-c` without the archive bytes ever being checked.
+  # Instead, compute the digest of `$archive` directly and compare it to the
+  # checksum line that names `$archive`, mirroring `src/checksum.rs::verify`.
+  actual=$( (cd "$dir" && $hasher "$archive") 2>/dev/null | awk '{ print $1; exit }')
+  if [[ -z "$actual" ]]; then
+    _error "failed to compute checksum for $archive"
+    return 1
+  fi
+
+  # Extract the expected digest from the line whose filename field matches
+  # `$archive`. Accept the standard `<hash>  <file>` and binary-mode
+  # `<hash> *<file>` forms plus a leading `./`, matching
+  # `checksum::named_checksum_file`. Bare-hash lines (no filename) are ignored,
+  # preserving the per-file binding. The bootstrap only ever consumes a
+  # per-archive `<archive>.sha256` (sha256sum output, digest first); the Rust
+  # path additionally tolerates filename-first multi-digest manifests, which
+  # this code path never receives.
+  expected=$(awk -v want="$archive" '
+    NF >= 2 {
+      name = $2
+      sub(/^[*]/, "", name)
+      sub(/^\.\//, "", name)
+      if (name == want) { print tolower($1); exit }
+    }
+  ' "$dir/$checksum" 2>/dev/null)
+  if [[ -z "$expected" ]]; then
+    _error "checksum file has no entry for $archive"
+    return 1
+  fi
+
+  if [[ "$(printf '%s' "$actual" | tr 'A-F' 'a-f')" != "$expected" ]]; then
     return 1
   fi
 }
 
 # Returns 0 (safe) only when every entry in a tar.gz archive uses a
-# relative path with no `..` components. The list step uses `tar -tzf`,
-# which is supported by both GNU tar and the BSD tar shipped on macOS,
-# so the bootstrap script does not depend on a platform-specific
-# `--no-absolute-filenames` flag.
+# relative path with no `..` components AND is a regular file or
+# directory (no symlinks or hardlinks). The name checks use `tar -tzf`
+# and the type check uses `tar -tzvf`; both listings are supported by
+# GNU tar and the BSD tar shipped on macOS, so the bootstrap does not
+# depend on a platform-specific `--no-absolute-filenames` flag.
 #
-# **Divergence from `archive.rs`:** the Rust extractor's structural
-# defense also rejects symlink and hardlink entries inside the
-# archive (see `archive::reject_links`). `tar -tzf` emits only path
-# names, so this Bash guard CANNOT distinguish a regular file from a
-# symlink/hardlink — it accepts a symlink entry like `evil ->
-# /etc/passwd` based on the path "evil" alone. In practice the
-# curl-pipe install path verifies the SHA-256 of the entire archive
-# BEFORE calling this guard, so an attacker would also need to
-# compromise the publisher's `.sha256` file to exploit the
-# symlink-blind gap. If parity with the Rust extractor matters for a
-# future code path that calls this without the upstream checksum,
-# switch to `tar -tzvf` and parse the leading mode char.
+# This mirrors the Rust extractor's structural defense
+# (`archive::reject_links`): a symlink/hardlink entry can redirect a
+# later extracted file outside the bundle even when its own name looks
+# benign. The curl-pipe path also verifies the whole-archive SHA-256
+# before extraction, but the link rejection here means parity no longer
+# depends on the publisher's `.sha256` being uncompromised.
 _archive_entries_safe() {
   local archive="$1" entry
   if ! command -v tar >/dev/null 2>&1; then
     return 1
   fi
-  # Use a process substitution-fed loop so we surface non-zero exit
-  # from `tar -tzf` itself (corrupt archive, IO error) as an
-  # unsafe verdict.
+  # Pass 1: reject absolute paths and `..` traversal. Run on the clean
+  # name-only listing so the well-tested traversal globs operate on bare
+  # names rather than verbose rows. Process substitution surfaces a
+  # non-zero `tar -tzf` exit (corrupt archive, IO error) as unsafe.
+  #
+  # `*../*` covers `..` as any path component (`a/../b`, `./../b`);
+  # `*/..` and `..` catch the trailing/standalone cases. Together they
+  # reject every shell-glob representation of a traversal segment without
+  # a full path canonicalizer.
   while IFS= read -r entry; do
     case "$entry" in
-      # Absolute paths escape the bundle root. `*../*` covers `..` as
-      # any path component (`a/../b`, `./../b`, etc.). `*/..` and `..`
-      # catch the trailing/standalone cases. Together they reject every
-      # shell-glob representation of a traversal segment without needing
-      # a full path canonicalizer.
       /*) return 1 ;;
       *../*) return 1 ;;
       */..) return 1 ;;
       ..) return 1 ;;
     esac
   done < <(tar -tzf "$archive" 2>/dev/null) || return 1
+
+  # Pass 2: reject symlink and hardlink entries. `tar -tzf` lists only
+  # names, so a verbose listing is required to see entry types. The
+  # leading character of the mode column is `l` for symlinks and `h` for
+  # hardlinks on both GNU and BSD tar; reject either.
+  while IFS= read -r entry; do
+    case "${entry:0:1}" in
+      l | h) return 1 ;;
+    esac
+  done < <(tar -tzvf "$archive" 2>/dev/null) || return 1
   return 0
 }
 
@@ -380,6 +458,18 @@ _install_release_fail() {
   fi
   _error "$message"
   return 1
+}
+
+# Restore a moved-aside install and discard the staging tree. Shared by the
+# rollback trap and the failed-activation path in `_install_bundle` so the two
+# restore sequences cannot drift. `$backup` may be empty when no prior install
+# was moved aside, in which case only the staging tree is removed.
+_rollback_install() {
+  local backup="$1" staging="$2"
+  if [[ -n "$backup" ]]; then
+    mv "$backup" "$SHDEPS_DIR" 2>/dev/null || true
+  fi
+  rm -rf "$staging"
 }
 
 _install_bundle() {
@@ -455,15 +545,14 @@ _install_bundle() {
     # and `$staging` baked in at trap-set time so the handler is robust
     # against later reassignment. shellcheck SC2064 flags this as a
     # maintenance concern; the trade-off is acceptable for this single
-    # signal-handling site.
+    # signal-handling site. The restore itself goes through
+    # `_rollback_install` so the trap and the failed-activation path
+    # below share one implementation.
     # shellcheck disable=SC2064
-    trap "
-      mv \"$backup\" \"$SHDEPS_DIR\" 2>/dev/null || true
-      rm -rf \"$staging\"
-      trap - INT TERM HUP
-      kill -INT \$\$ 2>/dev/null || exit 130
-    " INT TERM HUP
+    trap "_rollback_install \"$backup\" \"$staging\"; trap - INT TERM HUP; kill -INT \$\$ 2>/dev/null || exit 130" INT TERM HUP
     if ! mv "$SHDEPS_DIR" "$backup"; then
+      # The backup move itself failed, so SHDEPS_DIR is still in place and
+      # there is nothing to restore — just disarm and drop the staging tree.
       trap - INT TERM HUP
       rm -rf "$staging"
       return 1
@@ -471,10 +560,9 @@ _install_bundle() {
   fi
   if ! mv "$staging" "$SHDEPS_DIR"; then
     if [[ -n "$backup" ]]; then
-      mv "$backup" "$SHDEPS_DIR" 2>/dev/null || true
       trap - INT TERM HUP
     fi
-    rm -rf "$staging"
+    _rollback_install "$backup" "$staging"
     return 1
   fi
   if [[ -n "$backup" ]]; then
@@ -815,7 +903,7 @@ _install() {
     # Already installed — pull latest if clean
     if [[ -n "$(git -C "$SHDEPS_DIR" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
       _info "shdeps: dirty working tree, skipping update"
-    elif git -C "$SHDEPS_DIR" pull --ff-only --quiet 2>&1; then
+    elif git -C "$SHDEPS_DIR" pull --ff-only --quiet; then
       _info "shdeps: updated"
     else
       _error "shdeps: update failed (git pull --ff-only failed)"
@@ -970,7 +1058,7 @@ _bootstrap() {
 # ---------------------------------------------------------------------------
 
 _uninstall() {
-  local removed=0
+  local removed=0 failed=0
 
   # Clean up extras symlinks (man page, completions) before removing the repo
   if [[ -f "$SHDEPS_DIR/shdeps.sh" ]]; then
@@ -981,19 +1069,31 @@ _uninstall() {
     fi
   fi
 
+  # Guard each removal in an `if` so a failure neither aborts the rest of the
+  # uninstall under `set -e` nor passes silently — a partial uninstall must
+  # surface a diagnostic and a non-zero exit so the caller knows state remains.
   if [[ -L "$SHDEPS_BIN" ]]; then
-    rm "$SHDEPS_BIN"
-    ((removed++)) || true
+    if rm "$SHDEPS_BIN"; then
+      ((removed++)) || true
+    else
+      _error "failed to remove CLI symlink at $SHDEPS_BIN"
+      failed=1
+    fi
   fi
   if [[ -d "$SHDEPS_DIR" ]]; then
-    rm -rf "$SHDEPS_DIR"
-    ((removed++)) || true
+    if rm -rf "$SHDEPS_DIR"; then
+      ((removed++)) || true
+    else
+      _error "failed to remove install directory at $SHDEPS_DIR"
+      failed=1
+    fi
   fi
   if [[ $removed -gt 0 ]]; then
     _info "shdeps: uninstalled"
-  else
+  elif [[ $failed -eq 0 ]]; then
     _info "shdeps: nothing to uninstall"
   fi
+  [[ $failed -eq 0 ]]
 }
 
 # ---------------------------------------------------------------------------

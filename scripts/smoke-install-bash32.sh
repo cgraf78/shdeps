@@ -101,8 +101,8 @@ cat >"$_release_dir/latest.json" <<JSON
   "draft": false,
   "prerelease": false,
   "assets": [
-    {"name": "$_archive", "browser_download_url": "fixture://$_archive"},
-    {"name": "$_archive.sha256", "browser_download_url": "fixture://$_archive.sha256"}
+    {"name": "$_archive", "browser_download_url": "https://github.com/cgraf78/shdeps/releases/download/$_tag/$_archive"},
+    {"name": "$_archive.sha256", "browser_download_url": "https://github.com/cgraf78/shdeps/releases/download/$_tag/$_archive.sha256"}
   ]
 }
 JSON
@@ -134,11 +134,11 @@ case "$url" in
   fixture://latest)
     cp "$SHDEPS_TEST_RELEASE_DIR/latest.json" "$out"
     ;;
-  fixture://*.sha256)
-    cp "$SHDEPS_TEST_RELEASE_DIR/${url#fixture://}" "$out"
+  *.sha256)
+    cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out"
     ;;
-  fixture://*.tar.gz)
-    cp "$SHDEPS_TEST_RELEASE_DIR/${url#fixture://}" "$out"
+  *.tar.gz)
+    cp "$SHDEPS_TEST_RELEASE_DIR/$(basename "$url")" "$out"
     ;;
   *)
     printf 'unexpected url: %s\n' "$url" >&2

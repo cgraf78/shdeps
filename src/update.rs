@@ -744,7 +744,7 @@ where
 
     let builtin_outcomes = jobs::parallel_map_with_item_progress(
         &builtin_entries,
-        jobs::max(context.env_vars),
+        jobs::max_jobs(context.env_vars),
         |entry| {
             install_builtin(
                 entry,

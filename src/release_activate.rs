@@ -149,7 +149,24 @@ fn backup_path(install_dir: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    install_dir.with_extension(format!("shdeps-backup-{}-{nanos}", std::process::id()))
+    let suffix = format!(".shdeps-backup-{}-{nanos}", std::process::id());
+
+    // Append the suffix to the full final component rather than using
+    // `with_extension`, which REPLACES any existing extension: an
+    // install dir like `shdeps.dev` would otherwise back up to
+    // `shdeps.shdeps-backup-...`, silently dropping `.dev`. The backup is
+    // renamed back to the original `install_dir` on rollback, so a wrong
+    // name is not corrupting, but it should still visibly correspond to
+    // its source. Fall back to `with_extension` only for the degenerate
+    // case of a path with no final component (e.g. `/`).
+    match install_dir.file_name() {
+        Some(name) => {
+            let mut file_name = name.to_os_string();
+            file_name.push(&suffix);
+            install_dir.with_file_name(file_name)
+        }
+        None => install_dir.with_extension(&suffix[1..]),
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +266,33 @@ mod tests {
 
         assert!(matches!(failure, Failure::Metadata(_)));
         assert_eq!(fs::read_to_string(install.join("old")).unwrap(), "old");
+    }
+
+    #[test]
+    fn backup_path_preserves_dotted_install_dir_suffix() {
+        // `with_extension` would turn `shdeps.dev` into
+        // `shdeps.shdeps-backup-...`, dropping `.dev`. The backup name must
+        // keep the full original final component so it visibly corresponds to
+        // its source directory.
+        let backup = super::backup_path(std::path::Path::new("/tmp/tools/shdeps.dev"));
+        let name = backup.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("shdeps.dev.shdeps-backup-"),
+            "backup name must preserve the dotted suffix: {name}"
+        );
+        assert_eq!(backup.parent().unwrap(), std::path::Path::new("/tmp/tools"));
+    }
+
+    #[test]
+    fn backup_path_appends_suffix_to_extensionless_install_dir() {
+        // The canonical install dir has no extension; the backup is the
+        // original name plus the marker suffix.
+        let backup = super::backup_path(std::path::Path::new("/tmp/share/shdeps"));
+        let name = backup.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("shdeps.shdeps-backup-"),
+            "backup name must append the marker suffix: {name}"
+        );
     }
 
     fn staged(root: &std::path::Path, tag: &str) -> Staged {
