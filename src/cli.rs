@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -614,7 +615,7 @@ where
         }
 
         let summary = if progress_jsonl {
-            let mut progress = JsonlProgress { out: stdout };
+            let mut progress = JsonlProgress::with_prompt_tty(stdout);
             update::run_with_progress(&entries, &manifest, &context, update_options, &mut progress)?
         } else {
             let summary = update::run(&entries, &manifest, &context, update_options)?;
@@ -636,14 +637,14 @@ where
     let orphans = manifest.orphans(&entries);
     if !orphans.is_empty() && !options.quiet {
         if progress_jsonl {
-            let mut progress = JsonlProgress { out: stdout };
+            let mut progress = JsonlProgress::new(stdout);
             write_prune_orphans_jsonl(&orphans, &mut progress)?;
         } else {
             write_prune_orphans(&orphans, true, stderr)?;
         }
     }
     if progress_jsonl {
-        let mut progress = JsonlProgress { out: stdout };
+        let mut progress = JsonlProgress::new(stdout);
         write_update_summary_jsonl(&summary, &entries, active_count, &mut progress)?;
     }
 
@@ -839,16 +840,56 @@ where
     W: Write,
 {
     out: &'a mut W,
+    prompt_out: Option<&'a mut dyn Write>,
+    prompt_tty: bool,
 }
 
 impl<W> JsonlProgress<'_, W>
 where
     W: Write,
 {
+    fn new(out: &mut W) -> JsonlProgress<'_, W> {
+        JsonlProgress {
+            out,
+            prompt_out: None,
+            prompt_tty: false,
+        }
+    }
+
+    fn with_prompt_tty(out: &mut W) -> JsonlProgress<'_, W> {
+        JsonlProgress {
+            out,
+            prompt_out: None,
+            prompt_tty: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_prompt_out<'a>(out: &'a mut W, prompt_out: &'a mut dyn Write) -> JsonlProgress<'a, W> {
+        JsonlProgress {
+            out,
+            prompt_out: Some(prompt_out),
+            prompt_tty: false,
+        }
+    }
+
     fn event(&mut self, value: serde_json::Value) -> Result<()> {
         serde_json::to_writer(&mut self.out, &value)?;
         writeln!(self.out)?;
         self.out.flush()?;
+        Ok(())
+    }
+
+    fn fresh_prompt_line(&mut self) -> Result<()> {
+        if let Some(out) = self.prompt_out.as_deref_mut() {
+            writeln!(out)?;
+            out.flush()?;
+        } else if self.prompt_tty {
+            if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+                writeln!(tty)?;
+                tty.flush()?;
+            }
+        }
         Ok(())
     }
 }
@@ -885,7 +926,8 @@ where
             "event": "prompt",
             "status": "running",
             "detail": detail,
-        }))
+        }))?;
+        self.fresh_prompt_line()
     }
 }
 
@@ -1209,7 +1251,13 @@ where
     }
 
     fn pause_for_prompt(&mut self, _detail: &str) -> Result<()> {
-        self.clear_unfinished()
+        if self.active && !self.finished {
+            writeln!(self.out)?;
+            self.out.flush()?;
+            self.active = false;
+            self.rendered_rows = 0;
+        }
+        Ok(())
     }
 }
 
@@ -1521,7 +1569,7 @@ where
         runner: &Process,
         client: &Curl,
     };
-    let mut progress = JsonlProgress { out: stdout };
+    let mut progress = JsonlProgress::new(stdout);
     github_method::resolve_entries_with_progress(
         entries,
         &context,
@@ -2915,9 +2963,10 @@ mod tests {
     #[test]
     fn jsonl_progress_emits_prompt_pause_event() {
         let mut stdout = Vec::new();
+        let mut prompt_out = Vec::new();
 
         {
-            let mut progress = super::JsonlProgress { out: &mut stdout };
+            let mut progress = super::JsonlProgress::with_prompt_out(&mut stdout, &mut prompt_out);
             crate::update::Progress::pause_for_prompt(
                 &mut progress,
                 "waiting for sudo authentication",
@@ -2931,10 +2980,11 @@ mod tests {
         assert_eq!(event["event"], "prompt");
         assert_eq!(event["status"], "running");
         assert_eq!(event["detail"], "waiting for sudo authentication");
+        assert_eq!(String::from_utf8(prompt_out).unwrap(), "\n");
     }
 
     #[test]
-    fn terminal_progress_clears_live_rows_before_prompt() {
+    fn terminal_progress_moves_to_fresh_line_before_prompt() {
         let mut stdout = Vec::new();
 
         {
@@ -2963,8 +3013,12 @@ mod tests {
 
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(
-            stdout.ends_with("\r\x1b[K"),
-            "progress output should leave a clean current line for sudo: {stdout:?}"
+            stdout.ends_with('\n'),
+            "progress output should put sudo on a fresh line without clearing rows: {stdout:?}"
+        );
+        assert!(
+            !stdout.ends_with("\r\x1b[K"),
+            "prompt pause should not erase live progress rows: {stdout:?}"
         );
     }
 
