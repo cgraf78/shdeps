@@ -259,6 +259,12 @@ pub trait Progress {
 
     /// Reports the final item status for one dependency.
     fn item(&mut self, group: &'static str, item: &Item) -> Result<()>;
+
+    /// Gives renderers a chance to yield the terminal before a child process
+    /// may ask the user for input through `/dev/tty`.
+    fn pause_for_prompt(&mut self, _detail: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// One progress update for an update phase.
@@ -614,7 +620,7 @@ where
             }
         } else {
             let package_versions = update_pkg::package_versions(entries, context, options);
-            update_pkg::prepare(entries, context, &package_versions);
+            update_pkg::prepare(entries, context, &package_versions, progress)?;
 
             let mut package_clean = true;
             let mut package_done = 0usize;
@@ -663,7 +669,7 @@ where
 
             let pkg_changed_start = changed.len();
             let pkg_failed_start = summary.failed.len();
-            update_pkg::flush(&queued, context, &mut changed, &mut summary)?;
+            update_pkg::flush(&queued, context, &mut changed, &mut summary, progress)?;
             let successful_packages = changed[pkg_changed_start..]
                 .iter()
                 .cloned()
@@ -1269,6 +1275,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingProgress {
         phases: Vec<PhaseRecord>,
+        prompt_pauses: Vec<String>,
     }
 
     impl super::Progress for RecordingProgress {
@@ -1284,6 +1291,11 @@ mod tests {
         }
 
         fn item(&mut self, _group: &'static str, _item: &Item) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn pause_for_prompt(&mut self, detail: &str) -> crate::Result<()> {
+            self.prompt_pauses.push(detail.to_owned());
             Ok(())
         }
     }
@@ -2174,6 +2186,48 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/jq-post"; }
         assert_eq!(
             fs::read_to_string(fixture.roots.state_dir.join("jq-post")).unwrap(),
             "post\n"
+        );
+    }
+
+    #[test]
+    fn update_pauses_progress_before_sudo_package_commands() {
+        let fixture = Fixture::new("pkg-sudo-prompt-pause");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("sudo", ["apt-get", "update", "-qq"], "")
+            .with_success("apt-cache", ["show", "jq"], "Package: jq\n")
+            .with_success("sudo", ["apt-get", "install", "-y", "jq"], "");
+        let mut progress = RecordingProgress::default();
+
+        let summary = run_with_progress(
+            &[parse_entry("jq|pkg|missing-jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &mut progress,
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            progress.prompt_pauses,
+            vec![
+                "waiting for sudo authentication".to_owned(),
+                "waiting for sudo authentication".to_owned(),
+            ],
+            "metadata refresh and package install should both yield the UI before sudo"
+        );
+        let sudo_calls = runner
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("sudo\0"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sudo_calls,
+            vec![
+                key("sudo", ["apt-get", "update", "-qq"]),
+                key("sudo", ["apt-get", "install", "-y", "jq"]),
+            ]
         );
     }
 

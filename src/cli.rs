@@ -848,6 +848,7 @@ where
     fn event(&mut self, value: serde_json::Value) -> Result<()> {
         serde_json::to_writer(&mut self.out, &value)?;
         writeln!(self.out)?;
+        self.out.flush()?;
         Ok(())
     }
 }
@@ -876,6 +877,14 @@ where
             "status": item_status(item),
             "name": item.name.as_str(),
             "detail": item.detail.as_str(),
+        }))
+    }
+
+    fn pause_for_prompt(&mut self, detail: &str) -> Result<()> {
+        self.event(json!({
+            "event": "prompt",
+            "status": "running",
+            "detail": detail,
         }))
     }
 }
@@ -1197,6 +1206,10 @@ where
 
     fn item(&mut self, _group: &'static str, _item: &update::Item) -> Result<()> {
         Ok(())
+    }
+
+    fn pause_for_prompt(&mut self, _detail: &str) -> Result<()> {
+        self.clear_unfinished()
     }
 }
 
@@ -2897,6 +2910,62 @@ mod tests {
 
         assert!(String::from_utf8(stdout).unwrap().is_empty());
         assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn jsonl_progress_emits_prompt_pause_event() {
+        let mut stdout = Vec::new();
+
+        {
+            let mut progress = super::JsonlProgress { out: &mut stdout };
+            crate::update::Progress::pause_for_prompt(
+                &mut progress,
+                "waiting for sudo authentication",
+            )
+            .unwrap();
+        }
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        let event = serde_json::from_str::<serde_json::Value>(stdout.trim())
+            .expect("prompt pause should be valid JSONL");
+        assert_eq!(event["event"], "prompt");
+        assert_eq!(event["status"], "running");
+        assert_eq!(event["detail"], "waiting for sudo authentication");
+    }
+
+    #[test]
+    fn terminal_progress_clears_live_rows_before_prompt() {
+        let mut stdout = Vec::new();
+
+        {
+            let mut progress = super::TtyProgress::new(
+                &mut stdout,
+                vec![super::TtyProgressStage {
+                    stage: crate::update::GROUP_PACKAGES,
+                    total: 1,
+                }],
+            );
+            progress.start().unwrap();
+            progress
+                .progress_row("Packages", crate::update::PHASE_PACKAGES, 0, 1)
+                .unwrap();
+            assert!(progress.active);
+
+            crate::update::Progress::pause_for_prompt(
+                &mut progress,
+                "waiting for sudo authentication",
+            )
+            .unwrap();
+
+            assert!(!progress.active);
+            assert_eq!(progress.rendered_rows, 0);
+        }
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(
+            stdout.ends_with("\r\x1b[K"),
+            "progress output should leave a clean current line for sudo: {stdout:?}"
+        );
     }
 
     #[test]
