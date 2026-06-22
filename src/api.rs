@@ -647,6 +647,19 @@ fn pkg_install_with_mgr<E>(pkg_mgr: &str, package: &str, stderr: &mut E) -> Resu
 where
     E: Write,
 {
+    pkg_install_with_runner(pkg_mgr, package, &Process, stderr)
+}
+
+fn pkg_install_with_runner<E, R>(
+    pkg_mgr: &str,
+    package: &str,
+    runner: &R,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    E: Write,
+    R: Runner,
+{
     if package.is_empty() {
         return Ok(1);
     }
@@ -656,7 +669,7 @@ where
         // should not prevent an explicit hook fallback from checking whether
         // the requested package is available. Preserve that behavior here so
         // transient mirror failures do not block custom hooks unnecessarily.
-        let _ = run_pkg_command(&refresh);
+        let _ = run_pkg_command(runner, &refresh, None);
     }
 
     let Some(available) = pkg::available(pkg_mgr, package) else {
@@ -666,7 +679,7 @@ where
         )?;
         return Ok(1);
     };
-    let output = run_pkg_command(&available)?;
+    let output = run_pkg_command(runner, &available, Some(process::PACKAGE_PROBE_TIMEOUT))?;
     if !pkg::available_ok(pkg_mgr, output.success, &output.stdout) {
         writeln!(
             stderr,
@@ -679,7 +692,7 @@ where
     let Some(install) = pkg::install(pkg_mgr, &packages) else {
         return Ok(1);
     };
-    if run_pkg_command(&install)?.success {
+    if run_pkg_command(runner, &install, None)?.success {
         Ok(0)
     } else {
         writeln!(stderr, "warning: failed to install {package}")?;
@@ -696,9 +709,13 @@ fn package_manager() -> String {
     }
 }
 
-fn run_pkg_command(command: &CommandSpec) -> Result<crate::process::Output> {
+fn run_pkg_command(
+    runner: &impl Runner,
+    command: &CommandSpec,
+    timeout: Option<Duration>,
+) -> Result<crate::process::Output> {
     let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
-    Ok(Process.run(&command.program, &args, None)?)
+    Ok(runner.run(&command.program, &args, timeout)?)
 }
 
 fn require_sudo() -> Result<i32> {
@@ -761,4 +778,108 @@ fn flag(value: bool) -> &'static str {
 
 fn load_count(conf_dir: &Path) -> Result<usize> {
     Ok(config::load_dir(conf_dir)?.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use crate::process::Output;
+
+    use super::{Runner, pkg_install_with_runner, process};
+
+    #[derive(Debug, Default)]
+    struct FakeRunner {
+        outputs: BTreeMap<String, Output>,
+        calls: std::sync::Mutex<Vec<(String, Option<Duration>)>>,
+        commands: BTreeSet<String>,
+    }
+
+    impl FakeRunner {
+        fn with_success(
+            mut self,
+            program: &str,
+            args: impl IntoIterator<Item = impl AsRef<str>>,
+            stdout: &str,
+        ) -> Self {
+            self.outputs.insert(
+                key(program, args),
+                Output {
+                    success: true,
+                    timed_out: false,
+                    stdout: stdout.to_owned(),
+                    stderr: String::new(),
+                },
+            );
+            self
+        }
+
+        fn calls(&self) -> Vec<(String, Option<Duration>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Runner for FakeRunner {
+        fn exists(&self, command: &str) -> bool {
+            self.commands.contains(command)
+        }
+
+        fn path(&self, command: &str) -> Option<PathBuf> {
+            self.exists(command).then(|| PathBuf::from(command))
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            timeout: Option<Duration>,
+        ) -> io::Result<Output> {
+            let key = key(program, args);
+            self.calls.lock().unwrap().push((key.clone(), timeout));
+            self.outputs
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing fake command"))
+        }
+    }
+
+    #[test]
+    fn pkg_install_api_bounds_availability_probe_but_not_refresh_or_install() {
+        let runner = FakeRunner::default()
+            .with_success("sudo", ["apt-get", "update", "-qq"], "")
+            .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
+            .with_success("sudo", ["apt-get", "install", "-y", "tool"], "");
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            pkg_install_with_runner("apt", "tool", &runner, &mut stderr).unwrap(),
+            0
+        );
+
+        assert_eq!(
+            runner.calls(),
+            vec![
+                (key("sudo", ["apt-get", "update", "-qq"]), None),
+                (
+                    key("apt-cache", ["show", "tool"]),
+                    Some(process::PACKAGE_PROBE_TIMEOUT)
+                ),
+                (key("sudo", ["apt-get", "install", "-y", "tool"]), None),
+            ],
+            "hook package installs should bound only read-only availability probes"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    fn key(program: &str, args: impl IntoIterator<Item = impl AsRef<str>>) -> String {
+        let mut key = program.to_owned();
+        for arg in args {
+            key.push('\0');
+            key.push_str(arg.as_ref());
+        }
+        key
+    }
 }

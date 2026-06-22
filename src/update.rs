@@ -2090,6 +2090,31 @@ install() { return 42; }
     }
 
     #[test]
+    fn update_bounds_package_availability_probe_while_lock_is_held() {
+        let fixture = Fixture::new("pkg-availability-timeout");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("apt-cache", ["show", "jq"], "")
+            .with_success("sudo", ["apt-get", "install", "-y", "jq"], "");
+
+        let summary = run(
+            &[parse_entry("jq|pkg|jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            runner.timeouts_for("apt-cache", ["show", "jq"]),
+            vec![Some(crate::process::PACKAGE_PROBE_TIMEOUT)],
+            "availability probes run while the update lock is held and must be bounded"
+        );
+    }
+
+    #[test]
     fn update_refreshes_package_metadata_before_availability_probe() {
         let fixture = Fixture::new("pkg-refresh");
         fixture.write_lib();
@@ -5329,6 +5354,7 @@ version() { printf 'saw-pkg\n'; }
     }
 
     type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+    type TimeoutLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<Duration>)>>>;
     type AtomicCounter = std::sync::Arc<std::sync::atomic::AtomicUsize>;
     type OverlapGate = std::sync::Arc<OverlapGateState>;
 
@@ -5455,6 +5481,7 @@ version() { printf 'saw-pkg\n'; }
         creates: std::collections::BTreeMap<String, Vec<PathBuf>>,
         creates_dirs: std::collections::BTreeMap<String, Vec<PathBuf>>,
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        timeouts: TimeoutLog,
         delay: Option<Duration>,
         overlap_gate: Option<OverlapGate>,
         active: AtomicCounter,
@@ -5565,6 +5592,20 @@ version() { printf 'saw-pkg\n'; }
             self.calls.lock().unwrap().clone()
         }
 
+        fn timeouts_for(
+            &self,
+            program: &str,
+            args: impl IntoIterator<Item = impl AsRef<str>>,
+        ) -> Vec<Option<Duration>> {
+            let expected = key(program, args);
+            self.timeouts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(call, timeout)| (call == &expected).then_some(*timeout))
+                .collect()
+        }
+
         fn max_active(&self) -> usize {
             self.max_active.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -5598,6 +5639,7 @@ version() { printf 'saw-pkg\n'; }
                 std::thread::sleep(delay);
             }
             self.calls.lock().unwrap().push(key.clone());
+            self.timeouts.lock().unwrap().push((key.clone(), _timeout));
             for path in self.creates.get(&key).into_iter().flatten() {
                 write_executable(path);
             }

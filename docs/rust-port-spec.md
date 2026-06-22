@@ -410,6 +410,7 @@ Runtime environment variables:
 | `SHDEPS_BIN_DIR` | `$HOME/.local/bin` | Public command symlink dir |
 | `SHDEPS_LOG_LEVEL` | `1` | `0` quiet, `1` normal, `2` verbose |
 | `SHDEPS_JOBS` | auto CPU parallelism | Max concurrent read-only probe jobs; explicit values win |
+| `SHDEPS_STATE_LOCK_TIMEOUT_SECS` | `1800` | Max seconds a mutating command waits for another live `update`/`prune` holder before failing with lock metadata |
 | `SHDEPS_AUTO_EPEL` | `0` unless caller sets | dnf CRB/EPEL automation gate |
 | `GH_TOKEN` | unset | Preferred GitHub auth token for runtime GitHub API and asset calls |
 | `GITHUB_TOKEN` | unset | GitHub auth token fallback for runtime GitHub API and asset calls |

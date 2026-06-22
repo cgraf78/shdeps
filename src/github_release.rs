@@ -165,7 +165,11 @@ fn target(env: &RuntimeEnv, runner: &impl Runner) -> Target {
 
 fn arch(runner: &impl Runner) -> String {
     runner
-        .run("uname", &["-m"], None)
+        .run(
+            "uname",
+            &["-m"],
+            Some(crate::process::VERSION_PROBE_TIMEOUT),
+        )
         .ok()
         .filter(|output| output.success)
         .map(|output| output.stdout.trim().to_owned())
@@ -186,7 +190,11 @@ fn libc_with_probe(runner: &impl Runner, musl_ld_present: bool) -> &'static str 
     // is present and the output is parseable, trust it — it is the most
     // precise indicator the host can offer.
     if runner.exists("ldd") {
-        if let Ok(output) = runner.run("ldd", &["--version"], None) {
+        if let Ok(output) = runner.run(
+            "ldd",
+            &["--version"],
+            Some(crate::process::VERSION_PROBE_TIMEOUT),
+        ) {
             let combined = format!("{}{}", output.stdout, output.stderr);
             if combined.to_ascii_lowercase().contains("musl") {
                 return "musl";
@@ -198,7 +206,7 @@ fn libc_with_probe(runner: &impl Runner, musl_ld_present: bool) -> &'static str 
     }
 
     // Fallback: no usable ldd output. Defaulting to "gnu" used to silently
-    // mis-select gnu binaries on Alpine-minimal, NixOS minimal profiles,
+    // select gnu binaries on Alpine-minimal, NixOS minimal profiles,
     // and static-link-only container images that ship a musl loader but
     // no `ldd` wrapper. Look for the canonical musl loader on disk
     // before falling through to the gnu default.

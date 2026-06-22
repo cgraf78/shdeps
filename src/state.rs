@@ -6,9 +6,10 @@
 //! different temp-file behavior.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Result;
 
@@ -16,6 +17,9 @@ use crate::Result;
 use std::os::fd::AsRawFd;
 
 const LOCK_FILE: &str = ".lock";
+const LOCK_TIMEOUT_ENV: &str = "SHDEPS_STATE_LOCK_TIMEOUT_SECS";
+const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const LOCK_WAIT_POLL: Duration = Duration::from_millis(100);
 
 /// Env var set by a lock holder before spawning hook subprocesses.
 ///
@@ -110,15 +114,14 @@ impl StateLock {
         if is_legitimate_reentry() {
             return Ok(StateLock { file: None });
         }
-        acquire_impl(state_dir, LockMode::Blocking)
-            .map(|lock| lock.expect("blocking state lock acquisition always returns a lock"))
+        acquire_with_timeout(state_dir, lock_timeout())
     }
 
     /// Attempts to acquire the per-state-dir lock without waiting.
     ///
-    /// This is primarily useful for tests and future diagnostics. Normal update
-    /// code should use the blocking variant so concurrent invocations serialize
-    /// instead of failing spuriously on a busy developer machine.
+    /// This is primarily useful for tests and diagnostics. Normal update code
+    /// should use `acquire` so concurrent invocations serialize until the
+    /// configured wait budget is exhausted.
     pub fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
         if is_legitimate_reentry() {
             // Same re-entry rule as `acquire`: report success without
@@ -126,7 +129,7 @@ impl StateLock {
             // normally.
             return Ok(Some(StateLock { file: None }));
         }
-        acquire_impl(state_dir, LockMode::NonBlocking)
+        acquire_impl(state_dir)
     }
 
     /// Returns the lock file path for a state directory.
@@ -220,13 +223,7 @@ fn temp_nonce() -> u64 {
     hasher.finish()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockMode {
-    Blocking,
-    NonBlocking,
-}
-
-fn acquire_impl(state_dir: &Path, mode: LockMode) -> Result<Option<StateLock>> {
+fn acquire_impl(state_dir: &Path) -> Result<Option<StateLock>> {
     fs::create_dir_all(state_dir)?;
     let path = StateLock::path(state_dir);
     let file = OpenOptions::new()
@@ -238,11 +235,93 @@ fn acquire_impl(state_dir: &Path, mode: LockMode) -> Result<Option<StateLock>> {
         // metadata churn to the state directory.
         .truncate(false)
         .open(&path)?;
+    set_close_on_exec(&file)?;
 
-    match lock_file(&file, mode)? {
-        LockResult::Acquired => Ok(Some(StateLock { file: Some(file) })),
+    match lock_file(&file)? {
+        LockResult::Acquired => {
+            write_lock_metadata(&file, state_dir)?;
+            Ok(Some(StateLock { file: Some(file) }))
+        }
         LockResult::WouldBlock => Ok(None),
     }
+}
+
+fn acquire_with_timeout(state_dir: &Path, timeout: Duration) -> Result<StateLock> {
+    let started = Instant::now();
+    loop {
+        if let Some(lock) = acquire_impl(state_dir)? {
+            return Ok(lock);
+        }
+        if started.elapsed() >= timeout {
+            return Err(lock_timeout_error(state_dir, timeout).into());
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(std::cmp::min(LOCK_WAIT_POLL, remaining));
+    }
+}
+
+fn lock_timeout() -> Duration {
+    std::env::var(LOCK_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_LOCK_TIMEOUT)
+}
+
+fn lock_timeout_error(state_dir: &Path, timeout: Duration) -> std::io::Error {
+    let path = StateLock::path(state_dir);
+    let mut message = format!(
+        "timed out after {}s waiting for shdeps state lock at {}",
+        timeout.as_secs(),
+        path.display()
+    );
+    if let Ok(owner) = fs::read_to_string(&path) {
+        let owner = owner.trim();
+        if !owner.is_empty() {
+            message.push_str("; current lock metadata: ");
+            message.push_str(&owner.replace('\n', ", "));
+        }
+    }
+    std::io::Error::new(std::io::ErrorKind::TimedOut, message)
+}
+
+fn write_lock_metadata(mut file: &File, state_dir: &Path) -> Result<()> {
+    let acquired_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    write!(
+        file,
+        "pid={}\nstate_dir={}\nacquired_unix={acquired_unix}\n",
+        std::process::id(),
+        state_dir.display()
+    )?;
+    file.sync_data()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_close_on_exec(file: &File) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if flags & libc::FD_CLOEXEC != 0 {
+        return Ok(());
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_close_on_exec(_file: &File) -> Result<()> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,11 +331,8 @@ enum LockResult {
 }
 
 #[cfg(unix)]
-fn lock_file(file: &File, mode: LockMode) -> Result<LockResult> {
-    let mut operation = libc::LOCK_EX;
-    if mode == LockMode::NonBlocking {
-        operation |= libc::LOCK_NB;
-    }
+fn lock_file(file: &File) -> Result<LockResult> {
+    let operation = libc::LOCK_EX | libc::LOCK_NB;
 
     // Keep the lock implementation in this module so the concurrency
     // contract sits next to the atomic state writer it protects.
@@ -266,7 +342,7 @@ fn lock_file(file: &File, mode: LockMode) -> Result<LockResult> {
     }
 
     let error = std::io::Error::last_os_error();
-    if mode == LockMode::NonBlocking && error.kind() == std::io::ErrorKind::WouldBlock {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
         Ok(LockResult::WouldBlock)
     } else {
         Err(error.into())
@@ -353,8 +429,24 @@ pub(crate) fn set_reentry_env_for_test(value: impl AsRef<std::ffi::OsStr>) {
     }
 }
 
+#[cfg(test)]
+fn set_lock_timeout_env_for_test(value: impl AsRef<std::ffi::OsStr>) {
+    // SAFETY: state tests serialize env mutation with `lock_reentry_env_for_test`.
+    unsafe {
+        std::env::set_var(LOCK_TIMEOUT_ENV, value);
+    }
+}
+
+#[cfg(test)]
+fn clear_lock_timeout_env_for_test() {
+    // SAFETY: state tests serialize env mutation with `lock_reentry_env_for_test`.
+    unsafe {
+        std::env::remove_var(LOCK_TIMEOUT_ENV);
+    }
+}
+
 #[cfg(not(unix))]
-fn lock_file(_file: &File, _mode: LockMode) -> Result<LockResult> {
+fn lock_file(_file: &File) -> Result<LockResult> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "state locking is only implemented for Unix-like targets",
@@ -381,6 +473,75 @@ mod tests {
 
         drop(lock);
         assert!(StateLock::try_acquire(&fixture.dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn acquire_times_out_with_lock_metadata_when_holder_stays_alive() {
+        let _env_guard = super::lock_reentry_env_for_test();
+        super::clear_reentry_env_for_test();
+        super::set_lock_timeout_env_for_test("0");
+        let _timeout_reset = EnvReset;
+        let fixture = Fixture::new("lock-timeout");
+
+        let primary = StateLock::acquire(&fixture.dir).unwrap();
+        let error = StateLock::acquire(&fixture.dir).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("timed out after 0s waiting for shdeps state lock"),
+            "timeout should name the lock wait failure: {message}"
+        );
+        assert!(
+            message.contains("pid=") && message.contains("acquired_unix="),
+            "timeout should include holder metadata for diagnosis: {message}"
+        );
+
+        drop(primary);
+        assert!(StateLock::try_acquire(&fixture.dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn acquired_lock_file_records_owner_metadata() {
+        let _env_guard = super::lock_reentry_env_for_test();
+        super::clear_reentry_env_for_test();
+        let fixture = Fixture::new("lock-metadata");
+
+        let _lock = StateLock::acquire(&fixture.dir).unwrap();
+        let metadata = fs::read_to_string(StateLock::path(&fixture.dir)).unwrap();
+
+        assert!(metadata.contains(&format!("pid={}", std::process::id())));
+        assert!(metadata.contains(&format!("state_dir={}", fixture.dir.display())));
+        assert!(metadata.contains("acquired_unix="));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lock_fd_is_not_inherited_by_execed_children() {
+        let _env_guard = super::lock_reentry_env_for_test();
+        super::clear_reentry_env_for_test();
+        let fixture = Fixture::new("lock-cloexec");
+        let _lock = StateLock::acquire(&fixture.dir).unwrap();
+        let lock_path = StateLock::path(&fixture.dir);
+
+        let script = r#"
+for fd in /proc/self/fd/*; do
+  target=$(readlink "$fd" 2>/dev/null || true)
+  if [ "$target" = "$LOCK_PATH" ]; then
+    exit 7
+  fi
+done
+"#;
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("LOCK_PATH", &lock_path)
+            .status()
+            .unwrap();
+
+        assert!(
+            status.success(),
+            "execed children must not inherit the lock fd: {status:?}"
+        );
     }
 
     #[test]
@@ -503,6 +664,14 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Self { dir }
+        }
+    }
+
+    struct EnvReset;
+
+    impl Drop for EnvReset {
+        fn drop(&mut self) {
+            super::clear_lock_timeout_env_for_test();
         }
     }
 }

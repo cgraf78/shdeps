@@ -144,6 +144,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_BIN_DIR`     | `~/.local/bin`                                          | Directory for binary symlinks and raw `github:release` binaries                                                                                                                       |
 | `SHDEPS_LOG_LEVEL`   | `1`                                                     | 0=quiet, 1=normal, 2=verbose                                                                                                                                                          |
 | `SHDEPS_JOBS`        | auto (`nproc`)                                          | Max concurrent read-only probes. Explicit values win; `1` = sequential.                                                                                                               |
+| `SHDEPS_STATE_LOCK_TIMEOUT_SECS` | `1800`                                      | Max seconds a mutating command waits for another live `shdeps update`/`prune` holder before failing with lock metadata.                                                               |
 
 ## Install Methods
 
