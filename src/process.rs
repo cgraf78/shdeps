@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use crate::tool_version;
 
-const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PACKAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_POLL: Duration = Duration::from_millis(10);
 /// Grace window between SIGTERM and SIGKILL for a timed-out child.
 ///
@@ -244,7 +245,7 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
         return false;
     };
     runner
-        .run(program, &args, None)
+        .run(program, &args, Some(PACKAGE_PROBE_TIMEOUT))
         .ok()
         .is_some_and(|output| output.success)
 }
@@ -253,10 +254,18 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
 #[must_use]
 pub fn package_versions(runner: &impl Runner, pkg_mgr: &str) -> BTreeMap<String, String> {
     let output = match pkg_mgr {
-        "brew" => runner.run("brew", &["list", "--versions"], None),
-        "apt" => runner.run("dpkg-query", &["-W", "-f=${Package}\t${Version}\n"], None),
-        "dnf" => runner.run("rpm", &["-qa", "--qf", "%{NAME}\t%{VERSION}\n"], None),
-        "pacman" => runner.run("pacman", &["-Q"], None),
+        "brew" => runner.run("brew", &["list", "--versions"], Some(PACKAGE_PROBE_TIMEOUT)),
+        "apt" => runner.run(
+            "dpkg-query",
+            &["-W", "-f=${Package}\t${Version}\n"],
+            Some(PACKAGE_PROBE_TIMEOUT),
+        ),
+        "dnf" => runner.run(
+            "rpm",
+            &["-qa", "--qf", "%{NAME}\t%{VERSION}\n"],
+            Some(PACKAGE_PROBE_TIMEOUT),
+        ),
+        "pacman" => runner.run("pacman", &["-Q"], Some(PACKAGE_PROBE_TIMEOUT)),
         // Bash loads package versions only for these managers today. Keeping
         // zypper/apk empty avoids pretending we have parity for output formats
         // the reference never parses.
@@ -291,6 +300,7 @@ fn run(program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Ou
         return command.output().map(convert_output);
     };
 
+    isolate_process_group(&mut command);
     let mut child = command.spawn()?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -336,8 +346,9 @@ fn terminate_then_kill(child: &mut std::process::Child) {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
+        let pgid = -(child.id() as i32);
         unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
+            libc::kill(pgid, libc::SIGTERM);
         }
         let grace_deadline = Instant::now() + SIGTERM_GRACE;
         while Instant::now() < grace_deadline {
@@ -352,8 +363,32 @@ fn terminate_then_kill(child: &mut std::process::Child) {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
+        unsafe {
+            libc::kill(pgid, libc::SIGKILL);
+        }
     }
     let _ = child.kill();
+}
+
+fn isolate_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` is async-signal-safe and runs in the child after
+        // fork and before exec. Timed probes get their own process group so
+        // timeout cleanup reaches grandchildren that inherited our pipes.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EPERM) {
+                        return Err(error);
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
 }
 
 fn convert_output(output: std::process::Output) -> Output {
@@ -592,6 +627,19 @@ mod tests {
     }
 
     #[test]
+    fn package_installed_uses_bounded_probe_timeout() {
+        let runner = TimeoutRecordingRunner::default();
+
+        assert!(package_installed(&runner, "font", "apt"));
+
+        assert_eq!(
+            runner.timeouts(),
+            vec![Some(super::PACKAGE_PROBE_TIMEOUT)],
+            "package ownership probes must not run unbounded"
+        );
+    }
+
+    #[test]
     fn package_versions_parse_manager_batch_outputs() {
         let runner = FakeRunner::default()
             .with_output(
@@ -616,6 +664,20 @@ mod tests {
         let brew = package_versions(&runner, "brew");
         assert_eq!(brew.get("fzf").map(String::as_str), Some("0.62.0"));
         assert_eq!(brew.get("ripgrep").map(String::as_str), Some("14.1.1"));
+    }
+
+    #[test]
+    fn package_versions_uses_bounded_probe_timeout() {
+        let runner = TimeoutRecordingRunner::default();
+
+        let versions = package_versions(&runner, "apt");
+
+        assert_eq!(versions.get("tool").map(String::as_str), Some("1.0"));
+        assert_eq!(
+            runner.timeouts(),
+            vec![Some(super::PACKAGE_PROBE_TIMEOUT)],
+            "batch package snapshots must not run unbounded"
+        );
     }
 
     #[test]
@@ -656,5 +718,60 @@ mod tests {
         );
 
         assert_eq!(dep_version(&runner, "bad"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_run_kills_grandchildren_that_keep_pipes_open() {
+        let started = std::time::Instant::now();
+        let output = super::run(
+            "sh",
+            &["-c", "sleep 30 & printf ready; wait"],
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+
+        assert!(output.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout cleanup should not wait for a pipe-holding grandchild"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct TimeoutRecordingRunner {
+        timeouts: std::sync::Mutex<Vec<Option<Duration>>>,
+    }
+
+    impl TimeoutRecordingRunner {
+        fn timeouts(&self) -> Vec<Option<Duration>> {
+            self.timeouts.lock().unwrap().clone()
+        }
+    }
+
+    impl Runner for TimeoutRecordingRunner {
+        fn exists(&self, _command: &str) -> bool {
+            false
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            _args: &[&str],
+            timeout: Option<Duration>,
+        ) -> io::Result<Output> {
+            self.timeouts.lock().unwrap().push(timeout);
+            let stdout = if program == "dpkg-query" {
+                "tool\t1.0\n"
+            } else {
+                ""
+            };
+            Ok(Output {
+                success: true,
+                timed_out: false,
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+            })
+        }
     }
 }

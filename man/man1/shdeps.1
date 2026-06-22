@@ -444,6 +444,14 @@ Default:
 .TP
 .B SHDEPS_LOG_LEVEL
 Logging verbosity: 0=quiet, 1=normal, 2=verbose.
+.TP
+.B SHDEPS_STATE_LOCK_TIMEOUT_SECS
+Maximum seconds a mutating command waits for another live
+.B shdeps update
+or
+.B shdeps prune
+state lock holder before failing with lock metadata.
+Default: 1800.
 .SH EXIT STATUS
 .TP
 .B 0

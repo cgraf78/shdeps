@@ -379,7 +379,11 @@ fn available(runner: &impl Runner, mgr: &str, package: &str) -> Result<bool> {
         return Ok(true);
     };
     let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
-    let output = runner.run(&command.program, &args, None)?;
+    let output = runner.run(
+        &command.program,
+        &args,
+        Some(process::PACKAGE_PROBE_TIMEOUT),
+    )?;
     Ok(pkg::available_ok(mgr, output.success, &output.stdout))
 }
 
