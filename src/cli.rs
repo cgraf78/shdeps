@@ -2698,9 +2698,14 @@ fn shdeps_install_dir() -> Result<PathBuf> {
     }
 
     let exe = env::current_exe()?;
+    Ok(install_dir_from_exe(&exe))
+}
+
+fn install_dir_from_exe(exe: &Path) -> PathBuf {
+    let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
     if let Some(source_dir) = source_checkout_dir_from_target(dir) {
-        return Ok(source_dir);
+        return source_dir;
     }
 
     // Release installs put the Rust binary directly in SHDEPS_DIR, while older
@@ -2708,9 +2713,9 @@ fn shdeps_install_dir() -> Result<PathBuf> {
     // both shapes lets the same CLI entry point update converted installs and
     // developer checkouts without relying on a wrapper-specific env var.
     if dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
-        Ok(dir.parent().unwrap_or(dir).to_path_buf())
+        dir.parent().unwrap_or(dir).to_path_buf()
     } else {
-        Ok(dir.to_path_buf())
+        dir.to_path_buf()
     }
 }
 
@@ -2768,9 +2773,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    use super::{run, source_checkout_dir_from_target};
+    use super::{install_dir_from_exe, run, source_checkout_dir_from_target};
     use crate::config::Entry;
     use crate::update::{GroupSummary, Item, ItemReason, Summary};
     use crate::version;
@@ -2895,6 +2902,29 @@ mod tests {
         assert_eq!(
             source_checkout_dir_from_target(&release_dir),
             Some(checkout)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outer_bin_symlinks_resolve_to_source_checkout_root() {
+        let checkout = temp_dir("bin-symlink-source-root");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        fs::write(
+            checkout.join("Cargo.toml"),
+            "[package]\nname = \"shdeps\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(checkout.join("target/release")).unwrap();
+        fs::write(checkout.join("target/release/shdeps"), "").unwrap();
+        symlink("target/release/shdeps", checkout.join("shdeps")).unwrap();
+
+        let bin = temp_dir("bin-symlink-bin");
+        symlink(checkout.join("shdeps"), bin.join("shdeps")).unwrap();
+
+        assert_eq!(
+            install_dir_from_exe(&bin.join("shdeps")),
+            checkout.canonicalize().unwrap()
         );
     }
 
