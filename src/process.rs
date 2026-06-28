@@ -231,7 +231,7 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
     }
 
     let probe = match pkg_mgr {
-        "brew" => Some(("brew", vec!["list", package_name])),
+        "brew" => Some(("brew", vec!["list", "--versions", package_name])),
         "apt" => Some(("dpkg", vec!["-s", package_name])),
         "dnf" => Some(("rpm", vec!["-q", package_name])),
         "pacman" => Some(("pacman", vec!["-Q", package_name])),
@@ -254,7 +254,11 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
 #[must_use]
 pub fn package_versions(runner: &impl Runner, pkg_mgr: &str) -> BTreeMap<String, String> {
     let output = match pkg_mgr {
-        "brew" => runner.run("brew", &["list", "--versions"], Some(PACKAGE_PROBE_TIMEOUT)),
+        "brew" => runner.run(
+            "brew",
+            &["list", "--formula", "--versions"],
+            Some(PACKAGE_PROBE_TIMEOUT),
+        ),
         "apt" => runner.run(
             "dpkg-query",
             &["-W", "-f=${Package}\t${Version}\n"],
@@ -275,7 +279,7 @@ pub fn package_versions(runner: &impl Runner, pkg_mgr: &str) -> BTreeMap<String,
     let Ok(output) = output else {
         return BTreeMap::new();
     };
-    if !output.success {
+    if !output.success && (pkg_mgr != "brew" || output.stdout.trim().is_empty()) {
         return BTreeMap::new();
     }
 
@@ -627,6 +631,19 @@ mod tests {
     }
 
     #[test]
+    fn package_installed_uses_small_brew_version_probe() {
+        let runner = FakeRunner::default().with_output(
+            "brew",
+            ["list", "--versions", "bash-completion@2"],
+            true,
+            "bash-completion@2 2.17.0\n",
+            "",
+        );
+
+        assert!(package_installed(&runner, "bash-completion@2", "brew"));
+    }
+
+    #[test]
     fn package_installed_uses_bounded_probe_timeout() {
         let runner = TimeoutRecordingRunner::default();
 
@@ -651,7 +668,7 @@ mod tests {
             )
             .with_output(
                 "brew",
-                ["list", "--versions"],
+                ["list", "--formula", "--versions"],
                 true,
                 "fzf 0.62.0 0.61.3\nripgrep 14.1.1\n",
                 "",
@@ -662,6 +679,22 @@ mod tests {
         assert_eq!(apt.get("fd-find").map(String::as_str), Some("8.7.0"));
 
         let brew = package_versions(&runner, "brew");
+        assert_eq!(brew.get("fzf").map(String::as_str), Some("0.62.0"));
+        assert_eq!(brew.get("ripgrep").map(String::as_str), Some("14.1.1"));
+    }
+
+    #[test]
+    fn package_versions_keep_brew_stdout_when_snapshot_reports_cask_error() {
+        let runner = FakeRunner::default().with_output(
+            "brew",
+            ["list", "--formula", "--versions"],
+            false,
+            "fzf 0.62.0\nripgrep 14.1.1\n",
+            "Error: Refusing to load cask example from untrusted tap.\n",
+        );
+
+        let brew = package_versions(&runner, "brew");
+
         assert_eq!(brew.get("fzf").map(String::as_str), Some("0.62.0"));
         assert_eq!(brew.get("ripgrep").map(String::as_str), Some("14.1.1"));
     }
