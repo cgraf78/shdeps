@@ -363,6 +363,8 @@ else
   git -C "$_migrate_inst" init >/dev/null 2>&1
   git -C "$_migrate_inst" config user.email "test@test.com"
   git -C "$_migrate_inst" config user.name "Test"
+  git -C "$_migrate_inst" config commit.gpgsign false
+  git -C "$_migrate_inst" config core.hooksPath /dev/null
   git -C "$_migrate_inst" remote add origin "https://github.com/cgraf78/shdeps.git"
   printf '%s\n' "old source checkout" >"$_migrate_inst/shdeps.sh"
   git -C "$_migrate_inst" add shdeps.sh
@@ -389,6 +391,8 @@ else
   git -C "$_dirty_inst" init >/dev/null 2>&1
   git -C "$_dirty_inst" config user.email "test@test.com"
   git -C "$_dirty_inst" config user.name "Test"
+  git -C "$_dirty_inst" config commit.gpgsign false
+  git -C "$_dirty_inst" config core.hooksPath /dev/null
   git -C "$_dirty_inst" remote add origin "https://github.com/cgraf78/shdeps.git"
   printf '%s\n' "old source checkout" >"$_dirty_inst/shdeps.sh"
   git -C "$_dirty_inst" add shdeps.sh

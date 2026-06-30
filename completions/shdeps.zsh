@@ -2,28 +2,40 @@
 
 # Zsh completion for shdeps
 
+_shdeps_command_specs() {
+  local name description
+  command shdeps __api completion-commands 2>/dev/null | while IFS=$'\t' read -r name description; do
+    [[ -n "$name" ]] && printf '%s:%s\n' "$name" "$description"
+  done
+}
+
+_shdeps_command_specs_fallback() {
+  printf '%s\n' \
+    'update:Install/update all dependencies' \
+    'self-update:Update shdeps itself' \
+    'list:List all configured dependencies with status' \
+    'check:Check if a specific dependency is installed' \
+    'dep-root:Print a configured dependency root directory' \
+    'dep-path:Print a path below a configured dependency root' \
+    'dep-file:Print a readable regular file below a dependency root' \
+    'dep-links:Print public command links owned by a dependency' \
+    'prune:Remove orphaned deps no longer in config' \
+    'version:Print shdeps version' \
+    'help:Show this help message'
+}
+
 _shdeps_dep_names() {
-  local conf_dir="${SHDEPS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/shdeps}"
-  [[ -d "$conf_dir" ]] || return
   local -a names
-  names=(${(f)"$(grep -h '^[[:alpha:]]' "$conf_dir"/*.conf 2>/dev/null | awk '{print $1}')"})
+  # Use the same Rust config loader as the CLI instead of a completion-local
+  # parser; repo names, `.git` canonicalization, and duplicate handling matter.
+  names=(${(f)"$(command shdeps __api completion-dep-names 2>/dev/null)"})
   _describe -t dependencies 'dependency' names
 }
 
 _shdeps() {
-  local -a commands=(
-    'update:Install or update all dependencies'
-    'self-update:Update shdeps itself'
-    'list:List all configured dependencies with status'
-    'check:Check if a specific dependency is installed'
-    'dep-root:Print a configured dependency root directory'
-    'dep-path:Print a path below a configured dependency root'
-    'dep-file:Print a readable regular file below a dependency root'
-    'dep-links:Print public command links owned by a dependency'
-    'prune:Remove orphaned dependencies no longer in config'
-    'version:Print shdeps version'
-    'help:Show help message'
-  )
+  local -a commands
+  commands=(${(f)"$(_shdeps_command_specs)"})
+  ((${#commands[@]} > 0)) || commands=(${(f)"$(_shdeps_command_specs_fallback)"})
 
   local -a global_opts=(
     '(-c --config)'{-c,--config}'[Config directory or file]:config path:_directories'

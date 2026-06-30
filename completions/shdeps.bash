@@ -1,11 +1,25 @@
 # Bash completion for shdeps
 # shellcheck disable=SC2207  # compgen output splitting is intentional
 
+_shdeps_completion_commands() {
+  command shdeps __api completion-commands 2>/dev/null | awk -F '\t' '{print $1}'
+}
+
+_shdeps_completion_commands_fallback() {
+  printf '%s\n' update self-update list check dep-root dep-path dep-file dep-links prune version help
+}
+
+_shdeps_dep_names() {
+  command shdeps __api completion-dep-names 2>/dev/null
+}
+
 _shdeps() {
   local cur prev words cword
   _init_completion || return
 
-  local commands="update self-update list check dep-root dep-path dep-file dep-links prune version help"
+  local commands
+  commands="$(_shdeps_completion_commands)"
+  [[ -n "$commands" ]] || commands="$(_shdeps_completion_commands_fallback)"
   local global_opts="-c --config -f --force -R --reinstall -q --quiet -v --verbose -h --help"
 
   # Find the subcommand (skip options and their arguments)
@@ -46,13 +60,11 @@ _shdeps() {
   # Subcommand-specific completions
   case "$cmd" in
     check | dep-root | dep-path | dep-file | dep-links)
-      # Complete with dependency names from config files
-      local conf_dir="${SHDEPS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/shdeps}"
-      if [[ -d "$conf_dir" ]]; then
-        local names
-        names=$(grep -h '^[[:alpha:]]' "$conf_dir"/*.conf 2>/dev/null | awk '{print $1}')
-        COMPREPLY=($(compgen -W "$names" -- "$cur"))
-      fi
+      # Ask the Rust CLI for names so completion follows the real config
+      # grammar, canonicalization, dedupe, and safety filters.
+      local names
+      names="$(_shdeps_dep_names)"
+      COMPREPLY=($(compgen -W "$names" -- "$cur"))
       ;;
     prune)
       local prune_opts="-y --dry-run"

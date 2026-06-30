@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::Result;
+use crate::cli;
 use crate::config;
 use crate::dep_links;
 use crate::dep_path;
@@ -74,6 +75,8 @@ where
             writeln!(stdout, "abi=1")?;
             Ok(0)
         }
+        "completion-commands" => completion_commands(stdout),
+        "completion-dep-names" => completion_dep_names(&roots.conf_dir, stdout),
         "platform-match" => predicate(rest.first(), stderr, |spec| {
             platform::platform_match(spec, &env)
         }),
@@ -276,6 +279,27 @@ where
             Ok(2)
         }
     }
+}
+
+fn completion_commands<W>(stdout: &mut W) -> Result<i32>
+where
+    W: Write,
+{
+    for command in cli::PUBLIC_COMMANDS {
+        writeln!(stdout, "{}\t{}", command.name, command.description)?;
+    }
+    Ok(0)
+}
+
+fn completion_dep_names<W>(conf_dir: &Path, stdout: &mut W) -> Result<i32>
+where
+    W: Write,
+{
+    for raw_entry in config::load_dir(conf_dir)? {
+        let entry = config::parse_entry(&raw_entry, None);
+        writeln!(stdout, "{}", entry.name)?;
+    }
+    Ok(0)
 }
 
 fn github_release_install<W, E>(

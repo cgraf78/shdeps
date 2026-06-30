@@ -249,6 +249,28 @@ fn read_only_api_outputs_machine_clean_lines() {
 }
 
 #[test]
+fn completion_api_reports_commands_and_loaded_dependency_names() {
+    let fixture = Fixture::new("api-completion");
+    fixture.write(
+        "conf/10-deps.conf",
+        "owner/tool.git github:repo\njq pkg\njq pkg apt:jq-alt\n",
+    );
+
+    let commands = run(&mut fixture.command(["__api", "completion-commands"]));
+    assert_success(&commands);
+    let stdout = text(&commands.stdout);
+    assert!(stdout.contains("update\tInstall/update all dependencies\n"));
+    assert!(stdout.contains("dep-root\tPrint a configured dependency root directory\n"));
+    assert!(stdout.contains("help\tShow this help message\n"));
+    assert_eq!(text(&commands.stderr), "");
+
+    let names = run(&mut fixture.command(["__api", "completion-dep-names"]));
+    assert_success(&names);
+    assert_eq!(text(&names.stdout), "jq\nowner/tool\n");
+    assert_eq!(text(&names.stderr), "");
+}
+
+#[test]
 fn mutating_api_links_and_unlinks_extras() {
     let fixture = Fixture::new("api-extras");
     let install = fixture.dir.join("share/owner/tool");

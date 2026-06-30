@@ -34,6 +34,65 @@ use crate::update::{self, Context as UpdateContext, Options as UpdateOptions};
 use crate::version;
 use serde_json::json;
 
+/// Public command metadata shared by help-adjacent machine surfaces.
+///
+/// Completion scripts consume this through `shdeps __api completion-commands`
+/// so they do not need to rediscover command vocabulary from display text.
+pub struct PublicCommand {
+    /// Stable command token accepted by the top-level CLI.
+    pub name: &'static str,
+    /// Short human-readable summary suitable for completion descriptions.
+    pub description: &'static str,
+}
+
+/// User-facing command set advertised by completion and help-adjacent tooling.
+pub const PUBLIC_COMMANDS: &[PublicCommand] = &[
+    PublicCommand {
+        name: "update",
+        description: "Install/update all dependencies",
+    },
+    PublicCommand {
+        name: "self-update",
+        description: "Update shdeps itself",
+    },
+    PublicCommand {
+        name: "list",
+        description: "List all configured dependencies with status",
+    },
+    PublicCommand {
+        name: "check",
+        description: "Check if a specific dependency is installed",
+    },
+    PublicCommand {
+        name: "dep-root",
+        description: "Print a configured dependency root directory",
+    },
+    PublicCommand {
+        name: "dep-path",
+        description: "Print a path below a configured dependency root",
+    },
+    PublicCommand {
+        name: "dep-file",
+        description: "Print a readable regular file below a dependency root",
+    },
+    PublicCommand {
+        name: "dep-links",
+        description: "Print public command links owned by a dependency",
+    },
+    PublicCommand {
+        name: "prune",
+        description: "Remove orphaned deps no longer in config",
+    },
+    PublicCommand {
+        name: "version",
+        description: "Print shdeps version",
+    },
+    PublicCommand {
+        name: "help",
+        description: "Show this help message",
+    },
+];
+
 /// Compatibility help text for the `shdeps` CLI.
 ///
 /// Help output is user-facing API, so command support changes should update
@@ -685,7 +744,16 @@ where
         }
     };
 
-    if matches!(target, Target::SourceCheckout) && env::var_os("SHDEPS_DIR").is_none() {
+    let has_explicit_install_dir = env::var_os("SHDEPS_DIR").is_some();
+    if matches!(target, Target::SourceCheckout) && !has_explicit_install_dir {
+        return Ok(());
+    }
+    if matches!(target, Target::Unsupported { .. }) && !has_explicit_install_dir {
+        // Test binaries and ad-hoc developer invocations can resolve to a
+        // nearby build directory that is not a real install. Without an
+        // explicit wrapper-provided SHDEPS_DIR, there is no actionable
+        // self-update target, so verbose `update` output should stay focused on
+        // dependency work.
         return Ok(());
     }
 
