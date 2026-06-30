@@ -29,6 +29,12 @@ _shdeps_dep_names() {
   # Use the same Rust config loader as the CLI instead of a completion-local
   # parser; repo names, `.git` canonicalization, and duplicate handling matter.
   names=(${(f)"$(command shdeps __api completion-dep-names 2>/dev/null)"})
+  if ((${#names[@]} == 0)); then
+    local conf_dir="${SHDEPS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/shdeps}"
+    if [[ -d "$conf_dir" ]]; then
+      names=(${(f)"$(grep -h '^[[:alpha:]]' "$conf_dir"/*.conf 2>/dev/null | awk '{print $1}')"})
+    fi
+  fi
   _describe -t dependencies 'dependency' names
 }
 

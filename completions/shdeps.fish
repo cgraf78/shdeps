@@ -22,6 +22,13 @@ end
 # Helper: list dependency names through the same config loader the CLI uses.
 function __shdeps_dep_names
     command shdeps __api completion-dep-names 2>/dev/null
+    or __shdeps_dep_names_fallback
+end
+
+function __shdeps_dep_names_fallback
+    set -l conf_dir (set -q SHDEPS_CONF_DIR; and echo $SHDEPS_CONF_DIR; or echo $HOME/.config/shdeps)
+    test -d "$conf_dir"; or return
+    grep -h '^[[:alpha:]]' $conf_dir/*.conf 2>/dev/null | awk '{print $1}'
 end
 
 # Condition: no subcommand yet

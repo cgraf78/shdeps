@@ -46,6 +46,7 @@ jobs:
       # stay in the conventional tests/*.rs location.
       test-command: >
         tests/shell/install-sh-test &&
+        tests/shell/completion-test &&
         tests/shell/installer-flow-test &&
         tests/shell/lua-api-test &&
         tests/shell/lua-bootstrap-test &&

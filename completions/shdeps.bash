@@ -10,7 +10,13 @@ _shdeps_completion_commands_fallback() {
 }
 
 _shdeps_dep_names() {
-  command shdeps __api completion-dep-names 2>/dev/null
+  command shdeps __api completion-dep-names 2>/dev/null || _shdeps_dep_names_fallback
+}
+
+_shdeps_dep_names_fallback() {
+  local conf_dir="${SHDEPS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/shdeps}"
+  [[ -d "$conf_dir" ]] || return
+  grep -h '^[[:alpha:]]' "$conf_dir"/*.conf 2>/dev/null | awk '{print $1}'
 }
 
 _shdeps() {

@@ -266,6 +266,21 @@ fn completion_api_reports_commands_and_loaded_dependency_names() {
         .join("\n")
         + "\n";
     assert_eq!(text(&commands.stdout), expected_commands);
+    let help_commands = HELP
+        .lines()
+        .skip_while(|line| *line != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .map(|line| line.split_whitespace().next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let public_commands = PUBLIC_COMMANDS
+        .iter()
+        .map(|command| command.name.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        help_commands, public_commands,
+        "HELP command block should match PUBLIC_COMMANDS"
+    );
     for command in PUBLIC_COMMANDS {
         assert!(
             HELP.contains(command.name),
