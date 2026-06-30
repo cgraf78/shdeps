@@ -3,8 +3,29 @@
 # Disable file completions by default
 complete -c shdeps -f
 
-# Helper: list dependency names from config
+function __shdeps_commands
+    command shdeps __api completion-commands 2>/dev/null
+    or printf '%s\t%s\n' \
+        update 'Install/update all dependencies' \
+        self-update 'Update shdeps itself' \
+        list 'List all configured dependencies with status' \
+        check 'Check if a specific dependency is installed' \
+        dep-root 'Print a configured dependency root directory' \
+        dep-path 'Print a path below a configured dependency root' \
+        dep-file 'Print a readable regular file below a dependency root' \
+        dep-links 'Print public command links owned by a dependency' \
+        prune 'Remove orphaned deps no longer in config' \
+        version 'Print shdeps version' \
+        help 'Show this help message'
+end
+
+# Helper: list dependency names through the same config loader the CLI uses.
 function __shdeps_dep_names
+    command shdeps __api completion-dep-names 2>/dev/null
+    or __shdeps_dep_names_fallback
+end
+
+function __shdeps_dep_names_fallback
     set -l conf_dir (set -q SHDEPS_CONF_DIR; and echo $SHDEPS_CONF_DIR; or echo $HOME/.config/shdeps)
     test -d "$conf_dir"; or return
     grep -h '^[[:alpha:]]' $conf_dir/*.conf 2>/dev/null | awk '{print $1}'
@@ -55,17 +76,7 @@ complete -c shdeps -s v -l verbose -d "Verbose output"
 complete -c shdeps -s h -l help -d "Show help message"
 
 # Subcommands
-complete -c shdeps -n __shdeps_needs_command -a update -d "Install/update all dependencies"
-complete -c shdeps -n __shdeps_needs_command -a self-update -d "Update shdeps itself"
-complete -c shdeps -n __shdeps_needs_command -a list -d "List all configured dependencies"
-complete -c shdeps -n __shdeps_needs_command -a check -d "Check if a dependency is installed"
-complete -c shdeps -n __shdeps_needs_command -a dep-root -d "Print a dependency root"
-complete -c shdeps -n __shdeps_needs_command -a dep-path -d "Print a path below a dependency root"
-complete -c shdeps -n __shdeps_needs_command -a dep-file -d "Print a readable dependency file"
-complete -c shdeps -n __shdeps_needs_command -a dep-links -d "Print dependency command links"
-complete -c shdeps -n __shdeps_needs_command -a prune -d "Remove orphaned dependencies"
-complete -c shdeps -n __shdeps_needs_command -a version -d "Print shdeps version"
-complete -c shdeps -n __shdeps_needs_command -a help -d "Show help message"
+complete -c shdeps -n __shdeps_needs_command -a "(__shdeps_commands)"
 
 # check: complete with dependency names
 complete -c shdeps -n "__shdeps_using_command check" -a "(__shdeps_dep_names)" -d "Dependency name"

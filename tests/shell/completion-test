@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+# shellcheck source=tests/shell/helpers.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/helpers.sh"
+
+fixture=$(_tmpdir)
+conf_dir="$fixture/conf"
+fake_bin="$fixture/bin"
+mkdir -p "$conf_dir" "$fake_bin"
+
+cat >"$conf_dir/10-deps.conf" <<'CONF'
+jq pkg
+cgraf78/ds github
+github.com/junegunn/fzf go
+CONF
+
+cat >"$fake_bin/shdeps" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$*" in
+  "__api completion-dep-names")
+    exit 2
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+SH
+chmod +x "$fake_bin/shdeps"
+
+echo "=== completions: dependency name fallback ==="
+
+bash_names=$(
+  PATH="$fake_bin:$PATH" SHDEPS_CONF_DIR="$conf_dir" bash -c '
+    set -euo pipefail
+    # shellcheck source=completions/shdeps.bash
+    source "$1"
+    _shdeps_dep_names
+  ' bash "$REPO_ROOT/completions/shdeps.bash"
+)
+_assert_contains "bash fallback includes package dep" "jq" "$bash_names"
+_assert_contains "bash fallback includes github dep" "cgraf78/ds" "$bash_names"
+_assert_contains "bash fallback includes go dep" "github.com/junegunn/fzf" "$bash_names"
+
+if command -v zsh >/dev/null 2>&1; then
+  zsh_names=$(
+    PATH="$fake_bin:$PATH" SHDEPS_CONF_DIR="$conf_dir" zsh -fc '
+      _arguments() { return 0 }
+      _describe() { return 0 }
+      source "$1"
+      _describe() {
+        local array_name="${argv[-1]}"
+        print -r -- "${(@P)array_name}"
+      }
+      _shdeps_dep_names
+    ' zsh "$REPO_ROOT/completions/shdeps.zsh"
+  )
+  _assert_contains "zsh fallback includes package dep" "jq" "$zsh_names"
+  _assert_contains "zsh fallback includes github dep" "cgraf78/ds" "$zsh_names"
+  _assert_contains "zsh fallback includes go dep" "github.com/junegunn/fzf" "$zsh_names"
+
+  cat >"$conf_dir/10-deps.conf" <<'CONF'
+owner//bad pkg
+CONF
+  cat >"$fake_bin/shdeps" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$*" in
+  "__api completion-dep-names")
+    exit 0
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+SH
+  chmod +x "$fake_bin/shdeps"
+  zsh_empty_api_names=$(
+    PATH="$fake_bin:$PATH" SHDEPS_CONF_DIR="$conf_dir" zsh -fc '
+      _arguments() { return 0 }
+      _describe() { return 0 }
+      source "$1"
+      _describe() {
+        local array_name="${argv[-1]}"
+        print -r -- "${(@P)array_name}"
+      }
+      _shdeps_dep_names
+    ' zsh "$REPO_ROOT/completions/shdeps.zsh"
+  )
+  _assert_eq "zsh keeps empty successful API result authoritative" "" "$zsh_empty_api_names"
+else
+  echo "SKIP: zsh dependency fallback (zsh not found)"
+fi
+
+echo "=== completions: API result wins ==="
+
+cat >"$fake_bin/shdeps" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$*" in
+  "__api completion-dep-names")
+    printf '%s\n' api-owned
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+SH
+chmod +x "$fake_bin/shdeps"
+
+bash_api_names=$(
+  PATH="$fake_bin:$PATH" SHDEPS_CONF_DIR="$conf_dir" bash -c '
+    set -euo pipefail
+    # shellcheck source=completions/shdeps.bash
+    source "$1"
+    _shdeps_dep_names
+  ' bash "$REPO_ROOT/completions/shdeps.bash"
+)
+_assert_eq "bash uses API names when available" "api-owned" "$bash_api_names"
+
+_test_summary

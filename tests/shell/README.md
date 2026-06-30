@@ -27,6 +27,7 @@ The full shell suite used by CI is:
 
 ```sh
 tests/shell/install-sh-test
+tests/shell/completion-test
 tests/shell/installer-flow-test
 tests/shell/lua-api-test
 tests/shell/lua-bootstrap-test

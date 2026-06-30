@@ -5,6 +5,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use shdeps::cli::{HELP, PUBLIC_COMMANDS};
 
 fn shdeps() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shdeps"))
@@ -246,6 +247,53 @@ fn read_only_api_outputs_machine_clean_lines() {
         )
     );
     assert_eq!(text(&links.stderr), "");
+}
+
+#[test]
+fn completion_api_reports_commands_and_loaded_dependency_names() {
+    let fixture = Fixture::new("api-completion");
+    fixture.write(
+        "conf/10-deps.conf",
+        "owner/tool.git github:repo\njq pkg\njq pkg apt:jq-alt\n",
+    );
+
+    let commands = run(&mut fixture.command(["__api", "completion-commands"]));
+    assert_success(&commands);
+    let expected_commands = PUBLIC_COMMANDS
+        .iter()
+        .map(|command| format!("{}\t{}", command.name, command.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(text(&commands.stdout), expected_commands);
+    let help_commands = HELP
+        .lines()
+        .skip_while(|line| *line != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .map(|line| line.split_whitespace().next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let public_commands = PUBLIC_COMMANDS
+        .iter()
+        .map(|command| command.name.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        help_commands, public_commands,
+        "HELP command block should match PUBLIC_COMMANDS"
+    );
+    for command in PUBLIC_COMMANDS {
+        assert!(
+            HELP.contains(command.name),
+            "HELP should advertise public command {}",
+            command.name
+        );
+    }
+    assert_eq!(text(&commands.stderr), "");
+
+    let names = run(&mut fixture.command(["__api", "completion-dep-names"]));
+    assert_success(&names);
+    assert_eq!(text(&names.stdout), "jq\nowner/tool\n");
+    assert_eq!(text(&names.stderr), "");
 }
 
 #[test]
