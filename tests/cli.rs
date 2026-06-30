@@ -5,6 +5,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use shdeps::cli::{HELP, PUBLIC_COMMANDS};
 
 fn shdeps() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shdeps"))
@@ -258,10 +259,20 @@ fn completion_api_reports_commands_and_loaded_dependency_names() {
 
     let commands = run(&mut fixture.command(["__api", "completion-commands"]));
     assert_success(&commands);
-    let stdout = text(&commands.stdout);
-    assert!(stdout.contains("update\tInstall/update all dependencies\n"));
-    assert!(stdout.contains("dep-root\tPrint a configured dependency root directory\n"));
-    assert!(stdout.contains("help\tShow this help message\n"));
+    let expected_commands = PUBLIC_COMMANDS
+        .iter()
+        .map(|command| format!("{}\t{}", command.name, command.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(text(&commands.stdout), expected_commands);
+    for command in PUBLIC_COMMANDS {
+        assert!(
+            HELP.contains(command.name),
+            "HELP should advertise public command {}",
+            command.name
+        );
+    }
     assert_eq!(text(&commands.stderr), "");
 
     let names = run(&mut fixture.command(["__api", "completion-dep-names"]));
