@@ -114,6 +114,9 @@ pub enum ItemReason {
     PackageManagerOverride,
     /// Package is unavailable on this host/package manager.
     PackageUnavailable,
+    /// Quiet package work needs sudo, but the current user cannot use it
+    /// without an interactive prompt.
+    PackageSudoUnavailable,
     /// Package was queued for a later batch install.
     PackageQueued,
     /// Remote freshness stamp was current.
@@ -620,7 +623,8 @@ where
             }
         } else {
             let package_versions = update_pkg::package_versions(entries, context, options);
-            update_pkg::prepare(entries, context, &package_versions, progress)?;
+            let sudo = update_pkg::sudo_status(entries, context, &package_versions)?;
+            update_pkg::prepare(entries, context, &package_versions, sudo, progress)?;
 
             let mut package_clean = true;
             let mut package_done = 0usize;
@@ -630,8 +634,14 @@ where
                     continue;
                 }
 
-                let item =
-                    update_pkg::install(entry, context, options, &mut queued, &package_versions)?;
+                let item = update_pkg::install(
+                    entry,
+                    context,
+                    options,
+                    sudo,
+                    &mut queued,
+                    &package_versions,
+                )?;
                 if !item.failed {
                     match item.reason {
                         ItemReason::Installed => cleanup_successful_transition(
@@ -640,10 +650,12 @@ where
                             context,
                             &mut summary,
                         )?,
-                        ItemReason::PackageUnavailable => update_transition::restore_failed(
-                            transitions.get(&entry.name),
-                            context.manifest_path,
-                        )?,
+                        ItemReason::PackageUnavailable | ItemReason::PackageSudoUnavailable => {
+                            update_transition::restore_failed(
+                                transitions.get(&entry.name),
+                                context.manifest_path,
+                            )?
+                        }
                         _ => {}
                     }
                 }
@@ -669,7 +681,7 @@ where
 
             let pkg_changed_start = changed.len();
             let pkg_failed_start = summary.failed.len();
-            update_pkg::flush(&queued, context, &mut changed, &mut summary, progress)?;
+            update_pkg::flush(&queued, context, sudo, &mut changed, &mut summary, progress)?;
             let successful_packages = changed[pkg_changed_start..]
                 .iter()
                 .cloned()
@@ -1639,6 +1651,47 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
     }
 
     #[test]
+    fn update_pkg_transition_restores_old_manifest_when_quiet_sudo_is_unavailable() {
+        let fixture =
+            Fixture::new("transition-pkg-quiet-no-sudo").with_env_var("SHDEPS_QUIET", "1");
+        fixture.write_lib();
+        let old_install = fixture.roots.install_dir.join("tool");
+        write_executable(&old_install.join("bin/tool"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old_manifest = ManifestEntry::new(
+            "tool",
+            "github:release",
+            "tool",
+            old_install.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default()
+            .with_success("id", ["-u"], "1000\n")
+            .with_failure("sudo", ["-n", "true"]);
+
+        let summary = run(
+            &[parse_entry("tool|pkg|tool|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].status, super::ItemStatus::Skipped);
+        assert_eq!(
+            summary.items[0].reason,
+            super::ItemReason::PackageSudoUnavailable
+        );
+        assert!(old_install.exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old_manifest)
+        );
+    }
+
+    #[test]
     fn update_restores_release_public_binary_when_symlink_method_transition_fails() {
         let fixture = Fixture::new("transition-bin-restore");
         fixture.write_lib();
@@ -2087,6 +2140,105 @@ install() { return 42; }
             manifest::read(&manifest_path).unwrap().get("missing"),
             Some(&ManifestEntry::new("missing", "pkg", "missing", ""))
         );
+    }
+
+    #[test]
+    fn update_quiet_package_fast_path_does_not_probe_sudo() {
+        let fixture = Fixture::new("pkg-quiet-installed").with_env_var("SHDEPS_QUIET", "1");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_command("jq");
+
+        let summary = run(
+            &[parse_entry("jq|pkg|jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].status, super::ItemStatus::Current);
+        assert_eq!(summary.items[0].reason, super::ItemReason::Installed);
+        assert!(
+            runner.calls().is_empty(),
+            "quiet cron runs with all package commands present should stay on the no-sudo fast path"
+        );
+    }
+
+    #[test]
+    fn update_quiet_missing_package_skips_when_sudo_would_prompt() {
+        let fixture = Fixture::new("pkg-quiet-no-sudo").with_env_var("SHDEPS_QUIET", "1");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("id", ["-u"], "1000\n")
+            .with_failure("sudo", ["-n", "true"]);
+
+        let summary = run(
+            &[parse_entry("jq|pkg|jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].status, super::ItemStatus::Skipped);
+        assert_eq!(
+            summary.items[0].reason,
+            super::ItemReason::PackageSudoUnavailable
+        );
+        assert_eq!(summary.items[0].detail, "sudo unavailable in quiet mode");
+
+        let calls = runner.calls();
+        assert!(calls.contains(&key("id", ["-u"])));
+        assert!(calls.contains(&key("sudo", ["-n", "true"])));
+        assert!(
+            !calls.contains(&key("sudo", ["apt-get", "update", "-qq"])),
+            "quiet mode must not run sudo-backed metadata refresh when sudo would prompt"
+        );
+        assert!(
+            !calls.contains(&key("apt-cache", ["show", "jq"])),
+            "availability probes depend on refreshed metadata, so skip them when package work cannot run"
+        );
+        assert!(
+            !calls.contains(&key("sudo", ["apt-get", "install", "-y", "jq"])),
+            "quiet mode must not attempt package installs that require an interactive sudo prompt"
+        );
+    }
+
+    #[test]
+    fn update_quiet_root_still_runs_package_work() {
+        let fixture = Fixture::new("pkg-quiet-root").with_env_var("SHDEPS_QUIET", "1");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("id", ["-u"], "0\n")
+            .with_success("apt-cache", ["show", "jq"], "Package: jq\n")
+            .with_success("sudo", ["apt-get", "install", "-y", "jq"], "");
+
+        let summary = run(
+            &[parse_entry("jq|pkg|jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].status, super::ItemStatus::Changed);
+        assert_eq!(summary.items[0].reason, super::ItemReason::Installed);
+
+        let calls = runner.calls();
+        assert!(calls.contains(&key("id", ["-u"])));
+        assert!(
+            !calls.contains(&key("sudo", ["-n", "true"])),
+            "root can run package work directly, so quiet mode should not probe noninteractive sudo"
+        );
+        assert!(calls.contains(&key("sudo", ["apt-get", "update", "-qq"])));
+        assert!(calls.contains(&key("apt-cache", ["show", "jq"])));
+        assert!(calls.contains(&key("sudo", ["apt-get", "install", "-y", "jq"])));
     }
 
     #[test]

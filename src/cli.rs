@@ -242,6 +242,18 @@ struct ParsedOptions {
     verbose: bool,
 }
 
+fn env_vars(options: &ParsedOptions) -> BTreeMap<String, String> {
+    let mut vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    if options.quiet {
+        // The update/status engines are shared by the CLI and sourceable shell
+        // API. Normalize parsed quiet state back into the env contract so
+        // lower-level policy has one signal whether quiet came from `--quiet`
+        // or `SHDEPS_QUIET=1`.
+        vars.insert("SHDEPS_QUIET".to_owned(), "1".to_owned());
+    }
+    vars
+}
+
 fn parse_options<W, E>(args: &[String], stdout: &mut W, stderr: &mut E) -> Result<ParseOutcome>
 where
     W: Write,
@@ -412,7 +424,7 @@ where
     }
 
     let env = runtime::runtime_env(&ProcessEnv);
-    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let env_vars = env_vars(options);
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let entries =
         resolve_github_entries(&entries, &roots, Some(&manifest), &env, &env_vars, options)?;
@@ -478,7 +490,7 @@ where
         },
     );
     let env = runtime::runtime_env(&ProcessEnv);
-    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let env_vars = env_vars(options);
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let entry = resolve_github_entry(&entry, &roots, Some(&manifest), &env, &env_vars, options)?;
     let package_versions = if entry.method == method::PKG {
@@ -546,7 +558,7 @@ where
     let manifest = manifest::read(&manifest_path)?;
     let hooks = custom_probe();
     let env = runtime::runtime_env(&ProcessEnv);
-    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let env_vars = env_vars(options);
     if let Some(message) =
         update_prerequisite_error(&entries, &env, &Process, UpdatePrerequisitePhase::Initial)
     {
@@ -1358,7 +1370,7 @@ where
     let raw_entries = config::load_dir(&roots.conf_dir)?;
     let entries = parse_entries(&raw_entries, "");
     let env = runtime::runtime_env(&ProcessEnv);
-    let env_vars = std::env::vars().collect::<BTreeMap<_, _>>();
+    let env_vars = env_vars(options);
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
     let entries =
