@@ -2283,6 +2283,79 @@ fn update_quiet_environment_suppresses_empty_config_message() {
 }
 
 #[test]
+fn update_quiet_flag_skips_missing_package_when_sudo_would_prompt() {
+    let fixture = Fixture::new("update-quiet-flag-pkg-no-sudo");
+    let log = fixture.dir.join("pkg.log");
+    fixture.write(
+        "conf/deps.conf",
+        "missing-shdeps-test-tool pkg missing-shdeps-test-tool\n",
+    );
+    fixture.write_executable(
+        "fakebin/id",
+        "#!/bin/sh\nprintf 'id %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\nprintf '1000\\n'\n",
+    );
+    fixture.write_executable(
+        "fakebin/sudo",
+        "#!/bin/sh\nprintf 'sudo %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$1:$2\" = '-n:true' ] && exit 1\nexit 99\n",
+    );
+    fixture.write_executable(
+        "fakebin/apt-get",
+        "#!/bin/sh\nprintf 'apt-get %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\nexit 99\n",
+    );
+    fixture.write_executable(
+        "fakebin/apt-cache",
+        "#!/bin/sh\nprintf 'apt-cache %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\nexit 99\n",
+    );
+
+    let mut command = fixture.command(["--quiet", "update"]);
+    command
+        .env("SHDEPS_PKG_MGR", "apt")
+        .env("SHDEPS_TEST_LOG", &log);
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(fs::read_to_string(&log).unwrap(), "id -u\nsudo -n true\n");
+}
+
+#[test]
+fn update_quiet_environment_treats_missing_sudo_as_unavailable() {
+    let fixture = Fixture::new("update-quiet-env-pkg-missing-sudo");
+    let log = fixture.dir.join("pkg.log");
+    let fakebin = fixture.dir.join("fakebin");
+    fixture.write(
+        "conf/deps.conf",
+        "missing-shdeps-test-tool pkg missing-shdeps-test-tool\n",
+    );
+    fixture.write_executable(
+        "fakebin/id",
+        "#!/bin/sh\nprintf 'id %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\nprintf '1000\\n'\n",
+    );
+    fixture.write_executable(
+        "fakebin/apt-get",
+        "#!/bin/sh\nprintf 'apt-get %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\nexit 99\n",
+    );
+    fixture.write_executable(
+        "fakebin/apt-cache",
+        "#!/bin/sh\nprintf 'apt-cache %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\nexit 99\n",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_QUIET", "1")
+        .env("SHDEPS_PKG_MGR", "apt")
+        .env("SHDEPS_TEST_LOG", &log)
+        .env("PATH", format!("{}:/bin", fakebin.display()));
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(fs::read_to_string(&log).unwrap(), "id -u\n");
+}
+
+#[test]
 fn update_installs_custom_dep_runs_post_and_records_manifest() {
     let fixture = Fixture::new("update-custom");
     fixture.write("conf/deps.conf", "tool custom\n");

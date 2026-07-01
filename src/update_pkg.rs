@@ -16,11 +16,18 @@ use crate::update::{
     Context, Item, ItemReason, Options, Progress, Summary, active, detail_with_action,
     verbose_enabled,
 };
+use std::io;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Queued {
     pub(crate) name: String,
     package: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SudoStatus {
+    Available,
+    UnavailableQuiet,
 }
 
 pub(crate) fn cache_status(
@@ -128,13 +135,38 @@ pub(crate) fn package_versions(
     process::package_versions(context.runner, context.pkg_mgr)
 }
 
+pub(crate) fn sudo_status(
+    entries: &[Entry],
+    context: &Context<'_, impl Runner>,
+    package_versions: &std::collections::BTreeMap<String, String>,
+) -> Result<SudoStatus> {
+    if !needs_package_work(entries, context, package_versions) {
+        return Ok(SudoStatus::Available);
+    }
+    if !sudo_backed_manager(context.pkg_mgr) {
+        return Ok(SudoStatus::Available);
+    }
+    if context.env_vars.get("SHDEPS_QUIET").map(String::as_str) != Some("1") {
+        return Ok(SudoStatus::Available);
+    }
+    if user_is_root(context.runner)? || sudo_noninteractive(context.runner)? {
+        return Ok(SudoStatus::Available);
+    }
+
+    Ok(SudoStatus::UnavailableQuiet)
+}
+
 pub(crate) fn prepare(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     package_versions: &std::collections::BTreeMap<String, String>,
+    sudo: SudoStatus,
     progress: &mut dyn Progress,
 ) -> Result<()> {
     if !needs_package_work(entries, context, package_versions) {
+        return Ok(());
+    }
+    if sudo == SudoStatus::UnavailableQuiet {
         return Ok(());
     }
 
@@ -166,6 +198,7 @@ pub(crate) fn install(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     options: Options,
+    sudo: SudoStatus,
     queued: &mut Vec<Queued>,
     package_versions: &std::collections::BTreeMap<String, String>,
 ) -> Result<Item> {
@@ -208,6 +241,14 @@ pub(crate) fn install(
         ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
     )?;
 
+    if sudo == SudoStatus::UnavailableQuiet {
+        return Ok(Item::skipped(
+            entry.name.clone(),
+            ItemReason::PackageSudoUnavailable,
+            "sudo unavailable in quiet mode",
+        ));
+    }
+
     if !available(context.runner, context.pkg_mgr, &resolved)? {
         return Ok(Item::skipped(
             entry.name.clone(),
@@ -230,12 +271,16 @@ pub(crate) fn install(
 pub(crate) fn flush(
     queued: &[Queued],
     context: &Context<'_, impl Runner>,
+    sudo: SudoStatus,
     changed: &mut Vec<String>,
     summary: &mut Summary,
     progress: &mut dyn Progress,
 ) -> Result<()> {
     if queued.is_empty() {
         return Ok(());
+    }
+    if sudo == SudoStatus::UnavailableQuiet {
+        return Err(io::Error::other("internal error: packages queued without quiet sudo").into());
     }
 
     let packages = queued
@@ -302,6 +347,27 @@ fn needs_package_work(
                 package_versions,
             )
     })
+}
+
+fn sudo_backed_manager(pkg_mgr: &str) -> bool {
+    !pkg_mgr.is_empty() && pkg_mgr != "brew"
+}
+
+fn user_is_root(runner: &impl Runner) -> Result<bool> {
+    let output = runner.run("id", &["-u"], Some(process::VERSION_PROBE_TIMEOUT))?;
+    Ok(output.success && output.stdout.trim() == "0")
+}
+
+fn sudo_noninteractive(runner: &impl Runner) -> Result<bool> {
+    match runner.run(
+        "sudo",
+        &["-n", "true"],
+        Some(process::VERSION_PROBE_TIMEOUT),
+    ) {
+        Ok(output) => Ok(output.success),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn maybe_enable_epel(
