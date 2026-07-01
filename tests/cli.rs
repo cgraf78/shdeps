@@ -2346,7 +2346,7 @@ fn update_quiet_environment_treats_missing_sudo_as_unavailable() {
         .env("SHDEPS_QUIET", "1")
         .env("SHDEPS_PKG_MGR", "apt")
         .env("SHDEPS_TEST_LOG", &log)
-        .env("PATH", format!("{}:/bin", fakebin.display()));
+        .env("PATH", fakebin);
     let output = run(&mut command);
 
     assert_success(&output);
