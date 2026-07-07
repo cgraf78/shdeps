@@ -613,6 +613,7 @@ mod tests {
             name: name.to_owned(),
             method: method.to_owned(),
             cmd: name.to_owned(),
+            cmd_explicit: false,
             aliases: String::new(),
             filter: String::new(),
         }

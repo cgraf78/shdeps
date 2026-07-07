@@ -1409,6 +1409,26 @@ fn update_bare_github_falls_back_to_repo_and_uses_local_clone() {
 }
 
 #[test]
+fn update_bare_github_metadata_failure_rejects_repo_missing_explicit_command() {
+    let fixture = Fixture::new("update-github-rate-limited-repo-missing-command");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write("git/tool/README.md", "source checkout without bin/tool\n");
+    fixture.write_executable(
+        "fakebin/curl",
+        "#!/bin/sh\nprintf 'rate limited\\n' >&2\nexit 22\n",
+    );
+
+    let mut command = fixture.command(["update"]);
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("configured command `tool` not found in repo bin"));
+    assert!(!fixture.dir.join("bin/tool").exists());
+    assert!(!fixture.dir.join("share/owner/tool").exists());
+    assert!(!fixture.dir.join("state/manifest").exists());
+}
+
+#[test]
 fn update_bare_github_transitions_repo_to_release_after_release_appears() {
     let fixture = Fixture::new("update-github-repo-to-release");
     let asset = host_linux_asset("tool", "v1.0.0");
@@ -1477,7 +1497,7 @@ fn update_bare_github_rechecks_legacy_repo_cache_and_transitions_to_release() {
     assert!(!fixture.dir.join("share/owner/tool").exists());
     assert_eq!(
         fs::read_to_string(fixture.dir.join("state/owner/tool.github.method")).unwrap(),
-        "github:release\n"
+        "github:release\ncmd=tool\n"
     );
     assert!(
         fs::read_to_string(fixture.dir.join("state/manifest"))

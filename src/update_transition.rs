@@ -651,6 +651,7 @@ mod tests {
             name: "owner/tool".to_owned(),
             method: "github:release".to_owned(),
             cmd: "tool".to_owned(),
+            cmd_explicit: false,
             aliases: String::new(),
             filter: String::new(),
         };
@@ -722,6 +723,7 @@ mod tests {
             name: "owner/tool".to_owned(),
             method: "pkg".to_owned(),
             cmd: "tool".to_owned(),
+            cmd_explicit: false,
             aliases: String::new(),
             filter: String::new(),
         };
@@ -773,6 +775,7 @@ mod tests {
             name: "owner/tool".to_owned(),
             method: "github:release".to_owned(),
             cmd: "tool".to_owned(),
+            cmd_explicit: false,
             aliases: String::new(),
             filter: String::new(),
         };

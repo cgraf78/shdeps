@@ -193,7 +193,7 @@ where
             // release method. Keep it while GitHub's public latest tag is
             // unchanged; a new tag falls through to authoritative asset
             // selection before this cache is refreshed again.
-            cache.write_method(method::GITHUB_RELEASE)?;
+            cache.write_method(method::GITHUB_RELEASE, entry)?;
             stamp::remote_touch(&cache.stamp, options.now)?;
             stamp::remote_touch(
                 &stamp::remote_path(&context.roots.state_dir, &entry.name, "release"),
@@ -265,7 +265,7 @@ where
     if confirmed_current_release(&candidate, context, options)
         && github::remove_cached_releases(&context.roots.state_dir, &entry.name).is_ok()
     {
-        cache.write_method(method::GITHUB_RELEASE)?;
+        cache.write_method(method::GITHUB_RELEASE, entry)?;
         stamp::remote_touch(&cache.stamp, options.now)?;
         stamp::remote_touch(
             &stamp::remote_path(&context.roots.state_dir, &entry.name, "release"),
@@ -327,13 +327,17 @@ where
     R: Runner,
 {
     if stamp::remote_fresh(&cache.stamp, options.freshness()) {
-        if let Some(method) = cache.read_method()? {
+        let cached_method_file_exists = cache.method_file_exists()?;
+        if let Some(method) = cache.read_method(entry)? {
             if let Some(method) = usable_cached_method(method, entry, context) {
                 return Ok(Some(method));
             }
         }
+        if cached_method_file_exists {
+            return Ok(None);
+        }
     }
-    if let Some(method) = seed_method_from_manifest(entry, context, cache, options)? {
+    if let Some(method) = seed_method_from_manifest(entry, context, cache, options, false)? {
         return Ok(Some(method));
     }
 
@@ -360,7 +364,7 @@ where
                 // this decision; users who want live-checkout behavior should
                 // ask for `github:repo` explicitly.
                 github::write_cached_releases(&context.roots.state_dir, &entry.name, &releases)?;
-                cache.write_method(method::GITHUB_RELEASE)?;
+                cache.write_method(method::GITHUB_RELEASE, entry)?;
                 stamp::remote_touch(&cache.stamp, options.now)?;
                 method::GITHUB_RELEASE
             } else {
@@ -370,7 +374,7 @@ where
                 // "github:repo" cache files written after fetch failures are
                 // not trusted forever.
                 github::write_cached_releases(&context.roots.state_dir, &entry.name, &releases)?;
-                cache.write_method(METHOD_REPO_NO_ASSET)?;
+                cache.write_method(METHOD_REPO_NO_ASSET, entry)?;
                 stamp::remote_touch(&cache.stamp, options.now)?;
                 method::GITHUB_REPO
             }
@@ -381,8 +385,12 @@ where
             // successful remote re-check, but it is much better than flipping
             // an installed release-backed CLI to a source checkout just
             // because the fleet exhausted the unauthenticated API quota.
-            if let Some(method) = cache.read_stale_method()? {
+            if let Some(method) = cache.read_stale_method(entry)? {
                 usable_cached_method(method, entry, context).unwrap_or(method::GITHUB_REPO)
+            } else if let Some(method) =
+                seed_method_from_manifest(entry, context, cache, options, true)?
+            {
+                method
             } else {
                 // With no prior signal, keep the historical soft fallback so
                 // first-time installs can still try a source checkout when the
@@ -431,24 +439,40 @@ impl Cache {
         }
     }
 
-    fn read_method(&self) -> Result<Option<&'static str>> {
-        self.read_method_file(false)
+    fn method_file_exists(&self) -> Result<bool> {
+        match fs::metadata(&self.method) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
-    fn read_stale_method(&self) -> Result<Option<&'static str>> {
-        self.read_method_file(true)
+    fn read_method(&self, entry: &Entry) -> Result<Option<&'static str>> {
+        self.read_method_file(entry, false)
     }
 
-    fn read_method_file(&self, allow_legacy_repo: bool) -> Result<Option<&'static str>> {
+    fn read_stale_method(&self, entry: &Entry) -> Result<Option<&'static str>> {
+        self.read_method_file(entry, true)
+    }
+
+    fn read_method_file(
+        &self,
+        entry: &Entry,
+        allow_legacy_repo: bool,
+    ) -> Result<Option<&'static str>> {
         let content = match fs::read_to_string(&self.method) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        Ok(match content.trim_end() {
-            method::GITHUB_RELEASE => Some(method::GITHUB_RELEASE),
-            METHOD_REPO_NO_ASSET => Some(method::GITHUB_REPO),
-            METHOD_REPO_LAST_KNOWN => Some(METHOD_REPO_LAST_KNOWN),
+        let cached = CachedMethod::parse(&content);
+        Ok(match cached.method {
+            method::GITHUB_RELEASE if cached.matches_cmd(entry) => Some(method::GITHUB_RELEASE),
+            method::GITHUB_RELEASE => None,
+            METHOD_REPO_NO_ASSET if cached.matches_cmd(entry) => Some(method::GITHUB_REPO),
+            METHOD_REPO_NO_ASSET => None,
+            METHOD_REPO_LAST_KNOWN if cached.matches_cmd(entry) => Some(METHOD_REPO_LAST_KNOWN),
+            METHOD_REPO_LAST_KNOWN => None,
             // Legacy cache files wrote plain `github:repo` for both "no
             // compatible release" and "metadata fetch failed". Re-probe those
             // once so hosts can recover after credentials or repo visibility
@@ -460,8 +484,26 @@ impl Cache {
         })
     }
 
-    fn write_method(&self, method: &str) -> Result<()> {
-        state::write_atomic(&self.method, &format!("{method}\n"))
+    fn write_method(&self, method: &str, entry: &Entry) -> Result<()> {
+        state::write_atomic(&self.method, &format!("{method}\ncmd={}\n", entry.cmd))
+    }
+}
+
+struct CachedMethod<'a> {
+    method: &'a str,
+    cmd: Option<&'a str>,
+}
+
+impl<'a> CachedMethod<'a> {
+    fn parse(content: &'a str) -> Self {
+        let mut lines = content.lines();
+        let method = lines.next().unwrap_or_default().trim();
+        let cmd = lines.find_map(|line| line.strip_prefix("cmd="));
+        Self { method, cmd }
+    }
+
+    fn matches_cmd(&self, entry: &Entry) -> bool {
+        self.cmd.is_some_and(|cmd| cmd == entry.cmd)
     }
 }
 
@@ -470,6 +512,7 @@ fn seed_method_from_manifest<R>(
     context: &Context<'_, R>,
     cache: &Cache,
     options: Options,
+    allow_release_seed: bool,
 ) -> Result<Option<&'static str>>
 where
     R: Runner,
@@ -488,7 +531,9 @@ where
         return Ok(None);
     }
 
-    let Some((stored, resolved)) = manifest_method(row, context.roots, context.runner) else {
+    let Some((stored, resolved)) =
+        manifest_method(row, context.roots, context.runner, allow_release_seed)
+    else {
         return Ok(None);
     };
 
@@ -498,8 +543,14 @@ where
     // has always been a source checkout." The next stale/forced run still
     // performs the normal remote check, so this is a bootstrap cache, not a
     // permanent policy override.
-    cache.write_method(stored)?;
-    stamp::remote_touch(&cache.stamp, options.now)?;
+    // A release manifest fallback after a failed metadata fetch is only a
+    // local recovery signal. Do not cache it as though we proved current
+    // release compatibility remotely, or the next healthy run may skip the
+    // release-vs-repo decision and delay a required transition.
+    if !(allow_release_seed && stored == method::GITHUB_RELEASE) {
+        cache.write_method(stored, entry)?;
+        stamp::remote_touch(&cache.stamp, options.now)?;
+    }
     Ok(Some(resolved))
 }
 
@@ -530,18 +581,22 @@ where
     let Some(row) = manifest.get(&entry.name) else {
         return false;
     };
-    row.cmd == entry.cmd && manifest_method(row, context.roots, context.runner).is_some()
+    row.cmd == entry.cmd && manifest_method(row, context.roots, context.runner, false).is_some()
 }
 
 fn manifest_method<R>(
     row: &crate::manifest::ManifestEntry,
     roots: &Roots,
     runner: &R,
+    allow_release: bool,
 ) -> Option<(&'static str, &'static str)>
 where
     R: Runner,
 {
     match row.method.as_str() {
+        method::GITHUB_RELEASE if allow_release && manifest_release_command_visible(row) => {
+            Some((method::GITHUB_RELEASE, method::GITHUB_RELEASE))
+        }
         method::GITHUB_REPO if manifest_repo_command_visible(row, roots, runner) => {
             Some((METHOD_REPO_LAST_KNOWN, method::GITHUB_REPO))
         }
@@ -557,7 +612,22 @@ fn manifest_repo_command_visible<R>(
 where
     R: Runner,
 {
-    let repo_path = manifest_repo_path(row, roots);
+    manifest_command_visible(row, roots, runner)
+}
+
+fn manifest_release_command_visible(row: &crate::manifest::ManifestEntry) -> bool {
+    !row.install_path.is_empty() && crate::process::executable_path(Path::new(&row.install_path))
+}
+
+fn manifest_command_visible<R>(
+    row: &crate::manifest::ManifestEntry,
+    roots: &Roots,
+    runner: &R,
+) -> bool
+where
+    R: Runner,
+{
+    let install_path = manifest_install_path(row, roots);
     let Some(command_path) = runner.path(&row.cmd) else {
         return false;
     };
@@ -565,12 +635,12 @@ where
     // The manifest seed is a rollout optimization, not proof of correctness.
     // Source checkouts often contain many executable helper scripts, and an
     // unrelated package can also put the same command name on PATH. Trust a
-    // cached repo answer only when shell lookup resolves back into the repo
-    // path recorded in the manifest.
-    canonical_child_of(&command_path, &repo_path)
+    // local manifest answer only when shell lookup resolves back into the
+    // install path recorded in the manifest.
+    canonical_child_of(&command_path, &install_path)
 }
 
-fn manifest_repo_path(row: &crate::manifest::ManifestEntry, roots: &Roots) -> PathBuf {
+fn manifest_install_path(row: &crate::manifest::ManifestEntry, roots: &Roots) -> PathBuf {
     if row.install_path.is_empty() {
         roots.install_dir.join(&row.name)
     } else {
@@ -620,6 +690,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -726,7 +797,7 @@ mod tests {
     #[test]
     fn cached_resolution_avoids_repeated_github_fetches() {
         let fixture = Fixture::new("warm-cache");
-        fixture.write_cache("owner/tool", "github:release", 10);
+        fixture.write_cache_for_cmd("owner/tool", "github:release", "tool", 10);
         let client = FakeClient::new();
         let runner = FakeRunner::new().with_uname("x86_64");
         let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
@@ -747,9 +818,76 @@ mod tests {
     }
 
     #[test]
+    fn cached_release_resolution_rechecks_when_command_changes() {
+        let fixture = Fixture::new("warm-release-cache-command-change");
+        fixture.write_cache_for_cmd("owner/tool", "github:release", "tool", 10);
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["othercmd-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|othercmd|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(
+            fixture.cached_cmd("owner/tool"),
+            Some("othercmd".to_owned())
+        );
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[test]
+    fn legacy_release_cache_is_rechecked_so_command_compatibility_is_verified() {
+        let fixture = Fixture::new("legacy-release-cache");
+        fixture.write_cache("owner/tool", "github:release", 10);
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["othercmd-v1.0.0-darwin-aarch64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:repo");
+        assert_eq!(
+            fixture.cached_method("owner/tool"),
+            "github:repo:no-compatible-release"
+        );
+        assert_eq!(fixture.cached_cmd("owner/tool"), Some("tool".to_owned()));
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[test]
     fn cached_no_asset_repo_resolution_avoids_repeated_github_fetches() {
         let fixture = Fixture::new("warm-repo-cache");
-        fixture.write_cache("owner/tool", "github:repo:no-compatible-release", 10);
+        fixture.write_cache_for_cmd(
+            "owner/tool",
+            "github:repo:no-compatible-release",
+            "tool",
+            10,
+        );
         let client = FakeClient::new();
         let runner = FakeRunner::new().with_uname("x86_64");
         let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
@@ -767,6 +905,38 @@ mod tests {
 
         assert_eq!(resolved[0].method, "github:repo");
         assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn cached_no_asset_repo_resolution_rechecks_when_command_changes() {
+        let fixture = Fixture::new("warm-repo-cache-command-change");
+        fixture.write_cache_for_cmd(
+            "owner/tool",
+            "github:repo:no-compatible-release",
+            "tool",
+            10,
+        );
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["realcmd-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|realcmd|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
     }
 
     #[test]
@@ -796,6 +966,80 @@ mod tests {
             "github:repo:last-known"
         );
         assert!(client.urls().is_empty());
+    }
+
+    #[test]
+    fn manifest_release_seed_survives_metadata_fetch_failure() {
+        let fixture = Fixture::new("manifest-release-seed-failure");
+        let command_path = fixture.write_release_command("owner/tool", "tool");
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:release|tool|{}\n",
+            command_path.display()
+        ));
+        let client = FakeClient::new();
+        let runner = FakeRunner::new()
+            .with_uname("x86_64")
+            .with_path("tool", command_path);
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            fixture.options(false),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "");
+        assert_eq!(fixture.cached_cmd("owner/tool"), None);
+        assert!(
+            !stamp::remote_path(
+                &fixture.roots.state_dir,
+                "owner/tool",
+                crate::method::GITHUB
+            )
+            .exists()
+        );
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[test]
+    fn legacy_release_cache_survives_metadata_failure_without_path_lookup() {
+        let fixture = Fixture::new("legacy-release-cache-failure-no-path");
+        fixture.write_cache("owner/tool", "github:release", 10);
+        let command_path = fixture.write_release_command("owner/tool", "tool");
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:release|tool|{}\n",
+            command_path.display()
+        ));
+        let client = FakeClient::new();
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(fixture.cached_cmd("owner/tool"), None);
+        assert_eq!(
+            fs::read_to_string(stamp::remote_path(
+                &fixture.roots.state_dir,
+                "owner/tool",
+                crate::method::GITHUB
+            ))
+            .unwrap(),
+            "10\n"
+        );
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
     }
 
     #[test]
@@ -858,7 +1102,7 @@ mod tests {
     #[test]
     fn fresh_last_known_repo_cache_uses_manifest_command_path() {
         let fixture = Fixture::new("last-known-repo-cache-valid");
-        fixture.write_cache("owner/tool", "github:repo:last-known", 10);
+        fixture.write_cache_for_cmd("owner/tool", "github:repo:last-known", "tool", 10);
         let command_path = fixture.write_repo_command("owner/tool", "tool");
         let manifest = Manifest::parse(&format!(
             "owner/tool|github:repo|tool|{}\n",
@@ -886,9 +1130,47 @@ mod tests {
     }
 
     #[test]
+    fn fresh_last_known_repo_cache_rechecks_when_command_changes() {
+        let fixture = Fixture::new("last-known-repo-cache-command-change");
+        fixture.write_cache_for_cmd("owner/tool", "github:repo:last-known", "tool", 10);
+        let command_path = fixture.write_repo_command("owner/tool", "othercmd");
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|othercmd|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v1.0.0", &["othercmd-v1.0.0-linux-x86_64.tar.gz"]),
+        );
+        let runner = FakeRunner::new()
+            .with_uname("x86_64")
+            .with_path("othercmd", command_path);
+        let entries = vec![parse_entry("owner/tool|github|othercmd|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                now: 20,
+                remote_ttl: 3600,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert_eq!(
+            fixture.cached_cmd("owner/tool"),
+            Some("othercmd".to_owned())
+        );
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[test]
     fn fresh_last_known_repo_cache_requires_manifest_command_path() {
         let fixture = Fixture::new("last-known-repo-missing-command");
-        fixture.write_cache("owner/tool", "github:repo:last-known", 10);
+        fixture.write_cache_for_cmd("owner/tool", "github:repo:last-known", "tool", 10);
         fs::create_dir_all(fixture.roots.install_dir.join("owner/tool")).unwrap();
         let manifest = Manifest::parse(&format!(
             "owner/tool|github:repo|tool|{}\n",
@@ -949,7 +1231,7 @@ mod tests {
     #[test]
     fn stale_release_cache_survives_metadata_fetch_failures() {
         let fixture = Fixture::new("stale-release-cache");
-        fixture.write_cache("owner/tool", "github:release", 10);
+        fixture.write_cache_for_cmd("owner/tool", "github:release", "tool", 10);
         let client = FakeClient::new();
         let runner = FakeRunner::new().with_uname("x86_64");
         let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
@@ -1265,17 +1547,50 @@ mod tests {
             .unwrap();
         }
 
+        fn write_cache_for_cmd(&self, name: &str, method: &str, cmd: &str, now: u64) {
+            let method_path = self.roots.state_dir.join(format!("{name}.github.method"));
+            fs::create_dir_all(method_path.parent().unwrap()).unwrap();
+            fs::write(method_path, format!("{method}\ncmd={cmd}\n")).unwrap();
+            stamp::remote_touch(
+                &stamp::remote_path(&self.roots.state_dir, name, crate::method::GITHUB),
+                now,
+            )
+            .unwrap();
+        }
+
         fn cached_method(&self, name: &str) -> String {
             fs::read_to_string(self.roots.state_dir.join(format!("{name}.github.method")))
                 .unwrap_or_default()
-                .trim_end()
+                .lines()
+                .next()
+                .unwrap_or_default()
                 .to_owned()
+        }
+
+        fn cached_cmd(&self, name: &str) -> Option<String> {
+            fs::read_to_string(self.roots.state_dir.join(format!("{name}.github.method")))
+                .unwrap_or_default()
+                .lines()
+                .find_map(|line| line.strip_prefix("cmd=").map(ToOwned::to_owned))
         }
 
         fn write_repo_command(&self, name: &str, command: &str) -> PathBuf {
             let command_path = self.roots.install_dir.join(name).join("bin").join(command);
             fs::create_dir_all(command_path.parent().unwrap()).unwrap();
             fs::write(&command_path, b"fake executable").unwrap();
+            let mut perms = fs::metadata(&command_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&command_path, perms).unwrap();
+            command_path
+        }
+
+        fn write_release_command(&self, name: &str, command: &str) -> PathBuf {
+            let command_path = self.roots.install_dir.join(name).join("bin").join(command);
+            fs::create_dir_all(command_path.parent().unwrap()).unwrap();
+            fs::write(&command_path, b"fake executable").unwrap();
+            let mut perms = fs::metadata(&command_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&command_path, perms).unwrap();
             command_path
         }
 
@@ -1283,6 +1598,9 @@ mod tests {
             let command_path = self.root.join("outside-bin").join(command);
             fs::create_dir_all(command_path.parent().unwrap()).unwrap();
             fs::write(&command_path, b"fake executable").unwrap();
+            let mut perms = fs::metadata(&command_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&command_path, perms).unwrap();
             command_path
         }
     }

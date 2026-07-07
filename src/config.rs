@@ -21,6 +21,9 @@ pub struct Entry {
     pub method: String,
     /// Command name used for command lookup and public bin links.
     pub cmd: String,
+    /// Whether `cmd` was supplied explicitly by config rather than defaulted
+    /// from the dependency's short name.
+    pub cmd_explicit: bool,
     /// Package-manager override list for `pkg` dependencies.
     pub aliases: String,
     /// Combined `os:`/`host:` filter string.
@@ -54,7 +57,8 @@ pub fn short_name(name: &str) -> &str {
 /// resolved value because higher-level package logic owns the skip behavior.
 #[must_use]
 pub fn resolve_override(default: &str, overrides: &str, pkg_mgr: Option<&str>) -> String {
-    resolve_override_for_runtime(default, overrides, pkg_mgr, false)
+    resolve_override_match_for_runtime(overrides, pkg_mgr, false)
+        .unwrap_or_else(|| default.to_owned())
 }
 
 /// Resolves a package override for a concrete runtime.
@@ -70,19 +74,23 @@ pub fn resolve_override_for_runtime(
     pkg_mgr: Option<&str>,
     android: bool,
 ) -> String {
+    resolve_override_match_for_runtime(overrides, pkg_mgr, android)
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn resolve_override_match_for_runtime(
+    overrides: &str,
+    pkg_mgr: Option<&str>,
+    android: bool,
+) -> Option<String> {
     if android {
         if let Some(value) = matching_override(overrides, "android") {
-            return value.to_owned();
+            return Some(value.to_owned());
         }
     }
 
-    let Some(pkg_mgr) = pkg_mgr.filter(|value| !value.is_empty()) else {
-        return default.to_owned();
-    };
-
-    matching_override(overrides, pkg_mgr)
-        .unwrap_or(default)
-        .to_owned()
+    let pkg_mgr = pkg_mgr.filter(|value| !value.is_empty())?;
+    matching_override(overrides, pkg_mgr).map(str::to_owned)
 }
 
 fn matching_override<'a>(overrides: &'a str, qualifier: &str) -> Option<&'a str> {
@@ -112,7 +120,9 @@ pub fn parse_entry_for_runtime(raw: &str, pkg_mgr: Option<&str>, android: bool) 
     let mut fields = raw.split('|');
     let raw_name = fields.next().unwrap_or_default();
     let method = fields.next().unwrap_or_default();
-    let mut cmd = dash_to_empty(fields.next().unwrap_or_default()).to_owned();
+    let raw_cmd = fields.next();
+    let mut cmd = dash_to_empty(raw_cmd.unwrap_or_default()).to_owned();
+    let mut cmd_explicit = !cmd.is_empty();
     let aliases = dash_to_empty(fields.next().unwrap_or_default()).to_owned();
     let filter = dash_to_empty(fields.next().unwrap_or_default()).to_owned();
 
@@ -121,7 +131,13 @@ pub fn parse_entry_for_runtime(raw: &str, pkg_mgr: Option<&str>, android: bool) 
         cmd = short_name(&name).to_owned();
     }
     if cmd.contains(':') {
-        cmd = resolve_override_for_runtime(short_name(&name), &cmd, pkg_mgr, android);
+        if let Some(resolved) = resolve_override_match_for_runtime(&cmd, pkg_mgr, android) {
+            cmd = resolved;
+            cmd_explicit = true;
+        } else {
+            cmd = short_name(&name).to_owned();
+            cmd_explicit = false;
+        }
     }
     // The `cmd` field is concatenated into `<bin_dir>/<cmd>` at install
     // (`bin_link::one`), cleanup (`cleanup::remove_builtin`), and release
@@ -137,12 +153,14 @@ pub fn parse_entry_for_runtime(raw: &str, pkg_mgr: Option<&str>, android: bool) 
     // still installs, it just won't honor a clearly-broken `cmd`.
     if !valid_cmd_basename(&cmd) {
         cmd = short_name(&name).to_owned();
+        cmd_explicit = false;
     }
 
     Entry {
         name,
         method: method.to_owned(),
         cmd,
+        cmd_explicit,
         aliases,
         filter,
     }
@@ -485,8 +503,19 @@ mod tests {
         assert_eq!(entry.name, "pkg-a");
         assert_eq!(entry.method, "pkg");
         assert_eq!(entry.cmd, "pkg-a");
+        assert!(!entry.cmd_explicit);
         assert_eq!(entry.aliases, "");
         assert_eq!(entry.filter, "");
+    }
+
+    #[test]
+    fn parse_entry_tracks_explicit_command_field() {
+        assert!(parse_entry("smallstep/cli|github|step|-|-", None).cmd_explicit);
+        assert!(!parse_entry("owner/plugin|github:repo", None).cmd_explicit);
+        assert!(!parse_entry("owner/plugin|github:repo|-|-|-", None).cmd_explicit);
+        assert!(!parse_entry("owner/plugin|github:repo|apt:plugin-bin", Some("brew")).cmd_explicit);
+        assert!(parse_entry("owner/plugin|github:repo|apt:plugin-bin", Some("apt")).cmd_explicit);
+        assert!(parse_entry("owner/plugin|github:repo|apt:plugin", Some("apt")).cmd_explicit);
     }
 
     #[test]
@@ -496,6 +525,8 @@ mod tests {
 
         assert_eq!(apt.cmd, "batcat");
         assert_eq!(brew.cmd, "bat");
+        assert!(apt.cmd_explicit);
+        assert!(!brew.cmd_explicit);
     }
 
     #[test]
@@ -780,13 +811,16 @@ mod tests {
         // rather than carrying the unsafe value forward.
         let entry = parse_entry("tool|github:release|/etc/passwd", None);
         assert_eq!(entry.cmd, "tool");
+        assert!(!entry.cmd_explicit);
 
         let entry = parse_entry("owner/tool|github:repo|../escape", None);
         assert_eq!(entry.cmd, "tool");
+        assert!(!entry.cmd_explicit);
 
         // Subdir-style cmds are also rejected.
         let entry = parse_entry("tool|cargo|bin/tool", None);
         assert_eq!(entry.cmd, "tool");
+        assert!(!entry.cmd_explicit);
     }
 
     #[test]
