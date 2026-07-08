@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::config;
 use crate::dep_path::{self, ResolveError};
+use crate::link_state::{self, Kind};
 use crate::manifest;
 use crate::method;
 use crate::platform::RuntimeEnv;
@@ -52,8 +53,10 @@ where
 
 /// Resolves the public command links shdeps owns for `target`.
 ///
-/// Repo-style installs link every executable directly under the resolved
-/// dependency `bin/` directory. Single-binary methods link only the configured
+/// Repo-style installs resolve command links from the dependency `bin/`
+/// directory. Binary-root install methods use tracked `.binlinks` state when
+/// available so release archives can expose every executable under their
+/// packaged `bin/` directory; otherwise they fall back to the configured
 /// command, with the install manifest providing the target when available.
 pub fn links(target: &str, roots: &Roots, env: &RuntimeEnv) -> Result<Vec<DependencyLink>> {
     if !config::valid_dep_name(target) {
@@ -72,6 +75,11 @@ pub fn links(target: &str, roots: &Roots, env: &RuntimeEnv) -> Result<Vec<Depend
     }
 
     if method::is_binary_install_root(&concrete_method) {
+        let tracked = tracked_bin_links(&entry, roots)?;
+        if !tracked.is_empty() {
+            return Ok(tracked);
+        }
+
         let Some(target_path) = binary_target(&entry, roots, &manifest) else {
             return Err(ResolveError::NotFound.into());
         };
@@ -116,6 +124,29 @@ fn repo_links(target: &str, roots: &Roots, env: &RuntimeEnv) -> Result<Vec<Depen
             command: command.to_owned(),
             public_path: roots.bin_dir.join(command),
             target_path: path,
+        });
+    }
+
+    links.sort_by(|left, right| left.command.cmp(&right.command));
+    Ok(links)
+}
+
+fn tracked_bin_links(entry: &config::Entry, roots: &Roots) -> Result<Vec<DependencyLink>> {
+    let state_path = link_state::path(&roots.state_dir, &entry.name, Kind::Bin);
+    let mut links = Vec::new();
+    for public_path in link_state::read(&state_path)? {
+        let Some(command) = public_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        let target_path = fs::read_link(&public_path).unwrap_or_else(|_| public_path.clone());
+        links.push(DependencyLink {
+            command,
+            public_path,
+            target_path,
         });
     }
 
@@ -189,6 +220,43 @@ mod tests {
         assert_eq!(links[0].command, "tool");
         assert_eq!(links[0].public_path, fixture.dir.join("bin/tool"));
         assert_eq!(links[0].target_path, target);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn release_links_use_tracked_archive_binlinks_when_present() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("release-binlinks");
+        let root = fixture.dir.join("share/owner/tool");
+        let tool = root.join("bin/tool");
+        let helper = root.join("bin/tool-helper");
+        let public_tool = fixture.dir.join("bin/tool");
+        let public_helper = fixture.dir.join("bin/tool-helper");
+        fixture.write_conf("owner/tool  github:release  tool\n");
+        fixture.write(
+            "state/manifest",
+            &format!("owner/tool|github:release|tool|{}\n", public_tool.display()),
+        );
+        fixture.write_executable("share/owner/tool/bin/tool");
+        fixture.write_executable("share/owner/tool/bin/tool-helper");
+        fs::create_dir_all(fixture.dir.join("bin")).unwrap();
+        symlink(&tool, &public_tool).unwrap();
+        symlink(&helper, &public_helper).unwrap();
+        fixture.write(
+            "state/owner/tool.binlinks",
+            &format!("{}\n{}\n", public_helper.display(), public_tool.display()),
+        );
+
+        let links = links("owner/tool", &fixture.roots(), &fixture.env()).unwrap();
+
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].command, "tool");
+        assert_eq!(links[0].public_path, public_tool);
+        assert_eq!(links[0].target_path, tool);
+        assert_eq!(links[1].command, "tool-helper");
+        assert_eq!(links[1].public_path, public_helper);
+        assert_eq!(links[1].target_path, helper);
     }
 
     #[test]

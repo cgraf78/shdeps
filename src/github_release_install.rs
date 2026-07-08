@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::archive;
+use crate::bin_link::{self, Link};
 use crate::extras;
+use crate::link_state::{self, Kind};
 use crate::process;
 
 /// Installs a raw standalone release binary into `SHDEPS_BIN_DIR`.
@@ -399,6 +401,10 @@ fn install_archive(
 
     let source = install_dir.join(relative_binary);
     replace_symlink(&source, public)?;
+    // Bin-dir fanout is best-effort for the same reason extras are: the
+    // configured command at `public` is already live, so state-dir trouble
+    // should not turn a successful install into a manifest-less reinstall loop.
+    let _ = link_archive_bins(state_dir, public, name, &install_dir);
     // Release archives commonly carry completions or man pages beside the
     // binary. Reusing the shared extras linker keeps those secondary artifacts
     // tracked and prunable exactly like repo-based installs.
@@ -410,6 +416,73 @@ fn install_archive(
     // reinstall on every future `shdeps update`.
     let _ = extras::link(state_dir, install_base, name, &install_dir);
     Ok(public.to_path_buf())
+}
+
+fn link_archive_bins(
+    state_dir: &Path,
+    public: &Path,
+    name: &str,
+    install_dir: &Path,
+) -> Result<()> {
+    let Some(public_bin_dir) = public.parent() else {
+        return Ok(());
+    };
+    if public_bin_dir.starts_with(install_dir) || !public_bin_dir.is_dir() {
+        return Ok(());
+    }
+    clear_archive_bin_links(state_dir, name, public)?;
+
+    let source_dir = install_dir.join("bin");
+    let Ok(entries) = fs::read_dir(&source_dir) else {
+        return Ok(());
+    };
+
+    let mut sources = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !process::executable_path(&path) {
+            continue;
+        }
+        let Some(cmd) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        sources.push((cmd.to_owned(), path));
+    }
+    sources.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut created = Vec::new();
+    for (cmd, path) in sources {
+        let target = public_bin_dir.join(&cmd);
+        if target == public {
+            created.push(public.to_path_buf());
+        } else if let Link::Linked(link) = bin_link::one(public_bin_dir, &cmd, &path)? {
+            created.push(link);
+        }
+    }
+    if !created.is_empty() && !created.iter().any(|link| link == public) {
+        created.push(public.to_path_buf());
+    }
+    created.sort();
+
+    link_state::write(&link_state::path(state_dir, name, Kind::Bin), &created)?;
+    Ok(())
+}
+
+pub(crate) fn clear_archive_bin_links(state_dir: &Path, name: &str, preserve: &Path) -> Result<()> {
+    let state_path = link_state::path(state_dir, name, Kind::Bin);
+    for link in link_state::read(&state_path)? {
+        if link == preserve {
+            continue;
+        }
+        if fs::symlink_metadata(&link)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            fs::remove_file(link)?;
+        }
+    }
+    link_state::write(&state_path, &[])?;
+    Ok(())
 }
 
 fn temp_path(target: &Path) -> PathBuf {
@@ -713,6 +786,7 @@ mod tests {
         let dir = temp_dir("tar-gz");
         let bytes = tar_gz(&[
             ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.0/bin/tool-helper", b"helper".as_slice(), 0o755),
             ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
         ]);
 
@@ -732,6 +806,10 @@ mod tests {
             dir.join("share/owner/tool/bin/tool")
         );
         assert_eq!(
+            fs::read_link(dir.join("bin/tool-helper")).unwrap(),
+            dir.join("share/owner/tool/bin/tool-helper")
+        );
+        assert_eq!(
             fs::read_link(dir.join("share/man/man1/tool.1")).unwrap(),
             dir.join("share/owner/tool/share/man/man1/tool.1")
         );
@@ -742,6 +820,118 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp.")
         }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_bin_links_remove_stale_commands_on_update() {
+        let dir = temp_dir("archive-bin-stale");
+        let bytes_v1 = tar_gz(&[
+            ("tool-v1.0/bin/tool", b"v1".as_slice(), 0o755),
+            ("tool-v1.0/bin/old-helper", b"old".as_slice(), 0o755),
+        ]);
+        let bytes_v2 = tar_gz(&[
+            ("tool-v2.0/bin/tool", b"v2".as_slice(), 0o755),
+            ("tool-v2.0/bin/new-helper", b"new".as_slice(), 0o755),
+        ]);
+
+        super::install_tar_gz(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes_v1,
+        )
+        .unwrap();
+        assert!(dir.join("bin/old-helper").is_symlink());
+
+        super::install_tar_gz(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes_v2,
+        )
+        .unwrap();
+
+        assert!(dir.join("bin/tool").is_symlink());
+        assert!(!dir.join("bin/old-helper").exists());
+        assert_eq!(
+            fs::read_link(dir.join("bin/new-helper")).unwrap(),
+            dir.join("share/owner/tool/bin/new-helper")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_bin_link_cleanup_preserves_configured_command_when_new_archive_has_no_bin_dir() {
+        let dir = temp_dir("archive-bin-to-top-level");
+        let bytes_v1 = tar_gz(&[
+            ("tool-v1.0/bin/tool", b"v1".as_slice(), 0o755),
+            ("tool-v1.0/bin/tool-helper", b"helper".as_slice(), 0o755),
+        ]);
+        let bytes_v2 = tar_gz(&[("tool-v2.0/tool", b"v2".as_slice(), 0o755)]);
+
+        super::install_tar_gz(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes_v1,
+        )
+        .unwrap();
+        assert!(dir.join("bin/tool").is_symlink());
+        assert!(dir.join("bin/tool-helper").is_symlink());
+
+        super::install_tar_gz(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes_v2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_link(dir.join("bin/tool")).unwrap(),
+            dir.join("share/owner/tool/tool")
+        );
+        assert!(!dir.join("bin/tool-helper").exists());
+        assert!(!dir.join("state/owner/tool.binlinks").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_binlinks_include_configured_command_from_outside_bin_when_helpers_exist() {
+        let dir = temp_dir("archive-top-level-command-with-helper");
+        let bytes = tar_gz(&[
+            ("tool-v1.0/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.0/bin/tool-helper", b"helper".as_slice(), 0o755),
+        ]);
+
+        super::install_tar_gz(
+            &dir.join("state"),
+            &dir.join("share"),
+            &dir.join("bin"),
+            "owner/tool",
+            "tool",
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::link_state::read(&crate::link_state::path(
+                &dir.join("state"),
+                "owner/tool",
+                crate::link_state::Kind::Bin
+            ))
+            .unwrap(),
+            vec![dir.join("bin/tool"), dir.join("bin/tool-helper")]
+        );
     }
 
     #[test]

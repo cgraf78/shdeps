@@ -2880,6 +2880,73 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    #[cfg(unix)]
+    fn update_github_release_plain_asset_clears_stale_archive_binlinks() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = Fixture::new("release-plain-clears-archive-binlinks");
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v2.0.0",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-linux-x86_64",
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with("https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64", b"plain-v2".to_vec());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old_install = fixture.roots.install_dir.join("owner/tool");
+        let old_tool = old_install.join("bin/tool");
+        let old_helper = old_install.join("bin/tool-helper");
+        write_executable(&old_tool);
+        write_executable(&old_helper);
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        let helper_path = fixture.roots.bin_dir.join("tool-helper");
+        symlink(&old_tool, &bin_path).unwrap();
+        symlink(&old_helper, &helper_path).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "owner/tool", Kind::Bin),
+            &[bin_path.clone(), helper_path.clone()],
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                bin_path.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.0.0\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(fs::read(&bin_path).unwrap(), b"plain-v2");
+        assert!(!helper_path.exists());
+        assert!(!link_state::path(&fixture.roots.state_dir, "owner/tool", Kind::Bin).exists());
+    }
+
+    #[test]
     fn update_github_release_verifies_sibling_sha256_checksum_when_published() {
         // When the release publishes a `<asset>.sha256` sibling, the
         // installer must fetch it and verify the downloaded binary before
@@ -4376,6 +4443,7 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         let archive = tar_gz(&[
             ("tool-v1.2.3/bin/tool", b"binary".as_slice(), 0o755),
+            ("tool-v1.2.3/bin/tool-helper", b"helper".as_slice(), 0o755),
             (
                 "tool-v1.2.3/share/man/man1/tool.1",
                 b"man".as_slice(),
@@ -4410,11 +4478,25 @@ version() { printf 'saw-pkg\n'; }
 
         let install_dir = fixture.roots.install_dir.join("owner/tool");
         let bin_path = fixture.roots.bin_dir.join("tool");
+        let helper_path = fixture.roots.bin_dir.join("tool-helper");
         assert!(!summary.has_errors());
         assert!(summary.items[0].changed);
         assert_eq!(
             fs::read_link(&bin_path).unwrap(),
             install_dir.join("bin/tool")
+        );
+        assert_eq!(
+            fs::read_link(&helper_path).unwrap(),
+            install_dir.join("bin/tool-helper")
+        );
+        assert_eq!(
+            link_state::read(&link_state::path(
+                &fixture.roots.state_dir,
+                "owner/tool",
+                Kind::Bin
+            ))
+            .unwrap(),
+            vec![bin_path.clone(), helper_path]
         );
         assert_eq!(
             fs::read_link(fixture.roots.install_dir.join("man/man1/tool.1")).unwrap(),

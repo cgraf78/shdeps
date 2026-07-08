@@ -88,7 +88,7 @@ pub fn from_dir(
         return Ok(Vec::new());
     };
 
-    let mut created = Vec::new();
+    let mut sources = Vec::new();
     for entry in entries {
         let path = entry?.path();
         if !crate::process::executable_path(&path) {
@@ -97,7 +97,13 @@ pub fn from_dir(
         let Some(cmd) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if let Link::Linked(link) = one(bin_dir, cmd, &path)? {
+        sources.push((cmd.to_owned(), path));
+    }
+    sources.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut created = Vec::new();
+    for (cmd, path) in sources {
+        if let Link::Linked(link) = one(bin_dir, &cmd, &path)? {
             created.push(link);
         }
     }
