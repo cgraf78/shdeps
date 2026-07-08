@@ -231,6 +231,13 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
             unlink_snapshot(
                 &roots.state_dir,
                 &transition.old.name,
+                Kind::Bin,
+                &transition.bin_links,
+                &preserve,
+            )?;
+            unlink_snapshot(
+                &roots.state_dir,
+                &transition.old.name,
                 Kind::Extras,
                 &transition.extra_links,
                 &preserve,
@@ -258,10 +265,16 @@ fn preserve_paths(entry: &Entry, roots: &Roots) -> BTreeSet<PathBuf> {
     // old method. Read it after the install succeeds so transition cleanup can
     // remove only pre-existing links without deleting the freshly linked public
     // command, man page, or completion.
-    for kind in [Kind::Bin, Kind::Extras] {
-        if let Ok(links) = link_state::read(&link_state::path(&roots.state_dir, &entry.name, kind))
-        {
-            preserve.extend(links);
+    if matches!(
+        entry.method.as_str(),
+        method::GITHUB_REPO | method::GITHUB_RELEASE
+    ) {
+        for kind in [Kind::Bin, Kind::Extras] {
+            if let Ok(links) =
+                link_state::read(&link_state::path(&roots.state_dir, &entry.name, kind))
+            {
+                preserve.extend(links);
+            }
         }
     }
 
@@ -371,7 +384,10 @@ fn unlink_snapshot(
     // out of the current state and writing only what is left.
     let state_path = link_state::path(state_dir, name, kind);
     let current = link_state::read(&state_path)?;
-    let snapshot_set: BTreeSet<&PathBuf> = snapshot.iter().collect();
+    let snapshot_set: BTreeSet<&PathBuf> = snapshot
+        .iter()
+        .filter(|link| !preserve.contains(*link))
+        .collect();
     let remainder: Vec<PathBuf> = current
         .into_iter()
         .filter(|link| !snapshot_set.contains(link))
@@ -663,6 +679,111 @@ mod tests {
         assert!(
             !stamp_file.exists(),
             "old-method stamp must be removed even when install_path is tampered"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_snapshot_removes_binary_method_tracked_binlinks() {
+        let dir = temp_dir("binary-binlinks");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::create_dir_all(roots.state_dir.join("owner")).unwrap();
+        let target = dir.join("target");
+        fs::write(&target, "old").unwrap();
+        let public = roots.bin_dir.join("tool");
+        let helper = roots.bin_dir.join("tool-helper");
+        symlink(&target, &public).unwrap();
+        symlink(&target, &helper).unwrap();
+        link_state::write(
+            &link_state::path(&roots.state_dir, "owner/tool", Kind::Bin),
+            &[public.clone(), helper.clone()],
+        )
+        .unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.to_string_lossy(),
+            ),
+            bin_links: vec![public.clone(), helper.clone()],
+            extra_links: Vec::new(),
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "tool".to_owned(),
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+
+        assert!(!public.exists());
+        assert!(!helper.exists());
+        assert!(!link_state::path(&roots.state_dir, "owner/tool", Kind::Bin).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_snapshot_keeps_preserved_binlinks_in_state() {
+        let dir = temp_dir("preserve-binlink-state");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::create_dir_all(roots.state_dir.join("owner")).unwrap();
+        let target = dir.join("target");
+        fs::write(&target, "new").unwrap();
+        let public = roots.bin_dir.join("tool");
+        let helper = roots.bin_dir.join("tool-helper");
+        symlink(&target, &public).unwrap();
+        symlink(&target, &helper).unwrap();
+        link_state::write(
+            &link_state::path(&roots.state_dir, "owner/tool", Kind::Bin),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                roots.install_dir.join("owner/tool").to_string_lossy(),
+            ),
+            bin_links: vec![public.clone(), helper.clone()],
+            extra_links: Vec::new(),
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "github:release".to_owned(),
+            cmd: "tool".to_owned(),
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+
+        assert!(public.exists());
+        assert!(!helper.exists());
+        assert_eq!(
+            link_state::read(&link_state::path(&roots.state_dir, "owner/tool", Kind::Bin)).unwrap(),
+            vec![public]
         );
     }
 

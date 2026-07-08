@@ -451,18 +451,23 @@ pub(crate) fn install_request(
     match asset_kind {
         AssetKind::Plain => {
             github_release_install::install_plain_to(request.public_bin, &bytes)?;
+            clear_archive_bin_links(context, request);
         }
         AssetKind::Gz => {
             github_release_install::install_gz_to(request.public_bin, &bytes)?;
+            clear_archive_bin_links(context, request);
         }
         AssetKind::Bz2 => {
             github_release_install::install_bz2_to(request.public_bin, &bytes)?;
+            clear_archive_bin_links(context, request);
         }
         AssetKind::Xz => {
             github_release_install::install_xz_to(request.public_bin, &bytes)?;
+            clear_archive_bin_links(context, request);
         }
         AssetKind::Zst => {
             github_release_install::install_zst_to(request.public_bin, &bytes)?;
+            clear_archive_bin_links(context, request);
         }
         AssetKind::TarGz => {
             github_release_install::install_tar_gz_to(
@@ -549,6 +554,17 @@ pub(crate) fn install_request(
         detail,
         stamp: true,
     })
+}
+
+fn clear_archive_bin_links(
+    context: &RequestContext<'_, impl Runner>,
+    request: &ReleaseRequest<'_>,
+) {
+    let _ = github_release_install::clear_archive_bin_links(
+        &context.roots.state_dir,
+        request.name,
+        request.public_bin,
+    );
 }
 
 fn cached_releases(repo: &str, roots: &Roots, options: Options) -> Option<Vec<github::Release>> {

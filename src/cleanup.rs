@@ -103,6 +103,7 @@ pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
             remove_stamps(&roots.state_dir, &entry.name, &mut summary)?;
         }
         binary if method::is_binary_install_root(binary) => {
+            unlink_state(roots, &entry.name, Kind::Bin, &mut summary)?;
             unlink_state(roots, &entry.name, Kind::Extras, &mut summary)?;
             remove_any(&roots.bin_dir.join(&entry.cmd), &mut summary)?;
 
@@ -365,6 +366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn binary_method_cleanup_removes_binary_install_root_empty_parents_and_stamps() {
         let fixture = Fixture::new("binary");
         let entry = ManifestEntry::new(
@@ -373,13 +375,31 @@ mod tests {
             "binary-tool",
             fixture.roots.bin_dir.join("binary-tool").to_string_lossy(),
         );
+        let helper = fixture.roots.bin_dir.join("binary-helper");
+        let helper_target = fixture
+            .roots
+            .install_dir
+            .join("owner/binary-tool/bin/binary-helper");
+        fs::create_dir_all(helper_target.parent().unwrap()).unwrap();
+        fs::write(&helper_target, "#!/bin/sh\n").unwrap();
         fixture.write_bin("binary-tool", "#!/bin/sh\n");
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        symlink(&helper_target, &helper).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "owner/binary-tool", Kind::Bin),
+            std::slice::from_ref(&helper),
+        )
+        .unwrap();
         fixture.write_install("owner/binary-tool/artifact", "data\n");
         fixture.write_state("owner/binary-tool.release.stamp", "1\n");
 
         remove_builtin(&entry, &fixture.roots).unwrap();
 
         assert!(!fixture.roots.bin_dir.join("binary-tool").exists());
+        assert!(!helper.exists());
+        assert!(
+            !link_state::path(&fixture.roots.state_dir, "owner/binary-tool", Kind::Bin).exists()
+        );
         assert!(!fixture.roots.install_dir.join("owner/binary-tool").exists());
         assert!(!fixture.roots.install_dir.join("owner").exists());
         assert!(
