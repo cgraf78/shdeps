@@ -251,6 +251,43 @@ fn gh_token_allowed(env: &impl Env) -> bool {
     ) || (io::stdin().is_terminal() && io::stdout().is_terminal())
 }
 
+/// Classified failure for GitHub API metadata fetches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchFailure {
+    /// 403/429 from api.github.com: primary or secondary rate limit.
+    RateLimited,
+    /// 404: repository missing, private without credentials, or renamed.
+    NotFound,
+    /// Anything else: network/DNS failure, parse error, unexpected status.
+    Other,
+}
+
+/// Classifies a `fetch_releases*` error by transport status when available.
+///
+/// GitHub answers exhausted unauthenticated quota on `/releases` with 403
+/// (429 for some secondary limits). Genuine permission failures on that
+/// endpoint surface to unauthenticated callers as 404 (GitHub hides private
+/// repos), so 403/429 is safe to attribute to rate limiting rather than to
+/// credentials. Errors without an HTTP status payload stay `Other` so test
+/// fakes and network failures keep today's behavior.
+pub fn fetch_failure(error: &crate::errors::Error) -> FetchFailure {
+    let crate::errors::Error::Io(io_error) = error else {
+        return FetchFailure::Other;
+    };
+    let Some(status) = io_error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<crate::http::HttpStatusError>())
+        .map(crate::http::HttpStatusError::status)
+    else {
+        return FetchFailure::Other;
+    };
+    match status {
+        403 | 429 => FetchFailure::RateLimited,
+        404 => FetchFailure::NotFound,
+        _ => FetchFailure::Other,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiRelease {
     tag_name: Option<String>,
@@ -560,9 +597,7 @@ mod tests {
 
     #[test]
     fn token_skips_gh_cli_in_headless_contexts() {
-        let runner = FakeRunner::new().with_gh_token("from-gh");
-
-        assert_eq!(token(&FakeEnv::new(), &runner).as_deref(), None);
+        assert_eq!(token(&FakeEnv::new(), &PanicRunner).as_deref(), None);
     }
 
     #[test]
@@ -658,18 +693,56 @@ mod tests {
     struct PanicRunner;
 
     impl Runner for PanicRunner {
-        fn exists(&self, _command: &str) -> bool {
-            true
+        fn exists(&self, command: &str) -> bool {
+            panic!("token resolution must not query {command} in this context");
         }
 
         fn run(
             &self,
-            _program: &str,
-            _args: &[&str],
-            _timeout: Option<Duration>,
+            program: &str,
+            args: &[&str],
+            timeout: Option<Duration>,
         ) -> io::Result<Output> {
-            panic!("environment tokens must short-circuit gh credential probing");
+            panic!(
+                "token resolution must not run {program} {args:?} with timeout {timeout:?} in this context"
+            );
         }
+    }
+
+    #[test]
+    fn fetch_failure_classifies_rate_limit_statuses() {
+        use crate::http::HttpStatusError;
+        for status in [403u16, 429] {
+            let error = crate::errors::Error::Io(std::io::Error::other(HttpStatusError::new(
+                status, "limited",
+            )));
+            assert_eq!(
+                super::fetch_failure(&error),
+                super::FetchFailure::RateLimited
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_failure_classifies_missing_repos() {
+        use crate::http::HttpStatusError;
+        let error =
+            crate::errors::Error::Io(std::io::Error::other(HttpStatusError::new(404, "nope")));
+        assert_eq!(super::fetch_failure(&error), super::FetchFailure::NotFound);
+    }
+
+    #[test]
+    fn fetch_failure_defaults_to_other_without_status_payload() {
+        let io_error = crate::errors::Error::Io(std::io::Error::other("curl: connect timeout"));
+        assert_eq!(super::fetch_failure(&io_error), super::FetchFailure::Other);
+
+        let json_error = crate::errors::Error::Json(
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+        );
+        assert_eq!(
+            super::fetch_failure(&json_error),
+            super::FetchFailure::Other
+        );
     }
 
     struct FakeClient {

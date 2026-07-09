@@ -334,16 +334,27 @@ pub(crate) fn install_request(
                 )
             }) {
             Ok(releases) => releases,
-            Err(_) => {
+            Err(error) => {
+                let failure = github::fetch_failure(&error);
                 if process::executable_path(request.public_bin) && !context.options.reinstall {
                     // GitHub metadata is a freshness check, not proof that an
                     // already-installed binary disappeared. Fleet updates can
                     // exhaust unauthenticated API quota long before anything
                     // is actually stale, so preserve the working tool and try
                     // again on the next run instead of turning a transient API
-                    // failure into a broken `dot update`.
-                    let detail = current_version
-                        .unwrap_or_else(|| "release metadata unavailable".to_owned());
+                    // failure into a broken `dot update`. Rate-limited checks
+                    // say so in the detail so stale "current" rows are
+                    // distinguishable from verified ones.
+                    let detail = match (current_version, failure) {
+                        (Some(version), github::FetchFailure::RateLimited) => {
+                            format!("{version} (update check rate-limited)")
+                        }
+                        (Some(version), _) => version,
+                        (None, github::FetchFailure::RateLimited) => {
+                            "update check rate-limited".to_owned()
+                        }
+                        (None, _) => "release metadata unavailable".to_owned(),
+                    };
                     link_existing_extras(context.roots, request.name)?;
                     return Ok(ReleaseOutcome {
                         changed: false,
@@ -355,7 +366,15 @@ pub(crate) fn install_request(
                         stamp: false,
                     });
                 }
-                return Ok(failed("release metadata fetch failed"));
+                return Ok(failed(match failure {
+                    github::FetchFailure::RateLimited => {
+                        "GitHub API rate limit exceeded; retry after the window resets or set GH_TOKEN"
+                    }
+                    github::FetchFailure::NotFound => {
+                        "no GitHub release metadata (repo missing, private, or unreleased)"
+                    }
+                    github::FetchFailure::Other => "release metadata fetch failed",
+                }));
             }
         };
         &fetched_releases

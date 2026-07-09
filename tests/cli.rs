@@ -2230,6 +2230,32 @@ fn update_requires_git_after_bare_github_resolves_to_repo() {
 }
 
 #[test]
+fn update_warns_rate_limit_before_concrete_prerequisite_failure() {
+    let fixture = Fixture::new("update-rate-limit-before-prereq");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+    fixture.write_executable(
+        "missing-path/curl",
+        "#!/bin/sh\nprintf 'curl: (22) The requested URL returned error: 403\\n' >&2\nprintf '\\n403\\n'\nexit 22\n",
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &missing_path);
+    command.env_remove("GH_TOKEN");
+    command.env_remove("GITHUB_TOKEN");
+    command.env_remove("SHDEPS_ALLOW_GH_AUTH_TOKEN");
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        "  warning  GitHub API rate limit exceeded (unauthenticated calls share 60/hour per IP); remaining GitHub checks used cached data. Set GH_TOKEN, or SHDEPS_ALLOW_GH_AUTH_TOKEN=1 to allow gh CLI credentials.\nerror: shdeps update is missing required tools for configured deps: git (GitHub repo installs)\n"
+    );
+}
+
+#[test]
 fn update_quiet_environment_suppresses_normal_output() {
     let fixture = Fixture::new("update-quiet-env");
     fixture.write("conf/deps.conf", "tool custom\n");

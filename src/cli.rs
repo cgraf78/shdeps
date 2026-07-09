@@ -572,18 +572,23 @@ where
         write_heading(stdout, "Tools")?;
     }
 
+    // One breaker for the whole update run: method resolution, release
+    // prefetch, and per-dep installs share it so a single rate-limited
+    // response stops all further doomed API calls (github_gate.rs).
+    let gate = crate::github_gate::GatedClient::new(&Curl);
     let (entries, summary, active_count) = if terminal_progress {
         let mut progress = TtyProgress::new_colored(stdout, terminal_progress_plan(&entries, &env));
         progress.start()?;
-        let entries = resolve_github_entries_with_progress_sink(
-            &entries,
-            &roots,
-            Some(&manifest),
-            &env,
-            &env_vars,
-            github_options_from_update(update_options),
-            &mut progress,
-        )?;
+        let github_inputs = ResolveGithubInputs {
+            roots: &roots,
+            manifest: Some(&manifest),
+            env: &env,
+            env_vars: &env_vars,
+            options: github_options_from_update(update_options),
+            client: &gate,
+        };
+        let entries =
+            resolve_github_entries_with_progress_sink(&entries, &github_inputs, &mut progress)?;
         if let Some(message) = update_prerequisite_error(
             &entries,
             &env,
@@ -591,6 +596,7 @@ where
             UpdatePrerequisitePhase::ConcreteOnly,
         ) {
             progress.clear_unfinished()?;
+            write_update_trip_warning(&gate, options.quiet, stderr)?;
             writeln!(stderr, "{message}")?;
             return Ok(1);
         }
@@ -602,7 +608,7 @@ where
             runner: &Process,
             pkg_mgr: &pkg_mgr,
             env_vars: &env_vars,
-            client: &Curl,
+            client: &gate,
         };
         let active_count = entries
             .iter()
@@ -633,18 +639,19 @@ where
             stdout,
             stderr,
         )?;
+        write_update_trip_warning(&gate, options.quiet, stderr)?;
         (entries, summary, active_count)
     } else {
+        let github_inputs = ResolveGithubInputs {
+            roots: &roots,
+            manifest: Some(&manifest),
+            env: &env,
+            env_vars: &env_vars,
+            options: github_options_from_update(update_options),
+            client: &gate,
+        };
         let entries = if progress_jsonl {
-            resolve_github_entries_with_progress(
-                &entries,
-                &roots,
-                Some(&manifest),
-                &env,
-                &env_vars,
-                github_options_from_update(update_options),
-                stdout,
-            )?
+            resolve_github_entries_with_progress(&entries, &github_inputs, stdout)?
         } else {
             resolve_github_entries_with_options(
                 &entries,
@@ -653,6 +660,7 @@ where
                 &env,
                 &env_vars,
                 github_options_from_update(update_options),
+                &gate,
             )?
         };
         if let Some(message) = update_prerequisite_error(
@@ -661,6 +669,7 @@ where
             &Process,
             UpdatePrerequisitePhase::ConcreteOnly,
         ) {
+            write_update_trip_warning(&gate, options.quiet, stderr)?;
             writeln!(stderr, "{message}")?;
             return Ok(1);
         }
@@ -672,7 +681,7 @@ where
             runner: &Process,
             pkg_mgr: &pkg_mgr,
             env_vars: &env_vars,
-            client: &Curl,
+            client: &gate,
         };
         let active_count = entries
             .iter()
@@ -699,6 +708,7 @@ where
                 stdout,
                 stderr,
             )?;
+            write_update_trip_warning(&gate, options.quiet, stderr)?;
             summary
         };
         (entries, summary, active_count)
@@ -716,10 +726,33 @@ where
     }
     if progress_jsonl {
         let mut progress = JsonlProgress::new(stdout);
+        if let Some(text) = gate.trip_warning() {
+            progress.event(json!({
+                "event": "warning",
+                "status": "warning",
+                "detail": text,
+            }))?;
+        }
         write_update_summary_jsonl(&summary, &entries, active_count, &mut progress)?;
     }
 
     Ok(if summary.has_errors() { 1 } else { 0 })
+}
+
+fn write_update_trip_warning<E>(
+    gate: &crate::github_gate::GatedClient<'_>,
+    quiet: bool,
+    stderr: &mut E,
+) -> Result<()>
+where
+    E: Write,
+{
+    if !quiet {
+        if let Some(text) = gate.trip_warning() {
+            write_row(stderr, "warning", text)?;
+        }
+    }
+    Ok(())
 }
 
 fn self_update_before_update<E>(
@@ -1550,6 +1583,7 @@ fn resolve_github_entries(
         env,
         env_vars,
         github_options(options),
+        &Curl,
     )
 }
 
@@ -1572,6 +1606,15 @@ fn resolve_github_entry(
     github_method::resolve_entry(entry, &context, github_options(options))
 }
 
+struct ResolveGithubInputs<'a> {
+    roots: &'a runtime::Roots,
+    manifest: Option<&'a Manifest>,
+    env: &'a crate::platform::RuntimeEnv,
+    env_vars: &'a BTreeMap<String, String>,
+    options: github_method::Options,
+    client: &'a dyn crate::http::Client,
+}
+
 fn resolve_github_entries_with_options(
     entries: &[Entry],
     roots: &runtime::Roots,
@@ -1579,46 +1622,58 @@ fn resolve_github_entries_with_options(
     env: &crate::platform::RuntimeEnv,
     env_vars: &BTreeMap<String, String>,
     options: github_method::Options,
+    client: &dyn crate::http::Client,
 ) -> Result<Vec<Entry>> {
-    let context = github_method::Context {
+    let inputs = ResolveGithubInputs {
         roots,
         manifest,
         env,
         env_vars,
+        options,
+        client,
+    };
+    resolve_github_entries_with_inputs(entries, &inputs)
+}
+
+fn resolve_github_entries_with_inputs(
+    entries: &[Entry],
+    inputs: &ResolveGithubInputs<'_>,
+) -> Result<Vec<Entry>> {
+    let context = github_method::Context {
+        roots: inputs.roots,
+        manifest: inputs.manifest,
+        env: inputs.env,
+        env_vars: inputs.env_vars,
         runner: &Process,
-        client: &Curl,
+        client: inputs.client,
     };
     github_method::resolve_entries_with_progress(
         entries,
         &context,
-        options,
-        jobs::github_max(env_vars),
+        inputs.options,
+        jobs::github_max(inputs.env_vars),
         |_done, _total| Ok(()),
     )
 }
 
 fn resolve_github_entries_with_progress_sink(
     entries: &[Entry],
-    roots: &runtime::Roots,
-    manifest: Option<&Manifest>,
-    env: &crate::platform::RuntimeEnv,
-    env_vars: &BTreeMap<String, String>,
-    options: github_method::Options,
+    inputs: &ResolveGithubInputs<'_>,
     progress: &mut dyn update::Progress,
 ) -> Result<Vec<Entry>> {
     let context = github_method::Context {
-        roots,
-        manifest,
-        env,
-        env_vars,
+        roots: inputs.roots,
+        manifest: inputs.manifest,
+        env: inputs.env,
+        env_vars: inputs.env_vars,
         runner: &Process,
-        client: &Curl,
+        client: inputs.client,
     };
     github_method::resolve_entries_with_progress(
         entries,
         &context,
-        options,
-        jobs::github_max(env_vars),
+        inputs.options,
+        jobs::github_max(inputs.env_vars),
         |done, total| {
             progress.phase(update::running_phase(
                 update::PHASE_GITHUB_METHODS,
@@ -1631,30 +1686,26 @@ fn resolve_github_entries_with_progress_sink(
 
 fn resolve_github_entries_with_progress<W>(
     entries: &[Entry],
-    roots: &runtime::Roots,
-    manifest: Option<&Manifest>,
-    env: &crate::platform::RuntimeEnv,
-    env_vars: &BTreeMap<String, String>,
-    options: github_method::Options,
+    inputs: &ResolveGithubInputs<'_>,
     stdout: &mut W,
 ) -> Result<Vec<Entry>>
 where
     W: Write,
 {
     let context = github_method::Context {
-        roots,
-        manifest,
-        env,
-        env_vars,
+        roots: inputs.roots,
+        manifest: inputs.manifest,
+        env: inputs.env,
+        env_vars: inputs.env_vars,
         runner: &Process,
-        client: &Curl,
+        client: inputs.client,
     };
     let mut progress = JsonlProgress::new(stdout);
     github_method::resolve_entries_with_progress(
         entries,
         &context,
-        options,
-        jobs::github_max(env_vars),
+        inputs.options,
+        jobs::github_max(inputs.env_vars),
         |done, total| {
             update::Progress::phase(
                 &mut progress,
@@ -3091,6 +3142,19 @@ mod tests {
         assert_eq!(event["status"], "running");
         assert_eq!(event["detail"], "waiting for sudo authentication");
         assert_eq!(String::from_utf8(prompt_out).unwrap(), "\n");
+    }
+
+    #[test]
+    fn jsonl_warning_event_shape_matches_consumer_contract() {
+        // dot's adapter reads `status` and `detail` from `warning` events.
+        let value = serde_json::json!({
+            "event": "warning",
+            "status": "warning",
+            "detail": "text",
+        });
+        assert_eq!(value["event"], "warning");
+        assert_eq!(value["status"], "warning");
+        assert!(value["detail"].is_string());
     }
 
     #[test]

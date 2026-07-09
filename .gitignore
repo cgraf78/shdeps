@@ -8,6 +8,7 @@
 /tmp/
 dist/
 target/
+.worktrees/
 
 # Source-checkout bootstrap creates this root symlink so the sourceable wrapper
 # can find the freshly built Rust CLI before an installed PATH entry. Keep it

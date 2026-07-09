@@ -24,6 +24,7 @@ pub mod errors;
 pub mod external;
 pub mod extras;
 pub mod github;
+pub mod github_gate;
 pub mod github_method;
 pub mod github_release;
 pub mod github_release_install;
