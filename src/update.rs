@@ -4292,6 +4292,117 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn rate_limited_metadata_fetch_fails_uninstalled_release_with_classified_detail() {
+        let mut fixture = Fixture::new("release-metadata-rate-limit-missing");
+        fixture.write_lib();
+        fixture.client = FakeClient::default().with_status_error(
+            "https://api.github.com/repos/owner/tool/releases?per_page=100",
+            403,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["owner/tool"]);
+        assert_eq!(
+            summary.items[0].detail,
+            "GitHub API rate limit exceeded; retry after the window resets or set GH_TOKEN"
+        );
+    }
+
+    #[test]
+    fn rate_limited_metadata_fetch_keeps_installed_release_and_says_why() {
+        let mut fixture = Fixture::new("release-metadata-rate-limit-installed");
+        fixture.write_lib();
+        fixture.client = FakeClient::default().with_status_error(
+            "https://api.github.com/repos/owner/tool/releases?per_page=100",
+            429,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        let runner = FakeRunner::default().with_success("tool", ["--version"], "tool 1.0.0\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "1.0.0 (update check rate-limited)");
+    }
+
+    #[test]
+    fn missing_repo_metadata_fetch_fails_with_not_found_detail() {
+        let mut fixture = Fixture::new("release-metadata-not-found");
+        fixture.write_lib();
+        fixture.client = FakeClient::default().with_status_error(
+            "https://api.github.com/repos/owner/tool/releases?per_page=100",
+            404,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(
+            summary.items[0].detail,
+            "no GitHub release metadata (repo missing, private, or unreleased)"
+        );
+    }
+
+    #[test]
+    fn unclassified_metadata_fetch_failure_keeps_legacy_details() {
+        let fixture = Fixture::new("release-metadata-legacy-missing");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].detail, "release metadata fetch failed");
+
+        let fixture = Fixture::new("release-metadata-legacy-installed");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        write_executable(&fixture.roots.bin_dir.join("tool"));
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].detail, "release metadata unavailable");
+    }
+
+    #[test]
     fn update_github_release_reinstall_requires_metadata_even_with_binary() {
         let fixture = Fixture::new("release-metadata-outage-reinstall");
         fixture.write_lib();
@@ -5638,6 +5749,7 @@ version() { printf 'saw-pkg\n'; }
     #[derive(Debug, Clone, Default)]
     struct FakeClient {
         responses: std::collections::BTreeMap<String, Vec<u8>>,
+        status_errors: std::collections::BTreeMap<String, u16>,
         requests: RequestLog,
         delay: Option<Duration>,
         overlap_gate: Option<OverlapGate>,
@@ -5648,6 +5760,11 @@ version() { printf 'saw-pkg\n'; }
     impl FakeClient {
         fn with(mut self, url: &str, bytes: impl Into<Vec<u8>>) -> Self {
             self.responses.insert(url.to_owned(), bytes.into());
+            self
+        }
+
+        fn with_status_error(mut self, url: &str, status: u16) -> Self {
+            self.status_errors.insert(url.to_owned(), status);
             self
         }
 
@@ -5691,6 +5808,11 @@ version() { printf 'saw-pkg\n'; }
                 .lock()
                 .unwrap()
                 .push((url.to_owned(), token.map(ToOwned::to_owned)));
+            if let Some(status) = self.status_errors.get(url) {
+                return Err(io::Error::other(crate::http::HttpStatusError::new(
+                    *status, "test",
+                )));
+            }
             self.responses.get(url).cloned().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
             })

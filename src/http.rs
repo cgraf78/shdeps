@@ -21,6 +21,41 @@ pub trait Client: Sync {
     }
 }
 
+/// Error payload carrying the final HTTP status of a failed request.
+///
+/// The transport keeps returning `io::Error` so the `Client` trait and its
+/// many test fakes stay untouched; callers that need to distinguish "rate
+/// limited" from "missing repo" downcast via `io::Error::get_ref`. Prose
+/// stays in `detail`; control flow must use `status()` only.
+#[derive(Debug)]
+pub struct HttpStatusError {
+    status: u16,
+    detail: String,
+}
+
+impl HttpStatusError {
+    /// Creates a payload for a response with `status` and diagnostic prose.
+    pub(crate) fn new(status: u16, detail: impl Into<String>) -> Self {
+        Self {
+            status,
+            detail: detail.into(),
+        }
+    }
+
+    /// Final HTTP status code observed by the transport.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "HTTP {}: {}", self.status, self.detail)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
 /// Production HTTP client backed by the host `curl` command.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Curl;
@@ -76,13 +111,24 @@ impl Curl {
         }
 
         let output = child.wait_with_output()?;
+        let has_status_trailer = output.status.success() || output.status.code() == Some(22);
+        let (body, status) = if has_status_trailer {
+            split_status_suffix(output.stdout)
+        } else {
+            (output.stdout, None)
+        };
         if output.status.success() {
-            return Ok(output.stdout);
+            return Ok(body);
         }
 
-        Err(io::Error::other(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ))
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        // Attach the HTTP status only when curl actually saw a response
+        // (status "000" means DNS/connect failure - keep the legacy shape so
+        // callers do not misclassify network errors as HTTP errors).
+        if let Some(status) = status.filter(|&status| status >= 400) {
+            return Err(io::Error::other(HttpStatusError::new(status, detail)));
+        }
+        Err(io::Error::other(detail))
     }
 }
 
@@ -105,6 +151,9 @@ fn curl_config(url: &str, token: Option<&str>, accept: GithubAccept) -> io::Resu
     let mut config = String::new();
     push_config_line(&mut config, "url", url)?;
     push_config_line(&mut config, "user-agent", "shdeps")?;
+    // Trailer used by split_status_suffix to recover the final HTTP status
+    // even under --fail (which suppresses error bodies but not --write-out).
+    config.push_str("write-out = \"\\n%{http_code}\\n\"\n");
     if is_github_api_url(url) {
         push_config_line(&mut config, "header", accept.header())?;
         if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
@@ -118,7 +167,7 @@ fn curl_config(url: &str, token: Option<&str>, accept: GithubAccept) -> io::Resu
     Ok(config)
 }
 
-fn is_github_api_url(url: &str) -> bool {
+pub(crate) fn is_github_api_url(url: &str) -> bool {
     url.starts_with("https://api.github.com/")
 }
 
@@ -146,6 +195,28 @@ fn curl_quote(value: &str) -> io::Result<String> {
         }
     }
     Ok(quoted)
+}
+
+/// Splits the `--write-out "\n%{http_code}\n"` trailer off curl stdout.
+///
+/// `%{http_code}` always renders as exactly three digits ("000" when no
+/// response was received), so the trailer is a fixed 5-byte shape. When the
+/// shape is absent (unexpected transport behavior) the output is returned
+/// unchanged so behavior degrades to the pre-trailer contract.
+fn split_status_suffix(mut stdout: Vec<u8>) -> (Vec<u8>, Option<u16>) {
+    let len = stdout.len();
+    if len >= 5
+        && stdout[len - 5] == b'\n'
+        && stdout[len - 1] == b'\n'
+        && stdout[len - 4..len - 1].iter().all(u8::is_ascii_digit)
+    {
+        let status = std::str::from_utf8(&stdout[len - 4..len - 1])
+            .ok()
+            .and_then(|digits| digits.parse::<u16>().ok());
+        stdout.truncate(len - 5);
+        return (stdout, status);
+    }
+    (stdout, None)
 }
 
 #[cfg(test)]
@@ -206,6 +277,7 @@ mod tests {
         .unwrap();
 
         assert!(config.contains("user-agent = \"shdeps\""));
+        assert!(config.contains("write-out = \"\\n%{http_code}\\n\""));
         assert!(!config.contains("header = \"User-Agent: shdeps\""));
         assert!(!config.contains("Authorization: Bearer"));
         assert!(!config.contains("Accept: application/vnd.github+json"));
@@ -229,5 +301,46 @@ mod tests {
             curl_config("https://example/\nheader = bad", None, GithubAccept::Json).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn split_status_suffix_strips_write_out_trailer_and_parses_status() {
+        let (body, status) = super::split_status_suffix(b"payload\n200\n".to_vec());
+        assert_eq!(body, b"payload");
+        assert_eq!(status, Some(200));
+    }
+
+    #[test]
+    fn split_status_suffix_handles_empty_failed_body() {
+        // With --fail, curl suppresses the error body; only the trailer remains.
+        let (body, status) = super::split_status_suffix(b"\n403\n".to_vec());
+        assert!(body.is_empty());
+        assert_eq!(status, Some(403));
+    }
+
+    #[test]
+    fn split_status_suffix_leaves_unexpected_output_untouched() {
+        let (body, status) = super::split_status_suffix(b"no trailer here".to_vec());
+        assert_eq!(body, b"no trailer here");
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn curl_config_appends_write_out_status_trailer() {
+        let config = curl_config(
+            "https://api.github.com/repos/owner/tool/releases",
+            None,
+            GithubAccept::Json,
+        )
+        .unwrap();
+        assert!(config.contains("write-out = \"\\n%{http_code}\\n\""));
+    }
+
+    #[test]
+    fn http_status_error_exposes_status_and_detail() {
+        use super::HttpStatusError;
+        let error = HttpStatusError::new(403, "quota exhausted");
+        assert_eq!(error.status(), 403);
+        assert_eq!(error.to_string(), "HTTP 403: quota exhausted");
     }
 }
