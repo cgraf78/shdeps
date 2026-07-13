@@ -502,8 +502,11 @@ Field meanings:
 
 - `name`: dependency identity, manifest key, hook path.
 - `method`: install method.
-- `cmd`: command name, optional. `-` means default.
-- `aliases`: package alias overrides, optional. `-` means none.
+- `cmd`: command name, optional. `-` means default. Manager-qualified values
+  and the higher-priority `android:` qualifier select runtime-specific command
+  names.
+- `aliases`: package alias overrides, optional. `-` means none. An `android:`
+  override takes priority over the underlying package manager on Android.
 - `filter`: `os:` and `host:` filter tokens, optional. `-` means none.
 
 Valid install methods are:
@@ -548,6 +551,9 @@ Platform names:
 - Darwin normalizes to `macos`.
 - WSL normalizes to `wsl`.
 - Other `uname -s` values lowercase, with Linux normally `linux`.
+- Android/Bionic runtimes retain their normalized kernel platform and also
+  expose `android` as a platform identity. Therefore Android matches both
+  `os:linux` and `os:android`, while `os:!android` excludes only Android.
 
 Platform specs:
 
@@ -760,7 +766,9 @@ Package manager detection order:
 Behavior:
 
 - Aliases are comma-separated `mgr:name` pairs.
-- Matching alias for active manager wins.
+- On Android, a matching `android:name` alias wins before the active package
+  manager. This distinguishes Termux from Debian/Ubuntu while both use APT.
+- Otherwise, the matching alias for the active manager wins.
 - Alias value `NONE` skips the dependency for that manager.
 - Installed package existence is checked by command lookup first, then package
   manager query when needed.

@@ -121,9 +121,9 @@ Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
 | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`    | yes      | Dependency name (used for hooks, logging, tracking). For `github`, `github:repo`, and `github:release`: GitHub `owner/repo`. For `go`: full module path. |
 | `method`  | yes      | Install method: `pkg`, `github`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, `npm`, or `custom`                                             |
-| `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` qualifiers for platform-specific command names (e.g., `apt:batcat`). |
-| `aliases` | no       | For `pkg`: per-manager package name overrides (`apt:fd-find,dnf:fd-find`). Use `NONE` to skip a specific manager (e.g., `brew:NONE`).       |
-| `filter`  | no       | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:linux,host:nas`, `os:!wsl`).                |
+| `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` and higher-priority `android:name` qualifiers (e.g., `android:fd,apt:fdfind`). |
+| `aliases` | no       | For `pkg`: per-manager package overrides (`apt:fd-find,dnf:fd-find`). `android:name` takes priority on Android. Use `NONE` to skip a runtime. |
+| `filter`  | no       | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `os:android`, `host:nas`, `os:!wsl`). Android also matches `os:linux`. |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
 
@@ -156,11 +156,18 @@ Installs via the detected package manager (brew, apt, dnf, pacman, zypper, or ap
 jq        pkg
 bat       pkg    apt:batcat
 fd        pkg    apt:fdfind       apt:fd-find,dnf:fd-find
+go        pkg    -                android:golang,apt:golang-go,dnf:golang
 dust      pkg    -                -                        os:macos
+uv        pkg    -                -                        os:android
 htop      pkg    -                -                        host:nas
 ```
 
-Use `aliases` to map names across package managers. Use `NONE` to skip a dep on a specific manager (e.g., `brew:NONE`). Use `filter` with `os:` and `host:` prefixes to limit deps to specific platforms or machines.
+Use `aliases` to map names across package managers. An `android:` override wins
+over the underlying manager override, which lets Termux differ from
+Debian/Ubuntu even though both use APT. Use `NONE` to skip a dep on a specific
+manager or on Android. `os:android` targets Android specifically; Android also
+continues to match `os:linux` so existing Linux-inclusive configs remain valid.
+Use `host:` to limit deps to specific machines.
 
 ### `github` — Automatic GitHub Install
 

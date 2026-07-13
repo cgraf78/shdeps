@@ -594,7 +594,12 @@ where
         .iter()
         .filter(|entry| entry.method == method::PKG && active(entry, context.env))
         .filter(|entry| {
-            config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr)) != "NONE"
+            config::resolve_override_for_runtime(
+                &entry.name,
+                &entry.aliases,
+                Some(context.pkg_mgr),
+                context.env.is_android(),
+            ) != "NONE"
         })
         .count();
     if active_package_entries {
@@ -1266,7 +1271,7 @@ mod tests {
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
-    use crate::config::parse_entry;
+    use crate::config::{parse_entry, parse_entry_for_runtime};
     use crate::hooks::BashCustomProbe;
     use crate::http::Client;
     use crate::link_state::{self, Kind};
@@ -2416,12 +2421,16 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/jq-post"; }
         let runner = FakeRunner::default()
             .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
             .with_success("apt-get", ["update", "-qq"], "")
-            .with_success("apt-cache", ["show", "jq"], "Package: jq\n")
-            .with_success("apt-get", ["install", "-y", "jq"], "");
+            .with_success("apt-cache", ["show", "termux-jq"], "Package: termux-jq\n")
+            .with_success("apt-get", ["install", "-y", "termux-jq"], "");
         let mut progress = RecordingProgress::default();
 
         let summary = run_with_progress(
-            &[parse_entry("jq|pkg|missing-jq|-|-", None)],
+            &[parse_entry_for_runtime(
+                "jq|pkg|missing-jq|android:termux-jq,apt:jq|-",
+                Some("apt"),
+                true,
+            )],
             &manifest::Manifest::default(),
             &fixture.context(&manifest_path, &runner, "apt"),
             Options::default(),
@@ -2433,8 +2442,8 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/jq-post"; }
         assert!(progress.prompt_pauses.is_empty());
         let calls = runner.calls();
         assert!(calls.contains(&key("apt-get", ["update", "-qq"])));
-        assert!(calls.contains(&key("apt-cache", ["show", "jq"])));
-        assert!(calls.contains(&key("apt-get", ["install", "-y", "jq"])));
+        assert!(calls.contains(&key("apt-cache", ["show", "termux-jq"])));
+        assert!(calls.contains(&key("apt-get", ["install", "-y", "termux-jq"])));
         assert!(
             calls.iter().all(|call| !call.starts_with("sudo\0")),
             "Termux package work must never cross a sudo boundary: {calls:?}"

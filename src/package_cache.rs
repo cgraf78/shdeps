@@ -39,7 +39,7 @@ use crate::state;
 // files at a different path for v4-aware shdeps to migrate. Future
 // schema bumps should update only `CACHE_VERSION` unless the on-disk
 // layout itself changes incompatibly.
-const CACHE_VERSION: &str = "shdeps-pkg-check-cache-v4";
+const CACHE_VERSION: &str = "shdeps-pkg-check-cache-v5";
 const CACHE_FILE: &str = "pkg-check-cache-v3";
 
 /// Inputs that decide whether a package-check cache entry is still valid.
@@ -53,6 +53,8 @@ pub struct Inputs {
     pub pkg_mgr: String,
     /// Current shdeps platform name after Bash-compatible normalization.
     pub platform: String,
+    /// Whether the runtime uses Android/Bionic semantics such as Termux paths.
+    pub android: bool,
     /// Current host name used by `host:` filters.
     pub host: String,
     /// Config directory itself; directory metadata catches file add/remove.
@@ -190,6 +192,7 @@ pub fn inputs<R: Runner>(source: InputSource<'_, R>) -> Result<Inputs> {
         count: source.count,
         pkg_mgr: source.pkg_mgr.to_owned(),
         platform: source.env.platform().to_owned(),
+        android: source.env.is_android(),
         host: source.env.host().to_owned(),
         conf_dir: source.roots.conf_dir.clone(),
         conf_files: config::conf_files(&source.roots.conf_dir)?,
@@ -199,7 +202,13 @@ pub fn inputs<R: Runner>(source: InputSource<'_, R>) -> Result<Inputs> {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
-        db_signatures: db_signatures(source.pkg_mgr, source.env_vars, source.runner, &active)?,
+        db_signatures: db_signatures(
+            source.pkg_mgr,
+            source.env,
+            source.env_vars,
+            source.runner,
+            &active,
+        )?,
         commands: command_signatures(source.runner, &active),
         hooks: active
             .iter()
@@ -238,7 +247,12 @@ fn active_packages(entries: &[Entry], env: &RuntimeEnv, pkg_mgr: &str) -> Vec<Ac
             )
         })
         .filter_map(|entry| {
-            let package = config::resolve_override(&entry.name, &entry.aliases, Some(pkg_mgr));
+            let package = config::resolve_override_for_runtime(
+                &entry.name,
+                &entry.aliases,
+                Some(pkg_mgr),
+                env.is_android(),
+            );
             (package != "NONE").then(|| ActivePackage {
                 name: entry.name.clone(),
                 cmd: entry.cmd.clone(),
@@ -263,6 +277,7 @@ fn command_signatures(runner: &impl Runner, packages: &[ActivePackage]) -> Vec<(
 
 fn db_signatures(
     pkg_mgr: &str,
+    env: &RuntimeEnv,
     env_vars: &BTreeMap<String, String>,
     runner: &impl Runner,
     packages: &[ActivePackage],
@@ -275,7 +290,7 @@ fn db_signatures(
         }
         let signature = match pkg_mgr {
             "brew" => brew_signature(env_vars, runner, &dep.package)?,
-            "apt" => paths_signature([PathBuf::from("/var/lib/dpkg/status")])?,
+            "apt" => paths_signature([apt_status_path(env, env_vars)])?,
             "dnf" | "zypper" => rpm_signature()?,
             "pacman" => pacman_signature(&dep.package)?,
             "apk" => paths_signature([PathBuf::from("/lib/apk/db/installed")])?,
@@ -284,6 +299,22 @@ fn db_signatures(
         signatures.insert(key, signature);
     }
     Ok(signatures.into_iter().collect())
+}
+
+fn apt_status_path(env: &RuntimeEnv, env_vars: &BTreeMap<String, String>) -> PathBuf {
+    if env.is_android() {
+        // Termux relocates the complete package-manager filesystem below
+        // PREFIX. Honor the runtime value so alternate app builds remain
+        // correct while retaining the official Termux prefix as a fallback.
+        return env_vars
+            .get("PREFIX")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/usr"))
+            .join("var/lib/dpkg/status");
+    }
+
+    PathBuf::from("/var/lib/dpkg/status")
 }
 
 fn db_key(pkg_mgr: &str, package: &str) -> String {
@@ -425,6 +456,9 @@ fn validate(cache: &Cache, inputs: &Inputs) -> Result<(Status, bool)> {
         return Ok((miss(reason), false));
     }
     if let Err(reason) = require_identity(cache, "platform", &inputs.platform) {
+        return Ok((miss(reason), false));
+    }
+    if let Err(reason) = require_identity(cache, "android", bool_identity(inputs.android)) {
         return Ok((miss(reason), false));
     }
     if let Err(reason) = require_identity(cache, "host", &inputs.host) {
@@ -593,6 +627,7 @@ fn build_cache(inputs: &Inputs) -> Result<Cache> {
         Record::new("count", [inputs.count.to_string()]),
         Record::new("pkg_mgr", [&inputs.pkg_mgr]),
         Record::new("platform", [&inputs.platform]),
+        Record::new("android", [bool_identity(inputs.android)]),
         Record::new("host", [&inputs.host]),
         Record::new("env", [env_fingerprint(&inputs.env_overrides)]),
         PathRecord::snapshot("confdir", "confdir", &inputs.conf_dir)?.into_record(),
@@ -643,6 +678,10 @@ fn env_fingerprint(overrides: &[(String, String)]) -> String {
         value.hash(&mut hasher);
     }
     format!("{:016x}", hasher.finish())
+}
+
+const fn bool_identity(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
 }
 
 fn miss(reason: impl Into<String>) -> Status {
@@ -982,7 +1021,9 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{Inputs, Status, current, path, write};
+    use super::{Inputs, Status, apt_status_path, current, path, write};
+
+    use crate::platform::RuntimeEnv;
 
     #[test]
     fn stable_hasher_is_deterministic_and_distinguishes_distinct_inputs() {
@@ -1108,6 +1149,32 @@ mod tests {
     }
 
     #[test]
+    fn android_runtime_identity_invalidates_cache() {
+        let fixture = Fixture::new("android-identity");
+        let inputs = fixture.inputs();
+        write(&inputs).unwrap();
+
+        let mut android = inputs;
+        android.android = true;
+
+        assert!(!current(&android).unwrap().is_hit());
+    }
+
+    #[test]
+    fn android_apt_database_uses_termux_prefix() {
+        let env = RuntimeEnv::new("linux", "phone").with_android(true);
+        let vars = std::collections::BTreeMap::from([(
+            "PREFIX".to_owned(),
+            "/data/data/com.termux/files/usr".to_owned(),
+        )]);
+
+        assert_eq!(
+            apt_status_path(&env, &vars),
+            PathBuf::from("/data/data/com.termux/files/usr/var/lib/dpkg/status")
+        );
+    }
+
+    #[test]
     fn hook_set_and_hook_content_changes_invalidate_cache() {
         let fixture = Fixture::new("hooks");
         fixture.write("hooks/cache-tool.sh", "post() { :; }\n");
@@ -1145,6 +1212,7 @@ mod tests {
                 count: 1,
                 pkg_mgr: "apt".to_owned(),
                 platform: "linux".to_owned(),
+                android: false,
                 host: "test-host".to_owned(),
                 conf_dir: self.dir.join("conf"),
                 conf_files: vec![self.dir.join("conf/deps.conf")],
