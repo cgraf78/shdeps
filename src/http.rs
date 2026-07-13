@@ -8,7 +8,7 @@
 //! inspect with `ps`.
 
 use std::io::{self, Write};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 /// HTTP client interface used by installer and self-update workflows.
 pub trait Client: Sync {
@@ -18,6 +18,16 @@ pub trait Client: Sync {
     /// Downloads a GitHub release asset through the REST asset endpoint.
     fn get_github_asset(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
         self.get(url, token)
+    }
+
+    /// Returns the target of one unauthenticated HTTP redirect without
+    /// following it.
+    ///
+    /// Test clients default to "unsupported" so existing fakes keep their
+    /// narrow request model. Callers must treat `None` as a cache miss and use
+    /// their authoritative fallback.
+    fn redirect_location(&self, _url: &str) -> io::Result<Option<String>> {
+        Ok(None)
     }
 }
 
@@ -60,6 +70,16 @@ impl std::error::Error for HttpStatusError {}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Curl;
 
+const CURL_GET_ARGS: [&str; 6] = [
+    "--fail",
+    "--silent",
+    "--show-error",
+    "--location",
+    "--config",
+    "-",
+];
+const CURL_REDIRECT_ARGS: [&str; 4] = ["--silent", "--show-error", "--config", "-"];
+
 impl Client for Curl {
     fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
         self.get_with_accept(url, token, GithubAccept::Json)
@@ -82,6 +102,18 @@ impl Client for Curl {
         }
         self.get_with_accept(url, token, GithubAccept::OctetStream)
     }
+
+    fn redirect_location(&self, url: &str) -> io::Result<Option<String>> {
+        let config = redirect_curl_config(url)?;
+        let output = run_curl(&CURL_REDIRECT_ARGS, &config)?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(io::Error::other(detail));
+        }
+
+        let location = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Ok((!location.is_empty()).then_some(location))
+    }
 }
 
 impl Curl {
@@ -92,25 +124,7 @@ impl Curl {
         accept: GithubAccept,
     ) -> io::Result<Vec<u8>> {
         let config = curl_config(url, token, accept)?;
-        let mut child = Command::new("curl")
-            .args([
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--config",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(config.as_bytes())?;
-        }
-
-        let output = child.wait_with_output()?;
+        let output = run_curl(&CURL_GET_ARGS, &config)?;
         let has_status_trailer = output.status.success() || output.status.code() == Some(22);
         let (body, status) = if has_status_trailer {
             split_status_suffix(output.stdout)
@@ -130,6 +144,21 @@ impl Curl {
         }
         Err(io::Error::other(detail))
     }
+}
+
+fn run_curl(args: &[&str], config: &str) -> io::Result<Output> {
+    let mut child = Command::new("curl")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(config.as_bytes())?;
+    }
+
+    child.wait_with_output()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +193,18 @@ fn curl_config(url: &str, token: Option<&str>, accept: GithubAccept) -> io::Resu
             )?;
         }
     }
+    Ok(config)
+}
+
+fn redirect_curl_config(url: &str) -> io::Result<String> {
+    let mut config = String::new();
+    push_config_line(&mut config, "url", url)?;
+    push_config_line(&mut config, "user-agent", "shdeps")?;
+    // `%{redirect_url}` gives the next hop without following it. Omitting
+    // `--location` is intentional: following the redirect would lose the tag
+    // identity that this cheap probe is meant to discover.
+    config.push_str("output = \"/dev/null\"\n");
+    config.push_str("write-out = \"%{redirect_url}\"\n");
     Ok(config)
 }
 
@@ -221,7 +262,7 @@ fn split_status_suffix(mut stdout: Vec<u8>) -> (Vec<u8>, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubAccept, curl_config};
+    use super::{CURL_REDIRECT_ARGS, GithubAccept, curl_config, redirect_curl_config};
 
     #[test]
     fn curl_get_github_asset_refuses_non_api_github_host() {
@@ -334,6 +375,16 @@ mod tests {
         )
         .unwrap();
         assert!(config.contains("write-out = \"\\n%{http_code}\\n\""));
+    }
+
+    #[test]
+    fn redirect_curl_config_does_not_follow_or_authenticate() {
+        let config = redirect_curl_config("https://github.com/owner/tool/releases/latest").unwrap();
+
+        assert!(config.contains("output = \"/dev/null\""));
+        assert!(config.contains("write-out = \"%{redirect_url}\""));
+        assert!(!config.contains("Authorization: Bearer"));
+        assert!(!CURL_REDIRECT_ARGS.contains(&"--location"));
     }
 
     #[test]

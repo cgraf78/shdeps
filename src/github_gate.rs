@@ -113,6 +113,13 @@ impl Client for GatedClient<'_> {
         self.observe_asset(url, token, &result);
         result
     }
+
+    fn redirect_location(&self, url: &str) -> io::Result<Option<String>> {
+        // The latest-release probe is a public github.com route, not a REST
+        // API call. It neither spends the gated quota nor carries a token, so
+        // it must remain available even after the API circuit breaker trips.
+        self.inner.redirect_location(url)
+    }
 }
 
 impl GatedClient<'_> {
@@ -156,6 +163,23 @@ mod tests {
 
     struct TooManyRequestsInner {
         calls: AtomicUsize,
+    }
+
+    struct RedirectInner {
+        calls: AtomicUsize,
+    }
+
+    impl Client for RedirectInner {
+        fn get(&self, _url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+            panic!("public redirect forwarding must not issue a body GET");
+        }
+
+        fn redirect_location(&self, _url: &str) -> io::Result<Option<String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(
+                "https://github.com/owner/tool/releases/tag/v1.2.3".to_owned(),
+            ))
+        }
     }
 
     impl Client for TooManyRequestsInner {
@@ -245,6 +269,24 @@ mod tests {
             2,
             "browser asset downloads must never be short-circuited"
         );
+    }
+
+    #[test]
+    fn gate_forwards_public_redirect_probes_without_api_policy() {
+        let inner = RedirectInner {
+            calls: AtomicUsize::new(0),
+        };
+        let gate = GatedClient::new(&inner);
+
+        assert_eq!(
+            gate.redirect_location("https://github.com/owner/tool/releases/latest")
+                .unwrap()
+                .as_deref(),
+            Some("https://github.com/owner/tool/releases/tag/v1.2.3")
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(!gate.tripped());
+        assert!(!gate.saw_token());
     }
 
     #[test]

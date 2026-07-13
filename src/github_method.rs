@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::Result;
 use crate::config::Entry;
@@ -21,7 +22,7 @@ use crate::jobs;
 use crate::manifest::Manifest;
 use crate::method;
 use crate::platform::{self, RuntimeEnv};
-use crate::process::Runner;
+use crate::process::{self, Runner};
 use crate::runtime::{Env, Roots};
 use crate::stamp;
 use crate::state;
@@ -146,6 +147,7 @@ where
             remote.push(RemoteCandidate {
                 index,
                 name: entry.name.clone(),
+                cmd: entry.cmd.clone(),
             });
         }
     }
@@ -158,18 +160,25 @@ where
         vars: context.env_vars,
         runtime: context.env,
     };
-    let token = github::token(&env, context.runner);
+    let token = OnceLock::new();
     let remote_results = jobs::parallel_map_with_progress(
         &remote,
         max_jobs,
-        |candidate| RemoteProbe {
-            index: candidate.index,
-            releases: github::fetch_releases_with_token(
-                &candidate.name,
-                context.client,
-                token.as_deref(),
-            )
-            .ok(),
+        |candidate| {
+            let current_release = confirmed_current_release(candidate, context, options);
+            RemoteProbe {
+                index: candidate.index,
+                current_release,
+                releases: (!current_release)
+                    .then(|| {
+                        let token = token
+                            .get_or_init(|| github::token(&env, context.runner))
+                            .as_deref();
+                        github::fetch_releases_with_token(&candidate.name, context.client, token)
+                            .ok()
+                    })
+                    .flatten(),
+            }
         },
         |completed| progress(done + completed, total),
     )?;
@@ -177,7 +186,23 @@ where
     for probe in remote_results {
         let entry = &entries[probe.index];
         let cache = Cache::new(&context.roots.state_dir, &entry.name);
-        let method = resolve_remote_method(entry, context, &cache, options, probe.releases)?;
+        let method = if probe.current_release
+            && github::remove_cached_releases(&context.roots.state_dir, &entry.name).is_ok()
+        {
+            // The installed executable already proves this host can run the
+            // release method. Keep it while GitHub's public latest tag is
+            // unchanged; a new tag falls through to authoritative asset
+            // selection before this cache is refreshed again.
+            cache.write_method(method::GITHUB_RELEASE)?;
+            stamp::remote_touch(&cache.stamp, options.now)?;
+            stamp::remote_touch(
+                &stamp::remote_path(&context.roots.state_dir, &entry.name, "release"),
+                options.now,
+            )?;
+            method::GITHUB_RELEASE
+        } else {
+            resolve_remote_method(entry, context, &cache, options, probe.releases)?
+        };
         resolved[probe.index] = Some(resolved_entry(entry, method));
     }
 
@@ -188,10 +213,12 @@ where
 struct RemoteCandidate {
     index: usize,
     name: String,
+    cmd: String,
 }
 
 struct RemoteProbe {
     index: usize,
+    current_release: bool,
     releases: Option<Vec<github::Release>>,
 }
 
@@ -230,6 +257,23 @@ where
         return Ok(method);
     }
 
+    let candidate = RemoteCandidate {
+        index: 0,
+        name: entry.name.clone(),
+        cmd: entry.cmd.clone(),
+    };
+    if confirmed_current_release(&candidate, context, options)
+        && github::remove_cached_releases(&context.roots.state_dir, &entry.name).is_ok()
+    {
+        cache.write_method(method::GITHUB_RELEASE)?;
+        stamp::remote_touch(&cache.stamp, options.now)?;
+        stamp::remote_touch(
+            &stamp::remote_path(&context.roots.state_dir, &entry.name, "release"),
+            options.now,
+        )?;
+        return Ok(method::GITHUB_RELEASE);
+    }
+
     let env = EnvVars {
         vars: context.env_vars,
         runtime: context.env,
@@ -241,6 +285,36 @@ where
         options,
         github::fetch_releases(&entry.name, &env, context.runner, context.client).ok(),
     )
+}
+
+fn confirmed_current_release<R>(
+    candidate: &RemoteCandidate,
+    context: &Context<'_, R>,
+    options: Options,
+) -> bool
+where
+    R: Runner,
+{
+    if options.reinstall {
+        return false;
+    }
+    let Some(manifest) = context.manifest else {
+        return false;
+    };
+    let Some(row) = manifest.get(&candidate.name) else {
+        return false;
+    };
+    if row.method != method::GITHUB_RELEASE || row.cmd != candidate.cmd {
+        return false;
+    }
+    let public_bin = context.roots.bin_dir.join(&candidate.cmd);
+    if !process::executable_path(&public_bin) {
+        return false;
+    }
+    let Some(version) = process::dep_version(context.runner, &candidate.cmd) else {
+        return false;
+    };
+    github::latest_release_matches(&candidate.name, &version, context.client).unwrap_or(false)
 }
 
 fn resolve_local_method<R>(
@@ -955,6 +1029,102 @@ mod tests {
     }
 
     #[test]
+    fn force_keeps_current_manifest_release_without_rest_or_token_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = Fixture::new("force-current-release");
+        fixture
+            .env_vars
+            .insert("SHDEPS_ALLOW_GH_AUTH_TOKEN".to_owned(), "1".to_owned());
+        let public_bin = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(public_bin.parent().unwrap()).unwrap();
+        fs::write(&public_bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&public_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let stale_releases = github::parse_releases(&releases_json(
+            "v9.0.0",
+            &["tool-v9.0.0-linux-x86_64.tar.gz"],
+        ))
+        .unwrap();
+        github::write_cached_releases(&fixture.roots.state_dir, "owner/tool", &stale_releases)
+            .unwrap();
+        let client = FakeClient::new().with_redirect("owner/tool", "v1.2.3");
+        let runner = FakeRunner::new().with_version("tool", "1.2.3");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                force: true,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert!(stamp::remote_checked_at(
+            &stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release"),
+            fixture.options(false).now,
+        ));
+        assert!(
+            github::read_cached_releases(&fixture.roots.state_dir, "owner/tool").is_none(),
+            "a public current-tag proof must invalidate stale REST asset metadata"
+        );
+        assert_eq!(
+            client.urls(),
+            vec![github::latest_release_url("owner/tool")]
+        );
+        assert!(!runner.calls().contains(&"gh auth token".to_owned()));
+    }
+
+    #[test]
+    fn force_reselects_bare_github_method_when_latest_tag_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new("force-changed-release");
+        let public_bin = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(public_bin.parent().unwrap()).unwrap();
+        fs::write(&public_bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&public_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.roots.install_dir.join("owner/tool").display()
+        ));
+        let client = FakeClient::new()
+            .with_redirect("owner/tool", "v1.2.3")
+            .with_releases(
+                "owner/tool",
+                releases_json("v1.2.3", &["tool-v1.2.3-linux-x86_64.tar.gz"]),
+            );
+        let runner = FakeRunner::new().with_version("tool", "1.2.2");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                force: true,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(
+            client.urls(),
+            vec![
+                github::latest_release_url("owner/tool"),
+                github::releases_url("owner/tool"),
+            ]
+        );
+    }
+
+    #[test]
     fn progress_resolution_parallelizes_remote_fetches_but_writes_cache_in_order() {
         let fixture = Fixture::new("progress-parallel");
         let client = FakeClient::new()
@@ -1126,6 +1296,7 @@ mod tests {
     #[derive(Default)]
     struct FakeClient {
         responses: BTreeMap<String, Vec<u8>>,
+        redirects: BTreeMap<String, String>,
         urls: Arc<Mutex<Vec<String>>>,
         delay: Option<Duration>,
         active: std::sync::atomic::AtomicUsize,
@@ -1140,6 +1311,14 @@ mod tests {
         fn with_releases(mut self, repo: &str, json: String) -> Self {
             self.responses
                 .insert(github::releases_url(repo), json.into_bytes());
+            self
+        }
+
+        fn with_redirect(mut self, repo: &str, tag: &str) -> Self {
+            self.redirects.insert(
+                github::latest_release_url(repo),
+                format!("https://github.com/{repo}/releases/tag/{tag}"),
+            );
             self
         }
 
@@ -1176,6 +1355,11 @@ mod tests {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
             })
         }
+
+        fn redirect_location(&self, url: &str) -> io::Result<Option<String>> {
+            self.urls.lock().unwrap().push(url.to_owned());
+            Ok(self.redirects.get(url).cloned())
+        }
     }
 
     struct ActiveGuard<'a> {
@@ -1194,6 +1378,8 @@ mod tests {
         uname: String,
         missing: BTreeSet<String>,
         paths: BTreeMap<String, PathBuf>,
+        versions: BTreeMap<String, String>,
+        calls: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeRunner {
@@ -1202,6 +1388,8 @@ mod tests {
                 uname: "x86_64".to_owned(),
                 missing: BTreeSet::new(),
                 paths: BTreeMap::new(),
+                versions: BTreeMap::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1218,6 +1406,15 @@ mod tests {
         fn with_path(mut self, command: &str, path: PathBuf) -> Self {
             self.paths.insert(command.to_owned(), path);
             self
+        }
+
+        fn with_version(mut self, command: &str, version: &str) -> Self {
+            self.versions.insert(command.to_owned(), version.to_owned());
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
         }
     }
 
@@ -1242,11 +1439,23 @@ mod tests {
             args: &[&str],
             _timeout: Option<Duration>,
         ) -> io::Result<Output> {
+            self.calls.lock().unwrap().push(
+                std::iter::once(program)
+                    .chain(args.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
             match (program, args) {
                 ("uname", ["-m"]) => Ok(Output {
                     success: true,
                     timed_out: false,
                     stdout: format!("{}\n", self.uname),
+                    stderr: String::new(),
+                }),
+                (program, ["--version"]) if self.versions.contains_key(program) => Ok(Output {
+                    success: true,
+                    timed_out: false,
+                    stdout: format!("{program} {}\n", self.versions[program]),
                     stderr: String::new(),
                 }),
                 _ => Err(io::Error::new(

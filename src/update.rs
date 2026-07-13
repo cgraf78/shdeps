@@ -3780,28 +3780,22 @@ version() { printf 'saw-pkg\n'; }
             .insert("SHDEPS_JOBS".to_owned(), "2".to_owned());
         fixture
             .env_vars
-            .insert("GH_TOKEN".to_owned(), "ci-token".to_owned());
+            .insert("SHDEPS_ALLOW_GH_AUTH_TOKEN".to_owned(), "1".to_owned());
         fixture.client = FakeClient::default()
-            .with(
-                "https://api.github.com/repos/owner/tool-a/releases?per_page=100",
-                release_response(
-                    "tool-a",
-                    "v1.0.0",
-                    "https://github.com/owner/tool/releases/download/v1/tool-a-linux-x86_64",
-                ),
+            .with_redirect(
+                "https://github.com/owner/tool-a/releases/latest",
+                "https://github.com/owner/tool-a/releases/tag/v1.0.0",
             )
-            .with(
-                "https://api.github.com/repos/owner/tool-b/releases?per_page=100",
-                release_response(
-                    "tool-b",
-                    "v2.0.0",
-                    "https://github.com/owner/tool/releases/download/v1/tool-b-linux-x86_64",
-                ),
+            .with_redirect(
+                "https://github.com/owner/tool-b/releases/latest",
+                "https://github.com/owner/tool-b/releases/tag/v2.0.0",
             );
         write_executable(&fixture.roots.bin_dir.join("tool-a"));
         write_executable(&fixture.roots.bin_dir.join("tool-b"));
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default()
+            .with_command("gh")
+            .with_success("gh", ["auth", "token"], "gh-token\n")
             .with_success("tool-a", ["--version"], "tool-a 1.0.0\n")
             .with_success("tool-b", ["--version"], "tool-b 2.0.0\n")
             .with_overlap_gate(2)
@@ -3837,12 +3831,41 @@ version() { printf 'saw-pkg\n'; }
                 url.starts_with("https://github.com/owner/tool/releases/download/v1/tool-")
             })
             .count();
+        let api_count = fixture
+            .client
+            .requests()
+            .iter()
+            .filter(|(url, _)| url.starts_with("https://api.github.com/"))
+            .count();
+        let latest_count = fixture
+            .client
+            .requests()
+            .iter()
+            .filter(|(url, _)| url.ends_with("/releases/latest"))
+            .count();
+        let token_calls = runner
+            .calls()
+            .into_iter()
+            .filter(|call| call == &key("gh", ["auth", "token"]))
+            .count();
 
         assert!(!summary.has_errors());
         assert!(summary.items.iter().all(|item| !item.changed));
         assert_eq!(
             asset_count, 0,
             "prefetched current versions should preserve the force no-op path and avoid unnecessary release downloads"
+        );
+        assert_eq!(
+            api_count, 0,
+            "matching public latest-release redirects should avoid GitHub REST API quota entirely"
+        );
+        assert_eq!(
+            latest_count, 2,
+            "each dependency should need exactly one public latest-release probe"
+        );
+        assert_eq!(
+            token_calls, 0,
+            "fully current public releases should not need `gh auth token`"
         );
         assert_eq!(
             runner.max_active(),
@@ -4471,18 +4494,9 @@ version() { printf 'saw-pkg\n'; }
     fn update_github_release_force_checks_without_reinstalling_current_binary() {
         let mut fixture = Fixture::new("release-force-current");
         fixture.write_lib();
-        fixture.client = FakeClient::default().with(
-            "https://api.github.com/repos/owner/tool/releases?per_page=100",
-            br#"[{
-                "tag_name":"v1.2.3",
-                "draft":false,
-                "prerelease":false,
-                "assets":[{
-                    "name":"tool-linux-x86_64",
-                    "browser_download_url":"https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64"
-                }]
-            }]"#
-            .to_vec(),
+        fixture.client = FakeClient::default().with_redirect(
+            "https://github.com/owner/tool/releases/latest",
+            "https://github.com/owner/tool/releases/tag/v1.2.3",
         );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let bin_path = fixture.roots.bin_dir.join("tool");
@@ -4516,10 +4530,10 @@ version() { printf 'saw-pkg\n'; }
         assert_eq!(
             fixture.client.requests(),
             vec![(
-                "https://api.github.com/repos/owner/tool/releases?per_page=100".to_owned(),
+                "https://github.com/owner/tool/releases/latest".to_owned(),
                 None
             )],
-            "force should refresh metadata but must not download a release asset when the installed version is current"
+            "force should confirm the current tag without spending GitHub REST API quota"
         );
         assert_eq!(
             fs::read_to_string(crate::stamp::remote_path(
@@ -4529,6 +4543,105 @@ version() { printf 'saw-pkg\n'; }
             ))
             .unwrap(),
             "1700000500\n"
+        );
+    }
+
+    #[test]
+    fn update_github_release_reuses_same_run_generic_redirect_proof() {
+        let fixture = Fixture::new("release-force-generic-handoff");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release"),
+            1_700_000_500,
+        )
+        .unwrap();
+        let runner = FakeRunner::default().with_success("tool", ["--version"], "tool 1.2.3\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                force: true,
+                now: 1_700_000_500,
+                remote_ttl: 3600,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert!(fixture.client.requests().is_empty());
+    }
+
+    #[test]
+    fn update_github_release_changed_redirect_falls_back_to_rest_metadata() {
+        let mut fixture = Fixture::new("release-force-changed");
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with_redirect(
+                "https://github.com/owner/tool/releases/latest",
+                "https://github.com/owner/tool/releases/tag/v1.2.3",
+            )
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[{
+                        "name":"tool-linux-x86_64",
+                        "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                    }]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                b"new-binary".to_vec(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.bin_dir.join("tool");
+        write_executable(&bin_path);
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.2.2\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(fs::read(&bin_path).unwrap(), b"new-binary");
+        assert_eq!(
+            fixture.client.requests(),
+            vec![
+                (
+                    "https://github.com/owner/tool/releases/latest".to_owned(),
+                    None,
+                ),
+                (
+                    "https://api.github.com/repos/owner/tool/releases?per_page=100".to_owned(),
+                    None,
+                ),
+                (
+                    "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        .to_owned(),
+                    None,
+                ),
+            ],
         );
     }
 
@@ -5791,6 +5904,7 @@ version() { printf 'saw-pkg\n'; }
     #[derive(Debug, Clone, Default)]
     struct FakeClient {
         responses: std::collections::BTreeMap<String, Vec<u8>>,
+        redirects: std::collections::BTreeMap<String, String>,
         status_errors: std::collections::BTreeMap<String, u16>,
         requests: RequestLog,
         delay: Option<Duration>,
@@ -5807,6 +5921,11 @@ version() { printf 'saw-pkg\n'; }
 
         fn with_status_error(mut self, url: &str, status: u16) -> Self {
             self.status_errors.insert(url.to_owned(), status);
+            self
+        }
+
+        fn with_redirect(mut self, url: &str, location: &str) -> Self {
+            self.redirects.insert(url.to_owned(), location.to_owned());
             self
         }
 
@@ -5858,6 +5977,11 @@ version() { printf 'saw-pkg\n'; }
             self.responses.get(url).cloned().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
             })
+        }
+
+        fn redirect_location(&self, url: &str) -> io::Result<Option<String>> {
+            self.requests.lock().unwrap().push((url.to_owned(), None));
+            Ok(self.redirects.get(url).cloned())
         }
     }
 
