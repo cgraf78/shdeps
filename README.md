@@ -609,9 +609,10 @@ aarch64 (including Termux), and macOS on Intel/Apple Silicon. The installer and
 detect Android.
 
 CI cross-builds Android archives and verifies their AArch64 ELF identity plus
-the Bionic `/system/bin/linker64` interpreter. Because hosted Linux runners
-cannot execute that binary, launch and wrapper-ABI verification remain a
-post-release Termux smoke check.
+the Bionic `/system/bin/linker64` interpreter. A separate x86_64 Android build
+runs inside the official Termux app on a hardware-accelerated emulator, covering
+launch and Android package policy while the AArch64 release artifact retains
+structural cross-build coverage.
 
 ## License
 

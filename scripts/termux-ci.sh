@@ -1,14 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 
-# Exercise both the native Rust suite and the runtime path that distinguishes
-# Android's APT from a conventional Debian-family host.
-pkg update -y
-pkg install -y git rust
-export CARGO_BUILD_JOBS=1
-export RUST_MIN_STACK=16777216
-cargo test --locked --lib
-cargo build --locked
+# The standard matrix owns the full test suite. This job executes the
+# NDK-built Android binary inside Termux and verifies Android package policy.
+binary=.termux-ci/shdeps
 
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
@@ -20,7 +15,7 @@ printf '%s\n' \
 output=$(
   SHDEPS_CONF_DIR="$fixture/conf" \
     SHDEPS_STATE_DIR="$fixture/state" \
-    target/debug/shdeps list
+    "$binary" list
 )
 printf '%s\n' "$output"
 printf '%s\n' "$output" |
