@@ -13,11 +13,18 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@5bf6211ec3c3365f0310dd0aa22a6bd282554db5
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
       clippy-command: cargo clippy --locked --all-targets -- -D warnings
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
       termux-command: scripts/termux-ci.sh
+      termux-host-command: |
+        target_dir="$RUNNER_TEMP/shdeps-termux-target"
+        cargo build --release --locked --target "$RUST_TARGET" --target-dir "$target_dir"
+        mkdir -p .termux-ci
+        install -m 0755 \
+          "$target_dir/$RUST_TARGET/release/shdeps" \
+          .termux-ci/shdeps
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
@@ -43,7 +50,7 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5bf6211ec3c3365f0310dd0aa22a6bd282554db5
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
       profiles: base,shellcheck
       # Shell-owned behavior lives under tests/shell. Cargo integration tests
@@ -57,6 +64,6 @@ jobs:
         tests/shell/release-scripts-test
 
   bash32:
-    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@5bf6211ec3c3365f0310dd0aa22a6bd282554db5
+    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
       command: /bin/bash scripts/smoke-install-bash32.sh
