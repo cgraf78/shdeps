@@ -4,7 +4,8 @@ set -euo pipefail
 # Exercise both the native Rust suite and the runtime path that distinguishes
 # Android's APT from a conventional Debian-family host.
 pkg update -y
-pkg install -y rust
+pkg install -y git rust
+export CARGO_BUILD_JOBS=1
 cargo test --locked
 cargo build --locked
 
