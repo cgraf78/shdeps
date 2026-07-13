@@ -189,6 +189,11 @@ and avoids turning bare `github` into a third artifact ownership model.
 Local development clones in `$SHDEPS_GIT_DEV_DIR/<repo>` are considered only
 when `github` resolves to `github:repo`. A compatible release asset wins over a
 local clone; use explicit `github:repo` when live-checkout behavior is required.
+For stale or forced checks, a working release-backed install remains
+`github:release` when GitHub's public `/releases/latest` redirect reports the
+same tag. This avoids both the REST API quota and a `gh auth token` probe; a new
+tag or unusable local install still triggers authoritative asset and method
+selection through the API.
 
 ### `github:repo` — GitHub Repos
 
@@ -215,6 +220,14 @@ mvdan/sh         github:release
 ```
 
 The `owner/repo` is the `name` field.
+
+Forced and stale checks for an installed release use GitHub's public
+`/releases/latest` redirect before the GitHub REST API. If its tag matches the
+installed command version, the dependency is current without consuming the
+unauthenticated API's per-IP quota or probing `gh auth token`. Fresh installs
+and changed releases still use the API because shdeps needs authoritative asset
+metadata; set `GH_TOKEN` for those checks when operating a large fleet or using
+private repositories.
 
 ### `cargo` — Rust Crates
 

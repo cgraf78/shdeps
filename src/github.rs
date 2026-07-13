@@ -19,6 +19,7 @@ use crate::http::Client;
 use crate::process::Runner;
 use crate::runtime::Env;
 use crate::state;
+use crate::tool_version;
 
 const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -86,6 +87,109 @@ pub fn fetch_releases_with_token(
     let bytes = client.get(&url, token)?;
     let json = String::from_utf8_lossy(&bytes);
     parse_releases(&json)
+}
+
+/// Returns GitHub's public latest stable release tag without using the REST API.
+///
+/// The human-facing `/releases/latest` route redirects to `/releases/tag/<tag>`
+/// for public repositories. That redirect is outside the REST API quota and is
+/// enough to prove that an installed release remains current. Callers still use
+/// the releases API whenever this probe is unavailable or reports a new tag,
+/// because asset selection requires the authoritative JSON payload.
+pub fn latest_release_tag(
+    repo: &str,
+    client: &(impl Client + ?Sized),
+) -> io::Result<Option<String>> {
+    let Some(location) = client.redirect_location(&latest_release_url(repo))? else {
+        return Ok(None);
+    };
+    Ok(tag_from_latest_redirect(repo, &location))
+}
+
+/// Returns the public GitHub latest-release URL for `owner/repo`.
+#[must_use]
+pub fn latest_release_url(repo: &str) -> String {
+    format!("https://github.com/{repo}/releases/latest")
+}
+
+/// True when the public latest-release redirect identifies `installed`.
+pub fn latest_release_matches(
+    repo: &str,
+    installed: &str,
+    client: &(impl Client + ?Sized),
+) -> io::Result<bool> {
+    Ok(latest_release_tag(repo, client)?.is_some_and(|tag| installed_matches_tag(installed, &tag)))
+}
+
+/// True when a command's reported version identifies the given GitHub tag.
+///
+/// GitHub projects commonly decorate semantic versions as `v1.2.3`,
+/// `rust-v1.2.3`, or `release-1.2.3`, while binaries usually print the bare
+/// dotted version. Exact non-semver tags remain supported as well.
+#[must_use]
+pub fn installed_matches_tag(installed: &str, tag: &str) -> bool {
+    comparable_versions(tag)
+        .into_iter()
+        .any(|candidate| candidate == installed)
+}
+
+fn tag_from_latest_redirect(repo: &str, location: &str) -> Option<String> {
+    let prefix = format!("https://github.com/{repo}/releases/tag/");
+    let encoded = location.strip_prefix(&prefix)?;
+    if encoded.is_empty() || encoded.contains('/') || encoded.contains('?') || encoded.contains('#')
+    {
+        return None;
+    }
+    percent_decode(encoded)
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = *bytes.get(index + 1)?;
+        let low = *bytes.get(index + 2)?;
+        decoded.push(hex_value(high)? * 16 + hex_value(low)?);
+        index += 3;
+    }
+    String::from_utf8(decoded)
+        .ok()
+        .filter(|tag| !tag.is_empty())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn comparable_versions(tag: &str) -> Vec<String> {
+    let tag = tag.trim();
+    let mut versions = Vec::new();
+    push_unique(&mut versions, tag);
+    push_unique(&mut versions, tag.strip_prefix('v').unwrap_or(tag));
+
+    if let Some(dotted) = tool_version::extract(&[tag], "release-tag") {
+        push_unique(&mut versions, &dotted);
+    }
+
+    versions
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if value.is_empty() || values.iter().any(|existing| existing == value) {
+        return;
+    }
+    values.push(value.to_owned());
 }
 
 /// Downloads a release asset using browser semantics before API fallback.
@@ -204,6 +308,20 @@ pub fn write_cached_releases(state_dir: &Path, repo: &str, releases: &[Release])
     let mut content = serde_json::to_string(releases)?;
     content.push('\n');
     state::write_atomic(&releases_cache_path(state_dir, repo), &content)
+}
+
+/// Invalidates REST metadata after a public redirect becomes the newer fact.
+///
+/// A matching latest-release redirect proves the installed tag is current but
+/// says nothing about the older cached asset list. Removing that list prevents
+/// a later update phase from treating stale assets or a withdrawn release as
+/// current-run API data.
+pub fn remove_cached_releases(state_dir: &Path, repo: &str) -> io::Result<()> {
+    match fs::remove_file(releases_cache_path(state_dir, repo)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Resolves the runtime token used for GitHub API calls.
@@ -353,7 +471,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Asset, Release, download_asset, fetch_releases, parse_releases, releases_url, token,
+        Asset, Release, download_asset, fetch_releases, installed_matches_tag, latest_release_tag,
+        latest_release_url, parse_releases, releases_url, token,
     };
     use crate::http::Client;
     use crate::process::{Output, Runner};
@@ -438,6 +557,51 @@ mod tests {
         let releases = fetch_releases("cgraf78/shdeps", &env, &runner, &client).unwrap();
 
         assert_eq!(releases, vec![release("v2026.05.24")]);
+    }
+
+    #[test]
+    fn latest_release_tag_accepts_only_same_repo_tag_redirects() {
+        let client = RedirectClient(Some(
+            "https://github.com/owner/tool/releases/tag/release-1.2.3%2Bbuild".to_owned(),
+        ));
+
+        assert_eq!(
+            latest_release_url("owner/tool"),
+            "https://github.com/owner/tool/releases/latest"
+        );
+        assert_eq!(
+            latest_release_tag("owner/tool", &client)
+                .unwrap()
+                .as_deref(),
+            Some("release-1.2.3+build")
+        );
+
+        for location in [
+            "https://github.com/attacker/tool/releases/tag/v1",
+            "https://github.com/owner/tool/releases/tag/",
+            "https://github.com/owner/tool/releases/tag/v1/extra",
+            "https://github.com/owner/tool/releases/tag/v1?download=1",
+            "https://example.test/owner/tool/releases/tag/v1",
+        ] {
+            assert_eq!(
+                latest_release_tag("owner/tool", &RedirectClient(Some(location.to_owned())))
+                    .unwrap(),
+                None,
+                "must reject untrusted redirect {location}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_tag_comparison_accepts_common_github_prefixes() {
+        assert!(installed_matches_tag("1.2.3", "v1.2.3"));
+        assert!(installed_matches_tag("0.133.0", "rust-v0.133.0"));
+        assert!(installed_matches_tag("2026.5.15", "release-2026.5.15"));
+        assert!(installed_matches_tag(
+            "nightly-20260525",
+            "nightly-20260525"
+        ));
+        assert!(!installed_matches_tag("1.2.2", "v1.2.3"));
     }
 
     #[test]
@@ -706,6 +870,19 @@ mod tests {
             panic!(
                 "token resolution must not run {program} {args:?} with timeout {timeout:?} in this context"
             );
+        }
+    }
+
+    struct RedirectClient(Option<String>);
+
+    impl Client for RedirectClient {
+        fn get(&self, url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+            panic!("redirect probe must not issue a body GET for {url}");
+        }
+
+        fn redirect_location(&self, url: &str) -> io::Result<Option<String>> {
+            assert_eq!(url, "https://github.com/owner/tool/releases/latest");
+            Ok(self.0.clone())
         }
     }
 

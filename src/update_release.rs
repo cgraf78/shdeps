@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::Result;
 use crate::config::Entry;
@@ -23,7 +24,6 @@ use crate::process::{self, Runner};
 use crate::release_asset::AssetKind;
 use crate::runtime::{Env, Roots};
 use crate::stamp;
-use crate::tool_version;
 use crate::update::{
     self, Context, Item, ItemReason, Options, Progress, detail_with_action, verbose_enabled,
 };
@@ -82,8 +82,8 @@ pub(crate) fn install_with_prefetch(
 pub(crate) struct Prefetch {
     releases: BTreeMap<String, Vec<github::Release>>,
     versions: BTreeMap<String, String>,
-    token: Option<String>,
-    token_resolved: bool,
+    current: BTreeSet<String>,
+    token: OnceLock<Option<String>>,
 }
 
 impl Prefetch {
@@ -93,6 +93,16 @@ impl Prefetch {
 
     fn version(&self, name: &str) -> Option<&str> {
         self.versions.get(name).map(String::as_str)
+    }
+
+    fn is_current(&self, name: &str) -> bool {
+        self.current.contains(name)
+    }
+
+    fn token<'a>(&'a self, env: &impl Env, runner: &impl Runner) -> Option<&'a str> {
+        self.token
+            .get_or_init(|| github::token(env, runner))
+            .as_deref()
     }
 }
 
@@ -122,56 +132,23 @@ where
         vars: context.env_vars,
         runtime: context.env,
     };
-    let token = github::token(&env, context.runner);
     let mut prefetch = Prefetch {
         releases: BTreeMap::new(),
         versions: BTreeMap::new(),
-        token: token.clone(),
-        token_resolved: true,
+        current: BTreeSet::new(),
+        token: OnceLock::new(),
     };
     let jobs = jobs::github_max(context.env_vars);
     if jobs <= 1 || candidates.len() <= 1 {
-        // Still cache the token in the sequential path. The old Bash
-        // implementation naturally held this in shell state, but the Rust port
-        // otherwise probes `gh auth token` once per metadata/asset request.
-        // Avoiding that subprocess fan-out is a warm-path performance win and
-        // also keeps CI logs quieter when GitHub credentials are present.
+        for candidate in &candidates {
+            if let Some(releases) = cached_releases(&candidate.repo, context.roots, options) {
+                prefetch.releases.insert(candidate.repo.clone(), releases);
+            }
+        }
+        // The shared lazy token remains available to the sequential install
+        // path. It is resolved only if the public redirect cannot prove an
+        // installed release current, then reused for every API request.
         return Ok(prefetch);
-    }
-
-    // Prefetch only read-only release facts. Installation order is part of the
-    // public behavior because post hooks and method-transition cleanup are
-    // observable, but metadata reads are safe to overlap because they have no
-    // local mutation. A failed metadata prefetch is deliberately not cached so
-    // the normal per-dependency path can retry and report the same failure it
-    // would have reported without this optimization.
-    for (repo, releases) in jobs::parallel_map_with_progress(
-        &candidates,
-        jobs,
-        |candidate| {
-            cached_releases(&candidate.repo, context.roots, options)
-                .or_else(|| {
-                    github::fetch_releases_with_token(
-                        &candidate.repo,
-                        context.client,
-                        token.as_deref(),
-                    )
-                    .ok()
-                })
-                .map(|releases| (candidate.repo.clone(), releases))
-        },
-        |done| {
-            progress.phase(update::running_phase(
-                update::PHASE_GITHUB_RELEASE_METADATA,
-                done,
-                candidates.len(),
-            ))
-        },
-    )?
-    .into_iter()
-    .flatten()
-    {
-        prefetch.releases.insert(repo, releases);
     }
 
     let version_candidates = candidates
@@ -203,7 +180,66 @@ where
         }
     }
 
+    // Each remote worker first asks GitHub's public redirect for the latest
+    // tag. When that tag matches the installed command version, no REST API
+    // request is needed. New installs, changed tags, private repositories, and
+    // malformed redirects fall through to the existing authoritative release
+    // JSON request in the same worker. One result per candidate keeps progress
+    // totals stable even though a fallback worker can perform two HTTP calls.
+    let versions = &prefetch.versions;
+    let token = &prefetch.token;
+    for probe in jobs::parallel_map_with_progress(
+        &candidates,
+        jobs,
+        |candidate| {
+            if let Some(releases) = cached_releases(&candidate.repo, context.roots, options) {
+                return Some(RemoteProbe::Releases(candidate.repo.clone(), releases));
+            }
+
+            if !options.reinstall
+                && versions.get(&candidate.name).is_some_and(|version| {
+                    github::latest_release_matches(&candidate.repo, version, context.client)
+                        .unwrap_or(false)
+                })
+            {
+                return Some(RemoteProbe::Current(candidate.name.clone()));
+            }
+
+            {
+                let token = token
+                    .get_or_init(|| github::token(&env, context.runner))
+                    .as_deref();
+                github::fetch_releases_with_token(&candidate.repo, context.client, token).ok()
+            }
+            .map(|releases| RemoteProbe::Releases(candidate.repo.clone(), releases))
+        },
+        |done| {
+            progress.phase(update::running_phase(
+                update::PHASE_GITHUB_RELEASE_METADATA,
+                done,
+                candidates.len(),
+            ))
+        },
+    )?
+    .into_iter()
+    .flatten()
+    {
+        match probe {
+            RemoteProbe::Current(name) => {
+                prefetch.current.insert(name);
+            }
+            RemoteProbe::Releases(repo, releases) => {
+                prefetch.releases.insert(repo, releases);
+            }
+        }
+    }
+
     Ok(prefetch)
+}
+
+enum RemoteProbe {
+    Current(String),
+    Releases(String, Vec<github::Release>),
 }
 
 pub(crate) fn prefetch_progress_total(
@@ -221,7 +257,8 @@ fn prefetch_candidates(entries: &[&Entry], roots: &Roots, options: Options) -> V
         let public_bin = roots.bin_dir.join(&entry.cmd);
         let stamp_path = stamp::remote_path(&roots.state_dir, &entry.name, "release");
         if process::executable_path(&public_bin)
-            && stamp::remote_fresh(&stamp_path, options.freshness())
+            && (stamp::remote_fresh(&stamp_path, options.freshness())
+                || stamp::remote_checked_at(&stamp_path, options.now))
         {
             continue;
         }
@@ -276,8 +313,13 @@ pub(crate) fn install_request(
 ) -> Result<ReleaseOutcome> {
     let stamp_path = stamp::remote_path(&context.roots.state_dir, request.name, "release");
     if process::executable_path(request.public_bin)
-        && stamp::remote_fresh(&stamp_path, context.options.freshness())
+        && (stamp::remote_fresh(&stamp_path, context.options.freshness())
+            || stamp::remote_checked_at(&stamp_path, context.options.now))
     {
+        // Bare `github` resolution can verify this release through the public
+        // redirect earlier in the same run. `remote_checked_at` carries that
+        // proof into the concrete release phase even when `--force` bypasses
+        // ordinary TTL freshness, avoiding a duplicate public request.
         // Bash relinks extras even on the TTL fast path. That idempotent repair
         // matters when a user prunes a completion/manpage symlink by hand while
         // keeping the binary; a fresh stamp should skip the network, not leave
@@ -313,6 +355,25 @@ pub(crate) fn install_request(
                 .then(|| process::dep_version(context.runner, request.cmd))
                 .flatten()
         });
+
+    let redirect_confirms_current = context.prefetch.is_current(request.name)
+        || (!context.options.reinstall
+            && !context.prefetch.releases.contains_key(request.repo)
+            && current_version.as_deref().is_some_and(|current| {
+                github::latest_release_matches(request.repo, current, context.client)
+                    .unwrap_or(false)
+            }));
+    if redirect_confirms_current {
+        link_existing_extras(context.roots, request.name)?;
+        return Ok(ReleaseOutcome {
+            changed: false,
+            failed: false,
+            detail: current_version.unwrap_or_else(|| "current".to_owned()),
+            // The public redirect proved the installed tag is still GitHub's
+            // latest stable release, so this is a successful remote check.
+            stamp: true,
+        });
+    }
 
     let env = EnvVars {
         vars: context.env_vars,
@@ -383,7 +444,7 @@ pub(crate) fn install_request(
         if !context.options.reinstall
             && current_version
                 .as_deref()
-                .is_some_and(|current| installed_matches_tag(current, &latest.tag))
+                .is_some_and(|current| github::installed_matches_tag(current, &latest.tag))
         {
             // `--force` deliberately bypasses the TTL so users can ask GitHub
             // "is there anything newer?" immediately. It must not imply a
@@ -557,7 +618,7 @@ pub(crate) fn install_request(
 
     let detail = if verbose_enabled(context.options, context.env_vars) {
         match current_version {
-            Some(current) if installed_matches_tag(&current, &selection.tag) => {
+            Some(current) if github::installed_matches_tag(&current, &selection.tag) => {
                 detail_with_action("reinstalled", selection.tag.clone())
             }
             Some(current) => format!("updated -- {current} -> {}", selection.tag),
@@ -604,18 +665,14 @@ fn fetch_releases_with_prefetch_token(
     client: &dyn Client,
     prefetch: &Prefetch,
 ) -> Result<Vec<github::Release>> {
-    if prefetch.token_resolved {
-        github::fetch_releases_with_token(repo, client, prefetch.token.as_deref())
-    } else {
-        github::fetch_releases(repo, env, runner, client)
-    }
+    github::fetch_releases_with_token(repo, client, prefetch.token(env, runner))
 }
 
 fn github_token(env: &impl Env, context: &RequestContext<'_, impl Runner>) -> Option<String> {
-    if context.prefetch.token_resolved {
-        return context.prefetch.token.clone();
-    }
-    github::token(env, context.runner)
+    context
+        .prefetch
+        .token(env, context.runner)
+        .map(ToOwned::to_owned)
 }
 
 fn link_existing_extras(roots: &Roots, name: &str) -> Result<()> {
@@ -647,36 +704,6 @@ fn failed(detail: &str) -> ReleaseOutcome {
     }
 }
 
-fn installed_matches_tag(installed: &str, tag: &str) -> bool {
-    comparable_versions(tag)
-        .into_iter()
-        .any(|candidate| candidate == installed)
-}
-
-fn comparable_versions(tag: &str) -> Vec<String> {
-    let tag = tag.trim();
-    let mut versions = Vec::new();
-
-    // Keep exact-ish comparisons first for projects that report their tag
-    // verbatim. Then add the de-prefixed and dotted forms that cover common
-    // GitHub tags such as `v1.2.3`, `rust-v0.133.0`, and `release-2026.5.15`.
-    push_unique(&mut versions, tag);
-    push_unique(&mut versions, tag.strip_prefix('v').unwrap_or(tag));
-
-    if let Some(dotted) = tool_version::extract(&[tag], "release-tag") {
-        push_unique(&mut versions, &dotted);
-    }
-
-    versions
-}
-
-fn push_unique(values: &mut Vec<String>, value: &str) {
-    if value.is_empty() || values.iter().any(|existing| existing == value) {
-        return;
-    }
-    values.push(value.to_owned());
-}
-
 struct EnvVars<'a> {
     vars: &'a std::collections::BTreeMap<String, String>,
     runtime: &'a RuntimeEnv,
@@ -697,27 +724,5 @@ impl Env for EnvVars<'_> {
 
     fn read_to_string(&self, _path: &std::path::Path) -> Option<String> {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{comparable_versions, installed_matches_tag};
-
-    #[test]
-    fn release_tag_comparison_accepts_common_github_prefixes() {
-        assert!(installed_matches_tag("1.2.3", "v1.2.3"));
-        assert!(installed_matches_tag("0.133.0", "rust-v0.133.0"));
-        assert!(installed_matches_tag("2026.5.15", "release-2026.5.15"));
-        assert!(installed_matches_tag(
-            "nightly-20260525",
-            "nightly-20260525"
-        ));
-        assert!(!installed_matches_tag("1.2.2", "v1.2.3"));
-
-        assert_eq!(
-            comparable_versions("rust-v0.133.0"),
-            vec!["rust-v0.133.0", "0.133.0"]
-        );
     }
 }
