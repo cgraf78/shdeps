@@ -151,6 +151,7 @@ fn release_wide_checksum_priority(name: &str) -> Option<u8> {
 
 fn target(env: &RuntimeEnv, runner: &impl Runner) -> Target {
     let os = match env.platform() {
+        "linux" if env.is_android() => "android".to_owned(),
         // Bash uses `uname -s` directly, so macOS appears as `darwin` in the
         // release matcher. Preserve that spelling because many upstream
         // projects use `darwin` instead of `macos` in asset names.
@@ -601,6 +602,32 @@ mod tests {
                 &runner
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn select_uses_android_assets_inside_termux() {
+        let releases = vec![release(
+            "v1.0.0",
+            false,
+            false,
+            &[
+                "tool-v1.0.0-linux-aarch64-musl.tar.gz",
+                "tool-v1.0.0-android-aarch64.tar.gz",
+            ],
+        )];
+        let runner = FakeRunner::new("aarch64", "");
+
+        assert_eq!(
+            select(
+                "tool",
+                &releases,
+                &RuntimeEnv::new("linux", "host").with_android(true),
+                &runner
+            )
+            .unwrap()
+            .url,
+            "https://github.com/owner/tool/releases/download/v1/tool-v1.0.0-android-aarch64.tar.gz"
         );
     }
 

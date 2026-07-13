@@ -596,6 +596,16 @@ shdeps-YYYYMMDD-HHMMSS-<8hex>-<asset-platform>.tar.gz
 shdeps-YYYYMMDD-HHMMSS-<8hex>-<asset-platform>.tar.gz.sha256
 ```
 
+Published platforms include musl Linux on x86_64/aarch64, Bionic Android on
+aarch64 (including Termux), and macOS on Intel/Apple Silicon. The installer and
+`self-update` select `android-aarch64` before the generic Linux flavor when they
+detect Android.
+
+CI cross-builds Android archives and verifies their AArch64 ELF identity plus
+the Bionic `/system/bin/linker64` interpreter. Because hosted Linux runners
+cannot execute that binary, launch and wrapper-ABI verification remain a
+post-release Termux smoke check.
+
 ## License
 
 [MIT](LICENSE)

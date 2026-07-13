@@ -39,6 +39,9 @@ pub fn host_label(env: &impl Env) -> Option<String> {
     let arch = normalize_arch(&arch_probe)?;
 
     match runtime.platform() {
+        "linux" if runtime.is_android() => {
+            (arch == "aarch64").then(|| "android-aarch64".to_owned())
+        }
         // The release workflow publishes musl Linux binaries so older fleet
         // machines and WSL installs do not inherit the builder's glibc floor.
         "linux" | "wsl" => Some(format!("linux-{arch}-musl")),
@@ -106,6 +109,15 @@ mod tests {
             host_label(
                 &FakeEnv::new()
                     .with_var("SHDEPS_TEST_PLATFORM", "linux")
+                    .with_var("TERMUX_VERSION", "0.118.3")
+                    .with_command("uname -m", "aarch64")
+            ),
+            Some("android-aarch64".to_owned())
+        );
+        assert_eq!(
+            host_label(
+                &FakeEnv::new()
+                    .with_var("SHDEPS_TEST_PLATFORM", "linux")
                     .with_command("uname -m", "amd64")
             ),
             Some("linux-x86_64-musl".to_owned())
@@ -130,6 +142,15 @@ mod tests {
 
     #[test]
     fn host_label_rejects_unknown_platforms_and_architectures() {
+        assert_eq!(
+            host_label(
+                &FakeEnv::new()
+                    .with_var("SHDEPS_TEST_PLATFORM", "linux")
+                    .with_var("ANDROID_ROOT", "/system")
+                    .with_command("uname -m", "x86_64")
+            ),
+            None
+        );
         assert_eq!(
             host_label(
                 &FakeEnv::new()

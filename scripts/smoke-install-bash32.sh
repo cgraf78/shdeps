@@ -33,19 +33,23 @@ _sha256_line() {
 }
 
 _platform_label() {
-  local os arch
+  local os arch android=0
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m | tr '[:upper:]' '[:lower:]')
+  if [[ -n "${ANDROID_ROOT:-}" || -n "${TERMUX_VERSION:-}" || "$(uname -o 2>/dev/null)" == "Android" ]]; then
+    android=1
+  fi
   case "$arch" in
     amd64) arch="x86_64" ;;
     arm64) arch="aarch64" ;;
   esac
 
-  case "$os:$arch" in
-    linux:x86_64) printf '%s\n' "linux-x86_64-musl" ;;
-    linux:aarch64) printf '%s\n' "linux-aarch64-musl" ;;
-    darwin:x86_64) printf '%s\n' "macos-x86_64" ;;
-    darwin:aarch64) printf '%s\n' "macos-aarch64" ;;
+  case "$android:$os:$arch" in
+    1:linux:aarch64) printf '%s\n' "android-aarch64" ;;
+    0:linux:x86_64) printf '%s\n' "linux-x86_64-musl" ;;
+    0:linux:aarch64) printf '%s\n' "linux-aarch64-musl" ;;
+    0:darwin:x86_64) printf '%s\n' "macos-x86_64" ;;
+    0:darwin:aarch64) printf '%s\n' "macos-aarch64" ;;
     *) _die "unsupported smoke-test platform: $os/$arch" ;;
   esac
 }

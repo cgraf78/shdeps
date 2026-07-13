@@ -264,20 +264,31 @@ _uses_default_repo_slug() {
   [[ "$(_repo_slug)" == "$(_repo_url_slug "$_SHDEPS_DEFAULT_REPO")" ]]
 }
 
+_is_android() {
+  [[ -n "${ANDROID_ROOT:-}" || -n "${TERMUX_VERSION:-}" ]] && return 0
+  [[ "$(uname -o 2>/dev/null)" == "Android" ]]
+}
+
 _release_platform() {
-  local os arch
+  local os arch android=0
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
   arch=$(uname -m | tr '[:upper:]' '[:lower:]')
+  _is_android && android=1
   case "$arch" in
     amd64) arch="x86_64" ;;
     arm64) arch="aarch64" ;;
   esac
 
-  case "$os:$arch" in
-    linux:x86_64) printf '%s\n' "linux-x86_64-musl" ;;
-    linux:aarch64) printf '%s\n' "linux-aarch64-musl" ;;
-    darwin:x86_64) printf '%s\n' "macos-x86_64" ;;
-    darwin:aarch64) printf '%s\n' "macos-aarch64" ;;
+  case "$android:$os:$arch" in
+    1:linux:aarch64) printf '%s\n' "android-aarch64" ;;
+    1:linux:*)
+      _error "unsupported shdeps Android release architecture: $arch"
+      return 1
+      ;;
+    0:linux:x86_64) printf '%s\n' "linux-x86_64-musl" ;;
+    0:linux:aarch64) printf '%s\n' "linux-aarch64-musl" ;;
+    0:darwin:x86_64) printf '%s\n' "macos-x86_64" ;;
+    0:darwin:aarch64) printf '%s\n' "macos-aarch64" ;;
     *)
       _error "unsupported shdeps release platform: $os/$arch"
       return 1

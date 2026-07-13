@@ -604,6 +604,7 @@ fn artifact_platform_from_pair(pair: &Pair) -> Option<String> {
     [
         "linux-x86_64-musl",
         "linux-aarch64-musl",
+        "android-aarch64",
         "macos-x86_64",
         "macos-aarch64",
     ]

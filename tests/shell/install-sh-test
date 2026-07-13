@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091
+# shellcheck disable=SC1091,SC2329
 # install-sh-test — focused tests for install.sh helper functions.
+# SC2329: subshell-local `uname` mocks are invoked indirectly by install.sh.
 #
 # install.sh is the curl-pipe bootstrap script; its helpers cannot be
 # covered by the Rust test suite. This file sources install.sh in a
@@ -82,6 +83,75 @@ unset SHDEPS_INSTALL_SH_NO_DISPATCH
 
 _fixture_dir=$(mktemp -d)
 trap 'rm -rf "$_fixture_dir"' EXIT
+
+echo "=== install.sh: _release_platform ==="
+
+_android_env_platform=$(
+  uname() {
+    case "$1" in
+      -s) printf 'Linux\n' ;;
+      -m) printf 'aarch64\n' ;;
+      -o) printf 'GNU/Linux\n' ;;
+    esac
+  }
+  ANDROID_ROOT=/system _release_platform
+)
+_assert_eq "release platform: Android environment selects Bionic asset" \
+  "android-aarch64" "$_android_env_platform"
+
+_termux_platform=$(
+  uname() {
+    case "$1" in
+      -s) printf 'Linux\n' ;;
+      -m) printf 'arm64\n' ;;
+      -o) printf 'GNU/Linux\n' ;;
+    esac
+  }
+  TERMUX_VERSION=0.118.3 _release_platform
+)
+_assert_eq "release platform: Termux selects Bionic asset" \
+  "android-aarch64" "$_termux_platform"
+
+_uname_android_platform=$(
+  uname() {
+    case "$1" in
+      -s) printf 'Linux\n' ;;
+      -m) printf 'aarch64\n' ;;
+      -o) printf 'Android\n' ;;
+    esac
+  }
+  unset ANDROID_ROOT TERMUX_VERSION
+  _release_platform
+)
+_assert_eq "release platform: Android uname selects Bionic asset" \
+  "android-aarch64" "$_uname_android_platform"
+
+_linux_platform=$(
+  uname() {
+    case "$1" in
+      -s) printf 'Linux\n' ;;
+      -m) printf 'aarch64\n' ;;
+      -o) printf 'GNU/Linux\n' ;;
+    esac
+  }
+  unset ANDROID_ROOT TERMUX_VERSION
+  _release_platform
+)
+_assert_eq "release platform: ordinary ARM64 Linux keeps musl asset" \
+  "linux-aarch64-musl" "$_linux_platform"
+
+_empty_android_env_platform=$(
+  uname() {
+    case "$1" in
+      -s) printf 'Linux\n' ;;
+      -m) printf 'aarch64\n' ;;
+      -o) printf 'GNU/Linux\n' ;;
+    esac
+  }
+  ANDROID_ROOT='' TERMUX_VERSION='' _release_platform
+)
+_assert_eq "release platform: empty Android variables keep Linux asset" \
+  "linux-aarch64-musl" "$_empty_android_env_platform"
 
 echo "=== install.sh: _curl_config_quote ==="
 

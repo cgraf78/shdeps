@@ -754,6 +754,7 @@ Build these archive labels:
 
 - `linux-x86_64-musl`
 - `linux-aarch64-musl`
+- `android-aarch64`
 - `macos-x86_64`
 - `macos-aarch64`
 
@@ -768,11 +769,14 @@ Map artifact labels to Rust targets:
 | --- | --- | --- |
 | `linux-x86_64-musl` | `x86_64-unknown-linux-musl` | `ubuntu-24.04` |
 | `linux-aarch64-musl` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
+| `android-aarch64` | `aarch64-linux-android` | `ubuntu-24.04` |
 | `macos-x86_64` | `x86_64-apple-darwin` | `macos-15-intel` |
 | `macos-aarch64` | `aarch64-apple-darwin` | `macos-latest` |
 
 The Linux builds should be musl because shdeps is an installer/bootstrap tool.
 It should not depend on the target machine having a new enough glibc.
+Android builds should target Bionic through the Android NDK so Termux does not
+receive a conventional Linux executable.
 
 ### Artifact Names
 
