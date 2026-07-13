@@ -671,12 +671,20 @@ fn pkg_install_with_mgr<E>(pkg_mgr: &str, package: &str, stderr: &mut E) -> Resu
 where
     E: Write,
 {
-    pkg_install_with_runner(pkg_mgr, package, &Process, stderr)
+    let env = runtime::runtime_env(&ProcessEnv);
+    pkg_install_with_runner(
+        pkg_mgr,
+        package,
+        pkg::Elevation::for_manager(pkg_mgr, &env),
+        &Process,
+        stderr,
+    )
 }
 
 fn pkg_install_with_runner<E, R>(
     pkg_mgr: &str,
     package: &str,
+    elevation: pkg::Elevation,
     runner: &R,
     stderr: &mut E,
 ) -> Result<i32>
@@ -688,7 +696,7 @@ where
         return Ok(1);
     }
 
-    if let Some(refresh) = pkg::refresh(pkg_mgr) {
+    if let Some(refresh) = pkg::refresh(pkg_mgr, elevation) {
         // Bash treats metadata refresh as best effort: a stale repo cache
         // should not prevent an explicit hook fallback from checking whether
         // the requested package is available. Preserve that behavior here so
@@ -713,7 +721,7 @@ where
     }
 
     let packages = [package.to_owned()];
-    let Some(install) = pkg::install(pkg_mgr, &packages) else {
+    let Some(install) = pkg::install(pkg_mgr, &packages, elevation) else {
         return Ok(1);
     };
     if run_pkg_command(runner, &install, None)?.success {
@@ -879,7 +887,14 @@ mod tests {
         let mut stderr = Vec::new();
 
         assert_eq!(
-            pkg_install_with_runner("apt", "tool", &runner, &mut stderr).unwrap(),
+            pkg_install_with_runner(
+                "apt",
+                "tool",
+                crate::pkg::Elevation::Sudo,
+                &runner,
+                &mut stderr,
+            )
+            .unwrap(),
             0
         );
 
@@ -894,6 +909,39 @@ mod tests {
                 (key("sudo", ["apt-get", "install", "-y", "tool"]), None),
             ],
             "hook package installs should bound only read-only availability probes"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn pkg_install_api_runs_android_apt_without_sudo() {
+        let runner = FakeRunner::default()
+            .with_success("apt-get", ["update", "-qq"], "")
+            .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
+            .with_success("apt-get", ["install", "-y", "tool"], "");
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            pkg_install_with_runner(
+                "apt",
+                "tool",
+                crate::pkg::Elevation::Direct,
+                &runner,
+                &mut stderr,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![
+                (key("apt-get", ["update", "-qq"]), None),
+                (
+                    key("apt-cache", ["show", "tool"]),
+                    Some(process::PACKAGE_PROBE_TIMEOUT)
+                ),
+                (key("apt-get", ["install", "-y", "tool"]), None),
+            ]
         );
         assert!(stderr.is_empty());
     }
