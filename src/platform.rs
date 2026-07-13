@@ -103,13 +103,17 @@ pub fn normalize_platform(uname: &str, proc_version: Option<&str>) -> String {
 /// Returns whether a comma-separated platform spec matches the runtime.
 #[must_use]
 pub fn platform_match(spec: &str, env: &RuntimeEnv) -> bool {
-    match_spec(spec, env.platform(), CaseMode::Exact)
+    let mut identities = vec![env.platform()];
+    if env.is_android() {
+        identities.push("android");
+    }
+    match_specs(spec, &identities, CaseMode::Exact)
 }
 
 /// Returns whether a comma-separated host spec matches the runtime.
 #[must_use]
 pub fn host_match(spec: &str, env: &RuntimeEnv) -> bool {
-    match_spec(spec, env.host(), CaseMode::Lowercase)
+    match_specs(spec, &[env.host()], CaseMode::Lowercase)
 }
 
 /// Returns whether a combined `os:`/`host:` filter matches the runtime.
@@ -153,7 +157,7 @@ enum CaseMode {
     Lowercase,
 }
 
-fn match_spec(spec: &str, current: &str, case_mode: CaseMode) -> bool {
+fn match_specs(spec: &str, current: &[&str], case_mode: CaseMode) -> bool {
     if spec.is_empty() {
         return true;
     }
@@ -167,12 +171,18 @@ fn match_spec(spec: &str, current: &str, case_mode: CaseMode) -> bool {
     let has_include = items.iter().any(|item| !item.starts_with('!'));
     let has_exclude = items.iter().any(|item| item.starts_with('!'));
 
-    if has_exclude && items.iter().any(|item| item == &format!("!{current}")) {
+    if has_exclude
+        && current
+            .iter()
+            .any(|current| items.iter().any(|item| item == &format!("!{current}")))
+    {
         return false;
     }
 
     if has_include {
-        items.iter().any(|item| item == current)
+        current
+            .iter()
+            .any(|current| items.iter().any(|item| item == current))
     } else {
         true
     }
@@ -215,6 +225,17 @@ mod tests {
         assert!(platform_match("linux", &env));
         assert!(platform_match("linux,freebsd", &env));
         assert!(!platform_match("freebsd,openbsd", &env));
+    }
+
+    #[test]
+    fn android_runtime_matches_both_linux_and_android_filters() {
+        let env = RuntimeEnv::new("linux", "phone").with_android(true);
+
+        assert!(platform_match("linux", &env));
+        assert!(platform_match("android", &env));
+        assert!(platform_match("!macos", &env));
+        assert!(!platform_match("!android", &env));
+        assert!(!platform_match("!linux", &env));
     }
 
     #[test]

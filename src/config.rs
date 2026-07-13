@@ -54,18 +54,45 @@ pub fn short_name(name: &str) -> &str {
 /// resolved value because higher-level package logic owns the skip behavior.
 #[must_use]
 pub fn resolve_override(default: &str, overrides: &str, pkg_mgr: Option<&str>) -> String {
-    let Some(pkg_mgr) = pkg_mgr.filter(|value| !value.is_empty()) else {
-        return default.to_owned();
-    };
+    resolve_override_for_runtime(default, overrides, pkg_mgr, false)
+}
 
-    for pair in overrides.split(',').filter(|pair| !pair.is_empty()) {
-        let (manager, value) = pair.split_once(':').unwrap_or((pair, ""));
-        if manager == pkg_mgr {
+/// Resolves a package override for a concrete runtime.
+///
+/// Android overrides take precedence over the underlying package manager so a
+/// Termux host can express package names that differ from Debian/Ubuntu even
+/// though both environments use APT. When no `android:` entry is present, the
+/// ordinary manager-specific fallback remains unchanged.
+#[must_use]
+pub fn resolve_override_for_runtime(
+    default: &str,
+    overrides: &str,
+    pkg_mgr: Option<&str>,
+    android: bool,
+) -> String {
+    if android {
+        if let Some(value) = matching_override(overrides, "android") {
             return value.to_owned();
         }
     }
 
-    default.to_owned()
+    let Some(pkg_mgr) = pkg_mgr.filter(|value| !value.is_empty()) else {
+        return default.to_owned();
+    };
+
+    matching_override(overrides, pkg_mgr)
+        .unwrap_or(default)
+        .to_owned()
+}
+
+fn matching_override<'a>(overrides: &'a str, qualifier: &str) -> Option<&'a str> {
+    overrides
+        .split(',')
+        .filter(|pair| !pair.is_empty())
+        .find_map(|pair| {
+            let (manager, value) = pair.split_once(':').unwrap_or((pair, ""));
+            (manager == qualifier).then_some(value)
+        })
 }
 
 /// Parses one pipe-delimited registry entry.
@@ -76,6 +103,12 @@ pub fn resolve_override(default: &str, overrides: &str, pkg_mgr: Option<&str>) -
 /// operational entry.
 #[must_use]
 pub fn parse_entry(raw: &str, pkg_mgr: Option<&str>) -> Entry {
+    parse_entry_for_runtime(raw, pkg_mgr, false)
+}
+
+/// Parses one registry entry with runtime-specific override resolution.
+#[must_use]
+pub fn parse_entry_for_runtime(raw: &str, pkg_mgr: Option<&str>, android: bool) -> Entry {
     let mut fields = raw.split('|');
     let raw_name = fields.next().unwrap_or_default();
     let method = fields.next().unwrap_or_default();
@@ -88,7 +121,7 @@ pub fn parse_entry(raw: &str, pkg_mgr: Option<&str>) -> Entry {
         cmd = short_name(&name).to_owned();
     }
     if cmd.contains(':') {
-        cmd = resolve_override(short_name(&name), &cmd, pkg_mgr);
+        cmd = resolve_override_for_runtime(short_name(&name), &cmd, pkg_mgr, android);
     }
     // The `cmd` field is concatenated into `<bin_dir>/<cmd>` at install
     // (`bin_link::one`), cleanup (`cleanup::remove_builtin`), and release
@@ -367,7 +400,8 @@ mod tests {
 
     use super::{
         canonical_name, load_dir, parse_config_line, parse_config_texts, parse_entry,
-        resolve_override, short_name, sort_entries, valid_cmd_basename, valid_dep_name,
+        parse_entry_for_runtime, resolve_override, resolve_override_for_runtime, short_name,
+        sort_entries, valid_cmd_basename, valid_dep_name,
     };
 
     #[test]
@@ -423,6 +457,28 @@ mod tests {
     }
 
     #[test]
+    fn android_override_precedes_underlying_package_manager() {
+        assert_eq!(
+            resolve_override_for_runtime(
+                "fd",
+                "android:fd,apt:fd-find,dnf:fd-find",
+                Some("apt"),
+                true,
+            ),
+            "fd"
+        );
+        assert_eq!(
+            resolve_override_for_runtime(
+                "fd",
+                "android:fd,apt:fd-find,dnf:fd-find",
+                Some("apt"),
+                false,
+            ),
+            "fd-find"
+        );
+    }
+
+    #[test]
     fn parse_entry_expands_defaults_and_dash_fields() {
         let entry = parse_entry("pkg-a|pkg|-|-|-", Some("apt"));
 
@@ -440,6 +496,18 @@ mod tests {
 
         assert_eq!(apt.cmd, "batcat");
         assert_eq!(brew.cmd, "bat");
+    }
+
+    #[test]
+    fn parse_entry_resolves_android_qualified_command_first() {
+        let entry = parse_entry_for_runtime(
+            "fd|pkg|android:fd,apt:fdfind|android:fd,apt:fd-find|-",
+            Some("apt"),
+            true,
+        );
+
+        assert_eq!(entry.cmd, "fd");
+        assert_eq!(entry.aliases, "android:fd,apt:fd-find");
     }
 
     #[test]

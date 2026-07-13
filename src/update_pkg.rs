@@ -109,8 +109,12 @@ pub(crate) fn cached_items(entries: &[Entry], context: &Context<'_, impl Runner>
         .iter()
         .filter(|entry| entry.method == method::PKG && active(entry, context.env))
         .map(|entry| {
-            let resolved =
-                config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
+            let resolved = config::resolve_override_for_runtime(
+                &entry.name,
+                &entry.aliases,
+                Some(context.pkg_mgr),
+                context.env.is_android(),
+            );
             if resolved == "NONE" {
                 Item::skipped(
                     entry.name.clone(),
@@ -191,7 +195,12 @@ fn needs_package_version_snapshot(
         if entry.method != method::PKG || !active(entry, context.env) {
             return false;
         }
-        let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
+        let resolved = config::resolve_override_for_runtime(
+            &entry.name,
+            &entry.aliases,
+            Some(context.pkg_mgr),
+            context.env.is_android(),
+        );
         resolved != "NONE" && !context.runner.exists(&entry.cmd)
     })
 }
@@ -204,7 +213,12 @@ pub(crate) fn install(
     queued: &mut Vec<Queued>,
     package_versions: &std::collections::BTreeMap<String, String>,
 ) -> Result<Item> {
-    let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
+    let resolved = config::resolve_override_for_runtime(
+        &entry.name,
+        &entry.aliases,
+        Some(context.pkg_mgr),
+        context.env.is_android(),
+    );
     if resolved == "NONE" {
         return Ok(Item::skipped(
             entry.name.clone(),
@@ -340,7 +354,12 @@ fn needs_package_work(
             return false;
         }
 
-        let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(context.pkg_mgr));
+        let resolved = config::resolve_override_for_runtime(
+            &entry.name,
+            &entry.aliases,
+            Some(context.pkg_mgr),
+            context.env.is_android(),
+        );
         resolved != "NONE"
             && !process::dep_exists_with_versions(
                 context.runner,

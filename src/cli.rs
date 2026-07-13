@@ -416,14 +416,14 @@ where
 {
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     let pkg_mgr = process::detect_package_manager(&Process);
+    let env = runtime::runtime_env(&ProcessEnv);
     let raw_entries = config::load_dir(&roots.conf_dir)?;
-    let entries = parse_entries(&raw_entries, &pkg_mgr);
+    let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     if entries.is_empty() {
         writeln!(stdout, "No dependencies configured.")?;
         return Ok(0);
     }
 
-    let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = env_vars(options);
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let entries =
@@ -481,15 +481,16 @@ where
     } else {
         String::new()
     };
-    let entry = config::parse_entry(
+    let env = runtime::runtime_env(&ProcessEnv);
+    let entry = config::parse_entry_for_runtime(
         raw_entry,
         if pkg_mgr.is_empty() {
             None
         } else {
             Some(&pkg_mgr)
         },
+        env.is_android(),
     );
-    let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = env_vars(options);
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let entry = resolve_github_entry(&entry, &roots, Some(&manifest), &env, &env_vars, options)?;
@@ -544,8 +545,9 @@ where
     self_update_before_update(&roots, update_options, options, stderr)?;
 
     let pkg_mgr = process::detect_package_manager(&Process);
+    let env = runtime::runtime_env(&ProcessEnv);
     let raw_entries = config::load_dir(&roots.conf_dir)?;
-    let entries = parse_entries(&raw_entries, &pkg_mgr);
+    let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     if entries.is_empty() {
         if options.quiet {
             return Ok(0);
@@ -557,7 +559,6 @@ where
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
     let hooks = custom_probe();
-    let env = runtime::runtime_env(&ProcessEnv);
     let env_vars = env_vars(options);
     if let Some(message) =
         update_prerequisite_error(&entries, &env, &Process, UpdatePrerequisitePhase::Initial)
@@ -1400,9 +1401,9 @@ where
     }
 
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
-    let raw_entries = config::load_dir(&roots.conf_dir)?;
-    let entries = parse_entries(&raw_entries, "");
     let env = runtime::runtime_env(&ProcessEnv);
+    let raw_entries = config::load_dir(&roots.conf_dir)?;
+    let entries = parse_entries(&raw_entries, "", &env);
     let env_vars = env_vars(options);
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
@@ -1556,7 +1557,11 @@ where
     )
 }
 
-fn parse_entries(raw_entries: &[String], pkg_mgr: &str) -> Vec<Entry> {
+fn parse_entries(
+    raw_entries: &[String],
+    pkg_mgr: &str,
+    env: &crate::platform::RuntimeEnv,
+) -> Vec<Entry> {
     let pkg_mgr = if pkg_mgr.is_empty() {
         None
     } else {
@@ -1564,7 +1569,7 @@ fn parse_entries(raw_entries: &[String], pkg_mgr: &str) -> Vec<Entry> {
     };
     raw_entries
         .iter()
-        .map(|entry| config::parse_entry(entry, pkg_mgr))
+        .map(|entry| config::parse_entry_for_runtime(entry, pkg_mgr, env.is_android()))
         .collect()
 }
 

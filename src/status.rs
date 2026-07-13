@@ -195,6 +195,7 @@ where
             context.runner,
             context.pkg_mgr,
             context.package_versions,
+            context.env,
         )),
         method::GITHUB_REPO => Ok(github_repo_state(entry, context.roots, context.runner)),
         binary if method::is_binary_install_root(binary) => Ok(manifest_backed_state(
@@ -215,8 +216,14 @@ fn pkg_state(
     runner: &impl Runner,
     pkg_mgr: &str,
     package_versions: &BTreeMap<String, String>,
+    env: &RuntimeEnv,
 ) -> State {
-    let resolved = config::resolve_override(&entry.name, &entry.aliases, Some(pkg_mgr));
+    let resolved = config::resolve_override_for_runtime(
+        &entry.name,
+        &entry.aliases,
+        Some(pkg_mgr),
+        env.is_android(),
+    );
     if resolved == "NONE" {
         return State::Skipped(SkipReason::PackageManager);
     }

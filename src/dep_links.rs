@@ -223,6 +223,24 @@ mod tests {
     }
 
     #[test]
+    fn android_release_fallback_uses_runtime_command_override() {
+        let fixture = Fixture::new("android-release-link");
+        fixture.write_conf("owner/tool  github:release  android:tool-android,apt:tool\n");
+        fixture.write(
+            "state/manifest",
+            "owner/tool|github:release|tool-android|\n",
+        );
+        let env = RuntimeEnv::new("linux", "phone").with_android(true);
+
+        let links = links("owner/tool", &fixture.roots(), &env).unwrap();
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].command, "tool-android");
+        assert_eq!(links[0].public_path, fixture.dir.join("bin/tool-android"));
+        assert_eq!(links[0].target_path, fixture.dir.join("bin/tool-android"));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn release_links_use_tracked_archive_binlinks_when_present() {
         use std::os::unix::fs::symlink;
