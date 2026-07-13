@@ -159,6 +159,9 @@ Behavior:
 - MUST ensure `$SHDEPS_BIN_DIR` is present in `PATH` during the update process.
 - MUST load all active config entries.
 - MUST detect the package manager.
+- On Android with the `apt` package manager, MUST run metadata refresh and
+  package installation directly because Termux owns its package prefix as the
+  app user. MUST NOT route those APT mutations through `sudo`.
 - MUST prepare method transitions before installing new method artifacts.
 - MUST process package-manager deps before non-package deps.
 - MUST keep mutation phases sequential unless a future spec revision defines a

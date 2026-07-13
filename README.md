@@ -150,7 +150,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 
 ### `pkg` — System Packages
 
-Installs via the detected package manager (brew, apt, dnf, pacman, zypper, or apk). Packages are batched into a single install command for speed.
+Installs via the detected package manager (brew, apt, dnf, pacman, zypper, or apk). Packages are batched into a single install command for speed. On Android, Termux's APT prefix is owned by the app user, so shdeps runs `apt-get` directly instead of requiring `sudo`.
 
 ```text
 jq        pkg

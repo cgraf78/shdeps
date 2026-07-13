@@ -5,6 +5,33 @@
 //! custom hook helpers, and future dry-run diagnostics cannot drift into subtly
 //! different sudo/install behavior.
 
+use crate::platform::RuntimeEnv;
+
+/// Privilege boundary used for package-manager mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elevation {
+    /// Execute the package manager as the current user.
+    Direct,
+    /// Execute the package manager through `sudo`.
+    Sudo,
+}
+
+impl Elevation {
+    /// Resolves the package privilege model for a runtime.
+    ///
+    /// Termux owns its package prefix as the Android app user and deliberately
+    /// does not use system-style root escalation. Other Unix package managers
+    /// retain the existing sudo contract.
+    #[must_use]
+    pub fn for_manager(mgr: &str, env: &RuntimeEnv) -> Self {
+        if env.is_android() && mgr == "apt" {
+            Self::Direct
+        } else {
+            Self::Sudo
+        }
+    }
+}
+
 /// Shell command and argument vector to run for one package-manager action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -57,19 +84,20 @@ pub fn available_ok(mgr: &str, success: bool, stdout: &str) -> bool {
 
 /// Builds the metadata refresh command for managers with mutable repo caches.
 #[must_use]
-pub fn refresh(mgr: &str) -> Option<CommandSpec> {
-    match mgr {
+pub fn refresh(mgr: &str, elevation: Elevation) -> Option<CommandSpec> {
+    let command = match mgr {
         // Homebrew does its own metadata management around install/info. Bash
         // also skips an explicit brew refresh, which keeps normal macOS update
         // runs from paying a surprising `brew update` cost.
-        "brew" => None,
-        "apt" => Some(CommandSpec::new("sudo", ["apt-get", "update", "-qq"])),
-        "dnf" => Some(CommandSpec::new("sudo", ["dnf", "makecache", "-q"])),
-        "pacman" => Some(CommandSpec::new("sudo", ["pacman", "-Sy"])),
-        "zypper" => Some(CommandSpec::new("sudo", ["zypper", "-q", "refresh"])),
-        "apk" => Some(CommandSpec::new("sudo", ["apk", "update"])),
-        _ => None,
-    }
+        "brew" => return None,
+        "apt" => CommandSpec::new("apt-get", ["update", "-qq"]),
+        "dnf" => CommandSpec::new("dnf", ["makecache", "-q"]),
+        "pacman" => CommandSpec::new("pacman", ["-Sy"]),
+        "zypper" => CommandSpec::new("zypper", ["-q", "refresh"]),
+        "apk" => CommandSpec::new("apk", ["update"]),
+        _ => return None,
+    };
+    Some(elevate(command, elevation))
 }
 
 /// Builds the batched install command for one or more packages.
@@ -78,37 +106,79 @@ pub fn refresh(mgr: &str) -> Option<CommandSpec> {
 /// dominates cold installs. Callers should pass only packages that survived
 /// availability checks; an empty package list intentionally returns `None`.
 #[must_use]
-pub fn install(mgr: &str, packages: &[String]) -> Option<CommandSpec> {
+pub fn install(mgr: &str, packages: &[String], elevation: Elevation) -> Option<CommandSpec> {
     if packages.is_empty() {
         return None;
     }
 
-    let mut args = match mgr {
-        "brew" => vec!["install".to_owned()],
-        "apt" => vec!["apt-get".to_owned(), "install".to_owned(), "-y".to_owned()],
-        "dnf" => vec!["dnf".to_owned(), "install".to_owned(), "-y".to_owned()],
-        "pacman" => vec![
-            "pacman".to_owned(),
-            "-Sy".to_owned(),
-            "--needed".to_owned(),
-            "--noconfirm".to_owned(),
-        ],
-        "zypper" => vec!["zypper".to_owned(), "-n".to_owned(), "install".to_owned()],
-        "apk" => vec!["apk".to_owned(), "add".to_owned()],
+    let (program, mut args) = match mgr {
+        "brew" => ("brew", vec!["install".to_owned()]),
+        "apt" => ("apt-get", vec!["install".to_owned(), "-y".to_owned()]),
+        "dnf" => ("dnf", vec!["install".to_owned(), "-y".to_owned()]),
+        "pacman" => (
+            "pacman",
+            vec![
+                "-Sy".to_owned(),
+                "--needed".to_owned(),
+                "--noconfirm".to_owned(),
+            ],
+        ),
+        "zypper" => ("zypper", vec!["-n".to_owned(), "install".to_owned()]),
+        "apk" => ("apk", vec!["add".to_owned()]),
         _ => return None,
     };
     args.extend(packages.iter().cloned());
 
     if mgr == "brew" {
-        Some(CommandSpec::new("brew", args))
+        Some(CommandSpec::new(program, args))
     } else {
-        Some(CommandSpec::new("sudo", args))
+        Some(elevate(CommandSpec::new(program, args), elevation))
     }
+}
+
+fn elevate(command: CommandSpec, elevation: Elevation) -> CommandSpec {
+    if elevation == Elevation::Direct {
+        return command;
+    }
+    let mut args = Vec::with_capacity(command.args.len() + 1);
+    args.push(command.program);
+    args.extend(command.args);
+    CommandSpec::new("sudo", args)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandSpec, available, install, refresh};
+    use super::{CommandSpec, Elevation, available, install, refresh};
+    use crate::platform::RuntimeEnv;
+
+    #[test]
+    fn android_package_mutations_run_directly() {
+        let android = RuntimeEnv::new("linux", "phone").with_android(true);
+        let elevation = Elevation::for_manager("apt", &android);
+        let packages = vec!["jq".to_owned(), "fd".to_owned()];
+
+        assert_eq!(elevation, Elevation::Direct);
+        assert_eq!(
+            refresh("apt", elevation),
+            Some(cmd("apt-get", ["update", "-qq"]))
+        );
+        assert_eq!(
+            install("apt", &packages, elevation),
+            Some(cmd("apt-get", ["install", "-y", "jq", "fd"]))
+        );
+    }
+
+    #[test]
+    fn ordinary_linux_package_mutations_keep_sudo() {
+        let linux = RuntimeEnv::new("linux", "server");
+        assert_eq!(Elevation::for_manager("apt", &linux), Elevation::Sudo);
+    }
+
+    #[test]
+    fn android_non_termux_managers_keep_sudo() {
+        let android = RuntimeEnv::new("linux", "phone").with_android(true);
+        assert_eq!(Elevation::for_manager("dnf", &android), Elevation::Sudo);
+    }
 
     #[test]
     fn availability_probes_match_bash_manager_branches() {
@@ -143,22 +213,28 @@ mod tests {
 
     #[test]
     fn refresh_skips_brew_and_uses_quiet_metadata_commands() {
-        assert_eq!(refresh("brew"), None);
+        assert_eq!(refresh("brew", Elevation::Sudo), None);
         assert_eq!(
-            refresh("apt"),
+            refresh("apt", Elevation::Sudo),
             Some(cmd("sudo", ["apt-get", "update", "-qq"]))
         );
         assert_eq!(
-            refresh("dnf"),
+            refresh("dnf", Elevation::Sudo),
             Some(cmd("sudo", ["dnf", "makecache", "-q"]))
         );
-        assert_eq!(refresh("pacman"), Some(cmd("sudo", ["pacman", "-Sy"])));
         assert_eq!(
-            refresh("zypper"),
+            refresh("pacman", Elevation::Sudo),
+            Some(cmd("sudo", ["pacman", "-Sy"]))
+        );
+        assert_eq!(
+            refresh("zypper", Elevation::Sudo),
             Some(cmd("sudo", ["zypper", "-q", "refresh"]))
         );
-        assert_eq!(refresh("apk"), Some(cmd("sudo", ["apk", "update"])));
-        assert_eq!(refresh("unknown"), None);
+        assert_eq!(
+            refresh("apk", Elevation::Sudo),
+            Some(cmd("sudo", ["apk", "update"]))
+        );
+        assert_eq!(refresh("unknown", Elevation::Sudo), None);
     }
 
     #[test]
@@ -166,38 +242,41 @@ mod tests {
         let packages = vec!["jq".to_owned(), "fd".to_owned()];
 
         assert_eq!(
-            install("brew", &packages),
+            install("brew", &packages, Elevation::Sudo),
             Some(cmd("brew", ["install", "jq", "fd"]))
         );
         assert_eq!(
-            install("apt", &packages),
+            install("apt", &packages, Elevation::Sudo),
             Some(cmd("sudo", ["apt-get", "install", "-y", "jq", "fd"]))
         );
         assert_eq!(
-            install("dnf", &packages),
+            install("dnf", &packages, Elevation::Sudo),
             Some(cmd("sudo", ["dnf", "install", "-y", "jq", "fd"]))
         );
         assert_eq!(
-            install("pacman", &packages),
+            install("pacman", &packages, Elevation::Sudo),
             Some(cmd(
                 "sudo",
                 ["pacman", "-Sy", "--needed", "--noconfirm", "jq", "fd"]
             ))
         );
         assert_eq!(
-            install("zypper", &packages),
+            install("zypper", &packages, Elevation::Sudo),
             Some(cmd("sudo", ["zypper", "-n", "install", "jq", "fd"]))
         );
         assert_eq!(
-            install("apk", &packages),
+            install("apk", &packages, Elevation::Sudo),
             Some(cmd("sudo", ["apk", "add", "jq", "fd"]))
         );
     }
 
     #[test]
     fn install_refuses_empty_or_unknown_batches() {
-        assert_eq!(install("apt", &[]), None);
-        assert_eq!(install("unknown", &["jq".to_owned()]), None);
+        assert_eq!(install("apt", &[], Elevation::Sudo), None);
+        assert_eq!(
+            install("unknown", &["jq".to_owned()], Elevation::Sudo),
+            None
+        );
     }
 
     fn cmd(program: &str, args: impl IntoIterator<Item = impl Into<String>>) -> CommandSpec {

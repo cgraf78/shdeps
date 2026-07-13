@@ -143,7 +143,9 @@ pub(crate) fn sudo_status(
     if !needs_package_work(entries, context, package_versions) {
         return Ok(SudoStatus::Available);
     }
-    if !sudo_backed_manager(context.pkg_mgr) {
+    if pkg::Elevation::for_manager(context.pkg_mgr, context.env) == pkg::Elevation::Direct
+        || context.pkg_mgr == "brew"
+    {
         return Ok(SudoStatus::Available);
     }
     if context.env_vars.get("SHDEPS_QUIET").map(String::as_str) != Some("1") {
@@ -287,7 +289,8 @@ pub(crate) fn flush(
         .iter()
         .map(|item| item.package.clone())
         .collect::<Vec<_>>();
-    let Some(command) = pkg::install(context.pkg_mgr, &packages) else {
+    let elevation = pkg::Elevation::for_manager(context.pkg_mgr, context.env);
+    let Some(command) = pkg::install(context.pkg_mgr, &packages, elevation) else {
         return Ok(());
     };
 
@@ -302,7 +305,7 @@ pub(crate) fn flush(
     // on the uncommon failure path.
     for item in queued {
         let single = vec![item.package.clone()];
-        let Some(command) = pkg::install(context.pkg_mgr, &single) else {
+        let Some(command) = pkg::install(context.pkg_mgr, &single, elevation) else {
             continue;
         };
         if run(context.runner, &command, progress)?.success {
@@ -349,10 +352,6 @@ fn needs_package_work(
     })
 }
 
-fn sudo_backed_manager(pkg_mgr: &str) -> bool {
-    !pkg_mgr.is_empty() && pkg_mgr != "brew"
-}
-
 fn user_is_root(runner: &impl Runner) -> Result<bool> {
     let output = runner.run("id", &["-u"], Some(process::VERSION_PROBE_TIMEOUT))?;
     Ok(output.success && output.stdout.trim() == "0")
@@ -396,7 +395,11 @@ fn maybe_enable_epel(
     }
 
     let packages = vec!["epel-release".to_owned()];
-    let Some(command) = pkg::install("dnf", &packages) else {
+    let Some(command) = pkg::install(
+        "dnf",
+        &packages,
+        pkg::Elevation::for_manager("dnf", context.env),
+    ) else {
         return Ok(());
     };
     let _ = best_effort_run(context.runner, &command, progress)?;
@@ -425,7 +428,10 @@ fn repair_dnf_optional_repo(
 }
 
 fn refresh_metadata(context: &Context<'_, impl Runner>, progress: &mut dyn Progress) -> Result<()> {
-    let Some(command) = pkg::refresh(context.pkg_mgr) else {
+    let Some(command) = pkg::refresh(
+        context.pkg_mgr,
+        pkg::Elevation::for_manager(context.pkg_mgr, context.env),
+    ) else {
         return Ok(());
     };
 

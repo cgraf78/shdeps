@@ -2409,6 +2409,39 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/jq-post"; }
     }
 
     #[test]
+    fn update_runs_termux_apt_without_sudo_or_prompt_pause() {
+        let mut fixture = Fixture::new("pkg-termux-direct");
+        fixture.env = RuntimeEnv::new("linux", "phone").with_android(true);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+            .with_success("apt-get", ["update", "-qq"], "")
+            .with_success("apt-cache", ["show", "jq"], "Package: jq\n")
+            .with_success("apt-get", ["install", "-y", "jq"], "");
+        let mut progress = RecordingProgress::default();
+
+        let summary = run_with_progress(
+            &[parse_entry("jq|pkg|missing-jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &mut progress,
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(progress.prompt_pauses.is_empty());
+        let calls = runner.calls();
+        assert!(calls.contains(&key("apt-get", ["update", "-qq"])));
+        assert!(calls.contains(&key("apt-cache", ["show", "jq"])));
+        assert!(calls.contains(&key("apt-get", ["install", "-y", "jq"])));
+        assert!(
+            calls.iter().all(|call| !call.starts_with("sudo\0")),
+            "Termux package work must never cross a sudo boundary: {calls:?}"
+        );
+    }
+
+    #[test]
     fn update_processes_packages_before_custom_hooks() {
         let fixture = Fixture::new("pkg-first");
         fixture.write_lib();
