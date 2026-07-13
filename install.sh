@@ -69,6 +69,30 @@ _is_release_install_dir() {
   grep -q '"method"[[:space:]]*:[[:space:]]*"release"' "$dir/.shdeps-install.json" 2>/dev/null
 }
 
+_release_binary_supports_wrapper_abi() {
+  local dir="$1" version=""
+
+  [[ -x "$dir/shdeps" ]] || return 1
+  version=$("$dir/shdeps" __api version 2>/dev/null) || return 1
+  [[ "$version" == "abi:1" ]]
+}
+
+_repair_release_if_needed() {
+  local dir="$1"
+
+  _is_release_install_dir "$dir" || return 0
+  if ! _release_binary_supports_wrapper_abi "$dir"; then
+    # Unlike a normal forced freshness check, this archive cannot service the
+    # wrapper at all. Do not fall through and emit a misleading ABI error after
+    # a failed repair download.
+    _install_release >/dev/null 2>&1 || return 1
+  elif [[ "${SHDEPS_FORCE:-0}" == 1 ]]; then
+    # Preserve the existing best-effort force behavior: a transient GitHub
+    # failure must not disable an otherwise compatible local release.
+    _install_release >/dev/null 2>&1 || true
+  fi
+}
+
 _is_source_checkout_dir() {
   local dir="$1"
 
@@ -986,8 +1010,8 @@ _bootstrap() {
   if _bootstrap_lib_is_installed_tree; then
     if _uses_default_repo_slug && [[ -d "$SHDEPS_DIR/.git" ]]; then
       _install_release >/dev/null 2>&1 || true
-    elif [[ "${SHDEPS_FORCE:-0}" == 1 ]] && _is_release_install_dir "$SHDEPS_DIR"; then
-      _install_release >/dev/null 2>&1 || true
+    else
+      _repair_release_if_needed "$SHDEPS_DIR" || return 1
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
@@ -1005,8 +1029,8 @@ _bootstrap() {
       # this opportunistic: failed downloads, dirty checkouts, or unsupported
       # platforms fall through to the source path so bootstrap still converges.
       _install_release >/dev/null 2>&1 || true
-    elif [[ "${SHDEPS_FORCE:-0}" == 1 ]] && _is_release_install_dir "$SHDEPS_DIR"; then
-      _install_release >/dev/null 2>&1 || true
+    else
+      _repair_release_if_needed "$SHDEPS_DIR" || return 1
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"

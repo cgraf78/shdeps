@@ -458,6 +458,34 @@ else
     "$_bootstrap_stale_markers/archive"
 
   unset -f shdeps_update 2>/dev/null
+  _bootstrap_incompatible=$(_tmpdir)/bootstrap-incompatible
+  _bootstrap_incompatible_bin=$(_tmpdir)/bootstrap-incompatible-bin
+  _bootstrap_incompatible_markers=$(_tmpdir)/bootstrap-incompatible-markers
+  mkdir -p "$_bootstrap_incompatible" "$_bootstrap_incompatible_bin"
+  cp -R "$_payload/." "$_bootstrap_incompatible/"
+  cat >"$_bootstrap_incompatible/shdeps" <<'SH'
+#!/usr/bin/env bash
+exit 126
+SH
+  chmod +x "$_bootstrap_incompatible/shdeps"
+  HOME="$_bootstrap_home" PATH="$_release_fakebin:/usr/bin:/bin" \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
+    SHDEPS_TEST_MARKER_DIR="$_bootstrap_incompatible_markers" \
+    SHDEPS_GIT_DEV_DIR="$_bootstrap_home/git" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_bootstrap_incompatible" SHDEPS_BIN="$_bootstrap_incompatible_bin/shdeps" \
+    . "$_bootstrap_incompatible/install.sh" --bootstrap
+  _assert_eq "bootstrap incompatible release: repairs binary before sourcing wrapper" \
+    "shdeps $_updated_tag" "$("$_bootstrap_incompatible_bin/shdeps" version)"
+  _assert_file_exists "bootstrap incompatible release: checks latest" \
+    "$_bootstrap_incompatible_markers/latest"
+  _assert_file_exists "bootstrap incompatible release: downloads archive" \
+    "$_bootstrap_incompatible_markers/archive"
+  _assert_file_exists "bootstrap incompatible release: downloads checksum" \
+    "$_bootstrap_incompatible_markers/checksum"
+
+  unset -f shdeps_update 2>/dev/null
   _bootstrap_force=$(_tmpdir)/bootstrap-force
   _bootstrap_force_bin=$(_tmpdir)/bootstrap-force-bin
   _bootstrap_force_markers=$(_tmpdir)/bootstrap-force-markers
