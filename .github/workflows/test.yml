@@ -13,10 +13,13 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@main # zizmor: ignore[unpinned-uses]
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     with:
       clippy-command: cargo clippy --locked --all-targets -- -D warnings
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
+      android-package-smoke-command: |
+        scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+        scripts/smoke-release.sh "$ASSET_PLATFORM"
       package-smoke-setup-command: |
         if [[ "$RUNNER_OS" == "Linux" ]]; then
           # The release archive smoke test intentionally exercises the same
@@ -39,7 +42,7 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@main # zizmor: ignore[unpinned-uses]
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     with:
       profiles: base,shellcheck
       # Shell-owned behavior lives under tests/shell. Cargo integration tests
@@ -53,6 +56,6 @@ jobs:
         tests/shell/release-scripts-test
 
   bash32:
-    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@main # zizmor: ignore[unpinned-uses]
+    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     with:
       command: /bin/bash scripts/smoke-install-bash32.sh

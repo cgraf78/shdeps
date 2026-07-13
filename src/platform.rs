@@ -10,6 +10,7 @@
 pub struct RuntimeEnv {
     platform: String,
     host: String,
+    android: bool,
 }
 
 impl RuntimeEnv {
@@ -24,7 +25,15 @@ impl RuntimeEnv {
         Self {
             platform: platform.into(),
             host: host.into().to_lowercase(),
+            android: false,
         }
+    }
+
+    /// Records whether the Linux kernel is hosting an Android/Bionic userspace.
+    #[must_use]
+    pub fn with_android(mut self, android: bool) -> Self {
+        self.android = android;
+        self
     }
 
     /// Returns the normalized platform name.
@@ -37,6 +46,12 @@ impl RuntimeEnv {
     #[must_use]
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// Returns whether release assets must target Android/Bionic.
+    #[must_use]
+    pub fn is_android(&self) -> bool {
+        self.android
     }
 }
 

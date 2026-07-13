@@ -143,7 +143,25 @@ pub fn runtime_env(env: &impl Env) -> RuntimeEnv {
             .unwrap_or_default()
     });
 
-    RuntimeEnv::new(platform, host.trim())
+    RuntimeEnv::new(platform, host.trim()).with_android(is_android(env))
+}
+
+/// Returns whether the process is running directly on Android.
+///
+/// Android reports a Linux kernel through `uname -s`, so release selection
+/// needs a separate Bionic-runtime signal. Environment variables are the cheap
+/// and reliable Termux path; `uname -o` keeps the detection useful in other
+/// Android terminal environments.
+#[must_use]
+pub fn is_android(env: &impl Env) -> bool {
+    env.var_os("ANDROID_ROOT")
+        .is_some_and(|value| !value.is_empty())
+        || env
+            .var_os("TERMUX_VERSION")
+            .is_some_and(|value| !value.is_empty())
+        || env
+            .command_output("uname", &["-o"])
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("android"))
 }
 
 /// Returns whether force mode is active.
@@ -290,6 +308,19 @@ mod tests {
     }
 
     #[test]
+    fn runtime_identity_carries_termux_signal_when_uname_o_is_unavailable() {
+        let env = FakeEnv::new()
+            .with_var("TERMUX_VERSION", "0.118.3")
+            .with_command("uname -s", "Linux\n")
+            .with_command("hostname -s", "phone\n");
+
+        let runtime = runtime_env(&env);
+
+        assert_eq!(runtime.platform(), "linux");
+        assert!(runtime.is_android());
+    }
+
+    #[test]
     fn runtime_identity_preserves_legacy_empty_host_when_probes_fail() {
         let env = FakeEnv::new().with_command("uname -s", "Linux\n");
 
@@ -297,6 +328,27 @@ mod tests {
 
         assert_eq!(runtime.platform(), "linux");
         assert_eq!(runtime.host(), "");
+    }
+
+    #[test]
+    fn android_identity_uses_termux_and_kernel_signals() {
+        assert!(super::is_android(
+            &FakeEnv::new().with_var("TERMUX_VERSION", "0.118.3")
+        ));
+        assert!(super::is_android(
+            &FakeEnv::new().with_var("ANDROID_ROOT", "/system")
+        ));
+        assert!(super::is_android(
+            &FakeEnv::new().with_command("uname -o", "Android\n")
+        ));
+        assert!(!super::is_android(
+            &FakeEnv::new().with_command("uname -o", "GNU/Linux\n")
+        ));
+        assert!(!super::is_android(
+            &FakeEnv::new()
+                .with_var("ANDROID_ROOT", "")
+                .with_var("TERMUX_VERSION", "")
+        ));
     }
 
     #[test]

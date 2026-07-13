@@ -12,17 +12,18 @@ permissions:
 
 jobs:
   release:
-    uses: cgraf78/actions/.github/workflows/rust-release.yml@main # zizmor: ignore[unpinned-uses]
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     permissions:
       contents: write
     with:
+      android-aarch64: true
       # shdeps' public version is generated from the UTC committer timestamp
       # plus the commit suffix, not from Cargo.toml semver. Ask the shared
       # workflow to validate the exact release tag instead of forcing this repo
       # through Cargo's semver-oriented `version-command` + `tag-prefix` path.
       tag-command: scripts/release-tag.sh
       setup-command: |
-        if [[ "$RUNNER_OS" == "Linux" ]]; then
+        if [[ "$RUST_TARGET" == *-musl ]]; then
           # shdeps links native compression crates into static Linux release
           # binaries. The reusable workflow owns the matrix, but this repo
           # owns the linker/toolchain prerequisite those musl targets need.
