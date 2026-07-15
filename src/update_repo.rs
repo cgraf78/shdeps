@@ -47,24 +47,22 @@ pub(crate) fn install(
     let revision_path = stamp::revision_path(&context.roots.state_dir, &entry.name);
     let rev_before = stamp::revision_read(&revision_path)?;
     let mut status = git_status(context.runner, &local_clone);
+    let mut refresh_stamp = false;
 
     if !stamp::remote_fresh(&stamp_path, options.freshness()) && status.is_clean() {
         if has_upstream(context.runner, &local_clone) {
             if pull(context.runner, &local_clone) {
-                stamp::remote_touch(&stamp_path, options.now)?;
+                refresh_stamp = true;
             }
         } else {
             // Local-only dev clones are a valid dependency source. Touching the
             // stamp avoids repeating an upstream probe on every warm update.
-            stamp::remote_touch(&stamp_path, options.now)?;
+            refresh_stamp = true;
         }
         status = git_status(context.runner, &local_clone);
     }
 
     let rev_after = git_head(context.runner, &local_clone);
-    if let Some(revision) = &rev_after {
-        stamp::revision_touch(&revision_path, revision)?;
-    }
 
     if let Some(parent) = install_dir.parent() {
         fs::create_dir_all(parent)?;
@@ -73,6 +71,15 @@ pub(crate) fn install(
     // symlink to a development checkout. Replacing stale managed directories
     // here lets method transitions converge on the same canonical path without
     // ever deleting the real clone under `SHDEPS_GIT_DEV_DIR`.
+    if let Some(item) = missing_explicit_command(entry, &local_clone) {
+        return Ok(item);
+    }
+    if let Some(revision) = &rev_after {
+        stamp::revision_touch(&revision_path, revision)?;
+    }
+    if refresh_stamp {
+        stamp::remote_touch(&stamp_path, options.now)?;
+    }
     replace_symlink(&local_clone, &install_dir)?;
 
     record_success(entry, context, &install_dir)?;
@@ -113,6 +120,9 @@ fn install_existing(
 
     if stamp::remote_fresh(&stamp_path, options.freshness()) {
         secure_managed_clone_permissions(install_dir)?;
+        if let Some(item) = missing_explicit_command(entry, install_dir) {
+            return Ok(item);
+        }
         record_success(entry, context, install_dir)?;
         let detail = verbose_repo_detail(None, install_dir, context, options, "fresh");
         return Ok(Item::current(entry.name.clone(), ItemReason::Fresh, detail));
@@ -153,13 +163,19 @@ fn install_existing(
             "pull failed (no fast-forward)".to_owned()
         };
         secure_managed_clone_permissions(install_dir)?;
+        if let Some(item) = missing_explicit_command(entry, install_dir) {
+            return Ok(item);
+        }
         record_success(entry, context, install_dir)?;
         return Ok(Item::current(entry.name.clone(), ItemReason::Other, detail));
     }
 
     let head_after = git_head(context.runner, install_dir);
-    stamp::remote_touch(&stamp_path, options.now)?;
     secure_managed_clone_permissions(install_dir)?;
+    if let Some(item) = missing_explicit_command(entry, install_dir) {
+        return Ok(item);
+    }
+    stamp::remote_touch(&stamp_path, options.now)?;
     record_success(entry, context, install_dir)?;
     let changed = options.reinstall || head_before != head_after;
     let action = if head_before != head_after {
@@ -211,10 +227,15 @@ fn install_fresh(
         ));
     }
 
+    secure_managed_clone_permissions(&clone_tmp)?;
+    if let Some(item) = missing_explicit_command(entry, &clone_tmp) {
+        remove_any(&clone_tmp)?;
+        return Ok(item);
+    }
+
     remove_any(install_dir)?;
     fs::rename(&clone_tmp, install_dir)?;
     set_ssh_push_url(context.runner, install_dir, url);
-    secure_managed_clone_permissions(install_dir)?;
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
     stamp::remote_touch(&stamp_path, options.now)?;
     record_success(entry, context, install_dir)?;
@@ -285,6 +306,18 @@ fn secure_managed_clone_permissions(install_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn missing_explicit_command(entry: &Entry, install_dir: &Path) -> Option<Item> {
+    if !repo::missing_explicit_command(entry, install_dir) {
+        return None;
+    }
+
+    Some(Item::failed(
+        entry.name.clone(),
+        ItemReason::MissingBinary,
+        format!("configured command `{}` not found in repo bin", entry.cmd),
+    ))
 }
 
 fn record_success(

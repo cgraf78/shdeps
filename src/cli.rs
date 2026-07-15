@@ -3106,6 +3106,7 @@ mod tests {
             name: "jq".to_owned(),
             method: "pkg".to_owned(),
             cmd: "jq".to_owned(),
+            cmd_explicit: false,
             aliases: String::new(),
             filter: String::new(),
         }];
@@ -3207,6 +3208,7 @@ mod tests {
             name: "widget".to_owned(),
             method: "custom".to_owned(),
             cmd: "widget".to_owned(),
+            cmd_explicit: false,
             aliases: String::new(),
             filter: String::new(),
         }];
@@ -3250,6 +3252,7 @@ mod tests {
             name: "widget".to_owned(),
             method: "custom".to_owned(),
             cmd: "widget".to_owned(),
+            cmd_explicit: false,
             aliases: String::new(),
             filter: String::new(),
         }];
@@ -3350,6 +3353,7 @@ mod tests {
             name: "owner/repo".to_owned(),
             method: "github:release".to_owned(),
             cmd: "repo".to_owned(),
+            cmd_explicit: false,
             aliases: String::new(),
             filter: String::new(),
         }];

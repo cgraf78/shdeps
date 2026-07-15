@@ -1262,7 +1262,7 @@ mod tests {
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{Context, Item, Options, Summary, run, run_with_progress};
+    use super::{Context, Item, ItemReason, Options, Summary, run, run_with_progress};
     use bzip2::Compression as BzCompression;
     use bzip2::write::BzEncoder;
     use flate2::Compression;
@@ -5007,6 +5007,83 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_repo_rejects_local_dev_clone_missing_explicit_command() {
+        let fixture = Fixture::new("repo-local-missing-cmd");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("cli");
+        fs::create_dir_all(&local_clone).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success(
+            "git",
+            ["-C", local_clone.to_str().unwrap(), "rev-parse", "HEAD"],
+            "head\n",
+        );
+
+        let summary = run(
+            &[parse_entry("smallstep/cli|github:repo|step|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["smallstep/cli"]);
+        assert_eq!(summary.items[0].reason, ItemReason::MissingBinary);
+        assert_eq!(
+            summary.items[0].detail,
+            "configured command `step` not found in repo bin"
+        );
+        assert!(!fixture.roots.install_dir.join("smallstep/cli").exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("smallstep/cli")
+                .is_none()
+        );
+        assert!(
+            !crate::stamp::remote_path(&fixture.roots.state_dir, "smallstep/cli", "repo").exists(),
+            "missing explicit command must not refresh the repo TTL"
+        );
+        assert!(
+            !crate::stamp::revision_path(&fixture.roots.state_dir, "smallstep/cli").exists(),
+            "missing explicit command must not refresh the repo revision"
+        );
+    }
+
+    #[test]
+    fn update_github_repo_allows_asset_only_local_dev_clone_without_explicit_command() {
+        let fixture = Fixture::new("repo-local-asset-only");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("plugin");
+        fs::create_dir_all(&local_clone).unwrap();
+        fs::write(local_clone.join("plugin.zsh"), "# plugin\n").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("owner/plugin|github:repo", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let install_link = fixture.roots.install_dir.join("owner/plugin");
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/plugin"),
+            Some(&ManifestEntry::new(
+                "owner/plugin",
+                "github:repo",
+                "plugin",
+                install_link.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_github_repo_verbose_reports_local_clone_version() {
         let fixture = Fixture::new("repo-local-verbose");
         fixture.write_lib();
@@ -5187,6 +5264,17 @@ version() { printf 'saw-pkg\n'; }
                 ],
                 clone_tmp.join(".git"),
             )
+            .with_created_binary(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/cgraf78/ds",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join("bin/ds"),
+            )
             .with_success(
                 "git",
                 [
@@ -5310,6 +5398,17 @@ version() { printf 'saw-pkg\n'; }
                 ],
                 clone_tmp.join(".git"),
             )
+            .with_created_binary(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/private/tool",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join("bin/tool"),
+            )
             .with_success(
                 "git",
                 [
@@ -5360,6 +5459,120 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_repo_rejects_fresh_clone_missing_explicit_command() {
+        let mut fixture = Fixture::new("repo-fresh-missing-cmd");
+        fixture.write_lib();
+        fixture.env_vars.insert(
+            "SHDEPS_PRIVATE_TOOL_REPO".to_owned(),
+            "https://github.com/private/tool".to_owned(),
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("private/tool");
+        let clone_tmp = fixture
+            .roots
+            .install_dir
+            .join(format!("private/tool.tmp.{}", std::process::id()));
+        let runner = FakeRunner::default().with_command("git").with_created_dir(
+            "git",
+            [
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/private/tool",
+                clone_tmp.to_str().unwrap(),
+            ],
+            clone_tmp.join(".git"),
+        );
+
+        let summary = run(
+            &[parse_entry("private/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["private/tool"]);
+        assert_eq!(summary.items[0].reason, ItemReason::MissingBinary);
+        assert_eq!(
+            summary.items[0].detail,
+            "configured command `tool` not found in repo bin"
+        );
+        assert!(!install_dir.exists());
+        assert!(!clone_tmp.exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("private/tool")
+                .is_none()
+        );
+        assert!(
+            !crate::stamp::remote_path(&fixture.roots.state_dir, "private/tool", "repo").exists(),
+            "missing explicit command must not refresh the repo TTL"
+        );
+    }
+
+    #[test]
+    fn update_github_repo_allows_asset_only_fresh_clone_without_explicit_command() {
+        let fixture = Fixture::new("repo-fresh-asset-only");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/plugin");
+        let clone_tmp = fixture
+            .roots
+            .install_dir
+            .join(format!("owner/plugin.tmp.{}", std::process::id()));
+        let runner = FakeRunner::default()
+            .with_command("git")
+            .with_created_dir(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/owner/plugin",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join(".git"),
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    "git@github.com:owner/plugin.git",
+                ],
+                "",
+            );
+
+        let summary = run(
+            &[parse_entry("owner/plugin|github:repo", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert!(install_dir.join(".git").is_dir());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/plugin"),
+            Some(&ManifestEntry::new(
+                "owner/plugin",
+                "github:repo",
+                "plugin",
+                install_dir.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn update_github_repo_fresh_clone_retries_github_https_as_ssh() {
         let fixture = Fixture::new("repo-fresh-fallback");
         fixture.write_lib();
@@ -5391,6 +5604,17 @@ version() { printf 'saw-pkg\n'; }
                     clone_tmp.to_str().unwrap(),
                 ],
                 clone_tmp.join(".git"),
+            )
+            .with_created_binary(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "git@github.com:private/tool.git",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join("bin/tool"),
             )
             .with_success(
                 "git",
@@ -5427,6 +5651,7 @@ version() { printf 'saw-pkg\n'; }
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let install_dir = fixture.roots.install_dir.join("private/tool");
         fs::create_dir_all(install_dir.join(".git")).unwrap();
+        write_executable(&install_dir.join("bin/tool"));
         fs::create_dir_all(install_dir.join("src")).unwrap();
         fs::write(install_dir.join("src/_tool"), "#compdef tool\n").unwrap();
         fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o777)).unwrap();
@@ -5473,6 +5698,42 @@ version() { printf 'saw-pkg\n'; }
                 .mode()
                 & 0o022,
             0
+        );
+    }
+
+    #[test]
+    fn update_github_repo_existing_fresh_clone_rejects_missing_explicit_command() {
+        let fixture = Fixture::new("repo-existing-fresh-missing-cmd");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        let stamp_path = crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo");
+        crate::stamp::remote_touch(&stamp_path, 1_700_000_000).unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].reason, ItemReason::MissingBinary);
+        assert_eq!(
+            fs::read_to_string(&stamp_path).unwrap(),
+            "1700000000\n",
+            "fresh-path rejection must not rewrite the repo TTL"
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
         );
     }
 
@@ -5581,6 +5842,7 @@ version() { printf 'saw-pkg\n'; }
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let install_dir = fixture.roots.install_dir.join("owner/tool");
         fs::create_dir_all(install_dir.join(".git")).unwrap();
+        write_executable(&install_dir.join("bin/tool"));
         let runner = FakeRunner::default()
             // No SSH retry: pretend origin has no GitHub fallback.
             .with_failure(
@@ -5645,6 +5907,7 @@ version() { printf 'saw-pkg\n'; }
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let install_dir = fixture.roots.install_dir.join("owner/tool");
         fs::create_dir_all(install_dir.join(".git")).unwrap();
+        write_executable(&install_dir.join("bin/tool"));
         let runner = FakeRunner::default()
             .with_failure(
                 "git",
@@ -5704,6 +5967,7 @@ version() { printf 'saw-pkg\n'; }
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let install_dir = fixture.roots.install_dir.join("private/tool");
         fs::create_dir_all(install_dir.join(".git")).unwrap();
+        write_executable(&install_dir.join("bin/tool"));
         let runner = FakeRunner::default()
             .with_success(
                 "git",
@@ -5782,6 +6046,68 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert!(summary.items[0].changed);
         assert_eq!(summary.items[0].detail, "updated");
+    }
+
+    #[test]
+    fn update_github_repo_existing_pull_missing_explicit_command_does_not_touch_stamp() {
+        let fixture = Fixture::new("repo-pull-missing-cmd");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        let stamp_path = crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo");
+        let runner = FakeRunner::default()
+            .with_failure(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "get-url",
+                    "origin",
+                ],
+            )
+            .with_success(
+                "git",
+                ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"],
+                "head\n",
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+                "",
+            );
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].reason, ItemReason::MissingBinary);
+        assert!(
+            !stamp_path.exists(),
+            "missing explicit command must not refresh the repo TTL"
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
     }
 
     struct Fixture {

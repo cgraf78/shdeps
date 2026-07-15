@@ -247,6 +247,9 @@ fn github_repo_state(entry: &Entry, roots: &Roots, runner: &impl Runner) -> Stat
     if !root.is_dir() {
         return State::Missing;
     }
+    if repo::missing_explicit_command(entry, &root) {
+        return State::Missing;
+    }
 
     State::Installed {
         detail: repo::version(&root, runner),
@@ -618,6 +621,35 @@ mod tests {
                 detail: Some("commit abc1234".to_owned())
             }
         );
+    }
+
+    #[test]
+    fn github_repo_with_explicit_command_requires_repo_bin() {
+        let roots = roots();
+        let repo = roots.install_dir.join("smallstep/cli");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("VERSION"), "0.30.6\n").unwrap();
+        let manifest = Manifest::default();
+        let env = RuntimeEnv::new("linux", "workstation");
+        let runner = FakeRunner::default();
+        let package_versions = BTreeMap::new();
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &NoCustomProbe,
+            "",
+            &package_versions,
+        );
+
+        let status = classify(
+            &parse_entry("smallstep/cli|github:repo|step|-|-", None),
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(status.state, State::Missing);
     }
 
     #[test]

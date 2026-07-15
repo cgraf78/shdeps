@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::config;
+use crate::config::{self, Entry};
+use crate::process;
 use crate::process::Runner;
 
 /// GitHub repository source decision.
@@ -97,6 +98,11 @@ pub(crate) fn version(root: &Path, runner: &impl Runner) -> Option<String> {
             let commit = output.stdout.trim();
             (!commit.is_empty()).then(|| format!("commit {commit}"))
         })
+}
+
+/// Returns whether a repo install is missing the explicitly configured command.
+pub(crate) fn missing_explicit_command(entry: &Entry, root: &Path) -> bool {
+    entry.cmd_explicit && !process::executable_path(&root.join("bin").join(&entry.cmd))
 }
 
 fn canonical(name: &str) -> String {
