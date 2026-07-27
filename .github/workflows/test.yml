@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@1db322ef8a998a904974d0c81fb94515d1b16973
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@663f83780f58f231e810d0c9eca642bbf859353b
     with:
       clippy-command: cargo clippy --locked --all-targets -- -D warnings
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
@@ -50,7 +50,7 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@1db322ef8a998a904974d0c81fb94515d1b16973
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@663f83780f58f231e810d0c9eca642bbf859353b
     with:
       profiles: base,shellcheck
       # Shell-owned behavior lives under tests/shell. Cargo integration tests
@@ -64,6 +64,6 @@ jobs:
         tests/shell/release-scripts-test
 
   bash32:
-    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@1db322ef8a998a904974d0c81fb94515d1b16973
+    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@663f83780f58f231e810d0c9eca642bbf859353b
     with:
       command: /bin/bash scripts/smoke-install-bash32.sh

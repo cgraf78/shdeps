@@ -243,7 +243,7 @@ _inst_dir=$(_tmpdir)/shdeps-fresh
 _inst_bin=$(_tmpdir)/bin
 _cargo_log=$(_tmpdir)/cargo.log
 mkdir -p "$_inst_bin"
-PATH="$_build_bin:/usr/bin:/bin" \
+PATH="$_build_bin:$PATH" \
   SHDEPS_TEST_FAKE_SHDEPS="$_fake_shdeps" \
   SHDEPS_TEST_CARGO_LOG="$_cargo_log" \
   SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
@@ -255,7 +255,7 @@ _assert_contains "install source: cargo build ran locked" \
   "cargo build --release --locked" "$(cat "$_cargo_log")"
 
 : >"$_cargo_log"
-PATH="$_build_bin:/usr/bin:/bin" \
+PATH="$_build_bin:$PATH" \
   SHDEPS_TEST_FAKE_SHDEPS="$_fake_shdeps" \
   SHDEPS_TEST_CARGO_LOG="$_cargo_log" \
   SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
@@ -264,7 +264,7 @@ _assert_dir_exists "install source: idempotent rerun keeps clone" "$_inst_dir"
 
 printf '%s\n' dirty >>"$_inst_dir/shdeps.sh"
 _dirty_out=$(
-  PATH="$_build_bin:/usr/bin:/bin" \
+  PATH="$_build_bin:$PATH" \
     SHDEPS_TEST_FAKE_SHDEPS="$_fake_shdeps" \
     SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
     SHDEPS_REPO="$_source_repo" "$_install_script" 2>&1
@@ -310,7 +310,7 @@ else
   chmod +x "$_release_script_dir/install.sh"
   _release_install_script="$_release_script_dir/install.sh"
 
-  PATH="$_release_fakebin:/usr/bin:/bin" \
+  PATH="$_release_fakebin:$PATH" \
     SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_RELEASE_TAG="$_tag" \
     SHDEPS_TEST_CURL_LOG="$_release_log" \
@@ -330,7 +330,7 @@ else
   _updated_tag="20990102-030405-22222222"
   _updated_payload=$(_tmpdir)/release-update-payload
   _release_fixture "$_release_dir" "$_updated_payload" "$_updated_tag" "$_platform"
-  PATH="$_release_fakebin:/usr/bin:/bin" \
+  PATH="$_release_fakebin:$PATH" \
     SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
     SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
@@ -351,7 +351,7 @@ else
   _bad_bin=$(_tmpdir)/bad-bin
   mkdir -p "$_bad_bin"
   rc=0
-  PATH="$_release_fakebin:/usr/bin:/bin" \
+  PATH="$_release_fakebin:$PATH" \
     SHDEPS_TEST_RELEASE_DIR="$_bad_release_dir" \
     SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
     SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
@@ -375,7 +375,7 @@ else
   git -C "$_migrate_inst" commit -m "source install" >/dev/null 2>&1
   printf '%s\n' '{"schema":1,"method":"source-build"}' \
     >"$_migrate_inst/.shdeps-install.json"
-  PATH="$_release_fakebin:/usr/bin:/bin" \
+  PATH="$_release_fakebin:$PATH" \
     SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
     SHDEPS_REPO="ssh://git@github.com/cgraf78/shdeps.git" \
@@ -403,7 +403,7 @@ else
   git -C "$_dirty_inst" commit -m "source install" >/dev/null 2>&1
   printf '%s\n' "local edit" >>"$_dirty_inst/shdeps.sh"
   rc=0
-  PATH="$_release_fakebin:/usr/bin:/bin" \
+  PATH="$_release_fakebin:$PATH" \
     SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
     SHDEPS_DIR="$_dirty_inst" SHDEPS_BIN="$_dirty_bin/shdeps" \
@@ -421,7 +421,7 @@ else
   _bootstrap_home=$(_mock_home)
   mkdir -p "$_bootstrap_state" "$_bootstrap_bin"
   cp -R "$_updated_payload/." "$_bootstrap_state/"
-  HOME="$_bootstrap_home" PATH="$_release_fakebin:/usr/bin:/bin" \
+  HOME="$_bootstrap_home" PATH="$_release_fakebin:$PATH" \
     SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
     SHDEPS_TEST_MARKER_DIR="$_bootstrap_markers" \
@@ -442,7 +442,7 @@ else
   _bootstrap_stale_markers=$(_tmpdir)/bootstrap-stale-markers
   mkdir -p "$_bootstrap_stale" "$_bootstrap_stale_bin"
   cp -R "$_payload/." "$_bootstrap_stale/"
-  HOME="$_bootstrap_home" PATH="$_release_fakebin:/usr/bin:/bin" \
+  HOME="$_bootstrap_home" PATH="$_release_fakebin:$PATH" \
     SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
     SHDEPS_TEST_MARKER_DIR="$_bootstrap_stale_markers" \
@@ -468,7 +468,7 @@ else
 exit 126
 SH
   chmod +x "$_bootstrap_incompatible/shdeps"
-  HOME="$_bootstrap_home" PATH="$_release_fakebin:/usr/bin:/bin" \
+  HOME="$_bootstrap_home" PATH="$_release_fakebin:$PATH" \
     SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
     SHDEPS_TEST_MARKER_DIR="$_bootstrap_incompatible_markers" \
@@ -491,7 +491,7 @@ SH
   _bootstrap_force_markers=$(_tmpdir)/bootstrap-force-markers
   mkdir -p "$_bootstrap_force" "$_bootstrap_force_bin"
   cp -R "$_payload/." "$_bootstrap_force/"
-  HOME="$_bootstrap_home" PATH="$_release_fakebin:/usr/bin:/bin" \
+  HOME="$_bootstrap_home" PATH="$_release_fakebin:$PATH" \
     SHDEPS_FORCE=1 \
     SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
     SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
