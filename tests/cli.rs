@@ -1178,6 +1178,41 @@ fn list_reports_configured_dependency_statuses() {
 }
 
 #[test]
+fn list_keeps_short_custom_status_hooks_within_ci_budget() {
+    let fixture = Fixture::new("list-custom-status-perf");
+    let mut config = String::new();
+    for index in 0..30 {
+        let name = format!("custom-{index}");
+        config.push_str(&format!("{name} custom\n"));
+        fixture.write(
+            format!("conf/hooks.d/{name}.sh"),
+            "exists() { return 0; }\n",
+        );
+    }
+    fixture.write("conf/deps.conf", &config);
+
+    let mut command = fixture.command(["list"]);
+    command.env("SHDEPS_JOBS", "1");
+    let (output, elapsed) = timed(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("custom") && line.contains("installed"))
+            .count(),
+        30
+    );
+    assert_eq!(text(&output.stderr), "");
+    assert!(
+        elapsed <= Duration::from_millis(1_200),
+        "thirty short custom status hooks should stay under the CI budget; elapsed={elapsed:?}, stdout={:?}, stderr={:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+}
+
+#[test]
 fn list_preserves_hyphenated_release_version_details() {
     let fixture = Fixture::new("list-hyphenated-release-version");
     fixture.write("conf/deps.conf", "cgraf78/hive-memory github:release hm\n");
