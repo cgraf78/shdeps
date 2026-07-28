@@ -204,8 +204,8 @@ pub fn dep_version(runner: &impl Runner, command: &str) -> Option<String> {
             Some(VERSION_PROBE_TIMEOUT),
         ) {
             let combined = output.combined();
-            if !tool_version::failed_to_load(&combined) {
-                probes.push(combined);
+            if let Some(version) = record_version_probe(&mut probes, combined) {
+                return Some(version);
             }
         }
     }
@@ -213,14 +213,26 @@ pub fn dep_version(runner: &impl Runner, command: &str) -> Option<String> {
     for flag in ["--version", "-V"] {
         if let Ok(output) = runner.run(command, &[flag], Some(VERSION_PROBE_TIMEOUT)) {
             let combined = output.combined();
-            if !tool_version::failed_to_load(&combined) {
-                probes.push(combined);
+            if let Some(version) = record_version_probe(&mut probes, combined) {
+                return Some(version);
             }
         }
     }
 
     let probe_refs = probes.iter().map(String::as_str).collect::<Vec<_>>();
     tool_version::extract(&probe_refs, command)
+}
+
+fn record_version_probe(probes: &mut Vec<String>, output: String) -> Option<String> {
+    if tool_version::failed_to_load(&output) {
+        return None;
+    }
+
+    if let Some(version) = tool_version::extract_dotted(&output) {
+        return Some(version);
+    }
+    probes.push(output);
+    None
 }
 
 /// Returns whether a package manager reports `package_name` as installed.
@@ -473,6 +485,7 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::{
@@ -484,6 +497,7 @@ mod tests {
     struct FakeRunner {
         commands: BTreeSet<String>,
         outputs: BTreeMap<(String, Vec<String>), Output>,
+        calls: Mutex<Vec<(String, Vec<String>)>>,
     }
 
     impl FakeRunner {
@@ -514,6 +528,10 @@ mod tests {
             );
             self
         }
+
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
     }
 
     impl Runner for FakeRunner {
@@ -527,6 +545,10 @@ mod tests {
             args: &[&str],
             _timeout: Option<Duration>,
         ) -> io::Result<Output> {
+            self.calls.lock().unwrap().push((
+                program.to_owned(),
+                args.iter().copied().map(str::to_owned).collect(),
+            ));
             self.outputs
                 .get(&(
                     program.to_owned(),
@@ -738,6 +760,40 @@ mod tests {
         );
 
         assert_eq!(dep_version(&runner, "ssh").as_deref(), Some("10.2p1"));
+    }
+
+    #[test]
+    fn dep_version_stops_after_first_dotted_version() {
+        let runner = FakeRunner::default()
+            .with_output("tool", ["--version"], true, "tool 1.2.3\n", "")
+            .with_output("tool", ["-V"], true, "tool 9.9.9\n", "");
+
+        assert_eq!(dep_version(&runner, "tool").as_deref(), Some("1.2.3"));
+        assert_eq!(
+            runner.calls(),
+            vec![("tool".to_owned(), vec!["--version".to_owned()])],
+            "a definitive first probe must not launch the fallback process"
+        );
+    }
+
+    #[test]
+    fn dep_version_keeps_fallback_probe_for_integer_only_output() {
+        let runner = FakeRunner::default()
+            .with_output("tool", ["--version"], true, "tool version 12\n", "")
+            .with_output("tool", ["-V"], true, "tool 1.2.3\n", "");
+
+        assert_eq!(dep_version(&runner, "tool").as_deref(), Some("1.2.3"));
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[test]
+    fn dep_version_does_not_mistake_fallback_punctuation_for_dotted_version() {
+        let runner = FakeRunner::default()
+            .with_output("tool", ["--version"], true, "tool version 12-beta.1\n", "")
+            .with_output("tool", ["-V"], true, "tool 1.2.3\n", "");
+
+        assert_eq!(dep_version(&runner, "tool").as_deref(), Some("1.2.3"));
+        assert_eq!(runner.calls().len(), 2);
     }
 
     #[test]
