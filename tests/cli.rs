@@ -1204,9 +1204,16 @@ fn list_keeps_short_custom_status_hooks_within_ci_budget() {
         30
     );
     assert_eq!(text(&output.stderr), "");
+    // macOS process startup is materially slower, but a 50 ms polling
+    // regression still adds about 1.2 seconds across these 30 serial hooks.
+    let budget = if cfg!(target_os = "macos") {
+        Duration::from_millis(2_200)
+    } else {
+        Duration::from_millis(1_200)
+    };
     assert!(
-        elapsed <= Duration::from_millis(1_200),
-        "thirty short custom status hooks should stay under the CI budget; elapsed={elapsed:?}, stdout={:?}, stderr={:?}",
+        elapsed <= budget,
+        "thirty short custom status hooks should stay under the CI budget; elapsed={elapsed:?}, budget={budget:?}, stdout={:?}, stderr={:?}",
         text(&output.stdout),
         text(&output.stderr)
     );
