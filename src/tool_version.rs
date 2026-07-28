@@ -23,7 +23,7 @@ pub fn extract(probes: &[&str], command: &str) -> Option<String> {
         if failed_to_load(output) {
             continue;
         }
-        if let Some(version) = first_dotted_version(output) {
+        if let Some(version) = extract_dotted(output) {
             return Some(version);
         }
         fallback_output.push_str(output);
@@ -46,7 +46,8 @@ pub fn failed_to_load(output: &str) -> bool {
         || output.contains("error while loading shared libraries")
 }
 
-fn first_dotted_version(output: &str) -> Option<String> {
+/// Extracts the first version containing a numeric dot-separated component.
+pub(crate) fn extract_dotted(output: &str) -> Option<String> {
     let bytes = output.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
