@@ -1380,6 +1380,70 @@ fn check_reports_installed_skipped_missing_and_unknown() {
 }
 
 #[test]
+fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
+    let fixture = Fixture::new("check-targeted-package");
+    let log = fixture.dir.join("package-probes.log");
+    fixture.write(
+        "conf/deps.conf",
+        "fake-package pkg fake-tool\nfont-package pkg -\nmissing-package pkg -\n",
+    );
+    fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
+    fixture.write_executable(
+        "fakebin/dpkg-query",
+        "#!/bin/sh\nlast=\nfor arg do last=$arg; done\nprintf 'query %s\\n' \"$last\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$last\" = font-package ] || exit 1\nprintf 'font-package\\t9.8.7\\n'\n",
+    );
+    fixture.write_executable(
+        "fakebin/dpkg",
+        "#!/bin/sh\nprintf 'package %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$*\" = '-s font-package' ]\n",
+    );
+    fixture.write_executable(
+        "fakebin/fake-tool",
+        "#!/bin/sh\nprintf 'tool %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\nprintf 'fake-tool 1.2.3\\n'\n",
+    );
+
+    let mut command = fixture.command(["check", "fake-package"]);
+    command.env("SHDEPS_TEST_LOG", &log);
+    let installed = run(&mut command);
+    assert_success(&installed);
+    assert_eq!(text(&installed.stdout), "fake-package: installed (1.2.3)\n");
+    assert_eq!(text(&installed.stderr), "");
+    let probes = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        probes
+            .lines()
+            .filter(|line| line.starts_with("query "))
+            .all(|line| line == "query fake-package"),
+        "single-dependency check should not enumerate every installed package: {probes}"
+    );
+
+    fs::write(&log, "").unwrap();
+    let mut command = fixture.command(["check", "font-package"]);
+    command.env("SHDEPS_TEST_LOG", &log);
+    let installed_without_command = run(&mut command);
+    assert_success(&installed_without_command);
+    assert_eq!(
+        text(&installed_without_command.stdout),
+        "font-package: installed (9.8.7)\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "query font-package\n",
+        "package-only dependencies should retain version detail from one targeted probe"
+    );
+
+    fs::write(&log, "").unwrap();
+    let mut command = fixture.command(["check", "missing-package"]);
+    command.env("SHDEPS_TEST_LOG", &log);
+    let missing = run(&mut command);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(text(&missing.stdout), "missing-package: not installed\n");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "query missing-package\npackage -s missing-package\n"
+    );
+}
+
+#[test]
 fn update_bare_github_prefers_release_and_records_concrete_manifest_method() {
     let fixture = Fixture::new("update-github-release");
     let asset = host_linux_asset("tool", "v1.0.0");

@@ -494,11 +494,28 @@ where
     let env_vars = env_vars(options);
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
     let entry = resolve_github_entry(&entry, &roots, Some(&manifest), &env, &env_vars, options)?;
-    let package_versions = if entry.method == method::PKG {
-        process::package_versions(&Process, &pkg_mgr)
-    } else {
-        BTreeMap::new()
-    };
+    // A one-dependency check should use one targeted package query. The
+    // manager-wide snapshot is only worthwhile when `list` amortizes it across
+    // the full inventory, but the targeted result still preserves version
+    // detail when a dependency has no command or its version output is opaque.
+    let mut package_versions = BTreeMap::new();
+    if entry.method == method::PKG {
+        let resolved = config::resolve_override_for_runtime(
+            &entry.name,
+            &entry.aliases,
+            if pkg_mgr.is_empty() {
+                None
+            } else {
+                Some(&pkg_mgr)
+            },
+            env.is_android(),
+        );
+        if resolved != "NONE" {
+            if let Some(version) = process::package_version(&Process, &resolved, &pkg_mgr) {
+                package_versions.insert(resolved, version);
+            }
+        }
+    }
     let custom = custom_probe();
     let context = StatusContext {
         roots: &roots,

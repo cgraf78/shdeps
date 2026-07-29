@@ -298,6 +298,43 @@ pub fn package_versions(runner: &impl Runner, pkg_mgr: &str) -> BTreeMap<String,
     parse_package_versions(pkg_mgr, &output.stdout)
 }
 
+/// Returns one installed package's version without loading the manager's full inventory.
+#[must_use]
+pub fn package_version(runner: &impl Runner, package_name: &str, pkg_mgr: &str) -> Option<String> {
+    if package_name.is_empty() {
+        return None;
+    }
+
+    let output = match pkg_mgr {
+        "brew" => runner.run(
+            "brew",
+            &["list", "--versions", package_name],
+            Some(PACKAGE_PROBE_TIMEOUT),
+        ),
+        "apt" => runner.run(
+            "dpkg-query",
+            &["-W", "-f=${Package}\t${Version}\n", package_name],
+            Some(PACKAGE_PROBE_TIMEOUT),
+        ),
+        "dnf" => runner.run(
+            "rpm",
+            &["-q", "--qf", "%{NAME}\t%{VERSION}\n", package_name],
+            Some(PACKAGE_PROBE_TIMEOUT),
+        ),
+        "pacman" => runner.run("pacman", &["-Q", package_name], Some(PACKAGE_PROBE_TIMEOUT)),
+        _ => return None,
+    };
+
+    let output = output.ok()?;
+    if !output.success {
+        return None;
+    }
+
+    parse_package_versions(pkg_mgr, &output.stdout)
+        .into_values()
+        .next()
+}
+
 /// Returns whether `path` is an executable regular file.
 #[must_use]
 pub fn executable_path(path: &Path) -> bool {
@@ -490,7 +527,7 @@ mod tests {
 
     use super::{
         Output, Runner, dep_exists, dep_version, detect_package_manager, package_installed,
-        package_versions,
+        package_version, package_versions,
     };
 
     #[derive(Debug, Default)]
@@ -703,6 +740,47 @@ mod tests {
         let brew = package_versions(&runner, "brew");
         assert_eq!(brew.get("fzf").map(String::as_str), Some("0.62.0"));
         assert_eq!(brew.get("ripgrep").map(String::as_str), Some("14.1.1"));
+    }
+
+    #[test]
+    fn package_version_uses_one_targeted_manager_query() {
+        let runner = FakeRunner::default()
+            .with_output(
+                "dpkg-query",
+                ["-W", "-f=${Package}\t${Version}\n", "font-package"],
+                true,
+                "font-package\t9.8.7\n",
+                "",
+            )
+            .with_output(
+                "rpm",
+                ["-q", "--qf", "%{NAME}\t%{VERSION}\n", "font-package"],
+                true,
+                "font-package\t9.8.7\n",
+                "",
+            )
+            .with_output(
+                "pacman",
+                ["-Q", "font-package"],
+                true,
+                "font-package 9.8.7\n",
+                "",
+            )
+            .with_output(
+                "brew",
+                ["list", "--versions", "font-package"],
+                true,
+                "font-package 9.8.7\n",
+                "",
+            );
+
+        for manager in ["apt", "dnf", "pacman", "brew"] {
+            assert_eq!(
+                package_version(&runner, "font-package", manager).as_deref(),
+                Some("9.8.7")
+            );
+        }
+        assert_eq!(runner.calls().len(), 4);
     }
 
     #[test]
