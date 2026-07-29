@@ -199,6 +199,12 @@ field is the
 Prefers a local dev clone in
 .B $SHDEPS_GIT_DEV_DIR
 if present; otherwise pulls existing clones or does a fresh shallow clone.
+Clean local clones with an upstream are updated with
+.BR "git pull --ff-only" .
+If that pull fails, shdeps preserves the user-owned clone and reports a
+non-fatal warning instead of presenting potentially stale code as current.
+Resolve the clone's branch divergence or connectivity problem before retrying
+the update.
 .TP
 .B github:release
 Downloads a pre-built binary from GitHub Releases (the

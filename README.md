@@ -204,6 +204,14 @@ including `github:release`, ignore `$SHDEPS_GIT_DEV_DIR` so changing a dep's
 method cleanly changes ownership and install behavior instead of accidentally
 continuing to use a live checkout.
 
+On a stale or forced check, shdeps updates a clean local clone with
+`git pull --ff-only`. If that pull fails, shdeps leaves the user-owned clone
+untouched and emits a non-fatal warning naming the dependency and the checkout
+state it could observe. The installed links keep working, but may serve stale
+code until the clone's branch divergence or connectivity problem is resolved.
+This warning is also emitted in JSONL progress so parent tools such as dotfiles
+managers cannot silently present the checkout as current.
+
 ```text
 cgraf78/ds    github:repo
 ```

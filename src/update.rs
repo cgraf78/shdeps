@@ -97,6 +97,8 @@ pub enum ItemStatus {
     Current,
     /// Dependency changed and should be counted as changed.
     Changed,
+    /// Dependency remains usable, but update work needs operator attention.
+    Warning,
     /// Dependency was intentionally skipped.
     Skipped,
     /// Dependency failed.
@@ -110,6 +112,8 @@ pub enum ItemStatus {
 pub enum ItemReason {
     /// Installed/current dependency.
     Installed,
+    /// A repository remained usable after its fast-forward pull failed.
+    RepoPullFailed,
     /// Package manager override disabled this dependency.
     PackageManagerOverride,
     /// Package is unavailable on this host/package manager.
@@ -163,6 +167,22 @@ impl Item {
             changed: true,
             failed: false,
             status: ItemStatus::Changed,
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn warning(
+        name: impl Into<String>,
+        reason: ItemReason,
+        detail: impl Into<String>,
+        changed: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            changed,
+            failed: false,
+            status: ItemStatus::Warning,
             reason,
             detail: detail.into(),
         }
@@ -5177,6 +5197,83 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
+    fn update_github_repo_warns_when_local_clone_cannot_fast_forward() {
+        let fixture = Fixture::new("repo-local-diverged");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("ds");
+        write_executable(&local_clone.join("bin/ds"));
+        let install_link = fixture.roots.install_dir.join("cgraf78/ds");
+        fs::create_dir_all(install_link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&local_clone, &install_link).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    local_clone.to_str().unwrap(),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                ],
+                "",
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    local_clone.to_str().unwrap(),
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+                "origin/main\n",
+            )
+            .with_failure(
+                "git",
+                [
+                    "-C",
+                    local_clone.to_str().unwrap(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+            )
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    local_clone.to_str().unwrap(),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                ],
+                "",
+            );
+
+        let summary = run(
+            &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert!(!summary.items[0].failed);
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert_eq!(summary.items[0].reason, super::ItemReason::RepoPullFailed);
+        assert_eq!(
+            summary.items[0].detail,
+            "pull failed (no fast-forward; local clone)"
+        );
+        assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_github_repo_local_dev_clone_keeps_user_directory_modes() {
         let fixture = Fixture::new("repo-local-modes");
         fixture.write_lib();
@@ -5894,6 +5991,8 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(!summary.has_errors());
         assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert_eq!(summary.items[0].reason, ItemReason::RepoPullFailed);
         assert_eq!(summary.items[0].detail, "pull failed (dirty working tree)");
     }
 
@@ -5957,6 +6056,8 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(!summary.has_errors());
         assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert_eq!(summary.items[0].reason, ItemReason::RepoPullFailed);
         assert_eq!(summary.items[0].detail, "pull failed (no fast-forward)");
     }
 
