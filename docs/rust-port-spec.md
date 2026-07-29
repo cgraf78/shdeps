@@ -784,6 +784,10 @@ Behavior:
 - Dependency name is GitHub `owner/repo`.
 - `.git` suffix spelling is canonicalized.
 - Local dev clone `$SHDEPS_GIT_DEV_DIR/<repo>` is preferred and symlinked.
+- Clean local dev clones with an upstream are updated with a fast-forward-only
+  pull. A failed pull MUST preserve the user-owned clone, remain non-fatal, and
+  produce a structured warning with an actionable cause in human and JSONL
+  output; it MUST NOT be reported as current.
 - Existing clones are pulled/updated according to current behavior.
 - Fresh clones use shallow clone behavior.
 - Private repo clone failures over HTTPS should fall back to normal GitHub SSH

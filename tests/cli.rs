@@ -1006,6 +1006,66 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
 }
 
 #[test]
+fn update_jsonl_warns_when_local_clone_cannot_fast_forward() {
+    let fixture = Fixture::new("update-jsonl-local-clone-diverged");
+    fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");
+    fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\n");
+    fixture.write_executable(
+        "fakebin/git",
+        r#"#!/bin/sh
+case " $* " in
+  *" status --porcelain --untracked-files=normal ") exit 0 ;;
+  *" rev-parse --abbrev-ref --symbolic-full-name @{upstream} ")
+    printf 'origin/main\n'
+    exit 0
+    ;;
+  *" pull --ff-only --quiet ") exit 1 ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+    let mut command = fixture.command(["--force", "update"]);
+    command.env("SHDEPS_PROGRESS", "jsonl");
+
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
+    let events = jsonl(&output.stdout);
+    assert!(events.iter().any(|event| {
+        event["event"] == "item"
+            && event["group"] == "github-repos"
+            && event["status"] == "warning"
+            && event["name"] == "owner/tool"
+            && event["detail"] == "pull failed (no fast-forward; local clone)"
+    }));
+    assert!(events.iter().any(|event| {
+        event["event"] == "warning"
+            && event["status"] == "warning"
+            && event["detail"] == "owner/tool: pull failed (no fast-forward; local clone)"
+    }));
+    assert!(events.iter().any(|event| {
+        event["event"] == "group_summary"
+            && event["group"] == "github-repos"
+            && event["status"] == "warning"
+            && event["warnings"] == 1
+            && event["current"] == 0
+            && event["failed"] == 0
+    }));
+    assert!(events.iter().any(|event| {
+        event["event"] == "summary"
+            && event["status"] == "warning"
+            && event["warnings"] == 1
+            && event["current"] == 0
+            && event["failed"] == 0
+    }));
+    assert_eq!(
+        fs::read_link(fixture.dir.join("share/owner/tool")).unwrap(),
+        fixture.dir.join("git/tool")
+    );
+}
+
+#[test]
 fn update_jsonl_reports_bare_github_method_resolution() {
     let fixture = Fixture::new("update-jsonl-github-method-progress");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");

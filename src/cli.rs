@@ -1839,6 +1839,7 @@ where
             write_row(stderr, "failed", &format!("{}: {}", item.name, item.detail))?;
         }
     }
+    write_item_warnings(summary, stderr)?;
 
     for name in &summary.failed {
         if !item_failures.contains(name.as_str()) {
@@ -1861,7 +1862,12 @@ where
             write_row(
                 stdout,
                 update_status(counts),
-                &update_ok_summary(counts.changed, counts.current, counts.skipped),
+                &update_ok_summary(
+                    counts.changed,
+                    counts.warnings,
+                    counts.current,
+                    counts.skipped,
+                ),
             )?;
         } else {
             write_row(stderr, "failed", &format!("{} failed", counts.failed))?;
@@ -1894,6 +1900,7 @@ where
             write_row(stderr, "failed", &format!("{}: {}", item.name, item.detail))?;
         }
     }
+    write_item_warnings(summary, stderr)?;
 
     for name in &summary.failed {
         if !item_failures.contains(name.as_str()) {
@@ -1964,6 +1971,22 @@ where
     Ok(())
 }
 
+fn write_item_warnings<E>(summary: &update::Summary, stderr: &mut E) -> Result<()>
+where
+    E: Write,
+{
+    for item in &summary.items {
+        if item.status == update::ItemStatus::Warning {
+            write_row(
+                stderr,
+                "warning",
+                &format!("{}: {}", item.name, item.detail),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn terminal_progress_plan(
     entries: &[Entry],
     env: &crate::platform::RuntimeEnv,
@@ -2015,13 +2038,7 @@ where
             continue;
         }
         let counts = update_counts_for_items(&items);
-        let status = if counts.failed > 0 {
-            "failed"
-        } else if counts.changed > 0 {
-            "changed"
-        } else {
-            "ok"
-        };
+        let status = update_status(counts);
         write_row(
             stdout,
             status,
@@ -2032,7 +2049,7 @@ where
             ),
         )?;
         for item in items {
-            if item.changed && !item.failed {
+            if item.status == update::ItemStatus::Changed {
                 write_nested_row(
                     stdout,
                     "changed",
@@ -2099,7 +2116,12 @@ where
         write_row(
             stdout,
             update_status(counts),
-            &update_ok_summary(counts.changed, counts.current, counts.skipped),
+            &update_ok_summary(
+                counts.changed,
+                counts.warnings,
+                counts.current,
+                counts.skipped,
+            ),
         )?;
     } else {
         write_row(stderr, "failed", &format!("{} failed", counts.failed))?;
@@ -2138,6 +2160,15 @@ fn write_update_summary_jsonl<W>(
 where
     W: Write,
 {
+    for item in &summary.items {
+        if item.status == update::ItemStatus::Warning {
+            progress.event(json!({
+                "event": "warning",
+                "status": "warning",
+                "detail": format!("{}: {}", item.name, item.detail),
+            }))?;
+        }
+    }
     write_group_summaries_jsonl(summary, entries, progress)?;
     let counts = update_counts(summary, active_count);
     let status = update_status(counts);
@@ -2145,6 +2176,7 @@ where
         "event": "summary",
         "status": status,
         "changed": counts.changed,
+        "warnings": counts.warnings,
         "current": counts.current,
         "skipped": counts.skipped,
         "failed": counts.failed,
@@ -2180,6 +2212,7 @@ where
             "label": update::label_for_display_group(update::display_group_for_update_group(group)),
             "status": update_status(counts),
             "changed": counts.changed,
+            "warnings": counts.warnings,
             "current": counts.current,
             "skipped": counts.skipped,
             "failed": counts.failed,
@@ -2192,6 +2225,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UpdateCounts {
     changed: usize,
+    warnings: usize,
     current: usize,
     skipped: usize,
     failed: usize,
@@ -2203,6 +2237,11 @@ fn update_counts(summary: &update::Summary, active_count: usize) -> UpdateCounts
         .iter()
         .filter(|item| item.status == update::ItemStatus::Changed)
         .count();
+    let warnings = summary
+        .items
+        .iter()
+        .filter(|item| item.status == update::ItemStatus::Warning)
+        .count();
     let skipped = summary
         .items
         .iter()
@@ -2213,9 +2252,10 @@ fn update_counts(summary: &update::Summary, active_count: usize) -> UpdateCounts
         .iter()
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    let current = active_count.saturating_sub(changed + skipped + failed);
+    let current = active_count.saturating_sub(changed + warnings + skipped + failed);
     UpdateCounts {
         changed,
+        warnings,
         current,
         skipped,
         failed,
@@ -2227,6 +2267,10 @@ fn update_counts_for_items(items: &[&update::Item]) -> UpdateCounts {
         .iter()
         .filter(|item| item.status == update::ItemStatus::Changed)
         .count();
+    let warnings = items
+        .iter()
+        .filter(|item| item.status == update::ItemStatus::Warning)
+        .count();
     let skipped = items
         .iter()
         .filter(|item| item.status == update::ItemStatus::Skipped)
@@ -2235,9 +2279,12 @@ fn update_counts_for_items(items: &[&update::Item]) -> UpdateCounts {
         .iter()
         .filter(|item| item.status == update::ItemStatus::Failed)
         .count();
-    let current = items.len().saturating_sub(changed + skipped + failed);
+    let current = items
+        .len()
+        .saturating_sub(changed + warnings + skipped + failed);
     UpdateCounts {
         changed,
+        warnings,
         current,
         skipped,
         failed,
@@ -2247,6 +2294,9 @@ fn update_counts_for_items(items: &[&update::Item]) -> UpdateCounts {
 fn update_count_summary(counts: UpdateCounts) -> String {
     if counts.failed > 0 {
         let mut parts = vec![format!("{} failed", counts.failed)];
+        if counts.warnings > 0 {
+            parts.push(format!("{} warning", counts.warnings));
+        }
         if counts.changed > 0 {
             parts.push(format!("{} changed", counts.changed));
         }
@@ -2258,13 +2308,19 @@ fn update_count_summary(counts: UpdateCounts) -> String {
         }
         parts.join(", ")
     } else {
-        update_ok_summary(counts.changed, counts.current, counts.skipped)
+        update_ok_summary(
+            counts.changed,
+            counts.warnings,
+            counts.current,
+            counts.skipped,
+        )
     }
 }
 
 fn item_status(item: &update::Item) -> &'static str {
     match item.status {
         update::ItemStatus::Changed => "changed",
+        update::ItemStatus::Warning => "warning",
         update::ItemStatus::Skipped => "skipped",
         update::ItemStatus::Failed => "failed",
         update::ItemStatus::Current | update::ItemStatus::Pending => "ok",
@@ -2274,6 +2330,8 @@ fn item_status(item: &update::Item) -> &'static str {
 fn update_status(counts: UpdateCounts) -> &'static str {
     if counts.failed > 0 {
         "failed"
+    } else if counts.warnings > 0 {
+        "warning"
     } else if counts.changed > 0 {
         "changed"
     } else {
@@ -2281,8 +2339,11 @@ fn update_status(counts: UpdateCounts) -> &'static str {
     }
 }
 
-fn update_ok_summary(changed: usize, current: usize, skipped: usize) -> String {
+fn update_ok_summary(changed: usize, warnings: usize, current: usize, skipped: usize) -> String {
     let mut parts = Vec::new();
+    if warnings > 0 {
+        parts.push(format!("{warnings} warning"));
+    }
     if changed > 0 {
         parts.push(format!("{changed} changed"));
     }
@@ -3125,6 +3186,91 @@ mod tests {
 
         assert!(String::from_utf8(stdout).unwrap().is_empty());
         assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn terminal_summary_reports_repository_pull_warnings() {
+        let summary = Summary {
+            items: vec![Item::warning(
+                "cgraf78/ds",
+                ItemReason::RepoPullFailed,
+                "pull failed (no fast-forward; local clone)",
+                false,
+            )],
+            ..Summary::default()
+        };
+        let entries = vec![Entry {
+            name: "cgraf78/ds".to_owned(),
+            method: "github:repo".to_owned(),
+            cmd: "ds".to_owned(),
+            cmd_explicit: true,
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        super::write_update_terminal_summary(
+            &summary,
+            &entries,
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert!(String::from_utf8(stdout).unwrap().is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "  warning  cgraf78/ds: pull failed (no fast-forward; local clone)\n"
+        );
+    }
+
+    #[test]
+    fn jsonl_summary_emits_actionable_repository_pull_warning() {
+        let summary = Summary {
+            items: vec![Item::warning(
+                "cgraf78/ds",
+                ItemReason::RepoPullFailed,
+                "pull failed (no fast-forward; local clone)",
+                false,
+            )],
+            ..Summary::default()
+        };
+        let entries = vec![Entry {
+            name: "cgraf78/ds".to_owned(),
+            method: "github:repo".to_owned(),
+            cmd: "ds".to_owned(),
+            cmd_explicit: true,
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        let mut output = Vec::new();
+
+        {
+            let mut progress = super::JsonlProgress::new(&mut output);
+            super::write_update_summary_jsonl(&summary, &entries, 1, &mut progress).unwrap();
+        }
+
+        let events = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["event"] == "warning"
+                && event["status"] == "warning"
+                && event["detail"] == "cgraf78/ds: pull failed (no fast-forward; local clone)"
+        }));
+        let summary_event = events
+            .iter()
+            .find(|event| event["event"] == "summary")
+            .unwrap();
+        assert_eq!(summary_event["status"], "warning");
+        assert_eq!(summary_event["warnings"], 1);
+        assert_eq!(summary_event["current"], 0);
+        assert_eq!(summary_event["failed"], 0);
     }
 
     #[test]

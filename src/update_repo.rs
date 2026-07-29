@@ -48,11 +48,18 @@ pub(crate) fn install(
     let rev_before = stamp::revision_read(&revision_path)?;
     let mut status = git_status(context.runner, &local_clone);
     let mut refresh_stamp = false;
+    let mut pull_failed = false;
 
     if !stamp::remote_fresh(&stamp_path, options.freshness()) && status.is_clean() {
         if has_upstream(context.runner, &local_clone) {
             if pull(context.runner, &local_clone) {
                 refresh_stamp = true;
+            } else {
+                // A local development clone is user-owned, so shdeps must not
+                // reset or rebase it. Keep serving the checkout, but preserve
+                // the failed pull as a first-class warning instead of making a
+                // stale command look current.
+                pull_failed = true;
             }
         } else {
             // Local-only dev clones are a valid dependency source. Touching the
@@ -102,7 +109,14 @@ pub(crate) fn install(
         detail = format!("{detail} (local clone)");
     }
 
-    Ok(if changed {
+    Ok(if pull_failed {
+        Item::warning(
+            entry.name.clone(),
+            ItemReason::RepoPullFailed,
+            local_pull_failure_detail(status),
+            changed,
+        )
+    } else if changed {
         Item::changed(entry.name.clone(), ItemReason::Installed, detail)
     } else {
         Item::current(entry.name.clone(), ItemReason::Installed, detail)
@@ -155,19 +169,18 @@ fn install_existing(
         // guess. Lumping unreported into "no fast-forward" hid
         // broken-index/missing-git failures behind a misleading
         // label.
-        let detail = if !post_status.reported {
-            "pull failed (status unavailable)".to_owned()
-        } else if post_status.dirty {
-            "pull failed (dirty working tree)".to_owned()
-        } else {
-            "pull failed (no fast-forward)".to_owned()
-        };
+        let detail = pull_failure_detail(post_status);
         secure_managed_clone_permissions(install_dir)?;
         if let Some(item) = missing_explicit_command(entry, install_dir) {
             return Ok(item);
         }
         record_success(entry, context, install_dir)?;
-        return Ok(Item::current(entry.name.clone(), ItemReason::Other, detail));
+        return Ok(Item::warning(
+            entry.name.clone(),
+            ItemReason::RepoPullFailed,
+            detail,
+            false,
+        ));
     }
 
     let head_after = git_head(context.runner, install_dir);
@@ -384,6 +397,24 @@ fn git_status(runner: &impl Runner, dir: &Path) -> GitStatus {
             dirty: false,
             reported: false,
         },
+    }
+}
+
+fn pull_failure_detail(status: GitStatus) -> String {
+    format!("pull failed ({})", pull_failure_cause(status))
+}
+
+fn local_pull_failure_detail(status: GitStatus) -> String {
+    format!("pull failed ({}; local clone)", pull_failure_cause(status))
+}
+
+fn pull_failure_cause(status: GitStatus) -> &'static str {
+    if !status.reported {
+        "status unavailable"
+    } else if status.dirty {
+        "dirty working tree"
+    } else {
+        "no fast-forward"
     }
 }
 
