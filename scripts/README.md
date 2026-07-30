@@ -19,3 +19,7 @@ Keep scripts deterministic and friendly to CI. If a script needs a generated
 artifact, make the artifact path explicit and avoid depending on untracked local
 state. Release archive shape changes should be covered by
 `tests/shell/release-scripts-test`.
+
+Published releases are immutable and their tags are derived from the commit.
+Force a replacement build from a new commit and tag instead of replacing assets
+under an existing release.
