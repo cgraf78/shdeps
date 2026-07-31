@@ -3114,6 +3114,28 @@ struct Fixture {
     dir: PathBuf,
 }
 
+// Integration tests are a separate crate and cannot use the lib's private
+// #[cfg(test)] registry, so this fixture owns cleanup directly.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn fixture_removes_its_temp_tree_on_drop() {
+    let dir = {
+        let fixture = Fixture::new("drop-cleanup");
+        fixture.dir.clone()
+    };
+
+    assert!(
+        !dir.exists(),
+        "temporary integration fixture leaked: {}",
+        dir.display()
+    );
+}
+
 impl Fixture {
     fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(

@@ -12,7 +12,7 @@
 
 PASS=0
 FAIL=0
-CLEANUP_DIRS=()
+_SHDEPS_TEST_TMP_ROOT=$(mktemp -d) || exit 1
 
 # ---------------------------------------------------------------------------
 # Assertions
@@ -172,16 +172,11 @@ _assert_perms() {
 # ---------------------------------------------------------------------------
 
 _tmpdir() {
-  local d
-  d=$(mktemp -d)
-  CLEANUP_DIRS+=("$d")
-  echo "$d"
+  mktemp -d "$_SHDEPS_TEST_TMP_ROOT/fixture.XXXXXX"
 }
 
 _cleanup() {
-  for d in "${CLEANUP_DIRS[@]+"${CLEANUP_DIRS[@]}"}"; do
-    rm -rf "$d"
-  done
+  rm -rf "$_SHDEPS_TEST_TMP_ROOT"
 }
 trap _cleanup EXIT
 

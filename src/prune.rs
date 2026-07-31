@@ -241,7 +241,6 @@ impl fmt::Display for Item {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{Options, run};
     use crate::config::parse_entry;
@@ -499,16 +498,6 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!(
-            "shdeps-prune-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+        crate::test_support::temp_dir(&format!("shdeps-prune-{name}"))
     }
 }

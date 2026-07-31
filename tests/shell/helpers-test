@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -u
+
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+report=$(mktemp) || exit 1
+fixture=""
+
+cleanup() {
+  rm -f "$report"
+  [[ -z "$fixture" ]] || rm -rf "$fixture"
+}
+trap cleanup EXIT
+
+if ! bash -c '
+  set -u
+  source "$1"
+  fixture=$(_tmpdir)
+  printf "%s\n" "$fixture" >"$2"
+  [[ -d "$fixture" ]]
+' bash "$REPO_ROOT/tests/shell/helpers.sh" "$report"; then
+  echo "FAIL: helper child could not create a temporary directory" >&2
+  exit 1
+fi
+
+fixture=$(cat "$report")
+if [[ -e "$fixture" || -L "$fixture" ]]; then
+  echo "FAIL: command-substitution temporary directory leaked: $fixture" >&2
+  exit 1
+fi
+
+echo "PASS: command-substitution temporary directory is removed on exit"
