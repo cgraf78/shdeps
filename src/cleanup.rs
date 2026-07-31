@@ -485,13 +485,7 @@ mod tests {
         // `$HOME/.local/share`, so the relative path resolves UNDER
         // `install_dir` and remains acceptable. The fixture below
         // mirrors that real-world overlap so the legacy entry passes.
-        let dir = std::env::temp_dir().join(format!(
-            "shdeps-cleanup-safe-rel-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::temp_dir("shdeps-cleanup-safe-rel");
         let roots = Roots {
             state_dir: dir.join("state"),
             install_dir: dir.join("home/.local/share"),
@@ -569,13 +563,7 @@ mod tests {
         // the real escape vector. The fixture below uses an
         // install_dir-rooted relative path so the post-round-6
         // containment guard accepts it.
-        let dir = std::env::temp_dir().join(format!(
-            "shdeps-cleanup-safe-curdir-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::temp_dir("shdeps-cleanup-safe-curdir");
         let roots = Roots {
             state_dir: dir.join("state"),
             install_dir: dir.join("home/.local/share"),
@@ -626,13 +614,7 @@ mod tests {
 
     impl Fixture {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "shdeps-cleanup-{name}-{}-{}",
-                std::process::id(),
-                std::thread::current().name().unwrap_or("test")
-            ));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_support::temp_dir(&format!("shdeps-cleanup-{name}"));
             let roots = Roots {
                 state_dir: dir.join("state"),
                 install_dir: dir.join("share"),

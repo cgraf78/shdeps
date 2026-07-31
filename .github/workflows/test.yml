@@ -57,6 +57,7 @@ jobs:
       # Shell-owned behavior lives under tests/shell. Cargo integration tests
       # stay in the conventional tests/*.rs location.
       test-command: >
+        tests/shell/helpers-test &&
         tests/shell/install-sh-test &&
         tests/shell/completion-test &&
         tests/shell/installer-flow-test &&

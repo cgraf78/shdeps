@@ -51,6 +51,8 @@ pub mod self_update;
 pub mod stamp;
 pub mod state;
 pub mod status;
+#[cfg(test)]
+mod test_support;
 pub mod tool_version;
 pub mod update;
 mod update_external;

@@ -1280,7 +1280,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::Duration;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{Context, Item, ItemReason, Options, Summary, run, run_with_progress};
     use bzip2::Compression as BzCompression;
@@ -6734,16 +6733,6 @@ version() { printf 'saw-pkg\n'; }
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!(
-            "shdeps-update-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+        crate::test_support::temp_dir(&format!("shdeps-update-{name}"))
     }
 }

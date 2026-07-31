@@ -160,7 +160,6 @@ mod tests {
     use std::fs;
     use std::io::{self, Write};
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -347,16 +346,6 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!(
-            "shdeps-release-stage-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+        crate::test_support::temp_dir(&format!("shdeps-release-stage-{name}"))
     }
 }

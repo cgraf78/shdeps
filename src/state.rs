@@ -656,13 +656,7 @@ done
 
     impl Fixture {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "shdeps-state-{name}-{}-{}",
-                std::process::id(),
-                std::thread::current().name().unwrap_or("test")
-            ));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_support::temp_dir(&format!("shdeps-state-{name}"));
             Self { dir }
         }
     }

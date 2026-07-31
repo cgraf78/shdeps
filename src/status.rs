@@ -291,7 +291,7 @@ mod tests {
     use std::io;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use super::{
         Context, CustomProbe, DependencyStatus, NoCustomProbe, SkipReason, State, classify, list,
@@ -935,13 +935,6 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!("shdeps-{name}-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        path
+        crate::test_support::temp_dir(&format!("shdeps-{name}"))
     }
 }
