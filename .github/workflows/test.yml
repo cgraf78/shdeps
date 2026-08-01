@@ -50,10 +50,11 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@d0648a98a1585710edb5d1393af84e48025bcaa7
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@f9a9074b2d43fb3812067477d29307ef1e84e70e
     with:
       matrix-set: full
-      profiles: base,shellcheck
+      profiles: base
+      shellcheck-inventory-path: .github/shellcheck-files.txt
       # Shell-owned behavior lives under tests/shell. Cargo integration tests
       # stay in the conventional tests/*.rs location.
       test-command: >
