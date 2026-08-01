@@ -1,0 +1,23 @@
+# type<TAB>repository-relative path
+# `fixture` records are discovered but intentionally excluded from ShellCheck.
+program	completions/shdeps.bash
+program	demo/record.sh
+program	examples/hooks.d/example-hook.sh
+program	install.sh
+program	scripts/package-release.sh
+program	scripts/release-tag.sh
+program	scripts/release-version.sh
+program	scripts/release.sh
+program	scripts/smoke-install-bash32.sh
+program	scripts/smoke-release.sh
+program	scripts/termux-ci.sh
+program	shdeps.sh
+program	tests/shell/completion-test
+program	tests/shell/helpers-test
+program	tests/shell/helpers.sh
+program	tests/shell/install-sh-test
+program	tests/shell/installer-flow-test
+program	tests/shell/lua-api-test
+program	tests/shell/lua-bootstrap-test
+program	tests/shell/release-scripts-test
+program	tests/shell/shdeps-wrapper-test

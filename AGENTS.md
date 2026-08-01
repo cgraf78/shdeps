@@ -148,7 +148,9 @@ behavior lives in Rust (`src/hook_toolkit.rs`, bridged through `__api`).
 
 ## Code Quality
 
-- shellcheck must pass on all `.sh` files
+- ShellCheck must pass on every program in `.github/shellcheck-files.txt`;
+  the shared CI inventory gate rejects newly discovered shell programs until
+  they are reviewed and classified.
 - All variables quoted, edge cases handled, return codes checked
 - Comments explain WHY, not WHAT
 - Every function has a brief comment explaining purpose and params
