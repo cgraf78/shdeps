@@ -493,36 +493,45 @@ pub(crate) fn install_request(
     // The shdeps self-update path (`release_stage`) uses a stricter
     // contract that requires the checksum and rejects on download failure;
     // the third-party path here intentionally diverges in failure mode.
-    if let Some(checksum_url) = selection.checksum_url.as_deref() {
-        match github::download_asset(
-            context.client,
-            checksum_url,
-            selection.checksum_api_url.as_deref(),
-            asset_token.as_deref(),
-        ) {
-            Ok(checksum_bytes) => {
-                let checksum_text = String::from_utf8_lossy(&checksum_bytes);
-                if !crate::checksum::verify_any(&checksum_text, &selection.asset_name, &bytes) {
-                    return Ok(failed("release asset checksum mismatch"));
+    if !selection.checksum_assets.is_empty() {
+        let mut verified = false;
+        for checksum_asset in &selection.checksum_assets {
+            let checksum_bytes = match github::download_asset(
+                context.client,
+                &checksum_asset.url,
+                checksum_asset.api_url.as_deref(),
+                asset_token.as_deref(),
+            ) {
+                Ok(checksum_bytes) => checksum_bytes,
+                Err(_) => {
+                    // The checksum asset was advertised in the release JSON
+                    // but not retrievable. No install ran (we are NOT going
+                    // to land an unverified binary), but we also do not
+                    // refresh the TTL stamp so the next run retries the
+                    // verification.
+                    //
+                    // Failure-mode: report as `failed: true` rather than the
+                    // earlier soft `failed: false`. The earlier shape let
+                    // the caller's unconditional `write_manifest` run on
+                    // the success path, recording a manifest row pointing
+                    // at a `bin_dir/cmd` that does not exist on disk for
+                    // first-time installs. Treating the unavailable
+                    // checksum as a real failure keeps the manifest from
+                    // advertising a binary the user does not have.
+                    return Ok(failed(&format!("{}: checksum unavailable", selection.tag)));
                 }
+            };
+            let checksum_text = String::from_utf8_lossy(&checksum_bytes);
+            if crate::checksum::verify_any(&checksum_text, &selection.asset_name, &bytes) {
+                verified = true;
+                break;
             }
-            Err(_) => {
-                // The checksum asset was advertised in the release JSON
-                // but not retrievable. No install ran (we are NOT going
-                // to land an unverified binary), but we also do not
-                // refresh the TTL stamp so the next run retries the
-                // verification.
-                //
-                // Failure-mode: report as `failed: true` rather than the
-                // earlier soft `failed: false`. The earlier shape let
-                // the caller's unconditional `write_manifest` run on
-                // the success path, recording a manifest row pointing
-                // at a `bin_dir/cmd` that does not exist on disk for
-                // first-time installs. Treating the unavailable
-                // checksum as a real failure keeps the manifest from
-                // advertising a binary the user does not have.
-                return Ok(failed(&format!("{}: checksum unavailable", selection.tag)));
+            if crate::checksum::has_named_checksum(&checksum_text, &selection.asset_name) {
+                return Ok(failed("release asset checksum mismatch"));
             }
+        }
+        if !verified {
+            return Ok(failed("release asset checksum mismatch"));
         }
     }
     let Some(asset_kind) = crate::release_asset::install_kind(&selection.url) else {

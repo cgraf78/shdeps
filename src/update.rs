@@ -3079,6 +3079,89 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_falls_back_to_named_release_wide_checksum() {
+        // Watchexec and similar releases publish a per-asset digest without a
+        // filename, plus a release-wide manifest that does bind the digest to
+        // the asset. The bare sibling must remain untrusted, but it must not
+        // hide the usable named manifest from the verifier.
+        let mut fixture = Fixture::new("release-checksum-sibling-fallback");
+        fixture.write_lib();
+        let binary = b"binary".to_vec();
+        let sibling_checksum = crate::checksum::sha256_hex(&binary);
+        let release_wide_checksum = format!(
+            "{}  tool-linux-x86_64\n",
+            crate::checksum::sha256_hex(&binary)
+        );
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[
+                        {
+                            "name":"tool-linux-x86_64",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        },
+                        {
+                            "name":"tool-linux-x86_64.sha256",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256"
+                        },
+                        {
+                            "name":"SHA256SUMS",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/SHA256SUMS"
+                        }
+                    ]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                binary.clone(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256",
+                sibling_checksum.into_bytes(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/SHA256SUMS",
+                release_wide_checksum.into_bytes(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read(fixture.roots.bin_dir.join("tool")).unwrap(),
+            binary
+        );
+        let urls = fixture
+            .client
+            .requests()
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect::<Vec<_>>();
+        assert!(
+            urls.iter().any(|url| url.ends_with(".sha256")),
+            "bare sibling must be inspected before the fallback: {urls:?}"
+        );
+        assert!(
+            urls.iter().any(|url| url.ends_with("SHA256SUMS")),
+            "named release-wide manifest must be used as the fallback: {urls:?}"
+        );
+    }
+
+    #[test]
     fn update_github_release_verifies_release_wide_sha512_checksum() {
         let mut fixture = Fixture::new("release-checksum-sha512");
         fixture.write_lib();
