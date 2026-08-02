@@ -528,10 +528,23 @@ pub(crate) fn install_request(
                 break;
             }
             if crate::checksum::has_named_checksum(&checksum_text, &selection.asset_name) {
+                eprintln!(
+                    "shdeps: checksum mismatch: asset={} bytes={} sha256={} checksum={}",
+                    selection.asset_name,
+                    bytes.len(),
+                    crate::checksum::sha256_hex(&bytes),
+                    checksum_asset.url.rsplit('/').next().unwrap_or("checksum")
+                );
                 return Ok(failed("release asset checksum mismatch"));
             }
         }
         if !verified {
+            eprintln!(
+                "shdeps: checksum mismatch: asset={} bytes={} sha256={} checksum has no named entry",
+                selection.asset_name,
+                bytes.len(),
+                crate::checksum::sha256_hex(&bytes)
+            );
             return Ok(failed("release asset checksum mismatch"));
         }
     }
