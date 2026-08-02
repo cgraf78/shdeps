@@ -535,7 +535,10 @@ pub(crate) fn install_request(
                     crate::checksum::sha256_hex(&bytes),
                     checksum_asset.url.rsplit('/').next().unwrap_or("checksum")
                 );
-                return Ok(failed("release asset checksum mismatch"));
+                return Ok(failed(&checksum_mismatch_detail(
+                    &selection.asset_name,
+                    &bytes,
+                )));
             }
         }
         if !verified {
@@ -545,7 +548,10 @@ pub(crate) fn install_request(
                 bytes.len(),
                 crate::checksum::sha256_hex(&bytes)
             );
-            return Ok(failed("release asset checksum mismatch"));
+            return Ok(failed(&checksum_mismatch_detail(
+                &selection.asset_name,
+                &bytes,
+            )));
         }
     }
     let Some(asset_kind) = crate::release_asset::install_kind(&selection.url) else {
@@ -657,6 +663,14 @@ pub(crate) fn install_request(
         detail,
         stamp: true,
     })
+}
+
+fn checksum_mismatch_detail(asset_name: &str, bytes: &[u8]) -> String {
+    format!(
+        "release asset checksum mismatch ({asset_name}, {} bytes, sha256 {})",
+        bytes.len(),
+        crate::checksum::sha256_hex(bytes)
+    )
 }
 
 fn clear_archive_bin_links(
