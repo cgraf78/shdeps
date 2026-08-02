@@ -3337,7 +3337,14 @@ version() { printf 'saw-pkg\n'; }
         .unwrap();
 
         assert!(summary.has_errors());
-        assert_eq!(summary.items[0].detail, "release asset checksum mismatch");
+        assert_eq!(
+            summary.items[0].detail,
+            format!(
+                "release asset checksum mismatch (tool-linux-x86_64, {} bytes, sha256 {})",
+                b"binary".len(),
+                crate::checksum::sha256_hex(b"binary")
+            )
+        );
         assert!(!fixture.roots.bin_dir.join("tool").exists());
         let urls = fixture
             .client
@@ -3590,7 +3597,14 @@ version() { printf 'saw-pkg\n'; }
         .unwrap();
 
         assert!(summary.has_errors());
-        assert_eq!(summary.items[0].detail, "release asset checksum mismatch");
+        assert_eq!(
+            summary.items[0].detail,
+            format!(
+                "release asset checksum mismatch (tool-linux-x86_64, {} bytes, sha256 {})",
+                b"binary".len(),
+                crate::checksum::sha256_hex(b"binary")
+            )
+        );
         assert!(!fixture.roots.bin_dir.join("tool").exists());
         assert!(
             manifest::read(&manifest_path)
@@ -3654,7 +3668,14 @@ version() { printf 'saw-pkg\n'; }
         .unwrap();
 
         assert!(summary.has_errors());
-        assert_eq!(summary.items[0].detail, "release asset checksum mismatch");
+        assert_eq!(
+            summary.items[0].detail,
+            format!(
+                "release asset checksum mismatch (tool-linux-x86_64, {} bytes, sha256 {})",
+                b"binary".len(),
+                crate::checksum::sha256_hex(b"binary")
+            )
+        );
         assert!(!fixture.roots.bin_dir.join("tool").exists());
     }
 
