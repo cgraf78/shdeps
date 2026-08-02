@@ -1291,6 +1291,7 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use crate::config::{parse_entry, parse_entry_for_runtime};
+    use crate::github::{self, Asset, Release};
     use crate::hooks::BashCustomProbe;
     use crate::http::Client;
     use crate::link_state::{self, Kind};
@@ -1298,6 +1299,7 @@ mod tests {
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
     use crate::runtime::Roots;
+    use crate::stamp;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PhaseRecord {
@@ -3162,6 +3164,116 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn forced_release_install_ignores_cached_release_metadata() {
+        release_install_ignores_cached_release_metadata(
+            "force-release-cache",
+            Options {
+                force: true,
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        );
+    }
+
+    #[test]
+    fn reinstall_release_install_ignores_cached_release_metadata() {
+        release_install_ignores_cached_release_metadata(
+            "reinstall-release-cache",
+            Options {
+                reinstall: true,
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        );
+    }
+
+    fn release_install_ignores_cached_release_metadata(fixture_name: &str, options: Options) {
+        // A stamp can survive from a previous invocation that happened in the
+        // same epoch second. `--force` must still use fresh REST metadata: an
+        // old asset list can pair a newly served binary with an obsolete
+        // checksum and turn a valid upstream release into a false mismatch.
+        let mut fixture = Fixture::new(fixture_name);
+        fixture.write_lib();
+        let stale_asset = "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64";
+        let stale_checksum =
+            "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64.sha256";
+        let fresh_asset = "https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64";
+        let fresh_checksum =
+            "https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64.sha256";
+        let stale_releases = vec![Release {
+            tag: "v1".to_owned(),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                Asset {
+                    name: "tool-linux-x86_64".to_owned(),
+                    url: stale_asset.to_owned(),
+                    api_url: None,
+                },
+                Asset {
+                    name: "tool-linux-x86_64.sha256".to_owned(),
+                    url: stale_checksum.to_owned(),
+                    api_url: None,
+                },
+            ],
+        }];
+        github::write_cached_releases(&fixture.roots.state_dir, "owner/tool", &stale_releases)
+            .unwrap();
+        let now = options.now;
+        stamp::remote_touch(
+            &stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "github"),
+            now,
+        )
+        .unwrap();
+
+        let fresh_binary = b"fresh-binary".to_vec();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                format!(
+                    r#"[{{"tag_name":"v2","draft":false,"prerelease":false,"assets":[{{"name":"tool-linux-x86_64","browser_download_url":"{fresh_asset}"}},{{"name":"tool-linux-x86_64.sha256","browser_download_url":"{fresh_checksum}"}}]}}]"#
+                )
+                .into_bytes(),
+            )
+            .with(stale_asset, b"stale-binary".to_vec())
+            .with(stale_checksum, b"0000  tool-linux-x86_64\n".to_vec())
+            .with(fresh_asset, fresh_binary.clone())
+            .with(
+                fresh_checksum,
+                format!(
+                    "{}  tool-linux-x86_64\n",
+                    crate::checksum::sha256_hex(&fresh_binary)
+                )
+                .into_bytes(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            options,
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(
+            fs::read(fixture.roots.bin_dir.join("tool")).unwrap(),
+            fresh_binary
+        );
+        let urls = fixture
+            .client
+            .requests()
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect::<Vec<_>>();
+        assert!(urls.contains(&github::releases_url("owner/tool")));
+        assert!(urls.contains(&fresh_asset.to_owned()));
+        assert!(!urls.contains(&stale_asset.to_owned()));
+    }
+
+    #[test]
     fn update_github_release_rejects_named_sibling_before_release_wide_fallback() {
         // A filename-bound sibling that disagrees with the downloaded bytes is
         // an integrity failure, not a reason to seek a lower-priority digest.
@@ -4727,7 +4839,11 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
-    fn update_github_release_reuses_same_run_generic_redirect_proof() {
+    fn forced_release_install_rechecks_equal_timestamp_stamp() {
+        // A persisted stamp has no run identity, so an equal timestamp cannot
+        // prove that this forced invocation already checked the release.
+        // Recheck it rather than letting a just-finished older run suppress
+        // the caller's explicit refresh request.
         let fixture = Fixture::new("release-force-generic-handoff");
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
@@ -4755,7 +4871,19 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(!summary.has_errors());
         assert!(!summary.items[0].changed);
-        assert!(fixture.client.requests().is_empty());
+        assert_eq!(
+            fixture.client.requests(),
+            vec![
+                (
+                    "https://github.com/owner/tool/releases/latest".to_owned(),
+                    None
+                ),
+                (
+                    "https://api.github.com/repos/owner/tool/releases?per_page=100".to_owned(),
+                    None
+                ),
+            ]
+        );
     }
 
     #[test]

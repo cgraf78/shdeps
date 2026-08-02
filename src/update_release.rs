@@ -258,7 +258,7 @@ fn prefetch_candidates(entries: &[&Entry], roots: &Roots, options: Options) -> V
         let stamp_path = stamp::remote_path(&roots.state_dir, &entry.name, "release");
         if process::executable_path(&public_bin)
             && (stamp::remote_fresh(&stamp_path, options.freshness())
-                || stamp::remote_checked_at(&stamp_path, options.now))
+                || checked_this_run(&stamp_path, options))
         {
             continue;
         }
@@ -314,12 +314,13 @@ pub(crate) fn install_request(
     let stamp_path = stamp::remote_path(&context.roots.state_dir, request.name, "release");
     if process::executable_path(request.public_bin)
         && (stamp::remote_fresh(&stamp_path, context.options.freshness())
-            || stamp::remote_checked_at(&stamp_path, context.options.now))
+            || checked_this_run(&stamp_path, context.options))
     {
-        // Bare `github` resolution can verify this release through the public
-        // redirect earlier in the same run. `remote_checked_at` carries that
-        // proof into the concrete release phase even when `--force` bypasses
-        // ordinary TTL freshness, avoiding a duplicate public request.
+        // A prior phase can verify this release through the public redirect in
+        // the same ordinary update. Forced and reinstall runs deliberately do
+        // not share persisted state: a prior invocation can write the same
+        // second-level timestamp, which is indistinguishable on disk from an
+        // in-run check and can otherwise mask stale release metadata.
         // Bash relinks extras even on the TTL fast path. That idempotent repair
         // matters when a user prunes a completion/manpage symlink by hand while
         // keeping the binary; a fresh stamp should skip the network, not leave
@@ -657,14 +658,32 @@ fn clear_archive_bin_links(
 }
 
 fn cached_releases(repo: &str, roots: &Roots, options: Options) -> Option<Vec<github::Release>> {
+    if options.force || options.reinstall {
+        // `remote_checked_at` is persisted at second resolution, so it cannot
+        // prove that a stamp came from this invocation. Force is an explicit
+        // request to refresh the complete release decision, including assets
+        // and checksums, rather than merely bypassing the normal TTL.
+        return None;
+    }
+
     let stamp_path = stamp::remote_path(&roots.state_dir, repo, method::GITHUB);
     if !stamp::remote_fresh(&stamp_path, options.freshness())
-        && !stamp::remote_checked_at(&stamp_path, options.now)
+        && !checked_this_run(&stamp_path, options)
     {
         return None;
     }
 
     github::read_cached_releases(&roots.state_dir, repo)
+}
+
+/// Returns whether a non-forced update can reuse a remote fact written during
+/// its current invocation.
+///
+/// Stamps contain only seconds, not a run identifier. A forced/reinstall run
+/// must therefore never treat an equal timestamp as in-run proof: the stamp
+/// might instead belong to a just-finished prior invocation with stale assets.
+fn checked_this_run(path: &Path, options: Options) -> bool {
+    !options.force && !options.reinstall && stamp::remote_checked_at(path, options.now)
 }
 
 fn fetch_releases_with_prefetch_token(

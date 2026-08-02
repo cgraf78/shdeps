@@ -1120,8 +1120,8 @@ fn update_jsonl_reports_bare_github_method_resolution() {
     );
     assert_eq!(
         fs::read_to_string(fixture.dir.join("curl.log")).unwrap(),
-        "api\nasset\n",
-        "forced bare-github resolution should share the release metadata it already fetched instead of hitting the GitHub API again"
+        "api\napi\nasset\n",
+        "forced bare-GitHub resolution must refresh concrete release metadata instead of trusting a persisted cache with no run identity"
     );
 }
 
