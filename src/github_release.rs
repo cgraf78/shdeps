@@ -26,14 +26,18 @@ pub struct Selection {
     /// asset name (the same filename appears as the second field in standard
     /// `sha256sum` output) instead of relying on positional trust.
     pub asset_name: String,
-    /// Browser URL of a checksum asset if the upstream release published one.
-    /// `None` when the release does not include a recognized per-asset or
-    /// release-wide checksum file, in which case installation proceeds
-    /// unverified for backward compatibility — see the comment in
-    /// `update_release::install_request`.
-    pub checksum_url: Option<String>,
-    /// REST API URL for the sibling checksum asset (private-release fallback).
-    pub checksum_api_url: Option<String>,
+    /// Checksum candidates, from the asset-specific file to a release-wide
+    /// manifest. Installation retains filename binding for every candidate.
+    pub checksum_assets: Vec<ChecksumAsset>,
+}
+
+/// A release checksum asset eligible to verify one selected install asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumAsset {
+    /// Browser URL of the checksum asset.
+    pub url: String,
+    /// REST API URL for private-release fallback.
+    pub api_url: Option<String>,
 }
 
 /// Returns the release that GitHub would expose as "latest" for third-party deps.
@@ -73,24 +77,31 @@ pub fn select(
     let primary = release.assets.iter().find(|asset| asset.url == url)?;
     let api_url = primary.api_url.clone();
     // Prefer asset-specific checksums, then release-wide checksum files whose
-    // contents still bind each digest to an exact filename. The install layer
-    // verifies that named binding before landing bytes on disk.
-    let checksum_asset = checksum_asset(&release.assets, &primary.name);
+    // contents still bind each digest to an exact filename. A publisher can
+    // include a bare per-asset digest plus a correctly named release manifest;
+    // preserving both gives the verifier a safe fallback without ever trusting
+    // the unbound value.
+    let checksum_assets = checksum_assets(&release.assets, &primary.name)
+        .into_iter()
+        .map(|asset| ChecksumAsset {
+            url: asset.url.clone(),
+            api_url: asset.api_url.clone(),
+        })
+        .collect();
 
     Some(Selection {
         tag: release.tag.clone(),
         url,
         api_url,
         asset_name: primary.name.clone(),
-        checksum_url: checksum_asset.map(|asset| asset.url.clone()),
-        checksum_api_url: checksum_asset.and_then(|asset| asset.api_url.clone()),
+        checksum_assets,
     })
 }
 
-fn checksum_asset<'a>(
+fn checksum_assets<'a>(
     assets: &'a [crate::github::Asset],
     primary_name: &str,
-) -> Option<&'a crate::github::Asset> {
+) -> Vec<&'a crate::github::Asset> {
     let primary_name = primary_name.to_ascii_lowercase();
     let sibling_names = [
         format!("{primary_name}.sha256"),
@@ -98,12 +109,10 @@ fn checksum_asset<'a>(
         format!("{primary_name}.sha512"),
         format!("{primary_name}.sha512sum"),
     ];
-    if let Some(asset) = assets.iter().find(|asset| {
+    let sibling = assets.iter().find(|asset| {
         let name = asset.name.to_ascii_lowercase();
         sibling_names.contains(&name)
-    }) {
-        return Some(asset);
-    }
+    });
 
     let mut best = None;
     for asset in assets {
@@ -114,7 +123,8 @@ fn checksum_asset<'a>(
             best = Some((asset, priority));
         }
     }
-    best.map(|(asset, _)| asset)
+    let release_wide = best.map(|(asset, _)| asset);
+    sibling.into_iter().chain(release_wide).collect()
 }
 
 fn release_wide_checksum_priority(name: &str) -> Option<u8> {
@@ -322,8 +332,7 @@ mod tests {
                 url: "https://github.com/owner/tool/releases/download/v1/tool-v1.8.0-linux-x86_64.tar.gz".to_owned(),
                 api_url: None,
                 asset_name: "tool-v1.8.0-linux-x86_64.tar.gz".to_owned(),
-                checksum_url: None,
-                checksum_api_url: None,
+                checksum_assets: vec![],
             })
         );
     }
@@ -362,7 +371,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            selection.checksum_url.as_deref(),
+            selection
+                .checksum_assets
+                .first()
+                .map(|asset| asset.url.as_str()),
             Some(
                 "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.sha256"
             )
@@ -400,7 +412,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            selection.checksum_url.as_deref(),
+            selection
+                .checksum_assets
+                .first()
+                .map(|asset| asset.url.as_str()),
             Some(
                 "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.SHA512SUM"
             )
@@ -436,8 +451,9 @@ mod tests {
                 &runner
             )
             .unwrap()
-            .checksum_url
-            .as_deref(),
+            .checksum_assets
+            .first()
+            .map(|asset| asset.url.as_str()),
             Some(
                 "https://github.com/owner/tool/releases/download/v1.0.0/tool-v1.0.0-linux-x86_64.tar.gz.sha512sum"
             )
@@ -468,8 +484,9 @@ mod tests {
                 &runner
             )
             .unwrap()
-            .checksum_url
-            .as_deref(),
+            .checksum_assets
+            .first()
+            .map(|asset| asset.url.as_str()),
             Some("https://github.com/owner/tool/releases/download/v1.0.0/SHA256SUMS")
         );
 
@@ -507,8 +524,9 @@ mod tests {
                     &runner
                 )
                 .unwrap()
-                .checksum_url
-                .as_deref(),
+                .checksum_assets
+                .first()
+                .map(|asset| asset.url.as_str()),
                 Some(format!(
                     "https://github.com/owner/tool/releases/download/v1.0.0/{checksum_name}"
                 ))
@@ -553,7 +571,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            selection.checksum_url.as_deref(),
+            selection
+                .checksum_assets
+                .first()
+                .map(|asset| asset.url.as_str()),
             Some("https://github.com/owner/tool/releases/download/v1.0.0/SHA256SUMS")
         );
     }
@@ -580,8 +601,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selection.checksum_url, None);
-        assert_eq!(selection.checksum_api_url, None);
+        assert!(selection.checksum_assets.is_empty());
     }
 
     #[test]

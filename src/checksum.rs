@@ -79,6 +79,24 @@ pub fn verify_any(content: &str, file_name: &str, bytes: &[u8]) -> bool {
     verify_hex(content, file_name, 128, &actual_sha512)
 }
 
+/// Returns whether a checksum file contains a usable named digest for `file_name`.
+///
+/// This distinguishes an unbound checksum payload from a named checksum that
+/// disagrees with downloaded bytes. Callers may try a lower-priority manifest
+/// only for the former; a named mismatch remains a hard integrity failure.
+#[must_use]
+pub fn has_named_checksum(content: &str, file_name: &str) -> bool {
+    [64, 128].into_iter().any(|hex_len| {
+        content.lines().any(|line| {
+            let line = line.trim();
+            !line.is_empty()
+                && !line.starts_with('#')
+                && (parse_named_line(line, file_name, hex_len).is_some()
+                    || filename_first_line_has_named_digest(line, file_name, hex_len))
+        })
+    })
+}
+
 fn verify_hex(content: &str, file_name: &str, hex_len: usize, actual: &str) -> bool {
     for line in content.lines() {
         let line = line.trim();
@@ -124,6 +142,15 @@ fn filename_first_line_matches(line: &str, file_name: &str, hex_len: usize, actu
     fields.any(|field| normalize_hash(field, hex_len).is_some_and(|hash| hash == actual))
 }
 
+fn filename_first_line_has_named_digest(line: &str, file_name: &str, hex_len: usize) -> bool {
+    let mut fields = line.split_whitespace();
+    let Some(candidate) = fields.next() else {
+        return false;
+    };
+    named_checksum_file(candidate) == file_name
+        && fields.any(|field| normalize_hash(field, hex_len).is_some())
+}
+
 fn named_checksum_file(value: &str) -> &str {
     let value = value.trim_start();
     let value = value.strip_prefix('*').unwrap_or(value).trim_end();
@@ -147,7 +174,7 @@ fn push_hex(output: &mut String, byte: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{expected_sha256, sha256_hex, sha512_hex, verify, verify_any};
+    use super::{expected_sha256, has_named_checksum, sha256_hex, sha512_hex, verify, verify_any};
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const EMPTY_SHA512: &str = concat!(
@@ -285,5 +312,14 @@ mod tests {
         assert!(verify_any(&manifest, "archive.tar.gz", b""));
         assert!(!verify_any(&manifest, "different.tar.gz", b""));
         assert!(!verify_any(&manifest, "archive.tar.gz", b"not empty"));
+    }
+
+    #[test]
+    fn has_named_checksum_accepts_filename_first_manifest_rows() {
+        let manifest = format!("archive.tar.gz  {EMPTY_SHA256}  {EMPTY_SHA512}\n");
+
+        assert!(has_named_checksum(&manifest, "archive.tar.gz"));
+        assert!(!has_named_checksum(&manifest, "other.tar.gz"));
+        assert!(!has_named_checksum(EMPTY_SHA256, "archive.tar.gz"));
     }
 }
