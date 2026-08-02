@@ -174,7 +174,7 @@ fn push_hex(output: &mut String, byte: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{expected_sha256, sha256_hex, sha512_hex, verify, verify_any};
+    use super::{expected_sha256, has_named_checksum, sha256_hex, sha512_hex, verify, verify_any};
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const EMPTY_SHA512: &str = concat!(
@@ -312,5 +312,14 @@ mod tests {
         assert!(verify_any(&manifest, "archive.tar.gz", b""));
         assert!(!verify_any(&manifest, "different.tar.gz", b""));
         assert!(!verify_any(&manifest, "archive.tar.gz", b"not empty"));
+    }
+
+    #[test]
+    fn has_named_checksum_accepts_filename_first_manifest_rows() {
+        let manifest = format!("archive.tar.gz  {EMPTY_SHA256}  {EMPTY_SHA512}\n");
+
+        assert!(has_named_checksum(&manifest, "archive.tar.gz"));
+        assert!(!has_named_checksum(&manifest, "other.tar.gz"));
+        assert!(!has_named_checksum(EMPTY_SHA256, "archive.tar.gz"));
     }
 }

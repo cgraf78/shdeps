@@ -3162,6 +3162,84 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
+    fn update_github_release_rejects_named_sibling_before_release_wide_fallback() {
+        // A filename-bound sibling that disagrees with the downloaded bytes is
+        // an integrity failure, not a reason to seek a lower-priority digest.
+        // The release-wide manifest must therefore remain unread.
+        let mut fixture = Fixture::new("release-checksum-sibling-mismatch");
+        fixture.write_lib();
+        let binary = b"binary".to_vec();
+        let sibling_checksum = format!(
+            "{}  tool-linux-x86_64\n",
+            crate::checksum::sha256_hex(b"different-bytes")
+        );
+        let release_wide_checksum = format!(
+            "{}  tool-linux-x86_64\n",
+            crate::checksum::sha256_hex(&binary)
+        );
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                br#"[{
+                    "tag_name":"v1.2.3",
+                    "draft":false,
+                    "prerelease":false,
+                    "assets":[
+                        {
+                            "name":"tool-linux-x86_64",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64"
+                        },
+                        {
+                            "name":"tool-linux-x86_64.sha256",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256"
+                        },
+                        {
+                            "name":"SHA256SUMS",
+                            "browser_download_url":"https://github.com/owner/tool/releases/download/v1.2.3/SHA256SUMS"
+                        }
+                    ]
+                }]"#
+                .to_vec(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64",
+                binary,
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/tool-linux-x86_64.sha256",
+                sibling_checksum.into_bytes(),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1.2.3/SHA256SUMS",
+                release_wide_checksum.into_bytes(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].detail, "release asset checksum mismatch");
+        assert!(!fixture.roots.bin_dir.join("tool").exists());
+        let urls = fixture
+            .client
+            .requests()
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect::<Vec<_>>();
+        assert!(
+            !urls.iter().any(|url| url.ends_with("SHA256SUMS")),
+            "a named sibling mismatch must stop before fallback: {urls:?}"
+        );
+    }
+
+    #[test]
     fn update_github_release_verifies_release_wide_sha512_checksum() {
         let mut fixture = Fixture::new("release-checksum-sha512");
         fixture.write_lib();
