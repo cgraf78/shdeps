@@ -625,15 +625,14 @@ shdeps-YYYYMMDD-HHMMSS-<8hex>-<asset-platform>.tar.gz.sha256
 ```
 
 Published platforms include musl Linux on x86_64/aarch64, Bionic Android on
-aarch64 (including Termux), and macOS on Intel/Apple Silicon. The installer and
-`self-update` select `android-aarch64` before the generic Linux flavor when they
-detect Android.
+x86_64/aarch64 (including Termux), and macOS on Intel/Apple Silicon. The
+installer and `self-update` choose the Android artifact matching the runtime
+architecture before considering a generic Linux flavor.
 
-CI cross-builds Android archives and verifies their AArch64 ELF identity plus
-the Bionic `/system/bin/linker64` interpreter. A separate x86_64 Android build
-runs inside the official Termux app on a hardware-accelerated emulator, covering
-launch and Android package policy while the AArch64 release artifact retains
-structural cross-build coverage.
+CI cross-builds both Android archives and verifies their ELF identity plus the
+Bionic `/system/bin/linker64` interpreter. The x86_64 build also runs inside the
+official Termux app on a hardware-accelerated emulator, covering the actual
+runtime while the AArch64 artifact retains structural cross-build coverage.
 
 ## License
 

@@ -46,6 +46,7 @@ _platform_label() {
 
   case "$android:$os:$arch" in
     1:linux:aarch64) printf '%s\n' "android-aarch64" ;;
+    1:linux:x86_64) printf '%s\n' "android-x86_64" ;;
     0:linux:x86_64) printf '%s\n' "linux-x86_64-musl" ;;
     0:linux:aarch64) printf '%s\n' "linux-aarch64-musl" ;;
     0:darwin:x86_64) printf '%s\n' "macos-x86_64" ;;

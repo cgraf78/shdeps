@@ -84,10 +84,22 @@ test -f "$smoke/completions/shdeps.bash"
 test -f "$smoke/completions/shdeps.zsh"
 test -f "$smoke/completions/shdeps.fish"
 
-if [[ "$asset_platform" == "android-aarch64" ]]; then
-  # The Android artifact is cross-built on an x86_64 runner. Validate its
-  # architecture and Bionic loader without trying to execute it on glibc.
-  readelf -h "$smoke/shdeps" | grep -Eq 'Machine:[[:space:]]+AArch64'
+case "$asset_platform" in
+  android-aarch64)
+    android_machine='AArch64'
+    ;;
+  android-x86_64)
+    android_machine='X86-64'
+    ;;
+  *)
+    android_machine=''
+    ;;
+esac
+if [[ -n "$android_machine" ]]; then
+  # Android artifacts are cross-built on a glibc host. Validate both their
+  # architecture and Bionic loader without trying to execute them there.
+  readelf -h "$smoke/shdeps" |
+    grep -Eq "Machine:[[:space:]].*${android_machine}"
   readelf -l "$smoke/shdeps" | grep -Fq '/system/bin/linker64'
   exit 0
 fi

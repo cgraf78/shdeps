@@ -601,16 +601,10 @@ fn artifact_platform_from_pair(pair: &Pair) -> Option<String> {
         .archive_name
         .strip_prefix("shdeps-")?
         .strip_suffix(".tar.gz")?;
-    [
-        "linux-x86_64-musl",
-        "linux-aarch64-musl",
-        "android-aarch64",
-        "macos-x86_64",
-        "macos-aarch64",
-    ]
-    .iter()
-    .find(|label| body.ends_with(&format!("-{label}")))
-    .map(|label| (*label).to_owned())
+    crate::release_artifact::PLATFORM_LABELS
+        .iter()
+        .find(|label| body.ends_with(&format!("-{label}")))
+        .map(|label| (*label).to_owned())
 }
 
 fn compare_tags(left: &str, right: &str) -> std::cmp::Ordering {
@@ -716,7 +710,8 @@ mod tests {
 
     use super::{
         ArchiveDecision, Outcome, ReleaseArchiveFailure, ReleaseArchiveOutcome, ReleaseDecision,
-        Target, release_archive, select_archive, select_release, source_checkout, target,
+        Target, artifact_platform_from_pair, release_archive, select_archive, select_release,
+        source_checkout, target,
     };
     use crate::checksum;
     use crate::github::{Asset, Release};
@@ -774,6 +769,23 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing fake command"))
         }
+    }
+
+    #[test]
+    fn android_x86_64_archive_preserves_its_install_platform() {
+        let pair = Pair {
+            archive_name: "shdeps-v2026.08.03-android-x86_64.tar.gz".to_owned(),
+            archive_url: String::new(),
+            archive_api_url: None,
+            checksum_name: String::new(),
+            checksum_url: String::new(),
+            checksum_api_url: None,
+        };
+
+        assert_eq!(
+            artifact_platform_from_pair(&pair),
+            Some("android-x86_64".to_owned())
+        );
     }
 
     #[test]

@@ -305,6 +305,7 @@ _release_platform() {
 
   case "$android:$os:$arch" in
     1:linux:aarch64) printf '%s\n' "android-aarch64" ;;
+    1:linux:x86_64) printf '%s\n' "android-x86_64" ;;
     1:linux:*)
       _error "unsupported shdeps Android release architecture: $arch"
       return 1

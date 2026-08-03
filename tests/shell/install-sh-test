@@ -112,6 +112,19 @@ _termux_platform=$(
 _assert_eq "release platform: Termux selects Bionic asset" \
   "android-aarch64" "$_termux_platform"
 
+_termux_x86_platform=$(
+  uname() {
+    case "$1" in
+      -s) printf 'Linux\n' ;;
+      -m) printf 'x86_64\n' ;;
+      -o) printf 'Android\n' ;;
+    esac
+  }
+  TERMUX_VERSION=0.118.3 _release_platform
+)
+_assert_eq "release platform: x86_64 Termux selects Bionic asset" \
+  "android-x86_64" "$_termux_x86_platform"
+
 _uname_android_platform=$(
   uname() {
     case "$1" in

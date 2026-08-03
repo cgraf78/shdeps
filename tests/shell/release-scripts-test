@@ -111,6 +111,49 @@ _android_readelf=$(cat "$_android_smoke/readelf.log")
 _assert_contains "smoke release: checks Android ELF architecture" "-h" "$_android_readelf"
 _assert_contains "smoke release: checks Android Bionic loader" "-l" "$_android_readelf"
 
+tar -C "$_android_smoke/stage" -czf \
+  "$_android_smoke/dist/shdeps-${_android_tag}-android-x86_64.tar.gz" .
+cat >"$_android_bin/readelf" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$ANDROID_READELF_LOG"
+case "$1" in
+  -h) printf '  Machine:                           Advanced Micro Devices X86-64\n' ;;
+  -l) printf '      [Requesting program interpreter: /system/bin/linker64]\n' ;;
+  *) exit 2 ;;
+esac
+SH
+chmod +x "$_android_bin/readelf"
+rc=0
+(
+  cd "$_android_smoke" || exit 1
+  ANDROID_READELF_LOG="$_android_smoke/readelf-x86.log" \
+    PATH="$_android_bin:$PATH" scripts/smoke-release.sh android-x86_64
+) || rc=$?
+_assert_exit "smoke release: validates x86_64 Android archive" 0 "$rc"
+_android_x86_readelf=$(cat "$_android_smoke/readelf-x86.log")
+_assert_contains "smoke release: checks Android x86_64 ELF architecture" \
+  "-h" "$_android_x86_readelf"
+_assert_contains "smoke release: checks Android x86_64 Bionic loader" \
+  "-l" "$_android_x86_readelf"
+
+_release_workflow=$(cat "$SHDEPS_DIR/.github/workflows/release.yml")
+_assert_contains "release workflow: enables Android x86_64 artifact" \
+  "android-x86_64: true" "$_release_workflow"
+_assert_contains "release workflow: pins Android x86_64 release contract" \
+  "cgraf78/actions/.github/workflows/rust-release.yml@368baf40074bbc58c761ff859b82676acda7790c" \
+  "$_release_workflow"
+
+_test_workflow=$(cat "$SHDEPS_DIR/.github/workflows/test.yml")
+_termux_host_command=$(
+  sed -n '/^[[:space:]]*termux-host-command:/,/^[[:space:]]*android-package-smoke-command:/p' \
+    <<<"$_test_workflow"
+)
+_assert_contains "test workflow: packages the Android x86_64 release archive" \
+  "scripts/package-release.sh \"\$RUST_TARGET\" \"\$ASSET_PLATFORM\"" \
+  "$_termux_host_command"
+_assert_contains "test workflow: smokes the Android x86_64 release archive" \
+  "scripts/smoke-release.sh \"\$ASSET_PLATFORM\"" "$_termux_host_command"
+
 _release_script_origin=$(_tmpdir)/release-origin.git
 _release_script_repo=$(_tmpdir)/release-repo
 git init --bare "$_release_script_origin" >/dev/null 2>&1
