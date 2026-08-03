@@ -19,7 +19,10 @@ jobs:
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
       termux-command: scripts/termux-ci.sh
       termux-host-command: |
-        archive=$(scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM")
+        archive=$(
+          CARGO_TARGET_DIR="$RUNNER_TEMP/shdeps-termux-target" \
+            scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+        )
         scripts/smoke-release.sh "$ASSET_PLATFORM"
         mkdir -p .termux-ci
         tar -xzf "$archive" -C .termux-ci ./shdeps

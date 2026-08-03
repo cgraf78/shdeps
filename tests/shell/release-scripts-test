@@ -56,6 +56,66 @@ rc=0
 ) || rc=$?
 _assert_exit "package release: rejects Rust target label" 2 "$rc"
 
+_package_fixture=$(_tmpdir)
+mkdir -p "$_package_fixture/scripts" "$_package_fixture/man/man1" \
+  "$_package_fixture/completions" "$_package_fixture/lua/shdeps"
+cp "$SHDEPS_DIR/scripts/package-release.sh" \
+  "$_package_fixture/scripts/package-release.sh"
+cat >"$_package_fixture/scripts/release-tag.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${SHDEPS_BUILD_VERSION:?}"
+SH
+chmod +x "$_package_fixture/scripts/"*.sh
+printf '#!/usr/bin/env bash\n' >"$_package_fixture/install.sh"
+printf '# wrapper\n' >"$_package_fixture/shdeps.sh"
+printf '# shdeps\n' >"$_package_fixture/README.md"
+printf 'license\n' >"$_package_fixture/LICENSE"
+printf '.TH SHDEPS 1\n' >"$_package_fixture/man/man1/shdeps.1"
+printf '# completion\n' >"$_package_fixture/completions/shdeps.bash"
+printf '# completion\n' >"$_package_fixture/completions/shdeps.zsh"
+printf '# completion\n' >"$_package_fixture/completions/shdeps.fish"
+printf '%s\n' '-- lua' >"$_package_fixture/lua/shdeps.lua"
+printf '%s\n' '-- lua' >"$_package_fixture/lua/shdeps/core.lua"
+printf '%s\n' '-- lua' >"$_package_fixture/lua/shdeps/bootstrap.lua"
+_package_bin=$(_mock_bin)
+cat >"$_package_bin/cargo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+target=
+while (($#)); do
+  if [[ $1 == --target ]]; then
+    target=$2
+    break
+  fi
+  shift
+done
+mkdir -p "${CARGO_TARGET_DIR:?}/${target:?}/release"
+printf '#!/system/bin/sh\n' >"$CARGO_TARGET_DIR/$target/release/shdeps"
+chmod +x "$CARGO_TARGET_DIR/$target/release/shdeps"
+SH
+chmod +x "$_package_bin/cargo"
+_package_target_dir=$(_tmpdir)
+rc=0
+_package_archive=$(
+  cd "$_package_fixture" || exit 1
+  CARGO_TARGET_DIR="$_package_target_dir" \
+    PATH="$_package_bin:$PATH" \
+    SHDEPS_BUILD_COMMIT=abcdef123456 \
+    SHDEPS_BUILD_VERSION=20990208-091011-abcdef12 \
+    scripts/package-release.sh x86_64-linux-android android-x86_64
+) || rc=$?
+_assert_exit "package release: honors an external Cargo target directory" 0 "$rc"
+if [[ -f "$_package_fixture/$_package_archive" ]]; then
+  _pass "package release: creates archive from external Cargo target"
+else
+  _fail "package release: creates archive from external Cargo target"
+fi
+if [[ -e "$_package_fixture/target" ]]; then
+  _fail "package release: keeps Cargo artifacts out of checkout"
+else
+  _pass "package release: keeps Cargo artifacts out of checkout"
+fi
+
 rc=0
 (
   cd "$SHDEPS_DIR" || exit 1
@@ -150,6 +210,9 @@ _termux_host_command=$(
 )
 _assert_contains "test workflow: packages the Android x86_64 release archive" \
   "scripts/package-release.sh \"\$RUST_TARGET\" \"\$ASSET_PLATFORM\"" \
+  "$_termux_host_command"
+_assert_contains "test workflow: keeps Cargo artifacts out of transported checkout" \
+  "CARGO_TARGET_DIR=\"\$RUNNER_TEMP/shdeps-termux-target\"" \
   "$_termux_host_command"
 _assert_contains "test workflow: smokes the Android x86_64 release archive" \
   "scripts/smoke-release.sh \"\$ASSET_PLATFORM\"" "$_termux_host_command"
