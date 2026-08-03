@@ -51,7 +51,7 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@f9a9074b2d43fb3812067477d29307ef1e84e70e
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@6258122bd79dc9296b5d529c33fc3aad8f4d5796
     with:
       matrix-set: full
       profiles: base
