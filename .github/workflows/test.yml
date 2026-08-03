@@ -5,7 +5,7 @@ on:
     branches: [master, main]
   pull_request:
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "37 8 * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@d0648a98a1585710edb5d1393af84e48025bcaa7
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
     with:
       clippy-command: cargo clippy --locked --all-targets -- -D warnings
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
@@ -51,7 +51,7 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@6258122bd79dc9296b5d529c33fc3aad8f4d5796
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
     with:
       matrix-set: full
       profiles: base
@@ -68,6 +68,6 @@ jobs:
         tests/shell/release-scripts-test
 
   bash32:
-    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@be8dd5a8da32120f0a97c9a8e30d9b07805c90bc
+    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
     with:
       command: /bin/bash scripts/smoke-install-bash32.sh
