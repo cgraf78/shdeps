@@ -12,11 +12,12 @@ permissions:
 
 jobs:
   release:
-    uses: cgraf78/actions/.github/workflows/rust-release.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@368baf40074bbc58c761ff859b82676acda7790c
     permissions:
       contents: write
     with:
       android-aarch64: true
+      android-x86_64: true
       # shdeps' public version is generated from the UTC committer timestamp
       # plus the commit suffix, not from Cargo.toml semver. Ask the shared
       # workflow to validate the exact release tag instead of forcing this repo

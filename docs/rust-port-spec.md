@@ -1534,12 +1534,13 @@ Supported artifact labels:
 - `linux-x86_64-musl`
 - `linux-aarch64-musl`
 - `android-aarch64`
+- `android-x86_64`
 - `macos-x86_64`
 - `macos-aarch64`
 
 WSL uses Linux musl artifacts.
-Android aarch64 environments, including Termux, use the Android/Bionic artifact
-instead of a Linux musl artifact.
+Android aarch64 and x86_64 environments, including Termux, use the matching
+Android/Bionic artifact instead of a Linux musl artifact.
 
 Archive naming:
 

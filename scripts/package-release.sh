@@ -8,6 +8,7 @@ fi
 
 target=$1
 asset_platform=$2
+target_dir=${CARGO_TARGET_DIR:-target}
 
 case "$asset_platform" in
   '' | *[!A-Za-z0-9._-]*)
@@ -50,7 +51,10 @@ trap cleanup EXIT
 SHDEPS_BUILD_COMMIT="$commit" SHDEPS_BUILD_VERSION="$tag" \
   cargo build --release --locked --target "$target"
 
-install -m 0755 "target/${target}/release/shdeps" "$staging/shdeps"
+# Cargo's target directory is caller-configurable so CI can keep large build
+# trees out of source checkouts that are subsequently copied into constrained
+# runtimes such as Termux. Read the binary from the same location Cargo used.
+install -m 0755 "${target_dir}/${target}/release/shdeps" "$staging/shdeps"
 # `shdeps.sh` is now the Rust-era sourceable wrapper. Keep release archives
 # pointed at that single public wrapper path so source checkouts and packaged
 # installs expose the same Bash API surface.

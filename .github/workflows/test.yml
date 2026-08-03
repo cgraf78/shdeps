@@ -19,12 +19,13 @@ jobs:
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
       termux-command: scripts/termux-ci.sh
       termux-host-command: |
-        target_dir="$RUNNER_TEMP/shdeps-termux-target"
-        cargo build --release --locked --target "$RUST_TARGET" --target-dir "$target_dir"
+        archive=$(
+          CARGO_TARGET_DIR="$RUNNER_TEMP/shdeps-termux-target" \
+            scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+        )
+        scripts/smoke-release.sh "$ASSET_PLATFORM"
         mkdir -p .termux-ci
-        install -m 0755 \
-          "$target_dir/$RUST_TARGET/release/shdeps" \
-          .termux-ci/shdeps
+        tar -xzf "$archive" -C .termux-ci ./shdeps
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
