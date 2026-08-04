@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
     with:
       clippy-command: cargo clippy --locked --all-targets -- -D warnings
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
@@ -51,7 +51,7 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
     with:
       matrix-set: full
       profiles: base
@@ -68,6 +68,6 @@ jobs:
         tests/shell/release-scripts-test
 
   bash32:
-    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
+    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
     with:
       command: /bin/bash scripts/smoke-install-bash32.sh

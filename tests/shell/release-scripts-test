@@ -200,7 +200,7 @@ _release_workflow=$(cat "$SHDEPS_DIR/.github/workflows/release.yml")
 _assert_contains "release workflow: enables Android x86_64 artifact" \
   "android-x86_64: true" "$_release_workflow"
 _assert_contains "release workflow: pins Android x86_64 release contract" \
-  "cgraf78/actions/.github/workflows/rust-release.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c" \
+  "cgraf78/actions/.github/workflows/rust-release.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218" \
   "$_release_workflow"
 
 _test_workflow=$(cat "$SHDEPS_DIR/.github/workflows/test.yml")
