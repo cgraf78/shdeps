@@ -14,6 +14,13 @@ _real_mkdir=$(command -v mkdir)
 _real_mv=$(command -v mv)
 _real_rm=$(command -v rm)
 _real_tar=$(command -v tar)
+if command -v sha256sum >/dev/null 2>&1; then
+  _real_hasher=$(command -v sha256sum)
+  _real_hasher_is_shasum=0
+else
+  _real_hasher=$(command -v shasum)
+  _real_hasher_is_shasum=1
+fi
 
 _write_fake_shdeps() {
   local path="$1" version="$2"
@@ -113,6 +120,14 @@ set -u
 dest=""
 for arg in "$@"; do dest="$arg"; done
 case "${SHDEPS_TEST_PHASE:-}:$dest" in
+  staging-replacement:*/.shdeps-install.*/)
+    staging="${dest%/}"
+    printf '%s\n' "$staging" >"$SHDEPS_TEST_MARKERS/staging.path"
+    "$SHDEPS_TEST_REAL_RM" -rf -- "$staging"
+    "$SHDEPS_TEST_REAL_MKDIR" -p "$staging"
+    printf '%s\n' foreign >"$staging/foreign"
+    exit 74
+    ;;
   copy:*/.shdeps-install.*/)
     printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
     printf '%s\n' "${dest%/}" >"$SHDEPS_TEST_MARKERS/staging.path"
@@ -154,7 +169,17 @@ if [[ "$config" == - ]]; then
   done
 fi
 case "$url" in
-  */latest) "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/latest.json" "$out" ;;
+  */latest)
+    if [[ "${SHDEPS_TEST_PHASE:-}" == scratch-replacement ]]; then
+      scratch="${out%/*}"
+      printf '%s\n' "$scratch" >"$SHDEPS_TEST_MARKERS/scratch.path"
+      "$SHDEPS_TEST_REAL_RM" -rf -- "$scratch"
+      "$SHDEPS_TEST_REAL_MKDIR" -p "$scratch"
+      printf '%s\n' foreign >"$scratch/foreign"
+      exit 75
+    fi
+    "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/latest.json" "$out"
+    ;;
   *.tar.gz)
     "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/$(basename "$url")" "$out" || exit $?
     if [[ "${SHDEPS_TEST_PHASE:-}" == *download* ]]; then
@@ -175,6 +200,29 @@ case "$url" in
   *.sha256) "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/$(basename "$url")" "$out" ;;
   *) printf 'unexpected test URL: %s\n' "$url" >&2; exit 2 ;;
 esac
+SH
+
+  cat >"$bin/sha256sum" <<'SH'
+#!/usr/bin/env bash
+set -u
+last=""
+for arg in "$@"; do last="$arg"; done
+if [[ "${SHDEPS_TEST_PHASE:-}" == checksum ]]; then
+  scratch="$PWD"
+  case "$last" in */*) scratch="${last%/*}" ;; esac
+  printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+  printf '%s\n' "$scratch" >"$SHDEPS_TEST_MARKERS/scratch.path"
+  exec 3<>"$SHDEPS_TEST_CHECKSUM_GATE"
+  : >"$SHDEPS_TEST_MARKERS/ready"
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  IFS= read -r _ <&3
+fi
+if [[ "$SHDEPS_TEST_REAL_HASHER_IS_SHASUM" == 1 ]]; then
+  exec "$SHDEPS_TEST_REAL_HASHER" -a 256 "$@"
+fi
+exec "$SHDEPS_TEST_REAL_HASHER" "$@"
 SH
 
   cat >"$bin/tar" <<'SH'
@@ -292,7 +340,7 @@ fi
 exec "$SHDEPS_TEST_REAL_RM" "$@"
 SH
 
-  chmod +x "$bin/cp" "$bin/curl" "$bin/tar" "$bin/mkdir" "$bin/mv" "$bin/rm"
+  chmod +x "$bin/cp" "$bin/curl" "$bin/tar" "$bin/mkdir" "$bin/mv" "$bin/rm" "$bin/sha256sum"
 }
 
 _write_driver() {
@@ -444,6 +492,7 @@ _run_interrupt_case() {
   esac
 
   mkdir -p "$markers" "$tmp"
+  mkfifo "$markers/checksum-gate"
   if [[ "$fresh" -eq 0 ]]; then
     _make_bundle "$live" 20990101-020304-11111111
     cp -R "$live" "$snapshot"
@@ -482,6 +531,9 @@ _run_interrupt_case() {
     "SHDEPS_TEST_REAL_MV=$_real_mv"
     "SHDEPS_TEST_REAL_RM=$_real_rm"
     "SHDEPS_TEST_REAL_TAR=$_real_tar"
+    "SHDEPS_TEST_REAL_HASHER=$_real_hasher"
+    "SHDEPS_TEST_REAL_HASHER_IS_SHASUM=$_real_hasher_is_shasum"
+    "SHDEPS_TEST_CHECKSUM_GATE=$markers/checksum-gate"
     "SHDEPS_TEST_RELEASE=$release"
     "SHDEPS_TEST_REPORT=$report"
     "SHDEPS_TEST_ERREXIT=$errexit"
@@ -497,7 +549,7 @@ _run_interrupt_case() {
     parent=$!
 
     case "$phase" in
-      *download* | copy | extract | backup-remove)
+      *download* | checksum | copy | extract | backup-remove)
         if _wait_for_file "$markers/ready"; then
           kill -"$signal" "$parent" 2>/dev/null || true
           if [[ -n "$second_signal" ]]; then
@@ -677,6 +729,82 @@ _run_failure_case() {
       _assert_contains "$phase: diagnostic reports destination race" 'appeared before activation' "$(cat "$stderr")"
       ;;
   esac
+}
+
+_run_owned_replacement_case() {
+  local phase="$1" mode="$2"
+  local root live bundle snapshot release markers bin tmp report stdout stderr driver install_script
+  local platform tag path="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  release="$root/release"
+  markers="$root/markers"
+  bin="$root/bin"
+  tmp="$root/tmp"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  tag=20990102-030405-22222222
+  platform=$(_platform_label) || {
+    _fail "$phase: unsupported test platform"
+    return
+  }
+
+  mkdir -p "$markers" "$tmp"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" "$tag"
+  cp -R "$live" "$snapshot"
+  _make_release "$release" "$bundle" "$tag" "$platform"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    TMPDIR="$tmp" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_BIN="$root/shdeps-bin" \
+    SHDEPS_FORCE=1 \
+    SHDEPS_RELEASE_API_URL=https://api.github.com/repos/cgraf78/shdeps/releases/latest \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE="$mode" \
+    SHDEPS_TEST_PHASE="$phase" \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_HASHER="$_real_hasher" \
+    SHDEPS_TEST_REAL_HASHER_IS_SHASUM="$_real_hasher_is_shasum" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_RELEASE="$release" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" || rc=$?
+
+  _assert_eq "$phase: install fails through cleanup" 1 "$rc"
+  if _report_is_restored "$report"; then
+    _pass "$phase: caller state restored"
+  else
+    _fail "$phase: caller state restored"
+  fi
+  case "$phase" in
+    staging-replacement) path=$(cat "$markers/staging.path") ;;
+    scratch-replacement) path=$(cat "$markers/scratch.path") ;;
+  esac
+  _assert_file_content "$phase: foreign replacement survives cleanup" foreign "$path/foreign"
+  _assert_contains "$phase: cleanup reports identity mismatch" 'identity changed' "$(cat "$stderr")"
+  if _tree_matches "$snapshot" "$live"; then
+    _pass "$phase: old install remains byte-identical"
+  else
+    _fail "$phase: old install remains byte-identical"
+  fi
 }
 
 _run_dangling_live_case() {
@@ -950,6 +1078,7 @@ _run_interrupt_case download-ignore release old TERM 0 1
 _run_interrupt_case download-first-signal release old HUP 0 1 TERM
 _run_interrupt_case bootstrap-download bootstrap old TERM
 _run_interrupt_case bootstrap-fresh-download bootstrap none TERM 0 0 '' 1
+_run_interrupt_case checksum release old TERM
 _run_interrupt_case copy bundle old HUP 1
 _run_interrupt_case extract release old
 _run_interrupt_case old-moved bundle old
@@ -960,6 +1089,8 @@ _run_failure_case restore-failure
 _run_failure_case restore-race
 _run_failure_case destination-race
 _run_failure_case backup-race
+_run_owned_replacement_case staging-replacement bundle
+_run_owned_replacement_case scratch-replacement release
 _run_dangling_live_case
 _run_success_case
 _run_latched_spawn_case
