@@ -557,11 +557,15 @@ _latest_release_tag() {
     output="$_shdeps_tx_release_path/latest-url"
     if ! _install_run_to_file "$output" curl -fsSL -A shdeps -o /dev/null \
       -w '%{url_effective}' "https://github.com/$repo/releases/latest"; then
-      rm -f "$output"
       return 1
     fi
-    effective=$(cat "$output")
-    rm -f "$output"
+    # Keep the small response inside transaction-owned release scratch. A
+    # builtin read avoids an untracked `cat` and another child after a signal;
+    # the exact scratch directory is removed by normal transaction cleanup.
+    IFS= read -r effective <"$output" || true
+    if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+      return "$_shdeps_tx_signal"
+    fi
   else
     effective=$(curl -fsSL -A shdeps -o /dev/null -w '%{url_effective}' \
       "https://github.com/$repo/releases/latest") || return 1
@@ -910,16 +914,29 @@ _install_transaction_cleanup_run() {
   fi
   "$@" &
   _shdeps_tx_child=$!
-  if wait "$_shdeps_tx_child"; then
-    _shdeps_tx_child=""
-  else
-    rc=$?
-    if _install_transaction_job_running "$_shdeps_tx_child"; then
-      _install_transaction_cancel_child
-    else
+  while :; do
+    if wait "$_shdeps_tx_child"; then
       _shdeps_tx_child=""
+      break
+    else
+      rc=$?
+      if _install_transaction_job_running "$_shdeps_tx_child"; then
+        if [[ "$shielded" -eq 0 && "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+          _install_transaction_cancel_child
+          break
+        fi
+        # Caller-owned traps such as WINCH or USR1 can interrupt this wait too.
+        # Cleanup still owns the live child, so keep waiting instead of killing
+        # a healthy removal and converting a benign signal into a scratch leak.
+        continue
+      fi
+      # The child may have completed while a caller trap ran. Collect its
+      # retained status rather than returning the unrelated signal's 128+N.
+      if wait "$_shdeps_tx_child"; then rc=0; else rc=$?; fi
+      _shdeps_tx_child=""
+      break
     fi
-  fi
+  done
   [[ "$shielded" -eq 0 ]] || _install_transaction_install_signal_traps
   return "$rc"
 }
@@ -1202,12 +1219,16 @@ _install_bundle_core() {
     }
     if mv "$SHDEPS_DIR" "$_shdeps_tx_backup"; then rc=0; else rc=$?; fi
     _install_transaction_reconcile
+    if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
+    if [[ "$rc" -ne 0 ]] &&
+      _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_old_identity"; then
+      _error "failed to move existing shdeps install to backup (mv status $rc)"
+      return "$rc"
+    fi
     if [[ "$_shdeps_tx_state" != OLD_MOVED ]]; then
       _install_transaction_recover_backup_race || true
-      if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
       return 1
     fi
-    if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
     if [[ "$rc" -ne 0 ]]; then return "$rc"; fi
   fi
 

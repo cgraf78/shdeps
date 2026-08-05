@@ -279,6 +279,10 @@ esac
 
 case "$src:$dest" in
   "$SHDEPS_TEST_LIVE":*.backup)
+    if [[ "$phase" == backup-move-failure ]]; then
+      printf '%s\n' "$dest" >"$SHDEPS_TEST_MARKERS/backup.path"
+      exit 72
+    fi
     if [[ "$phase" == backup-race ]]; then
       "$SHDEPS_TEST_REAL_MKDIR" -p "$dest"
       printf '%s\n' foreign >"$dest/foreign"
@@ -358,16 +362,21 @@ if [[ "${SHDEPS_TEST_PHASE:-}" == backup-remove && "$target" == *.backup && ! -e
   while :; do sleep 1; done
 fi
 if [[ ("${SHDEPS_TEST_PHASE:-}" == cleanup-remove ||
-    "${SHDEPS_TEST_PHASE:-}" == cleanup-failure) &&
+    "${SHDEPS_TEST_PHASE:-}" == cleanup-failure ||
+    "${SHDEPS_TEST_PHASE:-}" == cleanup-unrelated-signal) &&
   "$target" == */.shdeps-install.* && ! -e "$SHDEPS_TEST_MARKERS/remove-attempted" ]]; then
   : >"$SHDEPS_TEST_MARKERS/remove-attempted"
   printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
   printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/staging.path"
   : >"$SHDEPS_TEST_MARKERS/ready"
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  while :; do sleep 1; done
+  if [[ "${SHDEPS_TEST_PHASE:-}" == cleanup-unrelated-signal ]]; then
+    IFS= read -r _ <"$SHDEPS_TEST_MARKERS/cleanup.gate"
+  else
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    while :; do sleep 1; done
+  fi
 fi
 if [[ "${SHDEPS_TEST_PHASE:-}" == cleanup-failure &&
   "$target" == */.shdeps-install.* ]]; then
@@ -476,6 +485,16 @@ case "$SHDEPS_TEST_MODE" in
     }
     _install_transaction bundle || rc=$?
     ;;
+  cleanup-unrelated-signal)
+    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"' USR1
+    _install_bundle_core() {
+      _install_private_directory "$_shdeps_tx_staging" || return 1
+      _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || return 1
+      _shdeps_tx_staging_owned=1
+      return 1
+    }
+    _install_transaction bundle || rc=$?
+    ;;
   unrelated-signal)
     trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"' USR1
     _install_bundle_core() {
@@ -488,12 +507,12 @@ case "$SHDEPS_TEST_MODE" in
     _install_transaction bundle || rc=$?
     ;;
   unrelated-signal-completion)
-    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"; sleep 0.2' USR1
+    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"; printf "release\n" >"$SHDEPS_TEST_MARKERS/completion.gate"; sleep 0.2' USR1
     _install_bundle_core() {
       _install_transaction_run sh -c '
         printf "%s\n" "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
         : >"$SHDEPS_TEST_MARKERS/ready"
-        sleep 0.05
+        IFS= read -r _ <"$SHDEPS_TEST_MARKERS/completion.gate"
       '
     }
     _install_transaction bundle || rc=$?
@@ -815,6 +834,7 @@ _run_failure_case() {
 
   case "$phase" in
     restore-failure | restore-race | destination-race | backup-stat-failure | backup-disappears) expected_rc=125 ;;
+    backup-move-failure) expected_rc=72 ;;
   esac
   _assert_eq "$phase: install fails" "$expected_rc" "$rc"
   if _report_is_restored "$report"; then
@@ -832,6 +852,17 @@ _run_failure_case() {
     _assert_file_content "$phase: foreign backup path is untouched" foreign "$backup/foreign"
     _assert_not_exists "$phase: old install is not left nested in foreign backup" "$backup/${live##*/}"
     _assert_contains "$phase: diagnostic reports backup race" 'backup path appeared' "$(cat "$stderr")"
+    return
+  fi
+  if [[ "$phase" == backup-move-failure ]]; then
+    if _tree_matches "$snapshot" "$live"; then
+      _pass "$phase: old install remains byte-identical"
+    else
+      _fail "$phase: old install remains byte-identical"
+    fi
+    _assert_not_exists "$phase: failed move creates no backup" "$backup"
+    _assert_contains "$phase: diagnostic reports the move failure" 'failed to move existing shdeps install to backup' "$(cat "$stderr")"
+    _assert_not_contains "$phase: diagnostic does not report a race" 'appeared during activation' "$(cat "$stderr")"
     return
   fi
   if [[ "$phase" == restore-race ]]; then
@@ -1472,6 +1503,73 @@ _run_cleanup_failure_case() {
   "$_real_rm" -rf -- "$staging"
 }
 
+_run_cleanup_unrelated_signal_case() {
+  local root markers bin report driver install_script parent worker="" staging="" rc=0 early_exit=0 timed_out=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  mkfifo "$markers/cleanup.gate"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=cleanup-unrelated-signal \
+    SHDEPS_TEST_PHASE=cleanup-unrelated-signal \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" &
+  parent=$!
+  if _wait_for_file "$markers/ready"; then
+    kill -USR1 "$parent" 2>/dev/null || true
+  else
+    timed_out=1
+  fi
+  _wait_for_file "$markers/usr1-seen" || timed_out=1
+  sleep 0.1
+  if ! kill -0 "$parent" 2>/dev/null; then
+    early_exit=1
+  else
+    printf 'release\n' >"$markers/cleanup.gate"
+  fi
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+
+  [[ -f "$markers/worker.pid" ]] && worker=$(cat "$markers/worker.pid")
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_eq 'cleanup unrelated signal: transaction keeps waiting' 0 "$early_exit"
+  _assert_eq 'cleanup unrelated signal: original operation failure is preserved' 1 "$rc"
+  _assert_eq 'cleanup unrelated signal: completion stays bounded' 0 "$timed_out"
+  _assert_not_exists 'cleanup unrelated signal: staging is removed' "$staging"
+  if [[ -n "$worker" ]] && ! kill -0 "$worker" 2>/dev/null; then
+    _pass 'cleanup unrelated signal: exact removal child is reaped'
+  else
+    _fail 'cleanup unrelated signal: exact removal child is reaped'
+    [[ -n "$worker" ]] && kill -KILL "$worker" 2>/dev/null || true
+  fi
+  if _report_is_restored "$report"; then
+    _pass 'cleanup unrelated signal: caller state restored'
+  else
+    _fail 'cleanup unrelated signal: caller state restored'
+  fi
+}
+
 _run_unrelated_signal_wait_case() {
   local mode="$1" label="$2"
   local root markers report driver install_script parent worker="" rc=0 early_exit=0 timed_out=0
@@ -1484,6 +1582,8 @@ _run_unrelated_signal_wait_case() {
   mkdir -p "$markers"
   if [[ "$mode" == unrelated-signal ]]; then
     mkfifo "$markers/unrelated.gate"
+  elif [[ "$mode" == unrelated-signal-completion ]]; then
+    mkfifo "$markers/completion.gate"
   fi
   _write_driver "$driver"
 
@@ -1607,12 +1707,14 @@ _run_interrupt_case activated-int bundle new INT
 _run_interrupt_case backup-remove bundle new
 _run_interrupt_case cleanup-remove cleanup-interrupt old
 _run_cleanup_failure_case
+_run_cleanup_unrelated_signal_case
 _run_unrelated_signal_wait_case unrelated-signal 'unrelated signal'
 _run_unrelated_signal_wait_case unrelated-signal-completion 'unrelated signal during child completion'
 _run_failure_case restore-failure
 _run_failure_case restore-race
 _run_failure_case destination-race
 _run_failure_case backup-race
+_run_failure_case backup-move-failure
 _run_failure_case backup-stat-failure
 _run_failure_case backup-disappears
 _run_owned_replacement_case staging-replacement bundle
