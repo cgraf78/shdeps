@@ -26,6 +26,7 @@ _SHDEPS_DEFAULT_REPO="https://github.com/cgraf78/shdeps.git"
 SHDEPS_DIR="${SHDEPS_DIR:-$HOME/.local/share/shdeps}"
 SHDEPS_REPO="${SHDEPS_REPO:-$_SHDEPS_DEFAULT_REPO}"
 SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
+_SHDEPS_INSTALL_PROPAGATION_MESSAGE=""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,8 +45,36 @@ _install_status_requires_propagation() {
   esac
 }
 
-# Record the first transaction signal and cooperatively stop its exact active
-# child. The normal control path owns bounded escalation, reaping, and cleanup.
+# Re-emit a transaction diagnostic after a caller intentionally suppressed the
+# installer's ordinary output. The transaction records only hard recovery or
+# post-commit interruption details; routine best-effort failures stay quiet.
+_install_report_propagation_message() {
+  [[ -n "${_SHDEPS_INSTALL_PROPAGATION_MESSAGE:-}" ]] || return 0
+  _error "$_SHDEPS_INSTALL_PROPAGATION_MESSAGE"
+  _SHDEPS_INSTALL_PROPAGATION_MESSAGE=""
+}
+
+# Suppressed bootstrap layers need one durable diagnostic that can describe
+# multiple independent outcomes without a later cleanup result erasing an
+# earlier convergence requirement.
+_install_append_propagation_message() {
+  local message="$1"
+
+  [[ -n "$message" ]] || return 0
+  case "; ${_SHDEPS_INSTALL_PROPAGATION_MESSAGE:-};" in
+    *"; $message;"*) return 0 ;;
+  esac
+  if [[ -n "${_SHDEPS_INSTALL_PROPAGATION_MESSAGE:-}" ]]; then
+    _SHDEPS_INSTALL_PROPAGATION_MESSAGE="$_SHDEPS_INSTALL_PROPAGATION_MESSAGE; $message"
+  else
+    _SHDEPS_INSTALL_PROPAGATION_MESSAGE="$message"
+  fi
+}
+
+# Record the first transaction signal and wake an exact child only while Bash
+# still reports that PID as this shell's active job. The job-table proof closes
+# the check-to-wait gap without reviving the stale-PID race after wait has reaped
+# the child but before the bookkeeping slot is cleared.
 _install_transaction_signal() {
   local signal="$1" status
 
@@ -57,7 +86,8 @@ _install_transaction_signal() {
   esac
   if [[ "${_shdeps_tx_signal:-0}" -eq 0 ]]; then
     _shdeps_tx_signal="$status"
-    if [[ -n "${_shdeps_tx_child:-}" ]]; then
+    if [[ -n "${_shdeps_tx_child:-}" ]] &&
+      _install_transaction_job_running "$_shdeps_tx_child"; then
       kill -TERM "$_shdeps_tx_child" 2>/dev/null || true
     fi
   fi
@@ -72,10 +102,30 @@ _install_transaction_install_signal_traps() {
 _install_transaction_job_running() {
   local wanted="$1" pid
 
+  # Transactions disable monitor mode before launching children. In that mode
+  # Bash keeps a SIGSTOP'd child in `jobs -r`, so this probe covers both running
+  # and stopped owned children while excluding completed/reaped PIDs. The
+  # process substitution may change `$!`; launchers capture it before any probe.
   while IFS= read -r pid; do
     [[ "$pid" == "$wanted" ]] && return 0
   done < <(jobs -pr)
   return 1
+}
+
+# A 128+N first wait can mean either an interrupted wait or a child that really
+# died from that signal. Re-wait recovers the former, but Bash 3.2 returns 127
+# after consuming the latter; preserve the first hard status only in that
+# exhausted-status case.
+_install_transaction_rewait_status() {
+  local original="$1" retried=0
+
+  if wait "$_shdeps_tx_child"; then
+    return 0
+  else
+    retried=$?
+  fi
+  [[ "$retried" -ne 127 ]] || return "$original"
+  return "$retried"
 }
 
 # TERM/KILL and reap the still-owned child after a signal interrupted wait.
@@ -120,14 +170,17 @@ _install_transaction_wait_child() {
       if _install_transaction_job_running "$_shdeps_tx_child"; then
         continue
       fi
-      # The child may have completed while a longer caller trap ran. Collect
-      # its retained wait status instead of returning the unrelated signal's
-      # synthetic 128+N status as the transaction result.
-      if wait "$_shdeps_tx_child"; then
-        _shdeps_tx_child=""
-        break
-      else
-        rc=$?
+      # A 128+N result can be the caller signal that interrupted wait after the
+      # child completed. Only that synthetic shape is safe to re-wait: Bash 3.2
+      # discards an ordinary completed child's status after the first wait and
+      # would turn failures such as curl's 22 into 127.
+      if [[ "$rc" -gt 128 ]]; then
+        if _install_transaction_rewait_status "$rc"; then
+          _shdeps_tx_child=""
+          break
+        else
+          rc=$?
+        fi
       fi
       _shdeps_tx_child=""
       return "$rc"
@@ -138,43 +191,73 @@ _install_transaction_wait_child() {
   fi
 }
 
+_install_transaction_cancel_started_child_if_signaled() {
+  local rc="${_shdeps_tx_signal:-0}"
+
+  [[ "$rc" -ne 0 ]] || return 0
+  _install_transaction_cancel_child
+  return "$rc"
+}
+
+# Emit only the trap declaration on fd 3 so caller DEBUG-hook stdout cannot become
+# part of the saved command that is later evaluated during restoration.
+_install_transaction_print_trap() {
+  trap -p "$1" >&3
+}
+
 _install_transaction_wait_started_child() {
   _shdeps_tx_child="$1"
-  if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
-    _install_transaction_cancel_child
-    return "$_shdeps_tx_signal"
-  fi
+  _install_transaction_cancel_started_child_if_signaled || return $?
   _install_transaction_wait_child
 }
 
 # Run one exact external child. A trapped signal interrupts wait immediately;
 # the unreaped PID remains owned until bounded cancellation completes.
 _install_transaction_run() {
+  local child saved_debug
+
   if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
     return "$_shdeps_tx_signal"
   fi
+  # A traced caller DEBUG hook runs between an asynchronous launch and the
+  # following command. Keep that hook from replacing `$!` with its own job;
+  # restore it as soon as the exact transaction child is registered locally.
+  saved_debug=$({ _install_transaction_print_trap DEBUG; } 3>&1 >/dev/null)
+  trap - DEBUG
   "$@" &
-  _install_transaction_wait_started_child "$!"
+  child=$!
+  _install_transaction_restore_trap "$saved_debug" DEBUG
+  _install_transaction_wait_started_child "$child"
 }
 
 _install_transaction_run_to_file() {
-  local output="$1"
+  local output="$1" child saved_debug
+
   shift
   if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
     return "$_shdeps_tx_signal"
   fi
+  saved_debug=$({ _install_transaction_print_trap DEBUG; } 3>&1 >/dev/null)
+  trap - DEBUG
   "$@" >"$output" &
-  _install_transaction_wait_started_child "$!"
+  child=$!
+  _install_transaction_restore_trap "$saved_debug" DEBUG
+  _install_transaction_wait_started_child "$child"
 }
 
 _install_transaction_run_with_input() {
-  local input="$1"
+  local input="$1" child saved_debug
+
   shift
   if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
     return "$_shdeps_tx_signal"
   fi
+  saved_debug=$({ _install_transaction_print_trap DEBUG; } 3>&1 >/dev/null)
+  trap - DEBUG
   "$@" <<<"$input" &
-  _install_transaction_wait_started_child "$!"
+  child=$!
+  _install_transaction_restore_trap "$saved_debug" DEBUG
+  _install_transaction_wait_started_child "$child"
 }
 
 _install_run() {
@@ -259,13 +342,19 @@ _repair_release_if_needed() {
     # wrapper at all. Do not fall through and emit a misleading ABI error after
     # a failed repair download.
     _install_release >/dev/null 2>&1 || rc=$?
-    if _install_status_requires_propagation "$rc"; then return "$rc"; fi
+    if _install_status_requires_propagation "$rc"; then
+      _install_report_propagation_message
+      return "$rc"
+    fi
     [[ "$rc" -eq 0 ]] || return 1
   elif [[ "${SHDEPS_FORCE:-0}" == 1 ]]; then
     # Preserve the existing best-effort force behavior: a transient GitHub
     # failure must not disable an otherwise compatible local release.
     _install_release >/dev/null 2>&1 || rc=$?
-    if _install_status_requires_propagation "$rc"; then return "$rc"; fi
+    if _install_status_requires_propagation "$rc"; then
+      _install_report_propagation_message
+      return "$rc"
+    fi
   fi
 }
 
@@ -299,19 +388,44 @@ _bootstrap_lib_is_installed_tree() {
   [[ "$lib_dir" == "$install_dir" ]]
 }
 
+# Desktop credential helpers can block or spawn services in cron/headless
+# shells, so only an explicitly interactive private-release path may probe gh.
+_github_token_can_probe() {
+  [[ -t 0 && -t 1 ]] && command -v gh >/dev/null 2>&1
+}
+
+# Resolve an optional GitHub token without exposing helper output outside the
+# transaction-owned private release scratch.
 _github_token() {
-  local destination="$1" selected=""
+  local destination="$1" scratch="$2" selected="" output rc=0
 
   if [[ -n "${GH_TOKEN:-}" ]]; then
     selected="$GH_TOKEN"
   elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
     selected="$GITHUB_TOKEN"
+  elif _github_token_can_probe; then
+    # Interactive private-release users may rely on gh's credential store. Run
+    # that lookup as an exact transaction child, and keep its output inside the
+    # already-owned mode-700 release scratch rather than a command substitution.
+    output="$scratch/github-token"
+    _install_transaction_run_to_file \
+      "$output" gh auth token --hostname github.com 2>/dev/null || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      IFS= read -r selected <"$output" || true
+    fi
+    if [[ -e "$output" || -L "$output" ]]; then
+      # Clear credential bytes with a builtin before starting another child. If
+      # cancellation lands between truncation and unlink, private scratch may
+      # remain for transaction cleanup, but it no longer contains the token.
+      : >"$output" 2>/dev/null || true
+      if [[ "${_shdeps_tx_signal:-0}" -eq 0 ]]; then
+        _install_transaction_run rm -f -- "$output" 2>/dev/null || true
+      fi
+    fi
+    if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+      return "$_shdeps_tx_signal"
+    fi
   fi
-  # The bootstrap transaction deliberately does not probe `gh auth token`.
-  # Credential helpers can block outside its exact-child ownership, while the
-  # public release path needs no token. Private/custom API callers can provide
-  # GH_TOKEN or GITHUB_TOKEN explicitly; the steady-state Rust client retains
-  # its own bounded credential lookup.
   printf -v "$destination" '%s' "$selected"
 }
 
@@ -322,9 +436,10 @@ _curl_get() {
       if [[ -n "$token" ]]; then
         # Feed the request via `curl --config -` over stdin so the bearer
         # token never appears in argv, where `ps` / `/proc/<pid>/cmdline`
-        # would expose it to any other user on the host. `printf` is a
-        # Bash builtin, so the token stays inside this process and never
-        # reaches a child argv. Mirrors `_curl_get_release_asset` and the
+        # would expose it to any other user on the host. The here-string keeps
+        # the token out of child argv. Older Bash may back that stdin with a
+        # private, unlinked temporary object, but no named token file is left
+        # for transaction cleanup. Mirrors `_curl_get_release_asset` and the
         # Rust `src/http.rs::curl_config` path; each value is wrapped in
         # `"..."` with `\` and `"` escaped per curl's config syntax.
         local _url_escaped _token_escaped
@@ -849,6 +964,10 @@ _install_transaction_reconcile() {
     # old install instead of exposing an incomplete executable tree.
     if _is_bundle_dir "$SHDEPS_DIR"; then
       _shdeps_tx_state=ACTIVE
+      # ACTIVE proves that the validated staged inode reached the live path.
+      # Remember that fact independently of later backup removal so a signal
+      # after commit still tells suppressed bootstrap callers to converge links.
+      _shdeps_tx_committed=1
       _shdeps_tx_staging_owned=0
     else
       _shdeps_tx_staging="$SHDEPS_DIR"
@@ -948,7 +1067,7 @@ _install_transaction_track_staging_after_move() {
 # Cleanup commands are allowed after the signal latch is set. They still use an
 # exact child so a repeated signal cannot strand an unowned removal process.
 _install_transaction_cleanup_run() {
-  local rc=0 shielded=0
+  local rc=0 shielded=0 child saved_debug
 
   if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
     # The operation result is already latched. Ignore later handled signals for
@@ -957,8 +1076,18 @@ _install_transaction_cleanup_run() {
     trap '' HUP INT TERM
     shielded=1
   fi
+  saved_debug=$({ _install_transaction_print_trap DEBUG; } 3>&1 >/dev/null)
+  trap - DEBUG
   "$@" &
-  _shdeps_tx_child=$!
+  child=$!
+  _shdeps_tx_child=$child
+  _install_transaction_restore_trap "$saved_debug" DEBUG
+  # A first signal can be latched after the pre-launch check but before child
+  # registration. Reconcile it before entering wait, which would otherwise
+  # block indefinitely because Bash has already dispatched that trap.
+  if [[ "$shielded" -eq 0 ]]; then
+    _install_transaction_cancel_started_child_if_signaled || return $?
+  fi
   while :; do
     if wait "$_shdeps_tx_child"; then
       rc=0
@@ -976,9 +1105,12 @@ _install_transaction_cleanup_run() {
         # a healthy removal and converting a benign signal into a scratch leak.
         continue
       fi
-      # The child may have completed while a caller trap ran. Collect its
-      # retained status rather than returning the unrelated signal's 128+N.
-      if wait "$_shdeps_tx_child"; then rc=0; else rc=$?; fi
+      # See `_install_transaction_wait_child`: ordinary nonzero child statuses
+      # have already been consumed, especially on the system Bash 3.2 shipped
+      # by macOS. Re-wait only a synthetic signal-interrupted result.
+      if [[ "$rc" -gt 128 ]]; then
+        if _install_transaction_rewait_status "$rc"; then rc=0; else rc=$?; fi
+      fi
       _shdeps_tx_child=""
       break
     fi
@@ -987,40 +1119,120 @@ _install_transaction_cleanup_run() {
   return "$rc"
 }
 
+# Allocate an exclusive mode-700 sibling so a validated object can be renamed
+# away from its public pathname before recursive deletion begins.
+_install_transaction_make_remove_quarantine() {
+  local path="$1" parent candidate attempt=0
+
+  parent=$(dirname "$path") || return 1
+  while ((attempt < 20)); do
+    candidate="$parent/.shdeps-remove.$$.$RANDOM.$RANDOM"
+    if _install_private_directory "$candidate"; then
+      _shdeps_remove_quarantine="$candidate"
+      _shdeps_remove_quarantine_identity=$(
+        _install_directory_identity "$candidate"
+      ) || {
+        rmdir "$candidate" 2>/dev/null || true
+        _shdeps_remove_quarantine=""
+        return 1
+      }
+      return 0
+    fi
+    # An exclusive mkdir collision is harmless; retry a fresh unpredictable
+    # sibling. A failure that created nothing is an operational error such as
+    # permissions, and twenty identical retries would only obscure it.
+    if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+      return 1
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+# Put an undeleted quarantined object back when its public pathname is still
+# free; otherwise retain the exact quarantine path for manual recovery.
+_install_transaction_restore_quarantined() {
+  local path="$1" payload="$2" quarantine="$3" expected_identity="$4"
+
+  if [[ ! -e "$path" && ! -L "$path" ]] && mv "$payload" "$path"; then
+    rmdir "$quarantine" 2>/dev/null || true
+    return 0
+  fi
+  # Never delete an object whose identity stopped matching after the atomic
+  # rename. If its original pathname was concurrently reused, retain the moved
+  # object under the private quarantine and make that exact path actionable.
+  _shdeps_tx_unresolved_quarantine="$payload"
+  _shdeps_tx_unresolved_quarantine_identity="$expected_identity"
+  return 1
+}
+
+# Rename, revalidate, then remove an owned object. The second identity check is
+# essential: validation of the public pathname alone is a check-to-rm race.
 _install_transaction_remove_owned() {
   local path="$1" label="$2" expected_identity="${3:-}" runner="${4:-cleanup}"
+  local _shdeps_remove_quarantine="" _shdeps_remove_quarantine_identity=""
+  local payload="" rc=0
 
   if [[ -z "$expected_identity" ]]; then
     _error "refusing to remove $label at $path because its ownership identity is missing"
     return 1
   fi
   [[ -e "$path" || -L "$path" ]] || return 0
+  if ! _install_transaction_make_remove_quarantine "$path"; then
+    _error "failed to create private removal quarantine for $label at $path"
+    return 1
+  fi
   if ! _install_identity_matches "$path" "$expected_identity"; then
+    rmdir "$_shdeps_remove_quarantine" 2>/dev/null || true
     _error "refusing to remove $label at $path because its identity changed"
     return 1
   fi
-  if [[ "$runner" == normal ]]; then
-    _install_run rm -rf -- "$path" || {
-      _error "failed to remove $label; retained at $path"
-      return 1
-    }
-  elif ! _install_transaction_cleanup_run rm -rf -- "$path"; then
-    # The first transaction signal may interrupt the cleanup child itself.
-    # Once latched, later parent-only delivery no longer forwards to children,
-    # so revalidate exact ownership and make one controlled retry rather than
-    # permanently marking a partially removed directory as cleaned.
-    if [[ ! -e "$path" && ! -L "$path" ]]; then
-      return 0
-    fi
-    if [[ "${_shdeps_tx_signal:-0}" -eq 0 ]] ||
-      ! _install_identity_matches "$path" "$expected_identity" ||
-      ! _install_transaction_cleanup_run rm -rf -- "$path"; then
-      _error "failed to remove $label; retained at $path"
-      return 1
-    fi
+
+  # Preserve the original basename inside quarantine. Besides better recovery
+  # diagnostics, this keeps platform fault-injection and audit tooling able to
+  # identify whether the object is staging, backup, or release scratch.
+  payload="$_shdeps_remove_quarantine/${path##*/}"
+  if ! mv "$path" "$payload"; then
+    rmdir "$_shdeps_remove_quarantine" 2>/dev/null || true
+    _error "failed to quarantine $label before removal; retained at $path"
+    return 1
   fi
-  if [[ -e "$path" || -L "$path" ]]; then
-    _error "failed to remove $label; retained at $path"
+  if ! _install_identity_matches "$payload" "$expected_identity"; then
+    _install_transaction_restore_quarantined \
+      "$path" "$payload" "$_shdeps_remove_quarantine" "$expected_identity" || true
+    _error "refusing to remove $label at $path because its identity changed"
+    return 1
+  fi
+
+  if [[ "$runner" == normal ]]; then
+    _install_run rm -rf -- "$payload" || rc=$?
+  else
+    _install_transaction_cleanup_run rm -rf -- "$payload" || rc=$?
+  fi
+  if [[ "$rc" -ne 0 && (-e "$payload" || -L "$payload") &&
+    "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+    # A first signal can interrupt the removal child. The payload is now inside
+    # a mode-700 quarantine, so one shielded retry cannot race a replacement at
+    # the public pathname and does not need another check-then-delete sequence.
+    rc=0
+    _install_transaction_cleanup_run rm -rf -- "$payload" || rc=$?
+  fi
+  if [[ ! -e "$payload" && ! -L "$payload" ]]; then
+    rc=0
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    _install_transaction_restore_quarantined \
+      "$path" "$payload" "$_shdeps_remove_quarantine" "$expected_identity" || true
+    # Reaching this branch means the shielded retry also failed. Unlike the
+    # transient first interruption, the restored path now genuinely requires
+    # recovery and the diagnostic must remain visible even with a signal latch.
+    _error "failed to remove $label; retained at ${_shdeps_tx_unresolved_quarantine:-$path}"
+    return 1
+  fi
+  if ! rmdir "$_shdeps_remove_quarantine"; then
+    _shdeps_tx_unresolved_quarantine="$_shdeps_remove_quarantine"
+    _shdeps_tx_unresolved_quarantine_identity="$_shdeps_remove_quarantine_identity"
+    _error "removed $label but could not remove its private quarantine at $_shdeps_remove_quarantine"
     return 1
   fi
 }
@@ -1108,12 +1320,28 @@ _install_transaction_cleanup() {
       ;;
   esac
 
-  if [[ "$_shdeps_tx_staging_owned" -eq 1 ]] &&
-    ! _install_transaction_remove_owned "$_shdeps_tx_staging" "shdeps install staging" "$_shdeps_tx_staging_identity"; then
-    failed=1
+  if [[ "$_shdeps_tx_staging_owned" -eq 1 ]]; then
+    if ! _install_transaction_remove_owned \
+      "$_shdeps_tx_staging" "shdeps install staging" "$_shdeps_tx_staging_identity"; then
+      failed=1
+    else
+      # Ownership state must track the filesystem after each independent
+      # removal. If a later cleanup fails, diagnostics must not name this
+      # already-deleted path as the retained manual-recovery location.
+      _shdeps_tx_staging_owned=0
+    fi
   fi
-  if [[ "$_shdeps_tx_release_owned" -eq 1 ]] &&
-    ! _install_transaction_remove_owned "$_shdeps_tx_release_path" "shdeps release scratch" "$_shdeps_tx_release_identity"; then
+  if [[ "$_shdeps_tx_release_owned" -eq 1 ]]; then
+    if ! _install_transaction_remove_owned \
+      "$_shdeps_tx_release_path" "shdeps release scratch" "$_shdeps_tx_release_identity"; then
+      failed=1
+    else
+      _shdeps_tx_release_owned=0
+    fi
+  fi
+  if [[ -n "${_shdeps_tx_unresolved_quarantine:-}" &&
+    (-e "$_shdeps_tx_unresolved_quarantine" ||
+    -L "$_shdeps_tx_unresolved_quarantine") ]]; then
     failed=1
   fi
   _shdeps_tx_cleanup_failed="$failed"
@@ -1124,12 +1352,93 @@ _install_transaction_cleanup() {
   return "$failed"
 }
 
+# Append one still-present recovery path after revalidating whether the inode is
+# the one this transaction owned. A pathname can be replaced between failed
+# cleanup and reporting; calling that replacement retained state would imply it
+# is safe to remove when the transaction deliberately refused to do so.
+_install_transaction_remember_recovery_path() {
+  local path="$1" expected_identity="${2:-}"
+
+  [[ -n "$path" && (-e "$path" || -L "$path") ]] || return 0
+  if _install_identity_matches "$path" "$expected_identity"; then
+    _install_append_propagation_message "retained state: $path"
+  else
+    _install_append_propagation_message \
+      "foreign or unverified path (not safe to remove): $path"
+  fi
+}
+
+# Preserve all actionable recovery locations across wrappers that intentionally
+# silence the transaction's detailed cleanup diagnostics.
+_install_transaction_remember_cleanup_failure() {
+  local recorded=""
+
+  # A cleanup failure can follow a committed-payload interruption. Append this
+  # diagnosis rather than replacing the convergence guidance recorded earlier.
+  _install_append_propagation_message \
+    "shdeps transaction cleanup requires manual recovery"
+  # Cleanup resources are independent: one removal can fail after another has
+  # succeeded, and more than one can fail. Report every path that still both
+  # exists and remains recovery-relevant or owned, as applicable, so no
+  # retained scratch is silently omitted by an output-suppressing caller.
+  if [[ -n "${_shdeps_tx_old_recovery:-}" &&
+    (-e "$_shdeps_tx_old_recovery" || -L "$_shdeps_tx_old_recovery") ]]; then
+    recorded="$_shdeps_tx_old_recovery"
+    _install_transaction_remember_recovery_path \
+      "$recorded" "${_shdeps_tx_old_identity:-}"
+  fi
+  if [[ "${_shdeps_tx_backup_owned:-0}" -eq 1 &&
+    -n "${_shdeps_tx_backup:-}" && "$_shdeps_tx_backup" != "$recorded" &&
+    (-e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup") ]]; then
+    _install_transaction_remember_recovery_path \
+      "$_shdeps_tx_backup" "${_shdeps_tx_old_identity:-}"
+  fi
+  if [[ "${_shdeps_tx_staging_owned:-0}" -eq 1 &&
+    -n "${_shdeps_tx_staging:-}" &&
+    (-e "$_shdeps_tx_staging" || -L "$_shdeps_tx_staging") ]]; then
+    _install_transaction_remember_recovery_path \
+      "$_shdeps_tx_staging" "${_shdeps_tx_staging_identity:-}"
+  fi
+  if [[ "${_shdeps_tx_release_owned:-0}" -eq 1 &&
+    -n "${_shdeps_tx_release_path:-}" &&
+    (-e "$_shdeps_tx_release_path" || -L "$_shdeps_tx_release_path") ]]; then
+    _install_transaction_remember_recovery_path \
+      "$_shdeps_tx_release_path" "${_shdeps_tx_release_identity:-}"
+  fi
+  if [[ -n "${_shdeps_tx_unresolved_quarantine:-}" &&
+    (-e "$_shdeps_tx_unresolved_quarantine" ||
+    -L "$_shdeps_tx_unresolved_quarantine") ]]; then
+    _install_transaction_remember_recovery_path \
+      "$_shdeps_tx_unresolved_quarantine" \
+      "${_shdeps_tx_unresolved_quarantine_identity:-}"
+  fi
+}
+
+# Cancellation can arrive after the live bundle is valid but before backup
+# removal and link activation finish. Preserve that distinction centrally so
+# every post-commit signal path gives the same convergence instruction.
+_install_transaction_remember_committed_interruption() {
+  local message="shdeps payload was committed, but activation was interrupted; rerun the installer"
+  local previous="${_SHDEPS_INSTALL_PROPAGATION_MESSAGE:-}"
+
+  [[ "${_shdeps_tx_committed:-0}" -eq 1 &&
+    "${_shdeps_tx_signal:-0}" -ne 0 ]] || return 0
+  _install_append_propagation_message "$message"
+  # The immediate post-move path may already have emitted this diagnosis. Only
+  # print it here when central teardown discovered a later interruption.
+  [[ "$previous" == "${_SHDEPS_INSTALL_PROPAGATION_MESSAGE:-}" ]] || _error "$message"
+}
+
 _install_transaction_exit() {
   local status="$1" cleanup_rc=0
 
   _install_transaction_cleanup || cleanup_rc=$?
   _install_transaction_restore_traps
-  [[ "$cleanup_rc" -eq 0 ]] || status=125
+  if [[ "$cleanup_rc" -ne 0 ]]; then
+    _install_transaction_remember_cleanup_failure
+    status=125
+  fi
+  _install_transaction_remember_committed_interruption
   exit "$status"
 }
 
@@ -1144,10 +1453,28 @@ _install_transaction() {
   local _shdeps_tx_staging_owned=0 _shdeps_tx_backup_owned=0
   local _shdeps_tx_backup_unverified=0
   local _shdeps_tx_release_owned=0 _shdeps_tx_cleanup_done=0
-  local _shdeps_tx_cleanup_failed=0
+  local _shdeps_tx_cleanup_failed=0 _shdeps_tx_committed=0
+  local _shdeps_tx_unresolved_quarantine=""
+  local _shdeps_tx_unresolved_quarantine_identity=""
   local _shdeps_tx_saved_hup _shdeps_tx_saved_int _shdeps_tx_saved_term
 
-  _install_transaction_prepare_paths "$mode" || return 1
+  _SHDEPS_INSTALL_PROPAGATION_MESSAGE=""
+
+  # Establish transaction signal ownership before even read-only setup. A
+  # signal during path reservation must cancel the operation, not run the
+  # sourced caller's trap and then continue into activation.
+  _shdeps_tx_saved_hup=$({ _install_transaction_print_trap HUP; } 3>&1 >/dev/null)
+  _shdeps_tx_saved_int=$({ _install_transaction_print_trap INT; } 3>&1 >/dev/null)
+  _shdeps_tx_saved_term=$({ _install_transaction_print_trap TERM; } 3>&1 >/dev/null)
+  _install_transaction_install_signal_traps
+  _install_transaction_prepare_paths "$mode" || rc=$?
+  if [[ "$rc" -ne 0 || "$_shdeps_tx_signal" -ne 0 ]]; then
+    _install_transaction_restore_traps
+    if [[ "$_shdeps_tx_signal" -ne 0 ]]; then
+      rc=$_shdeps_tx_signal
+    fi
+    return "$rc"
+  fi
   case "$-" in
     *m*)
       _shdeps_tx_monitor=1
@@ -1157,10 +1484,6 @@ _install_transaction() {
       set +m
       ;;
   esac
-  _shdeps_tx_saved_hup=$(trap -p HUP)
-  _shdeps_tx_saved_int=$(trap -p INT)
-  _shdeps_tx_saved_term=$(trap -p TERM)
-  _install_transaction_install_signal_traps
   if [[ "$_SHDEPS_INSTALL_EXECUTED" -eq 1 ]]; then
     trap '_install_transaction_exit "$?"' EXIT
   fi
@@ -1175,9 +1498,14 @@ _install_transaction() {
     # An unremoved transaction-owned path is a hard operational failure, even
     # when cleanup began because an earlier signal was latched. Returning the
     # signal would falsely tell callers that rollback completed successfully.
+    _install_transaction_remember_cleanup_failure
     rc=125
   fi
   _install_transaction_restore_traps
+  # Check after restoring traps: any signal delivered before restoration remains
+  # transaction-owned and is now visible in the latch; later delivery belongs
+  # to the sourced caller and must not change this transaction's diagnostics.
+  _install_transaction_remember_committed_interruption
   # Sample the latch only after teardown. A signal delivered after cleanup but
   # before its transaction trap is restored must still be the operation result;
   # once the caller's trap is restored, subsequent delivery belongs to it.
@@ -1245,11 +1573,15 @@ _install_bundle_core() {
     "$src_dir/.shdeps-install.json"
   )
   for name in README.md LICENSE; do
-    [[ -f "$src_dir/$name" ]] && files[${#files[@]}]="$src_dir/$name"
+    if [[ -f "$src_dir/$name" ]]; then
+      files[${#files[@]}]="$src_dir/$name"
+    fi
   done
   dirs=()
   for name in man completions lua; do
-    [[ -d "$src_dir/$name" ]] && dirs[${#dirs[@]}]="$src_dir/$name"
+    if [[ -d "$src_dir/$name" ]]; then
+      dirs[${#dirs[@]}]="$src_dir/$name"
+    fi
   done
   _install_run cp -p "${files[@]}" "$_shdeps_tx_staging/" || return $?
   if ((${#dirs[@]} > 0)); then
@@ -1302,7 +1634,12 @@ _install_bundle_core() {
   if [[ "$_shdeps_tx_state" != ACTIVE ]]; then
     _install_transaction_track_staging_after_move || true
   fi
-  if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
+  if [[ "$_shdeps_tx_signal" -ne 0 ]]; then
+    # The new bundle is already the validated live tree. Do not continue with
+    # link activation after cancellation; central transaction teardown records
+    # the required convergence step after all cleanup outcomes are known.
+    return "$_shdeps_tx_signal"
+  fi
   if [[ "$_shdeps_tx_state" != ACTIVE ]]; then
     if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
       if [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
@@ -1403,7 +1740,7 @@ _install_release_core() {
   _SHDEPS_RELEASE_FAILURE_KIND=""
   platform=$(_release_platform) || return 1
   repo=$(_repo_slug)
-  _github_token token
+  token=""
   tmp="$_shdeps_tx_release_path"
   _shdeps_tx_release_owned=1
   if ! _install_private_directory "$tmp" "$_shdeps_tx_release_token"; then
@@ -1426,6 +1763,7 @@ _install_release_core() {
   json="$tmp/release.json"
 
   if [[ -n "${SHDEPS_RELEASE_API_URL:-}" ]]; then
+    _github_token token "$tmp" || return $?
     api_url="$SHDEPS_RELEASE_API_URL"
     if ! _curl_get "$api_url" "$json" "$token"; then
       _install_release_fail "download" "failed to fetch shdeps release metadata"
@@ -1733,14 +2071,29 @@ _install() {
 # Clients set env vars (SHDEPS_CONF_DIR, SHDEPS_HOOKS_DIR, etc.) before
 # sourcing.
 #
-# Returns 0 if shdeps is ready, 1 if bootstrap failed.
+# Returns 0 if shdeps is ready, 1 for an ordinary bootstrap failure, 125 when
+# transaction cleanup retained manual-recovery state, or 128+signal when HUP,
+# INT, or TERM cancelled the transaction. The latter statuses deliberately
+# survive best-effort wrapper boundaries.
 
 _bootstrap() {
-  # Idempotent — skip if already bootstrapped
-  declare -f shdeps_update &>/dev/null && return 0
-
   local _bs_lib="" _bs_dir="" _bs_release_install=0 _bs_rc=0
-  local _dev_dir="${SHDEPS_GIT_DEV_DIR:-$HOME/git}"
+  local _bs_ready_key="" _dev_dir="${SHDEPS_GIT_DEV_DIR:-$HOME/git}"
+
+  # Sourcing shdeps.sh happens before link activation. A prior failed attempt
+  # can therefore leave its functions defined without a usable installation;
+  # only the sentinel written after links and stale-state cleanup is readiness.
+  # Bind it to the effective inputs because sourced callers can bootstrap more
+  # than one isolated install in the same shell, and SHDEPS_FORCE must remain a
+  # real request even after a normal bootstrap completed.
+  printf -v _bs_ready_key '%q %q %q %q %q %q %q %q %q %q' \
+    "$SHDEPS_DIR" "$SHDEPS_BIN" "$SHDEPS_REPO" "${SHDEPS_LIB:-}" \
+    "${SHDEPS_GIT_DEV_DIR:-$HOME/git}" "${SHDEPS_FORCE:-0}" \
+    "${SHDEPS_RELEASE_API_URL:-}" \
+    "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}" \
+    "${SHDEPS_BIN_DIR:-$HOME/.local/bin}" \
+    "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}"
+  [[ "${_SHDEPS_BOOTSTRAP_READY_KEY:-}" == "$_bs_ready_key" ]] && return 0
 
   # Find shdeps.sh: installed-tree env hint → env override → dev clone →
   # installed tree → fresh install. SHDEPS_LIB usually means "do exactly this",
@@ -1750,10 +2103,16 @@ _bootstrap() {
   if _bootstrap_lib_is_installed_tree; then
     if _uses_default_repo_slug && [[ -d "$SHDEPS_DIR/.git" ]]; then
       _install_release >/dev/null 2>&1 || _bs_rc=$?
-      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then
+        _install_report_propagation_message
+        return "$_bs_rc"
+      fi
     else
       _repair_release_if_needed "$SHDEPS_DIR" || _bs_rc=$?
-      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then
+        _install_report_propagation_message
+        return "$_bs_rc"
+      fi
       [[ "$_bs_rc" -eq 0 ]] || return 1
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
@@ -1773,11 +2132,17 @@ _bootstrap() {
       # platforms fall through to the source path so bootstrap still converges.
       _bs_rc=0
       _install_release >/dev/null 2>&1 || _bs_rc=$?
-      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then
+        _install_report_propagation_message
+        return "$_bs_rc"
+      fi
     else
       _bs_rc=0
       _repair_release_if_needed "$SHDEPS_DIR" || _bs_rc=$?
-      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then
+        _install_report_propagation_message
+        return "$_bs_rc"
+      fi
       [[ "$_bs_rc" -eq 0 ]] || return 1
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
@@ -1791,7 +2156,10 @@ _bootstrap() {
       _bs_dir="$SHDEPS_DIR"
     else
       _bs_rc=$?
-      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then
+        _install_report_propagation_message
+        return "$_bs_rc"
+      fi
       return 1
     fi
   fi
@@ -1835,8 +2203,14 @@ _bootstrap() {
 
   # Set up symlinks (CLI, man, completions) after self-update so newly
   # pulled files (e.g. man pages, completions) are linked immediately.
-  [[ -n "$_bs_dir" ]] && _setup_links "$_bs_dir"
-  [[ -n "$_bs_dir" ]] && _cleanup_installed_state_for_source_checkout "$_bs_dir"
+  if [[ -n "$_bs_dir" ]]; then
+    # The selected implementation is not usable until its CLI, man, and
+    # completion links converge. Do not let later stale-state cleanup overwrite
+    # that activation failure or remove a fallback before activation succeeds.
+    _setup_links "$_bs_dir" || return $?
+    _cleanup_installed_state_for_source_checkout "$_bs_dir" || return $?
+  fi
+  _SHDEPS_BOOTSTRAP_READY_KEY="$_bs_ready_key"
 }
 
 # ---------------------------------------------------------------------------

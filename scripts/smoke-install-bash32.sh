@@ -177,7 +177,16 @@ _version=$("$_bin_dir/shdeps" version)
 _real_mv=$(command -v mv)
 _signal_bin="$_tmp_root/signal-bin"
 _signal_log="$_tmp_root/signal.log"
+_rollback_payload="$_tmp_root/rollback-payload"
 mkdir -p "$_signal_bin"
+cp -R "$_payload" "$_rollback_payload"
+cat >"$_rollback_payload/shdeps" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "version" ]]; then
+  printf '%s\n' "shdeps 20991231-235959-deadbeef"
+fi
+SH
+chmod +x "$_rollback_payload/shdeps"
 cat >"$_signal_bin/mv" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -219,8 +228,19 @@ chmod +x "$_signal_bin/mv"
   SHDEPS_TEST_REAL_MV="$_real_mv"
   SHDEPS_TEST_SIGNAL_LOG="$_signal_log"
   export PATH SHDEPS_TEST_LIVE SHDEPS_TEST_REAL_MV SHDEPS_TEST_SIGNAL_LOG
+
+  # Stock Bash 3.2 consumes a completed child's ordinary failure on the first
+  # wait. A second wait returns 127, so the transaction helper must not retry
+  # unless the first status has the 128+signal interruption shape.
+  _shdeps_tx_signal=0
+  _shdeps_tx_child=""
+  _child_failure_rc=0
+  _install_transaction_run sh -c 'exit 22' || _child_failure_rc=$?
+  [[ "$_child_failure_rc" -eq 22 ]] ||
+    _die "Bash 3.2 transaction changed child status 22 to $_child_failure_rc"
+
   _tx_rc=0
-  _install_bundle "$_payload" || _tx_rc=$?
+  _install_bundle "$_rollback_payload" || _tx_rc=$?
 
   [[ "$_tx_rc" -eq 143 ]] || _die "Bash 3.2 transaction returned $_tx_rc instead of 143"
   [[ -f "$_signal_log" ]] || _die "Bash 3.2 transaction did not reach the post-rename signal gate"
@@ -234,6 +254,9 @@ chmod +x "$_signal_bin/mv"
   [[ ! -e "$_tmp_root/caller-term" ]] || _die "Bash 3.2 transaction invoked caller TERM trap"
   [[ "$("$_install_dir/shdeps" version)" == "shdeps 20990203-040506-abc12345" ]] ||
     _die "Bash 3.2 transaction did not restore the old install"
+  if compgen -G "${_install_dir%/*}/.shdeps-install.*" >/dev/null; then
+    _die "Bash 3.2 rollback retained transaction staging or backup paths"
+  fi
 )
 
 # Exercise cancellation while a real transaction child is active. This keeps

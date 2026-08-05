@@ -69,6 +69,15 @@ _assert_eq() {
   fi
 }
 
+_assert_contains() {
+  local label="$1" expected="$2" actual="$3"
+  if [[ "$actual" == *"$expected"* ]]; then
+    _pass "$label"
+  else
+    _fail "$label (expected to contain '$expected', got '$actual')"
+  fi
+}
+
 # Source install.sh in this shell with the dispatch suppressed via the
 # documented opt-out env var. The opt-out is necessary because
 # `. install.sh --bootstrap` is a real invocation pattern that the
@@ -83,6 +92,244 @@ unset SHDEPS_INSTALL_SH_NO_DISPATCH
 
 _fixture_dir=$(mktemp -d)
 trap 'rm -rf "$_fixture_dir"' EXIT
+
+echo "=== install.sh: interrupted wait status recovery ==="
+
+_completed_child_status=$(
+  set +e
+  _wait_call_count=0
+  wait() {
+    _wait_call_count=$((_wait_call_count + 1))
+    if [[ "$_wait_call_count" -eq 1 ]]; then
+      return 22
+    fi
+    return 127
+  }
+  _install_transaction_job_running() { return 1; }
+  _shdeps_tx_child=999999
+  _shdeps_tx_signal=0
+  _install_transaction_wait_child
+  printf '%s\n' "$?"
+)
+_assert_eq "wait recovery: preserves an ordinary completed child failure" \
+  22 "$_completed_child_status"
+
+_stale_child_signal=$(
+  set +e
+  _stale_kill_count=0
+  wait() { return 0; }
+  kill() {
+    _stale_kill_count=$((_stale_kill_count + 1))
+    return 0
+  }
+  _shdeps_tx_child=424242
+  _shdeps_tx_signal=0
+  set -T
+  trap 'if [[ "$BASH_COMMAND" == "_shdeps_tx_child=\"\"" ]]; then
+    trap - DEBUG
+    _install_transaction_signal TERM
+  fi' DEBUG
+  _install_transaction_wait_child
+  _stale_rc=$?
+  trap - DEBUG
+  set +T
+  printf '%s:%s\n' "$_stale_rc" "$_stale_kill_count"
+)
+_assert_eq "wait recovery: signal after reap never targets stale child PID" \
+  "143:0" "$_stale_child_signal"
+
+_active_child_signal=$(
+  sleep 60 &
+  _active_pid=$!
+  _active_kill_count=0
+  kill() {
+    _active_kill_count=$((_active_kill_count + 1))
+    builtin kill "$@"
+  }
+  _shdeps_tx_child=$_active_pid
+  _shdeps_tx_signal=0
+  _install_transaction_signal TERM
+  if builtin kill -0 "$_active_pid" 2>/dev/null; then
+    builtin kill -KILL "$_active_pid" 2>/dev/null || true
+  fi
+  wait "$_active_pid" 2>/dev/null || true
+  printf '%s:%s\n' "$_shdeps_tx_signal" "$_active_kill_count"
+)
+_assert_eq "wait recovery: latched signal wakes an active child" \
+  "143:1" "$_active_child_signal"
+
+_stopped_child_active=$(
+  sleep 60 &
+  _stopped_pid=$!
+  builtin kill -STOP "$_stopped_pid"
+  sleep 0.05
+  if _install_transaction_job_running "$_stopped_pid"; then
+    printf 'active\n'
+  else
+    printf 'missing\n'
+  fi
+  builtin kill -CONT "$_stopped_pid" 2>/dev/null || true
+  builtin kill -KILL "$_stopped_pid" 2>/dev/null || true
+  wait "$_stopped_pid" 2>/dev/null || true
+)
+_assert_eq "wait recovery: stopped child remains an active owned job" \
+  "active" "$_stopped_child_active"
+
+_signaled_child_status=$(
+  set +e
+  _wait_call_count=0
+  wait() {
+    _wait_call_count=$((_wait_call_count + 1))
+    [[ "$_wait_call_count" -ne 1 ]] || return 143
+    return 127
+  }
+  _install_transaction_job_running() { return 1; }
+  _shdeps_tx_child=999998
+  _shdeps_tx_signal=0
+  _install_transaction_wait_child
+  printf '%s:%s\n' "$?" "$_wait_call_count"
+)
+_assert_eq "wait recovery: genuine signal child status survives exhausted re-wait" \
+  "143:2" "$_signaled_child_status"
+
+_cleanup_signaled_status=$(
+  set +e
+  _wait_call_count=0
+  wait() {
+    _wait_call_count=$((_wait_call_count + 1))
+    [[ "$_wait_call_count" -ne 1 ]] || return 143
+    return 127
+  }
+  _install_transaction_job_running() { return 1; }
+  _shdeps_tx_child=""
+  _shdeps_tx_signal=0
+  _install_transaction_cleanup_run :
+  printf '%s:%s\n' "$?" "$_wait_call_count"
+)
+_assert_eq "wait recovery: cleanup preserves genuine signal child status" \
+  "143:2" "$_cleanup_signaled_status"
+
+echo "=== install.sh: ownership removal race ==="
+
+_remove_race_root="$_fixture_dir/remove-race"
+_remove_race_path="$_remove_race_root/owned"
+_remove_race_saved="$_remove_race_root/original-owned"
+_remove_race_report="$_remove_race_root/report"
+mkdir -p "$_remove_race_root"
+(
+  _install_private_directory "$_remove_race_path" race-token
+  printf 'owned\n' >"$_remove_race_path/owned"
+  _remove_race_identity=$(
+    _install_directory_identity "$_remove_race_path" race-token
+  )
+  _remove_race_injected=0
+  _install_identity_matches() {
+    local path="$1" expected="$2" actual=""
+    actual=$(_install_directory_identity "$path" 2>/dev/null) || return 1
+    [[ "$actual" == "$expected" ]] || return 1
+    if [[ "$path" == "$_remove_race_path" && "$_remove_race_injected" -eq 0 ]]; then
+      mv "$_remove_race_path" "$_remove_race_saved"
+      mkdir "$_remove_race_path"
+      printf 'foreign\n' >"$_remove_race_path/foreign"
+      _remove_race_injected=1
+    fi
+  }
+  _remove_race_rc=0
+  _install_transaction_remove_owned \
+    "$_remove_race_path" "race fixture" "$_remove_race_identity" normal ||
+    _remove_race_rc=$?
+  printf '%s:%s\n' "$_remove_race_rc" "$_remove_race_injected" \
+    >"$_remove_race_report"
+)
+_assert_eq "ownership removal: replacement race is detected" \
+  "1:1" "$(cat "$_remove_race_report")"
+_assert_true "ownership removal: foreign replacement survives" \
+  test -f "$_remove_race_path/foreign"
+_assert_true "ownership removal: original owned tree is not confused with replacement" \
+  test -f "$_remove_race_saved/owned"
+
+echo "=== install.sh: suppressed bootstrap status diagnostics ==="
+
+_bootstrap_status_out="$_fixture_dir/bootstrap-status.out"
+_bootstrap_status_rc=0
+(
+  unset SHDEPS_LIB
+  SHDEPS_GIT_DEV_DIR="$_fixture_dir/no-dev-clones"
+  SHDEPS_DIR="$_fixture_dir/no-installed-tree"
+  export SHDEPS_GIT_DEV_DIR SHDEPS_DIR
+  _install() {
+    _SHDEPS_INSTALL_PROPAGATION_MESSAGE="shdeps transaction cleanup requires manual recovery; retained state: $_fixture_dir/recovery"
+    _error "$_SHDEPS_INSTALL_PROPAGATION_MESSAGE"
+    return 125
+  }
+  _bootstrap
+) >"$_bootstrap_status_out" 2>&1 || _bootstrap_status_rc=$?
+_assert_eq "bootstrap status: hard cleanup failure is preserved" \
+  125 "$_bootstrap_status_rc"
+_assert_true "bootstrap status: suppressed recovery path is re-emitted" \
+  grep -Fq "retained state: $_fixture_dir/recovery" "$_bootstrap_status_out"
+
+echo "=== install.sh: bootstrap activation failure ==="
+
+_bootstrap_link_dir="$_fixture_dir/bootstrap-link"
+_bootstrap_link_out="$_fixture_dir/bootstrap-link.out"
+mkdir -p "$_bootstrap_link_dir"
+printf 'shdeps_update() { :; }\n' >"$_bootstrap_link_dir/shdeps.sh"
+_bootstrap_retry_report=$(
+  unset -f shdeps_update shdeps_self_update shdeps_link_extras 2>/dev/null || true
+  unset _SHDEPS_BOOTSTRAP_READY_KEY
+  SHDEPS_LIB="$_bootstrap_link_dir/shdeps.sh"
+  SHDEPS_DIR="$_fixture_dir/unrelated-install-root"
+  export SHDEPS_LIB SHDEPS_DIR
+  _setup_attempts=0
+  _cleanup_attempts=0
+  _setup_links() {
+    _setup_attempts=$((_setup_attempts + 1))
+    [[ "$_setup_attempts" -ne 1 ]] || return 77
+  }
+  _cleanup_installed_state_for_source_checkout() {
+    _cleanup_attempts=$((_cleanup_attempts + 1))
+  }
+  _first_rc=0
+  _second_rc=0
+  _third_rc=0
+  _fourth_rc=0
+  _fifth_rc=0
+  _bootstrap >"$_bootstrap_link_out" 2>&1 || _first_rc=$?
+  _bootstrap >>"$_bootstrap_link_out" 2>&1 || _second_rc=$?
+  _bootstrap >>"$_bootstrap_link_out" 2>&1 || _third_rc=$?
+  SHDEPS_INSTALL_DIR="$_fixture_dir/alternate-install-root"
+  export SHDEPS_INSTALL_DIR
+  _bootstrap >>"$_bootstrap_link_out" 2>&1 || _fourth_rc=$?
+  SHDEPS_STATE_DIR="$_fixture_dir/alternate-state-root"
+  export SHDEPS_STATE_DIR
+  _bootstrap >>"$_bootstrap_link_out" 2>&1 || _fifth_rc=$?
+  printf '%s:%s:%s:%s:%s:%s:%s\n' \
+    "$_first_rc" "$_second_rc" "$_third_rc" "$_fourth_rc" "$_fifth_rc" \
+    "$_setup_attempts" "$_cleanup_attempts"
+)
+_assert_eq "bootstrap activation: failure is retried before readiness" \
+  "77:0:0:0:0:4:3" "$_bootstrap_retry_report"
+
+echo "=== install.sh: combined propagation diagnostics ==="
+
+_combined_diag_dir="$_fixture_dir/combined-diagnostic"
+mkdir -p "$_combined_diag_dir"
+_combined_diag=$(
+  _SHDEPS_INSTALL_PROPAGATION_MESSAGE="shdeps payload was committed, but activation was interrupted; rerun the installer"
+  _shdeps_tx_old_recovery=""
+  _shdeps_tx_backup_owned=0
+  _shdeps_tx_staging_owned=1
+  _shdeps_tx_staging="$_combined_diag_dir"
+  _shdeps_tx_staging_identity=""
+  _shdeps_tx_release_owned=0
+  _install_transaction_remember_cleanup_failure
+  printf '%s\n' "$_SHDEPS_INSTALL_PROPAGATION_MESSAGE"
+)
+_assert_contains "combined diagnostic: committed activation guidance survives cleanup failure" \
+  "payload was committed, but activation was interrupted" "$_combined_diag"
+_assert_contains "combined diagnostic: manual recovery guidance is appended" \
+  "transaction cleanup requires manual recovery" "$_combined_diag"
 
 echo "=== install.sh: _release_platform ==="
 
@@ -186,16 +433,11 @@ _assert_false 'quote: carriage return rejected' _curl_config_quote $'line1\rline
 
 echo "=== install.sh: _github_token ==="
 
-if declare -f _github_token | grep -q 'gh auth token'; then
-  _fail "github token: bootstrap never starts an untracked credential helper"
-else
-  _pass "github token: bootstrap never starts an untracked credential helper"
-fi
-
 _gh_stub_dir=$(mktemp -d)
 cat >"$_gh_stub_dir/gh" <<'EOF'
 #!/usr/bin/env bash
-printf 'gh should not run in headless tests\n' >>"$SHDEPS_GH_STUB_LOG"
+printf 'gh invoked\n' >>"$SHDEPS_GH_STUB_LOG"
+printf '%s\n' "$*" >"$SHDEPS_GH_STUB_ARGS"
 printf 'stub-token\n'
 EOF
 chmod +x "$_gh_stub_dir/gh"
@@ -203,7 +445,8 @@ _old_path="$PATH"
 PATH="$_gh_stub_dir:$PATH"
 export PATH
 SHDEPS_GH_STUB_LOG="$_gh_stub_dir/calls"
-export SHDEPS_GH_STUB_LOG
+SHDEPS_GH_STUB_ARGS="$_gh_stub_dir/args"
+export SHDEPS_GH_STUB_LOG SHDEPS_GH_STUB_ARGS
 
 _old_gh_token_set=0
 _old_github_token_set=0
@@ -218,21 +461,57 @@ fi
 
 unset GH_TOKEN GITHUB_TOKEN
 _token_result=sentinel
-_github_token _token_result >"$_gh_stub_dir/stdout"
+_github_token _token_result "$_gh_stub_dir" >"$_gh_stub_dir/stdout"
 _assert_eq "github token: absent credentials produce an empty token" "" "$_token_result"
 _assert_eq "github token: lookup writes no token to stdout" "" "$(cat "$_gh_stub_dir/stdout")"
 _assert_false "github token: headless did not invoke gh" test -s "$SHDEPS_GH_STUB_LOG"
 
+_interactive_token=$(
+  _github_token_can_probe() { return 0; }
+  _shdeps_tx_signal=0
+  _shdeps_tx_child=""
+  _value=""
+  _github_token _value "$_gh_stub_dir"
+  printf '%s\n' "$_value"
+)
+_assert_eq "github token: interactive private release can use gh auth" \
+  "stub-token" "$_interactive_token"
+_assert_true "github token: interactive lookup invokes gh" test -s "$SHDEPS_GH_STUB_LOG"
+_assert_eq "github token: lookup selects the public GitHub host" \
+  "auth token --hostname github.com" "$(cat "$SHDEPS_GH_STUB_ARGS")"
+_assert_false "github token: scratch copy is removed after reading" \
+  test -e "$_gh_stub_dir/github-token"
+
+_interrupted_token_dir="$_fixture_dir/interrupted-token"
+_interrupted_token_rc=0
+mkdir -p "$_interrupted_token_dir"
+(
+  _github_token_can_probe() { return 0; }
+  _install_transaction_run_to_file() {
+    local output="$1"
+    printf 'credential-bytes\n' >"$output"
+    _shdeps_tx_signal=143
+    return 143
+  }
+  _shdeps_tx_signal=0
+  _interrupted_value=""
+  _github_token _interrupted_value "$_interrupted_token_dir"
+) || _interrupted_token_rc=$?
+_assert_eq "github token: interrupted lookup preserves signal status" \
+  143 "$_interrupted_token_rc"
+_assert_false "github token: interrupted lookup clears credential bytes" \
+  test -s "$_interrupted_token_dir/github-token"
+
 GH_TOKEN="explicit-gh-token"
 export GH_TOKEN
 unset GITHUB_TOKEN
-_github_token _token_result
+_github_token _token_result "$_gh_stub_dir"
 _assert_eq "github token: GH_TOKEN wins" "explicit-gh-token" "$_token_result"
 
 GITHUB_TOKEN="explicit-github-token"
 export GITHUB_TOKEN
 unset GH_TOKEN
-_github_token _token_result
+_github_token _token_result "$_gh_stub_dir"
 _assert_eq "github token: GITHUB_TOKEN fallback" "explicit-github-token" "$_token_result"
 
 if [[ $_old_gh_token_set -eq 1 ]]; then

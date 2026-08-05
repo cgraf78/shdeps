@@ -211,6 +211,77 @@ _assert_not_contains "wrapper cache: bin-dir not refetched" "__api bin-dir" "$_c
 _assert_not_contains "wrapper cache: git-dev-dir not refetched" "__api git-dev-dir" "$_cache_log_content"
 _assert_not_contains "wrapper cache: platform not refetched" "__api platform" "$_cache_log_content"
 
+_write_multi_install_stub() {
+  local path="$1" abi="$2" prefix="$3"
+
+  cat >"$path" <<SH
+#!/usr/bin/env bash
+printf '%s %s\n' "$prefix" "\$*" >>"\${SHDEPS_MULTI_INSTALL_LOG:?missing multi-install log}"
+case "\${1:-}:\${2:-}" in
+  __api:version)
+    printf '%s\n' "abi:$abi"
+    ;;
+  __api:env-snapshot)
+    printf '%s\n' \\
+      "install_dir=$prefix/install" \\
+      "bin_dir=$prefix/bin" \\
+      "git_dev_dir=$prefix/git" \\
+      "platform=linux" \\
+      "pkg_mgr=" \\
+      "force=0" \\
+      "reinstall=0"
+    ;;
+  *) exit 9 ;;
+esac
+SH
+  chmod +x "$path"
+}
+
+_multi_a=$(_tmpdir)/shdeps-a
+_multi_b_bad=$(_tmpdir)/shdeps-b-bad
+_multi_b=$(_tmpdir)/shdeps-b
+_multi_log=$(_tmpdir)/multi-install.log
+_write_multi_install_stub "$_multi_a" 1 /multi/a
+_write_multi_install_stub "$_multi_b_bad" 999 /multi/bad
+_write_multi_install_stub "$_multi_b" 1 /multi/b
+
+_multi_abi_result=$(
+  # Positional parameters in the quoted program belong to the child shell.
+  # shellcheck disable=SC2016
+  SHDEPS_MULTI_INSTALL_LOG="$_multi_log" \
+    "$(command -v bash)" -c '
+      unset SHDEPS_INSTALL_DIR SHDEPS_BIN_DIR SHDEPS_GIT_DEV_DIR
+      SHDEPS_RUST_CLI=$1
+      . "$4"
+      first=$?
+      SHDEPS_RUST_CLI=$2
+      . "$4" >/dev/null 2>&1
+      second=$?
+      printf "%s:%s\n" "$first" "$second"
+    ' bash "$_multi_a" "$_multi_b_bad" "$_multi_b" "$SHDEPS_DIR/shdeps.sh"
+)
+_assert_eq "wrapper multi-install: second binary gets its own ABI validation" \
+  "0:1" "$_multi_abi_result"
+
+: >"$_multi_log"
+_multi_env_result=$(
+  # Positional parameters in the quoted program belong to the child shell.
+  # shellcheck disable=SC2016
+  SHDEPS_MULTI_INSTALL_LOG="$_multi_log" \
+    "$(command -v bash)" -c '
+      unset SHDEPS_INSTALL_DIR SHDEPS_BIN_DIR SHDEPS_GIT_DEV_DIR
+      SHDEPS_RUST_CLI=$1
+      . "$3"
+      SHDEPS_RUST_CLI=$2
+      . "$3"
+      printf "%s\n" "$(shdeps_install_dir)" "$(shdeps_bin_dir)" "$(shdeps_git_dev_dir)"
+    ' bash "$_multi_a" "$_multi_b" "$SHDEPS_DIR/shdeps.sh"
+)
+_assert_eq "wrapper multi-install: environment cache follows selected binary" \
+  $'/multi/b/install\n/multi/b/bin\n/multi/b/git' "$_multi_env_result"
+_assert_eq "wrapper multi-install: second binary snapshot is loaded once" \
+  "1" "$(grep -c '^/multi/b __api env-snapshot$' "$_multi_log" || true)"
+
 _path_fake=$(_tmpdir)/shdeps
 cat >"$_path_fake" <<'SH'
 #!/usr/bin/env bash
