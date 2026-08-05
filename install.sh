@@ -748,6 +748,8 @@ _install_transaction_prepare_paths() {
     candidate="$$.$RANDOM.$RANDOM"
     _shdeps_tx_staging="$parent/.shdeps-install.$candidate"
     _shdeps_tx_backup="$_shdeps_tx_staging.backup"
+    _shdeps_tx_staging_token="staging.$candidate"
+    _shdeps_tx_release_token="release.$candidate"
     if [[ "$mode" == release ]]; then
       _shdeps_tx_release_path="$tmp_root/shdeps-release.$candidate"
     else
@@ -765,18 +767,42 @@ _install_transaction_prepare_paths() {
 }
 
 _install_private_directory() {
+  local path="$1" owner_token="${2:-}" marker="$1/.shdeps-install-owner"
+
   # These paths hold downloaded executables and the next live install. Match
   # `mktemp -d` privacy even when the caller has an unusually permissive umask;
-  # the subshell keeps the caller's umask unchanged in sourced mode.
-  (umask 077 && mkdir "$1")
+  # the subshell keeps the caller's umask unchanged in sourced mode. An optional
+  # marker makes transaction ownership survive directory moves and prevents an
+  # immediately reused inode from transferring cleanup ownership. A staged
+  # bundle retains the marker as managed-install metadata, letting its next
+  # replacement validate the same token after moving it to the backup path.
+  (
+    umask 077
+    mkdir "$path" || exit $?
+    [[ -n "$owner_token" ]] || exit 0
+    if printf '%s\n' "$owner_token" >"$marker"; then
+      exit 0
+    fi
+    rm -f -- "$marker" 2>/dev/null || true
+    rmdir "$path" 2>/dev/null || true
+    exit 1
+  )
 }
 
 _install_directory_identity() {
-  local path="$1" identity=""
+  local path="$1" expected_token="${2:-}" identity=""
+  local marker="$1/.shdeps-install-owner" owner_token=""
 
   identity=$(stat -c '%d:%i' "$path" 2>/dev/null) ||
     identity=$(stat -f '%d:%i' "$path" 2>/dev/null) || return 1
   [[ -n "$identity" ]] || return 1
+  if [[ -n "$expected_token" || -e "$marker" || -L "$marker" ]]; then
+    [[ -f "$marker" && ! -L "$marker" ]] || return 1
+    IFS= read -r owner_token <"$marker" || return 1
+    [[ -n "$owner_token" && "$owner_token" != *:* ]] || return 1
+    [[ -z "$expected_token" || "$owner_token" == "$expected_token" ]] || return 1
+    identity="$identity:$owner_token"
+  fi
   printf '%s\n' "$identity"
 }
 
@@ -789,11 +815,22 @@ _install_identity_matches() {
 }
 
 _install_remove_unidentified_directory() {
-  local path="$1" label="$2"
+  local path="$1" label="$2" owner_token="${3:-}"
+  local marker="$1/.shdeps-install-owner" actual_token=""
 
   # Creation succeeded but stat did not, so recursive cleanup has no identity
-  # proof. Only remove the still-empty pathname; if anything appeared inside or
-  # replaced it, retain it and let the transaction report a hard cleanup error.
+  # proof. A matching creation token is still sufficient to remove our marker;
+  # after that, only remove the empty pathname. Foreign contents or a replaced
+  # marker retain the directory and become a hard cleanup error.
+  if [[ -n "$owner_token" ]]; then
+    if [[ ! -f "$marker" || -L "$marker" ]] ||
+      ! IFS= read -r actual_token <"$marker" ||
+      [[ "$actual_token" != "$owner_token" ]] ||
+      ! rm -f -- "$marker"; then
+      _error "failed to remove unidentified $label; retained at $path"
+      return 1
+    fi
+  fi
   if rmdir "$path"; then
     return 0
   fi
@@ -1095,6 +1132,7 @@ _install_transaction() {
   local _shdeps_tx_state=PREPARED _shdeps_tx_staging="" _shdeps_tx_backup=""
   local _shdeps_tx_release_path="" _shdeps_tx_release_identity=""
   local _shdeps_tx_staging_identity="" _shdeps_tx_old_identity=""
+  local _shdeps_tx_staging_token="" _shdeps_tx_release_token=""
   local _shdeps_tx_old_recovery="" _shdeps_tx_monitor=0
   local _shdeps_tx_staging_owned=0 _shdeps_tx_backup_owned=0
   local _shdeps_tx_backup_unverified=0
@@ -1162,13 +1200,23 @@ _install_bundle_core() {
     _error "failed to create shdeps install parent at $parent"
     return 1
   fi
-  if ! _install_private_directory "$_shdeps_tx_staging"; then
+  # Claim the randomized pathname before allocation. Until exact identity is
+  # captured, cleanup may only report and retain a leftover path; it cannot
+  # recursively remove one. This closes the marker-publication interruption
+  # window without transferring deletion rights to a concurrent replacement.
+  _shdeps_tx_staging_owned=1
+  if ! _install_private_directory "$_shdeps_tx_staging" "$_shdeps_tx_staging_token"; then
+    if [[ ! -e "$_shdeps_tx_staging" && ! -L "$_shdeps_tx_staging" ]]; then
+      _shdeps_tx_staging_owned=0
+    fi
     _error "failed to create shdeps install staging at $_shdeps_tx_staging"
     return 1
   fi
-  _shdeps_tx_staging_owned=1
-  _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || {
-    if _install_remove_unidentified_directory "$_shdeps_tx_staging" "shdeps install staging"; then
+  _shdeps_tx_staging_identity=$(
+    _install_directory_identity "$_shdeps_tx_staging" "$_shdeps_tx_staging_token"
+  ) || {
+    if _install_remove_unidentified_directory \
+      "$_shdeps_tx_staging" "shdeps install staging" "$_shdeps_tx_staging_token"; then
       _shdeps_tx_staging_owned=0
     fi
     _error "failed to identify shdeps install staging"
@@ -1350,13 +1398,19 @@ _install_release_core() {
   repo=$(_repo_slug)
   _github_token token
   tmp="$_shdeps_tx_release_path"
-  if ! _install_private_directory "$tmp"; then
+  _shdeps_tx_release_owned=1
+  if ! _install_private_directory "$tmp" "$_shdeps_tx_release_token"; then
+    if [[ ! -e "$tmp" && ! -L "$tmp" ]]; then
+      _shdeps_tx_release_owned=0
+    fi
     _error "failed to create release staging directory"
     return 1
   fi
-  _shdeps_tx_release_owned=1
-  _shdeps_tx_release_identity=$(_install_directory_identity "$tmp") || {
-    if _install_remove_unidentified_directory "$tmp" "shdeps release scratch"; then
+  _shdeps_tx_release_identity=$(
+    _install_directory_identity "$tmp" "$_shdeps_tx_release_token"
+  ) || {
+    if _install_remove_unidentified_directory \
+      "$tmp" "shdeps release scratch" "$_shdeps_tx_release_token"; then
       _shdeps_tx_release_owned=0
     fi
     _error "failed to identify release staging directory"

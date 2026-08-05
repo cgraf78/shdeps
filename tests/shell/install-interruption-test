@@ -129,9 +129,16 @@ case "${SHDEPS_TEST_PHASE:-}:$dest" in
   staging-replacement:*/.shdeps-install.*/)
     staging="${dest%/}"
     printf '%s\n' "$staging" >"$SHDEPS_TEST_MARKERS/staging.path"
-    "$SHDEPS_TEST_REAL_RM" -rf -- "$staging"
-    "$SHDEPS_TEST_REAL_MKDIR" -p "$staging"
+    # Preserve the directory inode while revoking its transaction marker. This
+    # deterministically exercises ownership transfer without relying on whether
+    # the host filesystem immediately reuses an inode after remove/recreate.
+    "$SHDEPS_TEST_REAL_RM" -f -- "$staging/.shdeps-install-owner"
     printf '%s\n' foreign >"$staging/foreign"
+    exit 74
+    ;;
+  staging-initial-replacement:*/.shdeps-install.*/)
+    # The stat shim already revoked the marker before initial identity capture.
+    # Stop the install if a buggy implementation adopted that path anyway.
     exit 74
     ;;
   copy:*/.shdeps-install.*/)
@@ -179,8 +186,7 @@ case "$url" in
     if [[ "${SHDEPS_TEST_PHASE:-}" == scratch-replacement ]]; then
       scratch="${out%/*}"
       printf '%s\n' "$scratch" >"$SHDEPS_TEST_MARKERS/scratch.path"
-      "$SHDEPS_TEST_REAL_RM" -rf -- "$scratch"
-      "$SHDEPS_TEST_REAL_MKDIR" -p "$scratch"
+      "$SHDEPS_TEST_REAL_RM" -f -- "$scratch/.shdeps-install-owner"
       printf '%s\n' foreign >"$scratch/foreign"
       exit 75
     fi
@@ -341,6 +347,15 @@ if [[ "${SHDEPS_TEST_PHASE:-}" == allocation-failure && "$target" == */.shdeps-i
   printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/staging.path"
   exit 73
 fi
+if [[ "${SHDEPS_TEST_PHASE:-}" == allocation-marker-failure &&
+  "$target" == */.shdeps-install.* ]]; then
+  "$SHDEPS_TEST_REAL_MKDIR" "$@" || exit $?
+  printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/staging.path"
+  # A directory at the marker path makes marker publication and the helper's
+  # best-effort rollback fail without relying on permissions or root behavior.
+  "$SHDEPS_TEST_REAL_MKDIR" "$target/.shdeps-install-owner" || exit $?
+  exit 0
+fi
 exec "$SHDEPS_TEST_REAL_MKDIR" "$@"
 SH
 
@@ -391,6 +406,16 @@ set -u
 target=""
 for arg in "$@"; do target="$arg"; done
 case "${SHDEPS_TEST_PHASE:-}:$target" in
+  staging-initial-replacement:*/.shdeps-install.*)
+    printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/staging.path"
+    "$SHDEPS_TEST_REAL_RM" -f -- "$target/.shdeps-install-owner"
+    printf '%s\n' foreign >"$target/foreign"
+    ;;
+  staging-identity-marker-missing:*/.shdeps-install.*)
+    printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/identity.path"
+    "$SHDEPS_TEST_REAL_RM" -f -- "$target/.shdeps-install-owner"
+    exit 77
+    ;;
   staging-identity-failure:*/.shdeps-install.* | release-identity-failure:*/shdeps-release.*)
     printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/identity.path"
     exit 77
@@ -1002,11 +1027,15 @@ _run_owned_replacement_case() {
     _fail "$phase: caller state restored"
   fi
   case "$phase" in
-    staging-replacement) path=$(cat "$markers/staging.path") ;;
+    staging-replacement | staging-initial-replacement) path=$(cat "$markers/staging.path") ;;
     scratch-replacement) path=$(cat "$markers/scratch.path") ;;
   esac
   _assert_file_content "$phase: foreign replacement survives cleanup" foreign "$path/foreign"
-  _assert_contains "$phase: cleanup reports identity mismatch" 'identity changed' "$(cat "$stderr")"
+  if [[ "$phase" == staging-initial-replacement ]]; then
+    _assert_contains "$phase: cleanup reports unverified ownership" 'retained at' "$(cat "$stderr")"
+  else
+    _assert_contains "$phase: cleanup reports identity mismatch" 'identity changed' "$(cat "$stderr")"
+  fi
   if _tree_matches "$snapshot" "$live"; then
     _pass "$phase: old install remains byte-identical"
   else
@@ -1107,6 +1136,12 @@ _run_success_case() {
   _assert_file_content 'success: caller EXIT trap retains final status' caller-exit:0 "$root/caller-exit"
   _assert_eq 'success: complete new bundle is active' \
     'shdeps 20990102-030405-22222222' "$("$live/shdeps" version)"
+  if [[ -s "$live/.shdeps-install-owner" ]] &&
+    grep -Eq '^staging\.[0-9]+\.[0-9]+\.[0-9]+$' "$live/.shdeps-install-owner"; then
+    _pass 'success: active install retains its ownership token'
+  else
+    _fail 'success: active install retains its ownership token'
+  fi
   if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
     _fail 'success: no job-control text leaks'
   else
@@ -1422,6 +1457,63 @@ _run_allocation_case() {
   _assert_not_exists 'allocation failure: unowned staging path is not removed or created' "$staging"
 }
 
+_run_marker_allocation_failure_case() {
+  local root live bundle snapshot markers bin report stderr driver install_script staging="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  cp -R "$live" "$snapshot"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_PHASE=allocation-marker-failure \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$stderr" || rc=$?
+
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_eq 'marker allocation failure: incomplete cleanup is a hard failure' 125 "$rc"
+  _assert_dir_exists 'marker allocation failure: unresolved staging is retained' "$staging"
+  _assert_dir_exists 'marker allocation failure: conflicting marker is retained' \
+    "$staging/.shdeps-install-owner"
+  _assert_contains 'marker allocation failure: diagnostic names retained staging' \
+    "$staging" "$(cat "$stderr")"
+  if _tree_matches "$snapshot" "$live"; then
+    _pass 'marker allocation failure: old install remains byte-identical'
+  else
+    _fail 'marker allocation failure: old install remains byte-identical'
+  fi
+  if _report_is_restored "$report"; then
+    _pass 'marker allocation failure: caller state restored'
+  else
+    _fail 'marker allocation failure: caller state restored'
+  fi
+}
+
 _run_identity_failure_case() {
   local phase="$1" mode="$2"
   local root live bundle markers bin report driver install_script path="" rc=0
@@ -1461,8 +1553,13 @@ _run_identity_failure_case() {
     "$driver" >/dev/null 2>&1 || rc=$?
 
   [[ -f "$markers/identity.path" ]] && path=$(cat "$markers/identity.path")
-  _assert_eq "$phase: install fails" 1 "$rc"
-  _assert_not_exists "$phase: created but unidentified directory is removed" "$path"
+  if [[ "$phase" == staging-identity-marker-missing ]]; then
+    _assert_eq "$phase: unverified cleanup is a hard failure" 125 "$rc"
+    _assert_dir_exists "$phase: markerless directory is retained" "$path"
+  else
+    _assert_eq "$phase: install fails" 1 "$rc"
+    _assert_not_exists "$phase: created but unidentified directory is removed" "$path"
+  fi
   if _report_is_restored "$report"; then
     _pass "$phase: caller state restored"
   else
@@ -1764,6 +1861,7 @@ _run_failure_case backup-move-failure
 _run_failure_case backup-stat-failure
 _run_failure_case backup-disappears
 _run_owned_replacement_case staging-replacement bundle
+_run_owned_replacement_case staging-initial-replacement bundle
 _run_owned_replacement_case scratch-replacement release
 _run_dangling_live_case
 _run_private_directory_case
@@ -1775,7 +1873,9 @@ _run_latched_spawn_case
 _run_teardown_signal_case
 _run_monitor_case
 _run_allocation_case
+_run_marker_allocation_failure_case
 _run_identity_failure_case staging-identity-failure bundle
+_run_identity_failure_case staging-identity-marker-missing bundle
 _run_identity_failure_case release-identity-failure release
 _run_executed_case
 
