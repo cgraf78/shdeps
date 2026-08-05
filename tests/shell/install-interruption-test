@@ -124,16 +124,6 @@ case "${SHDEPS_TEST_PHASE:-}:$dest" in
     ;;
 esac
 "$SHDEPS_TEST_REAL_CP" "$@" || exit $?
-case "${SHDEPS_TEST_PHASE:-}:$dest" in
-  backup-race:*/.shdeps-install.*/)
-    backup="${dest%/}.backup"
-    if [[ ! -e "$SHDEPS_TEST_MARKERS/backup.path" ]]; then
-      "$SHDEPS_TEST_REAL_MKDIR" -p "$backup"
-      printf '%s\n' foreign >"$backup/foreign"
-      printf '%s\n' "$backup" >"$SHDEPS_TEST_MARKERS/backup.path"
-    fi
-    ;;
-esac
 SH
 
   cat >"$bin/curl" <<'SH'
@@ -213,13 +203,40 @@ phase=${SHDEPS_TEST_PHASE:-}
 case "$phase" in
   restore-failure)
     case "$src:$dest" in
-      */.shdeps-install.*:"$SHDEPS_TEST_LIVE") exit 71 ;;
       *.backup:"$SHDEPS_TEST_LIVE")
         printf '%s\n' "$src" >"$SHDEPS_TEST_MARKERS/backup.path"
         : >"$SHDEPS_TEST_MARKERS/restore-failed"
         exit 72
         ;;
+      */.shdeps-install.*:"$SHDEPS_TEST_LIVE") exit 71 ;;
     esac
+    ;;
+  restore-race)
+    case "$src:$dest" in
+      *.backup:"$SHDEPS_TEST_LIVE")
+        "$SHDEPS_TEST_REAL_MKDIR" -p "$SHDEPS_TEST_LIVE"
+        printf '%s\n' foreign >"$SHDEPS_TEST_LIVE/foreign"
+        printf '%s\n' "$SHDEPS_TEST_LIVE/${src##*/}" >"$SHDEPS_TEST_MARKERS/recovery.path"
+        ;;
+      */.shdeps-install.*:"$SHDEPS_TEST_LIVE") exit 71 ;;
+    esac
+    ;;
+esac
+
+case "$src:$dest" in
+  "$SHDEPS_TEST_LIVE":*.backup)
+    if [[ "$phase" == backup-race ]]; then
+      "$SHDEPS_TEST_REAL_MKDIR" -p "$dest"
+      printf '%s\n' foreign >"$dest/foreign"
+      printf '%s\n' "$dest" >"$SHDEPS_TEST_MARKERS/backup.path"
+    fi
+    ;;
+  */.shdeps-install.*:"$SHDEPS_TEST_LIVE")
+    if [[ "$phase" == destination-race ]]; then
+      "$SHDEPS_TEST_REAL_MKDIR" -p "$SHDEPS_TEST_LIVE"
+      printf '%s\n' foreign >"$SHDEPS_TEST_LIVE/foreign"
+      printf '%s\n' "$SHDEPS_TEST_LIVE/${src##*/}" >"$SHDEPS_TEST_MARKERS/nested-staging.path"
+    fi
     ;;
 esac
 
@@ -227,10 +244,7 @@ esac
 case "$src:$dest" in
   "$SHDEPS_TEST_LIVE":*.backup)
     printf '%s\n' "$dest" >"$SHDEPS_TEST_MARKERS/backup.path"
-    if [[ "$phase" == destination-race ]]; then
-      mkdir -p "$SHDEPS_TEST_LIVE"
-      printf '%s\n' foreign >"$SHDEPS_TEST_LIVE/foreign"
-    elif [[ "$phase" == old-moved ]]; then
+    if [[ "$phase" == old-moved ]]; then
       : >"$SHDEPS_TEST_MARKERS/ready"
       kill -"${SHDEPS_TEST_SIGNAL:-TERM}" "$PPID"
     fi
@@ -288,6 +302,7 @@ _write_driver() {
 #!/usr/bin/env bash
 set -uo pipefail
 if [[ "${SHDEPS_TEST_ERREXIT:-0}" == 1 ]]; then set -e; fi
+if [[ "${SHDEPS_TEST_MONITOR:-0}" == 1 ]]; then set -m; fi
 
 trap 'printf "caller-hup\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' HUP
 trap 'printf "caller-int\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' INT
@@ -313,6 +328,26 @@ case "$SHDEPS_TEST_MODE" in
   release) _install_release || rc=$? ;;
   bundle) _install_bundle "$SHDEPS_TEST_BUNDLE" || rc=$? ;;
   bootstrap) _bootstrap || rc=$? ;;
+  latched)
+    _install_test_blocker() {
+      printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+      : >"$SHDEPS_TEST_MARKERS/blocker-started"
+      trap 'exit 143' TERM
+      while :; do sleep 1; done
+    }
+    _install_bundle_core() {
+      _install_transaction_signal TERM
+      _install_transaction_run _install_test_blocker
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  monitor)
+    _install_bundle_core() {
+      printf '%s\n' "$-" >"$SHDEPS_TEST_MARKERS/transaction.flags"
+      _install_transaction_run true
+    }
+    _install_transaction bundle || rc=$?
+    ;;
 esac
 
 after_hup=$(trap -p HUP)
@@ -372,6 +407,7 @@ _report_is_restored() {
 _run_interrupt_case() {
   local phase="$1" mode="$2" expected_tree="$3" signal="${4:-TERM}" errexit="${5:-0}" ignore_term="${6:-0}"
   local second_signal="${7:-}"
+  local fresh="${8:-0}"
   local root live bundle snapshot release markers bin tmp report stdout stderr
   local caller_signals caller_exit driver install_script parent worker unrelated rc=0 timed_out=0
   local tag platform signal_status scratch="" staging="" backup=""
@@ -408,9 +444,15 @@ _run_interrupt_case() {
   esac
 
   mkdir -p "$markers" "$tmp"
-  _make_bundle "$live" 20990101-020304-11111111
+  if [[ "$fresh" -eq 0 ]]; then
+    _make_bundle "$live" 20990101-020304-11111111
+    cp -R "$live" "$snapshot"
+  else
+    mkdir -p "$root/installer"
+    cp "$SHDEPS_DIR/install.sh" "$root/installer/install.sh"
+    install_script="$root/installer/install.sh"
+  fi
   _make_bundle "$bundle" "$tag"
-  cp -R "$live" "$snapshot"
   _make_release "$release" "$bundle" "$tag" "$platform"
   _write_command_shims "$bin"
   _write_driver "$driver"
@@ -444,6 +486,7 @@ _run_interrupt_case() {
     "SHDEPS_TEST_REPORT=$report"
     "SHDEPS_TEST_ERREXIT=$errexit"
     "SHDEPS_TEST_IGNORE_TERM=$ignore_term"
+    "SHDEPS_TEST_MONITOR=0"
     "SHDEPS_TEST_SIGNAL=$signal"
   )
 
@@ -508,7 +551,7 @@ _run_interrupt_case() {
   else
     _fail "$phase: unrelated process survives"
   fi
-  if grep -Eq '^\[[0-9]+\][[:space:]]' "$stdout" "$stderr"; then
+  if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
     _fail "$phase: no job-control text leaks"
   else
     _pass "$phase: no job-control text leaks"
@@ -536,6 +579,9 @@ _run_interrupt_case() {
         "shdeps $tag" "$("$live/shdeps" version 2>/dev/null)"
       _assert_file_exists "$phase: active metadata is present" "$live/.shdeps-install.json"
       ;;
+    none)
+      _assert_not_exists "$phase: no incomplete install is exposed" "$live"
+      ;;
   esac
 
   kill -TERM "$unrelated" 2>/dev/null || true
@@ -545,6 +591,7 @@ _run_interrupt_case() {
 _run_failure_case() {
   local phase="$1"
   local root live bundle snapshot markers bin report stdout stderr driver install_script backup="" rc=0
+  local nested_staging="" recovery=""
 
   root=$(_tmpdir)
   live="$root/live"
@@ -596,7 +643,20 @@ _run_failure_case() {
       _fail "$phase: old install remains byte-identical"
     fi
     _assert_file_content "$phase: foreign backup path is untouched" foreign "$backup/foreign"
+    _assert_not_exists "$phase: old install is not left nested in foreign backup" "$backup/${live##*/}"
     _assert_contains "$phase: diagnostic reports backup race" 'backup path appeared' "$(cat "$stderr")"
+    return
+  fi
+  if [[ "$phase" == restore-race ]]; then
+    [[ -f "$markers/recovery.path" ]] && recovery=$(cat "$markers/recovery.path")
+    _assert_file_content "$phase: unexpected live destination is untouched" foreign "$live/foreign"
+    _assert_file_exists "$phase: exact old install remains recoverable" "$recovery/shdeps"
+    if _tree_matches "$snapshot" "$recovery"; then
+      _pass "$phase: recoverable old install is byte-identical"
+    else
+      _fail "$phase: recoverable old install is byte-identical"
+    fi
+    _assert_contains "$phase: diagnostic names exact recovery path" "$recovery" "$(cat "$stderr")"
     return
   fi
   _assert_file_exists "$phase: recoverable backup retained" "$backup/shdeps"
@@ -611,7 +671,9 @@ _run_failure_case() {
       _assert_contains "$phase: diagnostic names recoverable backup" recoverable "$(cat "$stderr")"
       ;;
     destination-race)
+      [[ -f "$markers/nested-staging.path" ]] && nested_staging=$(cat "$markers/nested-staging.path")
       _assert_file_content "$phase: unexpected destination is untouched" foreign "$live/foreign"
+      _assert_not_exists "$phase: owned staging is removed from foreign destination" "$nested_staging"
       _assert_contains "$phase: diagnostic reports destination race" 'appeared before activation' "$(cat "$stderr")"
       ;;
   esac
@@ -667,6 +729,7 @@ _run_success_case() {
     SHDEPS_TEST_MODE=bundle \
     SHDEPS_TEST_REPORT="$report" \
     SHDEPS_TEST_ERREXIT=1 \
+    SHDEPS_TEST_MONITOR=1 \
     "$driver" >"$stdout" 2>"$stderr" || rc=$?
 
   _assert_eq 'success: sourced install succeeds' 0 "$rc"
@@ -678,10 +741,93 @@ _run_success_case() {
   _assert_file_content 'success: caller EXIT trap retains final status' caller-exit:0 "$root/caller-exit"
   _assert_eq 'success: complete new bundle is active' \
     'shdeps 20990102-030405-22222222' "$("$live/shdeps" version)"
-  if grep -Eq '^\[[0-9]+\][[:space:]]' "$stdout" "$stderr"; then
+  if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
     _fail 'success: no job-control text leaks'
   else
     _pass 'success: no job-control text leaks'
+  fi
+}
+
+_run_latched_spawn_case() {
+  local root markers report stdout stderr driver install_script parent worker rc=0 timed_out=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=latched \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" &
+  parent=$!
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    if [[ -f "$markers/worker.pid" ]]; then
+      worker=$(cat "$markers/worker.pid")
+      kill -KILL "$worker" 2>/dev/null || true
+    fi
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+
+  _assert_eq 'latched signal: returns original signal status' 143 "$rc"
+  _assert_eq 'latched signal: completion is bounded' 0 "$timed_out"
+  _assert_not_exists 'latched signal: no new child starts' "$markers/blocker-started"
+  if _report_is_restored "$report"; then
+    _pass 'latched signal: caller state restored'
+  else
+    _fail 'latched signal: caller state restored'
+  fi
+}
+
+_run_monitor_case() {
+  local root markers report stdout stderr driver install_script flags="" rc=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=monitor \
+    SHDEPS_TEST_MONITOR=1 \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" || rc=$?
+
+  _assert_eq 'monitor mode: transaction succeeds' 0 "$rc"
+  [[ -f "$markers/transaction.flags" ]] && flags=$(cat "$markers/transaction.flags")
+  case "$flags" in
+    *m*) _fail 'monitor mode: disabled while transaction owns background children' ;;
+    *) _pass 'monitor mode: disabled while transaction owns background children' ;;
+  esac
+  if _report_is_restored "$report"; then
+    _pass 'monitor mode: caller state restored exactly'
+  else
+    _fail 'monitor mode: caller state restored exactly'
+  fi
+  if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
+    _fail 'monitor mode: no job-control text leaks'
+  else
+    _pass 'monitor mode: no job-control text leaks'
   fi
 }
 
@@ -791,7 +937,7 @@ _run_executed_case() {
   fi
   [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
   _assert_not_exists 'executed install: staging removed by EXIT-safe transaction' "$staging"
-  if grep -Eq '^\[[0-9]+\][[:space:]]' "$stdout" "$stderr"; then
+  if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
     _fail 'executed install: no job-control text leaks'
   else
     _pass 'executed install: no job-control text leaks'
@@ -803,6 +949,7 @@ _run_interrupt_case download release old TERM
 _run_interrupt_case download-ignore release old TERM 0 1
 _run_interrupt_case download-first-signal release old HUP 0 1 TERM
 _run_interrupt_case bootstrap-download bootstrap old TERM
+_run_interrupt_case bootstrap-fresh-download bootstrap none TERM 0 0 '' 1
 _run_interrupt_case copy bundle old HUP 1
 _run_interrupt_case extract release old
 _run_interrupt_case old-moved bundle old
@@ -810,10 +957,13 @@ _run_interrupt_case activated bundle new
 _run_interrupt_case activated-int bundle new INT
 _run_interrupt_case backup-remove bundle new
 _run_failure_case restore-failure
+_run_failure_case restore-race
 _run_failure_case destination-race
 _run_failure_case backup-race
 _run_dangling_live_case
 _run_success_case
+_run_latched_spawn_case
+_run_monitor_case
 _run_allocation_case
 _run_executed_case
 
