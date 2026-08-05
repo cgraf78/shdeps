@@ -430,6 +430,9 @@ case "${SHDEPS_TEST_PHASE:-}:$target" in
       exit 77
     fi
     ;;
+  backup-first-stat-failure:*.backup)
+    exit 77
+    ;;
 esac
 exec "$SHDEPS_TEST_REAL_STAT" "$@"
 SH
@@ -889,7 +892,7 @@ _run_failure_case() {
     "$driver" >"$stdout" 2>"$stderr" || rc=$?
 
   case "$phase" in
-    restore-failure | restore-race | destination-race | backup-stat-failure | backup-disappears) expected_rc=125 ;;
+    restore-failure | restore-race | destination-race | backup-stat-failure | backup-first-stat-failure | backup-disappears) expected_rc=125 ;;
     backup-move-failure) expected_rc=72 ;;
   esac
   _assert_eq "$phase: install fails" "$expected_rc" "$rc"
@@ -956,7 +959,7 @@ _run_failure_case() {
       _assert_not_exists "$phase: owned staging is removed from foreign destination" "$nested_staging"
       _assert_contains "$phase: diagnostic reports destination race" 'appeared before activation' "$(cat "$stderr")"
       ;;
-    backup-stat-failure)
+    backup-stat-failure | backup-first-stat-failure)
       _assert_not_exists "$phase: live install stays absent while identity is unknown" "$live"
       _assert_contains "$phase: diagnostic names retained old install" "$backup" "$(cat "$stderr")"
       ;;
@@ -999,6 +1002,7 @@ _run_owned_replacement_case() {
     TMPDIR="$tmp" \
     SHDEPS_DIR="$live" \
     SHDEPS_BIN="$root/shdeps-bin" \
+    SHDEPS_GIT_DEV_DIR="$root/no-dev-checkouts" \
     SHDEPS_FORCE=1 \
     SHDEPS_RELEASE_API_URL=https://api.github.com/repos/cgraf78/shdeps/releases/latest \
     SHDEPS_TEST_BUNDLE="$bundle" \
@@ -1031,10 +1035,14 @@ _run_owned_replacement_case() {
     scratch-replacement) path=$(cat "$markers/scratch.path") ;;
   esac
   _assert_file_content "$phase: foreign replacement survives cleanup" foreign "$path/foreign"
-  if [[ "$phase" == staging-initial-replacement ]]; then
-    _assert_contains "$phase: cleanup reports unverified ownership" 'retained at' "$(cat "$stderr")"
-  else
-    _assert_contains "$phase: cleanup reports identity mismatch" 'identity changed' "$(cat "$stderr")"
+  # Bootstrap keeps opportunistic refresh diagnostics quiet, but the hard
+  # transaction status must still escape instead of reporting success.
+  if [[ "$mode" != bootstrap ]]; then
+    if [[ "$phase" == staging-initial-replacement ]]; then
+      _assert_contains "$phase: cleanup reports unverified ownership" 'retained at' "$(cat "$stderr")"
+    else
+      _assert_contains "$phase: cleanup reports identity mismatch" 'identity changed' "$(cat "$stderr")"
+    fi
   fi
   if _tree_matches "$snapshot" "$live"; then
     _pass "$phase: old install remains byte-identical"
@@ -1859,8 +1867,10 @@ _run_failure_case destination-race
 _run_failure_case backup-race
 _run_failure_case backup-move-failure
 _run_failure_case backup-stat-failure
+_run_failure_case backup-first-stat-failure
 _run_failure_case backup-disappears
 _run_owned_replacement_case staging-replacement bundle
+_run_owned_replacement_case staging-replacement bootstrap
 _run_owned_replacement_case staging-initial-replacement bundle
 _run_owned_replacement_case scratch-replacement release
 _run_dangling_live_case

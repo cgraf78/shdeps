@@ -34,9 +34,12 @@ SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
 _info() { printf '%s\n' "$*" >&2; }
 _error() { printf 'error: %s\n' "$*" >&2; }
 
-_is_cancel_status() {
+_install_status_requires_propagation() {
+  # Status 125 means transaction cleanup could not prove that recovery state
+  # is safe. It is as non-recoverable as cancellation at wrapper boundaries:
+  # best-effort refresh must never downgrade or silently ignore it.
   case "${1:-0}" in
-    129 | 130 | 143) return 0 ;;
+    125 | 129 | 130 | 143) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -256,13 +259,13 @@ _repair_release_if_needed() {
     # wrapper at all. Do not fall through and emit a misleading ABI error after
     # a failed repair download.
     _install_release >/dev/null 2>&1 || rc=$?
-    if _is_cancel_status "$rc"; then return "$rc"; fi
+    if _install_status_requires_propagation "$rc"; then return "$rc"; fi
     [[ "$rc" -eq 0 ]] || return 1
   elif [[ "${SHDEPS_FORCE:-0}" == 1 ]]; then
     # Preserve the existing best-effort force behavior: a transient GitHub
     # failure must not disable an otherwise compatible local release.
     _install_release >/dev/null 2>&1 || rc=$?
-    if _is_cancel_status "$rc"; then return "$rc"; fi
+    if _install_status_requires_propagation "$rc"; then return "$rc"; fi
   fi
 }
 
@@ -858,12 +861,16 @@ _install_transaction_reconcile() {
   if _install_identity_matches "$_shdeps_tx_backup" "$_shdeps_tx_old_identity"; then
     _shdeps_tx_backup_owned=1
     _shdeps_tx_backup_unverified=0
-  elif [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
+  elif [[ "$_shdeps_tx_backup_owned" -eq 1 ||
+    (-n "$_shdeps_tx_old_identity" &&
+    ! -e "$SHDEPS_DIR" && ! -L "$SHDEPS_DIR" &&
+    (-e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup")) ]]; then
     # Ownership follows the inode, not the randomized pathname. A concurrent
     # replacement must never become eligible for transaction cleanup. However,
     # an existing path that cannot be identified may still contain the only old
-    # install, so retain it as a hard recovery condition instead of silently
-    # declaring cleanup complete.
+    # install. This also covers the first identity check after a successful move:
+    # the live path disappearing while the backup appears is enough to retain a
+    # hard recovery condition, but never enough to delete the unverified path.
     _shdeps_tx_backup_owned=0
     _shdeps_tx_backup_unverified=1
     _shdeps_tx_old_recovery="$_shdeps_tx_backup"
@@ -1743,10 +1750,10 @@ _bootstrap() {
   if _bootstrap_lib_is_installed_tree; then
     if _uses_default_repo_slug && [[ -d "$SHDEPS_DIR/.git" ]]; then
       _install_release >/dev/null 2>&1 || _bs_rc=$?
-      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
     else
       _repair_release_if_needed "$SHDEPS_DIR" || _bs_rc=$?
-      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
       [[ "$_bs_rc" -eq 0 ]] || return 1
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
@@ -1766,11 +1773,11 @@ _bootstrap() {
       # platforms fall through to the source path so bootstrap still converges.
       _bs_rc=0
       _install_release >/dev/null 2>&1 || _bs_rc=$?
-      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
     else
       _bs_rc=0
       _repair_release_if_needed "$SHDEPS_DIR" || _bs_rc=$?
-      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
       [[ "$_bs_rc" -eq 0 ]] || return 1
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
@@ -1784,7 +1791,7 @@ _bootstrap() {
       _bs_dir="$SHDEPS_DIR"
     else
       _bs_rc=$?
-      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
+      if _install_status_requires_propagation "$_bs_rc"; then return "$_bs_rc"; fi
       return 1
     fi
   fi
