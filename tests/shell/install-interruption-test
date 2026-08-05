@@ -436,6 +436,30 @@ before_options=$(set +o)
 before_cwd=$PWD
 before_umask=$(umask)
 
+_test_wait_for_worker_not_running() {
+  local wanted="" pid active attempt
+
+  [[ -f "$SHDEPS_TEST_MARKERS/worker.pid" ]] && wanted=$(<"$SHDEPS_TEST_MARKERS/worker.pid")
+  if [[ -z "$wanted" ]]; then
+    : >"$SHDEPS_TEST_MARKERS/completion-timeout"
+    return 1
+  fi
+  for ((attempt = 0; attempt < 250; attempt++)); do
+    active=0
+    jobs -pr >"$SHDEPS_TEST_MARKERS/jobs.running" || true
+    while IFS= read -r pid; do
+      [[ "$pid" == "$wanted" ]] && active=1
+    done <"$SHDEPS_TEST_MARKERS/jobs.running"
+    if [[ "$active" -eq 0 ]]; then
+      : >"$SHDEPS_TEST_MARKERS/completion-observed"
+      return 0
+    fi
+    sleep 0.01
+  done
+  : >"$SHDEPS_TEST_MARKERS/completion-timeout"
+  return 1
+}
+
 SHDEPS_INSTALL_SH_NO_DISPATCH=1
 export SHDEPS_INSTALL_SH_NO_DISPATCH
 # shellcheck source=/dev/null
@@ -487,6 +511,13 @@ case "$SHDEPS_TEST_MODE" in
     ;;
   cleanup-unrelated-signal)
     trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"' USR1
+    eval "$(declare -f _install_transaction_cleanup_run | sed '1s/_install_transaction_cleanup_run/_install_transaction_cleanup_run_original/')"
+    _install_transaction_cleanup_run() {
+      local cleanup_rc=0
+      _install_transaction_cleanup_run_original "$@" || cleanup_rc=$?
+      printf '%s\n' "$cleanup_rc" >"$SHDEPS_TEST_MARKERS/cleanup-run.rc"
+      return "$cleanup_rc"
+    }
     _install_bundle_core() {
       _install_private_directory "$_shdeps_tx_staging" || return 1
       _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || return 1
@@ -507,7 +538,7 @@ case "$SHDEPS_TEST_MODE" in
     _install_transaction bundle || rc=$?
     ;;
   unrelated-signal-completion)
-    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"; printf "release\n" >"$SHDEPS_TEST_MARKERS/completion.gate"; sleep 0.2' USR1
+    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"; printf "release\n" >"$SHDEPS_TEST_MARKERS/completion.gate"; _test_wait_for_worker_not_running || true' USR1
     _install_bundle_core() {
       _install_transaction_run sh -c '
         printf "%s\n" "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
@@ -1514,6 +1545,9 @@ _run_cleanup_unrelated_signal_case() {
   install_script="$SHDEPS_DIR/install.sh"
   mkdir -p "$markers"
   mkfifo "$markers/cleanup.gate"
+  # Keep both ends open in the harness so a regressed cleanup child cannot
+  # make the release write block forever after it has already been killed.
+  exec 9<>"$markers/cleanup.gate"
   _write_command_shims "$bin"
   _write_driver "$driver"
 
@@ -1543,19 +1577,22 @@ _run_cleanup_unrelated_signal_case() {
   if ! kill -0 "$parent" 2>/dev/null; then
     early_exit=1
   else
-    printf 'release\n' >"$markers/cleanup.gate"
+    printf 'release\n' >&9
   fi
   if ! _wait_for_exit "$parent"; then
     timed_out=1
     kill -KILL "$parent" 2>/dev/null || true
   fi
   wait "$parent" || rc=$?
+  exec 9>&-
 
   [[ -f "$markers/worker.pid" ]] && worker=$(cat "$markers/worker.pid")
   [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
   _assert_eq 'cleanup unrelated signal: transaction keeps waiting' 0 "$early_exit"
   _assert_eq 'cleanup unrelated signal: original operation failure is preserved' 1 "$rc"
   _assert_eq 'cleanup unrelated signal: completion stays bounded' 0 "$timed_out"
+  _assert_file_content 'cleanup unrelated signal: removal child success is preserved' \
+    0 "$markers/cleanup-run.rc"
   _assert_not_exists 'cleanup unrelated signal: staging is removed' "$staging"
   if [[ -n "$worker" ]] && ! kill -0 "$worker" 2>/dev/null; then
     _pass 'cleanup unrelated signal: exact removal child is reaped'
@@ -1615,9 +1652,18 @@ _run_unrelated_signal_wait_case() {
   wait "$parent" || rc=$?
 
   [[ -f "$markers/worker.pid" ]] && worker=$(cat "$markers/worker.pid")
-  _assert_eq "$label: transaction does not exit from unrelated signal" 0 "$early_exit"
+  if [[ "$mode" == unrelated-signal ]]; then
+    _assert_eq "$label: transaction does not exit from unrelated signal" 0 "$early_exit"
+  fi
   _assert_eq "$label: transaction returns the child status" 0 "$rc"
   _assert_eq "$label: completion stays bounded" 0 "$timed_out"
+  if [[ "$mode" == unrelated-signal-completion ]]; then
+    if [[ -e "$markers/completion-observed" && ! -e "$markers/completion-timeout" ]]; then
+      _pass "$label: completed-child wait branch is observed"
+    else
+      _fail "$label: completed-child wait branch is observed"
+    fi
+  fi
   if [[ -n "$worker" ]] && ! kill -0 "$worker" 2>/dev/null; then
     _pass "$label: exact child is reaped"
   else

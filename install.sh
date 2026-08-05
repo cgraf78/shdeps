@@ -102,6 +102,7 @@ _install_transaction_wait_child() {
 
   while :; do
     if wait "$_shdeps_tx_child"; then
+      rc=0
       _shdeps_tx_child=""
       break
     else
@@ -916,6 +917,7 @@ _install_transaction_cleanup_run() {
   _shdeps_tx_child=$!
   while :; do
     if wait "$_shdeps_tx_child"; then
+      rc=0
       _shdeps_tx_child=""
       break
     else
