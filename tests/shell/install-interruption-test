@@ -83,6 +83,10 @@ _platform_label() {
   esac
 }
 
+_directory_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
 _sha256_line() {
   local file="$1" name="$2"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -834,6 +838,28 @@ _run_dangling_live_case() {
   _assert_not_exists 'dangling live symlink: target remains absent' "$target"
 }
 
+_run_private_directory_case() {
+  local root private install_script rc=0
+
+  root=$(_tmpdir)
+  private="$root/private"
+  install_script="$SHDEPS_DIR/install.sh"
+  SHDEPS_TEST_PRIVATE="$private" SHDEPS_TEST_INSTALL_SH="$install_script" \
+    bash -c '
+      set -u
+      export SHDEPS_INSTALL_SH_NO_DISPATCH=1
+      # shellcheck source=/dev/null
+      . "$SHDEPS_TEST_INSTALL_SH"
+      unset SHDEPS_INSTALL_SH_NO_DISPATCH
+      umask 000
+      _install_private_directory "$SHDEPS_TEST_PRIVATE"
+    ' || rc=$?
+
+  _assert_eq 'private allocation: succeeds under adverse umask' 0 "$rc"
+  _assert_eq 'private allocation: excludes group and other access' 700 \
+    "$(_directory_mode "$private")"
+}
+
 _run_success_case() {
   local root live bundle report stdout stderr driver install_script rc=0
 
@@ -1092,6 +1118,7 @@ _run_failure_case backup-race
 _run_owned_replacement_case staging-replacement bundle
 _run_owned_replacement_case scratch-replacement release
 _run_dangling_live_case
+_run_private_directory_case
 _run_success_case
 _run_latched_spawn_case
 _run_monitor_case
