@@ -719,6 +719,13 @@ _install_transaction_prepare_paths() {
   return 1
 }
 
+_install_private_directory() {
+  # These paths hold downloaded executables and the next live install. Match
+  # `mktemp -d` privacy even when the caller has an unusually permissive umask;
+  # the subshell keeps the caller's umask unchanged in sourced mode.
+  (umask 077 && mkdir "$1")
+}
+
 _install_directory_identity() {
   local path="$1" identity=""
 
@@ -1022,7 +1029,7 @@ _install_bundle_core() {
     _error "failed to create shdeps install parent at $parent"
     return 1
   fi
-  if ! mkdir "$_shdeps_tx_staging"; then
+  if ! _install_private_directory "$_shdeps_tx_staging"; then
     _error "failed to create shdeps install staging at $_shdeps_tx_staging"
     return 1
   fi
@@ -1197,7 +1204,7 @@ _install_release_core() {
   repo=$(_repo_slug)
   token=$(_github_token)
   tmp="$_shdeps_tx_release_path"
-  if ! mkdir "$tmp"; then
+  if ! _install_private_directory "$tmp"; then
     _error "failed to create release staging directory"
     return 1
   fi

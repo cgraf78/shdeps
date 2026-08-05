@@ -355,6 +355,7 @@ _write_driver() {
 set -uo pipefail
 if [[ "${SHDEPS_TEST_ERREXIT:-0}" == 1 ]]; then set -e; fi
 if [[ "${SHDEPS_TEST_MONITOR:-0}" == 1 ]]; then set -m; fi
+if [[ -n "${SHDEPS_TEST_UMASK:-}" ]]; then umask "$SHDEPS_TEST_UMASK"; fi
 
 trap 'printf "caller-hup\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' HUP
 trap 'printf "caller-int\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' INT
@@ -368,6 +369,7 @@ before_exit=$(trap -p EXIT)
 before_flags=$-
 before_options=$(set +o)
 before_cwd=$PWD
+before_umask=$(umask)
 
 SHDEPS_INSTALL_SH_NO_DISPATCH=1
 export SHDEPS_INSTALL_SH_NO_DISPATCH
@@ -409,6 +411,7 @@ after_exit=$(trap -p EXIT)
 after_flags=$-
 after_options=$(set +o)
 after_cwd=$PWD
+after_umask=$(umask)
 
 {
   printf 'rc=%s\n' "$rc"
@@ -419,6 +422,7 @@ after_cwd=$PWD
   [[ "$before_flags" == "$after_flags" ]] && printf 'flags=restored\n' || printf 'flags=changed\n'
   [[ "$before_options" == "$after_options" ]] && printf 'options=restored\n' || printf 'options=changed\n'
   [[ "$before_cwd" == "$after_cwd" ]] && printf 'cwd=restored\n' || printf 'cwd=changed\n'
+  [[ "$before_umask" == "$after_umask" ]] && printf 'umask=restored\n' || printf 'umask=changed\n'
 } >"$SHDEPS_TEST_REPORT"
 
 exit "$rc"
@@ -453,13 +457,14 @@ _tree_matches() {
 _report_is_restored() {
   local report="$1"
   [[ -f "$report" ]] || return 1
-  [[ $(sed -n 's/=restored$//p' "$report" | wc -l | tr -d ' ') == 7 ]]
+  [[ $(sed -n 's/=restored$//p' "$report" | wc -l | tr -d ' ') == 8 ]]
 }
 
 _run_interrupt_case() {
   local phase="$1" mode="$2" expected_tree="$3" signal="${4:-TERM}" errexit="${5:-0}" ignore_term="${6:-0}"
   local second_signal="${7:-}"
   local fresh="${8:-0}"
+  local check_private="${9:-0}"
   local root live bundle snapshot release markers bin tmp report stdout stderr
   local caller_signals caller_exit driver install_script parent worker unrelated rc=0 timed_out=0
   local tag platform signal_status scratch="" staging="" backup=""
@@ -545,6 +550,9 @@ _run_interrupt_case() {
     "SHDEPS_TEST_MONITOR=0"
     "SHDEPS_TEST_SIGNAL=$signal"
   )
+  if [[ "$check_private" -eq 1 ]]; then
+    case_env+=("SHDEPS_TEST_UMASK=002")
+  fi
 
   if [[ "$signal" == INT ]]; then
     env "${case_env[@]}" "$driver" >"$stdout" 2>"$stderr" || rc=$?
@@ -555,6 +563,14 @@ _run_interrupt_case() {
     case "$phase" in
       *download* | checksum | copy | extract | backup-remove)
         if _wait_for_file "$markers/ready"; then
+          if [[ "$check_private" -eq 1 ]]; then
+            case "$phase" in
+              *download*) scratch=$(cat "$markers/scratch.path") ;;
+              copy) staging=$(cat "$markers/staging.path") ;;
+            esac
+            _assert_eq "$phase: production transaction directory stays private" 700 \
+              "$(_directory_mode "${scratch:-$staging}")"
+          fi
           kill -"$signal" "$parent" 2>/dev/null || true
           if [[ -n "$second_signal" ]]; then
             if _wait_for_file "$markers/term-forwarded"; then
@@ -839,25 +855,34 @@ _run_dangling_live_case() {
 }
 
 _run_private_directory_case() {
-  local root private install_script rc=0
+  local root private umask_report install_script before_umask after_umask rc=0
 
   root=$(_tmpdir)
   private="$root/private"
+  umask_report="$root/umask"
   install_script="$SHDEPS_DIR/install.sh"
-  SHDEPS_TEST_PRIVATE="$private" SHDEPS_TEST_INSTALL_SH="$install_script" \
+  SHDEPS_TEST_PRIVATE="$private" SHDEPS_TEST_UMASK_REPORT="$umask_report" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
     bash -c '
       set -u
       export SHDEPS_INSTALL_SH_NO_DISPATCH=1
       # shellcheck source=/dev/null
       . "$SHDEPS_TEST_INSTALL_SH"
       unset SHDEPS_INSTALL_SH_NO_DISPATCH
-      umask 000
+      umask 002
+      before_umask=$(umask)
       _install_private_directory "$SHDEPS_TEST_PRIVATE"
+      after_umask=$(umask)
+      printf "%s\n%s\n" "$before_umask" "$after_umask" >"$SHDEPS_TEST_UMASK_REPORT"
     ' || rc=$?
 
   _assert_eq 'private allocation: succeeds under adverse umask' 0 "$rc"
   _assert_eq 'private allocation: excludes group and other access' 700 \
     "$(_directory_mode "$private")"
+  before_umask=$(sed -n '1p' "$umask_report")
+  after_umask=$(sed -n '2p' "$umask_report")
+  _assert_eq 'private allocation: restores the sourced caller umask exactly' \
+    "$before_umask" "$after_umask"
 }
 
 _run_success_case() {
@@ -1099,13 +1124,13 @@ _run_executed_case() {
 }
 
 echo '=== install.sh interruption transactions ==='
-_run_interrupt_case download release old TERM
+_run_interrupt_case download release old TERM 0 0 '' 0 1
 _run_interrupt_case download-ignore release old TERM 0 1
 _run_interrupt_case download-first-signal release old HUP 0 1 TERM
 _run_interrupt_case bootstrap-download bootstrap old TERM
 _run_interrupt_case bootstrap-fresh-download bootstrap none TERM 0 0 '' 1
 _run_interrupt_case checksum release old TERM
-_run_interrupt_case copy bundle old HUP 1
+_run_interrupt_case copy bundle old HUP 1 0 '' 0 1
 _run_interrupt_case extract release old
 _run_interrupt_case old-moved bundle old
 _run_interrupt_case activated bundle new
