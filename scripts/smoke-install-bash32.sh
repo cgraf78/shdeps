@@ -167,4 +167,70 @@ PATH="$_fakebin:$PATH" \
 _version=$("$_bin_dir/shdeps" version)
 [[ "$_version" == "shdeps 20990203-040506-abc12345" ]] || _die "unexpected version output: $_version"
 
-printf 'install.sh Bash %s release smoke passed\n' "$BASH_VERSION"
+# Exercise the transaction trap/rollback path under the same system Bash, not
+# only normal activation. The mv shim signals the installer after the old tree
+# has really moved aside; the transaction must restore it and return TERM while
+# leaving every caller trap and option unchanged.
+_real_mv=$(command -v mv)
+_signal_bin="$_tmp_root/signal-bin"
+_signal_log="$_tmp_root/signal.log"
+mkdir -p "$_signal_bin"
+cat >"$_signal_bin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+"$SHDEPS_TEST_REAL_MV" "$@" || exit $?
+case "$1:$2" in
+  "$SHDEPS_TEST_LIVE":*.backup)
+    : >"$SHDEPS_TEST_SIGNAL_LOG"
+    kill -TERM "$PPID"
+    ;;
+esac
+SH
+chmod +x "$_signal_bin/mv"
+
+(
+  trap 'printf caller-hup >"$_tmp_root/caller-hup"' HUP
+  trap 'printf caller-int >"$_tmp_root/caller-int"' INT
+  trap 'printf caller-term >"$_tmp_root/caller-term"' TERM
+  trap 'printf caller-exit >"$_tmp_root/caller-exit"' EXIT
+  _before_hup=$(trap -p HUP)
+  _before_int=$(trap -p INT)
+  _before_term=$(trap -p TERM)
+  _before_exit=$(trap -p EXIT)
+  _before_options=$(set +o)
+  _before_flags=$-
+  _before_cwd=$PWD
+
+  SHDEPS_INSTALL_SH_NO_DISPATCH=1
+  export SHDEPS_INSTALL_SH_NO_DISPATCH
+  # shellcheck source=/dev/null
+  . "$_installer_dir/install.sh"
+  unset SHDEPS_INSTALL_SH_NO_DISPATCH
+
+  # Sourcing install.sh initializes its public defaults. Rebind the transaction
+  # to this smoke's fixture before any helper can touch a real user install.
+  export SHDEPS_DIR="$_install_dir"
+  export SHDEPS_BIN="$_bin_dir/shdeps"
+  PATH="$_signal_bin:$PATH"
+  SHDEPS_TEST_LIVE="$_install_dir"
+  SHDEPS_TEST_REAL_MV="$_real_mv"
+  SHDEPS_TEST_SIGNAL_LOG="$_signal_log"
+  export PATH SHDEPS_TEST_LIVE SHDEPS_TEST_REAL_MV SHDEPS_TEST_SIGNAL_LOG
+  _tx_rc=0
+  _install_bundle "$_payload" || _tx_rc=$?
+
+  [[ "$_tx_rc" -eq 143 ]] || _die "Bash 3.2 transaction returned $_tx_rc instead of 143"
+  [[ -f "$_signal_log" ]] || _die "Bash 3.2 transaction did not reach the post-rename signal gate"
+  [[ "$(trap -p HUP)" == "$_before_hup" ]] || _die "Bash 3.2 transaction changed HUP trap"
+  [[ "$(trap -p INT)" == "$_before_int" ]] || _die "Bash 3.2 transaction changed INT trap"
+  [[ "$(trap -p TERM)" == "$_before_term" ]] || _die "Bash 3.2 transaction changed TERM trap"
+  [[ "$(trap -p EXIT)" == "$_before_exit" ]] || _die "Bash 3.2 transaction changed EXIT trap"
+  [[ "$(set +o)" == "$_before_options" ]] || _die "Bash 3.2 transaction changed shell options"
+  [[ "$-" == "$_before_flags" ]] || _die "Bash 3.2 transaction changed shell flags"
+  [[ "$PWD" == "$_before_cwd" ]] || _die "Bash 3.2 transaction changed cwd"
+  [[ ! -e "$_tmp_root/caller-term" ]] || _die "Bash 3.2 transaction invoked caller TERM trap"
+  [[ "$("$_install_dir/shdeps" version)" == "shdeps 20990203-040506-abc12345" ]] ||
+    _die "Bash 3.2 transaction did not restore the old install"
+)
+
+printf 'install.sh Bash %s release and transaction smoke passed\n' "$BASH_VERSION"

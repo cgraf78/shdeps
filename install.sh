@@ -16,7 +16,9 @@
 
 # Strict mode when executed directly; skip when sourced (--bootstrap)
 # to avoid infecting the caller's shell options.
+_SHDEPS_INSTALL_EXECUTED=0
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _SHDEPS_INSTALL_EXECUTED=1
   set -euo pipefail
 fi
 
@@ -31,6 +33,134 @@ SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
 
 _info() { printf '%s\n' "$*" >&2; }
 _error() { printf 'error: %s\n' "$*" >&2; }
+
+_is_cancel_status() {
+  case "${1:-0}" in
+    129 | 130 | 143) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Record the first transaction signal and cooperatively stop its exact active
+# child. The normal control path owns bounded escalation, reaping, and cleanup.
+_install_transaction_signal() {
+  local signal="$1" status
+
+  case "$signal" in
+    HUP) status=129 ;;
+    INT) status=130 ;;
+    TERM) status=143 ;;
+    *) return 0 ;;
+  esac
+  if [[ "${_shdeps_tx_signal:-0}" -eq 0 ]]; then
+    _shdeps_tx_signal="$status"
+    if [[ -n "${_shdeps_tx_child:-}" ]]; then
+      kill -TERM "$_shdeps_tx_child" 2>/dev/null || true
+    fi
+  fi
+}
+
+_install_transaction_job_running() {
+  local wanted="$1" pid
+
+  while IFS= read -r pid; do
+    [[ "$pid" == "$wanted" ]] && return 0
+  done < <(jobs -pr)
+  return 1
+}
+
+# TERM/KILL and reap the still-owned child after a signal interrupted wait.
+_install_transaction_cancel_child() {
+  local remaining=50
+
+  [[ -n "${_shdeps_tx_child:-}" ]] || return 0
+  if _install_transaction_job_running "$_shdeps_tx_child"; then
+    kill -TERM "$_shdeps_tx_child" 2>/dev/null || true
+    while ((remaining > 0)); do
+      _install_transaction_job_running "$_shdeps_tx_child" || break
+      sleep 0.02
+      remaining=$((remaining - 1))
+    done
+    if _install_transaction_job_running "$_shdeps_tx_child"; then
+      kill -KILL "$_shdeps_tx_child" 2>/dev/null || true
+    fi
+  fi
+  wait "$_shdeps_tx_child" 2>/dev/null || true
+  _shdeps_tx_child=""
+}
+
+# Preserve a normal child failure, but give a latched signal precedence after
+# cancelling and reaping any child whose wait was interrupted.
+_install_transaction_wait_child() {
+  local rc=0
+
+  if wait "$_shdeps_tx_child"; then
+    _shdeps_tx_child=""
+  else
+    rc=$?
+    if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+      _install_transaction_cancel_child
+      return "$_shdeps_tx_signal"
+    fi
+    _shdeps_tx_child=""
+    return "$rc"
+  fi
+  if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+    return "$_shdeps_tx_signal"
+  fi
+}
+
+# Run one exact external child. A trapped signal interrupts wait immediately;
+# the unreaped PID remains owned until bounded cancellation completes.
+_install_transaction_run() {
+  "$@" &
+  _shdeps_tx_child=$!
+  _install_transaction_wait_child
+}
+
+_install_transaction_run_to_file() {
+  local output="$1"
+  shift
+  "$@" >"$output" &
+  _shdeps_tx_child=$!
+  _install_transaction_wait_child
+}
+
+_install_transaction_run_with_input() {
+  local input="$1"
+  shift
+  "$@" <<<"$input" &
+  _shdeps_tx_child=$!
+  _install_transaction_wait_child
+}
+
+_install_run() {
+  if [[ "${_shdeps_tx_active:-0}" -eq 1 ]]; then
+    _install_transaction_run "$@"
+  else
+    "$@"
+  fi
+}
+
+_install_run_to_file() {
+  local output="$1"
+  shift
+  if [[ "${_shdeps_tx_active:-0}" -eq 1 ]]; then
+    _install_transaction_run_to_file "$output" "$@"
+  else
+    "$@" >"$output"
+  fi
+}
+
+_install_run_with_input() {
+  local input="$1"
+  shift
+  if [[ "${_shdeps_tx_active:-0}" -eq 1 ]]; then
+    _install_transaction_run_with_input "$input" "$@"
+  else
+    "$@" <<<"$input"
+  fi
+}
 
 _bash_supports_sourceable_wrapper() {
   ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3)))
@@ -78,18 +208,21 @@ _release_binary_supports_wrapper_abi() {
 }
 
 _repair_release_if_needed() {
-  local dir="$1"
+  local dir="$1" rc=0
 
   _is_release_install_dir "$dir" || return 0
   if ! _release_binary_supports_wrapper_abi "$dir"; then
     # Unlike a normal forced freshness check, this archive cannot service the
     # wrapper at all. Do not fall through and emit a misleading ABI error after
     # a failed repair download.
-    _install_release >/dev/null 2>&1 || return 1
+    _install_release >/dev/null 2>&1 || rc=$?
+    if _is_cancel_status "$rc"; then return "$rc"; fi
+    [[ "$rc" -eq 0 ]] || return 1
   elif [[ "${SHDEPS_FORCE:-0}" == 1 ]]; then
     # Preserve the existing best-effort force behavior: a transient GitHub
     # failure must not disable an otherwise compatible local release.
-    _install_release >/dev/null 2>&1 || true
+    _install_release >/dev/null 2>&1 || rc=$?
+    if _is_cancel_status "$rc"; then return "$rc"; fi
   fi
 }
 
@@ -138,7 +271,7 @@ _github_token() {
 }
 
 _curl_get() {
-  local url="$1" out="$2" token="${3:-}"
+  local url="$1" out="$2" token="${3:-}" config
   case "$url" in
     https://api.github.com/*)
       if [[ -n "$token" ]]; then
@@ -152,26 +285,26 @@ _curl_get() {
         local _url_escaped _token_escaped
         _url_escaped=$(_curl_config_quote "$url")
         _token_escaped=$(_curl_config_quote "$token")
-        {
-          printf 'url = "%s"\n' "$_url_escaped"
-          printf 'user-agent = "shdeps"\n'
-          printf 'header = "Accept: application/vnd.github+json"\n'
-          printf 'header = "Authorization: Bearer %s"\n' "$_token_escaped"
-        } | curl -fsSL --config - -o "$out"
+        printf -v config '%s\n%s\n%s\n%s\n' \
+          "url = \"$_url_escaped\"" \
+          'user-agent = "shdeps"' \
+          'header = "Accept: application/vnd.github+json"' \
+          "header = \"Authorization: Bearer $_token_escaped\""
+        _install_run_with_input "$config" curl -fsSL --config - -o "$out"
         return
       fi
       # No token: a plain header on argv is harmless (nothing secret).
-      curl -fsSL -A shdeps -H "Accept: application/vnd.github+json" -o "$out" "$url"
+      _install_run curl -fsSL -A shdeps -H "Accept: application/vnd.github+json" -o "$out" "$url"
       ;;
     *)
-      curl -fsSL -A shdeps -o "$out" "$url"
+      _install_run curl -fsSL -A shdeps -o "$out" "$url"
       ;;
   esac
 }
 
 _curl_get_release_asset() {
   local browser_url="$1" out="$2" token="${3:-}" api_url="${4:-}"
-  local have_api_fallback=0
+  local config have_api_fallback=0
   if [[ -n "$token" && -n "$api_url" ]]; then
     have_api_fallback=1
   fi
@@ -239,12 +372,12 @@ _curl_get_release_asset() {
   # `\` and `"` backslash-escaped per curl's config syntax.
   _bearer_token_escaped=$(_curl_config_quote "$token")
   _api_url_escaped=$(_curl_config_quote "$api_url")
-  {
-    printf 'url = "%s"\n' "$_api_url_escaped"
-    printf 'user-agent = "shdeps"\n'
-    printf 'header = "Accept: application/octet-stream"\n'
-    printf 'header = "Authorization: Bearer %s"\n' "$_bearer_token_escaped"
-  } | curl -fsSL --config - -o "$out"
+  printf -v config '%s\n%s\n%s\n%s\n' \
+    "url = \"$_api_url_escaped\"" \
+    'user-agent = "shdeps"' \
+    'header = "Accept: application/octet-stream"' \
+    "header = \"Authorization: Bearer $_bearer_token_escaped\""
+  _install_run_with_input "$config" curl -fsSL --config - -o "$out"
 }
 
 # Escape a value for inclusion inside a `"..."`-quoted curl
@@ -365,14 +498,25 @@ _asset_api_url() {
 }
 
 _latest_release_tag() {
-  local repo="$1" effective tag
+  local repo="$1" effective tag output
 
   # The default shdeps repo is public, so bootstrap should not burn scarce
   # unauthenticated GitHub API quota just to learn the current tag. The normal
   # release page redirects to `/releases/tag/<tag>` and works for curl-pipe
   # installs without requiring `gh`, JSON parsing, or a token.
-  effective=$(curl -fsSL -A shdeps -o /dev/null -w '%{url_effective}' \
-    "https://github.com/$repo/releases/latest") || return 1
+  if [[ "${_shdeps_tx_active:-0}" -eq 1 ]]; then
+    output="$_shdeps_tx_release_path/latest-url"
+    if ! _install_run_to_file "$output" curl -fsSL -A shdeps -o /dev/null \
+      -w '%{url_effective}' "https://github.com/$repo/releases/latest"; then
+      rm -f "$output"
+      return 1
+    fi
+    effective=$(cat "$output")
+    rm -f "$output"
+  else
+    effective=$(curl -fsSL -A shdeps -o /dev/null -w '%{url_effective}' \
+      "https://github.com/$repo/releases/latest") || return 1
+  fi
   case "$effective" in
     */releases/tag/*) ;;
     *) return 1 ;;
@@ -380,7 +524,7 @@ _latest_release_tag() {
   tag="${effective##*/releases/tag/}"
   tag="${tag%%[?#]*}"
   [[ -n "$tag" ]] || return 1
-  printf '%s\n' "$tag"
+  _SHDEPS_LATEST_RELEASE_TAG="$tag"
 }
 
 _verify_checksum() {
@@ -448,19 +592,23 @@ _verify_checksum() {
 # before extraction, but the link rejection here means parity no longer
 # depends on the publisher's `.sha256` being uncompromised.
 _archive_entries_safe() {
-  local archive="$1" entry
+  local archive="$1" entry names verbose
   if ! command -v tar >/dev/null 2>&1; then
     return 1
   fi
+  names="${archive}.entries"
+  verbose="${archive}.verbose"
   # Pass 1: reject absolute paths and `..` traversal. Run on the clean
   # name-only listing so the well-tested traversal globs operate on bare
-  # names rather than verbose rows. Process substitution surfaces a
-  # non-zero `tar -tzf` exit (corrupt archive, IO error) as unsafe.
+  # names rather than verbose rows. Capture the listing through the transaction
+  # runner so a large archive remains interruptible and a non-zero `tar -tzf`
+  # exit (corrupt archive, IO error) is surfaced as unsafe.
   #
   # `*../*` covers `..` as any path component (`a/../b`, `./../b`);
   # `*/..` and `..` catch the trailing/standalone cases. Together they
   # reject every shell-glob representation of a traversal segment without
   # a full path canonicalizer.
+  _install_run_to_file "$names" tar -tzf "$archive" 2>/dev/null || return 1
   while IFS= read -r entry; do
     case "$entry" in
       /*) return 1 ;;
@@ -468,147 +616,331 @@ _archive_entries_safe() {
       */..) return 1 ;;
       ..) return 1 ;;
     esac
-  done < <(tar -tzf "$archive" 2>/dev/null) || return 1
+  done <"$names"
 
   # Pass 2: reject symlink and hardlink entries. `tar -tzf` lists only
   # names, so a verbose listing is required to see entry types. The
   # leading character of the mode column is `l` for symlinks and `h` for
   # hardlinks on both GNU and BSD tar; reject either.
+  _install_run_to_file "$verbose" tar -tzvf "$archive" 2>/dev/null || return 1
   while IFS= read -r entry; do
     case "${entry:0:1}" in
       l | h) return 1 ;;
     esac
-  done < <(tar -tzvf "$archive" 2>/dev/null) || return 1
+  done <"$verbose"
   return 0
 }
 
 _install_release_fail() {
-  local tmp="$1" kind="$2" message="$3"
+  local kind="$1" message="$2"
 
-  # Release downloads happen before any live install is touched. Clean the
-  # scratch tree on every pre-activation failure so repeated curl-pipe attempts
-  # do not accumulate stale archives or make a later diagnostic ambiguous.
+  # The surrounding transaction owns scratch cleanup. This helper only records
+  # a stable failure class and renders the user-facing diagnostic.
   _SHDEPS_RELEASE_FAILURE_KIND="$kind"
-  if [[ -n "$tmp" ]]; then
-    rm -rf "$tmp"
-  fi
   _error "$message"
   return 1
 }
 
-# Restore a moved-aside install and discard the staging tree. Shared by the
-# rollback trap and the failed-activation path in `_install_bundle` so the two
-# restore sequences cannot drift. `$backup` may be empty when no prior install
-# was moved aside, in which case only the staging tree is removed.
-_rollback_install() {
-  local backup="$1" staging="$2"
-  if [[ -n "$backup" ]]; then
-    mv "$backup" "$SHDEPS_DIR" 2>/dev/null || true
+_install_transaction_restore_trap() {
+  local saved="$1" signal="$2"
+
+  if [[ -n "$saved" ]]; then
+    eval "$saved"
+  else
+    trap - "$signal"
   fi
-  rm -rf "$staging"
 }
 
-_install_bundle() {
-  local src_dir="$1" parent staging backup=""
+_install_transaction_restore_traps() {
+  _install_transaction_restore_trap "$_shdeps_tx_saved_hup" HUP
+  _install_transaction_restore_trap "$_shdeps_tx_saved_int" INT
+  _install_transaction_restore_trap "$_shdeps_tx_saved_term" TERM
+  if [[ "$_SHDEPS_INSTALL_EXECUTED" -eq 1 ]]; then
+    trap - EXIT
+  fi
+}
 
-  if [[ -e "$SHDEPS_DIR" ]]; then
+_install_transaction_prepare_paths() {
+  local mode="$1" parent tmp_root candidate attempt=0
+
+  parent=$(dirname "$SHDEPS_DIR")
+  tmp_root=${TMPDIR:-/tmp}
+  while ((attempt < 20)); do
+    candidate="$$.$RANDOM.$RANDOM"
+    _shdeps_tx_staging="$parent/.shdeps-install.$candidate"
+    _shdeps_tx_backup="$_shdeps_tx_staging.backup"
+    if [[ "$mode" == release ]]; then
+      _shdeps_tx_release_path="$tmp_root/shdeps-release.$candidate"
+    else
+      _shdeps_tx_release_path=""
+    fi
+    if [[ ! -e "$_shdeps_tx_staging" && ! -L "$_shdeps_tx_staging" &&
+      ! -e "$_shdeps_tx_backup" && ! -L "$_shdeps_tx_backup" ]]; then
+      [[ -z "$_shdeps_tx_release_path" ]] && return 0
+      [[ ! -e "$_shdeps_tx_release_path" && ! -L "$_shdeps_tx_release_path" ]] && return 0
+    fi
+    attempt=$((attempt + 1))
+  done
+  _error "failed to reserve unique shdeps install paths"
+  return 1
+}
+
+_install_directory_identity() {
+  local path="$1" identity=""
+
+  identity=$(stat -c '%d:%i' "$path" 2>/dev/null) ||
+    identity=$(stat -f '%d:%i' "$path" 2>/dev/null) || return 1
+  [[ -n "$identity" ]] || return 1
+  printf '%s\n' "$identity"
+}
+
+_install_transaction_reconcile() {
+  local live_identity=""
+
+  if [[ -n "$_shdeps_tx_staging_identity" && -d "$SHDEPS_DIR" &&
+    ! -e "$_shdeps_tx_staging" && ! -L "$_shdeps_tx_staging" ]]; then
+    live_identity=$(_install_directory_identity "$SHDEPS_DIR" 2>/dev/null || true)
+    if [[ "$live_identity" == "$_shdeps_tx_staging_identity" ]] &&
+      _is_bundle_dir "$SHDEPS_DIR"; then
+      _shdeps_tx_state=ACTIVE
+      return 0
+    fi
+  fi
+  if [[ "$_shdeps_tx_backup_owned" -eq 1 && ! -e "$SHDEPS_DIR" && ! -L "$SHDEPS_DIR" ]] &&
+    [[ -e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup" ]]; then
+    _shdeps_tx_state=OLD_MOVED
+  else
+    _shdeps_tx_state=PREPARED
+  fi
+}
+
+# Cleanup commands are allowed after the signal latch is set. They still use an
+# exact child so a repeated signal cannot strand an unowned removal process.
+_install_transaction_cleanup_run() {
+  local rc=0
+
+  "$@" &
+  _shdeps_tx_child=$!
+  if wait "$_shdeps_tx_child"; then
+    _shdeps_tx_child=""
+    return 0
+  fi
+  rc=$?
+  if _install_transaction_job_running "$_shdeps_tx_child"; then
+    _install_transaction_cancel_child
+  else
+    _shdeps_tx_child=""
+  fi
+  return "$rc"
+}
+
+_install_transaction_remove_owned() {
+  local path="$1" label="$2"
+
+  [[ -e "$path" || -L "$path" ]] || return 0
+  if ! _install_transaction_cleanup_run rm -rf -- "$path"; then
+    _error "failed to remove $label at $path"
+    return 1
+  fi
+  if [[ -e "$path" || -L "$path" ]]; then
+    _error "failed to remove $label at $path"
+    return 1
+  fi
+}
+
+_install_transaction_cleanup() {
+  local failed=0
+
+  [[ "${_shdeps_tx_cleanup_done:-0}" -eq 0 ]] || return "$_shdeps_tx_cleanup_failed"
+  _install_transaction_cancel_child
+  _install_transaction_reconcile
+
+  case "$_shdeps_tx_state" in
+    ACTIVE)
+      if [[ "$_shdeps_tx_backup_owned" -eq 1 ]] &&
+        ! _install_transaction_remove_owned "$_shdeps_tx_backup" "superseded shdeps backup"; then
+        failed=1
+      else
+        _shdeps_tx_backup_owned=0
+      fi
+      ;;
+    OLD_MOVED)
+      if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
+        _error "cannot restore shdeps backup because $SHDEPS_DIR unexpectedly exists"
+        failed=1
+      elif mv "$_shdeps_tx_backup" "$SHDEPS_DIR"; then
+        _shdeps_tx_backup_owned=0
+      else
+        _error "failed to restore shdeps; recoverable backup retained at $_shdeps_tx_backup"
+        failed=1
+      fi
+      ;;
+    PREPARED)
+      if [[ "$_shdeps_tx_backup_owned" -eq 1 ]] &&
+        [[ -e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup" ]]; then
+        _error "cannot restore shdeps backup because $SHDEPS_DIR appeared before activation; recoverable backup retained at $_shdeps_tx_backup"
+        failed=1
+      fi
+      ;;
+  esac
+
+  if [[ "$_shdeps_tx_staging_owned" -eq 1 ]] &&
+    ! _install_transaction_remove_owned "$_shdeps_tx_staging" "shdeps install staging"; then
+    failed=1
+  fi
+  if [[ "$_shdeps_tx_release_owned" -eq 1 ]] &&
+    ! _install_transaction_remove_owned "$_shdeps_tx_release_path" "shdeps release scratch"; then
+    failed=1
+  fi
+  _shdeps_tx_cleanup_failed="$failed"
+  _shdeps_tx_cleanup_done=1
+  [[ "$failed" -eq 0 ]] && _shdeps_tx_state=DONE
+  return "$failed"
+}
+
+_install_transaction_exit() {
+  local status="$1"
+
+  _install_transaction_cleanup || true
+  _install_transaction_restore_traps
+  exit "$status"
+}
+
+_install_transaction() {
+  local mode="$1" src_dir="${2:-}" rc=0 cleanup_rc=0
+  local _shdeps_tx_active=1 _shdeps_tx_signal=0 _shdeps_tx_child=""
+  local _shdeps_tx_state=PREPARED _shdeps_tx_staging="" _shdeps_tx_backup=""
+  local _shdeps_tx_release_path="" _shdeps_tx_staging_identity=""
+  local _shdeps_tx_staging_owned=0 _shdeps_tx_backup_owned=0
+  local _shdeps_tx_release_owned=0 _shdeps_tx_cleanup_done=0
+  local _shdeps_tx_cleanup_failed=0
+  local _shdeps_tx_saved_hup _shdeps_tx_saved_int _shdeps_tx_saved_term
+
+  _install_transaction_prepare_paths "$mode" || return 1
+  _shdeps_tx_saved_hup=$(trap -p HUP)
+  _shdeps_tx_saved_int=$(trap -p INT)
+  _shdeps_tx_saved_term=$(trap -p TERM)
+  trap '_install_transaction_signal HUP' HUP
+  trap '_install_transaction_signal INT' INT
+  trap '_install_transaction_signal TERM' TERM
+  if [[ "$_SHDEPS_INSTALL_EXECUTED" -eq 1 ]]; then
+    trap '_install_transaction_exit "$?"' EXIT
+  fi
+
+  if [[ "$mode" == release ]]; then
+    _install_release_core || rc=$?
+  else
+    _install_bundle_core "$src_dir" || rc=$?
+  fi
+  _install_transaction_cleanup || cleanup_rc=$?
+  if [[ "$_shdeps_tx_signal" -ne 0 ]]; then
+    rc=$_shdeps_tx_signal
+  elif [[ "$cleanup_rc" -ne 0 ]]; then
+    rc=1
+  fi
+  _install_transaction_restore_traps
+  return "$rc"
+}
+
+_install_bundle_core() {
+  local src_dir="$1" parent name rc=0
+  local -a files dirs
+
+  if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
     if [[ -d "$SHDEPS_DIR/.git" ]]; then
       if ! _release_can_replace_source_checkout "$SHDEPS_DIR"; then
         return 1
       fi
-      backup="${SHDEPS_DIR}.shdeps-backup.$$"
     elif ! _is_release_install_dir "$SHDEPS_DIR"; then
       _error "$SHDEPS_DIR exists but is not a shdeps release install"
       return 1
-    else
-      backup="${SHDEPS_DIR}.shdeps-backup.$$"
     fi
   fi
 
   parent=$(dirname "$SHDEPS_DIR")
-  mkdir -p "$parent"
-  staging=$(mktemp -d "$parent/.shdeps-install.XXXXXX")
+  if ! mkdir -p "$parent"; then
+    _error "failed to create shdeps install parent at $parent"
+    return 1
+  fi
+  if ! mkdir "$_shdeps_tx_staging"; then
+    _error "failed to create shdeps install staging at $_shdeps_tx_staging"
+    return 1
+  fi
+  _shdeps_tx_staging_owned=1
 
   # Release archives are already verified before users run their bundled
   # installer, but filesystem activation can still fail. Copy into a sibling
   # staging directory first so an interrupted or full-disk install does not
   # leave SHDEPS_DIR looking usable while missing the wrapper or metadata.
   #
-  # Keep the copy in a subshell so required-file failures are contained and can
-  # be cleaned up before activation. Do not rely on `set -e` here: Bash disables
-  # errexit in several conditional contexts, and this subshell is intentionally
-  # tested by `if ! (...)`. Explicit exits keep Bash 3.2-era installers honest.
-  if ! (
-    cp -p "$src_dir/shdeps" "$staging/shdeps" || exit 1
-    cp -p "$src_dir/shdeps.sh" "$staging/shdeps.sh" || exit 1
-    cp -p "$src_dir/install.sh" "$staging/install.sh" || exit 1
-    cp -p "$src_dir/.shdeps-install.json" "$staging/.shdeps-install.json" || exit 1
-    if [[ -f "$src_dir/README.md" ]]; then
-      cp -p "$src_dir/README.md" "$staging/README.md" || exit 1
-    fi
-    if [[ -f "$src_dir/LICENSE" ]]; then
-      cp -p "$src_dir/LICENSE" "$staging/LICENSE" || exit 1
-    fi
-    if [[ -d "$src_dir/man" ]]; then
-      cp -R "$src_dir/man" "$staging/" || exit 1
-    fi
-    if [[ -d "$src_dir/completions" ]]; then
-      cp -R "$src_dir/completions" "$staging/" || exit 1
-    fi
-    if [[ -d "$src_dir/lua" ]]; then
-      cp -R "$src_dir/lua" "$staging/" || exit 1
-    fi
-  ); then
-    rm -rf "$staging"
-    return 1
+  # Keep files and directories in two portable cp batches so each potentially
+  # long copy remains one exact owned child without paying one fork/wait per
+  # bundle entry. Separate batches preserve the prior -p versus -R semantics.
+  files=(
+    "$src_dir/shdeps"
+    "$src_dir/shdeps.sh"
+    "$src_dir/install.sh"
+    "$src_dir/.shdeps-install.json"
+  )
+  for name in README.md LICENSE; do
+    [[ -f "$src_dir/$name" ]] && files[${#files[@]}]="$src_dir/$name"
+  done
+  dirs=()
+  for name in man completions lua; do
+    [[ -d "$src_dir/$name" ]] && dirs[${#dirs[@]}]="$src_dir/$name"
+  done
+  _install_run cp -p "${files[@]}" "$_shdeps_tx_staging/" || return $?
+  if ((${#dirs[@]} > 0)); then
+    _install_run cp -R "${dirs[@]}" "$_shdeps_tx_staging/" || return $?
   fi
-  if [[ -n "$backup" ]]; then
-    # Existing release installs are owned by shdeps, but still treat
-    # replacement as a transaction. Move the old tree aside only after the new
-    # payload is complete, then restore it if the final activation rename
-    # fails. Git checkouts and unknown/manual dirs are rejected above because
-    # automatic release conversion needs a separate migration path.
-    #
-    # Trap INT/TERM/HUP around the rename window so a Ctrl-C in the
-    # exact moment between `mv SHDEPS_DIR backup` and `mv staging
-    # SHDEPS_DIR` does not strand the user with `SHDEPS_DIR` missing
-    # and a backup directory the next bootstrap does not understand.
-    # The handler restores the backup (best-effort), cleans the
-    # staging tree, and re-raises the signal so the shell exits with
-    # the conventional 128+signal code instead of silently swallowing
-    # the interruption.
-    # Double-quoted trap body is intentional here: we want `$backup`
-    # and `$staging` baked in at trap-set time so the handler is robust
-    # against later reassignment. shellcheck SC2064 flags this as a
-    # maintenance concern; the trade-off is acceptable for this single
-    # signal-handling site. The restore itself goes through
-    # `_rollback_install` so the trap and the failed-activation path
-    # below share one implementation.
-    # shellcheck disable=SC2064
-    trap "_rollback_install \"$backup\" \"$staging\"; trap - INT TERM HUP; kill -INT \$\$ 2>/dev/null || exit 130" INT TERM HUP
-    if ! mv "$SHDEPS_DIR" "$backup"; then
-      # The backup move itself failed, so SHDEPS_DIR is still in place and
-      # there is nothing to restore — just disarm and drop the staging tree.
-      trap - INT TERM HUP
-      rm -rf "$staging"
+
+  _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || {
+    _error "failed to identify shdeps install staging"
+    return 1
+  }
+
+  if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
+    if [[ -e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup" ]]; then
+      _error "shdeps backup path appeared before activation: $_shdeps_tx_backup"
       return 1
     fi
+    _shdeps_tx_backup_owned=1
+    if mv "$SHDEPS_DIR" "$_shdeps_tx_backup"; then rc=0; else rc=$?; fi
+    _install_transaction_reconcile
+    if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
+    if [[ "$rc" -ne 0 ]]; then return "$rc"; fi
   fi
-  if ! mv "$staging" "$SHDEPS_DIR"; then
-    if [[ -n "$backup" ]]; then
-      trap - INT TERM HUP
+
+  if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
+    if [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
+      _error "$SHDEPS_DIR appeared before activation; recoverable backup retained at $_shdeps_tx_backup"
+    else
+      _error "$SHDEPS_DIR appeared before activation; refusing to replace it"
     fi
-    _rollback_install "$backup" "$staging"
     return 1
   fi
-  if [[ -n "$backup" ]]; then
-    # New install activated. Disarm the rollback trap before cleaning
-    # the backup so a Ctrl-C during backup removal does not try to
-    # restore from a directory we are deliberately deleting.
-    trap - INT TERM HUP
-    rm -rf "$backup"
+  if mv "$_shdeps_tx_staging" "$SHDEPS_DIR"; then rc=0; else rc=$?; fi
+  _install_transaction_reconcile
+  if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
+  if [[ "$_shdeps_tx_state" != ACTIVE ]]; then
+    [[ "$rc" -ne 0 ]] && return "$rc"
+    _error "activated shdeps install failed identity or bundle validation"
+    return 1
+  fi
+
+  if [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
+    _install_run rm -rf -- "$_shdeps_tx_backup" || return $?
+    if [[ -e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup" ]]; then
+      _error "failed to remove superseded shdeps backup at $_shdeps_tx_backup"
+      return 1
+    fi
+    _shdeps_tx_backup_owned=0
   fi
   _info "shdeps: installed"
+}
+
+_install_bundle() {
+  _install_transaction bundle "$1"
 }
 
 _release_can_replace_source_checkout() {
@@ -679,29 +1011,32 @@ _cleanup_installed_state_for_source_checkout() {
   fi
 }
 
-_install_release() {
+_install_release_core() {
   local platform repo api_url token tmp json tag archive checksum
   local archive_url checksum_url archive_api_url checksum_api_url bundle
+  local _SHDEPS_LATEST_RELEASE_TAG=""
   _SHDEPS_RELEASE_FAILURE_KIND=""
   platform=$(_release_platform) || return 1
   repo=$(_repo_slug)
   token=$(_github_token)
-  tmp=$(mktemp -d) || {
+  tmp="$_shdeps_tx_release_path"
+  if ! mkdir "$tmp"; then
     _error "failed to create release staging directory"
     return 1
-  }
+  fi
+  _shdeps_tx_release_owned=1
   json="$tmp/release.json"
 
   if [[ -n "${SHDEPS_RELEASE_API_URL:-}" ]]; then
     api_url="$SHDEPS_RELEASE_API_URL"
     if ! _curl_get "$api_url" "$json" "$token"; then
-      _install_release_fail "$tmp" "download" "failed to fetch shdeps release metadata"
+      _install_release_fail "download" "failed to fetch shdeps release metadata"
       return 1
     fi
 
     tag=$(_json_string "$json" "tag_name")
     if [[ -z "$tag" ]]; then
-      _install_release_fail "$tmp" "metadata" "release metadata did not contain tag_name"
+      _install_release_fail "metadata" "release metadata did not contain tag_name"
       return 1
     fi
 
@@ -712,7 +1047,7 @@ _install_release() {
     archive_api_url=$(_asset_api_url "$json" "$archive")
     checksum_api_url=$(_asset_api_url "$json" "$checksum")
     if [[ -z "$archive_url" || -z "$checksum_url" ]]; then
-      _install_release_fail "$tmp" "metadata" "release $tag does not contain assets for $platform"
+      _install_release_fail "metadata" "release $tag does not contain assets for $platform"
       return 1
     fi
   else
@@ -720,10 +1055,11 @@ _install_release() {
     # GitHub release redirect and construct canonical asset URLs. This avoids
     # unauthenticated API rate limits during fleet bootstrap while keeping the
     # archive/checksum contract explicit and easy to inspect.
-    tag=$(_latest_release_tag "$repo") || {
-      _install_release_fail "$tmp" "download" "failed to resolve latest shdeps release"
+    if ! _latest_release_tag "$repo"; then
+      _install_release_fail "download" "failed to resolve latest shdeps release"
       return 1
-    }
+    fi
+    tag="$_SHDEPS_LATEST_RELEASE_TAG"
     archive="shdeps-${tag}-${platform}.tar.gz"
     checksum="${archive}.sha256"
     archive_url="https://github.com/$repo/releases/download/$tag/$archive"
@@ -737,21 +1073,21 @@ _install_release() {
   fi
 
   if ! _curl_get_release_asset "$archive_url" "$tmp/$archive" "$token" "$archive_api_url"; then
-    _install_release_fail "$tmp" "download" "failed to download $archive"
+    _install_release_fail "download" "failed to download $archive"
     return 1
   fi
   if ! _curl_get_release_asset "$checksum_url" "$tmp/$checksum" "$token" "$checksum_api_url"; then
-    _install_release_fail "$tmp" "download" "failed to download $checksum"
+    _install_release_fail "download" "failed to download $checksum"
     return 1
   fi
   if ! _verify_checksum "$tmp" "$archive" "$checksum" >/dev/null; then
-    _install_release_fail "$tmp" "artifact" "checksum verification failed for $archive"
+    _install_release_fail "artifact" "checksum verification failed for $archive"
     return 1
   fi
 
   bundle="$tmp/bundle"
   if ! mkdir -p "$bundle"; then
-    _install_release_fail "$tmp" "artifact" "failed to create release bundle directory"
+    _install_release_fail "artifact" "failed to create release bundle directory"
     return 1
   fi
   # Tar traversal hardening: list the archive contents before extracting
@@ -762,18 +1098,21 @@ _install_release() {
   # (`archive.rs`) does the same check at a higher level; this is the
   # bootstrap-side equivalent for the curl-pipe install path.
   if ! _archive_entries_safe "$tmp/$archive"; then
-    _install_release_fail "$tmp" "artifact" "refusing to extract $archive: contains absolute or traversal paths"
+    _install_release_fail "artifact" "refusing to extract $archive: contains absolute or traversal paths"
     return 1
   fi
-  if ! tar -xzf "$tmp/$archive" -C "$bundle"; then
-    _install_release_fail "$tmp" "artifact" "failed to extract $archive"
+  if ! _install_run tar -xzf "$tmp/$archive" -C "$bundle"; then
+    _install_release_fail "artifact" "failed to extract $archive"
     return 1
   fi
-  if ! _install_bundle "$bundle"; then
-    _install_release_fail "$tmp" "artifact" "failed to install $archive"
+  if ! _install_bundle_core "$bundle"; then
+    _install_release_fail "artifact" "failed to install $archive"
     return 1
   fi
-  rm -rf "$tmp"
+}
+
+_install_release() {
+  _install_transaction release
 }
 
 _ensure_source_checkout_binary() {
@@ -918,17 +1257,19 @@ _activate_installed_tree() {
 # ---------------------------------------------------------------------------
 
 _install() {
-  local script_dir
+  local script_dir rc=0
   script_dir=$(_script_dir) || exit 1
 
   if _is_bundle_dir "$script_dir"; then
-    _install_bundle "$script_dir" || exit 1
+    _install_bundle "$script_dir" || rc=$?
+    [[ "$rc" -eq 0 ]] || exit "$rc"
     _activate_installed_tree "$SHDEPS_DIR"
     return
   fi
 
   if _uses_default_repo_slug && ! _is_source_checkout_dir "$script_dir"; then
-    _install_release || exit 1
+    _install_release || rc=$?
+    [[ "$rc" -eq 0 ]] || exit "$rc"
     _activate_installed_tree "$SHDEPS_DIR"
     return
   fi
@@ -1000,7 +1341,7 @@ _bootstrap() {
   # Idempotent — skip if already bootstrapped
   declare -f shdeps_update &>/dev/null && return 0
 
-  local _bs_lib="" _bs_dir="" _bs_release_install=0
+  local _bs_lib="" _bs_dir="" _bs_release_install=0 _bs_rc=0
   local _dev_dir="${SHDEPS_GIT_DEV_DIR:-$HOME/git}"
 
   # Find shdeps.sh: installed-tree env hint → env override → dev clone →
@@ -1010,9 +1351,12 @@ _bootstrap() {
   # be migrated from source checkout to release assets.
   if _bootstrap_lib_is_installed_tree; then
     if _uses_default_repo_slug && [[ -d "$SHDEPS_DIR/.git" ]]; then
-      _install_release >/dev/null 2>&1 || true
+      _install_release >/dev/null 2>&1 || _bs_rc=$?
+      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
     else
-      _repair_release_if_needed "$SHDEPS_DIR" || return 1
+      _repair_release_if_needed "$SHDEPS_DIR" || _bs_rc=$?
+      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
+      [[ "$_bs_rc" -eq 0 ]] || return 1
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
@@ -1029,9 +1373,14 @@ _bootstrap() {
       # dev workspace, so prefer the release archive now that one exists. Keep
       # this opportunistic: failed downloads, dirty checkouts, or unsupported
       # platforms fall through to the source path so bootstrap still converges.
-      _install_release >/dev/null 2>&1 || true
+      _bs_rc=0
+      _install_release >/dev/null 2>&1 || _bs_rc=$?
+      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
     else
-      _repair_release_if_needed "$SHDEPS_DIR" || return 1
+      _bs_rc=0
+      _repair_release_if_needed "$SHDEPS_DIR" || _bs_rc=$?
+      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
+      [[ "$_bs_rc" -eq 0 ]] || return 1
     fi
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
@@ -1042,6 +1391,8 @@ _bootstrap() {
       _bs_lib="$SHDEPS_DIR/shdeps.sh"
       _bs_dir="$SHDEPS_DIR"
     else
+      _bs_rc=$?
+      if _is_cancel_status "$_bs_rc"; then return "$_bs_rc"; fi
       return 1
     fi
   fi
