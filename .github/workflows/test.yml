@@ -83,6 +83,6 @@ jobs:
       # scripts/release-*.sh are vendored from cgraf78/actions. Catching drift
       # on every pull request is what keeps the vendored copy equivalent to a
       # single source rather than a fork that happens to look similar.
-      - uses: cgraf78/actions/.github/actions/verify-release-scripts@d8528e4e231e58ef6aecfe634b8942e5ea43d789
+      - uses: cgraf78/actions/.github/actions/verify-release-scripts@816817518ed623a59b6ffdd87949b23d15d73fa2
         with:
           scripts-dir: scripts
