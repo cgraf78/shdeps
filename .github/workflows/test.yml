@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@a2dd8390ddd0b410d5a82822296036387247cc4c
     with:
       clippy-command: cargo clippy --locked --all-targets -- -D warnings
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
@@ -29,16 +29,10 @@ jobs:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
-      package-smoke-setup-command: |
-        if [[ "$RUNNER_OS" == "Linux" ]]; then
-          # The release archive smoke test intentionally exercises the same
-          # static Linux target that fleet bootstrap installs. Keep this as
-          # caller-owned setup because the shared Rust workflow should not need
-          # to know which projects package musl archives.
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-        fi
+      # The release archive smoke test intentionally exercises the same static
+      # Linux target that fleet bootstrap installs. The shared workflow now owns
+      # adding that target and its linker.
+      package-smoke-musl-target: x86_64-unknown-linux-musl
       package-smoke-command: |
         # Release archives are the fleet bootstrap contract, so regular CI
         # should exercise the same Linux musl label that tagged releases

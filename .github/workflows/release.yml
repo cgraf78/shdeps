@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   release:
-    uses: cgraf78/actions/.github/workflows/rust-release.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@a2dd8390ddd0b410d5a82822296036387247cc4c
     permissions:
       contents: write
     with:
@@ -23,14 +23,12 @@ jobs:
       # workflow to validate the exact release tag instead of forcing this repo
       # through Cargo's semver-oriented `version-command` + `tag-prefix` path.
       tag-command: scripts/release-tag.sh
+      # shdeps links native compression crates into static Linux release
+      # binaries, so musl targets need a musl linker. The shared workflow owns
+      # the matrix and now owns that matrix's linker prerequisite too.
+      install-musl-tools: true
       setup-command: |
-        if [[ "$RUST_TARGET" == *-musl ]]; then
-          # shdeps links native compression crates into static Linux release
-          # binaries. The reusable workflow owns the matrix, but this repo
-          # owns the linker/toolchain prerequisite those musl targets need.
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-        elif [[ "$RUNNER_OS" == "macOS" ]]; then
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
           # macOS workflow steps still run under Apple's /bin/bash 3.2, while
           # the shipped sourceable wrapper requires Bash 4.3+. Install
           # Homebrew Bash for the release smoke test without changing the
