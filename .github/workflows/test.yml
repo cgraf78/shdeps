@@ -71,3 +71,18 @@ jobs:
     uses: cgraf78/actions/.github/workflows/bash32-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
     with:
       command: /bin/bash scripts/smoke-install-bash32.sh
+
+  release-scripts:
+    name: Vendored release scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # scripts/release-*.sh are vendored from cgraf78/actions. Catching drift
+      # on every pull request is what keeps the vendored copy equivalent to a
+      # single source rather than a fork that happens to look similar.
+      - uses: cgraf78/actions/.github/actions/verify-release-scripts@d6f24323ecff1876bdae05524065c1177edc00bd
+        with:
+          scripts-dir: scripts
