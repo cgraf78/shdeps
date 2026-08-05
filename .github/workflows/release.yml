@@ -3,9 +3,11 @@ name: Release
 on:
   push:
     tags:
-      # GitHub's filter glob is intentionally coarse here; scripts/release-tag.sh
-      # performs the exact YYYYMMDD-HHMMSS-<8hex> validation against the commit.
-      - "20*"
+      # Match the release identity shape exactly. GitHub's tag filter has no
+      # regex, so the YYYYMMDD-HHMMSS-<8hex> form is spelled out as character
+      # classes. scripts/release-tag.sh still validates the tag against the
+      # commit; this keeps unrelated tags from starting a release run at all.
+      - "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
 
 permissions:
   contents: read
