@@ -110,28 +110,43 @@ _install_transaction_wait_child() {
   fi
 }
 
+_install_transaction_wait_started_child() {
+  _shdeps_tx_child="$1"
+  if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+    _install_transaction_cancel_child
+    return "$_shdeps_tx_signal"
+  fi
+  _install_transaction_wait_child
+}
+
 # Run one exact external child. A trapped signal interrupts wait immediately;
 # the unreaped PID remains owned until bounded cancellation completes.
 _install_transaction_run() {
+  if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+    return "$_shdeps_tx_signal"
+  fi
   "$@" &
-  _shdeps_tx_child=$!
-  _install_transaction_wait_child
+  _install_transaction_wait_started_child "$!"
 }
 
 _install_transaction_run_to_file() {
   local output="$1"
   shift
+  if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+    return "$_shdeps_tx_signal"
+  fi
   "$@" >"$output" &
-  _shdeps_tx_child=$!
-  _install_transaction_wait_child
+  _install_transaction_wait_started_child "$!"
 }
 
 _install_transaction_run_with_input() {
   local input="$1"
   shift
+  if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+    return "$_shdeps_tx_signal"
+  fi
   "$@" <<<"$input" &
-  _shdeps_tx_child=$!
-  _install_transaction_wait_child
+  _install_transaction_wait_started_child "$!"
 }
 
 _install_run() {
@@ -169,7 +184,7 @@ _bash_supports_sourceable_wrapper() {
 _check_source_prereqs() {
   if ! command -v git >/dev/null 2>&1; then
     _error "git is required"
-    exit 1
+    return 1
   fi
 
   # Source-checkout installs are developer/explicit mode. Normal fleet
@@ -658,6 +673,9 @@ _install_transaction_restore_traps() {
   if [[ "$_SHDEPS_INSTALL_EXECUTED" -eq 1 ]]; then
     trap - EXIT
   fi
+  if [[ "${_shdeps_tx_monitor:-0}" -eq 1 ]]; then
+    set -m
+  fi
 }
 
 _install_transaction_prepare_paths() {
@@ -694,24 +712,96 @@ _install_directory_identity() {
   printf '%s\n' "$identity"
 }
 
-_install_transaction_reconcile() {
-  local live_identity=""
+_install_identity_matches() {
+  local path="$1" expected="$2" actual=""
 
+  [[ -n "$expected" && (-e "$path" || -L "$path") ]] || return 1
+  actual=$(_install_directory_identity "$path" 2>/dev/null) || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+_install_transaction_reconcile() {
   if [[ -n "$_shdeps_tx_staging_identity" && -d "$SHDEPS_DIR" &&
     ! -e "$_shdeps_tx_staging" && ! -L "$_shdeps_tx_staging" ]]; then
-    live_identity=$(_install_directory_identity "$SHDEPS_DIR" 2>/dev/null || true)
-    if [[ "$live_identity" == "$_shdeps_tx_staging_identity" ]] &&
+    if _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_staging_identity" &&
       _is_bundle_dir "$SHDEPS_DIR"; then
       _shdeps_tx_state=ACTIVE
       return 0
     fi
   fi
-  if [[ "$_shdeps_tx_backup_owned" -eq 1 && ! -e "$SHDEPS_DIR" && ! -L "$SHDEPS_DIR" ]] &&
-    [[ -e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup" ]]; then
+
+  if _install_identity_matches "$_shdeps_tx_backup" "$_shdeps_tx_old_identity"; then
+    _shdeps_tx_backup_owned=1
+  elif [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
+    # Ownership follows the inode, not the randomized pathname. A concurrent
+    # replacement must never become eligible for transaction cleanup.
+    _shdeps_tx_backup_owned=0
+  fi
+  if [[ "$_shdeps_tx_backup_owned" -eq 1 && ! -e "$SHDEPS_DIR" && ! -L "$SHDEPS_DIR" ]]; then
     _shdeps_tx_state=OLD_MOVED
   else
     _shdeps_tx_state=PREPARED
   fi
+}
+
+_install_transaction_recover_backup_race() {
+  local nested="$_shdeps_tx_backup/${SHDEPS_DIR##*/}"
+  local moved_nested="$SHDEPS_DIR/${nested##*/}" rc=0
+
+  _shdeps_tx_backup_owned=0
+  _shdeps_tx_old_recovery=""
+  if _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_old_identity"; then
+    _error "shdeps backup path appeared during activation; old install remains at $SHDEPS_DIR"
+    return 1
+  fi
+  if _install_identity_matches "$_shdeps_tx_backup" "$_shdeps_tx_old_identity"; then
+    _shdeps_tx_backup_owned=1
+    _shdeps_tx_old_recovery="$_shdeps_tx_backup"
+    _error "shdeps backup path appeared during activation; recoverable old install retained at $_shdeps_tx_backup"
+    return 1
+  fi
+  if ! _install_identity_matches "$nested" "$_shdeps_tx_old_identity"; then
+    _error "shdeps backup path appeared during activation; expected old install identity could not be located"
+    return 1
+  fi
+
+  _shdeps_tx_old_recovery="$nested"
+  if [[ ! -e "$SHDEPS_DIR" && ! -L "$SHDEPS_DIR" ]]; then
+    if mv "$nested" "$SHDEPS_DIR"; then rc=0; else rc=$?; fi
+    if _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_old_identity"; then
+      _shdeps_tx_old_recovery=""
+      _error "shdeps backup path appeared during activation; old install restored and foreign backup preserved at $_shdeps_tx_backup"
+      return 1
+    fi
+    if _install_identity_matches "$moved_nested" "$_shdeps_tx_old_identity"; then
+      _shdeps_tx_old_recovery="$moved_nested"
+    elif ! _install_identity_matches "$nested" "$_shdeps_tx_old_identity"; then
+      _shdeps_tx_old_recovery=""
+    fi
+  fi
+
+  if [[ -n "$_shdeps_tx_old_recovery" ]]; then
+    _error "shdeps backup path appeared during activation; recoverable old install retained at $_shdeps_tx_old_recovery"
+  else
+    _error "shdeps backup path appeared during activation; old install recovery could not be verified (mv status $rc)"
+  fi
+  return 1
+}
+
+_install_transaction_track_staging_after_move() {
+  local nested="$SHDEPS_DIR/${_shdeps_tx_staging##*/}"
+
+  if _install_identity_matches "$_shdeps_tx_staging" "$_shdeps_tx_staging_identity"; then
+    _shdeps_tx_staging_owned=1
+    return 0
+  fi
+  if _install_identity_matches "$nested" "$_shdeps_tx_staging_identity"; then
+    _shdeps_tx_staging="$nested"
+    _shdeps_tx_staging_owned=1
+    return 0
+  fi
+  _shdeps_tx_staging_owned=0
+  return 1
 }
 
 # Cleanup commands are allowed after the signal latch is set. They still use an
@@ -735,10 +825,19 @@ _install_transaction_cleanup_run() {
 }
 
 _install_transaction_remove_owned() {
-  local path="$1" label="$2"
+  local path="$1" label="$2" expected_identity="${3:-}" runner="${4:-cleanup}"
 
   [[ -e "$path" || -L "$path" ]] || return 0
-  if ! _install_transaction_cleanup_run rm -rf -- "$path"; then
+  if [[ -n "$expected_identity" ]] && ! _install_identity_matches "$path" "$expected_identity"; then
+    _error "refusing to remove $label at $path because its identity changed"
+    return 1
+  fi
+  if [[ "$runner" == normal ]]; then
+    _install_run rm -rf -- "$path" || {
+      _error "failed to remove $label at $path"
+      return 1
+    }
+  elif ! _install_transaction_cleanup_run rm -rf -- "$path"; then
     _error "failed to remove $label at $path"
     return 1
   fi
@@ -746,6 +845,37 @@ _install_transaction_remove_owned() {
     _error "failed to remove $label at $path"
     return 1
   fi
+}
+
+_install_transaction_restore_old() {
+  local nested="$SHDEPS_DIR/${_shdeps_tx_backup##*/}" rc=0
+
+  if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
+    _error "cannot restore shdeps backup because $SHDEPS_DIR unexpectedly exists; recoverable backup retained at $_shdeps_tx_backup"
+    return 1
+  fi
+  if mv "$_shdeps_tx_backup" "$SHDEPS_DIR"; then rc=0; else rc=$?; fi
+  if _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_old_identity"; then
+    _shdeps_tx_backup_owned=0
+    _shdeps_tx_old_recovery=""
+    return 0
+  fi
+  if _install_identity_matches "$nested" "$_shdeps_tx_old_identity"; then
+    _shdeps_tx_backup_owned=0
+    _shdeps_tx_old_recovery="$nested"
+    _error "failed to restore shdeps because the destination appeared; recoverable old install retained at $nested"
+    return 1
+  fi
+  if _install_identity_matches "$_shdeps_tx_backup" "$_shdeps_tx_old_identity"; then
+    _shdeps_tx_backup_owned=1
+    _shdeps_tx_old_recovery="$_shdeps_tx_backup"
+    _error "failed to restore shdeps (mv status $rc); recoverable backup retained at $_shdeps_tx_backup"
+    return 1
+  fi
+  _shdeps_tx_backup_owned=0
+  _shdeps_tx_old_recovery=""
+  _error "failed to restore shdeps (mv status $rc); expected old install identity could not be located"
+  return 1
 }
 
 _install_transaction_cleanup() {
@@ -758,20 +888,14 @@ _install_transaction_cleanup() {
   case "$_shdeps_tx_state" in
     ACTIVE)
       if [[ "$_shdeps_tx_backup_owned" -eq 1 ]] &&
-        ! _install_transaction_remove_owned "$_shdeps_tx_backup" "superseded shdeps backup"; then
+        ! _install_transaction_remove_owned "$_shdeps_tx_backup" "superseded shdeps backup" "$_shdeps_tx_old_identity"; then
         failed=1
       else
         _shdeps_tx_backup_owned=0
       fi
       ;;
     OLD_MOVED)
-      if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
-        _error "cannot restore shdeps backup because $SHDEPS_DIR unexpectedly exists"
-        failed=1
-      elif mv "$_shdeps_tx_backup" "$SHDEPS_DIR"; then
-        _shdeps_tx_backup_owned=0
-      else
-        _error "failed to restore shdeps; recoverable backup retained at $_shdeps_tx_backup"
+      if ! _install_transaction_restore_old; then
         failed=1
       fi
       ;;
@@ -781,11 +905,16 @@ _install_transaction_cleanup() {
         _error "cannot restore shdeps backup because $SHDEPS_DIR appeared before activation; recoverable backup retained at $_shdeps_tx_backup"
         failed=1
       fi
+      if [[ -n "$_shdeps_tx_old_recovery" ]] &&
+        _install_identity_matches "$_shdeps_tx_old_recovery" "$_shdeps_tx_old_identity"; then
+        _error "recoverable old install retained at $_shdeps_tx_old_recovery"
+        failed=1
+      fi
       ;;
   esac
 
   if [[ "$_shdeps_tx_staging_owned" -eq 1 ]] &&
-    ! _install_transaction_remove_owned "$_shdeps_tx_staging" "shdeps install staging"; then
+    ! _install_transaction_remove_owned "$_shdeps_tx_staging" "shdeps install staging" "$_shdeps_tx_staging_identity"; then
     failed=1
   fi
   if [[ "$_shdeps_tx_release_owned" -eq 1 ]] &&
@@ -810,13 +939,23 @@ _install_transaction() {
   local mode="$1" src_dir="${2:-}" rc=0 cleanup_rc=0
   local _shdeps_tx_active=1 _shdeps_tx_signal=0 _shdeps_tx_child=""
   local _shdeps_tx_state=PREPARED _shdeps_tx_staging="" _shdeps_tx_backup=""
-  local _shdeps_tx_release_path="" _shdeps_tx_staging_identity=""
+  local _shdeps_tx_release_path="" _shdeps_tx_staging_identity="" _shdeps_tx_old_identity=""
+  local _shdeps_tx_old_recovery="" _shdeps_tx_monitor=0
   local _shdeps_tx_staging_owned=0 _shdeps_tx_backup_owned=0
   local _shdeps_tx_release_owned=0 _shdeps_tx_cleanup_done=0
   local _shdeps_tx_cleanup_failed=0
   local _shdeps_tx_saved_hup _shdeps_tx_saved_int _shdeps_tx_saved_term
 
   _install_transaction_prepare_paths "$mode" || return 1
+  case "$-" in
+    *m*)
+      _shdeps_tx_monitor=1
+      # Background children are an implementation detail. Temporarily disabling
+      # monitor mode prevents Bash from printing job completion records into a
+      # sourced caller's output; exact prior state is restored after reaping.
+      set +m
+      ;;
+  esac
   _shdeps_tx_saved_hup=$(trap -p HUP)
   _shdeps_tx_saved_int=$(trap -p INT)
   _shdeps_tx_saved_term=$(trap -p TERM)
@@ -904,9 +1043,17 @@ _install_bundle_core() {
       _error "shdeps backup path appeared before activation: $_shdeps_tx_backup"
       return 1
     fi
-    _shdeps_tx_backup_owned=1
+    _shdeps_tx_old_identity=$(_install_directory_identity "$SHDEPS_DIR") || {
+      _error "failed to identify existing shdeps install before activation"
+      return 1
+    }
     if mv "$SHDEPS_DIR" "$_shdeps_tx_backup"; then rc=0; else rc=$?; fi
     _install_transaction_reconcile
+    if [[ "$_shdeps_tx_state" != OLD_MOVED ]]; then
+      _install_transaction_recover_backup_race || true
+      if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
+      return 1
+    fi
     if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
     if [[ "$rc" -ne 0 ]]; then return "$rc"; fi
   fi
@@ -923,17 +1070,22 @@ _install_bundle_core() {
   _install_transaction_reconcile
   if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
   if [[ "$_shdeps_tx_state" != ACTIVE ]]; then
+    _install_transaction_track_staging_after_move || true
+    if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
+      if [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
+        _error "$SHDEPS_DIR appeared before activation; recoverable backup retained at $_shdeps_tx_backup"
+      else
+        _error "$SHDEPS_DIR appeared before activation; refusing to replace it"
+      fi
+      return 1
+    fi
     [[ "$rc" -ne 0 ]] && return "$rc"
     _error "activated shdeps install failed identity or bundle validation"
     return 1
   fi
 
   if [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
-    _install_run rm -rf -- "$_shdeps_tx_backup" || return $?
-    if [[ -e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup" ]]; then
-      _error "failed to remove superseded shdeps backup at $_shdeps_tx_backup"
-      return 1
-    fi
+    _install_transaction_remove_owned "$_shdeps_tx_backup" "superseded shdeps backup" "$_shdeps_tx_old_identity" normal || return 1
     _shdeps_tx_backup_owned=0
   fi
   _info "shdeps: installed"
@@ -1217,12 +1369,12 @@ _setup_links() {
   fi
 
   if [[ -n "$cli" ]]; then
-    mkdir -p "$(dirname "$SHDEPS_BIN")"
-    ln -sf "$cli" "$SHDEPS_BIN"
+    mkdir -p "$(dirname "$SHDEPS_BIN")" || return 1
+    ln -sf "$cli" "$SHDEPS_BIN" || return 1
   fi
 
   if declare -f shdeps_link_extras &>/dev/null; then
-    shdeps_link_extras "shdeps" "$shdeps_dir"
+    shdeps_link_extras "shdeps" "$shdeps_dir" || return 1
   fi
 }
 
@@ -1248,7 +1400,7 @@ _source_installed_library_for_extras() {
 _activate_installed_tree() {
   local shdeps_dir="$1"
 
-  _source_installed_library_for_extras "$shdeps_dir"
+  _source_installed_library_for_extras "$shdeps_dir" || return $?
   _setup_links "$shdeps_dir"
 }
 
@@ -1258,23 +1410,23 @@ _activate_installed_tree() {
 
 _install() {
   local script_dir rc=0
-  script_dir=$(_script_dir) || exit 1
+  script_dir=$(_script_dir) || return 1
 
   if _is_bundle_dir "$script_dir"; then
     _install_bundle "$script_dir" || rc=$?
-    [[ "$rc" -eq 0 ]] || exit "$rc"
-    _activate_installed_tree "$SHDEPS_DIR"
+    [[ "$rc" -eq 0 ]] || return "$rc"
+    _activate_installed_tree "$SHDEPS_DIR" || return $?
     return
   fi
 
   if _uses_default_repo_slug && ! _is_source_checkout_dir "$script_dir"; then
     _install_release || rc=$?
-    [[ "$rc" -eq 0 ]] || exit "$rc"
-    _activate_installed_tree "$SHDEPS_DIR"
+    [[ "$rc" -eq 0 ]] || return "$rc"
+    _activate_installed_tree "$SHDEPS_DIR" || return $?
     return
   fi
 
-  _check_source_prereqs
+  _check_source_prereqs || return 1
 
   if [[ -d "$SHDEPS_DIR/.git" ]]; then
     # Already installed — pull latest if clean
@@ -1284,7 +1436,7 @@ _install() {
       _info "shdeps: updated"
     else
       _error "shdeps: update failed (git pull --ff-only failed)"
-      exit 1
+      return 1
     fi
   elif _is_release_install_dir "$SHDEPS_DIR"; then
     # Direct source installs are explicit developer/source mode. If a managed
@@ -1292,24 +1444,24 @@ _install() {
     # the selected implementation has a single owner on disk.
     if ! rm -rf "$SHDEPS_DIR"; then
       _error "failed to remove stale shdeps release install at $SHDEPS_DIR"
-      exit 1
+      return 1
     fi
     _info "shdeps: cloning to $SHDEPS_DIR..."
-    git clone --depth 1 "$SHDEPS_REPO" "$SHDEPS_DIR" || exit 1
+    git clone --depth 1 "$SHDEPS_REPO" "$SHDEPS_DIR" || return 1
     _info "shdeps: installed"
   elif [[ -d "$SHDEPS_DIR" ]]; then
     _error "$SHDEPS_DIR exists but is not a git repo"
-    exit 1
+    return 1
   else
     _info "shdeps: cloning to $SHDEPS_DIR..."
-    git clone --depth 1 "$SHDEPS_REPO" "$SHDEPS_DIR"
+    git clone --depth 1 "$SHDEPS_REPO" "$SHDEPS_DIR" || return 1
     _info "shdeps: installed"
   fi
 
-  _ensure_source_checkout_binary "$SHDEPS_DIR" || exit 1
+  _ensure_source_checkout_binary "$SHDEPS_DIR" || return 1
 
   # Source the library and set up all symlinks (CLI, man, completions).
-  _activate_installed_tree "$SHDEPS_DIR"
+  _activate_installed_tree "$SHDEPS_DIR" || return $?
 
   # Hint if the bin directory isn't on PATH
   local bin_dir
@@ -1385,9 +1537,10 @@ _bootstrap() {
     _bs_lib="$SHDEPS_DIR/shdeps.sh"
     _bs_dir="$SHDEPS_DIR"
   else
-    # Not installed — run _install in a subshell so exit doesn't kill caller
-    # shellcheck disable=SC2310  # intentional: subshell contains exit
-    if (_install) >/dev/null 2>&1; then
+    # Keep a fresh install in this shell so the transaction trap owns both the
+    # sourced caller signal and the exact download/copy child. `_install`
+    # returns failures explicitly and therefore remains safe to call here.
+    if _install >/dev/null 2>&1; then
       _bs_lib="$SHDEPS_DIR/shdeps.sh"
       _bs_dir="$SHDEPS_DIR"
     else
