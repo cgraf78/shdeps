@@ -770,7 +770,10 @@ _wait_for_exit() {
 }
 
 _tree_matches() {
-  diff -r "$1" "$2" >/dev/null 2>&1
+  # Every CI platform installs Git to check out and exercise shdeps, while
+  # minimal Arch and Fedora images do not provide diffutils. Keep the recovery
+  # oracle portable without weakening its recursive content comparison.
+  git diff --no-index --quiet -- "$1" "$2" >/dev/null 2>&1
 }
 
 _report_is_restored() {
