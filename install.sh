@@ -545,11 +545,12 @@ _latest_release_tag() {
 _verify_checksum() {
   local dir="$1" archive="$2" checksum="$3"
   local hasher="" actual="" expected=""
+  local output="$dir/.shdeps-checksum.actual" rc=0
 
   if command -v sha256sum >/dev/null 2>&1; then
     hasher="sha256sum"
   elif command -v shasum >/dev/null 2>&1; then
-    hasher="shasum -a 256"
+    hasher="shasum"
   else
     _error "sha256sum or shasum is required to verify release archives"
     return 1
@@ -561,7 +562,22 @@ _verify_checksum() {
   # file could satisfy `-c` without the archive bytes ever being checked.
   # Instead, compute the digest of `$archive` directly and compare it to the
   # checksum line that names `$archive`, mirroring `src/checksum.rs::verify`.
-  actual=$( (cd "$dir" && $hasher "$archive") 2>/dev/null | awk '{ print $1; exit }')
+  if [[ "$hasher" == sha256sum ]]; then
+    _install_run_to_file "$output" sha256sum "$dir/$archive" 2>/dev/null || rc=$?
+  else
+    _install_run_to_file "$output" shasum -a 256 "$dir/$archive" 2>/dev/null || rc=$?
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    # A latched signal owns cleanup of the release scratch as a whole. Do not
+    # start another normal child after cancellation merely to remove this file.
+    if [[ "${_shdeps_tx_signal:-0}" -eq 0 ]]; then
+      rm -f -- "$output"
+    fi
+    return "$rc"
+  fi
+  IFS= read -r actual <"$output" || actual=""
+  actual="${actual%%[[:space:]]*}"
+  _install_run rm -f -- "$output" || return $?
   if [[ -z "$actual" ]]; then
     _error "failed to compute checksum for $archive"
     return 1
@@ -827,8 +843,12 @@ _install_transaction_cleanup_run() {
 _install_transaction_remove_owned() {
   local path="$1" label="$2" expected_identity="${3:-}" runner="${4:-cleanup}"
 
+  if [[ -z "$expected_identity" ]]; then
+    _error "refusing to remove $label at $path because its ownership identity is missing"
+    return 1
+  fi
   [[ -e "$path" || -L "$path" ]] || return 0
-  if [[ -n "$expected_identity" ]] && ! _install_identity_matches "$path" "$expected_identity"; then
+  if ! _install_identity_matches "$path" "$expected_identity"; then
     _error "refusing to remove $label at $path because its identity changed"
     return 1
   fi
@@ -918,7 +938,7 @@ _install_transaction_cleanup() {
     failed=1
   fi
   if [[ "$_shdeps_tx_release_owned" -eq 1 ]] &&
-    ! _install_transaction_remove_owned "$_shdeps_tx_release_path" "shdeps release scratch"; then
+    ! _install_transaction_remove_owned "$_shdeps_tx_release_path" "shdeps release scratch" "$_shdeps_tx_release_identity"; then
     failed=1
   fi
   _shdeps_tx_cleanup_failed="$failed"
@@ -939,7 +959,8 @@ _install_transaction() {
   local mode="$1" src_dir="${2:-}" rc=0 cleanup_rc=0
   local _shdeps_tx_active=1 _shdeps_tx_signal=0 _shdeps_tx_child=""
   local _shdeps_tx_state=PREPARED _shdeps_tx_staging="" _shdeps_tx_backup=""
-  local _shdeps_tx_release_path="" _shdeps_tx_staging_identity="" _shdeps_tx_old_identity=""
+  local _shdeps_tx_release_path="" _shdeps_tx_release_identity=""
+  local _shdeps_tx_staging_identity="" _shdeps_tx_old_identity=""
   local _shdeps_tx_old_recovery="" _shdeps_tx_monitor=0
   local _shdeps_tx_staging_owned=0 _shdeps_tx_backup_owned=0
   local _shdeps_tx_release_owned=0 _shdeps_tx_cleanup_done=0
@@ -1005,6 +1026,10 @@ _install_bundle_core() {
     _error "failed to create shdeps install staging at $_shdeps_tx_staging"
     return 1
   fi
+  _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || {
+    _error "failed to identify shdeps install staging"
+    return 1
+  }
   _shdeps_tx_staging_owned=1
 
   # Release archives are already verified before users run their bundled
@@ -1033,10 +1058,10 @@ _install_bundle_core() {
     _install_run cp -R "${dirs[@]}" "$_shdeps_tx_staging/" || return $?
   fi
 
-  _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || {
-    _error "failed to identify shdeps install staging"
+  if ! _install_identity_matches "$_shdeps_tx_staging" "$_shdeps_tx_staging_identity"; then
+    _error "shdeps install staging identity changed during copy"
     return 1
-  }
+  fi
 
   if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
     if [[ -e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup" ]]; then
@@ -1176,6 +1201,10 @@ _install_release_core() {
     _error "failed to create release staging directory"
     return 1
   fi
+  _shdeps_tx_release_identity=$(_install_directory_identity "$tmp") || {
+    _error "failed to identify release staging directory"
+    return 1
+  }
   _shdeps_tx_release_owned=1
   json="$tmp/release.json"
 
