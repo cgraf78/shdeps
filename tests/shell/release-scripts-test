@@ -79,22 +79,41 @@ else
   _fail "smoke hook: defines release_smoke_check"
 fi
 
-# The wrapper requires Bash 4.3+ while macOS runners start from /bin/bash 3.2,
-# so the probe is what keeps the wrapper contract tested there.
-if _shdeps_modern_bash >/dev/null; then
-  _pass "smoke hook: finds a Bash new enough for the wrapper"
+# The probe deliberately checks absolute Homebrew paths, so it cannot be
+# neutralized portably from a test: PATH= does not hide /usr/local/bin/bash on a
+# macOS runner. Assert the hook's observable behavior instead and let the real
+# release smoke exercise the probe on the platform where it matters.
+_hook_fake=$(mktemp -d)
+printf '#!/usr/bin/env bash\nexit 0\n' >"$_hook_fake/shdeps"
+chmod +x "$_hook_fake/shdeps"
+printf 'shdeps_version() { printf "stub\\n"; }\n' >"$_hook_fake/shdeps.sh"
+
+rc=0
+release_smoke_check "$_hook_fake" linux-x86_64-musl >/dev/null 2>&1 || rc=$?
+_assert_exit "smoke hook: accepts a working binary and sourceable wrapper" 0 "$rc"
+
+# A binary that fails must fail the smoke test rather than being swallowed.
+printf '#!/usr/bin/env bash\nexit 3\n' >"$_hook_fake/shdeps"
+rc=0
+release_smoke_check "$_hook_fake" linux-x86_64-musl >/dev/null 2>&1 || rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  _pass "smoke hook: propagates a failing binary"
 else
-  _fail "smoke hook: finds a Bash new enough for the wrapper"
+  _fail "smoke hook: propagates a failing binary"
 fi
 
-# With no candidate available the probe must fail rather than return a Bash 3.2
-# that would silently skip the wrapper check.
+# A wrapper that does not define shdeps_version means the packaged Bash API is
+# broken even though the binary works.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$_hook_fake/shdeps"
+printf '# no shdeps_version here\n' >"$_hook_fake/shdeps.sh"
 rc=0
-(
-  export SHDEPS_SMOKE_BASH=/nonexistent/bash
-  PATH=/nonexistent _shdeps_modern_bash
-) >/dev/null 2>&1 || rc=$?
-_assert_exit "smoke hook: reports failure when no modern Bash exists" 1 "$rc"
+release_smoke_check "$_hook_fake" linux-x86_64-musl >/dev/null 2>&1 || rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  _pass "smoke hook: catches a wrapper missing its public API"
+else
+  _fail "smoke hook: catches a wrapper missing its public API"
+fi
+rm -rf "$_hook_fake"
 
 # --- Workflow contract ------------------------------------------------------
 

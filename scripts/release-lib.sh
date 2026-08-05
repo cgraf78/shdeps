@@ -470,7 +470,10 @@ _release_check_android() {
       ;;
   esac
 
-  readelf -h "$binary" | grep -Eq "Machine:[[:space:]]+${machine}" || {
+  # readelf prefixes some architectures with a vendor string, e.g.
+  # "Advanced Micro Devices X86-64", so anchor on the field and match the
+  # architecture anywhere after it rather than immediately after the spaces.
+  readelf -h "$binary" | grep -Eq "Machine:[[:space:]].*${machine}" || {
     release_die "packaged Android binary is not $machine"
     return 1
   }

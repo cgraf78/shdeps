@@ -37,12 +37,16 @@ _shdeps_modern_bash() {
   return 1
 }
 
+# Return codes are checked explicitly rather than relying on the caller's
+# `set -e`. The shared smoke script treats a non-zero return as failure, and a
+# hook whose result depends on ambient shell options can report success after a
+# command it ran has already failed.
 release_smoke_check() {
   local root=$1
   local wrapper_bash
 
-  "$root/shdeps" version
-  "$root/shdeps" help >/dev/null
+  "$root/shdeps" version || return 1
+  "$root/shdeps" help >/dev/null || return 1
 
   wrapper_bash=$(_shdeps_modern_bash) || {
     printf 'release smoke: shdeps.sh requires Bash 4.3+; set SHDEPS_SMOKE_BASH to a compatible bash\n' >&2
@@ -51,5 +55,5 @@ release_smoke_check() {
   # Single quotes are deliberate: the wrapper path is passed as $1 so the inner
   # Bash expands it, not this shell.
   # shellcheck disable=SC2016
-  "$wrapper_bash" -c '. "$1"; shdeps_version >/dev/null' bash "$root/shdeps.sh"
+  "$wrapper_bash" -c '. "$1"; shdeps_version >/dev/null' bash "$root/shdeps.sh" || return 1
 }
