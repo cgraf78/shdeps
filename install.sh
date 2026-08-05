@@ -60,6 +60,12 @@ _install_transaction_signal() {
   fi
 }
 
+_install_transaction_install_signal_traps() {
+  trap '_install_transaction_signal HUP' HUP
+  trap '_install_transaction_signal INT' INT
+  trap '_install_transaction_signal TERM' TERM
+}
+
 _install_transaction_job_running() {
   local wanted="$1" pid
 
@@ -272,17 +278,19 @@ _bootstrap_lib_is_installed_tree() {
 }
 
 _github_token() {
+  local destination="$1" selected=""
+
   if [[ -n "${GH_TOKEN:-}" ]]; then
-    printf '%s\n' "$GH_TOKEN"
+    selected="$GH_TOKEN"
   elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    printf '%s\n' "$GITHUB_TOKEN"
-  elif [[ -t 0 && -t 1 ]] && command -v gh >/dev/null 2>&1; then
-    # `gh auth token` can wake desktop credential helpers. On headless cron
-    # runs, libsecret may autostart an orphan session bus/keyring pair for each
-    # call, eventually exhausting D-Bus connection limits. Non-interactive
-    # callers should provide GH_TOKEN/GITHUB_TOKEN explicitly when auth matters.
-    gh auth token 2>/dev/null || true
+    selected="$GITHUB_TOKEN"
   fi
+  # The bootstrap transaction deliberately does not probe `gh auth token`.
+  # Credential helpers can block outside its exact-child ownership, while the
+  # public release path needs no token. Private/custom API callers can provide
+  # GH_TOKEN or GITHUB_TOKEN explicitly; the steady-state Rust client retains
+  # its own bounded credential lookup.
+  printf -v "$destination" '%s' "$selected"
 }
 
 _curl_get() {
@@ -298,8 +306,11 @@ _curl_get() {
         # Rust `src/http.rs::curl_config` path; each value is wrapped in
         # `"..."` with `\` and `"` escaped per curl's config syntax.
         local _url_escaped _token_escaped
-        _url_escaped=$(_curl_config_quote "$url")
-        _token_escaped=$(_curl_config_quote "$token")
+        _url_escaped=$(_curl_config_quote "$url") || return 1
+        _token_escaped=$(_curl_config_quote "$token") || {
+          _error "refusing GitHub token containing a newline"
+          return 1
+        }
         printf -v config '%s\n%s\n%s\n%s\n' \
           "url = \"$_url_escaped\"" \
           'user-agent = "shdeps"' \
@@ -319,7 +330,7 @@ _curl_get() {
 
 _curl_get_release_asset() {
   local browser_url="$1" out="$2" token="${3:-}" api_url="${4:-}"
-  local config have_api_fallback=0
+  local config have_api_fallback=0 _bearer_token_escaped _api_url_escaped
   if [[ -n "$token" && -n "$api_url" ]]; then
     have_api_fallback=1
   fi
@@ -380,13 +391,17 @@ _curl_get_release_asset() {
   # Feed the request via `curl --config -` over stdin so the bearer
   # token never appears in argv (where it would be visible to `ps`
   # / `/proc/<pid>/cmdline` for any other user on the same host).
-  # `printf` is a Bash builtin, so the token in `printf '...' "$token"`
-  # stays inside this bash process and never leaks to a child argv.
+  # The here-string keeps the token out of child argv. Older Bash may back that
+  # stdin with a private, unlinked temporary object, but no named token file is
+  # left for transaction cleanup.
   # Mirrors the same pattern `src/http.rs::curl_config` uses for the
   # steady-state Rust path. Each value is wrapped in `"..."` with
   # `\` and `"` backslash-escaped per curl's config syntax.
-  _bearer_token_escaped=$(_curl_config_quote "$token")
-  _api_url_escaped=$(_curl_config_quote "$api_url")
+  _bearer_token_escaped=$(_curl_config_quote "$token") || {
+    _error "refusing GitHub token containing a newline"
+    return 1
+  }
+  _api_url_escaped=$(_curl_config_quote "$api_url") || return 1
   printf -v config '%s\n%s\n%s\n%s\n' \
     "url = \"$_api_url_escaped\"" \
     'user-agent = "shdeps"' \
@@ -398,12 +413,13 @@ _curl_get_release_asset() {
 # Escape a value for inclusion inside a `"..."`-quoted curl
 # `--config` field. curl's config format treats `\` as an escape
 # character and `"` as the field terminator, so both must be
-# doubled. Tokens from `gh auth token` are alphanumeric and would
-# pass through unchanged, but escaping is cheap and prevents a
-# malformed `SHDEPS_GH_TOKEN` from breaking the curl invocation in
-# a confusing way.
+# doubled. Newlines are rejected because they would create a second config
+# directive instead of remaining part of the quoted value.
 _curl_config_quote() {
   local value="$1"
+  case "$value" in
+    *$'\n'* | *$'\r'*) return 1 ;;
+  esac
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
   printf '%s' "$value"
@@ -665,6 +681,12 @@ _archive_entries_safe() {
 _install_release_fail() {
   local kind="$1" message="$2"
 
+  # Cancellation is control flow, not an artifact or network diagnosis. The
+  # transaction owns the final signal status and scratch cleanup, so do not
+  # emit a misleading corruption/download error after its latch is set.
+  if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+    return "$_shdeps_tx_signal"
+  fi
   # The surrounding transaction owns scratch cleanup. This helper only records
   # a stable failure class and renders the user-facing diagnostic.
   _SHDEPS_RELEASE_FAILURE_KIND="$kind"
@@ -743,14 +765,34 @@ _install_identity_matches() {
   [[ "$actual" == "$expected" ]]
 }
 
+_install_remove_unidentified_directory() {
+  local path="$1" label="$2"
+
+  # Creation succeeded but stat did not, so recursive cleanup has no identity
+  # proof. Only remove the still-empty pathname; if anything appeared inside or
+  # replaced it, retain it and let the transaction report a hard cleanup error.
+  if rmdir "$path"; then
+    return 0
+  fi
+  _error "failed to remove unidentified $label; retained at $path"
+  return 1
+}
+
 _install_transaction_reconcile() {
-  if [[ -n "$_shdeps_tx_staging_identity" && -d "$SHDEPS_DIR" &&
-    ! -e "$_shdeps_tx_staging" && ! -L "$_shdeps_tx_staging" ]]; then
-    if _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_staging_identity" &&
-      _is_bundle_dir "$SHDEPS_DIR"; then
+  if [[ -n "$_shdeps_tx_staging_identity" ]] &&
+    _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_staging_identity"; then
+    # The staged inode reached the live path. Keep owning that exact inode even
+    # if a post-move validation fails, so cleanup can remove it and restore the
+    # old install instead of exposing an incomplete executable tree.
+    if _is_bundle_dir "$SHDEPS_DIR"; then
       _shdeps_tx_state=ACTIVE
-      return 0
+      _shdeps_tx_staging_owned=0
+    else
+      _shdeps_tx_staging="$SHDEPS_DIR"
+      _shdeps_tx_staging_owned=1
+      _shdeps_tx_state=STAGING_MOVED
     fi
+    return 0
   fi
 
   if _install_identity_matches "$_shdeps_tx_backup" "$_shdeps_tx_old_identity"; then
@@ -830,20 +872,28 @@ _install_transaction_track_staging_after_move() {
 # Cleanup commands are allowed after the signal latch is set. They still use an
 # exact child so a repeated signal cannot strand an unowned removal process.
 _install_transaction_cleanup_run() {
-  local rc=0
+  local rc=0 shielded=0
 
+  if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+    # The operation result is already latched. Ignore later handled signals for
+    # this exact cleanup child so repeated terminal-group delivery cannot turn a
+    # recoverable partial removal into a permanent scratch leak.
+    trap '' HUP INT TERM
+    shielded=1
+  fi
   "$@" &
   _shdeps_tx_child=$!
   if wait "$_shdeps_tx_child"; then
     _shdeps_tx_child=""
-    return 0
-  fi
-  rc=$?
-  if _install_transaction_job_running "$_shdeps_tx_child"; then
-    _install_transaction_cancel_child
   else
-    _shdeps_tx_child=""
+    rc=$?
+    if _install_transaction_job_running "$_shdeps_tx_child"; then
+      _install_transaction_cancel_child
+    else
+      _shdeps_tx_child=""
+    fi
   fi
+  [[ "$shielded" -eq 0 ]] || _install_transaction_install_signal_traps
   return "$rc"
 }
 
@@ -861,15 +911,26 @@ _install_transaction_remove_owned() {
   fi
   if [[ "$runner" == normal ]]; then
     _install_run rm -rf -- "$path" || {
-      _error "failed to remove $label at $path"
+      _error "failed to remove $label; retained at $path"
       return 1
     }
   elif ! _install_transaction_cleanup_run rm -rf -- "$path"; then
-    _error "failed to remove $label at $path"
-    return 1
+    # The first transaction signal may interrupt the cleanup child itself.
+    # Once latched, later parent-only delivery no longer forwards to children,
+    # so revalidate exact ownership and make one controlled retry rather than
+    # permanently marking a partially removed directory as cleaned.
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+      return 0
+    fi
+    if [[ "${_shdeps_tx_signal:-0}" -eq 0 ]] ||
+      ! _install_identity_matches "$path" "$expected_identity" ||
+      ! _install_transaction_cleanup_run rm -rf -- "$path"; then
+      _error "failed to remove $label; retained at $path"
+      return 1
+    fi
   fi
   if [[ -e "$path" || -L "$path" ]]; then
-    _error "failed to remove $label at $path"
+    _error "failed to remove $label; retained at $path"
     return 1
   fi
 }
@@ -926,6 +987,19 @@ _install_transaction_cleanup() {
         failed=1
       fi
       ;;
+    STAGING_MOVED)
+      if [[ "$_shdeps_tx_staging_owned" -eq 1 ]] &&
+        ! _install_transaction_remove_owned "$SHDEPS_DIR" \
+          "incomplete shdeps install" "$_shdeps_tx_staging_identity"; then
+        failed=1
+      else
+        _shdeps_tx_staging_owned=0
+        if [[ "$_shdeps_tx_backup_owned" -eq 1 ]] &&
+          ! _install_transaction_restore_old; then
+          failed=1
+        fi
+      fi
+      ;;
     PREPARED)
       if [[ "$_shdeps_tx_backup_owned" -eq 1 ]] &&
         [[ -e "$_shdeps_tx_backup" || -L "$_shdeps_tx_backup" ]]; then
@@ -949,16 +1023,19 @@ _install_transaction_cleanup() {
     failed=1
   fi
   _shdeps_tx_cleanup_failed="$failed"
-  _shdeps_tx_cleanup_done=1
-  [[ "$failed" -eq 0 ]] && _shdeps_tx_state=DONE
+  if [[ "$failed" -eq 0 ]]; then
+    _shdeps_tx_cleanup_done=1
+    _shdeps_tx_state=DONE
+  fi
   return "$failed"
 }
 
 _install_transaction_exit() {
-  local status="$1"
+  local status="$1" cleanup_rc=0
 
-  _install_transaction_cleanup || true
+  _install_transaction_cleanup || cleanup_rc=$?
   _install_transaction_restore_traps
+  [[ "$cleanup_rc" -eq 0 ]] || status=125
   exit "$status"
 }
 
@@ -987,9 +1064,7 @@ _install_transaction() {
   _shdeps_tx_saved_hup=$(trap -p HUP)
   _shdeps_tx_saved_int=$(trap -p INT)
   _shdeps_tx_saved_term=$(trap -p TERM)
-  trap '_install_transaction_signal HUP' HUP
-  trap '_install_transaction_signal INT' INT
-  trap '_install_transaction_signal TERM' TERM
+  _install_transaction_install_signal_traps
   if [[ "$_SHDEPS_INSTALL_EXECUTED" -eq 1 ]]; then
     trap '_install_transaction_exit "$?"' EXIT
   fi
@@ -1000,12 +1075,19 @@ _install_transaction() {
     _install_bundle_core "$src_dir" || rc=$?
   fi
   _install_transaction_cleanup || cleanup_rc=$?
-  if [[ "$_shdeps_tx_signal" -ne 0 ]]; then
-    rc=$_shdeps_tx_signal
-  elif [[ "$cleanup_rc" -ne 0 ]]; then
-    rc=1
+  if [[ "$cleanup_rc" -ne 0 ]]; then
+    # An unremoved transaction-owned path is a hard operational failure, even
+    # when cleanup began because an earlier signal was latched. Returning the
+    # signal would falsely tell callers that rollback completed successfully.
+    rc=125
   fi
   _install_transaction_restore_traps
+  # Sample the latch only after teardown. A signal delivered after cleanup but
+  # before its transaction trap is restored must still be the operation result;
+  # once the caller's trap is restored, subsequent delivery belongs to it.
+  if [[ "$cleanup_rc" -eq 0 && "$_shdeps_tx_signal" -ne 0 ]]; then
+    rc=$_shdeps_tx_signal
+  fi
   return "$rc"
 }
 
@@ -1033,11 +1115,14 @@ _install_bundle_core() {
     _error "failed to create shdeps install staging at $_shdeps_tx_staging"
     return 1
   fi
+  _shdeps_tx_staging_owned=1
   _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || {
+    if _install_remove_unidentified_directory "$_shdeps_tx_staging" "shdeps install staging"; then
+      _shdeps_tx_staging_owned=0
+    fi
     _error "failed to identify shdeps install staging"
     return 1
   }
-  _shdeps_tx_staging_owned=1
 
   # Release archives are already verified before users run their bundled
   # installer, but filesystem activation can still fail. Copy into a sibling
@@ -1067,6 +1152,10 @@ _install_bundle_core() {
 
   if ! _install_identity_matches "$_shdeps_tx_staging" "$_shdeps_tx_staging_identity"; then
     _error "shdeps install staging identity changed during copy"
+    return 1
+  fi
+  if ! _is_bundle_dir "$_shdeps_tx_staging"; then
+    _error "staged shdeps bundle is incomplete"
     return 1
   fi
 
@@ -1202,30 +1291,33 @@ _install_release_core() {
   _SHDEPS_RELEASE_FAILURE_KIND=""
   platform=$(_release_platform) || return 1
   repo=$(_repo_slug)
-  token=$(_github_token)
+  _github_token token
   tmp="$_shdeps_tx_release_path"
   if ! _install_private_directory "$tmp"; then
     _error "failed to create release staging directory"
     return 1
   fi
+  _shdeps_tx_release_owned=1
   _shdeps_tx_release_identity=$(_install_directory_identity "$tmp") || {
+    if _install_remove_unidentified_directory "$tmp" "shdeps release scratch"; then
+      _shdeps_tx_release_owned=0
+    fi
     _error "failed to identify release staging directory"
     return 1
   }
-  _shdeps_tx_release_owned=1
   json="$tmp/release.json"
 
   if [[ -n "${SHDEPS_RELEASE_API_URL:-}" ]]; then
     api_url="$SHDEPS_RELEASE_API_URL"
     if ! _curl_get "$api_url" "$json" "$token"; then
       _install_release_fail "download" "failed to fetch shdeps release metadata"
-      return 1
+      return $?
     fi
 
     tag=$(_json_string "$json" "tag_name")
     if [[ -z "$tag" ]]; then
       _install_release_fail "metadata" "release metadata did not contain tag_name"
-      return 1
+      return $?
     fi
 
     archive="shdeps-${tag}-${platform}.tar.gz"
@@ -1236,7 +1328,7 @@ _install_release_core() {
     checksum_api_url=$(_asset_api_url "$json" "$checksum")
     if [[ -z "$archive_url" || -z "$checksum_url" ]]; then
       _install_release_fail "metadata" "release $tag does not contain assets for $platform"
-      return 1
+      return $?
     fi
   else
     # For the public default repo, resolve the latest tag through the normal
@@ -1245,7 +1337,7 @@ _install_release_core() {
     # archive/checksum contract explicit and easy to inspect.
     if ! _latest_release_tag "$repo"; then
       _install_release_fail "download" "failed to resolve latest shdeps release"
-      return 1
+      return $?
     fi
     tag="$_SHDEPS_LATEST_RELEASE_TAG"
     archive="shdeps-${tag}-${platform}.tar.gz"
@@ -1262,21 +1354,21 @@ _install_release_core() {
 
   if ! _curl_get_release_asset "$archive_url" "$tmp/$archive" "$token" "$archive_api_url"; then
     _install_release_fail "download" "failed to download $archive"
-    return 1
+    return $?
   fi
   if ! _curl_get_release_asset "$checksum_url" "$tmp/$checksum" "$token" "$checksum_api_url"; then
     _install_release_fail "download" "failed to download $checksum"
-    return 1
+    return $?
   fi
   if ! _verify_checksum "$tmp" "$archive" "$checksum" >/dev/null; then
     _install_release_fail "artifact" "checksum verification failed for $archive"
-    return 1
+    return $?
   fi
 
   bundle="$tmp/bundle"
   if ! mkdir -p "$bundle"; then
     _install_release_fail "artifact" "failed to create release bundle directory"
-    return 1
+    return $?
   fi
   # Tar traversal hardening: list the archive contents before extracting
   # and refuse any entry whose path is absolute (`/foo`) or escapes the
@@ -1287,15 +1379,15 @@ _install_release_core() {
   # bootstrap-side equivalent for the curl-pipe install path.
   if ! _archive_entries_safe "$tmp/$archive"; then
     _install_release_fail "artifact" "refusing to extract $archive: contains absolute or traversal paths"
-    return 1
+    return $?
   fi
   if ! _install_run tar -xzf "$tmp/$archive" -C "$bundle"; then
     _install_release_fail "artifact" "failed to extract $archive"
-    return 1
+    return $?
   fi
   if ! _install_bundle_core "$bundle"; then
     _install_release_fail "artifact" "failed to install $archive"
-    return 1
+    return $?
   fi
 }
 

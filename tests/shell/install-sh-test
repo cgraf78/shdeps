@@ -171,9 +171,8 @@ echo "=== install.sh: _curl_config_quote ==="
 # The bearer token + URL are passed through `_curl_config_quote`
 # before being embedded in `"..."`-quoted curl config fields.
 # Escape contract: `\` → `\\`, `"` → `\"`. Plain alphanumerics
-# pass through unchanged. Tokens from `gh auth token` are
-# alphanumeric, but escaping is defensive against a malformed
-# `SHDEPS_GH_TOKEN`.
+# pass through unchanged. Escaping is defensive against malformed
+# explicit token values.
 _assert_eq "quote: alphanumeric passthrough" \
   "ghp_abc123XYZ" "$(_curl_config_quote 'ghp_abc123XYZ')"
 _assert_eq 'quote: backslash doubled' \
@@ -182,8 +181,16 @@ _assert_eq 'quote: double-quote escaped' \
   'a\"b' "$(_curl_config_quote 'a"b')"
 _assert_eq 'quote: backslash before quote order-correct' \
   'a\\\"b' "$(_curl_config_quote 'a\"b')"
+_assert_false 'quote: newline rejected' _curl_config_quote $'line1\nline2'
+_assert_false 'quote: carriage return rejected' _curl_config_quote $'line1\rline2'
 
 echo "=== install.sh: _github_token ==="
+
+if declare -f _github_token | grep -q 'gh auth token'; then
+  _fail "github token: bootstrap never starts an untracked credential helper"
+else
+  _pass "github token: bootstrap never starts an untracked credential helper"
+fi
 
 _gh_stub_dir=$(mktemp -d)
 cat >"$_gh_stub_dir/gh" <<'EOF'
@@ -210,18 +217,23 @@ if [[ -n ${GITHUB_TOKEN+x} ]]; then
 fi
 
 unset GH_TOKEN GITHUB_TOKEN
-_assert_eq "github token: headless skips gh credential helper" "" "$(_github_token)"
+_token_result=sentinel
+_github_token _token_result >"$_gh_stub_dir/stdout"
+_assert_eq "github token: absent credentials produce an empty token" "" "$_token_result"
+_assert_eq "github token: lookup writes no token to stdout" "" "$(cat "$_gh_stub_dir/stdout")"
 _assert_false "github token: headless did not invoke gh" test -s "$SHDEPS_GH_STUB_LOG"
 
 GH_TOKEN="explicit-gh-token"
 export GH_TOKEN
 unset GITHUB_TOKEN
-_assert_eq "github token: GH_TOKEN wins" "explicit-gh-token" "$(_github_token)"
+_github_token _token_result
+_assert_eq "github token: GH_TOKEN wins" "explicit-gh-token" "$_token_result"
 
 GITHUB_TOKEN="explicit-github-token"
 export GITHUB_TOKEN
 unset GH_TOKEN
-_assert_eq "github token: GITHUB_TOKEN fallback" "explicit-github-token" "$(_github_token)"
+_github_token _token_result
+_assert_eq "github token: GITHUB_TOKEN fallback" "explicit-github-token" "$_token_result"
 
 if [[ $_old_gh_token_set -eq 1 ]]; then
   GH_TOKEN="$_old_gh_token"
@@ -347,6 +359,27 @@ printf '%s  app.tar.gz\n' "$_ck_real" >"$_ck_dir/app.tar.gz.sha256"
 _assert_true "verify_checksum accepts the matching named line" \
   _verify_checksum "$_ck_dir" app.tar.gz app.tar.gz.sha256
 
+# Force the macOS fallback even on Linux hosts, where sha256sum would otherwise
+# always win command discovery and leave the shasum arguments unexercised.
+_shasum_bin=$(mktemp -d)
+_real_shasum=$(command -v shasum)
+cat >"$_shasum_bin/shasum" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$SHDEPS_TEST_SHASUM_ARGS"
+exec "$SHDEPS_TEST_REAL_SHASUM" "$@"
+EOF
+chmod +x "$_shasum_bin/shasum"
+for _command in awk bash rm tr; do
+  ln -s "$(command -v "$_command")" "$_shasum_bin/$_command"
+done
+SHDEPS_TEST_REAL_SHASUM="$_real_shasum" SHDEPS_TEST_SHASUM_ARGS="$_shasum_bin/args" \
+  PATH="$_shasum_bin" \
+  _assert_true "verify_checksum accepts the forced shasum fallback" \
+  _verify_checksum "$_ck_dir" app.tar.gz app.tar.gz.sha256
+_assert_eq "verify_checksum passes macOS SHA-256 arguments" \
+  "-a 256 $_ck_dir/app.tar.gz" "$(cat "$_shasum_bin/args")"
+rm -rf "$_shasum_bin"
+
 # Binary-mode `*` prefix and `./` prefix must also be accepted.
 printf '%s *./app.tar.gz\n' "$_ck_real" >"$_ck_dir/app-binmode.sha256"
 _assert_true "verify_checksum accepts binary-mode and ./ prefixed names" \
@@ -394,6 +427,9 @@ done
 if [[ "$_has_config" == 1 ]]; then
   cat >>"$SHDEPS_TEST_CURL_STDIN"
 fi
+if [[ "${SHDEPS_TEST_CURL_FAIL_PLAIN:-0}" == 1 && "$_has_config" == 0 ]]; then
+  exit 22
+fi
 [[ -n "$_out" ]] && : >"$_out"
 exit 0
 EOF
@@ -418,6 +454,21 @@ _assert_true "curl_get: --config used on stdin" \
   grep -q -- "--config" "$SHDEPS_TEST_CURL_ARGV"
 _assert_true "curl_get: token delivered via stdin config" \
   grep -q "secret-token-xyz" "$SHDEPS_TEST_CURL_STDIN"
+
+_bearer_token_escaped=caller-bearer-sentinel
+_api_url_escaped=caller-url-sentinel
+_release_asset_rc=0
+PATH="$_curl_stub_dir:$PATH" SHDEPS_TEST_CURL_FAIL_PLAIN=1 \
+  _curl_get_release_asset \
+  "https://github.com/o/r/releases/download/v1/archive" \
+  "$_curl_stub_dir/private-out" \
+  "secret-token-xyz" \
+  "https://api.github.com/repos/o/r/releases/assets/1" || _release_asset_rc=$?
+_assert_eq "release asset: authenticated fallback succeeds" 0 "$_release_asset_rc"
+_assert_eq "release asset: preserves caller bearer variable" \
+  caller-bearer-sentinel "$_bearer_token_escaped"
+_assert_eq "release asset: preserves caller URL variable" \
+  caller-url-sentinel "$_api_url_escaped"
 
 unset SHDEPS_TEST_CURL_ARGV SHDEPS_TEST_CURL_STDIN
 rm -rf "$_curl_stub_dir"
