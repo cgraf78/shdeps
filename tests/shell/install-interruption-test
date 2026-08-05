@@ -1,0 +1,540 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1091
+# Regression coverage for interruption-safe release activation in install.sh.
+
+set -uo pipefail
+
+SHDEPS_DIR=$(cd "$(dirname "$0")/../.." && pwd)
+
+# shellcheck source=helpers.sh
+. "$(dirname "$0")/helpers.sh"
+
+_real_cp=$(command -v cp)
+_real_mv=$(command -v mv)
+_real_rm=$(command -v rm)
+_real_tar=$(command -v tar)
+
+_write_fake_shdeps() {
+  local path="$1" version="$2"
+
+  cat >"$path" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  version) printf '%s\n' "shdeps $version" ;;
+  __api)
+    case "\${2:-}" in
+      version) printf '%s\n' 'abi:1' ;;
+      env-snapshot)
+        printf '%s\n' \
+          "install_dir=\${SHDEPS_INSTALL_DIR:-\$HOME/.local/share}" \
+          "bin_dir=\${SHDEPS_BIN_DIR:-\$HOME/.local/bin}" \
+          "git_dev_dir=\${SHDEPS_GIT_DEV_DIR:-\$HOME/git}" \
+          'platform=linux' 'pkg_mgr=' \
+          "force=\${SHDEPS_FORCE:-0}" \
+          "reinstall=\${SHDEPS_REINSTALL:-0}"
+        ;;
+      link-extras | unlink-extras) ;;
+    esac
+    ;;
+esac
+SH
+  chmod +x "$path"
+}
+
+_make_bundle() {
+  local dir="$1" version="$2"
+
+  mkdir -p "$dir"
+  _write_fake_shdeps "$dir/shdeps" "$version"
+  cp "$SHDEPS_DIR/shdeps.sh" "$dir/shdeps.sh"
+  cp "$SHDEPS_DIR/install.sh" "$dir/install.sh"
+  cat >"$dir/.shdeps-install.json" <<JSON
+{"schema":1,"method":"release","artifact_platform":"test","version":"$version","tag":"$version","commit":"abcdef123456","repo":"cgraf78/shdeps"}
+JSON
+}
+
+_platform_label() {
+  local os arch android=0
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m | tr '[:upper:]' '[:lower:]')
+  if [[ -n "${ANDROID_ROOT:-}" || -n "${TERMUX_VERSION:-}" || "$(uname -o 2>/dev/null)" == Android ]]; then
+    android=1
+  fi
+  case "$arch" in
+    amd64) arch=x86_64 ;;
+    arm64) arch=aarch64 ;;
+  esac
+  case "$android:$os:$arch" in
+    1:linux:aarch64) printf '%s\n' android-aarch64 ;;
+    1:linux:x86_64) printf '%s\n' android-x86_64 ;;
+    0:linux:x86_64) printf '%s\n' linux-x86_64-musl ;;
+    0:linux:aarch64) printf '%s\n' linux-aarch64-musl ;;
+    0:darwin:x86_64) printf '%s\n' macos-x86_64 ;;
+    0:darwin:aarch64) printf '%s\n' macos-aarch64 ;;
+    *) return 1 ;;
+  esac
+}
+
+_sha256_line() {
+  local file="$1" name="$2"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | sed "s| .*$|  $name|"
+  else
+    shasum -a 256 "$file" | sed "s| .*$|  $name|"
+  fi
+}
+
+_make_release() {
+  local root="$1" bundle="$2" tag="$3" platform="$4"
+  local archive="shdeps-${tag}-${platform}.tar.gz"
+
+  mkdir -p "$root"
+  tar -C "$bundle" -czf "$root/$archive" .
+  _sha256_line "$root/$archive" "$archive" >"$root/$archive.sha256"
+  cat >"$root/latest.json" <<JSON
+{
+  "tag_name": "$tag",
+  "assets": [
+    {"name": "$archive", "browser_download_url": "https://github.com/cgraf78/shdeps/releases/download/$tag/$archive"},
+    {"name": "$archive.sha256", "browser_download_url": "https://github.com/cgraf78/shdeps/releases/download/$tag/$archive.sha256"}
+  ]
+}
+JSON
+}
+
+_write_command_shims() {
+  local bin="$1"
+
+  mkdir -p "$bin"
+  cat >"$bin/cp" <<'SH'
+#!/usr/bin/env bash
+set -u
+dest=""
+for arg in "$@"; do dest="$arg"; done
+"$SHDEPS_TEST_REAL_CP" "$@" || exit $?
+case "${SHDEPS_TEST_PHASE:-}:$dest" in
+  copy:*/.shdeps-install.*/shdeps)
+    printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+    printf '%s\n' "${dest%/*}" >"$SHDEPS_TEST_MARKERS/staging.path"
+    : >"$SHDEPS_TEST_MARKERS/ready"
+    trap 'exit 143' TERM
+    while :; do sleep 1; done
+    ;;
+esac
+SH
+
+  cat >"$bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -u
+out=""
+url=""
+config=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w) shift 2 ;;
+    -H) shift 2 ;;
+    --config) config="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+if [[ "$config" == - ]]; then
+  while IFS= read -r line; do
+    case "$line" in
+      'url = '* )
+        url="${line#url = }"
+        url="${url#\"}"
+        url="${url%\"}"
+        ;;
+    esac
+  done
+fi
+case "$url" in
+  */latest) "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/latest.json" "$out" ;;
+  *.tar.gz)
+    "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/$(basename "$url")" "$out" || exit $?
+    if [[ "${SHDEPS_TEST_PHASE:-}" == download ]]; then
+      printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+      printf '%s\n' "${out%/*}" >"$SHDEPS_TEST_MARKERS/scratch.path"
+      : >"$SHDEPS_TEST_MARKERS/ready"
+      trap 'exit 143' TERM
+      while :; do sleep 1; done
+    fi
+    ;;
+  *.sha256) "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/$(basename "$url")" "$out" ;;
+  *) printf 'unexpected test URL: %s\n' "$url" >&2; exit 2 ;;
+esac
+SH
+
+  cat >"$bin/tar" <<'SH'
+#!/usr/bin/env bash
+set -u
+"$SHDEPS_TEST_REAL_TAR" "$@" || exit $?
+if [[ "${SHDEPS_TEST_PHASE:-}" == extract && "${1:-}" == -xzf ]]; then
+  archive="$2"
+  printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+  printf '%s\n' "${archive%/*}" >"$SHDEPS_TEST_MARKERS/scratch.path"
+  : >"$SHDEPS_TEST_MARKERS/ready"
+  trap 'exit 143' TERM
+  while :; do sleep 1; done
+fi
+SH
+
+  cat >"$bin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+src="$1"
+dest="$2"
+phase=${SHDEPS_TEST_PHASE:-}
+
+case "$phase" in
+  restore-failure)
+    case "$src:$dest" in
+      */.shdeps-install.*:"$SHDEPS_TEST_LIVE") exit 71 ;;
+      *.backup:"$SHDEPS_TEST_LIVE")
+        printf '%s\n' "$src" >"$SHDEPS_TEST_MARKERS/backup.path"
+        : >"$SHDEPS_TEST_MARKERS/restore-failed"
+        exit 72
+        ;;
+    esac
+    ;;
+esac
+
+"$SHDEPS_TEST_REAL_MV" "$@" || exit $?
+case "$src:$dest" in
+  "$SHDEPS_TEST_LIVE":*.backup)
+    printf '%s\n' "$dest" >"$SHDEPS_TEST_MARKERS/backup.path"
+    if [[ "$phase" == destination-race ]]; then
+      mkdir -p "$SHDEPS_TEST_LIVE"
+      printf '%s\n' foreign >"$SHDEPS_TEST_LIVE/foreign"
+    elif [[ "$phase" == old-moved ]]; then
+      : >"$SHDEPS_TEST_MARKERS/ready"
+      kill -TERM "$PPID"
+    fi
+    ;;
+  */.shdeps-install.*:"$SHDEPS_TEST_LIVE")
+    if [[ "$phase" == activated ]]; then
+      : >"$SHDEPS_TEST_MARKERS/ready"
+      kill -TERM "$PPID"
+    fi
+    ;;
+esac
+SH
+
+  cat >"$bin/rm" <<'SH'
+#!/usr/bin/env bash
+set -u
+target=""
+for arg in "$@"; do
+  case "$arg" in -*) ;; *) target="$arg" ;; esac
+done
+if [[ "${SHDEPS_TEST_PHASE:-}" == backup-remove && "$target" == *.backup && ! -e "$SHDEPS_TEST_MARKERS/remove-attempted" ]]; then
+  : >"$SHDEPS_TEST_MARKERS/remove-attempted"
+  printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+  printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/backup.path"
+  : >"$SHDEPS_TEST_MARKERS/ready"
+  trap 'exit 143' TERM
+  while :; do sleep 1; done
+fi
+exec "$SHDEPS_TEST_REAL_RM" "$@"
+SH
+
+  chmod +x "$bin/cp" "$bin/curl" "$bin/tar" "$bin/mv" "$bin/rm"
+}
+
+_write_driver() {
+  local path="$1"
+
+  cat >"$path" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ "${SHDEPS_TEST_ERREXIT:-0}" == 1 ]]; then set -e; fi
+
+trap 'printf "caller-hup\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' HUP
+trap 'printf "caller-int\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' INT
+trap 'printf "caller-term\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' TERM
+trap 'printf "caller-exit:%s\n" "$?" >>"$SHDEPS_TEST_CALLER_EXIT"' EXIT
+
+before_hup=$(trap -p HUP)
+before_int=$(trap -p INT)
+before_term=$(trap -p TERM)
+before_exit=$(trap -p EXIT)
+before_flags=$-
+before_options=$(set +o)
+before_cwd=$PWD
+
+SHDEPS_INSTALL_SH_NO_DISPATCH=1
+export SHDEPS_INSTALL_SH_NO_DISPATCH
+# shellcheck source=/dev/null
+. "$SHDEPS_TEST_INSTALL_SH"
+unset SHDEPS_INSTALL_SH_NO_DISPATCH
+
+rc=0
+if [[ "$SHDEPS_TEST_MODE" == release ]]; then
+  _install_release || rc=$?
+else
+  _install_bundle "$SHDEPS_TEST_BUNDLE" || rc=$?
+fi
+
+after_hup=$(trap -p HUP)
+after_int=$(trap -p INT)
+after_term=$(trap -p TERM)
+after_exit=$(trap -p EXIT)
+after_flags=$-
+after_options=$(set +o)
+after_cwd=$PWD
+
+{
+  printf 'rc=%s\n' "$rc"
+  [[ "$before_hup" == "$after_hup" ]] && printf 'hup=restored\n' || printf 'hup=changed\n'
+  [[ "$before_int" == "$after_int" ]] && printf 'int=restored\n' || printf 'int=changed\n'
+  [[ "$before_term" == "$after_term" ]] && printf 'term=restored\n' || printf 'term=changed\n'
+  [[ "$before_exit" == "$after_exit" ]] && printf 'exit=restored\n' || printf 'exit=changed\n'
+  [[ "$before_flags" == "$after_flags" ]] && printf 'flags=restored\n' || printf 'flags=changed\n'
+  [[ "$before_options" == "$after_options" ]] && printf 'options=restored\n' || printf 'options=changed\n'
+  [[ "$before_cwd" == "$after_cwd" ]] && printf 'cwd=restored\n' || printf 'cwd=changed\n'
+} >"$SHDEPS_TEST_REPORT"
+
+exit "$rc"
+SH
+  chmod +x "$path"
+}
+
+_wait_for_file() {
+  local path="$1" remaining=250
+  while ((remaining > 0)); do
+    [[ -e "$path" ]] && return 0
+    sleep 0.02
+    remaining=$((remaining - 1))
+  done
+  return 1
+}
+
+_wait_for_exit() {
+  local pid="$1" remaining=250
+  while ((remaining > 0)); do
+    if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+    sleep 0.02
+    remaining=$((remaining - 1))
+  done
+  return 1
+}
+
+_tree_matches() {
+  diff -r "$1" "$2" >/dev/null 2>&1
+}
+
+_report_is_restored() {
+  local report="$1"
+  [[ -f "$report" ]] || return 1
+  [[ $(sed -n 's/=restored$//p' "$report" | wc -l | tr -d ' ') == 7 ]]
+}
+
+_run_interrupt_case() {
+  local phase="$1" mode="$2" expected_tree="$3"
+  local root live bundle snapshot release markers bin tmp report stdout stderr
+  local caller_signals caller_exit driver install_script parent worker unrelated rc=0 timed_out=0
+  local tag platform scratch="" staging="" backup=""
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  release="$root/release"
+  markers="$root/markers"
+  bin="$root/bin"
+  tmp="$root/tmp"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  caller_signals="$root/caller-signals"
+  caller_exit="$root/caller-exit"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  tag=20990102-030405-22222222
+  platform=$(_platform_label) || {
+    _fail "$phase: unsupported test platform"
+    return
+  }
+
+  mkdir -p "$markers" "$tmp"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" "$tag"
+  cp -R "$live" "$snapshot"
+  _make_release "$release" "$bundle" "$tag" "$platform"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+  printf '%s\n' keep >"$root/unrelated"
+  sleep 60 &
+  unrelated=$!
+
+  PATH="$bin:$PATH" \
+    TMPDIR="$tmp" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_BIN="$root/shdeps-bin" \
+    SHDEPS_RELEASE_API_URL=https://api.github.com/repos/cgraf78/shdeps/releases/latest \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$caller_exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$caller_signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE="$mode" \
+    SHDEPS_TEST_PHASE="$phase" \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_RELEASE="$release" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" &
+  parent=$!
+
+  case "$phase" in
+    download | copy | extract | backup-remove)
+      if _wait_for_file "$markers/ready"; then
+        kill -TERM "$parent" 2>/dev/null || true
+      else
+        timed_out=1
+      fi
+      ;;
+  esac
+
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    if [[ -f "$markers/worker.pid" ]]; then
+      worker=$(cat "$markers/worker.pid")
+      kill -TERM "$worker" 2>/dev/null || true
+    fi
+    kill -TERM "$parent" 2>/dev/null || true
+    if ! _wait_for_exit "$parent"; then
+      kill -KILL "$parent" 2>/dev/null || true
+    fi
+  fi
+  wait "$parent" || rc=$?
+
+  _assert_eq "$phase: parent exits with TERM status" 143 "$rc"
+  _assert_eq "$phase: cancellation does not time out" 0 "$timed_out"
+  if _report_is_restored "$report"; then
+    _pass "$phase: caller traps, options, and cwd restored"
+  else
+    _fail "$phase: caller traps, options, and cwd restored"
+  fi
+  _assert_file_missing "$phase: caller signal trap is not invoked in transaction" "$caller_signals"
+  _assert_file_content "$phase: caller EXIT trap retains final status" caller-exit:143 "$caller_exit"
+  _assert_file_content "$phase: unrelated file survives" keep "$root/unrelated"
+  if kill -0 "$unrelated" 2>/dev/null; then
+    _pass "$phase: unrelated process survives"
+  else
+    _fail "$phase: unrelated process survives"
+  fi
+  if grep -Eq '^\[[0-9]+\][[:space:]]' "$stdout" "$stderr"; then
+    _fail "$phase: no job-control text leaks"
+  else
+    _pass "$phase: no job-control text leaks"
+  fi
+
+  [[ -f "$markers/scratch.path" ]] && scratch=$(cat "$markers/scratch.path")
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  [[ -f "$markers/backup.path" ]] && backup=$(cat "$markers/backup.path")
+  [[ -n "$scratch" ]] && _assert_not_exists "$phase: release scratch removed" "$scratch"
+  [[ -n "$staging" ]] && _assert_not_exists "$phase: staging removed" "$staging"
+  [[ -n "$backup" ]] && _assert_not_exists "$phase: backup removed" "$backup"
+
+  case "$expected_tree" in
+    old)
+      if _tree_matches "$snapshot" "$live"; then
+        _pass "$phase: old install remains byte-identical"
+      else
+        _fail "$phase: old install remains byte-identical"
+      fi
+      _assert_eq "$phase: old install remains executable" \
+        'shdeps 20990101-020304-11111111' "$("$live/shdeps" version 2>/dev/null)"
+      ;;
+    new)
+      _assert_eq "$phase: active install is the complete new bundle" \
+        "shdeps $tag" "$("$live/shdeps" version 2>/dev/null)"
+      _assert_file_exists "$phase: active metadata is present" "$live/.shdeps-install.json"
+      ;;
+  esac
+
+  kill -TERM "$unrelated" 2>/dev/null || true
+  wait "$unrelated" 2>/dev/null || true
+}
+
+_run_failure_case() {
+  local phase="$1"
+  local root live bundle snapshot markers bin report stdout stderr driver install_script backup="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  cp -R "$live" "$snapshot"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_PHASE="$phase" \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" || rc=$?
+
+  _assert_eq "$phase: install fails" 1 "$rc"
+  if _report_is_restored "$report"; then
+    _pass "$phase: caller state restored"
+  else
+    _fail "$phase: caller state restored"
+  fi
+  [[ -f "$markers/backup.path" ]] && backup=$(cat "$markers/backup.path")
+  _assert_file_exists "$phase: recoverable backup retained" "$backup/shdeps"
+  if _tree_matches "$snapshot" "$backup"; then
+    _pass "$phase: recoverable backup is byte-identical"
+  else
+    _fail "$phase: recoverable backup is byte-identical"
+  fi
+  case "$phase" in
+    restore-failure)
+      _assert_not_exists "$phase: unresolved live destination stays absent" "$live"
+      _assert_contains "$phase: diagnostic names recoverable backup" recoverable "$(cat "$stderr")"
+      ;;
+    destination-race)
+      _assert_file_content "$phase: unexpected destination is untouched" foreign "$live/foreign"
+      _assert_contains "$phase: diagnostic reports destination race" 'appeared before activation' "$(cat "$stderr")"
+      ;;
+  esac
+}
+
+echo '=== install.sh interruption transactions ==='
+_run_interrupt_case download release old
+_run_interrupt_case copy bundle old
+_run_interrupt_case extract release old
+_run_interrupt_case old-moved bundle old
+_run_interrupt_case activated bundle new
+_run_interrupt_case backup-remove bundle new
+_run_failure_case restore-failure
+_run_failure_case destination-race
+
+_test_summary

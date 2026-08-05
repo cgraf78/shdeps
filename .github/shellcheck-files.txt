@@ -16,6 +16,7 @@ program	tests/shell/completion-test
 program	tests/shell/helpers-test
 program	tests/shell/helpers.sh
 program	tests/shell/install-sh-test
+program	tests/shell/install-interruption-test
 program	tests/shell/installer-flow-test
 program	tests/shell/lua-api-test
 program	tests/shell/lua-bootstrap-test
