@@ -640,18 +640,23 @@ _assert_true "verify_checksum accepts the matching named line" \
 
 # Force the macOS fallback even on Linux hosts, where sha256sum would otherwise
 # always win command discovery and leave the shasum arguments unexercised.
+# Keep the stand-in self-contained: supported systems only need one SHA-256
+# tool, so the test must not require a real shasum in addition to sha256sum.
 _shasum_bin=$(mktemp -d)
-_real_shasum=$(command -v shasum)
 cat >"$_shasum_bin/shasum" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >"$SHDEPS_TEST_SHASUM_ARGS"
-exec "$SHDEPS_TEST_REAL_SHASUM" "$@"
+_shasum_file=""
+for _shasum_arg in "$@"; do
+  _shasum_file="$_shasum_arg"
+done
+printf '%s  %s\n' "$SHDEPS_TEST_SHASUM_DIGEST" "$_shasum_file"
 EOF
 chmod +x "$_shasum_bin/shasum"
 for _command in awk bash rm tr; do
   ln -s "$(command -v "$_command")" "$_shasum_bin/$_command"
 done
-SHDEPS_TEST_REAL_SHASUM="$_real_shasum" SHDEPS_TEST_SHASUM_ARGS="$_shasum_bin/args" \
+SHDEPS_TEST_SHASUM_DIGEST="$_ck_real" SHDEPS_TEST_SHASUM_ARGS="$_shasum_bin/args" \
   PATH="$_shasum_bin" \
   _assert_true "verify_checksum accepts the forced shasum fallback" \
   _verify_checksum "$_ck_dir" app.tar.gz app.tar.gz.sha256
