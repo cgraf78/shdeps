@@ -286,10 +286,15 @@ case "$src:$dest" in
     fi
     ;;
   */.shdeps-install.*:"$SHDEPS_TEST_LIVE")
-    if [[ "$phase" == destination-race ]]; then
+    if [[ "$phase" == destination-race || "$phase" == destination-race-signal ]]; then
       "$SHDEPS_TEST_REAL_MKDIR" -p "$SHDEPS_TEST_LIVE"
       printf '%s\n' foreign >"$SHDEPS_TEST_LIVE/foreign"
       printf '%s\n' "$SHDEPS_TEST_LIVE/${src##*/}" >"$SHDEPS_TEST_MARKERS/nested-staging.path"
+    fi
+    if [[ "$phase" == backup-disappears ]]; then
+      backup=$(cat "$SHDEPS_TEST_MARKERS/backup.path")
+      "$SHDEPS_TEST_REAL_RM" -rf -- "$backup"
+      exit 71
     fi
     ;;
 esac
@@ -298,6 +303,9 @@ esac
 case "$src:$dest" in
   "$SHDEPS_TEST_LIVE":*.backup)
     printf '%s\n' "$dest" >"$SHDEPS_TEST_MARKERS/backup.path"
+    if [[ "$phase" == backup-stat-failure ]]; then
+      exit 78
+    fi
     if [[ "$phase" == old-moved ]]; then
       : >"$SHDEPS_TEST_MARKERS/ready"
       kill -"${SHDEPS_TEST_SIGNAL:-TERM}" "$PPID"
@@ -310,6 +318,9 @@ case "$src:$dest" in
     if [[ "$phase" == activated* ]]; then
       : >"$SHDEPS_TEST_MARKERS/ready"
       kill -"${SHDEPS_TEST_SIGNAL:-TERM}" "$PPID"
+    fi
+    if [[ "$phase" == destination-race-signal && "$src" != *.backup ]]; then
+      kill -TERM "$PPID"
     fi
     ;;
 esac
@@ -374,6 +385,16 @@ case "${SHDEPS_TEST_PHASE:-}:$target" in
   staging-identity-failure:*/.shdeps-install.* | release-identity-failure:*/shdeps-release.*)
     printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/identity.path"
     exit 77
+    ;;
+  backup-stat-failure:*.backup)
+    count=0
+    [[ -f "$SHDEPS_TEST_MARKERS/backup-stat-count" ]] &&
+      count=$(cat "$SHDEPS_TEST_MARKERS/backup-stat-count")
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$SHDEPS_TEST_MARKERS/backup-stat-count"
+    if [[ "$count" -gt 1 ]]; then
+      exit 77
+    fi
     ;;
 esac
 exec "$SHDEPS_TEST_REAL_STAT" "$@"
@@ -452,6 +473,28 @@ case "$SHDEPS_TEST_MODE" in
       _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || return 1
       _shdeps_tx_staging_owned=1
       return 1
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  unrelated-signal)
+    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"' USR1
+    _install_bundle_core() {
+      _install_transaction_run sh -c '
+        printf "%s\n" "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+        : >"$SHDEPS_TEST_MARKERS/ready"
+        IFS= read -r _ <"$SHDEPS_TEST_MARKERS/unrelated.gate"
+      '
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  unrelated-signal-completion)
+    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"; sleep 0.2' USR1
+    _install_bundle_core() {
+      _install_transaction_run sh -c '
+        printf "%s\n" "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+        : >"$SHDEPS_TEST_MARKERS/ready"
+        sleep 0.05
+      '
     }
     _install_transaction bundle || rc=$?
     ;;
@@ -771,7 +814,7 @@ _run_failure_case() {
     "$driver" >"$stdout" 2>"$stderr" || rc=$?
 
   case "$phase" in
-    restore-failure | restore-race | destination-race) expected_rc=125 ;;
+    restore-failure | restore-race | destination-race | backup-stat-failure | backup-disappears) expected_rc=125 ;;
   esac
   _assert_eq "$phase: install fails" "$expected_rc" "$rc"
   if _report_is_restored "$report"; then
@@ -803,6 +846,12 @@ _run_failure_case() {
     _assert_contains "$phase: diagnostic names exact recovery path" "$recovery" "$(cat "$stderr")"
     return
   fi
+  if [[ "$phase" == backup-disappears ]]; then
+    _assert_not_exists "$phase: live install stays absent" "$live"
+    _assert_not_exists "$phase: vanished backup is not invented" "$backup"
+    _assert_contains "$phase: diagnostic names expected recovery path" "$backup" "$(cat "$stderr")"
+    return
+  fi
   _assert_file_exists "$phase: recoverable backup retained" "$backup/shdeps"
   if _tree_matches "$snapshot" "$backup"; then
     _pass "$phase: recoverable backup is byte-identical"
@@ -819,6 +868,10 @@ _run_failure_case() {
       _assert_file_content "$phase: unexpected destination is untouched" foreign "$live/foreign"
       _assert_not_exists "$phase: owned staging is removed from foreign destination" "$nested_staging"
       _assert_contains "$phase: diagnostic reports destination race" 'appeared before activation' "$(cat "$stderr")"
+      ;;
+    backup-stat-failure)
+      _assert_not_exists "$phase: live install stays absent while identity is unknown" "$live"
+      _assert_contains "$phase: diagnostic names retained old install" "$backup" "$(cat "$stderr")"
       ;;
   esac
 }
@@ -1100,6 +1153,51 @@ _run_postmove_invalid_case() {
   fi
 }
 
+_run_destination_signal_case() {
+  local root live bundle markers bin report driver install_script nested="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$bundle" 20990102-030405-22222222
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_PHASE=destination-race-signal \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" || rc=$?
+
+  [[ -f "$markers/nested-staging.path" ]] && nested=$(cat "$markers/nested-staging.path")
+  _assert_eq 'destination signal: original TERM status is preserved' 143 "$rc"
+  _assert_file_content 'destination signal: foreign destination is untouched' foreign "$live/foreign"
+  _assert_not_exists 'destination signal: nested staged bundle is removed' "$nested"
+  if _report_is_restored "$report"; then
+    _pass 'destination signal: caller state restored'
+  else
+    _fail 'destination signal: caller state restored'
+  fi
+}
+
 _run_latched_spawn_case() {
   local root markers report stdout stderr driver install_script parent worker rc=0 timed_out=0
 
@@ -1374,6 +1472,65 @@ _run_cleanup_failure_case() {
   "$_real_rm" -rf -- "$staging"
 }
 
+_run_unrelated_signal_wait_case() {
+  local mode="$1" label="$2"
+  local root markers report driver install_script parent worker="" rc=0 early_exit=0 timed_out=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  if [[ "$mode" == unrelated-signal ]]; then
+    mkfifo "$markers/unrelated.gate"
+  fi
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE="$mode" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" &
+  parent=$!
+  if _wait_for_file "$markers/ready"; then
+    kill -USR1 "$parent" 2>/dev/null || true
+  else
+    timed_out=1
+  fi
+  _wait_for_file "$markers/usr1-seen" || timed_out=1
+  sleep 0.1
+  if ! kill -0 "$parent" 2>/dev/null; then
+    early_exit=1
+  elif [[ "$mode" == unrelated-signal ]]; then
+    printf 'release\n' >"$markers/unrelated.gate"
+  fi
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+
+  [[ -f "$markers/worker.pid" ]] && worker=$(cat "$markers/worker.pid")
+  _assert_eq "$label: transaction does not exit from unrelated signal" 0 "$early_exit"
+  _assert_eq "$label: transaction returns the child status" 0 "$rc"
+  _assert_eq "$label: completion stays bounded" 0 "$timed_out"
+  if [[ -n "$worker" ]] && ! kill -0 "$worker" 2>/dev/null; then
+    _pass "$label: exact child is reaped"
+  else
+    _fail "$label: exact child is reaped"
+    [[ -n "$worker" ]] && kill -KILL "$worker" 2>/dev/null || true
+  fi
+  if _report_is_restored "$report"; then
+    _pass "$label: caller state restored"
+  else
+    _fail "$label: caller state restored"
+  fi
+}
+
 _run_executed_case() {
   local root live bundle snapshot markers bin stdout stderr parent worker rc=0 timed_out=0 staging=""
 
@@ -1450,16 +1607,21 @@ _run_interrupt_case activated-int bundle new INT
 _run_interrupt_case backup-remove bundle new
 _run_interrupt_case cleanup-remove cleanup-interrupt old
 _run_cleanup_failure_case
+_run_unrelated_signal_wait_case unrelated-signal 'unrelated signal'
+_run_unrelated_signal_wait_case unrelated-signal-completion 'unrelated signal during child completion'
 _run_failure_case restore-failure
 _run_failure_case restore-race
 _run_failure_case destination-race
 _run_failure_case backup-race
+_run_failure_case backup-stat-failure
+_run_failure_case backup-disappears
 _run_owned_replacement_case staging-replacement bundle
 _run_owned_replacement_case scratch-replacement release
 _run_dangling_live_case
 _run_private_directory_case
 _run_invalid_bundle_case
 _run_postmove_invalid_case
+_run_destination_signal_case
 _run_success_case
 _run_latched_spawn_case
 _run_teardown_signal_case

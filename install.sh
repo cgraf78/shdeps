@@ -100,17 +100,35 @@ _install_transaction_cancel_child() {
 _install_transaction_wait_child() {
   local rc=0
 
-  if wait "$_shdeps_tx_child"; then
-    _shdeps_tx_child=""
-  else
-    rc=$?
-    if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
-      _install_transaction_cancel_child
-      return "$_shdeps_tx_signal"
+  while :; do
+    if wait "$_shdeps_tx_child"; then
+      _shdeps_tx_child=""
+      break
+    else
+      rc=$?
+      if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
+        _install_transaction_cancel_child
+        return "$_shdeps_tx_signal"
+      fi
+      # A caller-owned trap such as WINCH or USR1 can interrupt Bash's wait
+      # without stopping the exact child. Retain ownership and wait again;
+      # clearing the slot here would let cleanup race a live curl/cp/tar.
+      if _install_transaction_job_running "$_shdeps_tx_child"; then
+        continue
+      fi
+      # The child may have completed while a longer caller trap ran. Collect
+      # its retained wait status instead of returning the unrelated signal's
+      # synthetic 128+N status as the transaction result.
+      if wait "$_shdeps_tx_child"; then
+        _shdeps_tx_child=""
+        break
+      else
+        rc=$?
+      fi
+      _shdeps_tx_child=""
+      return "$rc"
     fi
-    _shdeps_tx_child=""
-    return "$rc"
-  fi
+  done
   if [[ "${_shdeps_tx_signal:-0}" -ne 0 ]]; then
     return "$_shdeps_tx_signal"
   fi
@@ -797,12 +815,20 @@ _install_transaction_reconcile() {
 
   if _install_identity_matches "$_shdeps_tx_backup" "$_shdeps_tx_old_identity"; then
     _shdeps_tx_backup_owned=1
+    _shdeps_tx_backup_unverified=0
   elif [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
     # Ownership follows the inode, not the randomized pathname. A concurrent
-    # replacement must never become eligible for transaction cleanup.
+    # replacement must never become eligible for transaction cleanup. However,
+    # an existing path that cannot be identified may still contain the only old
+    # install, so retain it as a hard recovery condition instead of silently
+    # declaring cleanup complete.
     _shdeps_tx_backup_owned=0
+    _shdeps_tx_backup_unverified=1
+    _shdeps_tx_old_recovery="$_shdeps_tx_backup"
   fi
-  if [[ "$_shdeps_tx_backup_owned" -eq 1 && ! -e "$SHDEPS_DIR" && ! -L "$SHDEPS_DIR" ]]; then
+  if [[ "$_shdeps_tx_backup_unverified" -eq 1 ]]; then
+    _shdeps_tx_state=BACKUP_UNVERIFIED
+  elif [[ "$_shdeps_tx_backup_owned" -eq 1 && ! -e "$SHDEPS_DIR" && ! -L "$SHDEPS_DIR" ]]; then
     _shdeps_tx_state=OLD_MOVED
   else
     _shdeps_tx_state=PREPARED
@@ -814,6 +840,7 @@ _install_transaction_recover_backup_race() {
   local moved_nested="$SHDEPS_DIR/${nested##*/}" rc=0
 
   _shdeps_tx_backup_owned=0
+  _shdeps_tx_backup_unverified=0
   _shdeps_tx_old_recovery=""
   if _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_old_identity"; then
     _error "shdeps backup path appeared during activation; old install remains at $SHDEPS_DIR"
@@ -987,6 +1014,10 @@ _install_transaction_cleanup() {
         failed=1
       fi
       ;;
+    BACKUP_UNVERIFIED)
+      _error "cannot verify old shdeps install; expected recovery path at $_shdeps_tx_old_recovery"
+      failed=1
+      ;;
     STAGING_MOVED)
       if [[ "$_shdeps_tx_staging_owned" -eq 1 ]] &&
         ! _install_transaction_remove_owned "$SHDEPS_DIR" \
@@ -1047,6 +1078,7 @@ _install_transaction() {
   local _shdeps_tx_staging_identity="" _shdeps_tx_old_identity=""
   local _shdeps_tx_old_recovery="" _shdeps_tx_monitor=0
   local _shdeps_tx_staging_owned=0 _shdeps_tx_backup_owned=0
+  local _shdeps_tx_backup_unverified=0
   local _shdeps_tx_release_owned=0 _shdeps_tx_cleanup_done=0
   local _shdeps_tx_cleanup_failed=0
   local _shdeps_tx_saved_hup _shdeps_tx_saved_int _shdeps_tx_saved_term
@@ -1189,9 +1221,11 @@ _install_bundle_core() {
   fi
   if mv "$_shdeps_tx_staging" "$SHDEPS_DIR"; then rc=0; else rc=$?; fi
   _install_transaction_reconcile
-  if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
   if [[ "$_shdeps_tx_state" != ACTIVE ]]; then
     _install_transaction_track_staging_after_move || true
+  fi
+  if [[ "$_shdeps_tx_signal" -ne 0 ]]; then return "$_shdeps_tx_signal"; fi
+  if [[ "$_shdeps_tx_state" != ACTIVE ]]; then
     if [[ -e "$SHDEPS_DIR" || -L "$SHDEPS_DIR" ]]; then
       if [[ "$_shdeps_tx_backup_owned" -eq 1 ]]; then
         _error "$SHDEPS_DIR appeared before activation; recoverable backup retained at $_shdeps_tx_backup"
