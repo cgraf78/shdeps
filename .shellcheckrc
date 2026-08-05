@@ -1,5 +1,10 @@
 shell=bash
 enable=all
+# The vendored release entry points source scripts/release-lib.sh next to them.
+# Resolving siblings here keeps the commit hook agreeing with CI, which passes
+# -x -P SCRIPTDIR explicitly.
+external-sources=true
+source-path=SCRIPTDIR
 # SC2250: prefer ${var} over $var for consistency — not enforced here
 # SC2312: command substitution in [[ ]] — masking is fine for simple accessors
 # SC2249: default *) case — intentional no-op fallthrough in package manager dispatch

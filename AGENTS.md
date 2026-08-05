@@ -26,6 +26,10 @@ changes.
   `--bootstrap` for client integration.
 - **`tests/shell/shdeps-wrapper-test`** — focused tests for the sourceable
   Rust-era wrapper API.
+- **`scripts/release*.sh`** — vendored verbatim from `cgraf78/actions`
+  (`release-scripts/`). Do not edit them here: CI fails on any divergence.
+  Repo-specific release inputs live in `scripts/release.conf`, and runtime
+  smoke assertions in `scripts/release-smoke-hook.sh`.
 
 ## Code Organization
 

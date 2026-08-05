@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tag=$(scripts/release-version.sh)
+# Vendored from cgraf78/actions:release-scripts. Do not edit in consumer repos;
+# CI verifies this file byte-matches the shared copy. Per-project knobs live in
+# scripts/release.conf.
 
-case "$tag" in
-  *[!A-Za-z0-9._-]*)
-    printf 'release tag contains characters unsafe for asset names: %s\n' "$tag" >&2
-    exit 1
-    ;;
-esac
+# shellcheck source=release-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/release-lib.sh"
 
-printf '%s\n' "$tag"
+release_load_config
+release_compute_tag
