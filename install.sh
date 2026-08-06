@@ -205,6 +205,9 @@ _install_transaction_print_trap() {
   trap -p "$1" >&3
 }
 
+# Registration and the pre-wait signal check must stay adjacent. A trap can run
+# after the async launch but before `wait`; publishing the PID first lets that
+# already-dispatched signal cancel the exact child instead of blocking forever.
 _install_transaction_wait_started_child() {
   _shdeps_tx_child="$1"
   _install_transaction_cancel_started_child_if_signaled || return $?
@@ -230,6 +233,9 @@ _install_transaction_run() {
   _install_transaction_wait_started_child "$child"
 }
 
+# Keep output capture inside the transaction API so callers do not reach for a
+# pipeline or command substitution. Those wrappers would change which process
+# owns the useful status and complicate exact-child cancellation.
 _install_transaction_run_to_file() {
   local output="$1" child saved_debug
 
@@ -245,6 +251,8 @@ _install_transaction_run_to_file() {
   _install_transaction_wait_started_child "$child"
 }
 
+# Feed private input without putting it in argv while retaining the same exact
+# child registration and cancellation boundary as the other transaction runs.
 _install_transaction_run_with_input() {
   local input="$1" child saved_debug
 
@@ -857,6 +865,9 @@ _install_transaction_restore_traps() {
   fi
 }
 
+# Choose and preflight every pathname before the first allocation so one nonce
+# ties staging, backup, and release scratch together. These absence checks are
+# not ownership claims: creation plus identity capture establishes that later.
 _install_transaction_prepare_paths() {
   local mode="$1" parent tmp_root candidate attempt=0
 
@@ -907,6 +918,10 @@ _install_private_directory() {
   )
 }
 
+# Device and inode follow the same object across a same-filesystem `mv` and
+# reject ordinary pathname replacement. The owner token travels with the
+# managed directory and prevents immediate inode reuse from inheriting deletion
+# rights after staging, backup, or live-path transitions.
 _install_directory_identity() {
   local path="$1" expected_token="${2:-}" identity=""
   local marker="$1/.shdeps-install-owner" owner_token=""
@@ -956,6 +971,10 @@ _install_remove_unidentified_directory() {
   return 1
 }
 
+# Shell commands and signals can interrupt immediately after `mv` but before the
+# corresponding state assignment. Rebuild the state machine from validated
+# filesystem identities so cleanup follows what actually moved, never what the
+# previous command merely intended to move.
 _install_transaction_reconcile() {
   if [[ -n "$_shdeps_tx_staging_identity" ]] &&
     _install_identity_matches "$SHDEPS_DIR" "$_shdeps_tx_staging_identity"; then
@@ -1003,6 +1022,10 @@ _install_transaction_reconcile() {
   fi
 }
 
+# If a foreign backup directory appears between the absence check and `mv`, mv
+# can place the old install *inside* that directory. Locate the exact old inode
+# in every possible destination and restore it only when the public path remains
+# free; otherwise preserve an explicit recovery location.
 _install_transaction_recover_backup_race() {
   local nested="$_shdeps_tx_backup/${SHDEPS_DIR##*/}"
   local moved_nested="$SHDEPS_DIR/${nested##*/}" rc=0
@@ -1048,6 +1071,9 @@ _install_transaction_recover_backup_race() {
   return 1
 }
 
+# The same destination-appearance race can nest staging under a newly created
+# live directory. Track only the matching staged identity so later cleanup does
+# not mistake the foreign destination for transaction-owned state.
 _install_transaction_track_staging_after_move() {
   local nested="$SHDEPS_DIR/${_shdeps_tx_staging##*/}"
 
@@ -1237,6 +1263,9 @@ _install_transaction_remove_owned() {
   fi
 }
 
+# Restoring backup is another `mv source destination` race: a destination that
+# appears concurrently can receive the backup as a nested child. Revalidate all
+# candidate locations and retain the exact old install wherever it landed.
 _install_transaction_restore_old() {
   local nested="$SHDEPS_DIR/${_shdeps_tx_backup##*/}" rc=0
 
@@ -1268,6 +1297,10 @@ _install_transaction_restore_old() {
   return 1
 }
 
+# Cleanup is an idempotent state-machine transition, not a generic rm pass. Each
+# branch acts only on identities proven above, updates ownership immediately,
+# and leaves failed resources recorded so a second teardown cannot delete a
+# replacement or report an already-removed path.
 _install_transaction_cleanup() {
   local failed=0
 
@@ -1429,6 +1462,9 @@ _install_transaction_remember_committed_interruption() {
   [[ "$previous" == "${_SHDEPS_INSTALL_PROPAGATION_MESSAGE:-}" ]] || _error "$message"
 }
 
+# Direct execution needs EXIT as a final backstop for `set -e` and unexpected
+# returns. Sourced bootstrap cannot exit its caller, so it invokes the same
+# cleanup and trap restoration explicitly in `_install_transaction` instead.
 _install_transaction_exit() {
   local status="$1" cleanup_rc=0
 
@@ -1442,6 +1478,9 @@ _install_transaction_exit() {
   exit "$status"
 }
 
+# Keep signal ownership, child ownership, filesystem ownership, and trap
+# restoration inside one dynamic scope. This prevents sourced callers and
+# direct execution from observing different rollback semantics.
 _install_transaction() {
   local mode="$1" src_dir="${2:-}" rc=0 cleanup_rc=0
   local _shdeps_tx_active=1 _shdeps_tx_signal=0 _shdeps_tx_child=""
