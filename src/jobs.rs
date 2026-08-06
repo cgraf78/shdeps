@@ -332,20 +332,17 @@ where
         while completed < len {
             match completed_rx.recv() {
                 Ok(WorkerEvent::Started(index)) => {
-                    if callback_error.is_none()
-                        && let Err(error) = progress(ItemProgressEvent::Started(index))
-                    {
-                        callback_error = Some(error);
+                    if callback_error.is_none() {
+                        callback_error = progress(ItemProgressEvent::Started(index)).err();
                     }
                 }
                 Ok(WorkerEvent::Completed(index, result)) => {
-                    if callback_error.is_none()
-                        && let Err(error) = progress(ItemProgressEvent::Completed {
+                    if callback_error.is_none() {
+                        callback_error = progress(ItemProgressEvent::Completed {
                             index,
                             result: &result,
                         })
-                    {
-                        callback_error = Some(error);
+                        .err();
                     }
                     slots[index] = Some(result);
                     completed += 1;

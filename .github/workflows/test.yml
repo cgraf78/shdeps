@@ -2,9 +2,13 @@ name: Tests
 
 on:
   push:
-    branches: [master, main]
+    # main is the only maintained branch. Keeping the retired master name here
+    # would make the trigger disagree with branch protection and release docs.
+    branches: [main]
   pull_request:
   schedule:
+    # Stagger sibling repositories so scheduled full matrices do not compete
+    # for the same runner capacity at the top of the hour.
     - cron: "37 8 * * *"
   workflow_dispatch:
 
@@ -13,11 +17,17 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     with:
-      clippy-command: cargo clippy --locked --all-targets -- -D warnings
-      doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
+      # rust-version is a compatibility promise, so exercise it inside the
+      # shared required gate instead of leaving the README badge aspirational.
+      # The shared defaults own Clippy's locked all-target/all-feature scope and
+      # rustdoc's locked missing-doc lint; local copies would add a drift site.
+      msrv-toolchain: "1.85"
       termux-command: scripts/termux-ci.sh
+      # shdeps is installed from release archives on real machines. Build and
+      # unpack that exact archive on the host before transporting its binary
+      # into Termux so CI covers packaging/layout drift as well as Bionic ABI.
       termux-host-command: |
         archive=$(
           CARGO_TARGET_DIR="$RUNNER_TEMP/shdeps-termux-target" \
@@ -27,23 +37,22 @@ jobs:
         mkdir -p .termux-ci
         tar -xzf "$archive" -C .termux-ci ./shdeps
       android-package-smoke-command: |
+        # AArch64 is the dominant physical-device artifact; the x86_64 archive
+        # gets the independent emulator runtime proof above. Both remain
+        # published because shdeps selects an artifact by device architecture.
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
-      package-smoke-setup-command: |
-        if [[ "$RUNNER_OS" == "Linux" ]]; then
-          # The release archive smoke test intentionally exercises the same
-          # static Linux target that fleet bootstrap installs. Keep this as
-          # caller-owned setup because the shared Rust workflow should not need
-          # to know which projects package musl archives.
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-        fi
+      # The release archive smoke test intentionally exercises the same static
+      # Linux target that fleet bootstrap installs. zstd-sys compiles native
+      # code, so shdeps needs the optional host musl linker that pure-Rust
+      # sibling repositories deliberately skip.
+      package-smoke-musl-target: x86_64-unknown-linux-musl
+      package-smoke-install-musl-tools: true
       package-smoke-command: |
         # Release archives are the fleet bootstrap contract, so regular CI
         # should exercise the same Linux musl label that tagged releases
         # publish instead of waiting until a tag push discovers drift.
-        scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
+        scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl
         scripts/smoke-release.sh linux-x86_64-musl
 
         # The sourceable wrapper needs the optimized host binary from rust-ci's
@@ -51,8 +60,10 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     with:
+      # Cross-distribution package-manager behavior is shdeps' product surface,
+      # so the broad shell matrix is intentional rather than shared-CI drift.
       matrix-set: full
       profiles: base
       shellcheck-inventory-path: .github/shellcheck-files.txt
@@ -69,6 +80,22 @@ jobs:
         tests/shell/release-scripts-test
 
   bash32:
-    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     with:
+      # install.sh runs before shdeps can provide a newer shell, including on
+      # stock macOS. This compatibility gate is therefore product behavior,
+      # while the sourceable API itself intentionally requires Bash 4.3+.
       command: /bin/bash scripts/smoke-install-bash32.sh
+
+  release-scripts:
+    name: Release script sync
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Keep the established check name while broadening what it proves: every
+      # shared workflow/action and each vendored release script must come from
+      # the one commit recorded in the consumer lock.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@f301fa80f9eef8082332a83a74153eb0d3e1e8d4

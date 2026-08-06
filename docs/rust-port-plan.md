@@ -1190,8 +1190,8 @@ During the port, CI should include:
 
 - existing shell test matrix
 - `cargo fmt --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `cargo test --locked`
 - Rust integration tests
 - Bash compatibility tests
 - dotfiles compatibility smoke tests where practical
@@ -1277,9 +1277,9 @@ Acceptance:
 
 Acceptance:
 
-- `cargo test` passes.
-- `RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps` passes.
-- `cargo build --release` produces the `shdeps` binary.
+- `cargo test --locked` passes.
+- `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps` passes.
+- `cargo build --release --locked` produces the `shdeps` binary.
 - `shdeps version` prints `shdeps YYYYMMDD-HHMMSS-<8hex>`.
 
 ### Phase 2: Pure Logic
