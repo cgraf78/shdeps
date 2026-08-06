@@ -168,6 +168,7 @@ Run the test suite:
 ```bash
 cargo test --locked
 tests/shell/install-sh-test
+tests/shell/install-interruption-test
 tests/shell/installer-flow-test
 tests/shell/release-scripts-test
 SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test

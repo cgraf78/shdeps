@@ -599,6 +599,7 @@ static archive.
 ```bash
 cargo test --locked
 tests/shell/install-sh-test
+tests/shell/install-interruption-test
 tests/shell/installer-flow-test
 tests/shell/release-scripts-test
 SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
@@ -606,7 +607,9 @@ SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
 
 The standalone CLI is a Rust binary. The sourceable Bash API and hook prelude
 require Bash 4.3+; `install.sh` itself is kept compatible with the stock macOS
-Bash 3.2 installer path.
+Bash 3.2 installer path. A sourced bootstrap returns `125` when transaction
+cleanup cannot prove recovery state is safe, and `128+signal` when HUP, INT, or
+TERM cancels it; callers must not downgrade those statuses to best effort.
 
 ## Releasing
 

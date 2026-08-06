@@ -127,7 +127,9 @@ _shdepsw_prepend_bin_dir() {
 
 _shdepsw_ensure_abi() {
   local version
-  [[ "${_SHDEPS_ABI_CHECKED:-}" == "1" ]] && return 0
+  # This wrapper can be sourced for more than one install in a long-lived shell.
+  # A prior binary's success says nothing about the newly resolved sibling.
+  [[ "${_SHDEPSW_ABI_BIN:-}" == "$_SHDEPSW_BIN" ]] && return 0
 
   version=$(_shdepsw_call __api version 2>/dev/null) || {
     _shdepsw_source_fail "Rust shdeps binary does not expose the wrapper ABI"
@@ -135,7 +137,7 @@ _shdepsw_ensure_abi() {
   }
   case "$version" in
     abi:1)
-      _SHDEPS_ABI_CHECKED=1
+      _SHDEPSW_ABI_BIN="$_SHDEPSW_BIN"
       ;;
     *)
       _shdepsw_source_fail "Rust shdeps binary reports unsupported wrapper ABI: $version"
@@ -145,7 +147,17 @@ _shdepsw_ensure_abi() {
 
 _shdepsw_cache_env() {
   local snapshot line key value
-  [[ "${_SHDEPSW_ENV_CACHED:-}" == "1" ]] && return 0
+  [[ "${_SHDEPSW_ENV_BIN:-}" == "$_SHDEPSW_BIN" ]] && return 0
+
+  # Clear every binary-derived value before reading the replacement snapshot.
+  # Missing fields must not silently retain roots or flags from another install.
+  if [[ -n "${_SHDEPSW_EXPORTED_PKG_MGR:-}" &&
+    "${SHDEPS_PKG_MGR:-}" == "$_SHDEPSW_EXPORTED_PKG_MGR" ]]; then
+    unset SHDEPS_PKG_MGR
+  fi
+  unset _SHDEPSW_EXPORTED_PKG_MGR
+  unset _SHDEPSW_INSTALL_DIR _SHDEPSW_BIN_DIR _SHDEPSW_GIT_DEV_DIR
+  unset _SHDEPSW_PLATFORM _SHDEPSW_PKG_MGR _SHDEPSW_FORCE _SHDEPSW_REINSTALL
 
   snapshot=$(_shdepsw_call __api env-snapshot) || return $?
   while IFS= read -r line; do
@@ -168,8 +180,9 @@ _shdepsw_cache_env() {
   # caller's later explicit SHDEPS_PKG_MGR override.
   if [[ -n "${_SHDEPSW_PKG_MGR:-}" ]]; then
     export SHDEPS_PKG_MGR="$_SHDEPSW_PKG_MGR"
+    _SHDEPSW_EXPORTED_PKG_MGR="$_SHDEPSW_PKG_MGR"
   fi
-  _SHDEPSW_ENV_CACHED=1
+  _SHDEPSW_ENV_BIN="$_SHDEPSW_BIN"
 }
 
 _shdepsw_should_log() {

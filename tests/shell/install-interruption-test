@@ -1,0 +1,2309 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1091
+# Regression coverage for interruption-safe release activation in install.sh.
+
+set -uo pipefail
+
+SHDEPS_DIR=$(cd "$(dirname "$0")/../.." && pwd)
+
+# shellcheck source=helpers.sh
+. "$(dirname "$0")/helpers.sh"
+
+_real_cp=$(command -v cp)
+_real_mkdir=$(command -v mkdir)
+_real_mv=$(command -v mv)
+_real_rm=$(command -v rm)
+_real_stat=$(command -v stat)
+_real_tar=$(command -v tar)
+export SHDEPS_TEST_REAL_STAT="$_real_stat"
+if command -v sha256sum >/dev/null 2>&1; then
+  _real_hasher=$(command -v sha256sum)
+  _real_hasher_is_shasum=0
+else
+  _real_hasher=$(command -v shasum)
+  _real_hasher_is_shasum=1
+fi
+
+_write_fake_shdeps() {
+  local path="$1" version="$2"
+
+  cat >"$path" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  version) printf '%s\n' "shdeps $version" ;;
+  __api)
+    case "\${2:-}" in
+      version) printf '%s\n' 'abi:1' ;;
+      env-snapshot)
+        printf '%s\n' \
+          "install_dir=\${SHDEPS_INSTALL_DIR:-\$HOME/.local/share}" \
+          "bin_dir=\${SHDEPS_BIN_DIR:-\$HOME/.local/bin}" \
+          "git_dev_dir=\${SHDEPS_GIT_DEV_DIR:-\$HOME/git}" \
+          'platform=linux' 'pkg_mgr=' \
+          "force=\${SHDEPS_FORCE:-0}" \
+          "reinstall=\${SHDEPS_REINSTALL:-0}"
+        ;;
+      link-extras | unlink-extras) ;;
+    esac
+    ;;
+esac
+SH
+  chmod +x "$path"
+}
+
+_make_bundle() {
+  local dir="$1" version="$2"
+
+  mkdir -p "$dir"
+  _write_fake_shdeps "$dir/shdeps" "$version"
+  cp "$SHDEPS_DIR/shdeps.sh" "$dir/shdeps.sh"
+  cp "$SHDEPS_DIR/install.sh" "$dir/install.sh"
+  cat >"$dir/.shdeps-install.json" <<JSON
+{"schema":1,"method":"release","artifact_platform":"test","version":"$version","tag":"$version","commit":"abcdef123456","repo":"cgraf78/shdeps"}
+JSON
+}
+
+_platform_label() {
+  local os arch android=0
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m | tr '[:upper:]' '[:lower:]')
+  if [[ -n "${ANDROID_ROOT:-}" || -n "${TERMUX_VERSION:-}" || "$(uname -o 2>/dev/null)" == Android ]]; then
+    android=1
+  fi
+  case "$arch" in
+    amd64) arch=x86_64 ;;
+    arm64) arch=aarch64 ;;
+  esac
+  case "$android:$os:$arch" in
+    1:linux:aarch64) printf '%s\n' android-aarch64 ;;
+    1:linux:x86_64) printf '%s\n' android-x86_64 ;;
+    0:linux:x86_64) printf '%s\n' linux-x86_64-musl ;;
+    0:linux:aarch64) printf '%s\n' linux-aarch64-musl ;;
+    0:darwin:x86_64) printf '%s\n' macos-x86_64 ;;
+    0:darwin:aarch64) printf '%s\n' macos-aarch64 ;;
+    *) return 1 ;;
+  esac
+}
+
+_directory_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+_sha256_line() {
+  local file="$1" name="$2"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | sed "s| .*$|  $name|"
+  else
+    shasum -a 256 "$file" | sed "s| .*$|  $name|"
+  fi
+}
+
+_make_release() {
+  local root="$1" bundle="$2" tag="$3" platform="$4"
+  local archive="shdeps-${tag}-${platform}.tar.gz"
+
+  mkdir -p "$root"
+  tar -C "$bundle" -czf "$root/$archive" .
+  _sha256_line "$root/$archive" "$archive" >"$root/$archive.sha256"
+  cat >"$root/latest.json" <<JSON
+{
+  "tag_name": "$tag",
+  "assets": [
+    {"name": "$archive", "browser_download_url": "https://github.com/cgraf78/shdeps/releases/download/$tag/$archive"},
+    {"name": "$archive.sha256", "browser_download_url": "https://github.com/cgraf78/shdeps/releases/download/$tag/$archive.sha256"}
+  ]
+}
+JSON
+}
+
+_write_command_shims() {
+  local bin="$1"
+
+  mkdir -p "$bin"
+  cat >"$bin/cp" <<'SH'
+#!/usr/bin/env bash
+set -u
+dest=""
+for arg in "$@"; do dest="$arg"; done
+case "${SHDEPS_TEST_PHASE:-}:$dest" in
+  staging-replacement:*/.shdeps-install.*/)
+    staging="${dest%/}"
+    printf '%s\n' "$staging" >"$SHDEPS_TEST_MARKERS/staging.path"
+    # Preserve the directory inode while revoking its transaction marker. This
+    # deterministically exercises ownership transfer without relying on whether
+    # the host filesystem immediately reuses an inode after remove/recreate.
+    "$SHDEPS_TEST_REAL_RM" -f -- "$staging/.shdeps-install-owner"
+    printf '%s\n' foreign >"$staging/foreign"
+    exit 74
+    ;;
+  staging-initial-replacement:*/.shdeps-install.*/)
+    # The stat shim already revoked the marker before initial identity capture.
+    # Stop the install if a buggy implementation adopted that path anyway.
+    exit 74
+    ;;
+  copy:*/.shdeps-install.*/)
+    printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+    printf '%s\n' "${dest%/}" >"$SHDEPS_TEST_MARKERS/staging.path"
+    : >"$SHDEPS_TEST_MARKERS/ready"
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    while :; do sleep 1; done
+    ;;
+esac
+"$SHDEPS_TEST_REAL_CP" "$@" || exit $?
+SH
+
+  cat >"$bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -u
+out=""
+url=""
+config=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w) shift 2 ;;
+    -H) shift 2 ;;
+    --config) config="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+if [[ "$config" == - ]]; then
+  while IFS= read -r line; do
+    case "$line" in
+      'url = '* )
+        url="${line#url = }"
+        url="${url#\"}"
+        url="${url%\"}"
+        ;;
+    esac
+  done
+fi
+case "$url" in
+  */latest)
+    if [[ "${SHDEPS_TEST_PHASE:-}" == scratch-replacement ]]; then
+      scratch="${out%/*}"
+      printf '%s\n' "$scratch" >"$SHDEPS_TEST_MARKERS/scratch.path"
+      "$SHDEPS_TEST_REAL_RM" -f -- "$scratch/.shdeps-install-owner"
+      printf '%s\n' foreign >"$scratch/foreign"
+      exit 75
+    fi
+    "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/latest.json" "$out"
+    ;;
+  *.tar.gz)
+    "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/$(basename "$url")" "$out" || exit $?
+    if [[ "${SHDEPS_TEST_PHASE:-}" == *download* ]]; then
+      printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+      printf '%s\n' "${out%/*}" >"$SHDEPS_TEST_MARKERS/scratch.path"
+      : >"$SHDEPS_TEST_MARKERS/ready"
+      trap 'exit 129' HUP
+      trap 'exit 130' INT
+      if [[ "${SHDEPS_TEST_IGNORE_TERM:-0}" == 1 ]]; then
+        trap ': >"$SHDEPS_TEST_MARKERS/term-forwarded"' TERM
+        while :; do sleep 0.02; done
+      else
+        trap 'exit 143' TERM
+        while :; do sleep 1; done
+      fi
+    fi
+    ;;
+  *.sha256) "$SHDEPS_TEST_REAL_CP" "$SHDEPS_TEST_RELEASE/$(basename "$url")" "$out" ;;
+  *) printf 'unexpected test URL: %s\n' "$url" >&2; exit 2 ;;
+esac
+SH
+
+  cat >"$bin/sha256sum" <<'SH'
+#!/usr/bin/env bash
+set -u
+last=""
+for arg in "$@"; do last="$arg"; done
+if [[ "${SHDEPS_TEST_PHASE:-}" == checksum ]]; then
+  scratch="$PWD"
+  case "$last" in */*) scratch="${last%/*}" ;; esac
+  printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+  printf '%s\n' "$scratch" >"$SHDEPS_TEST_MARKERS/scratch.path"
+  exec 3<>"$SHDEPS_TEST_CHECKSUM_GATE"
+  : >"$SHDEPS_TEST_MARKERS/ready"
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  IFS= read -r _ <&3
+fi
+if [[ "$SHDEPS_TEST_REAL_HASHER_IS_SHASUM" == 1 ]]; then
+  exec "$SHDEPS_TEST_REAL_HASHER" -a 256 "$@"
+fi
+exec "$SHDEPS_TEST_REAL_HASHER" "$@"
+SH
+
+  cat >"$bin/tar" <<'SH'
+#!/usr/bin/env bash
+set -u
+"$SHDEPS_TEST_REAL_TAR" "$@" || exit $?
+if [[ "${SHDEPS_TEST_PHASE:-}" == extract && "${1:-}" == -xzf ]]; then
+  archive="$2"
+  printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+  printf '%s\n' "${archive%/*}" >"$SHDEPS_TEST_MARKERS/scratch.path"
+  : >"$SHDEPS_TEST_MARKERS/ready"
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  while :; do sleep 1; done
+fi
+SH
+
+  cat >"$bin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+src="$1"
+dest="$2"
+phase=${SHDEPS_TEST_PHASE:-}
+# Some cleanup-only fixtures have no live install. Give the generic mv shim a
+# nonmatching sentinel rather than making unrelated quarantine moves fail under
+# `set -u` before their intended rm fault injection runs.
+SHDEPS_TEST_LIVE=${SHDEPS_TEST_LIVE:-/__shdeps_test_live_unset__}
+
+case "$phase" in
+  restore-failure)
+    case "$src:$dest" in
+      *.backup:"$SHDEPS_TEST_LIVE")
+        printf '%s\n' "$src" >"$SHDEPS_TEST_MARKERS/backup.path"
+        : >"$SHDEPS_TEST_MARKERS/restore-failed"
+        exit 72
+        ;;
+      */.shdeps-install.*:"$SHDEPS_TEST_LIVE") exit 71 ;;
+    esac
+    ;;
+  restore-race)
+    case "$src:$dest" in
+      *.backup:"$SHDEPS_TEST_LIVE")
+        "$SHDEPS_TEST_REAL_MKDIR" -p "$SHDEPS_TEST_LIVE"
+        printf '%s\n' foreign >"$SHDEPS_TEST_LIVE/foreign"
+        printf '%s\n' "$SHDEPS_TEST_LIVE/${src##*/}" >"$SHDEPS_TEST_MARKERS/recovery.path"
+        ;;
+      */.shdeps-install.*:"$SHDEPS_TEST_LIVE") exit 71 ;;
+    esac
+    ;;
+esac
+
+case "$src:$dest" in
+  "$SHDEPS_TEST_LIVE":*.backup)
+    if [[ "$phase" == backup-move-failure ]]; then
+      printf '%s\n' "$dest" >"$SHDEPS_TEST_MARKERS/backup.path"
+      exit 72
+    fi
+    if [[ "$phase" == backup-race ]]; then
+      "$SHDEPS_TEST_REAL_MKDIR" -p "$dest"
+      printf '%s\n' foreign >"$dest/foreign"
+      printf '%s\n' "$dest" >"$SHDEPS_TEST_MARKERS/backup.path"
+    fi
+    ;;
+  */.shdeps-install.*:"$SHDEPS_TEST_LIVE")
+    if [[ "$phase" == destination-race || "$phase" == destination-race-signal ]]; then
+      "$SHDEPS_TEST_REAL_MKDIR" -p "$SHDEPS_TEST_LIVE"
+      printf '%s\n' foreign >"$SHDEPS_TEST_LIVE/foreign"
+      printf '%s\n' "$SHDEPS_TEST_LIVE/${src##*/}" >"$SHDEPS_TEST_MARKERS/nested-staging.path"
+    fi
+    if [[ "$phase" == backup-disappears ]]; then
+      backup=$(cat "$SHDEPS_TEST_MARKERS/backup.path")
+      "$SHDEPS_TEST_REAL_RM" -rf -- "$backup"
+      exit 71
+    fi
+    ;;
+esac
+
+"$SHDEPS_TEST_REAL_MV" "$@" || exit $?
+case "$src:$dest" in
+  "$SHDEPS_TEST_LIVE":*.backup)
+    printf '%s\n' "$dest" >"$SHDEPS_TEST_MARKERS/backup.path"
+    if [[ "$phase" == backup-stat-failure ]]; then
+      exit 78
+    fi
+    if [[ "$phase" == old-moved ]]; then
+      : >"$SHDEPS_TEST_MARKERS/ready"
+      kill -"${SHDEPS_TEST_SIGNAL:-TERM}" "$PPID"
+    fi
+    ;;
+  */.shdeps-install.*:"$SHDEPS_TEST_LIVE")
+    if [[ "$phase" == postmove-invalid && "$src" != *.backup ]]; then
+      chmod -x "$SHDEPS_TEST_LIVE/shdeps"
+    fi
+    if [[ "$phase" == activated* ]]; then
+      : >"$SHDEPS_TEST_MARKERS/ready"
+      kill -"${SHDEPS_TEST_SIGNAL:-TERM}" "$PPID"
+    fi
+    if [[ "$phase" == destination-race-signal && "$src" != *.backup ]]; then
+      kill -TERM "$PPID"
+    fi
+    ;;
+esac
+SH
+
+  cat >"$bin/mkdir" <<'SH'
+#!/usr/bin/env bash
+set -u
+target=""
+for arg in "$@"; do
+  case "$arg" in -*) ;; *) target="$arg" ;; esac
+done
+if [[ "${SHDEPS_TEST_PHASE:-}" == allocation-failure && "$target" == */.shdeps-install.* ]]; then
+  printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/staging.path"
+  exit 73
+fi
+if [[ "${SHDEPS_TEST_PHASE:-}" == allocation-marker-failure &&
+  "$target" == */.shdeps-install.* ]]; then
+  "$SHDEPS_TEST_REAL_MKDIR" "$@" || exit $?
+  printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/staging.path"
+  # A directory at the marker path makes marker publication and the helper's
+  # best-effort rollback fail without relying on permissions or root behavior.
+  "$SHDEPS_TEST_REAL_MKDIR" "$target/.shdeps-install-owner" || exit $?
+  exit 0
+fi
+exec "$SHDEPS_TEST_REAL_MKDIR" "$@"
+SH
+
+  cat >"$bin/rm" <<'SH'
+#!/usr/bin/env bash
+set -u
+target=""
+for arg in "$@"; do
+  case "$arg" in -*) ;; *) target="$arg" ;; esac
+done
+reported_target="$target"
+case "$target" in
+  */.shdeps-remove.*/*)
+    quarantine=${target%/*}
+    reported_target="${quarantine%/*}/${target##*/}"
+    ;;
+esac
+if [[ "${SHDEPS_TEST_PHASE:-}" == backup-remove && "$target" == *.backup && ! -e "$SHDEPS_TEST_MARKERS/remove-attempted" ]]; then
+  : >"$SHDEPS_TEST_MARKERS/remove-attempted"
+  printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+  printf '%s\n' "$reported_target" >"$SHDEPS_TEST_MARKERS/backup.path"
+  : >"$SHDEPS_TEST_MARKERS/ready"
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  while :; do sleep 1; done
+fi
+if [[ ("${SHDEPS_TEST_PHASE:-}" == cleanup-remove ||
+    "${SHDEPS_TEST_PHASE:-}" == cleanup-failure ||
+    "${SHDEPS_TEST_PHASE:-}" == cleanup-signal-gap ||
+    "${SHDEPS_TEST_PHASE:-}" == cleanup-unrelated-signal) &&
+  "$target" == */.shdeps-install.* && ! -e "$SHDEPS_TEST_MARKERS/remove-attempted" ]]; then
+  : >"$SHDEPS_TEST_MARKERS/remove-attempted"
+  printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+  printf '%s\n' "$reported_target" >"$SHDEPS_TEST_MARKERS/staging.path"
+  : >"$SHDEPS_TEST_MARKERS/ready"
+  if [[ "${SHDEPS_TEST_PHASE:-}" == cleanup-unrelated-signal ]]; then
+    IFS= read -r _ <"$SHDEPS_TEST_MARKERS/cleanup.gate"
+  else
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    while :; do sleep 1; done
+  fi
+fi
+if [[ ("${SHDEPS_TEST_PHASE:-}" == cleanup-failure ||
+    "${SHDEPS_TEST_PHASE:-}" == executed-abrupt-exit-cleanup-failure ||
+    "${SHDEPS_TEST_PHASE:-}" == both-cleanup-failure) &&
+  "$target" == */.shdeps-install.* ]]; then
+  exit 76
+fi
+if [[ ("${SHDEPS_TEST_PHASE:-}" == partial-cleanup-failure ||
+    "${SHDEPS_TEST_PHASE:-}" == both-cleanup-failure) &&
+  "$target" == */shdeps-release.* ]]; then
+  exit 76
+fi
+exec "$SHDEPS_TEST_REAL_RM" "$@"
+SH
+
+  cat >"$bin/stat" <<'SH'
+#!/usr/bin/env bash
+set -u
+target=""
+for arg in "$@"; do target="$arg"; done
+case "${SHDEPS_TEST_PHASE:-}:$target" in
+  staging-initial-replacement:*/.shdeps-install.*)
+    printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/staging.path"
+    "$SHDEPS_TEST_REAL_RM" -f -- "$target/.shdeps-install-owner"
+    printf '%s\n' foreign >"$target/foreign"
+    ;;
+  staging-identity-marker-missing:*/.shdeps-install.*)
+    printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/identity.path"
+    "$SHDEPS_TEST_REAL_RM" -f -- "$target/.shdeps-install-owner"
+    exit 77
+    ;;
+  staging-identity-failure:*/.shdeps-install.* | release-identity-failure:*/shdeps-release.*)
+    printf '%s\n' "$target" >"$SHDEPS_TEST_MARKERS/identity.path"
+    exit 77
+    ;;
+  backup-stat-failure:*.backup)
+    count=0
+    [[ -f "$SHDEPS_TEST_MARKERS/backup-stat-count" ]] &&
+      count=$(cat "$SHDEPS_TEST_MARKERS/backup-stat-count")
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$SHDEPS_TEST_MARKERS/backup-stat-count"
+    if [[ "$count" -gt 1 ]]; then
+      exit 77
+    fi
+    ;;
+  backup-first-stat-failure:*.backup)
+    exit 77
+    ;;
+esac
+exec "$SHDEPS_TEST_REAL_STAT" "$@"
+SH
+
+  chmod +x "$bin/cp" "$bin/curl" "$bin/tar" "$bin/mkdir" "$bin/mv" "$bin/rm" "$bin/sha256sum" "$bin/stat"
+}
+
+_write_driver() {
+  local path="$1"
+
+  cat >"$path" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ "${SHDEPS_TEST_ERREXIT:-0}" == 1 ]]; then set -e; fi
+if [[ "${SHDEPS_TEST_MONITOR:-0}" == 1 ]]; then set -m; fi
+if [[ -n "${SHDEPS_TEST_UMASK:-}" ]]; then umask "$SHDEPS_TEST_UMASK"; fi
+
+trap 'printf "caller-hup\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' HUP
+trap 'printf "caller-int\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' INT
+trap 'printf "caller-term\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' TERM
+trap 'printf "caller-exit:%s\n" "$?" >>"$SHDEPS_TEST_CALLER_EXIT"' EXIT
+
+_test_debug_hook() {
+  local command="$BASH_COMMAND" remaining
+
+  if [[ "${SHDEPS_TEST_DEBUG_HOOK_STDOUT:-0}" -eq 1 ]]; then
+    printf '%s\n' debug-hook-output
+  fi
+  if [[ "${SHDEPS_TEST_DEBUG_CAPTURE_ARMED:-0}" -eq 1 &&
+    "$command" == _install_transaction_wait_started_child* ]]; then
+    SHDEPS_TEST_DEBUG_CAPTURE_ARMED=0
+    true &
+    printf '%s\n' "$!" >"$SHDEPS_TEST_MARKERS/debug-decoy.pid"
+  fi
+  if [[ "${SHDEPS_TEST_CLEANUP_SIGNAL_ARMED:-0}" -eq 1 &&
+    ("$command" == '_shdeps_tx_child=$!' ||
+      "$command" == _install_transaction_cancel_started_child_if_signaled*) ]]; then
+    SHDEPS_TEST_CLEANUP_SIGNAL_ARMED=0
+    trap - DEBUG
+    remaining=250
+    while [[ ! -e "$SHDEPS_TEST_MARKERS/remove-attempted" && "$remaining" -gt 0 ]]; do
+      sleep 0.01
+      remaining=$((remaining - 1))
+    done
+    : >"$SHDEPS_TEST_MARKERS/cleanup-signal-injected"
+    _install_transaction_signal TERM
+    trap _test_debug_hook DEBUG
+  fi
+}
+if [[ "${SHDEPS_TEST_ENABLE_DEBUG_HOOK:-0}" -eq 1 ]]; then
+  set -T
+  trap _test_debug_hook DEBUG
+fi
+
+before_hup=$(trap -p HUP)
+before_int=$(trap -p INT)
+before_term=$(trap -p TERM)
+before_exit=$(trap -p EXIT)
+before_debug=$(trap -p DEBUG)
+before_flags=$-
+before_options=$(set +o)
+before_cwd=$PWD
+before_umask=$(umask)
+
+_test_wait_for_worker_not_running() {
+  local wanted="" pid active attempt
+
+  [[ -f "$SHDEPS_TEST_MARKERS/worker.pid" ]] && wanted=$(<"$SHDEPS_TEST_MARKERS/worker.pid")
+  if [[ -z "$wanted" ]]; then
+    : >"$SHDEPS_TEST_MARKERS/completion-timeout"
+    return 1
+  fi
+  for ((attempt = 0; attempt < 250; attempt++)); do
+    active=0
+    jobs -pr >"$SHDEPS_TEST_MARKERS/jobs.running" || true
+    while IFS= read -r pid; do
+      [[ "$pid" == "$wanted" ]] && active=1
+    done <"$SHDEPS_TEST_MARKERS/jobs.running"
+    if [[ "$active" -eq 0 ]]; then
+      : >"$SHDEPS_TEST_MARKERS/completion-observed"
+      return 0
+    fi
+    sleep 0.01
+  done
+  : >"$SHDEPS_TEST_MARKERS/completion-timeout"
+  return 1
+}
+
+SHDEPS_INSTALL_SH_NO_DISPATCH=1
+export SHDEPS_INSTALL_SH_NO_DISPATCH
+# shellcheck source=/dev/null
+. "$SHDEPS_TEST_INSTALL_SH"
+unset SHDEPS_INSTALL_SH_NO_DISPATCH
+
+rc=0
+case "$SHDEPS_TEST_MODE" in
+  release) _install_release || rc=$? ;;
+  bundle) _install_bundle "$SHDEPS_TEST_BUNDLE" || rc=$? ;;
+  bootstrap) _bootstrap || rc=$? ;;
+  latched)
+    _install_test_blocker() {
+      printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+      : >"$SHDEPS_TEST_MARKERS/blocker-started"
+      trap 'exit 143' TERM
+      while :; do sleep 1; done
+    }
+    _install_bundle_core() {
+      _install_transaction_signal TERM
+      _install_transaction_run _install_test_blocker
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  monitor)
+    _install_bundle_core() {
+      printf '%s\n' "$-" >"$SHDEPS_TEST_MARKERS/transaction.flags"
+      _install_transaction_run true
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  teardown-signal)
+    _install_bundle_core() { :; }
+    eval "$(declare -f _install_transaction_restore_traps | sed '1s/_install_transaction_restore_traps/_install_transaction_restore_traps_original/')"
+    _install_transaction_restore_traps() {
+      _install_transaction_signal TERM
+      _install_transaction_restore_traps_original
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  cleanup-interrupt)
+    _install_bundle_core() {
+      _install_private_directory "$_shdeps_tx_staging" || return 1
+      _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || return 1
+      _shdeps_tx_staging_owned=1
+      return 1
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  partial-cleanup-failure | both-cleanup-failure)
+    _install_release_core() {
+      printf '%s\n' "$_shdeps_tx_staging" >"$SHDEPS_TEST_MARKERS/staging.path"
+      printf '%s\n' "$_shdeps_tx_release_path" >"$SHDEPS_TEST_MARKERS/release.path"
+      _install_private_directory \
+        "$_shdeps_tx_staging" "$_shdeps_tx_staging_token" || return 1
+      _shdeps_tx_staging_identity=$( \
+        _install_directory_identity \
+          "$_shdeps_tx_staging" "$_shdeps_tx_staging_token"
+      ) || return 1
+      _shdeps_tx_staging_owned=1
+      _install_private_directory \
+        "$_shdeps_tx_release_path" "$_shdeps_tx_release_token" || return 1
+      _shdeps_tx_release_identity=$( \
+        _install_directory_identity \
+          "$_shdeps_tx_release_path" "$_shdeps_tx_release_token"
+      ) || return 1
+      _shdeps_tx_release_owned=1
+      return 1
+    }
+    _install_transaction release || rc=$?
+    ;;
+  cleanup-unrelated-signal)
+    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"' USR1
+    eval "$(declare -f _install_transaction_cleanup_run | sed '1s/_install_transaction_cleanup_run/_install_transaction_cleanup_run_original/')"
+    _install_transaction_cleanup_run() {
+      local cleanup_rc=0
+      _install_transaction_cleanup_run_original "$@" || cleanup_rc=$?
+      printf '%s\n' "$cleanup_rc" >"$SHDEPS_TEST_MARKERS/cleanup-run.rc"
+      return "$cleanup_rc"
+    }
+    _install_bundle_core() {
+      _install_private_directory "$_shdeps_tx_staging" || return 1
+      _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || return 1
+      _shdeps_tx_staging_owned=1
+      return 1
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  unrelated-signal)
+    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"' USR1
+    _install_bundle_core() {
+      _install_transaction_run sh -c '
+        printf "%s\n" "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+        : >"$SHDEPS_TEST_MARKERS/ready"
+        IFS= read -r _ <"$SHDEPS_TEST_MARKERS/unrelated.gate"
+      '
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  unrelated-signal-completion)
+    trap ': >"$SHDEPS_TEST_MARKERS/usr1-seen"; printf "release\n" >"$SHDEPS_TEST_MARKERS/completion.gate"; _test_wait_for_worker_not_running || true' USR1
+    _install_bundle_core() {
+      _install_transaction_run sh -c '
+        printf "%s\n" "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+        : >"$SHDEPS_TEST_MARKERS/ready"
+        IFS= read -r _ <"$SHDEPS_TEST_MARKERS/completion.gate"
+      '
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  debug-launch)
+    _install_test_launch_blocker() {
+      sh -c '
+        printf "%s\n" "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
+        : >"$SHDEPS_TEST_MARKERS/ready"
+        IFS= read -r _ <"$SHDEPS_TEST_MARKERS/launch.gate"
+      '
+    }
+    _install_bundle_core() {
+      SHDEPS_TEST_DEBUG_CAPTURE_ARMED=1
+      case "$SHDEPS_TEST_LAUNCH_KIND" in
+        plain) _install_transaction_run _install_test_launch_blocker ;;
+        to-file)
+          _install_transaction_run_to_file \
+            "$SHDEPS_TEST_MARKERS/launch.out" _install_test_launch_blocker
+          ;;
+        with-input)
+          _install_transaction_run_with_input \
+            input _install_test_launch_blocker
+          ;;
+        *) return 2 ;;
+      esac
+    }
+    SHDEPS_TEST_DEBUG_HOOK_STDOUT=1
+    _install_transaction bundle || rc=$?
+    SHDEPS_TEST_DEBUG_HOOK_STDOUT=0
+    ;;
+  cleanup-signal-gap)
+    SHDEPS_TEST_CLEANUP_SIGNAL_ARMED=1
+    _install_bundle_core() {
+      printf '%s\n' "$_shdeps_tx_staging" >"$SHDEPS_TEST_MARKERS/staging.path"
+      _install_private_directory "$_shdeps_tx_staging" || return 1
+      _shdeps_tx_staging_identity=$(_install_directory_identity "$_shdeps_tx_staging") || return 1
+      _shdeps_tx_staging_owned=1
+      return 1
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  setup-signal)
+    _install_transaction_prepare_paths() {
+      : >"$SHDEPS_TEST_MARKERS/setup-entered"
+      kill -TERM "$$"
+      return 0
+    }
+    _install_bundle_core() {
+      : >"$SHDEPS_TEST_MARKERS/install-core-started"
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+  executed-abrupt-exit | executed-abrupt-exit-cleanup-failure)
+    # Exercise the real executed-mode EXIT trap without a test hook in
+    # production. A nonlocal exit from the core leaves the transaction frame
+    # active, so the trap is solely responsible for owned-path cleanup and for
+    # preserving (or deliberately replacing) the process status.
+    _SHDEPS_INSTALL_EXECUTED=1
+    _install_bundle_core() {
+      printf '%s\n' "$_shdeps_tx_staging" >"$SHDEPS_TEST_MARKERS/staging.path"
+      _install_private_directory \
+        "$_shdeps_tx_staging" "$_shdeps_tx_staging_token" || return 1
+      _shdeps_tx_staging_identity=$( \
+        _install_directory_identity \
+          "$_shdeps_tx_staging" "$_shdeps_tx_staging_token"
+      ) || return 1
+      _shdeps_tx_staging_owned=1
+      exit 37
+    }
+    _install_transaction bundle || rc=$?
+    ;;
+esac
+
+after_hup=$(trap -p HUP)
+after_int=$(trap -p INT)
+after_term=$(trap -p TERM)
+after_exit=$(trap -p EXIT)
+after_debug=$(trap -p DEBUG)
+after_flags=$-
+after_options=$(set +o)
+after_cwd=$PWD
+after_umask=$(umask)
+
+{
+  printf 'rc=%s\n' "$rc"
+  [[ "$before_hup" == "$after_hup" ]] && printf 'hup=restored\n' || printf 'hup=changed\n'
+  [[ "$before_int" == "$after_int" ]] && printf 'int=restored\n' || printf 'int=changed\n'
+  [[ "$before_term" == "$after_term" ]] && printf 'term=restored\n' || printf 'term=changed\n'
+  [[ "$before_exit" == "$after_exit" ]] && printf 'exit=restored\n' || printf 'exit=changed\n'
+  [[ "$before_debug" == "$after_debug" ]] && printf 'debug=restored\n' || printf 'debug=changed\n'
+  [[ "$before_flags" == "$after_flags" ]] && printf 'flags=restored\n' || printf 'flags=changed\n'
+  [[ "$before_options" == "$after_options" ]] && printf 'options=restored\n' || printf 'options=changed\n'
+  [[ "$before_cwd" == "$after_cwd" ]] && printf 'cwd=restored\n' || printf 'cwd=changed\n'
+  [[ "$before_umask" == "$after_umask" ]] && printf 'umask=restored\n' || printf 'umask=changed\n'
+  printf 'propagation=%s\n' "${_SHDEPS_INSTALL_PROPAGATION_MESSAGE:-}"
+} >"$SHDEPS_TEST_REPORT"
+
+exit "$rc"
+SH
+  chmod +x "$path"
+}
+
+_wait_for_file() {
+  local path="$1" remaining=250
+  while ((remaining > 0)); do
+    [[ -e "$path" ]] && return 0
+    sleep 0.02
+    remaining=$((remaining - 1))
+  done
+  return 1
+}
+
+_wait_for_exit() {
+  local pid="$1" remaining=250
+  while ((remaining > 0)); do
+    if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+    sleep 0.02
+    remaining=$((remaining - 1))
+  done
+  return 1
+}
+
+_tree_matches() {
+  # Every CI platform installs Git to check out and exercise shdeps, while
+  # minimal Arch and Fedora images do not provide diffutils. Keep the recovery
+  # oracle portable without weakening its recursive content comparison.
+  git diff --no-index --quiet -- "$1" "$2" >/dev/null 2>&1
+}
+
+_report_is_restored() {
+  local report="$1"
+  [[ -f "$report" ]] || return 1
+  [[ $(sed -n 's/=restored$//p' "$report" | wc -l | tr -d ' ') == 9 ]]
+}
+
+_run_interrupt_case() {
+  local phase="$1" mode="$2" expected_tree="$3" signal="${4:-TERM}" errexit="${5:-0}" ignore_term="${6:-0}"
+  local second_signal="${7:-}"
+  local fresh="${8:-0}"
+  local check_private="${9:-0}"
+  local root live bundle snapshot release markers bin tmp report stdout stderr
+  local caller_signals caller_exit driver install_script parent worker unrelated rc=0 timed_out=0
+  local tag platform signal_status scratch="" staging="" backup=""
+  local -a case_env
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  release="$root/release"
+  markers="$root/markers"
+  bin="$root/bin"
+  tmp="$root/tmp"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  caller_signals="$root/caller-signals"
+  caller_exit="$root/caller-exit"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  tag=20990102-030405-22222222
+  platform=$(_platform_label) || {
+    _fail "$phase: unsupported test platform"
+    return
+  }
+  case "$signal" in
+    HUP) signal_status=129 ;;
+    INT) signal_status=130 ;;
+    TERM) signal_status=143 ;;
+    *)
+      _fail "$phase: unsupported signal $signal"
+      return
+      ;;
+  esac
+
+  mkdir -p "$markers" "$tmp"
+  mkfifo "$markers/checksum-gate"
+  if [[ "$fresh" -eq 0 ]]; then
+    _make_bundle "$live" 20990101-020304-11111111
+    cp -R "$live" "$snapshot"
+  else
+    mkdir -p "$root/installer"
+    cp "$SHDEPS_DIR/install.sh" "$root/installer/install.sh"
+    install_script="$root/installer/install.sh"
+  fi
+  _make_bundle "$bundle" "$tag"
+  _make_release "$release" "$bundle" "$tag" "$platform"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+  printf '%s\n' keep >"$root/unrelated"
+  sleep 60 &
+  unrelated=$!
+
+  case_env=(
+    "PATH=$bin:$PATH"
+    "TMPDIR=$tmp"
+    "SHDEPS_DIR=$live"
+    "SHDEPS_BIN=$root/shdeps-bin"
+    "SHDEPS_FORCE=1"
+    "SHDEPS_GIT_DEV_DIR=$root/no-dev"
+    "SHDEPS_LIB="
+    "SHDEPS_RELEASE_API_URL=https://api.github.com/repos/cgraf78/shdeps/releases/latest"
+    "SHDEPS_TEST_BUNDLE=$bundle"
+    "SHDEPS_TEST_CALLER_EXIT=$caller_exit"
+    "SHDEPS_TEST_CALLER_SIGNALS=$caller_signals"
+    "SHDEPS_TEST_INSTALL_SH=$install_script"
+    "SHDEPS_TEST_LIVE=$live"
+    "SHDEPS_TEST_MARKERS=$markers"
+    "SHDEPS_TEST_MODE=$mode"
+    "SHDEPS_TEST_PHASE=$phase"
+    "SHDEPS_TEST_REAL_CP=$_real_cp"
+    "SHDEPS_TEST_REAL_MKDIR=$_real_mkdir"
+    "SHDEPS_TEST_REAL_MV=$_real_mv"
+    "SHDEPS_TEST_REAL_RM=$_real_rm"
+    "SHDEPS_TEST_REAL_TAR=$_real_tar"
+    "SHDEPS_TEST_REAL_HASHER=$_real_hasher"
+    "SHDEPS_TEST_REAL_HASHER_IS_SHASUM=$_real_hasher_is_shasum"
+    "SHDEPS_TEST_CHECKSUM_GATE=$markers/checksum-gate"
+    "SHDEPS_TEST_RELEASE=$release"
+    "SHDEPS_TEST_REPORT=$report"
+    "SHDEPS_TEST_ERREXIT=$errexit"
+    "SHDEPS_TEST_IGNORE_TERM=$ignore_term"
+    "SHDEPS_TEST_MONITOR=0"
+    "SHDEPS_TEST_SIGNAL=$signal"
+  )
+  if [[ "$check_private" -eq 1 ]]; then
+    case_env+=("SHDEPS_TEST_UMASK=002")
+  fi
+
+  if [[ "$signal" == INT ]]; then
+    env "${case_env[@]}" "$driver" >"$stdout" 2>"$stderr" || rc=$?
+  else
+    env "${case_env[@]}" "$driver" >"$stdout" 2>"$stderr" &
+    parent=$!
+
+    case "$phase" in
+      *download* | checksum | copy | extract | backup-remove | cleanup-remove)
+        if _wait_for_file "$markers/ready"; then
+          if [[ "$check_private" -eq 1 ]]; then
+            case "$phase" in
+              *download*) scratch=$(cat "$markers/scratch.path") ;;
+              copy) staging=$(cat "$markers/staging.path") ;;
+            esac
+            _assert_eq "$phase: production transaction directory stays private" 700 \
+              "$(_directory_mode "${scratch:-$staging}")"
+          fi
+          kill -"$signal" "$parent" 2>/dev/null || true
+          if [[ -n "$second_signal" ]]; then
+            if _wait_for_file "$markers/term-forwarded"; then
+              kill -"$second_signal" "$parent" 2>/dev/null || true
+            else
+              timed_out=1
+            fi
+          fi
+        else
+          timed_out=1
+        fi
+        ;;
+    esac
+
+    if ! _wait_for_exit "$parent"; then
+      timed_out=1
+      if [[ -f "$markers/worker.pid" ]]; then
+        worker=$(cat "$markers/worker.pid")
+        kill -TERM "$worker" 2>/dev/null || true
+      fi
+      kill -TERM "$parent" 2>/dev/null || true
+      if ! _wait_for_exit "$parent"; then
+        kill -KILL "$parent" 2>/dev/null || true
+      fi
+    fi
+    wait "$parent" || rc=$?
+  fi
+
+  _assert_eq "$phase: parent exits with $signal status" "$signal_status" "$rc"
+  _assert_eq "$phase: cancellation does not time out" 0 "$timed_out"
+  if _report_is_restored "$report"; then
+    _pass "$phase: caller traps, options, and cwd restored"
+  else
+    _fail "$phase: caller traps, options, and cwd restored"
+  fi
+  _assert_file_missing "$phase: caller signal trap is not invoked in transaction" "$caller_signals"
+  _assert_file_content "$phase: caller EXIT trap retains final status" "caller-exit:$signal_status" "$caller_exit"
+  if [[ -f "$markers/worker.pid" ]]; then
+    worker=$(cat "$markers/worker.pid")
+    if kill -0 "$worker" 2>/dev/null; then
+      _fail "$phase: exact transaction child is gone"
+      kill -KILL "$worker" 2>/dev/null || true
+    else
+      _pass "$phase: exact transaction child is gone"
+    fi
+  fi
+  _assert_file_content "$phase: unrelated file survives" keep "$root/unrelated"
+  if kill -0 "$unrelated" 2>/dev/null; then
+    _pass "$phase: unrelated process survives"
+  else
+    _fail "$phase: unrelated process survives"
+  fi
+  if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
+    _fail "$phase: no job-control text leaks"
+  else
+    _pass "$phase: no job-control text leaks"
+  fi
+  case "$phase" in
+    download | download-ignore | download-first-signal)
+      _assert_not_contains "$phase: cancellation is not reported as a download failure" \
+        'failed to download' "$(cat "$stderr")"
+      ;;
+    checksum)
+      _assert_not_contains "$phase: cancellation is not reported as checksum corruption" \
+        'checksum verification failed' "$(cat "$stderr")"
+      ;;
+    extract)
+      _assert_not_contains "$phase: cancellation is not reported as an unsafe archive" \
+        'refusing to extract' "$(cat "$stderr")"
+      _assert_not_contains "$phase: cancellation is not reported as extraction failure" \
+        'failed to extract' "$(cat "$stderr")"
+      ;;
+    activated | activated-int | backup-remove)
+      _assert_contains "$phase: committed payload interruption tells the user how to converge" \
+        'payload was committed, but activation was interrupted; rerun the installer' \
+        "$(cat "$stderr")"
+      _assert_contains "$phase: committed payload guidance survives suppressed wrappers" \
+        'propagation=shdeps payload was committed, but activation was interrupted; rerun the installer' \
+        "$(cat "$report")"
+      ;;
+  esac
+
+  [[ -f "$markers/scratch.path" ]] && scratch=$(cat "$markers/scratch.path")
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  [[ -f "$markers/backup.path" ]] && backup=$(cat "$markers/backup.path")
+  [[ -n "$scratch" ]] && _assert_not_exists "$phase: release scratch removed" "$scratch"
+  [[ -n "$staging" ]] && _assert_not_exists "$phase: staging removed" "$staging"
+  [[ -n "$backup" ]] && _assert_not_exists "$phase: backup removed" "$backup"
+
+  case "$expected_tree" in
+    old)
+      if _tree_matches "$snapshot" "$live"; then
+        _pass "$phase: old install remains byte-identical"
+      else
+        _fail "$phase: old install remains byte-identical"
+      fi
+      _assert_eq "$phase: old install remains executable" \
+        'shdeps 20990101-020304-11111111' "$("$live/shdeps" version 2>/dev/null)"
+      ;;
+    new)
+      _assert_eq "$phase: active install is the complete new bundle" \
+        "shdeps $tag" "$("$live/shdeps" version 2>/dev/null)"
+      _assert_file_exists "$phase: active metadata is present" "$live/.shdeps-install.json"
+      ;;
+    none)
+      _assert_not_exists "$phase: no incomplete install is exposed" "$live"
+      ;;
+  esac
+
+  kill -TERM "$unrelated" 2>/dev/null || true
+  wait "$unrelated" 2>/dev/null || true
+}
+
+_run_failure_case() {
+  local phase="$1"
+  local root live bundle snapshot markers bin report stdout stderr driver install_script backup="" rc=0
+  local nested_staging="" recovery="" expected_rc=1
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  cp -R "$live" "$snapshot"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_PHASE="$phase" \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" || rc=$?
+
+  case "$phase" in
+    restore-failure | restore-race | destination-race | backup-stat-failure | backup-first-stat-failure | backup-disappears) expected_rc=125 ;;
+    backup-move-failure) expected_rc=72 ;;
+  esac
+  _assert_eq "$phase: install fails" "$expected_rc" "$rc"
+  if _report_is_restored "$report"; then
+    _pass "$phase: caller state restored"
+  else
+    _fail "$phase: caller state restored"
+  fi
+  [[ -f "$markers/backup.path" ]] && backup=$(cat "$markers/backup.path")
+  if [[ "$phase" == backup-race ]]; then
+    if _tree_matches "$snapshot" "$live"; then
+      _pass "$phase: old install remains byte-identical"
+    else
+      _fail "$phase: old install remains byte-identical"
+    fi
+    _assert_file_content "$phase: foreign backup path is untouched" foreign "$backup/foreign"
+    _assert_not_exists "$phase: old install is not left nested in foreign backup" "$backup/${live##*/}"
+    _assert_contains "$phase: diagnostic reports backup race" 'backup path appeared' "$(cat "$stderr")"
+    return
+  fi
+  if [[ "$phase" == backup-move-failure ]]; then
+    if _tree_matches "$snapshot" "$live"; then
+      _pass "$phase: old install remains byte-identical"
+    else
+      _fail "$phase: old install remains byte-identical"
+    fi
+    _assert_not_exists "$phase: failed move creates no backup" "$backup"
+    _assert_contains "$phase: diagnostic reports the move failure" 'failed to move existing shdeps install to backup' "$(cat "$stderr")"
+    _assert_not_contains "$phase: diagnostic does not report a race" 'appeared during activation' "$(cat "$stderr")"
+    return
+  fi
+  if [[ "$phase" == restore-race ]]; then
+    [[ -f "$markers/recovery.path" ]] && recovery=$(cat "$markers/recovery.path")
+    _assert_file_content "$phase: unexpected live destination is untouched" foreign "$live/foreign"
+    _assert_file_exists "$phase: exact old install remains recoverable" "$recovery/shdeps"
+    if _tree_matches "$snapshot" "$recovery"; then
+      _pass "$phase: recoverable old install is byte-identical"
+    else
+      _fail "$phase: recoverable old install is byte-identical"
+    fi
+    _assert_contains "$phase: diagnostic names exact recovery path" "$recovery" "$(cat "$stderr")"
+    return
+  fi
+  if [[ "$phase" == backup-disappears ]]; then
+    _assert_not_exists "$phase: live install stays absent" "$live"
+    _assert_not_exists "$phase: vanished backup is not invented" "$backup"
+    _assert_contains "$phase: diagnostic names expected recovery path" "$backup" "$(cat "$stderr")"
+    return
+  fi
+  _assert_file_exists "$phase: recoverable backup retained" "$backup/shdeps"
+  if _tree_matches "$snapshot" "$backup"; then
+    _pass "$phase: recoverable backup is byte-identical"
+  else
+    _fail "$phase: recoverable backup is byte-identical"
+  fi
+  case "$phase" in
+    restore-failure)
+      _assert_not_exists "$phase: unresolved live destination stays absent" "$live"
+      _assert_contains "$phase: diagnostic names recoverable backup" recoverable "$(cat "$stderr")"
+      ;;
+    destination-race)
+      [[ -f "$markers/nested-staging.path" ]] && nested_staging=$(cat "$markers/nested-staging.path")
+      _assert_file_content "$phase: unexpected destination is untouched" foreign "$live/foreign"
+      _assert_not_exists "$phase: owned staging is removed from foreign destination" "$nested_staging"
+      _assert_contains "$phase: diagnostic reports destination race" 'appeared before activation' "$(cat "$stderr")"
+      ;;
+    backup-stat-failure | backup-first-stat-failure)
+      _assert_not_exists "$phase: live install stays absent while identity is unknown" "$live"
+      _assert_contains "$phase: diagnostic names retained old install" "$backup" "$(cat "$stderr")"
+      ;;
+  esac
+}
+
+_run_owned_replacement_case() {
+  local phase="$1" mode="$2"
+  local root live bundle snapshot release markers bin tmp report stdout stderr driver install_script
+  local platform tag path="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  release="$root/release"
+  markers="$root/markers"
+  bin="$root/bin"
+  tmp="$root/tmp"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  tag=20990102-030405-22222222
+  platform=$(_platform_label) || {
+    _fail "$phase: unsupported test platform"
+    return
+  }
+
+  mkdir -p "$markers" "$tmp"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" "$tag"
+  cp -R "$live" "$snapshot"
+  _make_release "$release" "$bundle" "$tag" "$platform"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    TMPDIR="$tmp" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_BIN="$root/shdeps-bin" \
+    SHDEPS_GIT_DEV_DIR="$root/no-dev-checkouts" \
+    SHDEPS_FORCE=1 \
+    SHDEPS_RELEASE_API_URL=https://api.github.com/repos/cgraf78/shdeps/releases/latest \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE="$mode" \
+    SHDEPS_TEST_PHASE="$phase" \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_HASHER="$_real_hasher" \
+    SHDEPS_TEST_REAL_HASHER_IS_SHASUM="$_real_hasher_is_shasum" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_RELEASE="$release" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" || rc=$?
+
+  _assert_eq "$phase: install fails through cleanup" 125 "$rc"
+  if _report_is_restored "$report"; then
+    _pass "$phase: caller state restored"
+  else
+    _fail "$phase: caller state restored"
+  fi
+  case "$phase" in
+    staging-replacement | staging-initial-replacement) path=$(cat "$markers/staging.path") ;;
+    scratch-replacement) path=$(cat "$markers/scratch.path") ;;
+  esac
+  _assert_file_content "$phase: foreign replacement survives cleanup" foreign "$path/foreign"
+  # Bootstrap keeps opportunistic refresh diagnostics quiet, but the hard
+  # transaction status must still escape instead of reporting success.
+  if [[ "$mode" != bootstrap ]]; then
+    if [[ "$phase" == staging-initial-replacement ]]; then
+      _assert_contains "$phase: cleanup reports unverified ownership" 'retained at' "$(cat "$stderr")"
+    else
+      _assert_contains "$phase: cleanup reports identity mismatch" 'identity changed' "$(cat "$stderr")"
+    fi
+  else
+    _assert_contains "$phase: bootstrap labels a replacement as foreign and unsafe to remove" \
+      "foreign or unverified path (not safe to remove): $path" "$(cat "$stderr")"
+    _assert_not_contains "$phase: bootstrap does not call a foreign replacement retained owned state" \
+      "retained state: $path" "$(cat "$stderr")"
+  fi
+  if _tree_matches "$snapshot" "$live"; then
+    _pass "$phase: old install remains byte-identical"
+  else
+    _fail "$phase: old install remains byte-identical"
+  fi
+}
+
+_run_dangling_live_case() {
+  local root live bundle target install_script rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  target="$root/missing-target"
+  bundle="$root/bundle"
+  install_script="$SHDEPS_DIR/install.sh"
+  _make_bundle "$bundle" 20990102-030405-22222222
+  ln -s "$target" "$live"
+
+  SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    bash -c '
+      export SHDEPS_INSTALL_SH_NO_DISPATCH=1
+      # shellcheck source=/dev/null
+      . "$SHDEPS_TEST_INSTALL_SH"
+      unset SHDEPS_INSTALL_SH_NO_DISPATCH
+      _install_bundle "$SHDEPS_TEST_BUNDLE"
+    ' >/dev/null 2>&1 || rc=$?
+
+  _assert_eq 'dangling live symlink: install refuses unknown destination' 1 "$rc"
+  _assert_eq 'dangling live symlink: link target is unchanged' "$target" "$(readlink "$live")"
+  _assert_not_exists 'dangling live symlink: target remains absent' "$target"
+}
+
+_run_private_directory_case() {
+  local root private umask_report install_script before_umask after_umask rc=0
+
+  root=$(_tmpdir)
+  private="$root/private"
+  umask_report="$root/umask"
+  install_script="$SHDEPS_DIR/install.sh"
+  SHDEPS_TEST_PRIVATE="$private" SHDEPS_TEST_UMASK_REPORT="$umask_report" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    bash -c '
+      set -u
+      export SHDEPS_INSTALL_SH_NO_DISPATCH=1
+      # shellcheck source=/dev/null
+      . "$SHDEPS_TEST_INSTALL_SH"
+      unset SHDEPS_INSTALL_SH_NO_DISPATCH
+      umask 002
+      before_umask=$(umask)
+      _install_private_directory "$SHDEPS_TEST_PRIVATE"
+      after_umask=$(umask)
+      printf "%s\n%s\n" "$before_umask" "$after_umask" >"$SHDEPS_TEST_UMASK_REPORT"
+    ' || rc=$?
+
+  _assert_eq 'private allocation: succeeds under adverse umask' 0 "$rc"
+  _assert_eq 'private allocation: excludes group and other access' 700 \
+    "$(_directory_mode "$private")"
+  before_umask=$(sed -n '1p' "$umask_report")
+  after_umask=$(sed -n '2p' "$umask_report")
+  _assert_eq 'private allocation: restores the sourced caller umask exactly' \
+    "$before_umask" "$after_umask"
+}
+
+_run_success_case() {
+  local root live bundle report stdout stderr driver install_script rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_REPORT="$report" \
+    SHDEPS_TEST_ERREXIT=1 \
+    SHDEPS_TEST_MONITOR=1 \
+    "$driver" >"$stdout" 2>"$stderr" || rc=$?
+
+  _assert_eq 'success: sourced install succeeds' 0 "$rc"
+  if _report_is_restored "$report"; then
+    _pass 'success: caller traps, options, and cwd restored'
+  else
+    _fail 'success: caller traps, options, and cwd restored'
+  fi
+  _assert_file_content 'success: caller EXIT trap retains final status' caller-exit:0 "$root/caller-exit"
+  _assert_eq 'success: complete new bundle is active' \
+    'shdeps 20990102-030405-22222222' "$("$live/shdeps" version)"
+  if [[ -s "$live/.shdeps-install-owner" ]] &&
+    grep -Eq '^staging\.[0-9]+\.[0-9]+\.[0-9]+$' "$live/.shdeps-install-owner"; then
+    _pass 'success: active install retains its ownership token'
+  else
+    _fail 'success: active install retains its ownership token'
+  fi
+  if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
+    _fail 'success: no job-control text leaks'
+  else
+    _pass 'success: no job-control text leaks'
+  fi
+}
+
+_run_invalid_bundle_case() {
+  local root live bundle snapshot report stderr driver install_script rc=0
+  local -a leftovers=()
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  report="$root/report"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  chmod -x "$bundle/shdeps"
+  cp -R "$live" "$snapshot"
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$stderr" || rc=$?
+
+  _assert_eq 'invalid bundle: install fails before activation' 1 "$rc"
+  if _tree_matches "$snapshot" "$live"; then
+    _pass 'invalid bundle: old install remains byte-identical'
+  else
+    _fail 'invalid bundle: old install remains byte-identical'
+  fi
+  _assert_eq 'invalid bundle: old install remains executable' \
+    'shdeps 20990101-020304-11111111' "$("$live/shdeps" version 2>/dev/null)"
+  shopt -s nullglob
+  leftovers=("$root"/.shdeps-install.*)
+  shopt -u nullglob
+  _assert_eq 'invalid bundle: no staging or backup leaks' 0 "${#leftovers[@]}"
+  _assert_contains 'invalid bundle: diagnostic identifies staged bundle' \
+    'staged shdeps bundle is incomplete' "$(cat "$stderr")"
+}
+
+_run_postmove_invalid_case() {
+  local root live bundle snapshot markers bin report stderr driver install_script rc=0
+  local -a leftovers=()
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  cp -R "$live" "$snapshot"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_PHASE=postmove-invalid \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$stderr" || rc=$?
+
+  _assert_eq 'postmove invalid: install fails' 1 "$rc"
+  if _tree_matches "$snapshot" "$live"; then
+    _pass 'postmove invalid: old install is restored byte-identically'
+  else
+    _fail 'postmove invalid: old install is restored byte-identically'
+  fi
+  _assert_eq 'postmove invalid: restored install remains executable' \
+    'shdeps 20990101-020304-11111111' "$("$live/shdeps" version 2>/dev/null)"
+  shopt -s nullglob
+  leftovers=("$root"/.shdeps-install.*)
+  shopt -u nullglob
+  _assert_eq 'postmove invalid: no staging or backup paths remain' 0 "${#leftovers[@]}"
+  if _report_is_restored "$report"; then
+    _pass 'postmove invalid: caller state restored'
+  else
+    _fail 'postmove invalid: caller state restored'
+  fi
+}
+
+_run_destination_signal_case() {
+  local root live bundle markers bin report driver install_script nested="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$bundle" 20990102-030405-22222222
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_PHASE=destination-race-signal \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" || rc=$?
+
+  [[ -f "$markers/nested-staging.path" ]] && nested=$(cat "$markers/nested-staging.path")
+  _assert_eq 'destination signal: original TERM status is preserved' 143 "$rc"
+  _assert_file_content 'destination signal: foreign destination is untouched' foreign "$live/foreign"
+  _assert_not_exists 'destination signal: nested staged bundle is removed' "$nested"
+  if _report_is_restored "$report"; then
+    _pass 'destination signal: caller state restored'
+  else
+    _fail 'destination signal: caller state restored'
+  fi
+}
+
+_run_latched_spawn_case() {
+  local root markers report stdout stderr driver install_script parent worker rc=0 timed_out=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=latched \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" &
+  parent=$!
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    if [[ -f "$markers/worker.pid" ]]; then
+      worker=$(cat "$markers/worker.pid")
+      kill -KILL "$worker" 2>/dev/null || true
+    fi
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+
+  _assert_eq 'latched signal: returns original signal status' 143 "$rc"
+  _assert_eq 'latched signal: completion is bounded' 0 "$timed_out"
+  _assert_not_exists 'latched signal: no new child starts' "$markers/blocker-started"
+  if _report_is_restored "$report"; then
+    _pass 'latched signal: caller state restored'
+  else
+    _fail 'latched signal: caller state restored'
+  fi
+}
+
+_run_debug_launch_case() {
+  local kind="$1"
+  local root markers report driver install_script parent worker="" rc=0 early_exit=0 timed_out=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  mkfifo "$markers/launch.gate"
+  # Keep a writer open even if the regressed driver exits before releasing its
+  # real child; this lets the fixture clean that child up without blocking.
+  exec 9<>"$markers/launch.gate"
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_DEBUG_CAPTURE_ARMED=0 \
+    SHDEPS_TEST_ENABLE_DEBUG_HOOK=1 \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LAUNCH_KIND="$kind" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=debug-launch \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" &
+  parent=$!
+  _wait_for_file "$markers/ready" || timed_out=1
+  _wait_for_file "$markers/debug-decoy.pid" || timed_out=1
+  sleep 0.1
+  if ! kill -0 "$parent" 2>/dev/null; then
+    early_exit=1
+  fi
+  printf 'release\n' >&9
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+  exec 9>&-
+
+  [[ -f "$markers/worker.pid" ]] && worker=$(cat "$markers/worker.pid")
+  if [[ -n "$worker" ]] && ! _wait_for_exit "$worker"; then
+    timed_out=1
+    kill -KILL "$worker" 2>/dev/null || true
+  fi
+  _assert_eq "DEBUG capture $kind: transaction waits for its real child" 0 "$early_exit"
+  _assert_eq "DEBUG capture $kind: transaction succeeds" 0 "$rc"
+  _assert_eq "DEBUG capture $kind: completion stays bounded" 0 "$timed_out"
+  _assert_file_exists "DEBUG capture $kind: caller hook injected a decoy job" \
+    "$markers/debug-decoy.pid"
+  _assert_not_contains "DEBUG capture $kind: hook output is not evaluated as trap code" \
+    'debug-hook-output: command not found' "$(cat "$root/stderr")"
+  if _report_is_restored "$report"; then
+    _pass "DEBUG capture $kind: caller state is restored"
+  else
+    _fail "DEBUG capture $kind: caller state is restored"
+  fi
+}
+
+_run_cleanup_post_spawn_signal_case() {
+  local root markers bin report driver install_script parent worker="" staging="" rc=0 timed_out=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_CLEANUP_SIGNAL_ARMED=0 \
+    SHDEPS_TEST_ENABLE_DEBUG_HOOK=1 \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=cleanup-signal-gap \
+    SHDEPS_TEST_PHASE=cleanup-signal-gap \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_STAT="$_real_stat" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" &
+  parent=$!
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    [[ -f "$markers/worker.pid" ]] && worker=$(cat "$markers/worker.pid")
+    [[ -n "$worker" ]] && kill -KILL "$worker" 2>/dev/null || true
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_eq 'cleanup post-spawn signal: original TERM status is preserved' 143 "$rc"
+  _assert_eq 'cleanup post-spawn signal: completion stays bounded' 0 "$timed_out"
+  _assert_file_exists 'cleanup post-spawn signal: signal reached the registration window' \
+    "$markers/cleanup-signal-injected"
+  _assert_not_exists 'cleanup post-spawn signal: owned staging is removed' "$staging"
+  _assert_file_missing 'cleanup post-spawn signal: caller TERM trap stays deferred' \
+    "$root/caller-signals"
+  if _report_is_restored "$report"; then
+    _pass 'cleanup post-spawn signal: caller state is restored'
+  else
+    _fail 'cleanup post-spawn signal: caller state is restored'
+  fi
+}
+
+_run_setup_signal_case() {
+  local root markers report driver install_script rc=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=setup-signal \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" || rc=$?
+
+  _assert_eq 'setup signal: transaction preserves TERM status' 143 "$rc"
+  _assert_file_exists 'setup signal: path preparation was entered' "$markers/setup-entered"
+  _assert_file_missing 'setup signal: install core never starts' "$markers/install-core-started"
+  _assert_file_missing 'setup signal: caller TERM trap stays deferred' "$root/caller-signals"
+  _assert_file_content 'setup signal: caller EXIT trap sees TERM status' \
+    caller-exit:143 "$root/caller-exit"
+  if _report_is_restored "$report"; then
+    _pass 'setup signal: caller state is restored'
+  else
+    _fail 'setup signal: caller state is restored'
+  fi
+}
+
+_run_monitor_case() {
+  local root markers report stdout stderr driver install_script flags="" rc=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  report="$root/report"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=monitor \
+    SHDEPS_TEST_MONITOR=1 \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$stdout" 2>"$stderr" || rc=$?
+
+  _assert_eq 'monitor mode: transaction succeeds' 0 "$rc"
+  [[ -f "$markers/transaction.flags" ]] && flags=$(cat "$markers/transaction.flags")
+  case "$flags" in
+    *m*) _fail 'monitor mode: disabled while transaction owns background children' ;;
+    *) _pass 'monitor mode: disabled while transaction owns background children' ;;
+  esac
+  if _report_is_restored "$report"; then
+    _pass 'monitor mode: caller state restored exactly'
+  else
+    _fail 'monitor mode: caller state restored exactly'
+  fi
+  if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
+    _fail 'monitor mode: no job-control text leaks'
+  else
+    _pass 'monitor mode: no job-control text leaks'
+  fi
+}
+
+_run_teardown_signal_case() {
+  local root report driver install_script rc=0
+
+  root=$(_tmpdir)
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MODE=teardown-signal \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>&1 || rc=$?
+
+  _assert_eq 'teardown signal: late transaction TERM remains authoritative' 143 "$rc"
+  if _report_is_restored "$report"; then
+    _pass 'teardown signal: caller state is restored'
+  else
+    _fail 'teardown signal: caller state is restored'
+  fi
+  _assert_file_missing 'teardown signal: caller trap is not invoked inside transaction' \
+    "$root/caller-signals"
+}
+
+_run_allocation_case() {
+  local root live bundle snapshot markers bin report driver install_script staging="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  cp -R "$live" "$snapshot"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_PHASE=allocation-failure \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>&1 || rc=$?
+
+  _assert_eq 'allocation failure: install fails' 1 "$rc"
+  if _report_is_restored "$report"; then
+    _pass 'allocation failure: caller state restored'
+  else
+    _fail 'allocation failure: caller state restored'
+  fi
+  if _tree_matches "$snapshot" "$live"; then
+    _pass 'allocation failure: old install remains byte-identical'
+  else
+    _fail 'allocation failure: old install remains byte-identical'
+  fi
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_not_exists 'allocation failure: unowned staging path is not removed or created' "$staging"
+}
+
+_run_marker_allocation_failure_case() {
+  local root live bundle snapshot markers bin report stderr driver install_script staging="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  cp -R "$live" "$snapshot"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=bundle \
+    SHDEPS_TEST_PHASE=allocation-marker-failure \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$stderr" || rc=$?
+
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_eq 'marker allocation failure: incomplete cleanup is a hard failure' 125 "$rc"
+  _assert_dir_exists 'marker allocation failure: unresolved staging is retained' "$staging"
+  _assert_dir_exists 'marker allocation failure: conflicting marker is retained' \
+    "$staging/.shdeps-install-owner"
+  _assert_contains 'marker allocation failure: diagnostic names retained staging' \
+    "$staging" "$(cat "$stderr")"
+  if _tree_matches "$snapshot" "$live"; then
+    _pass 'marker allocation failure: old install remains byte-identical'
+  else
+    _fail 'marker allocation failure: old install remains byte-identical'
+  fi
+  if _report_is_restored "$report"; then
+    _pass 'marker allocation failure: caller state restored'
+  else
+    _fail 'marker allocation failure: caller state restored'
+  fi
+}
+
+_run_identity_failure_case() {
+  local phase="$1" mode="$2"
+  local root live bundle markers bin report driver install_script path="" rc=0
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers" "$root/tmp"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    TMPDIR="$root/tmp" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE="$mode" \
+    SHDEPS_TEST_PHASE="$phase" \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_STAT="$_real_stat" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>&1 || rc=$?
+
+  [[ -f "$markers/identity.path" ]] && path=$(cat "$markers/identity.path")
+  if [[ "$phase" == staging-identity-marker-missing ]]; then
+    _assert_eq "$phase: unverified cleanup is a hard failure" 125 "$rc"
+    _assert_dir_exists "$phase: markerless directory is retained" "$path"
+  else
+    _assert_eq "$phase: install fails" 1 "$rc"
+    _assert_not_exists "$phase: created but unidentified directory is removed" "$path"
+  fi
+  if _report_is_restored "$report"; then
+    _pass "$phase: caller state restored"
+  else
+    _fail "$phase: caller state restored"
+  fi
+}
+
+_run_cleanup_failure_case() {
+  local root live bundle markers bin report stderr driver install_script parent rc=0 timed_out=0 staging=""
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  stderr="$root/stderr"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_TEST_BUNDLE="$bundle" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=cleanup-interrupt \
+    SHDEPS_TEST_PHASE=cleanup-failure \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$stderr" &
+  parent=$!
+  if _wait_for_file "$markers/ready"; then
+    kill -TERM "$parent" 2>/dev/null || true
+  else
+    timed_out=1
+  fi
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_eq 'cleanup failure: overrides latched signal with hard failure' 125 "$rc"
+  _assert_eq 'cleanup failure: completion is bounded' 0 "$timed_out"
+  if [[ -d "$staging" ]]; then
+    _pass 'cleanup failure: retained staging remains recoverable'
+  else
+    _fail "cleanup failure: retained staging remains recoverable (directory not found: $staging)"
+  fi
+  _assert_contains 'cleanup failure: diagnostic names retained staging' "$staging" "$(cat "$stderr")"
+  _assert_contains 'cleanup failure: records retained state for suppressed callers' \
+    "propagation=shdeps transaction cleanup requires manual recovery; retained state: $staging" \
+    "$(cat "$report")"
+  if _report_is_restored "$report"; then
+    _pass 'cleanup failure: caller state restored'
+  else
+    _fail 'cleanup failure: caller state restored'
+  fi
+  "$_real_rm" -rf -- "$staging"
+}
+
+_run_partial_cleanup_failure_case() {
+  local mode="$1"
+  local root markers bin report driver install_script staging="" release="" rc=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    TMPDIR="$root" \
+    SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$root/live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE="$mode" \
+    SHDEPS_TEST_PHASE="$mode" \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$root/stdout" 2>"$root/stderr" || rc=$?
+
+  staging=$(cat "$markers/staging.path")
+  release=$(cat "$markers/release.path")
+  _assert_eq "$mode: remains a hard recovery failure" 125 "$rc"
+  if [[ "$mode" == partial-cleanup-failure ]]; then
+    _assert_not_exists "$mode: successfully removed staging stays gone" "$staging"
+  else
+    _assert_dir_exists "$mode: failed staging is retained" "$staging"
+    _assert_contains "$mode: propagated diagnostic names retained staging" \
+      "retained state: $staging" "$(cat "$report")"
+  fi
+  _assert_dir_exists "$mode: failed release scratch is retained" "$release"
+  _assert_contains "$mode: propagated diagnostic names retained release scratch" \
+    "retained state: $release" "$(cat "$report")"
+  if [[ "$mode" == partial-cleanup-failure ]]; then
+    _assert_not_contains "$mode: propagated diagnostic omits deleted staging" \
+      "retained state: $staging" "$(cat "$report")"
+  fi
+  "$_real_rm" -rf -- "$staging" "$release"
+}
+
+_run_cleanup_unrelated_signal_case() {
+  local root markers bin report driver install_script parent worker="" staging="" rc=0 early_exit=0 timed_out=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  mkfifo "$markers/cleanup.gate"
+  # Keep both ends open in the harness so a regressed cleanup child cannot
+  # make the release write block forever after it has already been killed.
+  exec 9<>"$markers/cleanup.gate"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE=cleanup-unrelated-signal \
+    SHDEPS_TEST_PHASE=cleanup-unrelated-signal \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" &
+  parent=$!
+  if _wait_for_file "$markers/ready"; then
+    kill -USR1 "$parent" 2>/dev/null || true
+  else
+    timed_out=1
+  fi
+  _wait_for_file "$markers/usr1-seen" || timed_out=1
+  sleep 0.1
+  if ! kill -0 "$parent" 2>/dev/null; then
+    early_exit=1
+  else
+    printf 'release\n' >&9
+  fi
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+  exec 9>&-
+
+  [[ -f "$markers/worker.pid" ]] && worker=$(cat "$markers/worker.pid")
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_eq 'cleanup unrelated signal: transaction keeps waiting' 0 "$early_exit"
+  _assert_eq 'cleanup unrelated signal: original operation failure is preserved' 1 "$rc"
+  _assert_eq 'cleanup unrelated signal: completion stays bounded' 0 "$timed_out"
+  _assert_file_content 'cleanup unrelated signal: removal child success is preserved' \
+    0 "$markers/cleanup-run.rc"
+  _assert_not_exists 'cleanup unrelated signal: staging is removed' "$staging"
+  if [[ -n "$worker" ]] && ! kill -0 "$worker" 2>/dev/null; then
+    _pass 'cleanup unrelated signal: exact removal child is reaped'
+  else
+    _fail 'cleanup unrelated signal: exact removal child is reaped'
+    [[ -n "$worker" ]] && kill -KILL "$worker" 2>/dev/null || true
+  fi
+  if _report_is_restored "$report"; then
+    _pass 'cleanup unrelated signal: caller state restored'
+  else
+    _fail 'cleanup unrelated signal: caller state restored'
+  fi
+}
+
+_run_unrelated_signal_wait_case() {
+  local mode="$1" label="$2"
+  local root markers report driver install_script parent worker="" rc=0 early_exit=0 timed_out=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  if [[ "$mode" == unrelated-signal ]]; then
+    mkfifo "$markers/unrelated.gate"
+  elif [[ "$mode" == unrelated-signal-completion ]]; then
+    mkfifo "$markers/completion.gate"
+  fi
+  _write_driver "$driver"
+
+  SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE="$mode" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >/dev/null 2>"$root/stderr" &
+  parent=$!
+  if _wait_for_file "$markers/ready"; then
+    kill -USR1 "$parent" 2>/dev/null || true
+  else
+    timed_out=1
+  fi
+  _wait_for_file "$markers/usr1-seen" || timed_out=1
+  sleep 0.1
+  if ! kill -0 "$parent" 2>/dev/null; then
+    early_exit=1
+  elif [[ "$mode" == unrelated-signal ]]; then
+    printf 'release\n' >"$markers/unrelated.gate"
+  fi
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+
+  [[ -f "$markers/worker.pid" ]] && worker=$(cat "$markers/worker.pid")
+  if [[ "$mode" == unrelated-signal ]]; then
+    _assert_eq "$label: transaction does not exit from unrelated signal" 0 "$early_exit"
+  fi
+  _assert_eq "$label: transaction returns the child status" 0 "$rc"
+  _assert_eq "$label: completion stays bounded" 0 "$timed_out"
+  if [[ "$mode" == unrelated-signal-completion ]]; then
+    if [[ -e "$markers/completion-observed" && ! -e "$markers/completion-timeout" ]]; then
+      _pass "$label: completed-child wait branch is observed"
+    else
+      _fail "$label: completed-child wait branch is observed"
+    fi
+  fi
+  if [[ -n "$worker" ]] && ! kill -0 "$worker" 2>/dev/null; then
+    _pass "$label: exact child is reaped"
+  else
+    _fail "$label: exact child is reaped"
+    [[ -n "$worker" ]] && kill -KILL "$worker" 2>/dev/null || true
+  fi
+  if _report_is_restored "$report"; then
+    _pass "$label: caller state restored"
+  else
+    _fail "$label: caller state restored"
+  fi
+}
+
+_run_executed_case() {
+  local root live bundle snapshot markers bin stdout stderr parent worker rc=0 timed_out=0 staging=""
+
+  root=$(_tmpdir)
+  live="$root/live"
+  bundle="$root/bundle"
+  snapshot="$root/old-snapshot"
+  markers="$root/markers"
+  bin="$root/bin"
+  stdout="$root/stdout"
+  stderr="$root/stderr"
+  mkdir -p "$markers"
+  _make_bundle "$live" 20990101-020304-11111111
+  _make_bundle "$bundle" 20990102-030405-22222222
+  cp -R "$live" "$snapshot"
+  _write_command_shims "$bin"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$live" \
+    SHDEPS_BIN="$root/shdeps-bin" \
+    SHDEPS_TEST_LIVE="$live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_PHASE=copy \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    "$bundle/install.sh" >"$stdout" 2>"$stderr" &
+  parent=$!
+  if _wait_for_file "$markers/ready"; then
+    kill -TERM "$parent" 2>/dev/null || true
+  else
+    timed_out=1
+  fi
+  if ! _wait_for_exit "$parent"; then
+    timed_out=1
+    if [[ -f "$markers/worker.pid" ]]; then
+      worker=$(cat "$markers/worker.pid")
+      kill -TERM "$worker" 2>/dev/null || true
+    fi
+    kill -KILL "$parent" 2>/dev/null || true
+  fi
+  wait "$parent" || rc=$?
+
+  _assert_eq 'executed install: preserves TERM status' 143 "$rc"
+  _assert_eq 'executed install: cancellation is bounded' 0 "$timed_out"
+  if _tree_matches "$snapshot" "$live"; then
+    _pass 'executed install: old install remains byte-identical'
+  else
+    _fail 'executed install: old install remains byte-identical'
+  fi
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_not_exists 'executed install: staging removed by EXIT-safe transaction' "$staging"
+  if grep -Eq '\[[0-9]+\][+ -]' "$stdout" "$stderr"; then
+    _fail 'executed install: no job-control text leaks'
+  else
+    _pass 'executed install: no job-control text leaks'
+  fi
+}
+
+_run_executed_exit_case() {
+  local mode="$1" expected_rc="$2"
+  local root markers bin report driver install_script staging="" rc=0
+
+  root=$(_tmpdir)
+  markers="$root/markers"
+  bin="$root/bin"
+  report="$root/report"
+  driver="$root/driver"
+  install_script="$SHDEPS_DIR/install.sh"
+  mkdir -p "$markers"
+  _write_command_shims "$bin"
+  _write_driver "$driver"
+
+  PATH="$bin:$PATH" \
+    SHDEPS_DIR="$root/live" \
+    SHDEPS_TEST_CALLER_EXIT="$root/caller-exit" \
+    SHDEPS_TEST_CALLER_SIGNALS="$root/caller-signals" \
+    SHDEPS_TEST_INSTALL_SH="$install_script" \
+    SHDEPS_TEST_LIVE="$root/live" \
+    SHDEPS_TEST_MARKERS="$markers" \
+    SHDEPS_TEST_MODE="$mode" \
+    SHDEPS_TEST_PHASE="$mode" \
+    SHDEPS_TEST_REAL_CP="$_real_cp" \
+    SHDEPS_TEST_REAL_MKDIR="$_real_mkdir" \
+    SHDEPS_TEST_REAL_MV="$_real_mv" \
+    SHDEPS_TEST_REAL_RM="$_real_rm" \
+    SHDEPS_TEST_REAL_TAR="$_real_tar" \
+    SHDEPS_TEST_REPORT="$report" \
+    "$driver" >"$root/stdout" 2>"$root/stderr" || rc=$?
+
+  [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
+  _assert_eq "$mode: EXIT cleanup selects the required status" "$expected_rc" "$rc"
+  if [[ "$mode" == executed-abrupt-exit ]]; then
+    _assert_not_exists "$mode: EXIT cleanup removes owned staging" "$staging"
+  else
+    _assert_dir_exists "$mode: failed EXIT cleanup retains recoverable staging" "$staging"
+    _assert_contains "$mode: cleanup diagnostic names retained staging" \
+      "$staging" "$(cat "$root/stderr")"
+    "$_real_rm" -rf -- "$staging"
+  fi
+}
+
+echo '=== install.sh interruption transactions ==='
+_run_interrupt_case download release old TERM 0 0 '' 0 1
+_run_interrupt_case download-ignore release old TERM 0 1
+_run_interrupt_case download-first-signal release old HUP 0 1 TERM
+_run_interrupt_case bootstrap-download bootstrap old TERM
+_run_interrupt_case bootstrap-fresh-download bootstrap none TERM 0 0 '' 1
+_run_interrupt_case checksum release old TERM
+_run_interrupt_case copy bundle old HUP 1 0 '' 0 1
+_run_interrupt_case extract release old
+_run_interrupt_case old-moved bundle old
+_run_interrupt_case activated bundle new
+_run_interrupt_case activated-int bundle new INT
+_run_interrupt_case backup-remove bundle new
+_run_interrupt_case cleanup-remove cleanup-interrupt old
+_run_cleanup_failure_case
+_run_partial_cleanup_failure_case partial-cleanup-failure
+_run_partial_cleanup_failure_case both-cleanup-failure
+_run_cleanup_unrelated_signal_case
+_run_unrelated_signal_wait_case unrelated-signal 'unrelated signal'
+_run_unrelated_signal_wait_case unrelated-signal-completion 'unrelated signal during child completion'
+_run_failure_case restore-failure
+_run_failure_case restore-race
+_run_failure_case destination-race
+_run_failure_case backup-race
+_run_failure_case backup-move-failure
+_run_failure_case backup-stat-failure
+_run_failure_case backup-first-stat-failure
+_run_failure_case backup-disappears
+_run_owned_replacement_case staging-replacement bundle
+_run_owned_replacement_case staging-replacement bootstrap
+_run_owned_replacement_case staging-initial-replacement bundle
+_run_owned_replacement_case scratch-replacement release
+_run_dangling_live_case
+_run_private_directory_case
+_run_invalid_bundle_case
+_run_postmove_invalid_case
+_run_destination_signal_case
+_run_success_case
+_run_latched_spawn_case
+_run_debug_launch_case plain
+_run_debug_launch_case to-file
+_run_debug_launch_case with-input
+_run_cleanup_post_spawn_signal_case
+_run_setup_signal_case
+_run_teardown_signal_case
+_run_monitor_case
+_run_allocation_case
+_run_marker_allocation_failure_case
+_run_identity_failure_case staging-identity-failure bundle
+_run_identity_failure_case staging-identity-marker-missing bundle
+_run_identity_failure_case release-identity-failure release
+_run_executed_case
+_run_executed_exit_case executed-abrupt-exit 37
+_run_executed_exit_case executed-abrupt-exit-cleanup-failure 125
+
+_test_summary

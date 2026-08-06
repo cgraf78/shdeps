@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# The two transaction probes intentionally rebind the same installer variables
+# in separate subshells so neither probe can contaminate the next one.
+# shellcheck disable=SC2030,SC2031
 # Smoke-test the curl-pipe installer path with a local release fixture.
 #
 # This script is intentionally Bash 3.2-compatible because CI runs it with
@@ -167,4 +170,170 @@ PATH="$_fakebin:$PATH" \
 _version=$("$_bin_dir/shdeps" version)
 [[ "$_version" == "shdeps 20990203-040506-abc12345" ]] || _die "unexpected version output: $_version"
 
-printf 'install.sh Bash %s release smoke passed\n' "$BASH_VERSION"
+# Exercise the transaction trap/rollback path under the same system Bash, not
+# only normal activation. The mv shim signals the installer after the old tree
+# has really moved aside; the transaction must restore it and return TERM while
+# leaving every caller trap and option unchanged.
+_real_mv=$(command -v mv)
+_signal_bin="$_tmp_root/signal-bin"
+_signal_log="$_tmp_root/signal.log"
+_rollback_payload="$_tmp_root/rollback-payload"
+mkdir -p "$_signal_bin"
+cp -R "$_payload" "$_rollback_payload"
+cat >"$_rollback_payload/shdeps" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "version" ]]; then
+  printf '%s\n' "shdeps 20991231-235959-deadbeef"
+fi
+SH
+chmod +x "$_rollback_payload/shdeps"
+cat >"$_signal_bin/mv" <<'SH'
+#!/usr/bin/env bash
+set -u
+"$SHDEPS_TEST_REAL_MV" "$@" || exit $?
+case "$1:$2" in
+  "$SHDEPS_TEST_LIVE":*.backup)
+    : >"$SHDEPS_TEST_SIGNAL_LOG"
+    kill -TERM "$PPID"
+    ;;
+esac
+SH
+chmod +x "$_signal_bin/mv"
+
+(
+  trap 'printf caller-hup >"$_tmp_root/caller-hup"' HUP
+  trap 'printf caller-int >"$_tmp_root/caller-int"' INT
+  trap 'printf caller-term >"$_tmp_root/caller-term"' TERM
+  trap 'printf caller-exit >"$_tmp_root/caller-exit"' EXIT
+  _before_hup=$(trap -p HUP)
+  _before_int=$(trap -p INT)
+  _before_term=$(trap -p TERM)
+  _before_exit=$(trap -p EXIT)
+  _before_options=$(set +o)
+  _before_flags=$-
+  _before_cwd=$PWD
+
+  SHDEPS_INSTALL_SH_NO_DISPATCH=1
+  export SHDEPS_INSTALL_SH_NO_DISPATCH
+  # shellcheck source=/dev/null
+  . "$_installer_dir/install.sh"
+  unset SHDEPS_INSTALL_SH_NO_DISPATCH
+
+  # Sourcing install.sh initializes its public defaults. Rebind the transaction
+  # to this smoke's fixture before any helper can touch a real user install.
+  export SHDEPS_DIR="$_install_dir"
+  export SHDEPS_BIN="$_bin_dir/shdeps"
+  PATH="$_signal_bin:$PATH"
+  SHDEPS_TEST_LIVE="$_install_dir"
+  SHDEPS_TEST_REAL_MV="$_real_mv"
+  SHDEPS_TEST_SIGNAL_LOG="$_signal_log"
+  export PATH SHDEPS_TEST_LIVE SHDEPS_TEST_REAL_MV SHDEPS_TEST_SIGNAL_LOG
+
+  # Stock Bash 3.2 consumes a completed child's ordinary failure on the first
+  # wait. A second wait returns 127, so the transaction helper must not retry
+  # unless the first status has the 128+signal interruption shape.
+  _shdeps_tx_signal=0
+  _shdeps_tx_child=""
+  _child_failure_rc=0
+  _install_transaction_run sh -c 'exit 22' || _child_failure_rc=$?
+  [[ "$_child_failure_rc" -eq 22 ]] ||
+    _die "Bash 3.2 transaction changed child status 22 to $_child_failure_rc"
+
+  _tx_rc=0
+  _install_bundle "$_rollback_payload" || _tx_rc=$?
+
+  [[ "$_tx_rc" -eq 143 ]] || _die "Bash 3.2 transaction returned $_tx_rc instead of 143"
+  [[ -f "$_signal_log" ]] || _die "Bash 3.2 transaction did not reach the post-rename signal gate"
+  [[ "$(trap -p HUP)" == "$_before_hup" ]] || _die "Bash 3.2 transaction changed HUP trap"
+  [[ "$(trap -p INT)" == "$_before_int" ]] || _die "Bash 3.2 transaction changed INT trap"
+  [[ "$(trap -p TERM)" == "$_before_term" ]] || _die "Bash 3.2 transaction changed TERM trap"
+  [[ "$(trap -p EXIT)" == "$_before_exit" ]] || _die "Bash 3.2 transaction changed EXIT trap"
+  [[ "$(set +o)" == "$_before_options" ]] || _die "Bash 3.2 transaction changed shell options"
+  [[ "$-" == "$_before_flags" ]] || _die "Bash 3.2 transaction changed shell flags"
+  [[ "$PWD" == "$_before_cwd" ]] || _die "Bash 3.2 transaction changed cwd"
+  [[ ! -e "$_tmp_root/caller-term" ]] || _die "Bash 3.2 transaction invoked caller TERM trap"
+  [[ "$("$_install_dir/shdeps" version)" == "shdeps 20990203-040506-abc12345" ]] ||
+    _die "Bash 3.2 transaction did not restore the old install"
+  if compgen -G "${_install_dir%/*}/.shdeps-install.*" >/dev/null; then
+    _die "Bash 3.2 rollback retained transaction staging or backup paths"
+  fi
+)
+
+# Exercise cancellation while a real transaction child is active. This keeps
+# the Bash 3.2 smoke honest about the background-child path used by downloads,
+# copies, extraction, and cleanup instead of covering only synchronous rename
+# checkpoints.
+_real_cp=$(command -v cp)
+_child_bin="$_tmp_root/child-bin"
+_child_ready="$_tmp_root/child-ready"
+_child_pid="$_tmp_root/child.pid"
+mkdir -p "$_child_bin"
+cat >"$_child_bin/cp" <<'SH'
+#!/usr/bin/env bash
+set -u
+dest=""
+for arg in "$@"; do dest="$arg"; done
+case "$dest" in
+  */.shdeps-install.*/)
+    printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+    : >"$SHDEPS_TEST_CHILD_READY"
+    trap 'exit 143' TERM
+    kill -TERM "$PPID"
+    while :; do sleep 1; done
+    ;;
+esac
+exec "$SHDEPS_TEST_REAL_CP" "$@"
+SH
+chmod +x "$_child_bin/cp"
+
+(
+  trap 'printf caller-hup >"$_tmp_root/child-caller-hup"' HUP
+  trap 'printf caller-int >"$_tmp_root/child-caller-int"' INT
+  trap 'printf caller-term >"$_tmp_root/child-caller-term"' TERM
+  trap 'printf caller-exit >"$_tmp_root/child-caller-exit"' EXIT
+  _before_hup=$(trap -p HUP)
+  _before_int=$(trap -p INT)
+  _before_term=$(trap -p TERM)
+  _before_exit=$(trap -p EXIT)
+  _before_options=$(set +o)
+  _before_flags=$-
+  _before_cwd=$PWD
+
+  SHDEPS_INSTALL_SH_NO_DISPATCH=1
+  export SHDEPS_INSTALL_SH_NO_DISPATCH
+  # shellcheck source=/dev/null
+  . "$_installer_dir/install.sh"
+  unset SHDEPS_INSTALL_SH_NO_DISPATCH
+
+  # Sourcing resets installer defaults, so explicitly keep this smoke isolated
+  # from any real user installation before starting the transaction.
+  export SHDEPS_DIR="$_install_dir"
+  export SHDEPS_BIN="$_bin_dir/shdeps"
+  PATH="$_child_bin:$PATH"
+  SHDEPS_TEST_CHILD_PID="$_child_pid"
+  SHDEPS_TEST_CHILD_READY="$_child_ready"
+  SHDEPS_TEST_REAL_CP="$_real_cp"
+  export PATH SHDEPS_TEST_CHILD_PID SHDEPS_TEST_CHILD_READY SHDEPS_TEST_REAL_CP
+  _tx_rc=0
+  _install_bundle "$_payload" || _tx_rc=$?
+
+  [[ "$_tx_rc" -eq 143 ]] || _die "Bash 3.2 active-child transaction returned $_tx_rc instead of 143"
+  [[ -f "$_child_ready" ]] || _die "Bash 3.2 transaction did not start the child fixture"
+  _worker=$(cat "$_child_pid")
+  if kill -0 "$_worker" 2>/dev/null; then
+    kill -KILL "$_worker" 2>/dev/null || true
+    _die "Bash 3.2 transaction left its active child running"
+  fi
+  [[ "$(trap -p HUP)" == "$_before_hup" ]] || _die "Bash 3.2 active-child transaction changed HUP trap"
+  [[ "$(trap -p INT)" == "$_before_int" ]] || _die "Bash 3.2 active-child transaction changed INT trap"
+  [[ "$(trap -p TERM)" == "$_before_term" ]] || _die "Bash 3.2 active-child transaction changed TERM trap"
+  [[ "$(trap -p EXIT)" == "$_before_exit" ]] || _die "Bash 3.2 active-child transaction changed EXIT trap"
+  [[ "$(set +o)" == "$_before_options" ]] || _die "Bash 3.2 active-child transaction changed shell options"
+  [[ "$-" == "$_before_flags" ]] || _die "Bash 3.2 active-child transaction changed shell flags"
+  [[ "$PWD" == "$_before_cwd" ]] || _die "Bash 3.2 active-child transaction changed cwd"
+  [[ ! -e "$_tmp_root/child-caller-term" ]] || _die "Bash 3.2 active-child transaction invoked caller TERM trap"
+  [[ "$("$_install_dir/shdeps" version)" == "shdeps 20990203-040506-abc12345" ]] ||
+    _die "Bash 3.2 active-child transaction did not preserve the old install"
+)
+
+printf 'install.sh Bash %s release and transaction smoke passed\n' "$BASH_VERSION"
