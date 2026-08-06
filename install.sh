@@ -1304,7 +1304,9 @@ _install_transaction_restore_old() {
 _install_transaction_cleanup() {
   local failed=0
 
-  [[ "${_shdeps_tx_cleanup_done:-0}" -eq 0 ]] || return "$_shdeps_tx_cleanup_failed"
+  # DONE is published only after every owned resource is reconciled. Failed
+  # cleanup deliberately retains its earlier state so a later teardown retries.
+  [[ "$_shdeps_tx_state" != DONE ]] || return 0
   _install_transaction_cancel_child
   _install_transaction_reconcile
 
@@ -1377,9 +1379,7 @@ _install_transaction_cleanup() {
     -L "$_shdeps_tx_unresolved_quarantine") ]]; then
     failed=1
   fi
-  _shdeps_tx_cleanup_failed="$failed"
   if [[ "$failed" -eq 0 ]]; then
-    _shdeps_tx_cleanup_done=1
     _shdeps_tx_state=DONE
   fi
   return "$failed"
@@ -1491,8 +1491,7 @@ _install_transaction() {
   local _shdeps_tx_old_recovery="" _shdeps_tx_monitor=0
   local _shdeps_tx_staging_owned=0 _shdeps_tx_backup_owned=0
   local _shdeps_tx_backup_unverified=0
-  local _shdeps_tx_release_owned=0 _shdeps_tx_cleanup_done=0
-  local _shdeps_tx_cleanup_failed=0 _shdeps_tx_committed=0
+  local _shdeps_tx_release_owned=0 _shdeps_tx_committed=0
   local _shdeps_tx_unresolved_quarantine=""
   local _shdeps_tx_unresolved_quarantine_identity=""
   local _shdeps_tx_saved_hup _shdeps_tx_saved_int _shdeps_tx_saved_term
