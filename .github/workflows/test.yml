@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
     with:
       # rust-version is a compatibility promise, so exercise it inside the
       # shared required gate instead of leaving the README badge aspirational.
@@ -60,7 +60,7 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
     with:
       # Cross-distribution package-manager behavior is shdeps' product surface,
       # so the broad shell matrix is intentional rather than shared-CI drift.
@@ -80,22 +80,25 @@ jobs:
         tests/shell/release-scripts-test
 
   bash32:
-    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
     with:
       # install.sh runs before shdeps can provide a newer shell, including on
       # stock macOS. This compatibility gate is therefore product behavior,
       # while the sourceable API itself intentionally requires Bash 4.3+.
       command: /bin/bash scripts/smoke-install-bash32.sh
 
-  release-scripts:
-    name: Release script sync
+  actions-sync:
+    name: cgraf78/actions sync
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Keep the established check name while broadening what it proves: every
-      # shared workflow/action and each vendored release script must come from
-      # the one commit recorded in the consumer lock.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+      # GitHub resolves literal `uses:` refs before a job can read repository
+      # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
+      # gate verifies every unavoidable action literal and all vendored release
+      # scripts still match that single reviewed dependency decision.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
