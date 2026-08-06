@@ -239,7 +239,7 @@ private repositories.
 
 ### `cargo` — Rust Crates
 
-Installs crates from crates.io via `cargo install --root "$SHDEPS_INSTALL_DIR/<name>" <name>`. Binaries land in a per-dep install directory and are symlinked into `$SHDEPS_BIN_DIR`.
+Installs crates from crates.io via `cargo install --locked --root "$SHDEPS_INSTALL_DIR/<name>" <name>`. Binaries land in a per-dep install directory and are symlinked into `$SHDEPS_BIN_DIR`.
 
 ```text
 ripgrep   cargo    rg

@@ -22,7 +22,7 @@ _version_line_re='^shdeps [0-9]{8}-[0-9]{6}-[0-9a-fA-F]{8}$'
 echo "=== Rust wrapper ==="
 
 if [[ ! -x "$SHDEPS_RUST_CLI" ]]; then
-  printf 'error: %s is not executable; run cargo build or set SHDEPS_RUST_CLI\n' "$SHDEPS_RUST_CLI" >&2
+  printf 'error: %s is not executable; run cargo build --locked or set SHDEPS_RUST_CLI\n' "$SHDEPS_RUST_CLI" >&2
   exit 2
 fi
 

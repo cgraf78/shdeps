@@ -1229,10 +1229,10 @@ where
                     "{}",
                     tty_row_with_color(&row.status, &row.detail, &row.elapsed, self.color)
                 )?;
-            } else if index == rows.len()
-                && let Some(footer) = footer
-            {
-                write!(self.out, "{footer}")?;
+            } else if index == rows.len() {
+                if let Some(footer) = footer {
+                    write!(self.out, "{footer}")?;
+                }
             }
             if index + 1 < line_count {
                 writeln!(self.out)?;
