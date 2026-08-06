@@ -26,10 +26,12 @@ changes.
   `--bootstrap` for client integration.
 - **`tests/shell/shdeps-wrapper-test`** — focused tests for the sourceable
   Rust-era wrapper API.
-- **`scripts/release*.sh`** — vendored verbatim from `cgraf78/actions`
-  (`release-scripts/`). Do not edit them here: CI fails on any divergence.
-  Repo-specific release inputs live in `scripts/release.conf`, and runtime
-  smoke assertions in `scripts/release-smoke-hook.sh`.
+- **Files listed in `scripts/.release-scripts.manifest`** — generated verbatim
+  from the `cgraf78/actions` commit in `.github/cgraf78-actions.lock`. Do not
+  edit them here: the same consumer sync that updates workflow pins owns these
+  files so executable code cannot drift from the reviewed action commit.
+  `scripts/release.conf` and `scripts/release-smoke-hook.sh` are intentionally
+  repo-owned; they define shdeps-specific inputs and runtime smoke assertions.
 
 ## Code Organization
 

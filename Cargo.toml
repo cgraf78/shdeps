@@ -39,9 +39,9 @@ libc = "0.2"
 name = "shdeps"
 path = "src/main.rs"
 
-# Treat compiler warnings as build errors. shdeps's CI runs `cargo
-# clippy -- -D warnings` for the lint pass, but local `cargo build` /
-# `cargo test` used to silently produce warnings (unused imports,
+# Treat compiler warnings as build errors. shdeps's CI runs `cargo clippy
+# --locked --all-targets --all-features -- -D warnings`, but ordinary local
+# builds and tests used to silently produce warnings (unused imports,
 # dead code from `#[cfg(test)]`-gated helpers, etc.) that masked
 # real regressions. Promoting warnings to errors here makes those
 # regressions visible at edit time rather than at CI time. Granular

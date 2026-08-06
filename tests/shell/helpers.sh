@@ -238,8 +238,9 @@ _fake_release_json() {
 # Mocks for external installers (cargo, go, uv, npm)
 # ---------------------------------------------------------------------------
 
-# Install a mock `cargo` on PATH that intercepts `cargo install --root <dir>
-# <crate> [--force]` and `cargo uninstall --root <dir> <crate>`. Creates
+# Install a mock `cargo` on PATH that intercepts
+# `cargo install --locked --root <dir> <crate> [--force]` and
+# `cargo uninstall --root <dir> <crate>`. Creates
 # `<dir>/bin/<crate>` on install and removes it on uninstall. Records each
 # invocation to $MOCK_CARGO_LOG (if set). Returns the dir to prepend to PATH.
 _mock_cargo_setup() {

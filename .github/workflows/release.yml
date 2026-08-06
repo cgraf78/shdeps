@@ -14,10 +14,13 @@ permissions:
 
 jobs:
   release:
-    uses: cgraf78/actions/.github/workflows/rust-release.yml@a2dd8390ddd0b410d5a82822296036387247cc4c
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     permissions:
       contents: write
     with:
+      # shdeps chooses Android archives by the runtime architecture. Keep both
+      # variants publishable: AArch64 serves physical devices and x86_64 is
+      # also executed in the Termux emulator during regular CI.
       android-aarch64: true
       android-x86_64: true
       # shdeps' public version is generated from the UTC committer timestamp

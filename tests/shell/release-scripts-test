@@ -124,6 +124,29 @@ _assert_contains "release workflow: enables Android x86_64 artifact" \
   "android-x86_64: true" "$_release_workflow"
 
 _test_workflow=$(cat "$SHDEPS_DIR/.github/workflows/test.yml")
+_assert_contains "test workflow: only pushes on main" \
+  "branches: [main]" "$_test_workflow"
+_assert_not_contains "test workflow: does not retain the retired master branch" \
+  "branches: [master" "$_test_workflow"
+_assert_not_contains "test workflow: inherits the shared Clippy contract" \
+  "clippy-command:" "$_test_workflow"
+_assert_not_contains "test workflow: inherits the shared rustdoc contract" \
+  "doc-command:" "$_test_workflow"
+_cargo_msrv=$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' \
+  "$SHDEPS_DIR/Cargo.toml")
+_assert_match "Cargo manifest: declares a parseable MSRV" \
+  '^[0-9]+\.[0-9]+(\.[0-9]+)?$' "$_cargo_msrv"
+_assert_contains "test workflow: enforces the Cargo.toml MSRV" \
+  "msrv-toolchain: \"$_cargo_msrv\"" "$_test_workflow"
+_assert_contains "test workflow: installs musl tools for native zstd code" \
+  "package-smoke-install-musl-tools: true" "$_test_workflow"
+_package_smoke_command=$(
+  sed -n '/^[[:space:]]*package-smoke-command:/,/^[[:space:]]*shell:/p' \
+    <<<"$_test_workflow"
+)
+_assert_contains "test workflow: reuses the shared package smoke target" \
+  "scripts/package-release.sh \"\$RUST_TARGET\" linux-x86_64-musl" \
+  "$_package_smoke_command"
 _termux_host_command=$(
   sed -n '/^[[:space:]]*termux-host-command:/,/^[[:space:]]*android-package-smoke-command:/p' \
     <<<"$_test_workflow"
@@ -137,8 +160,19 @@ _assert_contains "test workflow: keeps Cargo artifacts out of transported checko
 _assert_contains "test workflow: smokes the Android x86_64 release archive" \
   "scripts/smoke-release.sh \"\$ASSET_PLATFORM\"" "$_termux_host_command"
 
-# Vendored copies are only equivalent to a single source while CI enforces it.
-_assert_contains "test workflow: verifies the vendored release scripts" \
+# Consumer workflows and vendored scripts must resolve to the same actions
+# commit. The broader verifier keeps that invariant behind the established
+# required-check name instead of adding another branch-protection context.
+_assert_contains "test workflow: checks out the consumer" \
+  "actions/checkout@" "$_test_workflow"
+_assert_not_contains "test workflow: retired the checkout v6 pin" \
+  "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd" \
+  "$_test_workflow"
+_assert_contains "test workflow: verifies the complete actions consumer lock" \
+  "verify-consumer-sync" "$_test_workflow"
+_assert_not_contains "test workflow: replaces the release-only verifier" \
   "verify-release-scripts" "$_test_workflow"
+_assert_not_contains "test workflow: consumer verifier needs no local inputs" \
+  "scripts-dir:" "$_test_workflow"
 
 _test_summary
