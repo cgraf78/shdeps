@@ -812,10 +812,10 @@ where
                 } => {
                     let group = group_for_method(&builtin_entries[index].method);
                     progress.item(group, &outcome.item)?;
-                    if advance_group(progress, &mut group_done, &group_totals, group)?
-                        && let Some(started) = group_started.remove(group)
-                    {
-                        finish_group(&mut summary, group, started);
+                    if advance_group(progress, &mut group_done, &group_totals, group)? {
+                        if let Some(started) = group_started.remove(group) {
+                            finish_group(&mut summary, group, started);
+                        }
                     }
                 }
             }
@@ -866,10 +866,10 @@ where
             record_changed(&mut changed, marker);
         }
         progress.item(group, &item)?;
-        if advance_group(progress, &mut group_done, &group_totals, group)?
-            && let Some(started) = group_started.remove(group)
-        {
-            finish_group(&mut summary, group, started);
+        if advance_group(progress, &mut group_done, &group_totals, group)? {
+            if let Some(started) = group_started.remove(group) {
+                finish_group(&mut summary, group, started);
+            }
         }
         summary.items.push(item);
     }
