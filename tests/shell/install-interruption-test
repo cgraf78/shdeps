@@ -475,7 +475,7 @@ trap 'printf "caller-term\n" >>"$SHDEPS_TEST_CALLER_SIGNALS"' TERM
 trap 'printf "caller-exit:%s\n" "$?" >>"$SHDEPS_TEST_CALLER_EXIT"' EXIT
 
 _test_debug_hook() {
-  local command="$BASH_COMMAND" remaining
+  local command="$BASH_COMMAND"
 
   if [[ "${SHDEPS_TEST_DEBUG_HOOK_STDOUT:-0}" -eq 1 ]]; then
     printf '%s\n' debug-hook-output
@@ -485,20 +485,6 @@ _test_debug_hook() {
     SHDEPS_TEST_DEBUG_CAPTURE_ARMED=0
     true &
     printf '%s\n' "$!" >"$SHDEPS_TEST_MARKERS/debug-decoy.pid"
-  fi
-  if [[ "${SHDEPS_TEST_CLEANUP_SIGNAL_ARMED:-0}" -eq 1 &&
-    ("$command" == '_shdeps_tx_child=$!' ||
-      "$command" == _install_transaction_cancel_started_child_if_signaled*) ]]; then
-    SHDEPS_TEST_CLEANUP_SIGNAL_ARMED=0
-    trap - DEBUG
-    remaining=250
-    while [[ ! -e "$SHDEPS_TEST_MARKERS/remove-attempted" && "$remaining" -gt 0 ]]; do
-      sleep 0.01
-      remaining=$((remaining - 1))
-    done
-    : >"$SHDEPS_TEST_MARKERS/cleanup-signal-injected"
-    _install_transaction_signal TERM
-    trap _test_debug_hook DEBUG
   fi
 }
 if [[ "${SHDEPS_TEST_ENABLE_DEBUG_HOOK:-0}" -eq 1 ]]; then
@@ -678,6 +664,35 @@ case "$SHDEPS_TEST_MODE" in
     SHDEPS_TEST_DEBUG_HOOK_STDOUT=0
     ;;
   cleanup-signal-gap)
+    # Inject through a wrapper at the first reconciliation call, after the
+    # cleanup launcher has published its exact child PID but before production
+    # code reads the signal latch. Bash 5.3 on Termux was observed to segfault
+    # while the former fixture disabled and reinstalled its own functraced DEBUG
+    # trap and synchronously called the TERM handler. A real signal here exercises
+    # the same production boundary without mutating a running trap, and the
+    # original helper still owns cancellation and status.
+    eval "$(declare -f _install_transaction_cancel_started_child_if_signaled |
+      sed '1s/_install_transaction_cancel_started_child_if_signaled/_install_transaction_cancel_started_child_if_signaled_original/')"
+    _install_transaction_cancel_started_child_if_signaled() {
+      local remaining=250
+
+      if [[ "${SHDEPS_TEST_CLEANUP_SIGNAL_ARMED:-0}" -eq 1 ]]; then
+        SHDEPS_TEST_CLEANUP_SIGNAL_ARMED=0
+        # Wait until the first cleanup process has entered the blocking shim.
+        # Otherwise an immediate signal can stop it before the marker is written,
+        # causing the shielded retry (rather than the first attempt) to block.
+        while [[ ! -e "$SHDEPS_TEST_MARKERS/remove-attempted" && "$remaining" -gt 0 ]]; do
+          sleep 0.01
+          remaining=$((remaining - 1))
+        done
+        if [[ -e "$SHDEPS_TEST_MARKERS/remove-attempted" ]]; then
+          : >"$SHDEPS_TEST_MARKERS/cleanup-signal-target-ready"
+        fi
+        : >"$SHDEPS_TEST_MARKERS/cleanup-signal-injected"
+        kill -TERM "$$"
+      fi
+      _install_transaction_cancel_started_child_if_signaled_original
+    }
     SHDEPS_TEST_CLEANUP_SIGNAL_ARMED=1
     _install_bundle_core() {
       printf '%s\n' "$_shdeps_tx_staging" >"$SHDEPS_TEST_MARKERS/staging.path"
@@ -1610,6 +1625,8 @@ _run_cleanup_post_spawn_signal_case() {
   [[ -f "$markers/staging.path" ]] && staging=$(cat "$markers/staging.path")
   _assert_eq 'cleanup post-spawn signal: original TERM status is preserved' 143 "$rc"
   _assert_eq 'cleanup post-spawn signal: completion stays bounded' 0 "$timed_out"
+  _assert_file_exists 'cleanup post-spawn signal: first cleanup child became ready' \
+    "$markers/cleanup-signal-target-ready"
   _assert_file_exists 'cleanup post-spawn signal: signal reached the registration window' \
     "$markers/cleanup-signal-injected"
   _assert_not_exists 'cleanup post-spawn signal: owned staging is removed' "$staging"
