@@ -1238,8 +1238,8 @@ fn list_reports_configured_dependency_statuses() {
 }
 
 #[test]
-fn list_keeps_short_custom_status_hooks_within_ci_budget() {
-    let fixture = Fixture::new("list-custom-status-perf");
+fn custom_hooks_stay_within_ci_budget() {
+    let fixture = Fixture::new("custom-hook-perf");
     let mut config = String::new();
     for index in 0..30 {
         let name = format!("custom-{index}");
@@ -1274,6 +1274,37 @@ fn list_keeps_short_custom_status_hooks_within_ci_budget() {
     assert!(
         elapsed <= budget,
         "thirty short custom status hooks should stay under the CI budget; elapsed={elapsed:?}, budget={budget:?}, stdout={:?}, stderr={:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+
+    // Seed the manifest outside the timed window. The performance contract is
+    // for a warm current update, not thirty serial atomic manifest fsyncs.
+    assert_success(&run(&mut fixture.command(["update"])));
+
+    let mut command = fixture.command(["-v", "update"]);
+    command.env("SHDEPS_JOBS", "1");
+    let (output, elapsed) = timed(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        text(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("custom-") && line.contains("ok"))
+            .count(),
+        30
+    );
+    assert_eq!(text(&output.stderr), "");
+    // Catch an exit-polling regression that adds about 1.2 seconds across these
+    // 30 serial current hooks without folding manifest I/O into the budget.
+    let budget = if cfg!(target_os = "macos") {
+        Duration::from_millis(2_200)
+    } else {
+        Duration::from_millis(1_200)
+    };
+    assert!(
+        elapsed <= budget,
+        "thirty current custom hooks should stay under the CI budget; elapsed={elapsed:?}, budget={budget:?}, stdout={:?}, stderr={:?}",
         text(&output.stdout),
         text(&output.stderr)
     );

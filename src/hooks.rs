@@ -48,29 +48,15 @@ const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_HOOK_MAX_OUTPUT_BYTES: usize = 1 << 20;
 
 /// Poll interval used while waiting for a hook child to exit.
-const HOOK_WAIT_POLL: Duration = Duration::from_millis(50);
-
-/// Short status probes dominate the interactive `list` path, so check them
-/// more frequently without making long-running mutating hooks poll as often.
-const STATUS_HOOK_WAIT_POLL: Duration = Duration::from_millis(10);
+///
+/// Short hooks dominate warm updates, so 10 ms avoids adding one coarse wait
+/// per custom dependency. This matches the general timed subprocess runner;
+/// even a five-minute install performs only 30,000 nonblocking wait checks.
+const HOOK_WAIT_POLL: Duration = Duration::from_millis(10);
 
 /// Runs a configured hook command with a wall-clock timeout and a
 /// per-stream output cap.
-fn run_hook_command(command: Command) -> io::Result<std::process::Output> {
-    run_hook_command_with_poll(command, HOOK_WAIT_POLL)
-}
-
-/// Runs a short status hook with a lower exit-detection latency.
-fn run_status_hook_command(command: Command) -> io::Result<std::process::Output> {
-    run_hook_command_with_poll(command, STATUS_HOOK_WAIT_POLL)
-}
-
-/// Runs hook commands with the requested exit-detection cadence while retaining
-/// the shared timeout, process-group termination, and capped-output behavior.
-fn run_hook_command_with_poll(
-    mut command: Command,
-    wait_poll: Duration,
-) -> io::Result<std::process::Output> {
+fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
     let timeout = hook_timeout();
     let max_bytes = hook_max_bytes();
 
@@ -156,7 +142,7 @@ fn run_hook_command_with_poll(
             }
             break child.wait()?;
         }
-        thread::sleep(wait_poll);
+        thread::sleep(HOOK_WAIT_POLL);
     };
 
     let stdout = stdout_handle.join().unwrap_or_default();
@@ -634,7 +620,7 @@ impl CustomProbe for BashCustomProbe {
         // predicate gate; hooks that need phase-specific install/post behavior
         // get separate subprocesses with more precise phases.
         apply_hook_env(&mut command, roots, &entry.name, "exists", None);
-        let output = run_status_hook_command(command)?;
+        let output = run_hook_command(command)?;
 
         if !output.status.success() {
             return Ok(None);
