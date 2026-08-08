@@ -212,6 +212,33 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert_eq!(text(&version.stdout), "abi:1\n");
     assert_eq!(text(&version.stderr), "");
 
+    let capability = run(&mut fixture.command([
+        "__api",
+        "capability",
+        "release-archive-launcher-preservation-v1",
+    ]));
+    assert_success(&capability);
+    assert_eq!(text(&capability.stdout), "");
+    assert_eq!(text(&capability.stderr), "");
+
+    let unknown = run(&mut fixture.command(["__api", "capability", "not-a-real-capability"]));
+    assert_eq!(unknown.status.code(), Some(1));
+    assert_eq!(text(&unknown.stdout), "");
+    assert_eq!(text(&unknown.stderr), "");
+
+    let malformed = run(&mut fixture.command([
+        "__api",
+        "capability",
+        "release-archive-launcher-preservation-v1",
+        "extra",
+    ]));
+    assert_eq!(malformed.status.code(), Some(2));
+    assert_eq!(text(&malformed.stdout), "");
+    assert_eq!(
+        text(&malformed.stderr),
+        "error: __api capability requires exactly one name\n"
+    );
+
     let count = run(&mut fixture.command(["__api", "load-count"]));
     assert_success(&count);
     assert_eq!(text(&count.stdout), "2\n");
@@ -247,6 +274,53 @@ fn read_only_api_outputs_machine_clean_lines() {
         )
     );
     assert_eq!(text(&links.stderr), "");
+}
+
+#[test]
+fn explicit_release_archive_launcher_adoption_is_machine_clean() {
+    let fixture = Fixture::new("adopt-release-archive-launcher");
+    let public = fixture.dir.join("bin/tool");
+    fixture.write_executable("share/owner/tool/bin/tool", "#!/bin/sh\n");
+    fixture.write_executable("bin/tool", "#!/bin/sh\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.dir.join("share/owner/tool/bin/tool").display()
+        ),
+    );
+    fixture.write(
+        "state/owner/tool.binlinks",
+        &format!("{}\n", public.display()),
+    );
+
+    let adopted = run(&mut fixture.command([
+        "__api",
+        "adopt-release-archive-launcher",
+        "owner/tool",
+        "tool",
+    ]));
+    assert_success(&adopted);
+    assert_eq!(text(&adopted.stdout), "");
+    assert_eq!(text(&adopted.stderr), "");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("share/owner/tool/.shdeps-release-layout")).unwrap(),
+        "v1 archive\n"
+    );
+
+    let malformed = run(&mut fixture.command([
+        "__api",
+        "adopt-release-archive-launcher",
+        "owner/tool",
+        "tool",
+        "extra",
+    ]));
+    assert_eq!(malformed.status.code(), Some(2));
+    assert_eq!(text(&malformed.stdout), "");
+    assert_eq!(
+        text(&malformed.stderr),
+        "error: __api adopt-release-archive-launcher requires a dependency name and command\n"
+    );
 }
 
 #[test]
@@ -2815,14 +2889,23 @@ install() { printf 'installed\n'; }
 }
 
 #[test]
+#[cfg(unix)]
 fn prune_lists_dry_runs_and_removes_orphans() {
+    use std::os::unix::fs::symlink;
+
     let fixture = Fixture::new("prune");
     fixture.write("conf/deps.conf", "current github:repo\n");
     fixture.write(
         "state/manifest",
         "old|github:release|old|/tmp/old\ncurrent|github:repo|current|/tmp/current\n",
     );
-    fixture.write_executable("bin/old", "#!/bin/sh\n");
+    fixture.write_executable("share/old/bin/old", "#!/bin/sh\n");
+    fs::create_dir_all(fixture.dir.join("bin")).unwrap();
+    symlink(
+        fixture.dir.join("share/old/bin/old"),
+        fixture.dir.join("bin/old"),
+    )
+    .unwrap();
     fixture.write("share/old/artifact", "artifact\n");
     fixture.write(
         "conf/hooks.d/old.sh",

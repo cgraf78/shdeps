@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::cleanup;
 use crate::config::{self, Entry};
+use crate::github_release_install::{self, ArchiveState};
 use crate::link_state::{self, Kind};
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::method;
@@ -25,6 +26,7 @@ pub(crate) struct Transition {
     old: ManifestEntry,
     bin_links: Vec<PathBuf>,
     extra_links: Vec<PathBuf>,
+    archive_state: ArchiveState,
 }
 
 /// Builds a transition map keyed by dependency name.
@@ -43,12 +45,23 @@ pub(crate) fn by_name(
                 &entry.name,
                 Kind::Extras,
             ))?;
+            let archive_state = if entry.method == method::GITHUB_RELEASE {
+                github_release_install::archive_state(
+                    &roots.state_dir,
+                    &roots.install_dir,
+                    &roots.bin_dir.join(&entry.cmd),
+                    &entry.name,
+                )?
+            } else {
+                ArchiveState::None
+            };
             Ok((
                 entry.name.clone(),
                 Transition {
                     old: entry,
                     bin_links,
                     extra_links,
+                    archive_state,
                 },
             ))
         })
@@ -123,6 +136,22 @@ fn prepare_public_bin(
     }
 
     let original = roots.bin_dir.join(&entry.cmd);
+    match transition.archive_state {
+        ArchiveState::Proven if github_release_install::is_non_symlink(&original) => {
+            // Archive installs never own a regular launcher they preserved.
+            // Moving it aside here would let the new method replace it and the
+            // success path would then discard the only copy.
+            return Ok(None);
+        }
+        ArchiveState::Ambiguous => {
+            return Err(std::io::Error::other(format!(
+                "refusing to replace ambiguous legacy release command: {}",
+                original.display()
+            ))
+            .into());
+        }
+        ArchiveState::None | ArchiveState::Proven => {}
+    }
     let metadata = match fs::symlink_metadata(&original) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -172,7 +201,7 @@ fn backup_path(path: &Path) -> PathBuf {
 }
 
 fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Result<()> {
-    let preserve = preserve_paths(entry, roots);
+    let preserve = preserve_paths(entry, roots)?;
 
     match transition.old.method.as_str() {
         method::PKG => {
@@ -228,6 +257,10 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
             remove_stamps(&roots.state_dir, &transition.old.name)?;
         }
         binary if method::is_binary_install_root(binary) => {
+            let public_bin = roots.bin_dir.join(&transition.old.cmd);
+            let preserve_public_launcher = binary == method::GITHUB_RELEASE
+                && transition.archive_state != ArchiveState::None
+                && github_release_install::is_non_symlink(&public_bin);
             unlink_snapshot(
                 &roots.state_dir,
                 &transition.old.name,
@@ -242,7 +275,9 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
                 &transition.extra_links,
                 &preserve,
             )?;
-            remove_any_unless_preserved(&roots.bin_dir.join(&transition.old.cmd), &preserve)?;
+            if !preserve_public_launcher {
+                remove_any_unless_preserved(&public_bin, &preserve)?;
+            }
 
             let install_root = roots.install_dir.join(&transition.old.name);
             if !preserve.contains(&install_root) {
@@ -258,7 +293,7 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
     Ok(())
 }
 
-fn preserve_paths(entry: &Entry, roots: &Roots) -> BTreeSet<PathBuf> {
+fn preserve_paths(entry: &Entry, roots: &Roots) -> Result<BTreeSet<PathBuf>> {
     let mut preserve = BTreeSet::new();
 
     // New-method link state may live at the same `<name>.links` path as the
@@ -288,14 +323,21 @@ fn preserve_paths(entry: &Entry, roots: &Roots) -> BTreeSet<PathBuf> {
             preserve.insert(public_bin.clone());
 
             let install_root = roots.install_dir.join(&entry.name);
-            if release_install_root_is_owned(&install_root, &public_bin) {
+            if github_release_install::archive_state(
+                &roots.state_dir,
+                &roots.install_dir,
+                &public_bin,
+                &entry.name,
+            )? == ArchiveState::Proven
+                || release_install_root_is_owned(&install_root, &public_bin)
+            {
                 preserve.insert(install_root);
             }
         }
         _ => {}
     }
 
-    preserve
+    Ok(preserve)
 }
 
 fn release_install_root_is_owned(path: &Path, public_bin: &Path) -> bool {
@@ -314,9 +356,10 @@ fn release_install_root_is_owned(path: &Path, public_bin: &Path) -> bool {
     // into it. A repo -> raw-release transition can leave an old real checkout
     // directory at the same path; preserving it would make the manifest say
     // release while `dep-root` and cleanup still see stale repo-owned files.
-    // The public command is the durable proof of archive ownership because raw
-    // release installs write a regular bin file, while archive installs expose
-    // the selected binary from inside the extracted root.
+    // The public command is the legacy proof of archive ownership because raw
+    // release installs write a regular bin file, while old archive installs
+    // exposed the selected binary from inside the extracted root. New archives
+    // carry an explicit marker handled by `archive_state` above.
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return false;
     }
@@ -446,6 +489,7 @@ mod tests {
 
     use super::{Transition, cleanup_snapshot, points_into, unlink_snapshot};
     use crate::config::Entry;
+    use crate::github_release_install::{self, ArchiveState};
     use crate::link_state::{self, Kind};
     use crate::manifest::ManifestEntry;
     use crate::runtime::Roots;
@@ -646,6 +690,7 @@ mod tests {
             ),
             bin_links: Vec::new(),
             extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -718,6 +763,7 @@ mod tests {
             ),
             bin_links: vec![public.clone(), helper.clone()],
             extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -732,6 +778,63 @@ mod tests {
 
         assert!(!public.exists());
         assert!(!helper.exists());
+        assert!(!link_state::path(&roots.state_dir, "owner/tool", Kind::Bin).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_snapshot_preserves_archive_regular_launcher() {
+        let dir = temp_dir("preserve-archive-launcher");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let public = roots.bin_dir.join("tool");
+        let install_root = roots.install_dir.join("owner/tool");
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::create_dir_all(&install_root).unwrap();
+        fs::create_dir_all(roots.state_dir.join("owner")).unwrap();
+        fs::write(&public, "user launcher").unwrap();
+        fs::write(install_root.join("tool"), "archive binary").unwrap();
+        fs::write(
+            github_release_install::archive_layout_path(&roots.install_dir, "owner/tool"),
+            "v1 archive\n",
+        )
+        .unwrap();
+        link_state::write(
+            &link_state::path(&roots.state_dir, "owner/tool", Kind::Bin),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.to_string_lossy(),
+            ),
+            bin_links: vec![public.clone()],
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::Proven,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: false,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+
+        assert_eq!(fs::read_to_string(&public).unwrap(), "user launcher");
+        assert!(!install_root.exists());
         assert!(!link_state::path(&roots.state_dir, "owner/tool", Kind::Bin).exists());
     }
 
@@ -770,6 +873,7 @@ mod tests {
             ),
             bin_links: vec![public.clone(), helper.clone()],
             extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -787,6 +891,65 @@ mod tests {
         assert_eq!(
             link_state::read(&link_state::path(&roots.state_dir, "owner/tool", Kind::Bin)).unwrap(),
             vec![public]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_to_archive_transition_preserves_root_behind_regular_launcher() {
+        let dir = temp_dir("archive-regular-launcher");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let install_root = roots.install_dir.join("owner/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::create_dir_all(roots.state_dir.join("owner")).unwrap();
+        fs::write(install_root.join("tool"), "archive binary").unwrap();
+        fs::write(
+            github_release_install::archive_layout_path(&roots.install_dir, "owner/tool"),
+            "v1 archive\n",
+        )
+        .unwrap();
+        fs::write(&public, "user launcher").unwrap();
+        link_state::write(
+            &link_state::path(&roots.state_dir, "owner/tool", Kind::Bin),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_root.to_string_lossy(),
+            ),
+            bin_links: Vec::new(),
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "github:release".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: false,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+
+        assert_eq!(fs::read_to_string(&public).unwrap(), "user launcher");
+        assert_eq!(
+            fs::read_to_string(install_root.join("tool")).unwrap(),
+            "archive binary"
         );
     }
 

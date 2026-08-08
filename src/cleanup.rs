@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::config;
+use crate::github_release_install::{self, ArchiveState};
 use crate::link_state::{self, Kind};
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::method;
@@ -103,9 +104,24 @@ pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
             remove_stamps(&roots.state_dir, &entry.name, &mut summary)?;
         }
         binary if method::is_binary_install_root(binary) => {
+            let public_bin = roots.bin_dir.join(&entry.cmd);
+            let preserve_public_launcher = if binary == method::GITHUB_RELEASE {
+                github_release_install::archive_state(
+                    &roots.state_dir,
+                    &roots.install_dir,
+                    &public_bin,
+                    &entry.name,
+                )? != ArchiveState::None
+                    && github_release_install::is_non_symlink(&public_bin)
+            } else {
+                false
+            };
+
             unlink_state(roots, &entry.name, Kind::Bin, &mut summary)?;
             unlink_state(roots, &entry.name, Kind::Extras, &mut summary)?;
-            remove_any(&roots.bin_dir.join(&entry.cmd), &mut summary)?;
+            if !preserve_public_launcher {
+                remove_any(&public_bin, &mut summary)?;
+            }
 
             let install_root = roots.install_dir.join(&entry.name);
             remove_any(&install_root, &mut summary)?;
@@ -289,6 +305,7 @@ mod tests {
         Roots, Summary, method_transitions, remove_builtin, remove_stamps, safe_managed_path,
     };
     use crate::config::Entry;
+    use crate::github_release_install;
     use crate::link_state::{self, Kind};
     use crate::manifest::{Manifest, ManifestEntry};
 
@@ -382,12 +399,18 @@ mod tests {
             .join("owner/binary-tool/bin/binary-helper");
         fs::create_dir_all(helper_target.parent().unwrap()).unwrap();
         fs::write(&helper_target, "#!/bin/sh\n").unwrap();
-        fixture.write_bin("binary-tool", "#!/bin/sh\n");
+        let tool_target = fixture
+            .roots
+            .install_dir
+            .join("owner/binary-tool/bin/binary-tool");
+        fs::write(&tool_target, "#!/bin/sh\n").unwrap();
+        fs::create_dir_all(fixture.roots.bin_dir.clone()).unwrap();
+        symlink(&tool_target, fixture.roots.bin_dir.join("binary-tool")).unwrap();
         fs::create_dir_all(helper.parent().unwrap()).unwrap();
         symlink(&helper_target, &helper).unwrap();
         link_state::write(
             &link_state::path(&fixture.roots.state_dir, "owner/binary-tool", Kind::Bin),
-            std::slice::from_ref(&helper),
+            &[fixture.roots.bin_dir.join("binary-tool"), helper.clone()],
         )
         .unwrap();
         fixture.write_install("owner/binary-tool/artifact", "data\n");
@@ -407,6 +430,59 @@ mod tests {
                 .roots
                 .state_dir
                 .join("owner/binary-tool.release.stamp")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_cleanup_preserves_regular_public_launcher() {
+        let fixture = Fixture::new("archive-launcher");
+        let entry = ManifestEntry::new(
+            "owner/archive-tool",
+            "github:release",
+            "archive-tool",
+            fixture.roots.bin_dir.join("archive-tool").to_string_lossy(),
+        );
+        let public = fixture.roots.bin_dir.join("archive-tool");
+        let helper = fixture.roots.bin_dir.join("archive-helper");
+        let helper_target = fixture
+            .roots
+            .install_dir
+            .join("owner/archive-tool/bin/archive-helper");
+        fs::create_dir_all(helper_target.parent().unwrap()).unwrap();
+        fs::write(&helper_target, "#!/bin/sh\n").unwrap();
+        fixture.write_bin("archive-tool", "#!/bin/sh\n# user launcher\n");
+        symlink(&helper_target, &helper).unwrap();
+        fs::write(
+            github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/archive-tool",
+            ),
+            "v1 archive\n",
+        )
+        .unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "owner/archive-tool", Kind::Bin),
+            std::slice::from_ref(&helper),
+        )
+        .unwrap();
+
+        remove_builtin(&entry, &fixture.roots).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "#!/bin/sh\n# user launcher\n"
+        );
+        assert!(!helper.exists());
+        assert!(
+            !link_state::path(&fixture.roots.state_dir, "owner/archive-tool", Kind::Bin).exists()
+        );
+        assert!(
+            !fixture
+                .roots
+                .install_dir
+                .join("owner/archive-tool")
                 .exists()
         );
     }

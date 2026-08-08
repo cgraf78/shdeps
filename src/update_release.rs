@@ -49,6 +49,9 @@ pub(crate) fn install_with_prefetch(
         client: context.client,
         options,
         prefetch,
+        prior_release: manifest::read(context.manifest_path)?
+            .get(&entry.name)
+            .is_some_and(|installed| installed.method == method::GITHUB_RELEASE),
     };
     let outcome = install_request(&request, &request_context)?;
     if !outcome.failed {
@@ -292,6 +295,7 @@ pub(crate) struct RequestContext<'a, R: Runner> {
     pub(crate) client: &'a dyn Client,
     pub(crate) options: Options,
     pub(crate) prefetch: &'a Prefetch,
+    pub(crate) prior_release: bool,
 }
 
 pub(crate) struct ReleaseOutcome {
@@ -312,6 +316,23 @@ pub(crate) fn install_request(
     context: &RequestContext<'_, impl Runner>,
 ) -> Result<ReleaseOutcome> {
     let stamp_path = stamp::remote_path(&context.roots.state_dir, request.name, "release");
+    // Marker repair precedes every fast return. Existing installs can therefore
+    // gain durable archive ownership without a download, while read-only
+    // commands remain side-effect free. The result is also the pre-install
+    // snapshot used to make archive/raw format changes fail closed.
+    let archive = if context.prior_release {
+        github_release_install::repair_archive_marker(
+            &context.roots.state_dir,
+            &context.roots.install_dir,
+            request.public_bin,
+            request.name,
+        )?
+    } else {
+        // A repo install uses the same root and symlink shape as a legacy
+        // release archive. Method-transition cleanup owns that old state; never
+        // write release markers into a checkout before the new method succeeds.
+        github_release_install::explicit_archive_state(&context.roots.install_dir, request.name)?
+    };
     if process::executable_path(request.public_bin)
         && (stamp::remote_fresh(&stamp_path, context.options.freshness())
             || checked_this_run(&stamp_path, context.options))
@@ -473,6 +494,26 @@ pub(crate) fn install_request(
     else {
         return Ok(failed("no matching release asset"));
     };
+    let Some(asset_kind) = crate::release_asset::install_kind(&selection.url) else {
+        return Ok(failed("release asset type is not implemented yet"));
+    };
+    let format_changed = (!is_archive(asset_kind)
+        && archive != github_release_install::ArchiveState::None)
+        || (is_archive(asset_kind)
+            && context.prior_release
+            && archive != github_release_install::ArchiveState::Proven
+            && github_release_install::path_entry_exists(request.public_bin)?);
+    if format_changed {
+        // Switching between archive and single-file releases is not a normal
+        // update: each layout owns different paths, and making the conversion
+        // crash-safe would require a durable multi-path transaction journal.
+        // Upstream release formats are normally stable, so fail before the
+        // download and require a manual layout migration rather than risk
+        // overwriting a launcher or stranding half-converted ownership state.
+        return Ok(failed(
+            "release asset format changed; manual layout migration is required",
+        ));
+    }
     let asset_token = github_token(&env, context);
     let bytes = match github::download_asset(
         context.client,
@@ -554,9 +595,6 @@ pub(crate) fn install_request(
             )));
         }
     }
-    let Some(asset_kind) = crate::release_asset::install_kind(&selection.url) else {
-        return Ok(failed("release asset type is not implemented yet"));
-    };
     match asset_kind {
         AssetKind::Plain => {
             github_release_install::install_plain_to(request.public_bin, &bytes)?;
@@ -682,6 +720,18 @@ fn clear_archive_bin_links(
         request.name,
         request.public_bin,
     );
+}
+
+fn is_archive(kind: AssetKind) -> bool {
+    matches!(
+        kind,
+        AssetKind::TarGz
+            | AssetKind::Tar
+            | AssetKind::TarBz2
+            | AssetKind::TarZst
+            | AssetKind::TarXz
+            | AssetKind::Zip
+    )
 }
 
 fn cached_releases(repo: &str, roots: &Roots, options: Options) -> Option<Vec<github::Release>> {

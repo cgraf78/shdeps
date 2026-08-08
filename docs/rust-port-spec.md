@@ -827,11 +827,16 @@ Behavior:
   explicitly reject unsafe archive paths before extraction. The Rust port MUST
   add safe extraction as an intentional security hardening, while preserving
   behavior for normal safe archives.
-- Current Bash writes or symlinks the selected release binary directly to the
-  requested public `bin_path`, so a pre-existing non-symlink file at that exact
-  path can be replaced. This differs from `_shdeps_link_bin` used by other
-  methods, which preserves regular files. Any Rust hardening here must be
-  deliberate and covered by migration/compatibility tests.
+- Archive assets use the same public-link ownership rule as other managed
+  install roots: replace a tracked symlink, but preserve an existing regular
+  launcher. Raw and compressed single-binary assets retain the Bash behavior
+  of replacing the requested public `bin_path`. Automatic transitions between
+  archive and single-binary layouts MUST fail closed: the layouts own different
+  paths, and safe conversion would require a durable multi-path transaction.
+  Compatibility tests MUST keep both sides explicit.
+- Archive roots reserve `.shdeps-release-layout` for ownership metadata. An
+  upstream archive containing that path MUST be rejected rather than having
+  payload data overwritten or later mistaken for shdeps-owned state.
 - Extras are discovered and linked from extracted installs.
 
 ### `cargo`
@@ -898,7 +903,7 @@ shdeps MUST centralize ownership decisions. This table is normative:
 | TTL/rev stamps | yes | remove on prune/method transition |
 | symlink recorded in `.binlinks` | yes | remove on relink/prune/transition |
 | symlink recorded in `.links` | yes | remove on relink/prune/transition |
-| regular file in `$SHDEPS_BIN_DIR` not created as symlink | no for link helpers; current `github:release` is an exception | preserve for `_shdeps_link_bin`/repo/external method linking; current `github:release` may replace the requested `bin_path` |
+| regular file in `$SHDEPS_BIN_DIR` not created as symlink | no for link helpers and archive release installs; raw/compressed-single `github:release` is an exception | preserve for symlink-based installs; a raw/compressed-single release may replace the requested `bin_path` |
 | `github:repo` install symlink to local dev clone | symlink yes, target no | remove symlink only |
 | local dev clone under `$SHDEPS_GIT_DEV_DIR` | no | never remove |
 | install dir under `$SHDEPS_INSTALL_DIR/<name>` | yes for non-local managed methods | remove on prune/transition |
@@ -907,10 +912,10 @@ shdeps MUST centralize ownership decisions. This table is normative:
 | shdeps release-installed binary/wrapper/extras | yes | self-update/uninstall may replace/remove |
 
 When ownership is ambiguous, shdeps SHOULD preserve files and warn rather than
-delete. The current `github:release` public binary write path is the main known
-exception, and any Rust-era behavior change there needs an explicit
-compatibility test because a caller may currently rely on reinstall replacing a
-stale binary at `$SHDEPS_BIN_DIR/<cmd>`.
+delete. The raw/compressed-single `github:release` public binary write path is
+the main known exception, and any behavior change there needs an explicit
+compatibility test because a caller may rely on reinstall replacing a stale
+binary at `$SHDEPS_BIN_DIR/<cmd>`.
 
 ## Method Transitions
 
@@ -1213,6 +1218,15 @@ functions and hook preludes:
   source hooks, or touch the network. MUST be backwards-compatible: a
   wrapper from an older shdeps version MUST get a parseable response from
   any future binary.
+- `capability <name>` — returns a machine-clean predicate status for one
+  orchestrator-facing behavioral contract without tying callers to a release
+  tag.
+- `adopt-release-archive-launcher <name> <cmd>` — explicitly resolves a
+  pre-marker archive whose Shdeps-created public symlink was replaced by a
+  regular consumer-owned launcher. It requires a matching `github:release`
+  manifest plus either the exact legacy bin-link ledger entry or a live tracked
+  secondary link, and is serialized by the normal Shdeps state lock. Historical
+  link evidence is trusted only through this explicit migration command.
 - `env-snapshot` — prints all wrapper-cacheable RuntimeEnv values
   (`install_dir`, `bin_dir`, `git_dev_dir`, `platform`, `pkg_mgr`,
   `force`, `reinstall`, `abi`) in a single subprocess call to amortize
