@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091
+# shellcheck disable=SC1090,SC1091
 # End-to-end shell coverage for install.sh and bootstrap behavior. The Rust
 # suite owns shdeps behavior; this file protects the still-shell installer.
+# Runtime-selected installer copies are the behavior under test, so ShellCheck
+# cannot resolve every sourced path statically.
 
 set -uo pipefail
 
@@ -235,6 +237,8 @@ echo "=== install.sh source installs ==="
 
 _install_script="$SHDEPS_DIR/install.sh"
 _source_repo="$SHDEPS_DIR"
+_lua_api_link=$(_tmpdir)/lib/shdeps
+export SHDEPS_LUA_DIR="$_lua_api_link"
 _build_bin=$(_mock_bin)
 _fake_shdeps="$_build_bin/shdeps-built"
 _write_fake_shdeps "$_fake_shdeps" "20990203-040506-abc12345"
@@ -252,6 +256,9 @@ PATH="$_build_bin:$PATH" \
 _assert_dir_exists "install source: clone dir created" "$_inst_dir"
 _assert_file_exists "install source: wrapper present" "$_inst_dir/shdeps.sh"
 _assert_symlink "install source: CLI symlinked" "$_inst_bin/shdeps"
+_assert_symlink "install source: stable Lua API linked" "$_lua_api_link"
+_assert_eq "install source: Lua API link selects source install" \
+  "$(_physical_dir "$_inst_dir/lua")" "$(readlink "$_lua_api_link")"
 _assert_contains "install source: cargo build ran locked" \
   "cargo build --release --locked" "$(cat "$_cargo_log")"
 
@@ -283,6 +290,8 @@ _assert_exit "install source: existing non-git dir exits 1" 1 "$rc"
 SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
   "$_install_script" --uninstall >/dev/null 2>&1
 _assert_file_missing "install source: uninstall removes symlink" "$_inst_bin/shdeps"
+_assert_not_exists "install source: uninstall removes stable Lua API link" \
+  "$_lua_api_link"
 _assert_dir_missing "install source: uninstall removes clone" "$_inst_dir"
 
 _uninstall_out=$(SHDEPS_DIR="$_inst_dir" SHDEPS_BIN="$_inst_bin/shdeps" \
@@ -323,6 +332,9 @@ else
   _assert_file_exists "install release: metadata installed" \
     "$_release_inst/.shdeps-install.json"
   _assert_symlink "install release: CLI symlinked" "$_release_bin_dir/shdeps"
+  _assert_symlink "install release: stable Lua API linked" "$_lua_api_link"
+  _assert_eq "install release: Lua API link selects release install" \
+    "$(_physical_dir "$_release_inst/lua")" "$(readlink "$_lua_api_link")"
   _assert_eq "install release: CLI points at release binary" \
     "$_release_inst/shdeps" "$(readlink "$_release_bin_dir/shdeps")"
   _assert_contains "install release: token sent to metadata" \
@@ -339,6 +351,46 @@ else
     "$_release_install_script" >/dev/null 2>&1
   _assert_eq "install release: replacement updates binary" \
     "shdeps $_updated_tag" "$("$_release_bin_dir/shdeps" version)"
+
+  echo "=== install.sh Lua API activation transitions ==="
+
+  _dev_parent=$(_tmpdir)/dev
+  _dev_checkout="$_dev_parent/shdeps"
+  _dev_release_inst=$(_tmpdir)/dev-stale-release
+  _dev_bin=$(_tmpdir)/dev-bin
+  _dev_home=$(_tmpdir)/dev-home
+  mkdir -p "$_dev_parent" "$_dev_release_inst" "$_dev_bin" "$_dev_home"
+  git clone --quiet "$_source_repo" "$_dev_checkout"
+  cp -R "$_updated_payload/." "$_dev_release_inst/"
+
+  (
+    unset SHDEPS_LIB SHDEPS_FORCE
+    HOME="$_dev_home" PATH="$_build_bin:$PATH" \
+      SHDEPS_TEST_FAKE_SHDEPS="$_fake_shdeps" \
+      SHDEPS_GIT_DEV_DIR="$_dev_parent" \
+      SHDEPS_DIR="$_dev_release_inst" SHDEPS_BIN="$_dev_bin/shdeps" \
+      SHDEPS_LUA_DIR="$_lua_api_link" \
+      . "$_install_script" --bootstrap
+  ) >/dev/null 2>&1
+  _assert_eq "Lua API transition: developer checkout becomes active" \
+    "$(_physical_dir "$_dev_checkout/lua")" "$(readlink "$_lua_api_link")"
+  _assert_dir_missing "Lua API transition: stale release is removed after retarget" \
+    "$_dev_release_inst"
+
+  _transition_release_inst=$(_tmpdir)/transition-release
+  _transition_release_bin=$(_tmpdir)/transition-release-bin
+  mkdir -p "$_transition_release_bin"
+  PATH="$_release_fakebin:$PATH" \
+    SHDEPS_TEST_RELEASE_DIR="$_release_dir" \
+    SHDEPS_TEST_RELEASE_TAG="$_updated_tag" \
+    SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest" \
+    SHDEPS_DIR="$_transition_release_inst" \
+    SHDEPS_BIN="$_transition_release_bin/shdeps" \
+    SHDEPS_LUA_DIR="$_lua_api_link" \
+    "$_release_install_script" >/dev/null 2>&1
+  _assert_eq "Lua API transition: release install can become active again" \
+    "$(_physical_dir "$_transition_release_inst/lua")" \
+    "$(readlink "$_lua_api_link")"
 
   _bad_release_dir=$(_tmpdir)/bad-release
   cp "$_release_dir/shdeps-${_updated_tag}-${_platform}.tar.gz" "$_bad_release_dir.tar.gz"

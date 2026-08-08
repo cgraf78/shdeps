@@ -11,6 +11,7 @@
 #   SHDEPS_REPO         Git repo URL for source/dev mode
 #                       (default: https://github.com/cgraf78/shdeps.git)
 #   SHDEPS_BIN          CLI symlink path       (default: ~/.local/bin/shdeps)
+#   SHDEPS_LUA_DIR      Stable Lua API link     (default: ~/.local/lib/shdeps)
 #   SHDEPS_LIB          Direct path to shdeps.sh for explicit/dev bootstrap use
 #   SHDEPS_GIT_DEV_DIR  Dev clone directory    (default: ~/git)
 
@@ -26,6 +27,7 @@ _SHDEPS_DEFAULT_REPO="https://github.com/cgraf78/shdeps.git"
 SHDEPS_DIR="${SHDEPS_DIR:-$HOME/.local/share/shdeps}"
 SHDEPS_REPO="${SHDEPS_REPO:-$_SHDEPS_DEFAULT_REPO}"
 SHDEPS_BIN="${SHDEPS_BIN:-$HOME/.local/bin/shdeps}"
+SHDEPS_LUA_DIR="${SHDEPS_LUA_DIR:-$HOME/.local/lib/shdeps}"
 _SHDEPS_INSTALL_PROPAGATION_MESSAGE=""
 
 # ---------------------------------------------------------------------------
@@ -1979,10 +1981,43 @@ _bootstrap_self_update() {
   fi
 }
 
-# Symlink CLI into PATH and link man page + shell completions.
+# Publish one stable Lua tree regardless of whether the active implementation
+# is a release install, a source install, or a developer checkout. Consumers
+# should not need to reproduce install-selection policy merely to find
+# `shdeps/bootstrap.lua`, and this link cannot live below SHDEPS_DIR because a
+# developer checkout intentionally removes a stale release tree at that path.
+_setup_lua_api_link() {
+  local shdeps_dir="$1" lua_tree=""
+
+  lua_tree=$(cd -P -- "$shdeps_dir/lua" 2>/dev/null && pwd) || {
+    _error "$shdeps_dir is missing the shdeps Lua API tree"
+    return 1
+  }
+  if [[ ! -f "$lua_tree/shdeps.lua" || ! -f "$lua_tree/shdeps/bootstrap.lua" ]]; then
+    _error "$lua_tree is missing the shdeps Lua API entrypoints"
+    return 1
+  fi
+
+  # SHDEPS_LUA_DIR is an installer-owned public link, not an install root.
+  # Replace links so activation can retarget between valid implementations,
+  # but never turn a caller's real file or directory into managed state.
+  if [[ -e "$SHDEPS_LUA_DIR" && ! -L "$SHDEPS_LUA_DIR" ]]; then
+    _error "$SHDEPS_LUA_DIR exists and is not a symlink; refusing to replace it"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$SHDEPS_LUA_DIR")" || return 1
+  ln -sfn "$lua_tree" "$SHDEPS_LUA_DIR"
+}
+
+# Symlink the Lua API and CLI, then link man pages + shell completions.
 _setup_links() {
   local shdeps_dir="$1"
   local cli=""
+
+  # Link the provider-owned API first. If a user-owned path blocks it, fail
+  # before changing the CLI and extras so activation has one clear outcome.
+  _setup_lua_api_link "$shdeps_dir" || return 1
 
   if [[ -x "$shdeps_dir/shdeps" ]]; then
     cli="$shdeps_dir/shdeps"
@@ -2124,13 +2159,14 @@ _bootstrap() {
   # Bind it to the effective inputs because sourced callers can bootstrap more
   # than one isolated install in the same shell, and SHDEPS_FORCE must remain a
   # real request even after a normal bootstrap completed.
-  printf -v _bs_ready_key '%q %q %q %q %q %q %q %q %q %q' \
+  printf -v _bs_ready_key '%q %q %q %q %q %q %q %q %q %q %q' \
     "$SHDEPS_DIR" "$SHDEPS_BIN" "$SHDEPS_REPO" "${SHDEPS_LIB:-}" \
     "${SHDEPS_GIT_DEV_DIR:-$HOME/git}" "${SHDEPS_FORCE:-0}" \
     "${SHDEPS_RELEASE_API_URL:-}" \
     "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}" \
     "${SHDEPS_BIN_DIR:-$HOME/.local/bin}" \
-    "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}"
+    "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}" \
+    "$SHDEPS_LUA_DIR"
   [[ "${_SHDEPS_BOOTSTRAP_READY_KEY:-}" == "$_bs_ready_key" ]] && return 0
 
   # Find shdeps.sh: installed-tree env hint → env override → dev clone →
@@ -2275,6 +2311,14 @@ _uninstall() {
       ((removed++)) || true
     else
       _error "failed to remove CLI symlink at $SHDEPS_BIN"
+      failed=1
+    fi
+  fi
+  if [[ -L "$SHDEPS_LUA_DIR" ]]; then
+    if rm "$SHDEPS_LUA_DIR"; then
+      ((removed++)) || true
+    else
+      _error "failed to remove Lua API symlink at $SHDEPS_LUA_DIR"
       failed=1
     fi
   fi
