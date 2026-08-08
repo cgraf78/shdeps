@@ -429,7 +429,8 @@ _assert_symlink "bootstrap release wrapper: CLI linked" "$_bootstrap_bin"
 _assert_eq "bootstrap release wrapper: CLI points at sibling binary" "$_bootstrap_release/shdeps" "$(readlink "$_bootstrap_bin")"
 _assert_symlink "bootstrap release wrapper: stable Lua API linked" "$_bootstrap_lua_dir"
 _assert_eq "bootstrap release wrapper: Lua API points at release tree" \
-  "$_bootstrap_release/lua" "$(readlink "$_bootstrap_lua_dir")"
+  "$(_physical_dir "$_bootstrap_release/lua")" \
+  "$(readlink "$_bootstrap_lua_dir")"
 _assert_symlink "bootstrap release wrapper: man page linked through public helper" "$_bootstrap_share/man/man1/shdeps.1"
 
 echo ""

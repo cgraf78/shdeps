@@ -30,6 +30,13 @@ _repo_root=$(cd -P -- "$_test_dir/../.." && pwd)
 _pass_count=0
 _fail_count=0
 
+# The installer deliberately links to a physical Lua tree. Keep expected paths
+# under the same canonicalization policy, including macOS's /var -> /private/var
+# alias and the explicit symlink-parent fixture below.
+_physical_dir() {
+  (cd -P -- "$1" && pwd)
+}
+
 _pass() {
   printf '  PASS: %s\n' "$*"
   _pass_count=$((_pass_count + 1))
@@ -314,8 +321,14 @@ _assert_eq "bootstrap activation: failure is retried before readiness" \
 echo "=== install.sh: Lua API link ownership ==="
 
 _lua_link_root="$_fixture_dir/lua-link"
-_lua_source_one="$_fixture_dir/lua-source-one"
-_lua_source_two="$_fixture_dir/lua-source-two"
+_lua_physical_root="$_fixture_dir/lua-physical-root"
+_lua_alias_root="$_fixture_dir/lua-alias-root"
+mkdir -p "$_lua_physical_root"
+ln -s "$_lua_physical_root" "$_lua_alias_root"
+# Use a symlinked parent even on Linux so the physical-target contract and the
+# macOS path spelling that exposed it remain covered on every platform.
+_lua_source_one="$_lua_alias_root/lua-source-one"
+_lua_source_two="$_lua_alias_root/lua-source-two"
 mkdir -p \
   "$_lua_source_one/lua/shdeps" \
   "$_lua_source_two/lua/shdeps"
@@ -330,11 +343,11 @@ _setup_links "$_lua_source_one"
 _assert_true "Lua API link: activation creates the stable link" \
   test -L "$_lua_link_root"
 _assert_eq "Lua API link: stable link selects the active Lua tree" \
-  "$_lua_source_one/lua" "$(readlink "$_lua_link_root")"
+  "$(_physical_dir "$_lua_source_one/lua")" "$(readlink "$_lua_link_root")"
 
 _setup_links "$_lua_source_two"
 _assert_eq "Lua API link: later activation retargets the managed link" \
-  "$_lua_source_two/lua" "$(readlink "$_lua_link_root")"
+  "$(_physical_dir "$_lua_source_two/lua")" "$(readlink "$_lua_link_root")"
 
 rm -f "$_lua_link_root"
 mkdir -p "$_lua_link_root"

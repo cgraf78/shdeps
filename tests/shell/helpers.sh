@@ -14,6 +14,14 @@ PASS=0
 FAIL=0
 _SHDEPS_TEST_TMP_ROOT=$(mktemp -d) || exit 1
 
+# install.sh publishes the physical Lua tree so a stable link never depends on
+# an intermediate directory symlink. macOS commonly exposes this distinction:
+# mktemp spells paths as /var/..., while `cd -P` resolves them to /private/var/....
+# Compare physical directory names in tests that inspect the link target.
+_physical_dir() {
+  (cd -P -- "$1" && pwd)
+}
+
 # ---------------------------------------------------------------------------
 # Assertions
 # ---------------------------------------------------------------------------

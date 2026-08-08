@@ -26,6 +26,12 @@ _script_dir() {
   cd -P -- "$dir" && pwd
 }
 
+# install.sh publishes a physical target. This matters on macOS, where mktemp
+# commonly returns /var/... while `cd -P` names the same tree /private/var/....
+_physical_dir() {
+  (cd -P -- "$1" && pwd)
+}
+
 _sha256_line() {
   local file="$1" name="$2"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -177,7 +183,7 @@ PATH="$_fakebin:$PATH" \
 [[ -f "$_install_dir/.shdeps-install.json" ]] || _die "install metadata was not installed"
 [[ -L "$_bin_dir/shdeps" ]] || _die "CLI symlink was not created"
 [[ -L "$_lua_dir" ]] || _die "Lua API symlink was not created"
-[[ "$(readlink "$_lua_dir")" == "$_install_dir/lua" ]] ||
+[[ "$(readlink "$_lua_dir")" == "$(_physical_dir "$_install_dir/lua")" ]] ||
   _die "Lua API symlink did not select the release tree"
 
 _version=$("$_bin_dir/shdeps" version)

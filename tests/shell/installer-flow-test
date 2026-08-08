@@ -258,7 +258,7 @@ _assert_file_exists "install source: wrapper present" "$_inst_dir/shdeps.sh"
 _assert_symlink "install source: CLI symlinked" "$_inst_bin/shdeps"
 _assert_symlink "install source: stable Lua API linked" "$_lua_api_link"
 _assert_eq "install source: Lua API link selects source install" \
-  "$_inst_dir/lua" "$(readlink "$_lua_api_link")"
+  "$(_physical_dir "$_inst_dir/lua")" "$(readlink "$_lua_api_link")"
 _assert_contains "install source: cargo build ran locked" \
   "cargo build --release --locked" "$(cat "$_cargo_log")"
 
@@ -334,7 +334,7 @@ else
   _assert_symlink "install release: CLI symlinked" "$_release_bin_dir/shdeps"
   _assert_symlink "install release: stable Lua API linked" "$_lua_api_link"
   _assert_eq "install release: Lua API link selects release install" \
-    "$_release_inst/lua" "$(readlink "$_lua_api_link")"
+    "$(_physical_dir "$_release_inst/lua")" "$(readlink "$_lua_api_link")"
   _assert_eq "install release: CLI points at release binary" \
     "$_release_inst/shdeps" "$(readlink "$_release_bin_dir/shdeps")"
   _assert_contains "install release: token sent to metadata" \
@@ -373,7 +373,7 @@ else
       . "$_install_script" --bootstrap
   ) >/dev/null 2>&1
   _assert_eq "Lua API transition: developer checkout becomes active" \
-    "$_dev_checkout/lua" "$(readlink "$_lua_api_link")"
+    "$(_physical_dir "$_dev_checkout/lua")" "$(readlink "$_lua_api_link")"
   _assert_dir_missing "Lua API transition: stale release is removed after retarget" \
     "$_dev_release_inst"
 
@@ -389,7 +389,8 @@ else
     SHDEPS_LUA_DIR="$_lua_api_link" \
     "$_release_install_script" >/dev/null 2>&1
   _assert_eq "Lua API transition: release install can become active again" \
-    "$_transition_release_inst/lua" "$(readlink "$_lua_api_link")"
+    "$(_physical_dir "$_transition_release_inst/lua")" \
+    "$(readlink "$_lua_api_link")"
 
   _bad_release_dir=$(_tmpdir)/bad-release
   cp "$_release_dir/shdeps-${_updated_tag}-${_platform}.tar.gz" "$_bad_release_dir.tar.gz"
