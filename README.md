@@ -221,7 +221,7 @@ The `owner/repo` is the `name` field. Override the repo URL with `SHDEPS_<NAME>_
 
 ### `github:release` — GitHub Release Binaries
 
-Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries. Archive-style releases install into a shdeps-owned root under `$SHDEPS_INSTALL_DIR/<owner>/<repo>` so bundled assets can be linked. Raw and compressed single-binary releases install directly to `$SHDEPS_BIN_DIR/<cmd>`, preserving the historical Bash behavior for this method.
+Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries. Archive-style releases install into a shdeps-owned root under `$SHDEPS_INSTALL_DIR/<owner>/<repo>` so bundled assets can be linked; their public symlink preserves an existing regular launcher. Raw and compressed single-binary releases install directly to `$SHDEPS_BIN_DIR/<cmd>` and preserve the historical Bash replacement behavior. If an upstream changes between archive and single-binary packaging, shdeps fails closed and requires a manual layout migration because the two layouts own different paths.
 
 ```text
 neovim/neovim    github:release    nvim

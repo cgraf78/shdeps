@@ -249,11 +249,17 @@ mod tests {
     use crate::runtime::Roots;
 
     #[test]
+    #[cfg(unix)]
     fn prune_removes_orphan_manifest_and_owned_artifacts() {
+        use std::os::unix::fs::symlink;
+
         let fixture = Fixture::new("remove-orphan");
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let bin = fixture.roots.bin_dir.join("tool");
-        fixture.write(&bin, "#!/bin/sh\n");
+        let archive_bin = fixture.roots.install_dir.join("owner/tool/bin/tool");
+        fixture.write(&archive_bin, "#!/bin/sh\n");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        symlink(&archive_bin, &bin).unwrap();
         fixture.write(
             &fixture.roots.install_dir.join("owner/tool/artifact"),
             "artifact\n",

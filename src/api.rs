@@ -18,6 +18,7 @@ use crate::dep_links;
 use crate::dep_path;
 use crate::errors::Error;
 use crate::extras;
+use crate::github_release_install;
 use crate::hook_toolkit::{self, RuntimeQuery, WrapperSpec};
 use crate::http::Curl;
 use crate::link_state::{self, Kind};
@@ -28,6 +29,8 @@ use crate::process::{self, Process, Runner};
 use crate::runtime::{self, Overrides, ProcessEnv};
 use crate::update::Options;
 use crate::update_release::{self, ReleaseRequest};
+
+const RELEASE_ARCHIVE_LAUNCHER_CAPABILITY: &str = "release-archive-launcher-preservation-v1";
 
 /// Runs one hidden bridge command.
 pub fn run<W, E>(
@@ -49,6 +52,54 @@ where
     let env = runtime::runtime_env(&ProcessEnv);
 
     match command {
+        "capability" => {
+            let [capability] = rest else {
+                writeln!(stderr, "error: __api capability requires exactly one name")?;
+                return Ok(2);
+            };
+            // Capability probes let an orchestrator require one behavioral
+            // contract without coupling itself to release tags or bumping the
+            // wrapper ABI. Unknown names are a clean predicate miss so old and
+            // new callers can negotiate independently.
+            Ok(if capability == RELEASE_ARCHIVE_LAUNCHER_CAPABILITY {
+                0
+            } else {
+                1
+            })
+        }
+        "adopt-release-archive-launcher" => {
+            let [name, cmd] = rest else {
+                writeln!(
+                    stderr,
+                    "error: __api adopt-release-archive-launcher requires a dependency name and command"
+                )?;
+                return Ok(2);
+            };
+            if !config::valid_dep_name(name) || !config::valid_cmd_basename(cmd) {
+                writeln!(
+                    stderr,
+                    "error: invalid adopt-release-archive-launcher arguments"
+                )?;
+                return Ok(2);
+            }
+            // This bridge is intentionally explicit rather than part of normal
+            // archive detection. A stale bin-link ledger can also come from an
+            // interrupted archive-to-raw conversion; only the owner replacing
+            // the public path knows that the regular file is now a launcher.
+            Ok(
+                if github_release_install::adopt_legacy_archive_launcher(
+                    &roots.state_dir,
+                    &roots.install_dir,
+                    &roots.bin_dir.join(cmd),
+                    name,
+                    cmd,
+                )? {
+                    0
+                } else {
+                    1
+                },
+            )
+        }
         "version" => {
             // This is wrapper-binary ABI, not the shdeps git commit version.
             // Keep it tiny and config-free so old wrappers can negotiate with
@@ -379,6 +430,9 @@ where
         client: &Curl,
         options,
         prefetch: &prefetch,
+        prior_release: crate::manifest::read(&crate::manifest::path(&roots.state_dir))?
+            .get(&name)
+            .is_some_and(|installed| installed.method == method::GITHUB_RELEASE),
     };
     let outcome = update_release::install_request(&request, &request_context)?;
 

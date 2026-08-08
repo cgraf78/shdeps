@@ -1534,8 +1534,10 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         fs::write(local_clone.join("share/man/man1/ds.1"), "new man").unwrap();
 
         let old_install = fixture.roots.install_dir.join("cgraf78/ds");
+        let old_public = fixture.roots.bin_dir.join("ds");
         write_executable(&old_install.join("bin/ds"));
-        write_executable(&fixture.roots.bin_dir.join("ds"));
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        symlink(old_install.join("bin/ds"), &old_public).unwrap();
         let old_extra = fixture.roots.install_dir.join("man/man1/old-ds.1");
         fs::create_dir_all(old_extra.parent().unwrap()).unwrap();
         symlink(old_install.join("share/man/man1/old-ds.1"), &old_extra).unwrap();
@@ -1602,12 +1604,17 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
     }
 
     #[test]
+    #[cfg(unix)]
     fn update_pkg_transition_cleans_old_builtin_artifacts_without_uninstalling_package() {
+        use std::os::unix::fs::symlink;
+
         let fixture = Fixture::new("transition-pkg");
         fixture.write_lib();
         let old_install = fixture.roots.install_dir.join("tool");
+        let old_public = fixture.roots.bin_dir.join("tool");
         write_executable(&old_install.join("bin/tool"));
-        write_executable(&fixture.roots.bin_dir.join("tool"));
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        symlink(old_install.join("bin/tool"), &old_public).unwrap();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         manifest::upsert(
             &manifest_path,
@@ -2944,7 +2951,7 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
-    fn update_github_release_plain_asset_clears_stale_archive_binlinks() {
+    fn update_github_release_plain_asset_refuses_archive_format_change() {
         use std::os::unix::fs::symlink;
 
         let mut fixture = Fixture::new("release-plain-clears-archive-binlinks");
@@ -2962,8 +2969,7 @@ version() { printf 'saw-pkg\n'; }
                     }]
                 }]"#
                 .to_vec(),
-            )
-            .with("https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64", b"plain-v2".to_vec());
+            );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let old_install = fixture.roots.install_dir.join("owner/tool");
         let old_tool = old_install.join("bin/tool");
@@ -3003,10 +3009,10 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
-        assert_eq!(fs::read(&bin_path).unwrap(), b"plain-v2");
-        assert!(!helper_path.exists());
-        assert!(!link_state::path(&fixture.roots.state_dir, "owner/tool", Kind::Bin).exists());
+        assert!(summary.has_errors());
+        assert_eq!(fs::read_link(&bin_path).unwrap(), old_tool);
+        assert_eq!(fs::read_link(&helper_path).unwrap(), old_helper);
+        assert!(link_state::path(&fixture.roots.state_dir, "owner/tool", Kind::Bin).exists());
     }
 
     #[test]
@@ -5110,6 +5116,326 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
+    fn update_github_release_warm_path_does_not_infer_archive_from_secondary_link() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("release-marker-backfill");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        let man_source = install_dir.join("share/man/man1/tool.1");
+        let man_link = fixture.roots.install_dir.join("man/man1/tool.1");
+        write_executable(&install_dir.join("bin/tool"));
+        write_executable(&public);
+        fs::create_dir_all(man_source.parent().unwrap()).unwrap();
+        fs::create_dir_all(man_link.parent().unwrap()).unwrap();
+        fs::write(&man_source, "manual").unwrap();
+        symlink(&man_source, &man_link).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "owner/tool", Kind::Extras),
+            std::slice::from_ref(&man_link),
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release"),
+            1_700_000_000,
+        )
+        .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_100,
+                remote_ttl: 3600,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert!(!public.is_symlink());
+        assert!(
+            !crate::github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/tool"
+            )
+            .exists(),
+            "a secondary link cannot distinguish a launcher from a raw release"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_refuses_raw_to_archive_format_change() {
+        let mut fixture = Fixture::new("release-raw-to-archive");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&public);
+        fs::write(&public, "#!/bin/sh\nprintf raw-v1\\n\n").unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let url = "https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64.tar.gz";
+        fixture.client = FakeClient::default().with(
+            "https://api.github.com/repos/owner/tool/releases?per_page=100",
+            release_asset_response("tool-linux-x86_64.tar.gz", "v2.0.0", url),
+        );
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.0.0\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+        let installed = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "#!/bin/sh\nprintf raw-v1\\n\n"
+        );
+        assert!(!fixture.roots.install_dir.join("owner/tool").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_does_not_replace_unowned_symlink_during_format_change() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = Fixture::new("release-symlink-to-archive");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let external = fixture.roots.home.join("user-tool");
+        write_executable(&external);
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&external, &public).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let url = "https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64.tar.gz";
+        fixture.client = FakeClient::default().with(
+            "https://api.github.com/repos/owner/tool/releases?per_page=100",
+            release_asset_response("tool-linux-x86_64.tar.gz", "v2.0.0", url),
+        );
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.0.0\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+        let installed = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(fs::read_link(public).unwrap(), external);
+        assert!(!fixture.roots.install_dir.join("owner/tool").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_refuses_raw_asset_over_archive_launcher() {
+        let mut fixture = Fixture::new("release-archive-launcher-to-raw");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&install_dir.join("bin/tool"));
+        fs::write(
+            crate::github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/tool",
+            ),
+            "v1 archive\n",
+        )
+        .unwrap();
+        write_executable(&public);
+        fs::write(&public, "#!/bin/sh\nexec archive-core \"$@\"\n").unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let url = "https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64";
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                release_response("tool", "v2.0.0", url),
+            )
+            .with(url, b"raw-v2".to_vec());
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.0.0\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+        let installed = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "#!/bin/sh\nexec archive-core \"$@\"\n"
+        );
+        assert!(install_dir.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_without_manifest_does_not_convert_marked_archive() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = Fixture::new("release-crash-before-manifest");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        let archive_tool = install_dir.join("bin/tool");
+        write_executable(&archive_tool);
+        fs::write(
+            crate::github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/tool",
+            ),
+            "v1 archive\n",
+        )
+        .unwrap();
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&archive_tool, &public).unwrap();
+        let url = "https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64";
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                release_response("tool", "v2.0.0", url),
+            )
+            .with(url, b"raw-v2".to_vec());
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.0.0\n")
+            .with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(fs::read_link(&public).unwrap(), archive_tool);
+        assert!(install_dir.exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_to_release_failure_does_not_mark_checkout_as_archive() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("repo-to-release-marker-failure");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let checkout = fixture.roots.install_dir.join("owner/tool");
+        let checkout_tool = checkout.join("bin/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&checkout_tool);
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&checkout_tool, &public).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                checkout.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert!(!checkout.join(".shdeps-release-layout").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            installed.get("owner/tool")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_github_release_installs_tar_archive_and_links_extras() {
         let mut fixture = Fixture::new("release-tar");
         fixture.write_lib();
@@ -6963,13 +7289,17 @@ version() { printf 'saw-pkg\n'; }
         // repeated GitHub JSON. The asset name still includes the command and
         // target platform because the selector's matching rules are part of
         // the behavior those tests are exercising.
+        release_asset_response(&format!("{cmd}-linux-x86_64"), tag, url)
+    }
+
+    fn release_asset_response(asset: &str, tag: &str, url: &str) -> Vec<u8> {
         format!(
             r#"[{{
                 "tag_name":"{tag}",
                 "draft":false,
                 "prerelease":false,
                 "assets":[{{
-                    "name":"{cmd}-linux-x86_64",
+                    "name":"{asset}",
                     "browser_download_url":"{url}"
                 }}]
             }}]"#
