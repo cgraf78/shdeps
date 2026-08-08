@@ -72,7 +72,13 @@ _fakebin="$_tmp_root/bin"
 _installer_dir="$_tmp_root/installer"
 _install_dir="$_tmp_root/install/shdeps"
 _bin_dir="$_tmp_root/out-bin"
-mkdir -p "$_release_dir" "$_payload" "$_fakebin" "$_installer_dir" "$_bin_dir"
+_lua_dir="$_tmp_root/out-lib/shdeps"
+mkdir -p \
+  "$_release_dir" \
+  "$_payload/lua/shdeps" \
+  "$_fakebin" \
+  "$_installer_dir" \
+  "$_bin_dir"
 
 cat >"$_payload/shdeps" <<'SH'
 #!/usr/bin/env bash
@@ -96,6 +102,9 @@ cp "$_repo_dir/install.sh" "$_payload/install.sh"
 cp "$_repo_dir/install.sh" "$_installer_dir/install.sh"
 cp "$_repo_dir/README.md" "$_payload/README.md"
 cp "$_repo_dir/LICENSE" "$_payload/LICENSE"
+cp "$_repo_dir/lua/shdeps.lua" "$_payload/lua/shdeps.lua"
+cp "$_repo_dir/lua/shdeps/core.lua" "$_payload/lua/shdeps/core.lua"
+cp "$_repo_dir/lua/shdeps/bootstrap.lua" "$_payload/lua/shdeps/bootstrap.lua"
 cat >"$_payload/.shdeps-install.json" <<JSON
 {"schema":1,"method":"release","artifact_platform":"$_platform","version":"$_tag","tag":"$_tag","commit":"abc123456789","repo":"cgraf78/shdeps"}
 JSON
@@ -161,11 +170,15 @@ PATH="$_fakebin:$PATH" \
   SHDEPS_RELEASE_API_URL="fixture://latest" \
   SHDEPS_DIR="$_install_dir" \
   SHDEPS_BIN="$_bin_dir/shdeps" \
+  SHDEPS_LUA_DIR="$_lua_dir" \
   "$_installer_dir/install.sh" >/dev/null
 
 [[ -x "$_install_dir/shdeps" ]] || _die "release binary was not installed"
 [[ -f "$_install_dir/.shdeps-install.json" ]] || _die "install metadata was not installed"
 [[ -L "$_bin_dir/shdeps" ]] || _die "CLI symlink was not created"
+[[ -L "$_lua_dir" ]] || _die "Lua API symlink was not created"
+[[ "$(readlink "$_lua_dir")" == "$_install_dir/lua" ]] ||
+  _die "Lua API symlink did not select the release tree"
 
 _version=$("$_bin_dir/shdeps" version)
 [[ "$_version" == "shdeps 20990203-040506-abc12345" ]] || _die "unexpected version output: $_version"
@@ -223,6 +236,7 @@ chmod +x "$_signal_bin/mv"
   # to this smoke's fixture before any helper can touch a real user install.
   export SHDEPS_DIR="$_install_dir"
   export SHDEPS_BIN="$_bin_dir/shdeps"
+  export SHDEPS_LUA_DIR="$_lua_dir"
   PATH="$_signal_bin:$PATH"
   SHDEPS_TEST_LIVE="$_install_dir"
   SHDEPS_TEST_REAL_MV="$_real_mv"
@@ -309,6 +323,7 @@ chmod +x "$_child_bin/cp"
   # from any real user installation before starting the transaction.
   export SHDEPS_DIR="$_install_dir"
   export SHDEPS_BIN="$_bin_dir/shdeps"
+  export SHDEPS_LUA_DIR="$_lua_dir"
   PATH="$_child_bin:$PATH"
   SHDEPS_TEST_CHILD_PID="$_child_pid"
   SHDEPS_TEST_CHILD_READY="$_child_ready"

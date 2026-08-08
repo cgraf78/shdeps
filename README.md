@@ -107,7 +107,7 @@ TTL.
 curl -fsSL https://raw.githubusercontent.com/cgraf78/shdeps/main/install.sh | bash -s -- --uninstall
 ```
 
-Or manually: `rm -rf ~/.local/share/shdeps ~/.local/bin/shdeps`.
+Or manually: `rm -rf ~/.local/share/shdeps && rm -f ~/.local/bin/shdeps ~/.local/lib/shdeps`.
 
 ## Configuration
 
@@ -142,6 +142,7 @@ Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf
 | `SHDEPS_GIT_DEV_DIR` | `~/git`                                                 | Dev clone directory used only by `github:repo` deps (prefers `<dir>/<repo>` over a managed clone)                                                                                     |
 | `SHDEPS_INSTALL_DIR` | `~/.local/share`                                        | Base directory for shdeps-owned install roots (`github:repo`, archive-style `github:release`, `cargo`, `go`, `uv`, `npm`). Raw release binaries install into `SHDEPS_BIN_DIR` instead. |
 | `SHDEPS_BIN_DIR`     | `~/.local/bin`                                          | Directory for binary symlinks and raw `github:release` binaries                                                                                                                       |
+| `SHDEPS_LUA_DIR`     | `~/.local/lib/shdeps`                                   | Installer-owned stable link to the active Shdeps Lua API tree                                                                                                                         |
 | `SHDEPS_LOG_LEVEL`   | `1`                                                     | 0=quiet, 1=normal, 2=verbose                                                                                                                                                          |
 | `SHDEPS_JOBS`        | auto (`nproc`)                                          | Max concurrent read-only probes. Explicit values win; `1` = sequential.                                                                                                               |
 | `SHDEPS_STATE_LOCK_TIMEOUT_SECS` | `1800`                                      | Max seconds a mutating command waits for another live `shdeps update`/`prune` holder before failing with lock metadata.                                                               |
@@ -444,6 +445,7 @@ The `--bootstrap` flag:
 - **Finds shdeps.sh** via `$SHDEPS_LIB` → `$SHDEPS_GIT_DEV_DIR/shdeps/` → `$SHDEPS_DIR/` → fresh install
 - **Sources it** into the caller (all `shdeps_*` functions become available)
 - **Symlinks the CLI** into `$SHDEPS_BIN` (default `~/.local/bin/shdeps`)
+- **Symlinks the Lua API tree** into `$SHDEPS_LUA_DIR` (default `~/.local/lib/shdeps`)
 - **Keeps bootstrap fast** by avoiding release freshness checks unless `SHDEPS_FORCE=1`
 - **Is idempotent** — safe to call multiple times
 - **Does not leak `set -e`** into the caller's shell
@@ -509,11 +511,18 @@ configured command and manifest target.
 
 ## Lua API
 
-shdeps ships a Lua module at `lua/shdeps.lua` inside the shdeps root. In a
-source checkout that is typically `~/git/shdeps/lua/shdeps.lua`; in a release
-install it is `$SHDEPS_DIR/lua/shdeps.lua` (for the default installer,
-`~/.local/share/shdeps/lua/shdeps.lua`). Release staging treats this file and
-its `lua/shdeps/` implementation modules as required public artifacts.
+shdeps ships a Lua module at `lua/shdeps.lua` inside the shdeps root. Installer
+activation publishes that whole `lua/` tree through the stable
+`$SHDEPS_LUA_DIR` link (default `~/.local/lib/shdeps`). The link points at the
+active source, developer, or release tree and is retargeted before an obsolete
+install is removed. A real file or directory already at that path is preserved
+and activation fails instead of overwriting caller-owned state.
+
+`SHDEPS_LUA_DIR` is intentionally separate from `$SHDEPS_DIR`: selecting a
+developer checkout removes a stale release install under `$SHDEPS_DIR`, while
+Lua hosts still need one durable entry point. Release staging treats
+`lua/shdeps.lua` and the `lua/shdeps/` implementation modules as required
+public artifacts.
 
 The Lua API is for runtime asset resolution from Lua hosts such as Neovim and
 WezTerm. It deliberately delegates to the `shdeps` CLI instead of parsing
@@ -522,19 +531,20 @@ preference, filters, and path validation remain single-sourced in the Rust
 implementation.
 
 ```lua
-local shdeps = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps.lua")
+local shdeps = dofile(os.getenv("HOME") .. "/.local/lib/shdeps/shdeps.lua")
 local api = shdeps.new({ home = os.getenv("HOME") })
 
 local setup = api.dep_file("cgraf78/termnav", "lib/termnav/nvim/setup.lua")
 local env = api.env()
 ```
 
-Lua hosts that start before shell init has normalized PATH can load the
-bootstrap helper from any known shdeps root and let it locate the active API
-module:
+Lua hosts that start before shell init has normalized PATH should load the
+bootstrap helper from the stable provider-owned tree. The helper then locates
+the active API module and binary without making the host duplicate Shdeps'
+source-versus-release selection policy:
 
 ```lua
-local bootstrap = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps/bootstrap.lua")
+local bootstrap = dofile(os.getenv("HOME") .. "/.local/lib/shdeps/shdeps/bootstrap.lua")
 local shdeps = bootstrap.load({ home = os.getenv("HOME") })
 local api = shdeps.new({ home = os.getenv("HOME") })
 ```
@@ -578,7 +588,8 @@ absolute path. That keeps dependency-owned child tools that shell out to
 `bootstrap.load(options)` checks `options.lua`, `$SHDEPS_LUA`,
 `options.root`, `$SHDEPS_LIB`'s sibling root, `$SHDEPS_GIT_DEV_DIR/shdeps`,
 `<home>/git/shdeps`, `$SHDEPS_DIR`, `<home>/.local/share/shdeps`, and finally
-the bootstrap file's own root.
+the `shdeps.lua` module beside the bootstrap file's Lua tree. That final sibling
+lookup is what makes the provider-managed `$SHDEPS_LUA_DIR` link self-contained.
 
 ## Rust API
 

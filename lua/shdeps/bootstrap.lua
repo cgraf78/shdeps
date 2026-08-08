@@ -20,9 +20,10 @@ local function source_path()
   return (source:gsub("^@", ""):gsub("\\", "/"))
 end
 
-local function source_root()
+local function source_module()
   local source = source_path()
-  return source and source:match("^(.*)/lua/shdeps/bootstrap%.lua$")
+  local lua_dir = source and source:match("^(.*)/shdeps/bootstrap%.lua$")
+  return lua_dir and (lua_dir .. "/shdeps.lua")
 end
 
 local function readable(path)
@@ -92,7 +93,10 @@ local function candidates(options)
   add_root(result, seen, os.getenv("SHDEPS_DIR"))
   add_root(result, seen, type(home) == "string" and (home .. "/.local/share/shdeps") or nil)
   add_root(result, seen, type(env_home) == "string" and (env_home .. "/.local/share/shdeps") or nil)
-  add_root(result, seen, source_root())
+  -- The installer publishes the whole `lua/` tree through a stable symlink.
+  -- Resolve the sibling module from the path used to load this file rather
+  -- than requiring that path to retain the repository's parent directories.
+  add_path(result, seen, source_module())
 
   return result
 end

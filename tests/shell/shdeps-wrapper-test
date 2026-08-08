@@ -393,9 +393,16 @@ _bootstrap_state=$(_tmpdir)
 _bootstrap_share=$(_tmpdir)
 _bootstrap_bin_dir=$(_tmpdir)
 _bootstrap_dev=$(_tmpdir)
+_bootstrap_lua_dir=$(_tmpdir)/shdeps
 cp "$SHDEPS_RUST_CLI" "$_bootstrap_release/shdeps"
 cp "$SHDEPS_DIR/shdeps.sh" "$_bootstrap_release/shdeps.sh"
-mkdir -p "$_bootstrap_release/man/man1" "$_bootstrap_release/completions"
+mkdir -p \
+  "$_bootstrap_release/man/man1" \
+  "$_bootstrap_release/completions" \
+  "$_bootstrap_release/lua/shdeps"
+cp "$SHDEPS_DIR/lua/shdeps.lua" "$_bootstrap_release/lua/shdeps.lua"
+cp "$SHDEPS_DIR/lua/shdeps/core.lua" "$_bootstrap_release/lua/shdeps/core.lua"
+cp "$SHDEPS_DIR/lua/shdeps/bootstrap.lua" "$_bootstrap_release/lua/shdeps/bootstrap.lua"
 printf '.TH SHDEPS 1\n' >"$_bootstrap_release/man/man1/shdeps.1"
 printf '# completion\n' >"$_bootstrap_release/completions/shdeps.bash"
 cat >"$_bootstrap_release/.shdeps-install.json" <<'JSON'
@@ -407,6 +414,7 @@ _install_sh="$SHDEPS_DIR/install.sh"
 _bootstrap_output=$(
   env SHDEPS_DIR="$_bootstrap_release" \
     SHDEPS_BIN="$_bootstrap_bin" \
+    SHDEPS_LUA_DIR="$_bootstrap_lua_dir" \
     SHDEPS_RUST_CLI='' \
     SHDEPS_STATE_DIR="$_bootstrap_state" \
     SHDEPS_INSTALL_DIR="$_bootstrap_share" \
@@ -419,6 +427,9 @@ _assert_exit "bootstrap release wrapper: succeeds" 0 "$_bootstrap_rc"
 _assert_match "bootstrap release wrapper: sourced Rust API" "$_version_line_re" "$_bootstrap_output"
 _assert_symlink "bootstrap release wrapper: CLI linked" "$_bootstrap_bin"
 _assert_eq "bootstrap release wrapper: CLI points at sibling binary" "$_bootstrap_release/shdeps" "$(readlink "$_bootstrap_bin")"
+_assert_symlink "bootstrap release wrapper: stable Lua API linked" "$_bootstrap_lua_dir"
+_assert_eq "bootstrap release wrapper: Lua API points at release tree" \
+  "$_bootstrap_release/lua" "$(readlink "$_bootstrap_lua_dir")"
 _assert_symlink "bootstrap release wrapper: man page linked through public helper" "$_bootstrap_share/man/man1/shdeps.1"
 
 echo ""

@@ -9,6 +9,13 @@ same hidden CLI bridge used by other adapters. Keep host-specific setup out of
 this layer; callers should configure paths through documented options or
 environment variables.
 
+`install.sh` publishes this entire directory through `$SHDEPS_LUA_DIR`
+(default `~/.local/lib/shdeps`). It is a stable symlink to the active source,
+developer, or release tree, so consumers can load
+`~/.local/lib/shdeps/shdeps/bootstrap.lua` without copying Shdeps' install
+discovery rules. The installer owns the symlink itself, but deliberately
+refuses to replace a real file or directory at that path.
+
 ## Files
 
 - `shdeps.lua` is the module entrypoint for `require("shdeps")`.

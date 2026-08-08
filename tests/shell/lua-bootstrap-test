@@ -97,6 +97,22 @@ LUA
 _assert_eq "lua bootstrap: home release install can create API object" \
   "release:new|$fixture/home" "$result"
 
+stable_lua="$fixture/stable-lua"
+isolated_home="$fixture/isolated-home"
+mkdir -p "$isolated_home"
+ln -s "$REPO_ROOT/lua" "$stable_lua"
+result=$(
+  HOME="$isolated_home" \
+    SHDEPS_GIT_DEV_DIR="$fixture/no-dev-root" \
+    SHDEPS_DIR="$fixture/no-release-root" \
+    SHDEPS_BOOTSTRAP="$stable_lua/shdeps/bootstrap.lua" lua <<'LUA'
+local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))
+print(bootstrap.load({}).API_VERSION)
+LUA
+)
+_assert_eq "lua bootstrap: provider-managed Lua tree loads its sibling API" \
+  "1" "$result"
+
 result=$(
   SHDEPS_BOOTSTRAP="$bootstrap" lua <<'LUA'
 local bootstrap = dofile(os.getenv("SHDEPS_BOOTSTRAP"))

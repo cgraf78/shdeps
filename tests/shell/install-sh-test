@@ -311,6 +311,41 @@ _bootstrap_retry_report=$(
 _assert_eq "bootstrap activation: failure is retried before readiness" \
   "77:0:0:0:0:4:3" "$_bootstrap_retry_report"
 
+echo "=== install.sh: Lua API link ownership ==="
+
+_lua_link_root="$_fixture_dir/lua-link"
+_lua_source_one="$_fixture_dir/lua-source-one"
+_lua_source_two="$_fixture_dir/lua-source-two"
+mkdir -p \
+  "$_lua_source_one/lua/shdeps" \
+  "$_lua_source_two/lua/shdeps"
+printf 'return {}\n' >"$_lua_source_one/lua/shdeps.lua"
+printf 'return {}\n' >"$_lua_source_one/lua/shdeps/bootstrap.lua"
+printf 'return {}\n' >"$_lua_source_two/lua/shdeps.lua"
+printf 'return {}\n' >"$_lua_source_two/lua/shdeps/bootstrap.lua"
+
+SHDEPS_LUA_DIR="$_lua_link_root"
+export SHDEPS_LUA_DIR
+_setup_links "$_lua_source_one"
+_assert_true "Lua API link: activation creates the stable link" \
+  test -L "$_lua_link_root"
+_assert_eq "Lua API link: stable link selects the active Lua tree" \
+  "$_lua_source_one/lua" "$(readlink "$_lua_link_root")"
+
+_setup_links "$_lua_source_two"
+_assert_eq "Lua API link: later activation retargets the managed link" \
+  "$_lua_source_two/lua" "$(readlink "$_lua_link_root")"
+
+rm -f "$_lua_link_root"
+mkdir -p "$_lua_link_root"
+printf 'keep\n' >"$_lua_link_root/owned-by-user"
+_lua_foreign_rc=0
+_setup_links "$_lua_source_one" >/dev/null 2>&1 || _lua_foreign_rc=$?
+_assert_eq "Lua API link: a pre-existing directory rejects activation" \
+  1 "$_lua_foreign_rc"
+_assert_true "Lua API link: rejected directory remains untouched" \
+  test -f "$_lua_link_root/owned-by-user"
+
 echo "=== install.sh: combined propagation diagnostics ==="
 
 _combined_diag_dir="$_fixture_dir/combined-diagnostic"
