@@ -538,6 +538,10 @@ local setup = api.dep_file("cgraf78/termnav", "lib/termnav/nvim/setup.lua")
 local env = api.env()
 ```
 
+For a complete host-neutral resolver that uses the provider-managed bootstrap,
+validated asset lookup, and child environment together, see
+[`examples/lua/resolve-asset.lua`](examples/lua/resolve-asset.lua).
+
 Lua hosts that start before shell init has normalized PATH should load the
 bootstrap helper from the stable provider-owned tree. The helper then locates
 the active API module and binary without making the host duplicate Shdeps'

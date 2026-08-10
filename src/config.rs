@@ -659,6 +659,17 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_dependency_example_uses_the_production_grammar() {
+        let entries = parse_config_texts([include_str!("../examples/deps.conf")]);
+
+        assert_eq!(entries.len(), 19, "every active example row should parse");
+        assert!(entries.contains(&"fd|pkg|apt:fdfind|apt:fd-find,dnf:fd-find".to_owned()));
+        assert!(entries.contains(&"neovim/neovim|github:release|nvim".to_owned()));
+        assert!(entries.contains(&"nerd-fonts|custom".to_owned()));
+        assert!(entries.contains(&"openai/codex|github:release|-|-|host:nas".to_owned()));
+    }
+
+    #[test]
     fn parse_config_texts_deduplicates_repeats_with_last_occurrence_winning() {
         // `manifest::get` is last-wins, so loading the same dep twice from
         // two `.conf` files must collapse to one entry — the later one.

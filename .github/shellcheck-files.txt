@@ -16,6 +16,7 @@ program	scripts/smoke-release.sh
 program	scripts/termux-ci.sh
 program	shdeps.sh
 program	tests/shell/completion-test
+program	tests/shell/examples-test
 program	tests/shell/helpers-test
 program	tests/shell/helpers.sh
 program	tests/shell/install-sh-test
