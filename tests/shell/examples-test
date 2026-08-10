@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Exercise the checked-in examples through the same public contracts callers use.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+# shellcheck source=tests/shell/helpers.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/helpers.sh"
+
+fixture=$(_tmpdir)
+example_home="$fixture/home"
+mkdir -p "$example_home"
+
+# Source the real hook but exercise only its side-effect-free existence probe;
+# the install path intentionally downloads software and does not belong in a
+# deterministic example contract test.
+HOME="$example_home"
+export HOME
+# shellcheck source=examples/hooks.d/example-hook.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/examples/hooks.d/example-hook.sh"
+if exists nerd-fonts; then
+  _fail "examples: custom hook reports a missing font before installation"
+else
+  _pass "examples: custom hook reports a missing font before installation"
+fi
+mkdir -p "$HOME/.local/share/fonts"
+: >"$HOME/.local/share/fonts/JetBrainsMonoExample.ttf"
+if exists nerd-fonts; then
+  _pass "examples: custom hook recognizes its installed artifact"
+else
+  _fail "examples: custom hook recognizes its installed artifact"
+fi
+
+if command -v lua >/dev/null 2>&1; then
+  fake_bin="$fixture/bin"
+  fake_root="$fixture/share/example/tool"
+  fake_log="$fixture/shdeps.log"
+  mkdir -p "$fake_bin" "$fake_root/share/tool"
+  printf 'asset\n' >"$fake_root/share/tool/example.lua"
+  cat >"$fake_bin/shdeps" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\t%s\t%s\n' "${HOME:-}" "${SHDEPS_CONF_DIR:-}" "$*" >>"$SHDEPS_FAKE_LOG"
+[[ "${1:-}" == dep-file && "${2:-}" == example/tool ]] || exit 2
+path="$SHDEPS_FAKE_ROOT/${3:-}"
+[[ -f "$path" ]] || exit 1
+printf '%s\n' "$path"
+SH
+  chmod +x "$fake_bin/shdeps"
+
+  result=$(
+    SHDEPS_EXAMPLE="$REPO_ROOT/examples/lua/resolve-asset.lua" \
+      SHDEPS_LUA_DIR="$REPO_ROOT/lua" \
+      SHDEPS_FAKE_BIN="$fake_bin/shdeps" \
+      SHDEPS_FAKE_ROOT="$fake_root" \
+      SHDEPS_FAKE_LOG="$fake_log" \
+      SHDEPS_EXAMPLE_HOME="$example_home" \
+      lua <<'LUA'
+local resolver = dofile(os.getenv("SHDEPS_EXAMPLE"))
+local path, env = resolver.resolve({
+  lua_dir = os.getenv("SHDEPS_LUA_DIR"),
+  home = os.getenv("SHDEPS_EXAMPLE_HOME"),
+  bin = os.getenv("SHDEPS_FAKE_BIN"),
+  dependency = "example/tool",
+  relative_path = "share/tool/example.lua",
+})
+assert(path, env)
+print(path .. "|" .. env.HOME .. "|" .. env.SHDEPS_CONF_DIR)
+LUA
+  )
+  _assert_eq "examples: Lua resolver returns an installed asset and child environment" \
+    "$fake_root/share/tool/example.lua|$example_home|$example_home/.config/shdeps" \
+    "$result"
+  _assert_contains "examples: Lua resolver uses the requested dependency" \
+    $'\tdep-file example/tool share/tool/example.lua' "$(<"$fake_log")"
+else
+  echo "SKIP: Lua example (lua not found)"
+fi
+
+_test_summary
