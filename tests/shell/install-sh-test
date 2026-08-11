@@ -359,6 +359,65 @@ _assert_eq "Lua API link: a pre-existing directory rejects activation" \
 _assert_true "Lua API link: rejected directory remains untouched" \
   test -f "$_lua_link_root/owned-by-user"
 
+_cli_source="$_fixture_dir/cli-source"
+_cli_lua_link="$_fixture_dir/cli-lua-link"
+_cli_target="$_fixture_dir/bin/shdeps"
+mkdir -p "$_cli_source/lua/shdeps" "$(dirname "$_cli_target")"
+printf 'return {}\n' >"$_cli_source/lua/shdeps.lua"
+printf 'return {}\n' >"$_cli_source/lua/shdeps/bootstrap.lua"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$_cli_source/shdeps"
+chmod +x "$_cli_source/shdeps"
+printf 'owned elsewhere\n' >"$_cli_target"
+_saved_lua_dir="$SHDEPS_LUA_DIR"
+_saved_shdeps_bin="$SHDEPS_BIN"
+SHDEPS_LUA_DIR="$_cli_lua_link"
+SHDEPS_BIN="$_cli_target"
+_cli_foreign_rc=0
+_cli_foreign_output=$(_setup_links "$_cli_source" 2>&1) ||
+  _cli_foreign_rc=$?
+_assert_eq "CLI link: a pre-existing file rejects activation" \
+  1 "$_cli_foreign_rc"
+_assert_eq "CLI link: rejected file remains untouched" \
+  "owned elsewhere" "$(cat "$_cli_target")"
+_assert_false "CLI link: rejected activation publishes no Lua API" \
+  test -L "$_cli_lua_link"
+_assert_contains "CLI link: rejection is actionable" \
+  "not a symlink; refusing to replace it" "$_cli_foreign_output"
+
+_rollback_lua_link="$_fixture_dir/rollback-lua-link"
+_rollback_cli_target="$_fixture_dir/rollback-bin/shdeps"
+_rollback_prior_target=--help
+mkdir -p "$(dirname "$_rollback_cli_target")"
+ln -s -- "$_rollback_prior_target" "$_rollback_lua_link"
+SHDEPS_LUA_DIR="$_rollback_lua_link"
+SHDEPS_BIN="$_rollback_cli_target"
+ln() {
+  local ln_args=("$@")
+  local ln_operand_count=${#ln_args[@]}
+  local ln_source_operand=${ln_args[$((ln_operand_count - 2))]}
+  local ln_target_operand=${ln_args[$((ln_operand_count - 1))]}
+  command ln "$@" || return $?
+  if [[ "$ln_source_operand" == "$_cli_source/shdeps" &&
+    "$ln_target_operand" == "$_rollback_cli_target" ]]; then
+    printf 'injected late ln failure\n' >&2
+    return 73
+  fi
+}
+_rollback_rc=0
+_rollback_output=$(_setup_links "$_cli_source" 2>&1) || _rollback_rc=$?
+unset -f ln
+_assert_eq "link transaction: late CLI failure preserves its status" \
+  73 "$_rollback_rc"
+_assert_contains "link transaction: late CLI failure preserves its diagnostic" \
+  "injected late ln failure" "$_rollback_output"
+_assert_eq "link transaction: restores an option-like Lua API target" \
+  "$_rollback_prior_target" "$(readlink "$_rollback_lua_link")"
+_assert_false "link transaction: removes the newly published CLI link" \
+  test -L "$_rollback_cli_target"
+
+SHDEPS_LUA_DIR="$_saved_lua_dir"
+SHDEPS_BIN="$_saved_shdeps_bin"
+
 echo "=== install.sh: combined propagation diagnostics ==="
 
 _combined_diag_dir="$_fixture_dir/combined-diagnostic"

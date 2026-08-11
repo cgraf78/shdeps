@@ -2007,17 +2007,36 @@ _setup_lua_api_link() {
   fi
 
   mkdir -p "$(dirname "$SHDEPS_LUA_DIR")" || return 1
-  ln -sfn "$lua_tree" "$SHDEPS_LUA_DIR"
+  ln -sfn -- "$lua_tree" "$SHDEPS_LUA_DIR"
+}
+
+_restore_setup_link() {
+  local target="$1" was_symlink="$2" old_target="$3"
+
+  # Recovery must never overwrite a real path that appeared after preflight.
+  # It may belong to the caller or another concurrent installer.
+  if [[ (-e "$target" || -L "$target") && ! -L "$target" ]]; then
+    _error "rollback preserved non-symlink path at $target"
+    return 1
+  fi
+  if [[ "$was_symlink" -eq 1 ]]; then
+    if ! ln -sfn -- "$old_target" "$target"; then
+      _error "rollback could not restore symlink at $target"
+      return 1
+    fi
+  elif [[ -L "$target" ]] && ! rm -f -- "$target"; then
+    _error "rollback could not remove new symlink at $target"
+    return 1
+  fi
 }
 
 # Symlink the Lua API and CLI, then link man pages + shell completions.
 _setup_links() {
   local shdeps_dir="$1"
   local cli=""
-
-  # Link the provider-owned API first. If a user-owned path blocks it, fail
-  # before changing the CLI and extras so activation has one clear outcome.
-  _setup_lua_api_link "$shdeps_dir" || return 1
+  local lua_was_symlink=0 lua_old_target=""
+  local cli_was_symlink=0 cli_old_target=""
+  local status=0
 
   if [[ -x "$shdeps_dir/shdeps" ]]; then
     cli="$shdeps_dir/shdeps"
@@ -2025,9 +2044,56 @@ _setup_links() {
     cli="$shdeps_dir/bin/shdeps"
   fi
 
+  # Both public links are installer-owned and may be retargeted between valid
+  # implementations. Preflight the optional CLI before publishing the Lua API,
+  # however, so a user-owned CLI path cannot leave activation half complete.
+  if [[ -n "$cli" && (-e "$SHDEPS_BIN" || -L "$SHDEPS_BIN") &&
+    ! -L "$SHDEPS_BIN" ]]; then
+    _error "$SHDEPS_BIN exists and is not a symlink; refusing to replace it"
+    return 1
+  fi
+
+  # Snapshot both installer-owned links before publishing either one. A
+  # successful Lua link followed by a failed CLI ln would otherwise activate a
+  # mixed implementation. Explicit variables keep this bootstrap compatible
+  # with stock macOS Bash 3.2 and avoid changing dependency-selection policy.
+  if [[ -L "$SHDEPS_LUA_DIR" ]]; then
+    lua_was_symlink=1
+    lua_old_target=$(readlink "$SHDEPS_LUA_DIR") || return 1
+  fi
+  if [[ -n "$cli" && -L "$SHDEPS_BIN" ]]; then
+    cli_was_symlink=1
+    cli_old_target=$(readlink "$SHDEPS_BIN") || return 1
+  fi
+
+  if _setup_lua_api_link "$shdeps_dir"; then
+    :
+  else
+    status=$?
+    _restore_setup_link \
+      "$SHDEPS_LUA_DIR" "$lua_was_symlink" "$lua_old_target" || true
+    return "$status"
+  fi
+
   if [[ -n "$cli" ]]; then
-    mkdir -p "$(dirname "$SHDEPS_BIN")" || return 1
-    ln -sf "$cli" "$SHDEPS_BIN" || return 1
+    if mkdir -p "$(dirname "$SHDEPS_BIN")"; then
+      :
+    else
+      status=$?
+      _restore_setup_link \
+        "$SHDEPS_LUA_DIR" "$lua_was_symlink" "$lua_old_target" || true
+      return "$status"
+    fi
+    if ln -sfn -- "$cli" "$SHDEPS_BIN"; then
+      :
+    else
+      status=$?
+      _restore_setup_link \
+        "$SHDEPS_BIN" "$cli_was_symlink" "$cli_old_target" || true
+      _restore_setup_link \
+        "$SHDEPS_LUA_DIR" "$lua_was_symlink" "$lua_old_target" || true
+      return "$status"
+    fi
   fi
 
   if declare -f shdeps_link_extras &>/dev/null; then
