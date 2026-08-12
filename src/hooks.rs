@@ -204,10 +204,11 @@ pub mod prelude;
 // (= our `$$`), `is_legitimate_reentry` fires, and the lock acquisition
 // becomes a no-op guard.
 //
-// User-export-bypass remains blocked: a user shell init that exported
-// `SHDEPS_STATE_LOCK_HELD=1` is overridden by our `$$` re-export when
-// their shell goes through a hook, and a top-level `shdeps` invocation
-// (no hook in the chain) never sees the bash re-export at all.
+// Overwriting an inherited value here is hygiene for legitimate reentry, not a
+// trust boundary. It keeps a stale or incidental value from breaking the hook
+// chain, but a caller can deliberately forge the cooperative parent-PID signal.
+// `StateLock` documents why that trade-off is acceptable for a same-user
+// deadlock-prevention mechanism.
 const STATUS_SCRIPT: &str = r#"
 export SHDEPS_STATE_LOCK_HELD=$$
 name=$1

@@ -1,7 +1,11 @@
 //! Shared bounded-concurrency helpers.
 //!
-//! shdeps has several hot paths where read-only probes are safe to overlap,
-//! but install-time mutations are not. Keeping job-count parsing and chunked
+//! shdeps has several hot paths where independent work is safe to overlap.
+//! Read-only probes qualify directly; `update` also admits a deliberately
+//! restricted set of built-in, non-package installers whose managed roots are
+//! dependency-scoped and whose manifest writes are serialized. Their public
+//! link names must still be collision-free. Package-manager mutations and
+//! arbitrary custom hooks stay outside that pool. Keeping job-count parsing and
 //! fan-out here gives those callers one contract for `SHDEPS_JOBS`: explicit
 //! positive values win, `1` is the deterministic sequential escape hatch, and
 //! auto mode follows the host's CPU parallelism.
@@ -25,10 +29,13 @@ pub fn max_jobs(env_vars: &BTreeMap<String, String>) -> usize {
         return configured;
     }
 
-    // Auto mode follows the machine instead of an arbitrary ceiling. The work
-    // this helper gates is intentionally read-only; callers that could trigger
-    // rate limits or mutate shared state must choose narrower candidate sets
-    // rather than hiding another policy here.
+    // Auto mode follows the machine instead of an arbitrary ceiling. This
+    // helper cannot know whether a caller's work is safe to overlap, so each
+    // caller must enforce that boundary when selecting candidates. Rate-limited
+    // GitHub reads use `github_max`, while `update` excludes shared package
+    // managers and arbitrary hooks before using this unrestricted host-sized
+    // pool. Keeping those policies at the call sites makes the safety reason
+    // visible where the actual work is chosen.
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
@@ -144,6 +151,13 @@ where
         .collect()
 }
 
+/// Runs work in parallel while reporting completed-item counts.
+///
+/// Workers may finish out of order, but callbacks run serially on the caller
+/// thread and the returned vector stays in input order. If a callback fails,
+/// later callbacks are suppressed while the scoped workers are still joined;
+/// returning early and detaching work would let an apparently failed update
+/// continue mutating state in the background.
 pub(crate) fn parallel_map_with_progress<T, R, F, P>(
     items: &[T],
     jobs: usize,
@@ -250,7 +264,12 @@ pub(crate) enum ItemProgressEvent<'a, R> {
     Completed { index: usize, result: &'a R },
 }
 
-/// Runs work in parallel, reports each started/completed item, and returns input order.
+/// Runs work in parallel and reports each started and completed item.
+///
+/// Events follow worker activity rather than input order, but callbacks are
+/// serialized on the caller thread and final results retain input order. After
+/// the first callback error, the caller keeps draining results without further
+/// callbacks so every scoped worker is joined before the error is returned.
 pub(crate) fn parallel_map_with_item_progress<T, R, F, P>(
     items: &[T],
     jobs: usize,

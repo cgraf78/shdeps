@@ -478,8 +478,9 @@ impl Progress for NoProgress {
 /// `update` is the first command that touches every expensive boundary:
 /// package managers, hooks, manifests, and filesystem cleanup. Keep those
 /// dependencies explicit so tests can run without a host package manager and
-/// future CLI wiring can hold the state lock only around the mutations that
-/// actually need it.
+/// each boundary can be exercised without ambient host state. The update lock
+/// deliberately spans the whole operation; dependency injection makes the
+/// operation testable without weakening that serialization window.
 pub struct Context<'a, R>
 where
     R: Runner,
@@ -584,13 +585,12 @@ where
     //
     // Re-entry safety: when a hook subprocess calls back into shdeps
     // (e.g., a `post()` hook that runs `shdeps update some-other-dep`),
-    // the inner acquire sees `SHDEPS_STATE_LOCK_HELD` in its env (set
-    // by `apply_hook_env`) and returns a no-op guard instead of
-    // deadlocking against the parent's flock. The doc comment on
-    // `StateLock` warns against holding the lock across hooks — that
-    // warning predates the re-entry env-var contract added here, which
-    // makes the broader scope safe. Concurrent top-level invocations
-    // still serialize because they do not inherit the env var.
+    // the hook re-binds `SHDEPS_STATE_LOCK_HELD` to its own PID. The
+    // inner acquire recognizes that cooperative parent-child chain and
+    // returns a no-op guard instead of deadlocking against the outer
+    // flock. This exception exists only for recursive hooks and is not
+    // a security boundary; `StateLock` documents the full threat model.
+    // Independent top-level invocations still take the real file lock.
     //
     // The handle is bound to a local so its `Drop` releases the lock
     // when `run` returns by any path.
@@ -779,6 +779,17 @@ where
         ))?;
     }
 
+    // Only built-in, non-package methods enter this pool. Package managers
+    // mutate shared system databases and have already completed above; custom
+    // hooks are arbitrary caller code and remain serial below. The admitted
+    // installers keep their managed roots and ledgers dependency-scoped, while
+    // `manifest::upsert` serializes manifest updates. Public bin, man, and
+    // completion directories are shared, so configured output names must also
+    // be collision-free; parallel execution does not define a winner for a
+    // collision. Preserve both sides of that boundary when adding a method.
+    // The worker helper still returns outcomes in configuration order, even
+    // though progress reports completion order, so dependency-result ordering
+    // remains deterministic.
     let builtin_entries = entries
         .iter()
         .filter(|entry| method::active_non_package_builtin(entry))
