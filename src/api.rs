@@ -1,11 +1,12 @@
 //! Hidden bridge commands for Bash wrappers and hook preludes.
 //!
 //! `shdeps __api` is not a user-facing CLI, but it is still compatibility
-//! surface. The Bash wrapper will call these commands from command substitution
-//! and hooks, so stdout must stay machine-clean and each command must be honest
-//! about whether it is cheap. This initial registry intentionally includes only
-//! read-only commands and path helpers; mutating bridge calls land with the Rust
-//! modules that own those side effects.
+//! surface. The Bash wrapper calls these commands from command substitution and
+//! hooks, so stdout must stay machine-clean and each command must be honest
+//! about whether it is cheap. The registry now includes both queries and
+//! narrowly scoped mutations; keep this bridge small by leaving behavior in the
+//! Rust modules that own the side effects and using this layer only to validate
+//! arguments and preserve the wrapper contract.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
