@@ -907,7 +907,8 @@ fn update_prerequisite_error(
         .into_iter()
         .filter(|prereq| {
             !runner.exists(prereq.command)
-                && !package_bootstraps_prerequisite(entries, env, *prereq)
+                && !(phase == UpdatePrerequisitePhase::ConcreteOnly
+                    && package_bootstraps_prerequisite(entries, env, *prereq))
         })
         .collect::<Vec<_>>();
     if missing.is_empty() {
