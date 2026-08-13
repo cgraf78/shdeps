@@ -597,6 +597,7 @@ where
     let _lock = crate::state::StateLock::acquire(&context.roots.state_dir)?;
 
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
+    let package_transitions = transitions.keys().cloned().collect::<BTreeSet<_>>();
 
     let mut summary = Summary::default();
     let mut changed = Vec::new();
@@ -647,9 +648,18 @@ where
                 summary.items.push(item);
             }
         } else {
-            let package_versions = update_pkg::package_versions(entries, context, options);
-            let sudo = update_pkg::sudo_status(entries, context, &package_versions)?;
-            update_pkg::prepare(entries, context, &package_versions, sudo, progress)?;
+            let package_versions =
+                update_pkg::package_versions(entries, context, options, &package_transitions);
+            let sudo =
+                update_pkg::sudo_status(entries, context, &package_versions, &package_transitions)?;
+            update_pkg::prepare(
+                entries,
+                context,
+                &package_versions,
+                &package_transitions,
+                sudo,
+                progress,
+            )?;
 
             let mut package_clean = true;
             let mut package_done = 0usize;
@@ -666,6 +676,7 @@ where
                     sudo,
                     &mut queued,
                     &package_versions,
+                    package_transitions.contains(&entry.name),
                 )?;
                 if !item.failed {
                     match item.reason {
@@ -1638,7 +1649,10 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         )
         .unwrap();
         let manifest = manifest::read(&manifest_path).unwrap();
-        let runner = FakeRunner::default().with_command("tool");
+        let runner = FakeRunner::default()
+            .with_command("tool")
+            .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
+            .with_success("sudo", ["apt-get", "install", "-y", "tool"], "");
 
         let summary = run(
             &[parse_entry("tool|pkg|tool|-|-", None)],
@@ -1652,6 +1666,12 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         assert_eq!(summary.items[0].detail, "installed");
         assert!(!old_install.exists());
         assert!(!fixture.roots.bin_dir.join("tool").exists());
+        assert!(
+            runner
+                .calls()
+                .contains(&key("sudo", ["apt-get", "install", "-y", "tool"])),
+            "the old managed command must not masquerade as package ownership"
+        );
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("tool"),
             Some(&ManifestEntry::new("tool", "pkg", "tool", ""))
