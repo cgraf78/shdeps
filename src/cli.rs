@@ -907,7 +907,8 @@ fn update_prerequisite_error(
         .into_iter()
         .filter(|prereq| {
             !runner.exists(prereq.command)
-                && !(phase == UpdatePrerequisitePhase::ConcreteOnly
+                && !((phase == UpdatePrerequisitePhase::ConcreteOnly
+                    || !needed_before_packages(entries, env, *prereq))
                     && package_bootstraps_prerequisite(entries, env, *prereq))
         })
         .collect::<Vec<_>>();
@@ -923,6 +924,17 @@ fn update_prerequisite_error(
     Some(format!(
         "error: shdeps update is missing required tools for configured deps: {details}"
     ))
+}
+
+fn needed_before_packages(
+    entries: &[Entry],
+    env: &crate::platform::RuntimeEnv,
+    prereq: UpdatePrerequisite,
+) -> bool {
+    prereq.command == "curl"
+        && entries
+            .iter()
+            .any(|entry| entry.method == method::GITHUB && update::active(entry, env))
 }
 
 fn package_bootstraps_prerequisite(

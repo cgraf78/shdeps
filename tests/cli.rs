@@ -715,7 +715,7 @@ fn mutating_api_github_release_reports_selection_failures() {
     let fakebin = fixture.dir.join("fakebin");
     fixture.write_executable(
         "fakebin/curl",
-        r#"#!/bin/sh
+        r##"#!/bin/sh
 set -eu
 
 # Keep this fake compatible with the production curl transport, which sends the
@@ -725,7 +725,7 @@ set -eu
 # the older CentOS Stream userspace in the shared CI matrix.
 cat >/dev/null
 printf '[{"tag_name":"v1.0.0","assets":[]}]\n'
-"#,
+"##,
     );
 
     let mut command = fixture.command([
@@ -1103,7 +1103,7 @@ fn update_jsonl_warns_when_local_clone_cannot_fast_forward() {
     fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\n");
     fixture.write_executable(
         "fakebin/git",
-        r#"#!/bin/sh
+        r##"#!/bin/sh
 case " $* " in
   *" status --porcelain --untracked-files=normal ") exit 0 ;;
   *" rev-parse --abbrev-ref --symbolic-full-name @{upstream} ")
@@ -1113,7 +1113,7 @@ case " $* " in
   *" pull --ff-only --quiet ") exit 1 ;;
   *) exit 1 ;;
 esac
-"#,
+"##,
     );
     let mut command = fixture.command(["--force", "update"]);
     command.env("SHDEPS_PROGRESS", "jsonl");
@@ -2526,6 +2526,62 @@ fn package_curl_cannot_bootstrap_bare_github_resolution() {
     assert_eq!(
         text(&output.stderr),
         "error: shdeps update is missing required tools for configured deps: curl (GitHub release metadata and downloads)\n"
+    );
+}
+
+#[test]
+fn package_phase_bootstraps_cargo_before_cargo_dependency() {
+    let fixture = Fixture::new("update-prereqs-bootstrap-cargo");
+    let log = fixture.dir.join("order.log");
+    fixture.write("conf/deps.conf", "cargo pkg\ntool cargo\n");
+    fixture.write_executable("fakebin/id", "#!/bin/sh\nprintf '0\n'\n");
+    fixture.write_executable("fakebin/sudo", "#!/bin/sh\nexec \"$@\"\n");
+    fixture.write_executable("fakebin/dpkg-query", "#!/bin/sh\nexit 1\n");
+    fixture.write_executable(
+        "fakebin/apt-cache",
+        "#!/bin/sh\n[ \"$1:$2\" = show:cargo ]\n",
+    );
+    fixture.write_executable(
+        "fakebin/apt-get",
+        r##"#!/bin/sh
+printf 'package %s\n' "$*" >>"$SHDEPS_TEST_LOG"
+if [ "$1:$2:$3" = 'install:-y:cargo' ]; then
+  printf '%s\n' '#!/bin/sh' \
+    'printf "cargo %s\\n" "$*" >>"$SHDEPS_TEST_LOG"' \
+    'root=' \
+    'while [ "$#" -gt 0 ]; do' \
+    '  if [ "$1" = --root ]; then root=$2; shift 2; else shift; fi' \
+    'done' \
+    '/bin/mkdir -p "$root/bin"' \
+    'printf "#!/bin/sh\\n" >"$root/bin/tool"' \
+    '/bin/chmod +x "$root/bin/tool"' \
+    >"$SHDEPS_TEST_FAKEBIN/cargo"
+  /bin/chmod +x "$SHDEPS_TEST_FAKEBIN/cargo"
+fi
+"##,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_PKG_MGR", "apt")
+        .env("SHDEPS_TEST_LOG", &log)
+        .env("SHDEPS_TEST_FAKEBIN", fixture.dir.join("fakebin"))
+        .env("PATH", fixture.dir.join("fakebin"));
+    let output = run(&mut command);
+
+    let events = fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?} events={events:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    let package = events.find("package install -y cargo").unwrap();
+    let cargo = events.find("cargo install --locked").unwrap();
+    assert!(
+        package < cargo,
+        "package phase must precede Cargo: {events}"
     );
 }
 
