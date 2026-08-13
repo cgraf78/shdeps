@@ -1,4 +1,4 @@
-//! Platform, host, and combined filter matching.
+//! Platform, host, package-manager, and combined filter matching.
 //!
 //! `shdeps` uses these predicates to decide whether a dependency applies to a
 //! machine before any install work starts. The rules intentionally mirror the
@@ -10,6 +10,7 @@
 pub struct RuntimeEnv {
     platform: String,
     host: String,
+    package_manager: String,
     android: bool,
 }
 
@@ -25,8 +26,16 @@ impl RuntimeEnv {
         Self {
             platform: platform.into(),
             host: host.into().to_lowercase(),
+            package_manager: String::new(),
             android: false,
         }
+    }
+
+    /// Records the detected package manager used by `mgr:` filters.
+    #[must_use]
+    pub fn with_package_manager(mut self, package_manager: impl Into<String>) -> Self {
+        self.package_manager = package_manager.into().to_lowercase();
+        self
     }
 
     /// Records whether the Linux kernel is hosting an Android/Bionic userspace.
@@ -53,9 +62,23 @@ impl RuntimeEnv {
     pub fn is_android(&self) -> bool {
         self.android
     }
+
+    /// Returns the user-facing package-manager identity.
+    ///
+    /// Termux uses APT-compatible commands internally, but config already uses
+    /// `android:` for its package overrides. Exposing the same durable identity
+    /// to filters keeps policy independent of that implementation detail.
+    #[must_use]
+    pub fn package_manager(&self) -> &str {
+        if self.android {
+            "android"
+        } else {
+            &self.package_manager
+        }
+    }
 }
 
-/// Result of evaluating a combined `os:`/`host:` filter.
+/// Result of evaluating a combined `os:`/`host:`/`mgr:` filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMatch {
     /// The filter applies to the current runtime identity.
@@ -64,6 +87,8 @@ pub enum FilterMatch {
     PlatformMismatch,
     /// The `host:` portion rejected the current host.
     HostMismatch,
+    /// The `mgr:` portion rejected the active package manager.
+    ManagerMismatch,
 }
 
 impl FilterMatch {
@@ -74,6 +99,7 @@ impl FilterMatch {
             Self::Match => 0,
             Self::PlatformMismatch => 1,
             Self::HostMismatch => 2,
+            Self::ManagerMismatch => 3,
         }
     }
 }
@@ -116,7 +142,13 @@ pub fn host_match(spec: &str, env: &RuntimeEnv) -> bool {
     match_specs(spec, &[env.host()], CaseMode::Lowercase)
 }
 
-/// Returns whether a combined `os:`/`host:` filter matches the runtime.
+/// Returns whether a comma-separated package-manager spec matches the runtime.
+#[must_use]
+pub fn manager_match(spec: &str, env: &RuntimeEnv) -> bool {
+    match_specs(spec, &[env.package_manager()], CaseMode::Lowercase)
+}
+
+/// Returns whether a combined `os:`/`host:`/`mgr:` filter matches the runtime.
 #[must_use]
 pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
     if spec.is_empty() {
@@ -125,12 +157,15 @@ pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
 
     let mut platform_spec = String::new();
     let mut host_spec = String::new();
+    let mut manager_spec = String::new();
 
     for token in spec.split(',').filter(|token| !token.is_empty()) {
         if let Some(value) = token.strip_prefix("os:") {
             append_spec(&mut platform_spec, value);
         } else if let Some(value) = token.strip_prefix("host:") {
             append_spec(&mut host_spec, value);
+        } else if let Some(value) = token.strip_prefix("mgr:") {
+            append_spec(&mut manager_spec, value);
         }
     }
 
@@ -139,6 +174,9 @@ pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
     }
     if !host_spec.is_empty() && !host_match(&host_spec, env) {
         return FilterMatch::HostMismatch;
+    }
+    if !manager_spec.is_empty() && !manager_match(&manager_spec, env) {
+        return FilterMatch::ManagerMismatch;
     }
 
     FilterMatch::Match
@@ -362,9 +400,69 @@ mod tests {
     }
 
     #[test]
+    fn manager_filter_supports_includes_excludes_and_unknown_fallbacks() {
+        let pacman = RuntimeEnv::new("linux", "workstation").with_package_manager("pacman");
+        let unknown = RuntimeEnv::new("linux", "workstation");
+
+        assert_eq!(
+            filter_match("mgr:brew,mgr:pacman", &pacman),
+            FilterMatch::Match
+        );
+        assert_eq!(
+            filter_match("mgr:apt,mgr:dnf", &pacman),
+            FilterMatch::ManagerMismatch
+        );
+        assert_eq!(
+            filter_match("mgr:!brew,mgr:!pacman", &pacman),
+            FilterMatch::ManagerMismatch
+        );
+        assert_eq!(
+            filter_match("mgr:!brew,mgr:!pacman", &unknown),
+            FilterMatch::Match
+        );
+        assert_eq!(
+            filter_match("mgr:brew,mgr:pacman", &unknown),
+            FilterMatch::ManagerMismatch
+        );
+    }
+
+    #[test]
+    fn android_runtime_exposes_android_instead_of_underlying_apt_manager() {
+        let env = RuntimeEnv::new("linux", "phone")
+            .with_package_manager("apt")
+            .with_android(true);
+
+        assert_eq!(filter_match("mgr:android", &env), FilterMatch::Match);
+        assert_eq!(filter_match("mgr:apt", &env), FilterMatch::ManagerMismatch);
+        assert_eq!(
+            filter_match("mgr:!brew,mgr:!pacman", &env),
+            FilterMatch::Match
+        );
+    }
+
+    #[test]
+    fn filter_reports_manager_mismatch_after_platform_and_host() {
+        let env = RuntimeEnv::new("linux", "nas").with_package_manager("apt");
+
+        assert_eq!(
+            filter_match("os:macos,host:missing,mgr:pacman", &env),
+            FilterMatch::PlatformMismatch
+        );
+        assert_eq!(
+            filter_match("os:linux,host:missing,mgr:pacman", &env),
+            FilterMatch::HostMismatch
+        );
+        assert_eq!(
+            filter_match("os:linux,host:nas,mgr:pacman", &env),
+            FilterMatch::ManagerMismatch
+        );
+    }
+
+    #[test]
     fn filter_result_exposes_bash_exit_codes() {
         assert_eq!(FilterMatch::Match.exit_code(), 0);
         assert_eq!(FilterMatch::PlatformMismatch.exit_code(), 1);
         assert_eq!(FilterMatch::HostMismatch.exit_code(), 2);
+        assert_eq!(FilterMatch::ManagerMismatch.exit_code(), 3);
     }
 }

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::method;
+use crate::platform::{self, RuntimeEnv};
 
 /// Parsed dependency entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +27,7 @@ pub struct Entry {
     pub cmd_explicit: bool,
     /// Package-manager override list for `pkg` dependencies.
     pub aliases: String,
-    /// Combined `os:`/`host:` filter string.
+    /// Combined `os:`/`host:`/`mgr:` filter string.
     pub filter: String,
 }
 
@@ -313,6 +314,21 @@ fn dedupe_last_wins(entries: Vec<String>) -> Vec<String> {
 /// `update`, `list`, `dep-file`, and bridge APIs cannot accidentally disagree
 /// about `.git` canonicalization or comment handling.
 pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
+    load_dir_entries(conf_dir, None)
+}
+
+/// Loads config while selecting one active declaration from filtered duplicates.
+///
+/// Ordinary duplicate declarations retain the historical last-wins override
+/// behavior. When every declaration for one name is filtered, however, the
+/// last matching declaration wins. This lets one manifest identity move
+/// safely between platform or package-manager providers, so the normal method
+/// transition cleanup removes the previous provider's managed artifacts.
+pub fn load_dir_for_runtime(conf_dir: &Path, env: &RuntimeEnv) -> Result<Vec<String>> {
+    load_dir_entries(conf_dir, Some(env))
+}
+
+fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<Vec<String>> {
     let mut files = conf_files(conf_dir)?;
     files.sort();
 
@@ -325,7 +341,10 @@ pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
     // user who declares the same dep in two `*.conf` files gets the last
     // (lex-order) definition rather than two adjacent entries that would
     // both get processed by `update`.
-    let mut entries = dedupe_last_wins(entries);
+    let mut entries = match env {
+        Some(env) => select_filtered_duplicates(entries, env),
+        None => dedupe_last_wins(entries),
+    };
     // Drop entries whose dep name is not safe to use as a managed path
     // suffix BEFORE downstream callers (update, prune, status) start
     // joining the name into `install_dir` / `state_dir` / `hooks_dir`.
@@ -344,6 +363,41 @@ pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
     });
     sort_entries(&mut entries);
     Ok(entries)
+}
+
+fn select_filtered_duplicates(entries: Vec<String>, env: &RuntimeEnv) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut groups: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for (index, entry) in entries.into_iter().enumerate() {
+        groups
+            .entry(entry_name(&entry).to_owned())
+            .or_default()
+            .push((index, entry));
+    }
+
+    let mut selected = groups
+        .into_values()
+        .filter_map(|group| {
+            if group.len() == 1 || group.iter().any(|(_, raw)| entry_filter(raw).is_empty()) {
+                return group.into_iter().last();
+            }
+            group
+                .iter()
+                .rev()
+                .find(|(_, raw)| {
+                    platform::filter_match(entry_filter(raw), env) == platform::FilterMatch::Match
+                })
+                .cloned()
+                .or_else(|| group.into_iter().last())
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by_key(|(index, _)| *index);
+    selected.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn entry_filter(entry: &str) -> &str {
+    entry.split('|').nth(4).unwrap_or_default()
 }
 
 /// Returns whether a dependency name is safe to use as a managed path suffix.
@@ -417,9 +471,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        canonical_name, load_dir, parse_config_line, parse_config_texts, parse_entry,
-        parse_entry_for_runtime, resolve_override, resolve_override_for_runtime, short_name,
-        sort_entries, valid_cmd_basename, valid_dep_name,
+        RuntimeEnv, canonical_name, load_dir, load_dir_for_runtime, parse_config_line,
+        parse_config_texts, parse_entry, parse_entry_for_runtime, resolve_override,
+        resolve_override_for_runtime, short_name, sort_entries, valid_cmd_basename, valid_dep_name,
     };
 
     #[test]
@@ -662,11 +716,12 @@ mod tests {
     fn checked_in_dependency_example_uses_the_production_grammar() {
         let entries = parse_config_texts([include_str!("../examples/deps.conf")]);
 
-        assert_eq!(entries.len(), 19, "every active example row should parse");
+        assert_eq!(entries.len(), 20, "every active example name should parse");
         assert!(entries.contains(&"fd|pkg|apt:fdfind|apt:fd-find,dnf:fd-find".to_owned()));
         assert!(entries.contains(&"neovim/neovim|github:release|nvim".to_owned()));
         assert!(entries.contains(&"nerd-fonts|custom".to_owned()));
         assert!(entries.contains(&"openai/codex|github:release|-|-|host:nas".to_owned()));
+        assert!(entries.contains(&"ast-grep|cargo|-|-|mgr:!brew,mgr:!pacman".to_owned()));
     }
 
     #[test]
@@ -706,6 +761,42 @@ mod tests {
         let entries = load_dir(&dir).unwrap();
 
         assert_eq!(entries, vec!["tool-a|cargo", "tool-b|pkg"]);
+    }
+
+    #[test]
+    fn runtime_loader_selects_active_filtered_provider_with_one_identity() {
+        let dir = temp_dir("filtered-provider");
+        write(
+            &dir.join("deps.conf"),
+            "ast-grep pkg ast-grep pacman:ast-grep mgr:pacman\nast-grep cargo - - mgr:!pacman\n",
+        );
+
+        let pacman = RuntimeEnv::new("linux", "host").with_package_manager("pacman");
+        let apt = RuntimeEnv::new("linux", "host").with_package_manager("apt");
+
+        assert_eq!(
+            load_dir_for_runtime(&dir, &pacman).unwrap(),
+            vec!["ast-grep|pkg|ast-grep|pacman:ast-grep|mgr:pacman"]
+        );
+        assert_eq!(
+            load_dir_for_runtime(&dir, &apt).unwrap(),
+            vec!["ast-grep|cargo|-|-|mgr:!pacman"]
+        );
+    }
+
+    #[test]
+    fn runtime_loader_keeps_unfiltered_override_last_wins() {
+        let dir = temp_dir("unfiltered-override");
+        write(
+            &dir.join("deps.conf"),
+            "tool pkg - - mgr:pacman\ntool cargo\n",
+        );
+        let pacman = RuntimeEnv::new("linux", "host").with_package_manager("pacman");
+
+        assert_eq!(
+            load_dir_for_runtime(&dir, &pacman).unwrap(),
+            vec!["tool|cargo"]
+        );
     }
 
     #[test]

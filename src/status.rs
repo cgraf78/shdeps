@@ -27,6 +27,8 @@ pub enum SkipReason {
     Platform,
     /// The dependency's `host:` filter excludes the current host.
     Host,
+    /// The dependency's `mgr:` filter excludes the active package manager.
+    ManagerFilter,
     /// The active package-manager override resolves to `NONE`.
     PackageManager,
 }
@@ -93,7 +95,7 @@ where
 {
     /// Runtime filesystem roots.
     pub roots: &'a Roots,
-    /// Runtime platform/host identity.
+    /// Runtime platform, host, and package-manager identity.
     pub env: &'a RuntimeEnv,
     /// Loaded install manifest.
     pub manifest: &'a Manifest,
@@ -186,6 +188,7 @@ where
     match platform::filter_match(&entry.filter, context.env).exit_code() {
         1 => return Ok(State::Skipped(SkipReason::Platform)),
         2 => return Ok(State::Skipped(SkipReason::Host)),
+        3 => return Ok(State::Skipped(SkipReason::ManagerFilter)),
         _ => {}
     }
 
@@ -432,6 +435,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(status.state, State::Skipped(SkipReason::Platform));
+    }
+
+    #[test]
+    fn manager_filtered_dependencies_are_skipped_before_method_checks() {
+        let roots = roots();
+        let manifest = Manifest::default();
+        let runner = FakeRunner::default();
+        let env = RuntimeEnv::new("linux", "workstation").with_package_manager("apt");
+        let package_versions = BTreeMap::new();
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &NoCustomProbe,
+            "apt",
+            &package_versions,
+        );
+
+        let status = classify(
+            &parse_entry("tool|cargo|tool|-|mgr:pacman", Some("apt")),
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(status.state, State::Skipped(SkipReason::ManagerFilter));
     }
 
     #[test]

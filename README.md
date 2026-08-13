@@ -16,7 +16,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 
 - **Declarative config** — one line per dependency in `*.conf` files
 - **Multiple install methods** — system packages (brew/apt/dnf/pacman/zypper/apk), automatic GitHub release/repo selection, explicit GitHub repos, explicit GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), Node.js CLI tools (`npm install -g`), or fully custom hooks
-- **Cross-platform** — Linux, macOS, WSL with `os:` and `host:` filtering per dep
+- **Cross-platform** — Linux, macOS, WSL with `os:`, `host:`, and `mgr:` filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
 - **TTL-based caching** — avoids redundant network calls
@@ -123,9 +123,17 @@ Or manually: `rm -rf ~/.local/share/shdeps && rm -f ~/.local/bin/shdeps ~/.local
 | `method`  | yes      | Install method: `pkg`, `github`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, `npm`, or `custom`                                             |
 | `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` and higher-priority `android:name` qualifiers (e.g., `android:fd,apt:fdfind`). |
 | `aliases` | no       | For `pkg`: per-manager package overrides (`apt:fd-find,dnf:fd-find`). `android:name` takes priority on Android. Use `NONE` to skip a runtime. |
-| `filter`  | no       | Platform and hostname filter. Use `os:` and `host:` prefixes (e.g., `os:linux`, `os:android`, `host:nas`, `os:!wsl`). Android also matches `os:linux`. |
+| `filter`  | no       | Platform, hostname, and package-manager filter. Use `os:`, `host:`, and `mgr:` prefixes (e.g., `os:linux`, `host:nas`, `mgr:brew`, `mgr:!pacman`). Android matches both `os:linux` and `mgr:android`. |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
+
+Values within one filter dimension are alternatives, while different dimensions
+must all match. For example, `os:linux,mgr:apt,mgr:dnf` means Linux with either
+APT or DNF. A filter containing only exclusions matches unknown managers, so
+`mgr:!brew,mgr:!pacman` is a useful fallback route. Filtered declarations may
+share one dependency name; Shdeps selects the last matching declaration before
+applying its normal last-wins rule, preserving one manifest identity across
+provider transitions.
 
 ### Environment Variables
 
@@ -468,7 +476,7 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_prune [-y] [--dry-run]`   | Remove orphaned deps no longer in config                                                    |
 | `shdeps_load`                     | Parse config and return dep count                                                           |
 | `shdeps_version`                  | Print version string                                                                        |
-| `shdeps_filter_match <spec>`      | Check if current platform/host matches a filter spec (e.g., `os:linux,host:nas`, `os:!wsl`) |
+| `shdeps_filter_match <spec>`      | Check if the current platform, host, and package manager match a filter spec (e.g., `os:linux,host:nas,mgr:apt`) |
 | `shdeps_platform_match <spec>`    | Check if current platform matches a spec (e.g., `linux,macos`, `!wsl`)                      |
 | `shdeps_host_match <spec>`        | Check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`)               |
 | `shdeps_platform`                 | Print normalized platform name (`linux`, `macos`, `wsl`)                                    |

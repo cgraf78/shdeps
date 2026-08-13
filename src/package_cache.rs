@@ -159,7 +159,7 @@ pub struct InputSource<'a, R: Runner> {
     pub entries: &'a [Entry],
     /// Runtime filesystem roots.
     pub roots: &'a Roots,
-    /// Runtime platform/host identity.
+    /// Runtime platform, host, and package-manager identity.
     pub env: &'a RuntimeEnv,
     /// Manifest path whose content participates in the proof.
     pub manifest_path: &'a Path,

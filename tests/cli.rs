@@ -257,6 +257,23 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert!(stdout.contains("abi=1\n"));
     assert_eq!(text(&snapshot.stderr), "");
 
+    fixture.write_executable("bin/pacman", "#!/bin/sh\nexit 0\n");
+    let mut manager_match = fixture.command(["__api", "filter-match", "mgr:brew,mgr:pacman"]);
+    manager_match.env_remove("SHDEPS_PKG_MGR");
+    manager_match.env("PATH", fixture.dir.join("bin"));
+    let manager_match = run(&mut manager_match);
+    assert_success(&manager_match);
+    assert_eq!(text(&manager_match.stdout), "");
+    assert_eq!(text(&manager_match.stderr), "");
+
+    let mut manager_mismatch = fixture.command(["__api", "filter-match", "mgr:apt"]);
+    manager_mismatch.env_remove("SHDEPS_PKG_MGR");
+    manager_mismatch.env("PATH", fixture.dir.join("bin"));
+    let manager_mismatch = run(&mut manager_mismatch);
+    assert_eq!(manager_mismatch.status.code(), Some(3));
+    assert_eq!(text(&manager_mismatch.stdout), "");
+    assert_eq!(text(&manager_mismatch.stderr), "");
+
     let links = run(&mut fixture.command(["__api", "dep-links", "owner/tool"]));
     assert_success(&links);
     assert_eq!(
@@ -2460,10 +2477,11 @@ fn update_prerequisites_ignore_filtered_inactive_methods() {
     let fixture = Fixture::new("update-prereqs-filtered");
     fixture.write(
         "conf/deps.conf",
-        "ripgrep cargo rg - os:macos\nprettier npm - - host:other-host\ntool custom\n",
+        "ripgrep cargo rg - os:macos\nprettier npm - - host:other-host\ntokei cargo - - mgr:!pacman\ntool custom\n",
     );
     let missing_path = fixture.dir.join("missing-path");
     fs::create_dir_all(&missing_path).unwrap();
+    fixture.write_executable("missing-path/pacman", "#!/bin/sh\nexit 0\n");
 
     let mut command = fixture.command(["update"]);
     command.env("PATH", &missing_path);

@@ -489,7 +489,7 @@ where
     pub manifest_path: &'a std::path::Path,
     /// Runtime filesystem roots.
     pub roots: &'a Roots,
-    /// Runtime platform/host identity.
+    /// Runtime platform, host, and package-manager identity.
     pub env: &'a RuntimeEnv,
     /// Bash hook subprocess runner.
     pub hooks: &'a BashCustomProbe,

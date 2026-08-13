@@ -73,7 +73,7 @@ pub struct Context<'a, R: Runner> {
     pub roots: &'a Roots,
     /// Existing install manifest, used to seed bare `github` caches.
     pub manifest: Option<&'a Manifest>,
-    /// Runtime platform/host identity.
+    /// Runtime platform, host, and package-manager identity.
     pub env: &'a RuntimeEnv,
     /// Environment variables used for GitHub credentials.
     pub env_vars: &'a BTreeMap<String, String>,

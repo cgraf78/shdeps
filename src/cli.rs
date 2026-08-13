@@ -398,10 +398,8 @@ where
     };
 
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
-    dep_links_result(
-        dep_links::links(target, &roots, &runtime::runtime_env(&ProcessEnv)),
-        stdout,
-    )
+    let (_, env) = detected_runtime_env();
+    dep_links_result(dep_links::links(target, &roots, &env), stdout)
 }
 
 fn list_cmd<W, E>(
@@ -416,8 +414,8 @@ where
 {
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     let pkg_mgr = process::detect_package_manager(&Process);
-    let env = runtime::runtime_env(&ProcessEnv);
-    let raw_entries = config::load_dir(&roots.conf_dir)?;
+    let env = runtime_env_for_manager(&pkg_mgr);
+    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
     let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     if entries.is_empty() {
         writeln!(stdout, "No dependencies configured.")?;
@@ -466,7 +464,9 @@ where
     };
 
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
-    let raw_entries = config::load_dir(&roots.conf_dir)?;
+    let pkg_mgr = process::detect_package_manager(&Process);
+    let env = runtime_env_for_manager(&pkg_mgr);
+    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
     let Some(raw_entry) = raw_entries.iter().find(|raw| {
         let entry = config::parse_entry(raw, None);
         entry.name == *target
@@ -475,13 +475,6 @@ where
         return Ok(1);
     };
 
-    let probe_entry = config::parse_entry(raw_entry, None);
-    let pkg_mgr = if probe_entry.method == method::PKG {
-        process::detect_package_manager(&Process)
-    } else {
-        String::new()
-    };
-    let env = runtime::runtime_env(&ProcessEnv);
     let entry = config::parse_entry_for_runtime(
         raw_entry,
         if pkg_mgr.is_empty() {
@@ -562,8 +555,8 @@ where
     self_update_before_update(&roots, update_options, options, stderr)?;
 
     let pkg_mgr = process::detect_package_manager(&Process);
-    let env = runtime::runtime_env(&ProcessEnv);
-    let raw_entries = config::load_dir(&roots.conf_dir)?;
+    let env = runtime_env_for_manager(&pkg_mgr);
+    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
     let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     if entries.is_empty() {
         if options.quiet {
@@ -1418,9 +1411,9 @@ where
     }
 
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
-    let env = runtime::runtime_env(&ProcessEnv);
-    let raw_entries = config::load_dir(&roots.conf_dir)?;
-    let entries = parse_entries(&raw_entries, "", &env);
+    let (pkg_mgr, env) = detected_runtime_env();
+    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
+    let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     let env_vars = env_vars(options);
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
@@ -1532,12 +1525,9 @@ where
     W: Write,
 {
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    let (_, env) = detected_runtime_env();
     run_path_lookup(
-        dep_path::root(
-            target,
-            &roots.dep_path_roots(),
-            &runtime::runtime_env(&ProcessEnv),
-        ),
+        dep_path::root(target, &roots.dep_path_roots(), &env),
         stdout,
     )
 }
@@ -1547,13 +1537,9 @@ where
     W: Write,
 {
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    let (_, env) = detected_runtime_env();
     run_path_lookup(
-        dep_path::path(
-            target,
-            rel,
-            &roots.dep_path_roots(),
-            &runtime::runtime_env(&ProcessEnv),
-        ),
+        dep_path::path(target, rel, &roots.dep_path_roots(), &env),
         stdout,
     )
 }
@@ -1563,15 +1549,23 @@ where
     W: Write,
 {
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    let (_, env) = detected_runtime_env();
     run_path_lookup(
-        dep_path::file(
-            target,
-            rel,
-            &roots.dep_path_roots(),
-            &runtime::runtime_env(&ProcessEnv),
-        ),
+        dep_path::file(target, rel, &roots.dep_path_roots(), &env),
         stdout,
     )
+}
+
+/// Builds one runtime identity from an already-detected package manager.
+fn runtime_env_for_manager(pkg_mgr: &str) -> crate::platform::RuntimeEnv {
+    runtime::runtime_env(&ProcessEnv).with_package_manager(pkg_mgr)
+}
+
+/// Detects the package manager once and returns it with the matching runtime identity.
+fn detected_runtime_env() -> (String, crate::platform::RuntimeEnv) {
+    let pkg_mgr = process::detect_package_manager(&Process);
+    let env = runtime_env_for_manager(&pkg_mgr);
+    (pkg_mgr, env)
 }
 
 fn parse_entries(
@@ -1800,6 +1794,7 @@ fn list_fields(state: &State) -> (&'static str, String) {
         State::Missing => ("missing", String::new()),
         State::Skipped(SkipReason::Platform) => ("skipped", "(platform)".to_owned()),
         State::Skipped(SkipReason::Host) => ("skipped", "(host)".to_owned()),
+        State::Skipped(SkipReason::ManagerFilter) => ("skipped", "(manager filter)".to_owned()),
         State::Skipped(SkipReason::PackageManager) => ("skipped", "(pkg manager)".to_owned()),
     }
 }
@@ -1824,6 +1819,9 @@ where
         }
         State::Skipped(SkipReason::Host) => {
             writeln!(stdout, "{}: skipped (host mismatch)", status.name)?;
+        }
+        State::Skipped(SkipReason::ManagerFilter) => {
+            writeln!(stdout, "{}: skipped (manager filter)", status.name)?;
         }
         State::Skipped(SkipReason::PackageManager) => {
             writeln!(stdout, "{}: skipped (pkg manager)", status.name)?;

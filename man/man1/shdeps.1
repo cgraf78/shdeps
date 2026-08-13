@@ -174,17 +174,27 @@ Use
 to skip a specific manager.
 .TP
 .B filter
-Combined platform and hostname filter using
+Combined platform, hostname, and package-manager filter using
 .B os:
-and
+,
 .B host:
+,
+and
+.B mgr:
 prefixes.
 Comma-separated (e.g.,
-.BR os:linux,host:nas ).
+.BR os:linux,host:nas,mgr:apt ).
 Prefix with
 .B !
 to exclude (e.g.,
-.BR os:!wsl ).
+.BR os:!wsl,mgr:!pacman ).
+Termux exposes
+.B mgr:android
+even though its package operations use APT-compatible commands internally.
+Values within one prefix are alternatives; different prefixes must all match.
+A filter containing only package-manager exclusions matches an unknown manager.
+Filtered declarations may share one dependency name; the last matching
+declaration is selected before ordinary last-wins override handling.
 .SS Install Methods
 .TP
 .B pkg
