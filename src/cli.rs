@@ -905,7 +905,11 @@ fn update_prerequisite_error(
 ) -> Option<String> {
     let missing = update_prerequisites(entries, env, phase)
         .into_iter()
-        .filter(|prereq| !runner.exists(prereq.command))
+        .filter(|prereq| {
+            !runner.exists(prereq.command)
+                && !(phase == UpdatePrerequisitePhase::ConcreteOnly
+                    && package_bootstraps_prerequisite(entries, env, *prereq))
+        })
         .collect::<Vec<_>>();
     if missing.is_empty() {
         return None;
@@ -919,6 +923,24 @@ fn update_prerequisite_error(
     Some(format!(
         "error: shdeps update is missing required tools for configured deps: {details}"
     ))
+}
+
+fn package_bootstraps_prerequisite(
+    entries: &[Entry],
+    env: &crate::platform::RuntimeEnv,
+    prereq: UpdatePrerequisite,
+) -> bool {
+    entries.iter().any(|entry| {
+        entry.method == method::PKG
+            && update::active(entry, env)
+            && entry.cmd == prereq.command
+            && config::resolve_override_for_runtime(
+                &entry.name,
+                &entry.aliases,
+                Some(env.package_manager()),
+                env.is_android(),
+            ) != "NONE"
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2989,10 +3011,70 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    use super::{install_dir_from_exe, run, source_checkout_dir_from_target};
+    use super::{
+        UpdatePrerequisite, install_dir_from_exe, package_bootstraps_prerequisite, run,
+        source_checkout_dir_from_target,
+    };
     use crate::config::Entry;
     use crate::update::{GroupSummary, Item, ItemReason, Summary};
     use crate::version;
+
+    #[test]
+    fn package_entry_can_bootstrap_a_method_prerequisite() {
+        let env = crate::platform::RuntimeEnv::new("linux", "host").with_package_manager("apt");
+        let cargo = Entry {
+            name: "cargo".into(),
+            method: crate::method::PKG.into(),
+            cmd: "cargo".into(),
+            cmd_explicit: true,
+            aliases: "android:rust,apt:cargo".into(),
+            filter: "mgr:!brew,mgr:!pacman".into(),
+        };
+        let prereq = UpdatePrerequisite {
+            command: "cargo",
+            reason: "cargo installs",
+        };
+
+        assert!(package_bootstraps_prerequisite(&[cargo], &env, prereq));
+    }
+
+    #[test]
+    fn unavailable_package_cannot_bootstrap_a_method_prerequisite() {
+        let env = crate::platform::RuntimeEnv::new("linux", "host").with_package_manager("apk");
+        let cargo = Entry {
+            name: "cargo".into(),
+            method: crate::method::PKG.into(),
+            cmd: "cargo".into(),
+            cmd_explicit: true,
+            aliases: "apk:NONE".into(),
+            filter: String::new(),
+        };
+        let prereq = UpdatePrerequisite {
+            command: "cargo",
+            reason: "cargo installs",
+        };
+
+        assert!(!package_bootstraps_prerequisite(&[cargo], &env, prereq));
+    }
+
+    #[test]
+    fn inactive_package_cannot_bootstrap_a_method_prerequisite() {
+        let env = crate::platform::RuntimeEnv::new("linux", "host").with_package_manager("apt");
+        let cargo = Entry {
+            name: "cargo".into(),
+            method: crate::method::PKG.into(),
+            cmd: "cargo".into(),
+            cmd_explicit: true,
+            aliases: "apt:cargo".into(),
+            filter: "mgr:pacman".into(),
+        };
+        let prereq = UpdatePrerequisite {
+            command: "cargo",
+            reason: "cargo installs",
+        };
+
+        assert!(!package_bootstraps_prerequisite(&[cargo], &env, prereq));
+    }
 
     #[test]
     fn version_prints_embedded_public_version() {

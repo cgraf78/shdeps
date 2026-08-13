@@ -2512,6 +2512,24 @@ fn update_requires_curl_for_bare_github_resolution_upfront() {
 }
 
 #[test]
+fn package_curl_cannot_bootstrap_bare_github_resolution() {
+    let fixture = Fixture::new("update-prereqs-bare-github-pkg-curl");
+    fixture.write("conf/deps.conf", "curl pkg\nowner/tool github tool\n");
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command.env("PATH", &missing_path);
+    let output = run(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        "error: shdeps update is missing required tools for configured deps: curl (GitHub release metadata and downloads)\n"
+    );
+}
+
+#[test]
 fn update_requires_git_after_bare_github_resolves_to_repo() {
     let fixture = Fixture::new("update-prereqs-bare-github-repo");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
