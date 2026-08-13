@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@3834fe036de0360a8418b6e129034797071edb0c
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@2a6119d7886443929e1961a0e11b8dafa71c1978
     with:
       # rust-version is a compatibility promise, so exercise it inside the
       # shared required gate instead of leaving the README badge aspirational.
@@ -60,7 +60,7 @@ jobs:
         SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@3834fe036de0360a8418b6e129034797071edb0c
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@2a6119d7886443929e1961a0e11b8dafa71c1978
     with:
       # Cross-distribution package-manager behavior is shdeps' product surface,
       # so the broad shell matrix is intentional rather than shared-CI drift.
@@ -81,7 +81,7 @@ jobs:
         tests/shell/release-scripts-test
 
   bash32:
-    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@3834fe036de0360a8418b6e129034797071edb0c
+    uses: cgraf78/actions/.github/workflows/bash32-ci.yml@2a6119d7886443929e1961a0e11b8dafa71c1978
     with:
       # install.sh runs before shdeps can provide a newer shell, including on
       # stock macOS. This compatibility gate is therefore product behavior,
@@ -102,4 +102,4 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@3834fe036de0360a8418b6e129034797071edb0c
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@2a6119d7886443929e1961a0e11b8dafa71c1978
