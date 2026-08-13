@@ -16,6 +16,7 @@ use crate::update::{
     Context, Item, ItemReason, Options, Progress, Summary, active, detail_with_action,
     verbose_enabled,
 };
+use std::collections::BTreeSet;
 use std::io;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,8 +133,9 @@ pub(crate) fn package_versions(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     options: Options,
+    transitions: &BTreeSet<String>,
 ) -> std::collections::BTreeMap<String, String> {
-    if !needs_package_version_snapshot(entries, context, options) {
+    if !needs_package_version_snapshot(entries, context, options, transitions) {
         return std::collections::BTreeMap::new();
     }
     process::package_versions(context.runner, context.pkg_mgr)
@@ -143,8 +145,9 @@ pub(crate) fn sudo_status(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     package_versions: &std::collections::BTreeMap<String, String>,
+    transitions: &BTreeSet<String>,
 ) -> Result<SudoStatus> {
-    if !needs_package_work(entries, context, package_versions) {
+    if !needs_package_work(entries, context, package_versions, transitions) {
         return Ok(SudoStatus::Available);
     }
     if pkg::Elevation::for_manager(context.pkg_mgr, context.env) == pkg::Elevation::Direct
@@ -166,10 +169,11 @@ pub(crate) fn prepare(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     package_versions: &std::collections::BTreeMap<String, String>,
+    transitions: &BTreeSet<String>,
     sudo: SudoStatus,
     progress: &mut dyn Progress,
 ) -> Result<()> {
-    if !needs_package_work(entries, context, package_versions) {
+    if !needs_package_work(entries, context, package_versions, transitions) {
         return Ok(());
     }
     if sudo == SudoStatus::UnavailableQuiet {
@@ -185,6 +189,7 @@ fn needs_package_version_snapshot(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     _options: Options,
+    transitions: &BTreeSet<String>,
 ) -> bool {
     // Batch package versions are useful only when command lookup alone cannot
     // prove every active package dependency. Avoiding the manager-wide query on
@@ -201,7 +206,8 @@ fn needs_package_version_snapshot(
             Some(context.pkg_mgr),
             context.env.is_android(),
         );
-        resolved != "NONE" && !context.runner.exists(&entry.cmd)
+        resolved != "NONE"
+            && (transitions.contains(&entry.name) || !context.runner.exists(&entry.cmd))
     })
 }
 
@@ -212,6 +218,7 @@ pub(crate) fn install(
     sudo: SudoStatus,
     queued: &mut Vec<Queued>,
     package_versions: &std::collections::BTreeMap<String, String>,
+    transitioning: bool,
 ) -> Result<Item> {
     let resolved = config::resolve_override_for_runtime(
         &entry.name,
@@ -227,13 +234,8 @@ pub(crate) fn install(
         ));
     }
 
-    if process::dep_exists_with_versions(
-        context.runner,
-        &entry.cmd,
-        &resolved,
-        context.pkg_mgr,
-        package_versions,
-    ) {
+    let installed = installed(entry, &resolved, context, package_versions, transitioning);
+    if installed {
         manifest::upsert(
             context.manifest_path,
             ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
@@ -344,6 +346,7 @@ fn needs_package_work(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     package_versions: &std::collections::BTreeMap<String, String>,
+    transitions: &BTreeSet<String>,
 ) -> bool {
     if context.pkg_mgr.is_empty() {
         return false;
@@ -361,14 +364,36 @@ fn needs_package_work(
             context.env.is_android(),
         );
         resolved != "NONE"
-            && !process::dep_exists_with_versions(
-                context.runner,
-                &entry.cmd,
+            && !installed(
+                entry,
                 &resolved,
-                context.pkg_mgr,
+                context,
                 package_versions,
+                transitions.contains(&entry.name),
             )
     })
+}
+
+fn installed(
+    entry: &Entry,
+    package: &str,
+    context: &Context<'_, impl Runner>,
+    package_versions: &std::collections::BTreeMap<String, String>,
+    transitioning: bool,
+) -> bool {
+    if transitioning {
+        // A command owned by the old method must not satisfy the new package
+        // provider: transition cleanup will remove that command afterward.
+        return package_versions.contains_key(package)
+            || process::package_installed(context.runner, package, context.pkg_mgr);
+    }
+    process::dep_exists_with_versions(
+        context.runner,
+        &entry.cmd,
+        package,
+        context.pkg_mgr,
+        package_versions,
+    )
 }
 
 fn user_is_root(runner: &impl Runner) -> Result<bool> {
