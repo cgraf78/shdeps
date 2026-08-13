@@ -81,10 +81,12 @@ ruff                uv
 nerd-fonts          custom
 openai/codex        github:release   -                -                        host:nas
 dust                pkg              -                -                        os:macos
+ast-grep            pkg              ast-grep         brew:ast-grep,pacman:ast-grep mgr:brew,mgr:pacman
+ast-grep            cargo            -                -                        mgr:!brew,mgr:!pacman
 ```
 
 Methods: `pkg` (system package manager), `github` (auto-resolve to release or repo), `github:repo` (GitHub clone), `github:release` (GitHub release binary), `cargo` (Rust crate), `go` (Go module), `uv` (Python CLI tool), `npm` (Node.js package), `custom` (hook-only).
-Fields are ordered most-used to least-used. For `github`/`github:repo`/`github:release`, the `owner/repo` is the `name` field. For `go`, the full module path (e.g. `github.com/junegunn/fzf`) is the `name`. `cmd` supports `mgr:name` qualifiers (e.g., `apt:batcat`). `aliases` holds per-manager package name overrides for `pkg` deps. `filter` uses `os:` and `host:` prefixes (e.g., `os:linux`, `host:nas`, `os:!wsl`).
+Fields are ordered most-used to least-used. For `github`/`github:repo`/`github:release`, the `owner/repo` is the `name` field. For `go`, the full module path (e.g. `github.com/junegunn/fzf`) is the `name`. `cmd` supports `mgr:name` qualifiers (e.g., `apt:batcat`). `aliases` holds per-manager package name overrides for `pkg` deps. `filter` uses `os:`, `host:`, and `mgr:` prefixes (e.g., `os:linux`, `host:nas`, `mgr:brew`, `mgr:!pacman`). Termux exposes `mgr:android`.
 
 ## State Tracking
 

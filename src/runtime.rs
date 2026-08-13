@@ -120,7 +120,7 @@ pub fn roots(env: &impl Env, overrides: &Overrides) -> Roots {
     }
 }
 
-/// Resolves the platform/host identity used by filters and cache keys.
+/// Resolves the platform, host, and cached package-manager identity used by filters.
 #[must_use]
 pub fn runtime_env(env: &impl Env) -> RuntimeEnv {
     let platform = env_string(env, "SHDEPS_TEST_PLATFORM").unwrap_or_else(|| {
@@ -143,7 +143,9 @@ pub fn runtime_env(env: &impl Env) -> RuntimeEnv {
             .unwrap_or_default()
     });
 
-    RuntimeEnv::new(platform, host.trim()).with_android(is_android(env))
+    RuntimeEnv::new(platform, host.trim())
+        .with_package_manager(pkg_mgr(env))
+        .with_android(is_android(env))
 }
 
 /// Returns whether the process is running directly on Android.
@@ -287,12 +289,14 @@ mod tests {
     fn runtime_identity_prefers_test_overrides() {
         let env = FakeEnv::new()
             .with_var("SHDEPS_TEST_PLATFORM", "wsl")
-            .with_var("SHDEPS_TEST_HOST", "BUILD-HOST");
+            .with_var("SHDEPS_TEST_HOST", "BUILD-HOST")
+            .with_var("SHDEPS_PKG_MGR", "PACMAN");
 
         let runtime = runtime_env(&env);
 
         assert_eq!(runtime.platform(), "wsl");
         assert_eq!(runtime.host(), "build-host");
+        assert_eq!(runtime.package_manager(), "pacman");
     }
 
     #[test]
@@ -318,6 +322,7 @@ mod tests {
 
         assert_eq!(runtime.platform(), "linux");
         assert!(runtime.is_android());
+        assert_eq!(runtime.package_manager(), "android");
     }
 
     #[test]

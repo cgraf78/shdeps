@@ -140,6 +140,7 @@ where
                 writeln!(stderr, "error: __api filter-match requires a spec")?;
                 return Ok(2);
             };
+            let env = env.with_package_manager(package_manager());
             Ok(platform::filter_match(spec, &env).exit_code())
         }
         "platform" => {
@@ -626,11 +627,7 @@ where
 {
     let roots = runtime::roots(&ProcessEnv, overrides);
     path_result(
-        dep_path::root(
-            target,
-            &roots.dep_path_roots(),
-            &runtime::runtime_env(&ProcessEnv),
-        ),
+        dep_path::root(target, &roots.dep_path_roots(), &runtime_env_with_manager()),
         stdout,
     )
 }
@@ -645,7 +642,7 @@ where
             target,
             rel,
             &roots.dep_path_roots(),
-            &runtime::runtime_env(&ProcessEnv),
+            &runtime_env_with_manager(),
         ),
         stdout,
     )
@@ -661,7 +658,7 @@ where
             target,
             rel,
             &roots.dep_path_roots(),
-            &runtime::runtime_env(&ProcessEnv),
+            &runtime_env_with_manager(),
         ),
         stdout,
     )
@@ -672,7 +669,7 @@ where
     W: Write,
 {
     let roots = runtime::roots(&ProcessEnv, overrides);
-    match dep_links::links(target, &roots, &runtime::runtime_env(&ProcessEnv)) {
+    match dep_links::links(target, &roots, &runtime_env_with_manager()) {
         Ok(links) => {
             dep_links::write_tsv(&links, stdout)?;
             Ok(0)
@@ -794,6 +791,10 @@ fn package_manager() -> String {
     } else {
         cached
     }
+}
+
+fn runtime_env_with_manager() -> crate::platform::RuntimeEnv {
+    runtime::runtime_env(&ProcessEnv).with_package_manager(package_manager())
 }
 
 fn run_pkg_command(
