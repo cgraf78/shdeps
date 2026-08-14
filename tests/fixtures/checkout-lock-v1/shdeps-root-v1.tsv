@@ -1,0 +1,8 @@
+# cgraf78 checkout installer / Shdeps root conformance vectors, version 1.
+# name  XDG_DATA_HOME  SHDEPS_INSTALL_DIR  expected-base
+default	unset	unset	home
+xdg-only	set	unset	home
+shdeps-only	unset	set	shdeps
+both	set	set	shdeps
+shdeps-trailing	unset	trailing	shdeps
+shdeps-root	unset	root	root
