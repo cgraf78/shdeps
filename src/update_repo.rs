@@ -25,6 +25,7 @@ pub(crate) fn install(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     options: Options,
+    install_dir: &Path,
 ) -> Result<Item> {
     // Local development clones deliberately win before any network work. This
     // keeps shdeps useful while hacking on cgraf78 repos: a fleet machine can
@@ -32,27 +33,37 @@ pub(crate) fn install(
     // relink instead of a clone/pull against GitHub.
     let source = repo::source(&entry.name, context.env_vars);
     let local_clone = context.roots.git_dev_dir.join(&source.short);
+    install_locked(entry, context, options, &source, &local_clone, install_dir)
+}
+
+// Apply one repo install at the normalized root supplied by the lock coordinator.
+fn install_locked(
+    entry: &Entry,
+    context: &Context<'_, impl Runner>,
+    options: Options,
+    source: &repo::Source,
+    local_clone: &Path,
+    install_dir: &Path,
+) -> Result<Item> {
     if !local_clone.is_dir() {
-        let install_dir = context.roots.install_dir.join(&source.name);
         return if install_dir.join(".git").is_dir() {
-            install_existing(entry, context, options, &install_dir)
+            install_existing(entry, context, options, install_dir)
         } else {
-            install_fresh(entry, context, options, &install_dir, &source.url)
+            install_fresh(entry, context, options, install_dir, &source.url)
         };
     }
 
-    let install_dir = context.roots.install_dir.join(&entry.name);
-    let previous_target = fs::read_link(&install_dir).ok();
+    let previous_target = fs::read_link(install_dir).ok();
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
     let revision_path = stamp::revision_path(&context.roots.state_dir, &entry.name);
     let rev_before = stamp::revision_read(&revision_path)?;
-    let mut status = git_status(context.runner, &local_clone);
+    let mut status = git_status(context.runner, local_clone);
     let mut refresh_stamp = false;
     let mut pull_failed = false;
 
     if !stamp::remote_fresh(&stamp_path, options.freshness()) && status.is_clean() {
-        if has_upstream(context.runner, &local_clone) {
-            if pull(context.runner, &local_clone) {
+        if has_upstream(context.runner, local_clone) {
+            if pull(context.runner, local_clone) {
                 refresh_stamp = true;
             } else {
                 // A local development clone is user-owned, so shdeps must not
@@ -66,10 +77,10 @@ pub(crate) fn install(
             // stamp avoids repeating an upstream probe on every warm update.
             refresh_stamp = true;
         }
-        status = git_status(context.runner, &local_clone);
+        status = git_status(context.runner, local_clone);
     }
 
-    let rev_after = git_head(context.runner, &local_clone);
+    let rev_after = git_head(context.runner, local_clone);
 
     if let Some(parent) = install_dir.parent() {
         fs::create_dir_all(parent)?;
@@ -78,7 +89,7 @@ pub(crate) fn install(
     // symlink to a development checkout. Replacing stale managed directories
     // here lets method transitions converge on the same canonical path without
     // ever deleting the real clone under `SHDEPS_GIT_DEV_DIR`.
-    if let Some(item) = missing_explicit_command(entry, &local_clone) {
+    if let Some(item) = missing_explicit_command(entry, local_clone) {
         return Ok(item);
     }
     if let Some(revision) = &rev_after {
@@ -87,15 +98,15 @@ pub(crate) fn install(
     if refresh_stamp {
         stamp::remote_touch(&stamp_path, options.now)?;
     }
-    replace_symlink(&local_clone, &install_dir)?;
+    replace_symlink(local_clone, install_dir)?;
 
-    record_success(entry, context, &install_dir)?;
+    record_success(entry, context, install_dir)?;
 
     let changed = options.reinstall
         || status.dirty
-        || previous_target.as_ref() != Some(&local_clone)
+        || previous_target.as_deref() != Some(local_clone)
         || rev_before != rev_after;
-    let action = if previous_target.as_ref() != Some(&local_clone) {
+    let action = if previous_target.as_deref() != Some(local_clone) {
         Some("added")
     } else if rev_before != rev_after {
         Some("updated")
@@ -104,7 +115,7 @@ pub(crate) fn install(
     } else {
         None
     };
-    let mut detail = verbose_repo_detail(action, &local_clone, context, options, "local clone");
+    let mut detail = verbose_repo_detail(action, local_clone, context, options, "local clone");
     if verbose_enabled(options, context.env_vars) && detail != "local clone" {
         detail = format!("{detail} (local clone)");
     }

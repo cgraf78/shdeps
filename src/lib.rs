@@ -14,7 +14,7 @@
 pub mod api;
 pub mod archive;
 pub mod bin_link;
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 mod checkout_lock;
 pub mod checksum;
 pub mod cleanup;

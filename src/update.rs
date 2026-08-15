@@ -7,6 +7,7 @@
 //! rules here avoids each install method learning partial transaction policy.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::Result;
@@ -20,6 +21,7 @@ use crate::method;
 use crate::package_cache;
 use crate::platform::{self, RuntimeEnv};
 use crate::process::Runner;
+use crate::repo;
 use crate::runtime::Roots;
 use crate::stamp;
 use crate::update_external;
@@ -568,7 +570,7 @@ where
 /// Runs update while reporting phase and item progress to `progress`.
 pub fn run_with_progress<R>(
     entries: &[Entry],
-    manifest: &Manifest,
+    _manifest: &Manifest,
     context: &Context<'_, R>,
     options: Options,
     progress: &mut dyn Progress,
@@ -595,6 +597,13 @@ where
     // The handle is bound to a local so its `Drop` releases the lock
     // when `run` returns by any path.
     let _lock = crate::state::StateLock::acquire(&context.roots.state_dir)?;
+
+    // The caller's manifest snapshot was necessarily loaded before the state
+    // lock. Another updater may have committed a newer method or ownership row
+    // while this invocation waited, so all transition and cleanup decisions
+    // below must be rebuilt from the now-serialized on-disk state.
+    let fresh_manifest = manifest::read(context.manifest_path)?;
+    let manifest = &fresh_manifest;
 
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
     let package_transitions = transitions.keys().cloned().collect::<BTreeSet<_>>();
@@ -1068,6 +1077,75 @@ struct BuiltinOutcome {
     cleanup_leftover: bool,
 }
 
+// Return the one repo root whose ownership changes during this transition.
+fn repo_lock_root(
+    entry: &Entry,
+    transition: Option<&update_transition::Transition>,
+    context: &Context<'_, impl Runner>,
+) -> Option<PathBuf> {
+    if entry.method == method::GITHUB_REPO {
+        let source = repo::source(&entry.name, context.env_vars);
+        return Some(context.roots.install_dir.join(source.name));
+    }
+    let old = transition.map(update_transition::old)?;
+    if old.method != method::GITHUB_REPO {
+        return None;
+    }
+    let roots = cleanup_roots(context.roots);
+    cleanup::safe_repo_root(old, &roots)
+}
+
+// Enforce state-lock then checkout-lock ordering around every repo ownership change.
+fn with_repo_checkout_lock<T>(
+    entry: &Entry,
+    transition: Option<&update_transition::Transition>,
+    context: &Context<'_, impl Runner>,
+    operation: impl FnOnce(Option<&Path>) -> Result<T>,
+) -> Result<T> {
+    let Some(root) = repo_lock_root(entry, transition, context) else {
+        return operation(None);
+    };
+
+    #[cfg(unix)]
+    {
+        crate::checkout_lock::with_checkout_lock(&root, context.env_vars, |normalized| {
+            operation(Some(normalized))
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        operation(Some(&root))
+    }
+}
+
+// Serialize post-hook/package cleanup when the old method owned a repo root.
+fn with_old_repo_checkout_lock<T>(
+    old: Option<&ManifestEntry>,
+    context: &Context<'_, impl Runner>,
+    operation: impl FnOnce(Option<&Path>) -> Result<T>,
+) -> Result<T> {
+    let Some(old) = old.filter(|old| old.method == method::GITHUB_REPO) else {
+        return operation(None);
+    };
+    let roots = cleanup_roots(context.roots);
+    let Some(root) = cleanup::safe_repo_root(old, &roots) else {
+        return operation(None);
+    };
+
+    #[cfg(unix)]
+    {
+        crate::checkout_lock::with_checkout_lock(&root, context.env_vars, |normalized| {
+            operation(Some(normalized))
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        operation(Some(&root))
+    }
+}
+
 fn install_builtin<R>(
     entry: &Entry,
     context: &Context<'_, R>,
@@ -1078,87 +1156,118 @@ fn install_builtin<R>(
 where
     R: Runner + Sync,
 {
-    let result = match entry.method.as_str() {
-        method::GITHUB_RELEASE => {
-            update_transition::install_with_prepared(entry, transition, context.roots, || {
-                update_release::install_with_prefetch(entry, context, options, release_prefetch)
-            })
-        }
-        method::GITHUB_REPO => {
-            update_transition::install_with_prepared(entry, transition, context.roots, || {
-                update_repo::install(entry, context, options)
-            })
-        }
-        candidate if method::requires_external_plan(candidate) => {
-            update_transition::install_with_prepared(entry, transition, context.roots, || {
-                update_external::install(entry, context, options)
-            })
-        }
-        method => Ok(Item::failed(
-            entry.name.clone(),
-            ItemReason::UnsupportedMethod,
-            format!("{method} update is not implemented yet"),
-        )),
-    };
+    let locked = with_repo_checkout_lock(entry, transition, context, |repo_root| {
+        let result = match entry.method.as_str() {
+            method::GITHUB_RELEASE => {
+                update_transition::install_with_prepared(entry, transition, context.roots, || {
+                    update_release::install_with_prefetch(entry, context, options, release_prefetch)
+                })
+            }
+            method::GITHUB_REPO => {
+                let install_dir = repo_root.expect("repo method requires a checkout lock root");
+                update_transition::install_with_prepared(entry, transition, context.roots, || {
+                    update_repo::install(entry, context, options, install_dir)
+                })
+            }
+            candidate if method::requires_external_plan(candidate) => {
+                update_transition::install_with_prepared(entry, transition, context.roots, || {
+                    update_external::install(entry, context, options)
+                })
+            }
+            method => Ok(Item::failed(
+                entry.name.clone(),
+                ItemReason::UnsupportedMethod,
+                format!("{method} update is not implemented yet"),
+            )),
+        };
 
-    let item = match result {
-        Ok(item) => item,
-        Err(error) => Item::failed(
+        let item = match result {
+            Ok(item) => item,
+            Err(error) => Item::failed(
+                entry.name.clone(),
+                ItemReason::InstallFailed,
+                error.to_string(),
+            ),
+        };
+        let cleanup_leftover = if item.failed {
+            false
+        } else {
+            update_transition::cleanup_successful(entry, transition, context.roots, repo_root)
+                .unwrap_or(true)
+        };
+        Ok(BuiltinOutcome {
+            item,
+            cleanup_leftover,
+        })
+    });
+
+    locked.unwrap_or_else(|error| BuiltinOutcome {
+        item: Item::failed(
             entry.name.clone(),
             ItemReason::InstallFailed,
             error.to_string(),
         ),
-    };
-
-    let cleanup_leftover = if item.failed {
-        false
-    } else {
-        update_transition::cleanup_successful(entry, transition, context.roots).unwrap_or(true)
-    };
-
-    BuiltinOutcome {
-        item,
-        cleanup_leftover,
-    }
+        cleanup_leftover: false,
+    })
 }
 
 fn successful_custom(
     entry: &Entry,
-    manifest_path: &std::path::Path,
-    roots: &Roots,
+    context: &Context<'_, impl Runner>,
     changed: bool,
     detail: String,
     transition: Option<&ManifestEntry>,
 ) -> Result<CustomOutcome> {
-    manifest::upsert(
-        manifest_path,
-        ManifestEntry::new(&entry.name, method::CUSTOM, &entry.cmd, ""),
-    )?;
+    with_old_repo_checkout_lock(transition, context, |repo_root| {
+        if transition.is_some_and(|old| old.method == method::GITHUB_REPO) && repo_root.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "github:repo transition cleanup requires an acquired checkout-lock root",
+            )
+            .into());
+        }
 
-    let cleanup_leftover = match transition {
-        Some(old) => cleanup_transition(old, roots),
-        None => false,
-    };
+        manifest::upsert(
+            context.manifest_path,
+            ManifestEntry::new(&entry.name, method::CUSTOM, &entry.cmd, ""),
+        )?;
 
-    Ok(CustomOutcome {
-        item: if changed {
-            Item::changed(entry.name.clone(), ItemReason::Installed, detail)
-        } else {
-            Item::current(entry.name.clone(), ItemReason::Installed, detail)
-        },
-        cleanup_leftover,
-        marked: Vec::new(),
+        let cleanup_leftover = match transition {
+            Some(old) => cleanup_transition(old, context.roots, repo_root)?,
+            None => false,
+        };
+
+        Ok(CustomOutcome {
+            item: if changed {
+                Item::changed(entry.name.clone(), ItemReason::Installed, detail)
+            } else {
+                Item::current(entry.name.clone(), ItemReason::Installed, detail)
+            },
+            cleanup_leftover,
+            marked: Vec::new(),
+        })
     })
 }
 
-fn cleanup_transition(old: &ManifestEntry, roots: &Roots) -> bool {
+fn cleanup_transition(
+    old: &ManifestEntry,
+    roots: &Roots,
+    repo_root: Option<&Path>,
+) -> Result<bool> {
+    if old.method == method::GITHUB_REPO && repo_root.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "github:repo transition cleanup requires an acquired checkout-lock root",
+        )
+        .into());
+    }
     // Transition cleanup happens after the new method is recorded so a cleanup
     // failure cannot erase the working install. Do not run `uninstall()` here:
     // the hook path is keyed only by dependency name, so after a switch there
     // is no reliable way to source the old method's hook separately from the
     // new method's hook. Running the current hook after a successful custom
     // install could undo the install we just accepted.
-    cleanup::remove_builtin(old, &cleanup_roots(roots)).is_err()
+    Ok(cleanup::remove_builtin_with_repo_root(old, &cleanup_roots(roots), repo_root).is_err())
 }
 
 fn cleanup_successful_transition(
@@ -1167,10 +1276,16 @@ fn cleanup_successful_transition(
     context: &Context<'_, impl Runner>,
     summary: &mut Summary,
 ) -> Result<()> {
-    if update_transition::cleanup_successful(entry, transition, context.roots)? {
-        summary.leftovers.push(entry.name.clone());
-    }
-    Ok(())
+    with_old_repo_checkout_lock(
+        transition.map(update_transition::old),
+        context,
+        |repo_root| {
+            if update_transition::cleanup_successful(entry, transition, context.roots, repo_root)? {
+                summary.leftovers.push(entry.name.clone());
+            }
+            Ok(())
+        },
+    )
 }
 
 fn install_custom(
@@ -1188,14 +1303,7 @@ fn install_custom(
     let verbose = verbose_enabled(options, context.env_vars);
     match install {
         Install::Already { detail } => {
-            let mut outcome = successful_custom(
-                entry,
-                context.manifest_path,
-                context.roots,
-                false,
-                detail,
-                transition,
-            )?;
+            let mut outcome = successful_custom(entry, context, false, detail, transition)?;
             outcome.marked = marked;
             Ok(outcome)
         }
@@ -1210,14 +1318,7 @@ fn install_custom(
             } else {
                 detail
             };
-            let mut outcome = successful_custom(
-                entry,
-                context.manifest_path,
-                context.roots,
-                true,
-                detail,
-                transition,
-            )?;
+            let mut outcome = successful_custom(entry, context, true, detail, transition)?;
             outcome.marked = marked;
             Ok(outcome)
         }
@@ -1288,7 +1389,6 @@ fn cleanup_roots(roots: &Roots) -> cleanup::Roots {
         state_dir: roots.state_dir.clone(),
         install_dir: roots.install_dir.clone(),
         bin_dir: roots.bin_dir.clone(),
-        home: roots.home.clone(),
     }
 }
 
@@ -1392,6 +1492,163 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
         assert_eq!(
             fs::read_to_string(fixture.roots.state_dir.join("tool-post")).unwrap(),
             "post\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_lock_normalizes_legacy_repo_manifest_path() {
+        let fixture = Fixture::new("repo-lock-legacy-curdir");
+        fixture.write_lib();
+        fs::create_dir_all(fixture.roots.hooks_dir.join("owner")).unwrap();
+        fixture.write_hook(
+            "owner/tool",
+            r#"
+exists() { return 1; }
+install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("artifact"), "managed\n").unwrap();
+        let legacy_spelling = format!("{}/./owner/tool", fixture.roots.install_dir.display());
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("owner/tool", "github:repo", "tool", legacy_spelling),
+        )
+        .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default();
+
+        let summary = run(
+            &[parse_entry("owner/tool|custom|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!install_root.exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new("owner/tool", "custom", "tool", ""))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_transition_consults_checkout_lock_before_operation() {
+        let fixture = Fixture::new("repo-lock-structural-wiring");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("artifact"), "managed\n").unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let malformed_lock = install_root.parent().unwrap().join(".tool.install.lock");
+        fs::write(&malformed_lock, "foreign\n").unwrap();
+        let expected_binary = fixture.roots.install_dir.join("tool/bin/tool");
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_created_binary(
+                "cargo",
+                [
+                    "install",
+                    "--locked",
+                    "--root",
+                    fixture.roots.install_dir.join("tool").to_str().unwrap(),
+                    "tool",
+                ],
+                expected_binary,
+            );
+        let context = fixture.context(&manifest_path, &runner, "apt");
+
+        let summary = run(
+            &[parse_entry("tool|cargo|tool|-|-", None)],
+            &installed,
+            &context,
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("cargo\0install\0")),
+            "the installer ran without acquiring its checkout lock"
+        );
+        assert!(install_root.join("artifact").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new(
+                "tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn update_rejects_unsafe_transition_command_before_install_or_cleanup() {
+        let fixture = Fixture::new("transition-unsafe-manifest-command");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { return 1; }
+install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let outside = fixture
+            .roots
+            .bin_dir
+            .parent()
+            .unwrap()
+            .join("outside-command");
+        fs::write(&outside, "preserve\n").unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("tool", "github:release", "../outside-command", ""),
+        )
+        .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default();
+
+        let result = run(
+            &[parse_entry("tool|custom|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        );
+
+        let error = result.expect_err("unsafe transition command was accepted");
+        assert!(error.to_string().contains("unsafe command name"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "preserve\n");
+        assert!(!fixture.roots.state_dir.join("tool-installed").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new(
+                "tool",
+                "github:release",
+                "../outside-command",
+                ""
+            ))
         );
     }
 
@@ -5690,6 +5947,62 @@ version() { printf 'saw-pkg\n'; }
                 install_link.display().to_string(),
             ))
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_install_root_update_then_prune_removes_physical_checkout() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = Fixture::new("repo-symlinked-install-root");
+        fixture.write_lib();
+        let physical_install = fixture.roots.home.join("physical-share");
+        let logical_install = fixture.roots.home.join("share-link");
+        fs::create_dir_all(&physical_install).unwrap();
+        symlink(&physical_install, &logical_install).unwrap();
+        fixture.roots.install_dir = logical_install;
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        write_executable(&local_clone.join("bin/tool"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default();
+
+        let update = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        let physical_checkout = physical_install.join("owner/tool");
+        assert!(!update.has_errors());
+        assert!(fs::symlink_metadata(&physical_checkout).is_ok());
+        assert_eq!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .unwrap()
+                .install_path,
+            physical_checkout.display().to_string()
+        );
+
+        let installed = manifest::read(&manifest_path).unwrap();
+        crate::prune::run(
+            &[],
+            &installed,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            crate::prune::Options {
+                yes: true,
+                ..crate::prune::Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(fs::symlink_metadata(&physical_checkout).is_err());
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(local_clone.join("bin/tool").exists());
     }
 
     #[test]
