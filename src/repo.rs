@@ -52,6 +52,69 @@ pub fn override_var(short: &str) -> String {
     format!("SHDEPS_{}_REPO", short.replace('-', "_").to_uppercase())
 }
 
+/// Normalizes one documented GitHub repository URL to `owner/repository`.
+///
+/// Adoption uses this deliberately narrow identity grammar before trusting an
+/// existing checkout. The host is case-insensitive, while owner and repository
+/// spelling remains exact. Ports, URL decoration, alternate SSH users,
+/// trailing slashes, and encoded path bytes are rejected so a future transport
+/// feature cannot silently broaden today's ownership decision.
+#[must_use]
+pub fn canonical_github_repo(url: &str) -> Option<String> {
+    let path = if let Some(rest) = url.strip_prefix("https://") {
+        let (host, path) = rest.split_once('/')?;
+        host.eq_ignore_ascii_case("github.com").then_some(path)?
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        let (authority, path) = rest.split_once('/')?;
+        let (user, host) = authority.split_once('@')?;
+        (user == "git" && host.eq_ignore_ascii_case("github.com")).then_some(path)?
+    } else if let Some(rest) = url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        host.eq_ignore_ascii_case("github.com").then_some(path)?
+    } else {
+        return None;
+    };
+
+    canonical_github_path(path)
+}
+
+fn canonical_github_path(path: &str) -> Option<String> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || byte.is_ascii_control()
+                || matches!(byte, b'%' | b'?' | b'#' | b':' | b'\\')
+        })
+    {
+        return None;
+    }
+    let mut components = path.split('/');
+    let owner = components.next()?;
+    let raw_repository = components.next()?;
+    // The optional suffix belongs only to the final path component.
+    let repository = raw_repository
+        .strip_suffix(".git")
+        .unwrap_or(raw_repository);
+    if components.next().is_some()
+        || !safe_github_component(owner)
+        || !safe_github_component(repository)
+    {
+        return None;
+    }
+    Some(format!("{owner}/{repository}"))
+}
+
+fn safe_github_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 /// Converts a GitHub HTTPS URL to the normal SSH remote form.
 #[must_use]
 pub fn ssh_fallback(url: &str) -> Option<String> {
@@ -121,7 +184,46 @@ fn safe_github_path(path: &str) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{Source, override_var, source, ssh_fallback};
+    use super::{Source, canonical_github_repo, override_var, source, ssh_fallback};
+
+    #[test]
+    fn canonical_github_repo_accepts_only_documented_transport_spellings() {
+        for (url, expected) in [
+            ("https://github.com/owner/tool", "owner/tool"),
+            ("https://GITHUB.COM/Owner/Tool.git", "Owner/Tool"),
+            ("ssh://git@github.com/owner/tool", "owner/tool"),
+            ("ssh://git@GITHUB.COM/Owner/Tool.git", "Owner/Tool"),
+            ("git@github.com:owner/tool", "owner/tool"),
+            ("git@GITHUB.COM:Owner/Tool.git", "Owner/Tool"),
+        ] {
+            assert_eq!(
+                canonical_github_repo(url).as_deref(),
+                Some(expected),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_github_repo_rejects_ambiguous_or_extensible_urls() {
+        for url in [
+            "http://github.com/owner/tool",
+            "https://user@github.com/owner/tool",
+            "https://github.com:443/owner/tool",
+            "https://github.com/owner/tool/",
+            "https://github.com/owner/tool?ref=main",
+            "https://github.com/owner/tool#main",
+            "https://github.com/owner%2ftool",
+            "ssh://owner@github.com/owner/tool",
+            "ssh://git@github.com:22/owner/tool",
+            "git@github.com:owner/tool/extra",
+            "git@github.com:owner/../tool",
+            "git@example.com:owner/tool",
+            "owner/tool",
+        ] {
+            assert_eq!(canonical_github_repo(url), None, "{url}");
+        }
+    }
 
     #[test]
     fn source_uses_canonical_name_short_name_and_default_https_url() {
