@@ -48,6 +48,7 @@ pub mod release_artifact;
 pub mod release_asset;
 pub mod release_stage;
 pub mod repo;
+mod repo_adopt;
 pub mod runtime;
 pub mod self_update;
 pub mod stamp;

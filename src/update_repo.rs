@@ -18,14 +18,27 @@ use crate::manifest::{self, ManifestEntry};
 use crate::method;
 use crate::process::Runner;
 use crate::repo;
+use crate::repo_adopt;
 use crate::stamp;
 use crate::update::{Context, Item, ItemReason, Options, detail_with_action, verbose_enabled};
+
+/// Authority for a preexisting canonical repository destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DestinationOwnership {
+    /// The current manifest already records this dependency as `github:repo`.
+    RecordedRepo,
+    /// A validated previous built-in method owns the same canonical root.
+    PreviousMethod,
+    /// No Shdeps state authorizes mutation; adoption must prove the root first.
+    Unrecorded,
+}
 
 pub(crate) fn install(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     options: Options,
     install_dir: &Path,
+    ownership: DestinationOwnership,
 ) -> Result<Item> {
     // Local development clones deliberately win before any network work. This
     // keeps shdeps useful while hacking on cgraf78 repos: a fleet machine can
@@ -33,7 +46,15 @@ pub(crate) fn install(
     // relink instead of a clone/pull against GitHub.
     let source = repo::source(&entry.name, context.env_vars);
     let local_clone = context.roots.git_dev_dir.join(&source.short);
-    install_locked(entry, context, options, &source, &local_clone, install_dir)
+    install_locked(
+        entry,
+        context,
+        options,
+        &source,
+        &local_clone,
+        install_dir,
+        ownership,
+    )
 }
 
 // Apply one repo install at the normalized root supplied by the lock coordinator.
@@ -44,7 +65,31 @@ fn install_locked(
     source: &repo::Source,
     local_clone: &Path,
     install_dir: &Path,
+    ownership: DestinationOwnership,
 ) -> Result<Item> {
+    let destination = if ownership == DestinationOwnership::Unrecorded {
+        match repo_adopt::inspect_destination(install_dir, local_clone, &source.name) {
+            Ok(destination) => Some(destination),
+            Err(error) => {
+                return Ok(Item::failed(
+                    entry.name.clone(),
+                    ItemReason::InstallFailed,
+                    format!("refusing to adopt existing checkout: {error}"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // A valid ordinary checkout won adoption on its own merits. The mere
+    // presence of a developer clone must not convert that proof into permission
+    // to recursively delete the accepted directory. A later manifest-owned run
+    // can use the recoverable directory-to-development publication transaction.
+    if destination == Some(repo_adopt::Destination::OrdinaryCheckout) {
+        return install_existing(entry, context, options, install_dir);
+    }
+
     if !local_clone.is_dir() {
         return if install_dir.join(".git").is_dir() {
             install_existing(entry, context, options, install_dir)
@@ -553,6 +598,16 @@ fn replace_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<(
     use std::os::unix::fs::symlink;
 
     match fs::symlink_metadata(link) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                && fs::read_link(link).is_ok_and(|existing| existing == target) =>
+        {
+            // An exact development link is already the desired publication.
+            // Preserving its inode avoids a needless absent-path window and is
+            // especially important during first adoption, before Shdeps has a
+            // manifest row proving ownership of the link.
+            return Ok(());
+        }
         Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(link)?,
         Ok(_) => fs::remove_file(link)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

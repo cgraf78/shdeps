@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
@@ -27,6 +29,15 @@ pub(crate) struct Transition {
     bin_links: Vec<PathBuf>,
     extra_links: Vec<PathBuf>,
     archive_state: ArchiveState,
+    archive_root_identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 /// Builds a transition map keyed by dependency name.
@@ -58,6 +69,11 @@ pub(crate) fn by_name(
             } else {
                 ArchiveState::None
             };
+            let archive_root_identity = if entry.method == method::GITHUB_RELEASE {
+                file_identity(&roots.install_dir.join(&entry.name))?
+            } else {
+                None
+            };
             Ok((
                 entry.name.clone(),
                 Transition {
@@ -65,6 +81,7 @@ pub(crate) fn by_name(
                     bin_links,
                     extra_links,
                     archive_state,
+                    archive_root_identity,
                 },
             ))
         })
@@ -74,6 +91,117 @@ pub(crate) fn by_name(
 /// Returns the old manifest row for a transition.
 pub(crate) fn old(transition: &Transition) -> &ManifestEntry {
     &transition.old
+}
+
+/// Returns whether the previous built-in method proves ownership of the
+/// canonical install root that a new `github:repo` install will reuse.
+///
+/// External toolchains always install beneath that managed root. A GitHub
+/// release owns it only when archive evidence is proven; raw release binaries,
+/// packages, and custom hooks do not authorize deleting a coincidental path.
+pub(crate) fn owns_repo_destination(transition: &Transition) -> bool {
+    method::is_external(&transition.old.method)
+        || (transition.old.method == method::GITHUB_RELEASE
+            && transition.archive_state == ArchiveState::Proven)
+}
+
+/// Refreshes filesystem-derived transition evidence under the checkout lock.
+///
+/// `by_name` runs before workers acquire dependency checkout locks. Structural
+/// state in the manifest remains valid across that wait, but an installer may
+/// legally replace a release root while holding the shared lock. Re-reading the
+/// archive marker and live links from the lock-normalized physical root keeps a
+/// stale pre-worker snapshot from authorizing deletion of the new generation.
+pub(crate) fn revalidate_for_repo_install(
+    transition: Option<&Transition>,
+    roots: &Roots,
+    locked_repo_root: &Path,
+) -> Result<Option<Transition>> {
+    let Some(transition) = transition else {
+        return Ok(None);
+    };
+    let mut refreshed = transition.clone();
+    if refreshed.old.method == method::GITHUB_RELEASE {
+        let install_base = cleanup::install_root_for_repo(locked_repo_root, &refreshed.old.name)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cannot derive install root from acquired checkout-lock path",
+                )
+            })?;
+        let explicit =
+            github_release_install::explicit_archive_state(&install_base, &refreshed.old.name)?;
+        let current_identity = file_identity(locked_repo_root)?;
+        let checkout_metadata_present = path_entry_exists(&locked_repo_root.join(".git"))?;
+        refreshed.archive_state = if explicit == ArchiveState::Proven {
+            ArchiveState::Proven
+        } else if !checkout_metadata_present
+            && refreshed.archive_state == ArchiveState::Proven
+            && same_file_identity(refreshed.archive_root_identity, current_identity)
+        {
+            github_release_install::archive_state(
+                &roots.state_dir,
+                &install_base,
+                &roots.bin_dir.join(&refreshed.old.cmd),
+                &refreshed.old.name,
+            )?
+        } else {
+            // Legacy archive proof is path-based: a public symlink can keep
+            // resolving after another writer replaces the directory at the
+            // same name. It authorizes only the exact root generation whose
+            // identity was observed before waiting for the checkout lock.
+            ArchiveState::None
+        };
+        refreshed.archive_root_identity = current_identity;
+    }
+    Ok(Some(refreshed))
+}
+
+// Snapshot one real directory generation on Unix; platforms without a stable
+// inode API intentionally cannot retain legacy path-only archive proof.
+fn file_identity(path: &Path) -> Result<Option<FileIdentity>> {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(Some(FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// Require a present, unchanged Unix identity rather than allowing None == None
+// to become accidental ownership evidence.
+fn same_file_identity(before: Option<FileIdentity>, current: Option<FileIdentity>) -> bool {
+    #[cfg(unix)]
+    {
+        before.is_some() && before == current
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (before, current);
+        false
+    }
+}
+
+// Probe a no-follow ownership marker while preserving all errors except true
+// absence; a malformed .git entry must still disqualify legacy archive proof.
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Runs an installer with transition-only public-bin preparation.
@@ -744,6 +872,7 @@ mod tests {
             bin_links: Vec::new(),
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -817,6 +946,7 @@ mod tests {
             bin_links: vec![public.clone(), helper.clone()],
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -874,6 +1004,7 @@ mod tests {
             bin_links: vec![public.clone()],
             extra_links: Vec::new(),
             archive_state: ArchiveState::Proven,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -927,6 +1058,7 @@ mod tests {
             bin_links: vec![public.clone(), helper.clone()],
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -979,6 +1111,7 @@ mod tests {
             bin_links: Vec::new(),
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1026,6 +1159,7 @@ mod tests {
             bin_links: Vec::new(),
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1076,6 +1210,7 @@ mod tests {
             bin_links: Vec::new(),
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1141,6 +1276,7 @@ mod tests {
             bin_links: Vec::new(),
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1202,6 +1338,7 @@ mod tests {
             bin_links: Vec::new(),
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),

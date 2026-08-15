@@ -826,6 +826,7 @@ where
                 options,
                 &release_prefetch,
                 transitions.get(&entry.name),
+                repo_destination_snapshot(manifest.get(&entry.name), transitions.get(&entry.name)),
             )
         },
         |event| {
@@ -1146,17 +1147,79 @@ fn with_old_repo_checkout_lock<T>(
     }
 }
 
+/// Ownership evidence observed before acquiring the checkout mutation lock.
+///
+/// Recorded repo and external-method ownership are structural Shdeps state.
+/// Release ownership is filesystem-derived, so the snapshot only records that
+/// it must be revalidated after lock acquisition; it never authorizes mutation
+/// on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoDestinationSnapshot {
+    RecordedRepo,
+    PreviousExternal,
+    PreviousRelease,
+    Unrecorded,
+}
+
+// Convert manifest/transition structure into pre-lock evidence without treating
+// a release filesystem snapshot as final mutation authority.
+fn repo_destination_snapshot(
+    installed: Option<&ManifestEntry>,
+    transition: Option<&update_transition::Transition>,
+) -> RepoDestinationSnapshot {
+    if installed.is_some_and(|entry| entry.method == method::GITHUB_REPO) {
+        return RepoDestinationSnapshot::RecordedRepo;
+    }
+    match transition
+        .map(update_transition::old)
+        .map(|entry| entry.method.as_str())
+    {
+        Some(candidate) if method::is_external(candidate) => {
+            RepoDestinationSnapshot::PreviousExternal
+        }
+        Some(method::GITHUB_RELEASE) => RepoDestinationSnapshot::PreviousRelease,
+        _ => RepoDestinationSnapshot::Unrecorded,
+    }
+}
+
 fn install_builtin<R>(
     entry: &Entry,
     context: &Context<'_, R>,
     options: Options,
     release_prefetch: &update_release::Prefetch,
     transition: Option<&update_transition::Transition>,
+    repo_destination: RepoDestinationSnapshot,
 ) -> BuiltinOutcome
 where
     R: Runner + Sync,
 {
     let locked = with_repo_checkout_lock(entry, transition, context, |repo_root| {
+        let refreshed_transition = if entry.method == method::GITHUB_REPO {
+            update_transition::revalidate_for_repo_install(
+                transition,
+                context.roots,
+                repo_root.expect("repo method requires a checkout lock root"),
+            )?
+        } else {
+            None
+        };
+        let transition = refreshed_transition.as_ref().or(transition);
+        let repo_destination = match repo_destination {
+            RepoDestinationSnapshot::RecordedRepo => {
+                update_repo::DestinationOwnership::RecordedRepo
+            }
+            RepoDestinationSnapshot::PreviousExternal => {
+                update_repo::DestinationOwnership::PreviousMethod
+            }
+            RepoDestinationSnapshot::PreviousRelease
+                if transition.is_some_and(update_transition::owns_repo_destination) =>
+            {
+                update_repo::DestinationOwnership::PreviousMethod
+            }
+            RepoDestinationSnapshot::PreviousRelease | RepoDestinationSnapshot::Unrecorded => {
+                update_repo::DestinationOwnership::Unrecorded
+            }
+        };
         let result = match entry.method.as_str() {
             method::GITHUB_RELEASE => {
                 update_transition::install_with_prepared(entry, transition, context.roots, || {
@@ -1166,7 +1229,7 @@ where
             method::GITHUB_REPO => {
                 let install_dir = repo_root.expect("repo method requires a checkout lock root");
                 update_transition::install_with_prepared(entry, transition, context.roots, || {
-                    update_repo::install(entry, context, options, install_dir)
+                    update_repo::install(entry, context, options, install_dir, repo_destination)
                 })
             }
             candidate if method::requires_external_plan(candidate) => {
@@ -1880,6 +1943,308 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
                 "ds",
                 install_link.display().to_string(),
             ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_release_to_repo_preserves_unproven_foreign_canonical_root() {
+        let fixture = Fixture::new("transition-release-foreign-root");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        write_executable(&local_clone.join("bin/tool"));
+        let foreign_root = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(&foreign_root).unwrap();
+        fs::write(foreign_root.join("sentinel"), "preserve\n").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            fixture.roots.bin_dir.join("tool").display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].reason, ItemReason::InstallFailed);
+        assert!(summary.items[0].detail.contains("refusing to adopt"));
+        assert!(!foreign_root.is_symlink());
+        assert_eq!(
+            fs::read_to_string(foreign_root.join("sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
+        );
+        assert!(local_clone.join("bin/tool").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_release_to_repo_adopts_checkout_already_replaced_before_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("transition-release-replaced-before-snapshot");
+        fixture.write_lib();
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        write_executable(&install_root.join("bin/tool"));
+        fs::write(install_root.join("sentinel"), "new checkout\n").unwrap();
+        initialize_git_checkout(&install_root, "https://github.com/owner/tool");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(
+            install_root.join("bin/tool"),
+            fixture.roots.bin_dir.join("tool"),
+        )
+        .unwrap();
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        write_executable(&local_clone.join("bin/tool"));
+
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                install_root.join("bin/tool").display().to_string(),
+            ),
+        )
+        .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo"),
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!install_root.is_symlink());
+        assert_eq!(
+            fs::read_to_string(install_root.join("sentinel")).unwrap(),
+            "new checkout\n"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .unwrap()
+                .method,
+            "github:repo"
+        );
+        assert!(local_clone.join("bin/tool").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_install_revalidates_release_ownership_after_acquiring_checkout_lock() {
+        let fixture = Fixture::new("transition-release-stale-ownership");
+        fixture.write_lib();
+        let entry = parse_entry("owner/tool|github:repo|tool|-|-", None);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("sentinel"), "preserve\n").unwrap();
+        let archive_marker = crate::github_release_install::archive_layout_path(
+            &fixture.roots.install_dir,
+            "owner/tool",
+        );
+        fs::write(&archive_marker, "v1 archive\n").unwrap();
+
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            install_root.join("bin/tool").display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let transitions = crate::update_transition::by_name(
+            &installed,
+            std::slice::from_ref(&entry),
+            &fixture.roots,
+        )
+        .unwrap();
+        let transition = transitions.get("owner/tool").unwrap();
+        assert!(crate::update_transition::owns_repo_destination(transition));
+
+        // Model the bootstrap installer replacing the archive root while it
+        // owns the shared checkout lock. The transition snapshot above is now
+        // stale; Shdeps must re-read filesystem ownership only after it later
+        // acquires that same lock.
+        fs::remove_file(&archive_marker).unwrap();
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        write_executable(&local_clone.join("bin/tool"));
+        let runner = FakeRunner::default();
+        let outcome = super::install_builtin(
+            &entry,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &crate::update_release::Prefetch::default(),
+            Some(transition),
+            super::RepoDestinationSnapshot::PreviousRelease,
+        );
+
+        assert!(outcome.item.failed);
+        assert!(outcome.item.detail.contains("refusing to adopt"));
+        assert!(!install_root.is_symlink());
+        assert_eq!(
+            fs::read_to_string(install_root.join("sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_install_does_not_reuse_legacy_archive_proof_for_a_new_root_generation() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("transition-release-stale-legacy-generation");
+        fixture.write_lib();
+        let entry = parse_entry("owner/tool|github:repo|tool|-|-", None);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        write_executable(&install_root.join("bin/tool"));
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(
+            install_root.join("bin/tool"),
+            fixture.roots.bin_dir.join("tool"),
+        )
+        .unwrap();
+
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            install_root.join("bin/tool").display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let transitions = crate::update_transition::by_name(
+            &installed,
+            std::slice::from_ref(&entry),
+            &fixture.roots,
+        )
+        .unwrap();
+        let transition = transitions.get("owner/tool").unwrap();
+        assert!(crate::update_transition::owns_repo_destination(transition));
+
+        // A bootstrap installer can replace the directory at the same path
+        // while the old public archive symlink remains valid. That path-based
+        // symlink evidence belongs to the retired inode, not the new checkout
+        // generation that now happens to expose the same command path.
+        fs::remove_dir_all(&install_root).unwrap();
+        write_executable(&install_root.join("bin/tool"));
+        fs::write(install_root.join("sentinel"), "new generation\n").unwrap();
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        write_executable(&local_clone.join("bin/tool"));
+        let runner = FakeRunner::default();
+        let outcome = super::install_builtin(
+            &entry,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &crate::update_release::Prefetch::default(),
+            Some(transition),
+            super::RepoDestinationSnapshot::PreviousRelease,
+        );
+
+        assert!(outcome.item.failed);
+        assert!(!install_root.is_symlink());
+        assert_eq!(
+            fs::read_to_string(install_root.join("sentinel")).unwrap(),
+            "new generation\n"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_install_does_not_upgrade_legacy_proof_created_while_waiting_for_lock() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("transition-release-new-legacy-proof");
+        fixture.write_lib();
+        let entry = parse_entry("owner/tool|github:repo|tool|-|-", None);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        write_executable(&install_root.join("bin/tool"));
+        fs::write(install_root.join("sentinel"), "preserve\n").unwrap();
+
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            install_root.join("bin/tool").display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let transitions = crate::update_transition::by_name(
+            &installed,
+            std::slice::from_ref(&entry),
+            &fixture.roots,
+        )
+        .unwrap();
+        let transition = transitions.get("owner/tool").unwrap();
+        assert!(!crate::update_transition::owns_repo_destination(transition));
+
+        // A legacy public symlink appearing during the lock wait is not proof
+        // that the pre-lock release generation owned this root. Only proof
+        // observed before waiting may be retained across an unchanged inode;
+        // a newly published durable marker is the sole under-lock upgrade.
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(
+            install_root.join("bin/tool"),
+            fixture.roots.bin_dir.join("tool"),
+        )
+        .unwrap();
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        write_executable(&local_clone.join("bin/tool"));
+        let runner = FakeRunner::default();
+        let outcome = super::install_builtin(
+            &entry,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &crate::update_release::Prefetch::default(),
+            Some(transition),
+            super::RepoDestinationSnapshot::PreviousRelease,
+        );
+
+        assert!(outcome.item.failed);
+        assert!(!install_root.is_symlink());
+        assert_eq!(
+            fs::read_to_string(install_root.join("sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
         );
     }
 
@@ -6191,6 +6556,102 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
+    fn update_github_repo_adopts_exact_unrecorded_local_clone_symlink_without_replacing_it() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("repo-local-unrecorded-link");
+        fixture.write_lib();
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        write_executable(&local_clone.join("bin/tool"));
+        let install_link = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(install_link.parent().unwrap()).unwrap();
+        symlink(&local_clone, &install_link).unwrap();
+        let link_inode = fs::symlink_metadata(&install_link).unwrap().ino();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+        assert_eq!(
+            fs::symlink_metadata(&install_link).unwrap().ino(),
+            link_inode
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("tool")).unwrap(),
+            install_link.join("bin/tool")
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_link.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_repo_recovers_unrecorded_link_to_symlinked_dev_checkout() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("repo-local-unrecorded-symlinked-dev");
+        fixture.write_lib();
+        let real_clone = fixture.roots.home.join("real-dev-tool");
+        write_executable(&real_clone.join("bin/tool"));
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        fs::create_dir_all(local_clone.parent().unwrap()).unwrap();
+        symlink(&real_clone, &local_clone).unwrap();
+
+        // This is the exact state left if the historical development-link
+        // publication succeeds but the manifest write is interrupted. The
+        // next run must be able to validate and finish owning what Shdeps
+        // itself already published.
+        let install_link = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(install_link.parent().unwrap()).unwrap();
+        symlink(&local_clone, &install_link).unwrap();
+        let install_inode = fs::symlink_metadata(&install_link).unwrap().ino();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+        assert_eq!(
+            fs::symlink_metadata(&install_link).unwrap().ino(),
+            install_inode
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("tool")).unwrap(),
+            install_link.join("bin/tool")
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_link.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_github_repo_warns_when_local_clone_cannot_fast_forward() {
         let fixture = Fixture::new("repo-local-diverged");
         fixture.write_lib();
@@ -6858,6 +7319,205 @@ version() { printf 'saw-pkg\n'; }
             "an asset-only checkout must not acquire public-command ownership"
         );
         assert!(!fixture.roots.bin_dir.join("plugin").exists());
+    }
+
+    #[test]
+    fn update_github_repo_rejects_unrecorded_checkout_with_foreign_origin() {
+        let fixture = Fixture::new("repo-existing-foreign-origin");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        write_executable(&install_dir.join("bin/tool"));
+        initialize_git_checkout(&install_dir, "https://github.com/other/tool");
+        let command_before = fs::read(install_dir.join("bin/tool")).unwrap();
+        let stamp_path = crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo");
+        crate::stamp::remote_touch(&stamp_path, 1_700_000_000).unwrap();
+        let stamp_before = fs::read(&stamp_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].reason, ItemReason::InstallFailed);
+        assert!(summary.items[0].detail.contains("refusing to adopt"));
+        assert!(summary.items[0].detail.contains("origin"));
+        assert!(summary.items[0].detail.contains("owner/tool"));
+        assert_eq!(
+            fs::read(install_dir.join("bin/tool")).unwrap(),
+            command_before
+        );
+        assert_eq!(fs::read(&stamp_path).unwrap(), stamp_before);
+        assert!(install_dir.join(".git").is_dir());
+        assert!(!fixture.roots.bin_dir.join("tool").exists());
+        assert!(!link_state::path(&fixture.roots.state_dir, "owner/tool", Kind::Bin).exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_repo_rejects_malformed_unrecorded_roots_before_source_selection() {
+        use std::os::unix::fs::symlink;
+
+        #[derive(Debug, Clone, Copy)]
+        enum RootKind {
+            Directory,
+            File,
+            DanglingSymlink,
+            GitFile,
+        }
+
+        for with_dev in [false, true] {
+            for kind in [
+                RootKind::Directory,
+                RootKind::File,
+                RootKind::DanglingSymlink,
+                RootKind::GitFile,
+            ] {
+                let fixture = Fixture::new(&format!(
+                    "repo-malformed-root-{kind:?}-{}",
+                    if with_dev { "dev" } else { "managed" }
+                ));
+                fixture.write_lib();
+                let manifest_path = manifest::path(&fixture.roots.state_dir);
+                let install_dir = fixture.roots.install_dir.join("owner/tool");
+                let sentinel = install_dir.join("sentinel");
+                let dangling_target = fixture.roots.home.join("missing-target");
+                match kind {
+                    RootKind::Directory => {
+                        fs::create_dir_all(&install_dir).unwrap();
+                        fs::write(&sentinel, "preserve\n").unwrap();
+                    }
+                    RootKind::File => {
+                        fs::create_dir_all(install_dir.parent().unwrap()).unwrap();
+                        fs::write(&install_dir, "preserve\n").unwrap();
+                    }
+                    RootKind::DanglingSymlink => {
+                        fs::create_dir_all(install_dir.parent().unwrap()).unwrap();
+                        symlink(&dangling_target, &install_dir).unwrap();
+                    }
+                    RootKind::GitFile => {
+                        fs::create_dir_all(&install_dir).unwrap();
+                        fs::write(&sentinel, "preserve\n").unwrap();
+                        fs::write(install_dir.join(".git"), "gitdir: elsewhere\n").unwrap();
+                    }
+                }
+                let local_clone = fixture.roots.git_dev_dir.join("tool");
+                if with_dev {
+                    write_executable(&local_clone.join("bin/tool"));
+                }
+
+                let summary = run(
+                    &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+                    &Manifest::default(),
+                    &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+                    Options::default(),
+                )
+                .unwrap();
+
+                assert!(summary.has_errors(), "{kind:?}, with_dev={with_dev}");
+                assert_eq!(summary.items[0].reason, ItemReason::InstallFailed);
+                assert!(
+                    summary.items[0].detail.contains("refusing to adopt"),
+                    "{kind:?}, with_dev={with_dev}: {}",
+                    summary.items[0].detail
+                );
+                match kind {
+                    RootKind::Directory | RootKind::GitFile => {
+                        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "preserve\n");
+                    }
+                    RootKind::File => {
+                        assert_eq!(fs::read_to_string(&install_dir).unwrap(), "preserve\n");
+                    }
+                    RootKind::DanglingSymlink => {
+                        assert_eq!(fs::read_link(&install_dir).unwrap(), dangling_target);
+                    }
+                }
+                assert!(
+                    !fixture.roots.bin_dir.join("tool").exists(),
+                    "{kind:?}, with_dev={with_dev}"
+                );
+                assert!(
+                    manifest::read(&manifest_path)
+                        .unwrap()
+                        .get("owner/tool")
+                        .is_none(),
+                    "{kind:?}, with_dev={with_dev}"
+                );
+                if with_dev {
+                    assert!(local_clone.join("bin/tool").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_repo_preserves_valid_unrecorded_checkout_when_dev_clone_exists() {
+        let fixture = Fixture::new("repo-existing-valid-with-dev");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        write_executable(&install_dir.join("bin/tool"));
+        fs::write(install_dir.join("managed-sentinel"), "preserve\n").unwrap();
+        initialize_git_checkout(&install_dir, "https://github.com/owner/tool");
+        let command_before = fs::read(install_dir.join("bin/tool")).unwrap();
+        let local_clone = fixture.roots.git_dev_dir.join("tool");
+        write_executable(&local_clone.join("bin/tool"));
+        fs::write(local_clone.join("dev-sentinel"), "dev\n").unwrap();
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo"),
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!install_dir.is_symlink());
+        assert_eq!(
+            fs::read_to_string(install_dir.join("managed-sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(
+            fs::read(install_dir.join("bin/tool")).unwrap(),
+            command_before
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("tool")).unwrap(),
+            install_dir.join("bin/tool")
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_dir.display().to_string(),
+            ))
+        );
+        assert!(local_clone.join("dev-sentinel").exists());
     }
 
     #[test]
