@@ -227,12 +227,24 @@ pub(crate) fn apply(
         InstallRoute::Managed if plan.install_dir.join(".git").is_dir() => {
             install_existing(entry, context, options, &plan.install_dir)
         }
-        InstallRoute::Managed => {
-            install_fresh(entry, context, options, &plan.install_dir, &plan.source.url)
-        }
+        InstallRoute::Managed => install_fresh(
+            entry,
+            context,
+            options,
+            &plan.install_dir,
+            &plan.source.url,
+            true,
+        ),
         InstallRoute::Fresh => {
             require_still_absent(&plan.install_dir)?;
-            install_fresh(entry, context, options, &plan.install_dir, &plan.source.url)
+            install_fresh(
+                entry,
+                context,
+                options,
+                &plan.install_dir,
+                &plan.source.url,
+                false,
+            )
         }
         InstallRoute::Development {
             verified,
@@ -545,6 +557,7 @@ fn install_fresh(
     options: Options,
     install_dir: &Path,
     url: &str,
+    replace_owned_destination: bool,
 ) -> Result<Item> {
     if !context.runner.exists("git") {
         return Ok(Item::failed(
@@ -579,8 +592,23 @@ fn install_fresh(
         return Ok(item);
     }
 
-    remove_any(install_dir)?;
-    fs::rename(&clone_tmp, install_dir)?;
+    #[cfg(unix)]
+    if let Err(error) = crate::repo_transition::publish_directory(
+        install_dir,
+        &clone_tmp,
+        replace_owned_destination,
+    ) {
+        remove_any(&clone_tmp)?;
+        return Err(error);
+    }
+    #[cfg(not(unix))]
+    {
+        if !replace_owned_destination {
+            require_still_absent(install_dir)?;
+        }
+        remove_any(install_dir)?;
+        fs::rename(&clone_tmp, install_dir)?;
+    }
     set_ssh_push_url(context.runner, install_dir, url);
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
     stamp::remote_touch(&stamp_path, options.now)?;
@@ -945,33 +973,5 @@ fn publish_development_link(
     link: &std::path::Path,
     replace_owned_destination: bool,
 ) -> Result<()> {
-    use std::os::unix::fs::symlink;
-
-    match fs::symlink_metadata(link) {
-        Ok(metadata)
-            if metadata.file_type().is_symlink()
-                && fs::read_link(link).is_ok_and(|existing| existing == target) =>
-        {
-            // An exact development link is already the desired publication.
-            // Preserving its inode avoids a needless absent-path window and is
-            // especially important during first adoption, before Shdeps has a
-            // manifest row proving ownership of the link.
-            return Ok(());
-        }
-        Ok(metadata) if replace_owned_destination && metadata.file_type().is_dir() => {
-            fs::remove_dir_all(link)?
-        }
-        Ok(_) if replace_owned_destination => fs::remove_file(link)?,
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "repository destination appeared before development-link publication",
-            )
-            .into());
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    symlink(target, link)?;
-    Ok(())
+    crate::repo_transition::publish_development(link, target, replace_owned_destination)
 }

@@ -249,6 +249,33 @@ code until the clone's branch divergence or connectivity problem is resolved.
 This warning is also emitted in JSONL progress so parent tools such as dotfiles
 managers cannot silently present the checkout as current.
 
+Repository-root publication and replacement uses a private same-parent
+recovery journal while the shared checkout lock is held whenever an owned
+managed directory and a development symlink change places. The same recovery
+also covers replacement of an owned managed checkout. A later Shdeps run rolls
+an interrupted move back or finishes it from the exact recorded inode; if the
+generated checkout installer filled the temporarily vacant path with a new
+managed checkout, that new generation wins and Shdeps retires only its own
+backup. Publishing into an absent/unowned root and restoring a parked backup
+use atomic no-replace renames, so a late destination is preserved rather than
+overwritten. Installer-owned `.install.transaction` state is not reimplemented
+by Shdeps: it fails closed with guidance to rerun the installer that owns that
+format.
+
+Public command relinking is desired-first. Shdeps inventories the complete
+repo `bin/` directory, records the exact intended link/target pairs before the
+first publication, publishes usable desired links, atomically records a
+superset recovery ledger, and only then removes stale tracked symlinks before
+writing final ownership. It never removes a previously live desired command
+before its replacement is published. After a crash, cleanup can claim every
+exact desired link that became live, while a later update publishes any
+remaining desired commands and converges the ledger. A regular file at a
+tracked or desired command path is preserved byte-for-byte and is omitted from
+the final Shdeps ownership state. This no-clobber rule is serialized across
+Shdeps runs; as with the existing extras linker, an unrelated process racing to
+replace the same path between a no-follow check and atomic rename/unlink is
+outside that cooperative locking contract.
+
 ```text
 cgraf78/ds    github:repo
 ```

@@ -6,7 +6,7 @@
 //! different temp-file behavior.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +15,8 @@ use crate::Result;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 const LOCK_FILE: &str = ".lock";
 const LOCK_TIMEOUT_ENV: &str = "SHDEPS_STATE_LOCK_TIMEOUT_SECS";
@@ -165,6 +167,89 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     write_result
+}
+
+/// Reads one private, bounded regular file without following a swapped path.
+///
+/// Recovery records authorize filesystem cleanup while update/prune locks are
+/// held. A normal `lstat` followed by `read(path)` would let a concurrent
+/// replacement redirect that authority through a symlink or block forever on
+/// a FIFO. Open the descriptor with no-follow/nonblocking flags, then bind it
+/// back to the no-follow metadata and exact bounded length before accepting
+/// any bytes.
+pub(crate) fn read_private_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let expected = fs::symlink_metadata(path)?;
+    read_private_bounded_after_metadata(path, &expected, limit)
+}
+
+fn read_private_bounded_after_metadata(
+    path: &Path,
+    expected: &fs::Metadata,
+    limit: u64,
+) -> Result<Vec<u8>> {
+    if !expected.file_type().is_file() || expected.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "private state is not a bounded regular file: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    if expected.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("private state has multiple hard links: {}", path.display()),
+        )
+        .into());
+    }
+
+    #[cfg(unix)]
+    let file = {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = OpenOptions::new().read(true).open(path)?;
+
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != expected.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("private state changed while opening: {}", path.display()),
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    if opened.dev() != expected.dev() || opened.ino() != expected.ino() || opened.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "private state identity changed while opening: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).ok() != Some(expected.len()) || expected.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "private state changed size while reading: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    Ok(bytes)
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -459,7 +544,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{StateLock, temp_nonce, write_atomic};
+    use super::{StateLock, read_private_bounded_after_metadata, temp_nonce, write_atomic};
 
     #[test]
     fn lock_serializes_state_dir_access() {
@@ -648,6 +733,33 @@ done
         write_atomic(&path, "new\n").unwrap();
 
         assert_eq!(fs::read_to_string(path).unwrap(), "new\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_bounded_read_rejects_path_swapped_to_symlink_or_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("private-read-swap");
+        let path = fixture.dir.join("record");
+        let outside = fixture.dir.join("outside");
+        fs::write(&path, "trusted\n").unwrap();
+        fs::write(&outside, "outside\n").unwrap();
+        let expected = fs::symlink_metadata(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(read_private_bounded_after_metadata(&path, &expected, 1024).is_err());
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "trusted\n").unwrap();
+        let expected = fs::symlink_metadata(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is NUL-terminated and the path was removed above.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_private_bounded_after_metadata(&path, &expected, 1024).is_err());
     }
 
     struct Fixture {

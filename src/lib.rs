@@ -49,6 +49,8 @@ pub mod release_asset;
 pub mod release_stage;
 pub mod repo;
 mod repo_adopt;
+#[cfg(unix)]
+mod repo_transition;
 mod repo_verify;
 pub mod runtime;
 pub mod self_update;

@@ -822,7 +822,30 @@ Behavior:
 - Every executable directly under the repo `bin/` dir is linked into
   `$SHDEPS_BIN_DIR`.
 - Existing regular files in `$SHDEPS_BIN_DIR` MUST be preserved.
-- Bin links are tracked.
+- Replacing an owned managed checkout, including transitions in both
+  directions between a managed directory and a development symlink, MUST use a
+  same-parent recoverable transaction under the shared checkout lock. Recovery
+  MUST roll back an absent stable path, finish the exact desired publication,
+  or preserve a new real checkout generation published by the checkout
+  installer while retiring only Shdeps-owned backup state. Publication into an
+  absent/unowned root and transaction rollback MUST use atomic no-replace
+  semantics and MUST preserve and reject any late destination.
+- Shdeps MUST fail closed when the checkout installer's sibling
+  `.install.transaction` remains after lock acquisition. The installer is the
+  sole parser and recovery owner for that format.
+- Bin links are tracked. Reconciliation MUST inventory desired commands and
+  publish exact intended link/target recovery authority before live mutation,
+  publish desired links before retiring stale links, atomically persist a
+  superset recovery ledger, and then atomically persist final ownership.
+  Cleanup MUST recognize every exact desired link that became live before an
+  interruption; the next update publishes any remaining desired commands and
+  converges the ledger without deleting a previously live desired command
+  first.
+- A regular command path MUST remain unmodified even when stale `.binlinks`
+  state names it, and MUST be removed from final Shdeps ownership. This rule
+  applies to the path type observed during the state-locked Shdeps operation;
+  unrelated processes concurrently replacing the same public path are outside
+  the cooperative serialization contract.
 - Extras are discovered and linked.
 
 ### `github:release`

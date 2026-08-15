@@ -1110,6 +1110,10 @@ fn with_repo_checkout_lock<T>(
     #[cfg(unix)]
     {
         crate::checkout_lock::with_checkout_lock(&root, context.env_vars, |normalized| {
+            // The lock serializes live writers; recovery closes the separate
+            // uncatchable-death window before any caller derives ownership or
+            // mutates the stable checkout path.
+            crate::repo_transition::recover(normalized)?;
             operation(Some(normalized))
         })
     }
@@ -1137,6 +1141,7 @@ fn with_old_repo_checkout_lock<T>(
     #[cfg(unix)]
     {
         crate::checkout_lock::with_checkout_lock(&root, context.env_vars, |normalized| {
+            crate::repo_transition::recover(normalized)?;
             operation(Some(normalized))
         })
     }
@@ -1347,7 +1352,7 @@ fn cleanup_successful_transition(
     context: &Context<'_, impl Runner>,
     summary: &mut Summary,
 ) -> Result<()> {
-    with_old_repo_checkout_lock(
+    let cleanup = with_old_repo_checkout_lock(
         transition.map(update_transition::old),
         context,
         |repo_root| {
@@ -1356,7 +1361,21 @@ fn cleanup_successful_transition(
             }
             Ok(())
         },
-    )
+    );
+    if let Err(error) = cleanup {
+        // Package installation records its new method before old repo cleanup.
+        // A lock/recovery failure must not strand that new row while the old
+        // checkout and link authority remain; restoring the prior row makes
+        // the next update retry the same transition coherently.
+        if let Err(restore) = update_transition::restore_failed(transition, context.manifest_path) {
+            return Err(std::io::Error::other(format!(
+                "transition cleanup failed ({error}); restoring the old manifest also failed ({restore})"
+            ))
+            .into());
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn install_custom(
@@ -1665,6 +1684,85 @@ install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
             "the installer ran without acquiring its checkout lock"
         );
         assert!(install_root.join("artifact").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new(
+                "tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string()
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_transition_rejects_unrecovered_checkout_installer_transaction() {
+        let fixture = Fixture::new("repo-installer-transaction-wiring");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("artifact"), "managed\n").unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let installer_transaction = install_root
+            .parent()
+            .unwrap()
+            .join(".tool.install.transaction");
+        fs::create_dir_all(&installer_transaction).unwrap();
+        fs::write(installer_transaction.join("identity.partial"), "preserve\n").unwrap();
+        let expected_binary = fixture.roots.install_dir.join("tool/bin/tool");
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_created_binary(
+                "cargo",
+                [
+                    "install",
+                    "--locked",
+                    "--root",
+                    fixture.roots.install_dir.join("tool").to_str().unwrap(),
+                    "tool",
+                ],
+                expected_binary,
+            );
+        let context = fixture.context(&manifest_path, &runner, "apt");
+
+        let summary = run(
+            &[parse_entry("tool|cargo|tool|-|-", None)],
+            &installed,
+            &context,
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert!(
+            summary.items[0]
+                .detail
+                .contains("rerun the checkout installer")
+        );
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("cargo\0install\0")),
+            "the next method ran before installer-owned recovery"
+        );
+        assert_eq!(
+            fs::read_to_string(install_root.join("artifact")).unwrap(),
+            "managed\n"
+        );
+        assert!(installer_transaction.is_dir());
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("tool"),
             Some(&ManifestEntry::new(
@@ -2310,6 +2408,72 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             manifest::read(&manifest_path).unwrap().get("tool"),
             Some(&ManifestEntry::new("tool", "pkg", "tool", ""))
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_to_pkg_recovery_failure_restores_old_manifest_for_retry() {
+        for already_installed in [true, false] {
+            let fixture = Fixture::new(if already_installed {
+                "repo-to-pkg-recovery-installed"
+            } else {
+                "repo-to-pkg-recovery-queued"
+            });
+            fixture.write_lib();
+            let old_install = fixture.roots.install_dir.join("tool");
+            let old_public = fixture.roots.bin_dir.join("tool");
+            write_executable(&old_install.join("bin/tool"));
+            fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(old_install.join("bin/tool"), &old_public).unwrap();
+            let manifest_path = manifest::path(&fixture.roots.state_dir);
+            let old_manifest = ManifestEntry::new(
+                "tool",
+                "github:repo",
+                "tool",
+                old_install.display().to_string(),
+            );
+            manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
+            let installer_transaction = old_install
+                .parent()
+                .unwrap()
+                .join(".tool.install.transaction");
+            fs::create_dir_all(&installer_transaction).unwrap();
+            fs::write(installer_transaction.join("identity.partial"), "preserve\n").unwrap();
+            let manifest = manifest::read(&manifest_path).unwrap();
+            let runner = if already_installed {
+                FakeRunner::default().with_success(
+                    "dpkg-query",
+                    ["-W", "-f=${Package}\t${Version}\n"],
+                    "tool\t1.0\n",
+                )
+            } else {
+                FakeRunner::default()
+                    .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+                    .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
+                    .with_success("sudo", ["apt-get", "install", "-y", "tool"], "")
+            };
+
+            let error = run(
+                &[parse_entry("tool|pkg|tool|-|-", None)],
+                &manifest,
+                &fixture.context(&manifest_path, &runner, "apt"),
+                Options::default(),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("rerun the checkout installer"));
+            assert_eq!(
+                manifest::read(&manifest_path).unwrap().get("tool"),
+                Some(&old_manifest),
+                "already_installed={already_installed}"
+            );
+            assert!(old_install.join("bin/tool").exists());
+            assert_eq!(
+                fs::read_link(&old_public).unwrap(),
+                old_install.join("bin/tool")
+            );
+            assert!(installer_transaction.is_dir());
+        }
     }
 
     #[test]
@@ -7356,6 +7520,57 @@ version() { printf 'saw-pkg\n'; }
         assert!(
             !crate::stamp::remote_path(&fixture.roots.state_dir, "private/tool", "repo").exists(),
             "missing explicit command must not refresh the repo TTL"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_repo_fresh_clone_preserves_destination_appearing_during_clone() {
+        let fixture = Fixture::new("repo-fresh-late-destination");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        let clone_tmp = fixture
+            .roots
+            .install_dir
+            .join(format!("owner/tool.tmp.{}", std::process::id()));
+        let clone_args = [
+            "clone",
+            "--depth",
+            "1",
+            "https://github.com/owner/tool",
+            clone_tmp.to_str().unwrap(),
+        ];
+        let runner = FakeRunner::default()
+            .with_command("git")
+            .with_created_dir("git", clone_args, clone_tmp.join(".git"))
+            .with_created_dir("git", clone_args, install_dir.clone())
+            .with_created_binary("git", clone_args, clone_tmp.join("bin/tool"));
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert!(summary.items[0].detail.contains("destination appeared"));
+        assert_eq!(fs::read_dir(&install_dir).unwrap().count(), 0);
+        assert!(!clone_tmp.exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+        assert!(
+            !install_dir
+                .parent()
+                .unwrap()
+                .join(".tool.shdeps-repo-transition-v1")
+                .exists()
         );
     }
 

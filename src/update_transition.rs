@@ -52,8 +52,13 @@ pub(crate) fn by_name(
             // A saved row is human-editable state. Validate it before its name
             // or command participates in link-state and public-bin paths.
             cleanup::validate_manifest_artifact_entry(&entry)?;
-            let bin_links =
-                link_state::read(&link_state::path(&roots.state_dir, &entry.name, Kind::Bin))?;
+            let bin_state = link_state::path(&roots.state_dir, &entry.name, Kind::Bin);
+            // A method change may be the first operation after a killed repo
+            // relink. Recover prepublication command ownership before taking
+            // the old-method snapshot so cleanup cannot strand a newly live
+            // symlink merely because the repo disappeared from configuration.
+            link_state::recover_reconcile(&bin_state)?;
+            let bin_links = link_state::read(&bin_state)?;
             let extra_links = link_state::read(&link_state::path(
                 &roots.state_dir,
                 &entry.name,
@@ -657,11 +662,11 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    use super::{Transition, cleanup_snapshot, points_into, unlink_snapshot};
-    use crate::config::Entry;
+    use super::{Transition, by_name, cleanup_snapshot, points_into, unlink_snapshot};
+    use crate::config::{Entry, parse_entry};
     use crate::github_release_install::{self, ArchiveState};
-    use crate::link_state::{self, Kind};
-    use crate::manifest::ManifestEntry;
+    use crate::link_state::{self, Kind, ReconcileLink};
+    use crate::manifest::{Manifest, ManifestEntry};
     use crate::runtime::Roots;
     use std::collections::BTreeSet;
 
@@ -779,6 +784,48 @@ mod tests {
             "snapshot entries removed; foreign entries preserved"
         );
         assert!(extra.is_symlink(), "foreign link must still exist on disk");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transition_snapshot_recovers_prepublished_repo_command() {
+        let dir = temp_dir("prepublished-repo-command");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let source = roots.install_dir.join("owner/tool/bin/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        fs::write(&source, "#!/bin/sh\n").unwrap();
+        let bin_state = link_state::path(&roots.state_dir, "owner/tool", Kind::Bin);
+        link_state::begin_reconcile(
+            &bin_state,
+            &[ReconcileLink::new(public.clone(), source.clone())],
+        )
+        .unwrap();
+        symlink(&source, &public).unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|tool|{}\n",
+            roots.install_dir.join("owner/tool").display()
+        ));
+        let entry = parse_entry("owner/tool|cargo|tool|-|-", None);
+
+        let transitions = by_name(&manifest, std::slice::from_ref(&entry), &roots).unwrap();
+        let transition = transitions.get("owner/tool").unwrap();
+
+        assert_eq!(transition.bin_links, [public]);
+        assert!(
+            !bin_state
+                .with_file_name("tool.binlinks.reconcile-v1")
+                .exists()
+        );
     }
 
     #[test]
