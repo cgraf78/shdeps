@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -412,10 +412,26 @@ fn run_command(mut command: Command, timeout: Option<Duration>) -> io::Result<Ou
 
     isolate_process_group(&mut command);
     let mut child = command.spawn()?;
+    // Drain both pipes while the child runs. Waiting for exit first can
+    // deadlock once either pipe fills: the producer blocks on write while the
+    // parent waits for a status that the blocked producer cannot reach.
+    let stdout_reader = spawn_pipe_reader(
+        child
+            .stdout
+            .take()
+            .expect("piped child stdout must be available"),
+    );
+    let stderr_reader = spawn_pipe_reader(
+        child
+            .stderr
+            .take()
+            .expect("piped child stderr must be available"),
+    );
     let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
     loop {
         if child.try_wait()?.is_some() {
-            return child.wait_with_output().map(convert_output);
+            break;
         }
         if Instant::now() >= deadline {
             // Version probes are intentionally best-effort. Send SIGTERM
@@ -424,12 +440,37 @@ fn run_command(mut command: Command, timeout: Option<Duration>) -> io::Result<Ou
             // grace window, then SIGKILL if it has not exited. This
             // mirrors POSIX shells' default behavior for `timeout(1)`.
             terminate_then_kill(&mut child);
-            let mut output = child.wait_with_output().map(convert_output)?;
-            output.timed_out = true;
-            return Ok(output);
+            timed_out = true;
+            break;
         }
         thread::sleep(WAIT_POLL);
     }
+
+    let status = child.wait()?;
+    let stdout = join_pipe_reader(stdout_reader)?;
+    let stderr = join_pipe_reader(stderr_reader)?;
+    Ok(Output {
+        success: status.success(),
+        timed_out,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+fn spawn_pipe_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn join_pipe_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("subprocess output reader panicked"))?
 }
 
 /// Sends SIGTERM, waits up to `SIGTERM_GRACE`, and then SIGKILLs if the
@@ -709,6 +750,41 @@ mod tests {
 
         assert!(output.success, "{}", output.stderr);
         assert_eq!(Path::new(output.stdout.trim()), cwd);
+    }
+
+    #[test]
+    fn process_environment_cleared_execution_drains_large_stdout_and_stderr() {
+        let program = command_path("sh").expect("test host must provide sh");
+        let cwd = crate::test_support::temp_dir("shdeps-process-large-output");
+        let stdout_chunk = "a".repeat(1024);
+        let stderr_chunk = "b".repeat(1024);
+        let script = format!(
+            "i=0; while [ \"$i\" -lt 2048 ]; do \
+             printf '%s' '{stdout_chunk}'; \
+             printf '%s' '{stderr_chunk}' >&2; \
+             i=$((i + 1)); done"
+        );
+
+        let output = Process
+            .run_env_clear(
+                &program,
+                &cwd,
+                &[OsString::from("-c"), OsString::from(script)],
+                &BTreeMap::new(),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+
+        assert!(
+            output.success,
+            "large producer timed out: {}",
+            output.stderr
+        );
+        assert!(!output.timed_out);
+        assert_eq!(output.stdout.len(), 2 * 1024 * 1024);
+        assert_eq!(output.stderr.len(), 2 * 1024 * 1024);
+        assert!(output.stdout.bytes().all(|byte| byte == b'a'));
+        assert!(output.stderr.bytes().all(|byte| byte == b'b'));
     }
 
     #[test]
