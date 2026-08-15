@@ -1,9 +1,15 @@
-//! Independent quarantine verification for unrecorded repository adoption.
+//! Repository verification capabilities used before Shdeps publishes state.
 //!
-//! Candidate metadata is only a claim. This module fetches the configured
-//! remote into a private Git directory, compares the candidate index and every
-//! worktree entry against that remote truth, and returns a capability token.
-//! Git never receives a candidate path, config, ref, object store, or hook.
+//! Ordinary unrecorded adoption is the strict path: candidate metadata is only
+//! a claim, so Git runs entirely inside an independent quarantine and never
+//! receives a candidate path, config, ref, object store, or hook.
+//!
+//! An explicitly selected development checkout has a deliberately different
+//! contract. It may be dirty and Git must inspect its local repository, but a
+//! capability binds every such command to one followed root generation, one
+//! trusted host Git executable, a sanitized environment, and a verified origin
+//! plus tracked-command policy. Keeping the two contracts separate prevents a
+//! future convenience change from weakening ordinary adoption.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -19,9 +25,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::process::{self, Output, Runner};
+use crate::repo;
 use crate::repo_adopt::{self, OrdinaryCandidate};
 
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
+const DEVELOPMENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const DEVELOPMENT_PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TREE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 1_000_000;
@@ -54,6 +63,96 @@ pub(crate) enum Verification {
     Verified(VerifiedOrdinary),
     /// The configured explicit command is not a tracked executable file.
     MissingCommand,
+}
+
+/// Capability proving that one selected development checkout has the expected
+/// repository identity and, when configured, a tracked regular command.
+#[derive(Debug)]
+pub(crate) struct VerifiedDevelopment {
+    identity: FollowedRootIdentity,
+    git: DevelopmentGit,
+    origin: DevelopmentOrigin,
+    command: Option<String>,
+}
+
+impl VerifiedDevelopment {
+    /// Consumes the capability only for the exact followed directory generation
+    /// that was inspected. Dirty file contents may change by design.
+    pub(crate) fn authorize(&self, root: &Path) -> io::Result<()> {
+        if followed_root_identity(root)? != self.identity {
+            return Err(invalid(
+                "verified development checkout changed before publication",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs one Git operation against the exact development checkout and host
+    /// executable selected during preparation. Callers intentionally receive
+    /// the raw exit status because status/upstream/pull preserve their existing
+    /// best-effort semantics.
+    pub(crate) fn run_git(
+        &self,
+        root: &Path,
+        runner: &impl Runner,
+        args: &[&str],
+    ) -> io::Result<Output> {
+        self.authorize(root)?;
+        self.git.run(runner, args, DEVELOPMENT_READ_TIMEOUT)
+    }
+
+    /// Runs the one potentially long development mutation with a separate
+    /// bound. Repository reads should finish quickly; a network pull may
+    /// legitimately wait for authentication or a slow remote.
+    pub(crate) fn run_pull(&self, root: &Path, runner: &impl Runner) -> io::Result<Output> {
+        self.authorize(root)?;
+        self.git.run(
+            runner,
+            &["pull", "--ff-only", "--quiet"],
+            DEVELOPMENT_PULL_TIMEOUT,
+        )
+    }
+
+    /// Revalidates the mutable development properties immediately before
+    /// publication. Pulls and ordinary developer edits are allowed between
+    /// preparation and apply, so the initial proof alone cannot authorize the
+    /// final origin/command shape.
+    pub(crate) fn revalidate(self, root: &Path, runner: &impl Runner) -> io::Result<bool> {
+        self.authorize(root)?;
+        let command_available = validate_development_state(
+            root,
+            &self.git,
+            &self.origin,
+            self.command.as_deref(),
+            runner,
+        )?;
+        if followed_root_identity(root)? != self.identity {
+            return Err(invalid(
+                "development checkout changed during final verification",
+            ));
+        }
+        Ok(command_available)
+    }
+}
+
+/// Result of the lighter trust rule for an explicitly selected development
+/// source. Unlike ordinary adoption, this does not claim an exact revision.
+#[derive(Debug)]
+pub(crate) enum DevelopmentVerification {
+    /// Origin and configured command policy passed for the selected root.
+    Verified(VerifiedDevelopment),
+    /// The explicitly configured command is not tracked as a regular 100755
+    /// blob or the live worktree entry no longer has that shape.
+    MissingCommand,
+}
+
+/// Inputs that define one development-checkout trust decision.
+pub(crate) struct DevelopmentRequest<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) configured_origin: &'a str,
+    pub(crate) command: &'a str,
+    pub(crate) command_explicit: bool,
+    pub(crate) env_vars: &'a BTreeMap<String, String>,
 }
 
 /// Inputs whose values define one ordinary-checkout proof attempt.
@@ -186,6 +285,316 @@ pub(crate) fn verify_ordinary(
     Ok(Verification::Verified(VerifiedOrdinary {
         candidate: final_candidate,
     }))
+}
+
+/// Verifies the narrow development-source contract without requiring a clean
+/// index or worktree. Development checkout contents are deliberately live, but
+/// their origin and published command ownership must not be inferred from a
+/// directory name alone.
+pub(crate) fn verify_development(
+    request: &DevelopmentRequest<'_>,
+    runner: &impl Runner,
+) -> io::Result<DevelopmentVerification> {
+    let DevelopmentRequest {
+        root,
+        configured_origin,
+        command,
+        command_explicit,
+        env_vars,
+    } = request;
+    let identity = followed_root_identity(root)?;
+    let origin = DevelopmentOrigin::new(configured_origin);
+    let git = DevelopmentGit::new(runner, root, env_vars)?;
+    let command = command_explicit.then(|| (*command).to_owned());
+    let command_available =
+        validate_development_state(root, &git, &origin, command.as_deref(), runner)?;
+    if !command_available {
+        return Ok(DevelopmentVerification::MissingCommand);
+    }
+
+    let final_identity = followed_root_identity(root)?;
+    if final_identity != identity {
+        return Err(invalid(
+            "development checkout changed while it was being verified",
+        ));
+    }
+    Ok(DevelopmentVerification::Verified(VerifiedDevelopment {
+        identity: final_identity,
+        git,
+        origin,
+        command,
+    }))
+}
+
+fn validate_development_state(
+    root: &Path,
+    git: &DevelopmentGit,
+    origin_policy: &DevelopmentOrigin,
+    command: Option<&str>,
+    runner: &impl Runner,
+) -> io::Result<bool> {
+    let top_level = development_git_output(
+        git,
+        runner,
+        &["rev-parse", "--show-toplevel"],
+        "root lookup",
+    )?;
+    let top_level = one_output_line(&top_level, "development checkout root")?;
+    if fs::canonicalize(top_level)? != git.cwd {
+        return Err(invalid(
+            "development checkout path is not the repository root",
+        ));
+    }
+    let raw_origin = development_git_output(
+        git,
+        runner,
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get-all",
+            "remote.origin.url",
+        ],
+        "origin lookup",
+    )?;
+    let raw_origin = one_output_line(&raw_origin, "development checkout origin")?;
+    let effective_origin = development_git_output(
+        git,
+        runner,
+        &["remote", "get-url", "--all", "origin"],
+        "effective origin lookup",
+    )?;
+    let effective_origin =
+        one_output_line(&effective_origin, "development checkout effective origin")?;
+    if !origin_policy.matches(raw_origin) || !origin_policy.matches(effective_origin) {
+        return Err(invalid(format!(
+            "development checkout origin does not match `{}`",
+            origin_policy.configured()
+        )));
+    }
+
+    if let Some(command) = command {
+        let command_path = format!("bin/{command}");
+        let tree = development_git_output(
+            git,
+            runner,
+            &["ls-tree", "-z", "--full-tree", "HEAD", "--", &command_path],
+            "tracked command lookup",
+        )?;
+        if !development_tree_has_command(&tree, &command_path)
+            || !live_development_command(root, command)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Exact policy derived only from the configured clone URL. Canonical GitHub
+/// spellings may vary by transport; arbitrary supported overrides retain their
+/// historical behavior but must match byte-for-byte after Git's rewrite rules.
+#[derive(Debug)]
+enum DevelopmentOrigin {
+    GitHub {
+        configured: String,
+        repository: String,
+    },
+    Exact(String),
+}
+
+impl DevelopmentOrigin {
+    fn new(configured: &str) -> Self {
+        match repo::canonical_github_repo(configured) {
+            Some(repository) => Self::GitHub {
+                configured: configured.to_owned(),
+                repository,
+            },
+            None => Self::Exact(configured.to_owned()),
+        }
+    }
+
+    fn configured(&self) -> &str {
+        match self {
+            Self::GitHub { configured, .. } | Self::Exact(configured) => configured,
+        }
+    }
+
+    fn matches(&self, observed: &str) -> bool {
+        match self {
+            Self::GitHub { repository, .. } => {
+                repo::canonical_github_repo(observed).as_deref() == Some(repository)
+            }
+            Self::Exact(configured) => observed == configured,
+        }
+    }
+}
+
+/// Reusable, environment-sanitized Git capability for one trusted dirty
+/// development checkout. Unlike the ordinary verifier this intentionally lets
+/// Git read the checkout's own local config and object database, while ambient
+/// `GIT_DIR`, `GIT_WORK_TREE`, alternates, and executable selection cannot
+/// redirect operations to another repository.
+#[derive(Debug)]
+struct DevelopmentGit {
+    program: PathBuf,
+    cwd: PathBuf,
+    env: BTreeMap<OsString, OsString>,
+}
+
+impl DevelopmentGit {
+    fn new(
+        runner: &impl Runner,
+        root: &Path,
+        env_vars: &BTreeMap<String, String>,
+    ) -> io::Result<Self> {
+        let cwd = fs::canonicalize(root)?;
+        require_development_metadata_root(&cwd)?;
+        let program = trusted_program(runner, "git", &cwd)?;
+        let mut env = BTreeMap::new();
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "TMPDIR",
+            "PATH",
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "CURL_CA_BUNDLE",
+            "USER",
+            "LOGNAME",
+        ] {
+            if let Some(value) = env_vars.get(key) {
+                env.insert(key.into(), value.into());
+            }
+        }
+        env.insert("GIT_NO_REPLACE_OBJECTS".into(), "1".into());
+        env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        env.insert("LC_ALL".into(), "C".into());
+        env.insert("LANG".into(), "C".into());
+        Ok(Self { program, cwd, env })
+    }
+
+    fn run(&self, runner: &impl Runner, args: &[&str], timeout: Duration) -> io::Result<Output> {
+        let mut command = vec!["--no-pager".into(), "--no-replace-objects".into()];
+        command.extend(args.iter().map(OsString::from));
+        runner.run_env_clear(&self.program, &self.cwd, &command, &self.env, timeout)
+    }
+}
+
+fn require_development_metadata_root(root: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(root.join(".git")).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            invalid("development checkout path is not a repository root")
+        } else {
+            error
+        }
+    })?;
+    if !metadata.file_type().is_dir() && !metadata.file_type().is_file() {
+        return Err(invalid(
+            "development checkout .git entry is linked or special",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FollowedRootIdentity {
+    canonical: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn followed_root_identity(root: &Path) -> io::Result<FollowedRootIdentity> {
+    let metadata = fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(invalid("development checkout is not a directory"));
+    }
+    Ok(FollowedRootIdentity {
+        canonical: fs::canonicalize(root)?,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+fn development_git_output(
+    git: &DevelopmentGit,
+    runner: &impl Runner,
+    args: &[&str],
+    label: &str,
+) -> io::Result<String> {
+    let output = git.run(runner, args, DEVELOPMENT_READ_TIMEOUT)?;
+    if output.timed_out {
+        return Err(invalid(format!("development checkout {label} timed out")));
+    }
+    if !output.success {
+        return Err(invalid(format!("development checkout {label} failed")));
+    }
+    Ok(output.stdout)
+}
+
+fn one_output_line<'a>(output: &'a str, label: &str) -> io::Result<&'a str> {
+    let line = output.strip_suffix('\n').unwrap_or(output);
+    if line.is_empty() || line.contains(['\n', '\r', '\0']) {
+        return Err(invalid(format!("{label} is not one clean line")));
+    }
+    Ok(line)
+}
+
+fn development_tree_has_command(output: &str, expected_path: &str) -> bool {
+    let Some(record) = output.strip_suffix('\0') else {
+        return false;
+    };
+    if record.contains('\0') {
+        return false;
+    }
+    let Some((header, path)) = record.split_once('\t') else {
+        return false;
+    };
+    let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
+    fields.len() == 3
+        && fields[0] == "100755"
+        && fields[1] == "blob"
+        && valid_development_oid(fields[2])
+        && path == expected_path
+}
+
+fn valid_development_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn live_development_command(root: &Path, command: &str) -> io::Result<bool> {
+    let bin = root.join("bin");
+    let bin_metadata = match fs::symlink_metadata(&bin) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !bin_metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    let metadata = match fs::symlink_metadata(bin.join(command)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    Ok(executable_bit(&metadata))
 }
 
 // Resolve the existing physical prefix without creating missing components so
@@ -1188,8 +1597,8 @@ mod tests {
 
     use super::{
         CleanGit, Quarantine, TreeEntry, TreeKind, copy_candidate_index, copy_open_regular,
-        initialize_quarantine, parse_remote_head, parse_tree, safe_relative_utf8,
-        validate_command_policy, verify_candidate_index,
+        development_tree_has_command, initialize_quarantine, parse_remote_head, parse_tree,
+        safe_relative_utf8, validate_command_policy, verify_candidate_index,
     };
 
     const OID: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1278,6 +1687,28 @@ mod tests {
 
         let non_executable = BTreeMap::from([("bin/tool".to_owned(), asset)]);
         assert!(!validate_command_policy(&non_executable, "tool", true).unwrap());
+    }
+
+    #[test]
+    fn development_command_requires_one_exact_executable_blob_record() {
+        assert!(development_tree_has_command(
+            &format!("100755 blob {OID}\tbin/tool\0"),
+            "bin/tool"
+        ));
+        assert!(development_tree_has_command(
+            &format!("100755 blob {}\tbin/tool\0", "a".repeat(64)),
+            "bin/tool"
+        ));
+        for output in [
+            format!("100644 blob {OID}\tbin/tool\0"),
+            format!("120000 blob {OID}\tbin/tool\0"),
+            format!("100755 blob {OID}\tbin/other\0"),
+            format!("100755 blob {OID}\tbin/tool\0extra\0"),
+            format!("100755 tree {OID}\tbin/tool\0"),
+            "".to_owned(),
+        ] {
+            assert!(!development_tree_has_command(&output, "bin/tool"));
+        }
     }
 
     #[test]

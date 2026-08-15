@@ -230,6 +230,17 @@ system SSH configuration. The noninteractive retry requires a trusted
 `~/.ssh/known_hosts` entry for GitHub and may reuse only a validated external
 `SSH_AUTH_SOCK`; it never accepts a new host key during adoption.
 
+A selected `$SHDEPS_GIT_DEV_DIR/<repo>` checkout uses a separate development
+trust rule rather than the exact-revision adoption proof. The selected path
+must itself be the checkout root. For normal GitHub URLs, both the raw and
+Git-effective `origin` must identify the configured repository across the
+supported HTTPS/SSH spellings. For another explicit `SHDEPS_<NAME>_REPO`
+override, both values must exactly match that override. An explicitly
+configured command must already be a tracked `100755` regular file at `HEAD`
+whose live path remains a regular executable. Staged or unstaged edits to
+already tracked development content are allowed and served live; this check
+grants no claim that the checkout matches its remote.
+
 On a stale or forced check, shdeps updates a clean local clone with
 `git pull --ff-only`. If that pull fails, shdeps leaves the user-owned clone
 untouched and emits a non-fatal warning naming the dependency and the checkout

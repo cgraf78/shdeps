@@ -53,7 +53,10 @@ pub(crate) struct InstallPlan {
 enum InstallRoute {
     Managed,
     Fresh,
-    Development,
+    Development {
+        verified: repo_verify::VerifiedDevelopment,
+        replace_owned_destination: bool,
+    },
     Adopted(repo_verify::VerifiedOrdinary),
 }
 
@@ -71,10 +74,17 @@ pub(crate) fn prepare(
     // independently adopted first.
     let source = repo::source(&entry.name, context.env_vars);
     let local_clone = context.roots.git_dev_dir.join(&source.short);
+    let configured_repository = repo::canonical_github_repo(&source.url);
     let route = if ownership != DestinationOwnership::Unrecorded {
-        InstallRoute::Managed
+        if local_clone.is_dir() {
+            match development_route(entry, context, &local_clone, &source.url, true) {
+                Ok(route) => route,
+                Err(item) => return Ok(Preparation::Failed(item)),
+            }
+        } else {
+            InstallRoute::Managed
+        }
     } else {
-        let configured_repository = repo::canonical_github_repo(&source.url);
         let inspected_repository = configured_repository.as_deref().unwrap_or(&source.name);
         let destination = match repo_adopt::inspect_destination(
             install_dir,
@@ -85,9 +95,19 @@ pub(crate) fn prepare(
             Err(error) => return Ok(Preparation::Failed(adoption_failure(entry, error))),
         };
         match destination {
-            repo_adopt::Destination::Absent if local_clone.is_dir() => InstallRoute::Development,
+            repo_adopt::Destination::Absent if local_clone.is_dir() => {
+                match development_route(entry, context, &local_clone, &source.url, false) {
+                    Ok(route) => route,
+                    Err(item) => return Ok(Preparation::Failed(item)),
+                }
+            }
             repo_adopt::Destination::Absent => InstallRoute::Fresh,
-            repo_adopt::Destination::DevelopmentLink => InstallRoute::Development,
+            repo_adopt::Destination::DevelopmentLink => {
+                match development_route(entry, context, &local_clone, &source.url, false) {
+                    Ok(route) => route,
+                    Err(item) => return Ok(Preparation::Failed(item)),
+                }
+            }
             repo_adopt::Destination::Ordinary(candidate) => {
                 if configured_repository.is_none() {
                     return Ok(Preparation::Failed(adoption_failure(
@@ -126,6 +146,34 @@ pub(crate) fn prepare(
         install_dir: install_dir.to_path_buf(),
         route,
     })))
+}
+
+fn development_route(
+    entry: &Entry,
+    context: &Context<'_, impl Runner>,
+    local_clone: &Path,
+    configured_origin: &str,
+    replace_owned_destination: bool,
+) -> std::result::Result<InstallRoute, Item> {
+    let request = repo_verify::DevelopmentRequest {
+        root: local_clone,
+        configured_origin,
+        command: &entry.cmd,
+        command_explicit: entry.cmd_explicit,
+        env_vars: context.env_vars,
+    };
+    match repo_verify::verify_development(&request, context.runner) {
+        Ok(repo_verify::DevelopmentVerification::Verified(verified)) => {
+            Ok(InstallRoute::Development {
+                verified,
+                replace_owned_destination,
+            })
+        }
+        Ok(repo_verify::DevelopmentVerification::MissingCommand) => {
+            Err(missing_command_item(entry))
+        }
+        Err(error) => Err(development_failure(entry, error)),
+    }
 }
 
 fn verify_ordinary_with_fallback(
@@ -176,13 +224,6 @@ pub(crate) fn apply(
     options: Options,
 ) -> Result<Item> {
     match plan.route {
-        InstallRoute::Managed if plan.local_clone.is_dir() => install_development(
-            entry,
-            context,
-            options,
-            &plan.local_clone,
-            &plan.install_dir,
-        ),
         InstallRoute::Managed if plan.install_dir.join(".git").is_dir() => {
             install_existing(entry, context, options, &plan.install_dir)
         }
@@ -193,14 +234,23 @@ pub(crate) fn apply(
             require_still_absent(&plan.install_dir)?;
             install_fresh(entry, context, options, &plan.install_dir, &plan.source.url)
         }
-        InstallRoute::Development => {
-            require_development_destination(&plan.install_dir, &plan.local_clone)?;
+        InstallRoute::Development {
+            verified,
+            replace_owned_destination,
+        } => {
+            require_development_destination(
+                &plan.install_dir,
+                &plan.local_clone,
+                replace_owned_destination,
+            )?;
             install_development(
                 entry,
                 context,
                 options,
                 &plan.local_clone,
                 &plan.install_dir,
+                verified,
+                replace_owned_destination,
             )
         }
         InstallRoute::Adopted(verified) => {
@@ -214,6 +264,14 @@ fn adoption_failure(entry: &Entry, error: impl std::fmt::Display) -> Item {
         entry.name.clone(),
         ItemReason::InstallFailed,
         format!("refusing to adopt existing checkout: {error}"),
+    )
+}
+
+fn development_failure(entry: &Entry, error: impl std::fmt::Display) -> Item {
+    Item::failed(
+        entry.name.clone(),
+        ItemReason::InstallFailed,
+        format!("refusing development checkout: {error}"),
     )
 }
 
@@ -233,12 +291,17 @@ fn require_still_absent(path: &Path) -> Result<()> {
 
 // Development publication may preserve only the exact link prepared earlier
 // or an absent destination. Every other late object remains untouched.
-fn require_development_destination(path: &Path, local_clone: &Path) -> Result<()> {
+fn require_development_destination(
+    path: &Path,
+    local_clone: &Path,
+    replace_owned_destination: bool,
+) -> Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
         Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(path) {
             Ok(target) if target == local_clone => Ok(()),
+            Ok(_) if replace_owned_destination => Ok(()),
             Ok(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "repository destination changed after development-source preparation",
@@ -246,6 +309,7 @@ fn require_development_destination(path: &Path, local_clone: &Path) -> Result<()
             .into()),
             Err(error) => Err(error.into()),
         },
+        Ok(_) if replace_owned_destination => Ok(()),
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "repository destination changed after development-source preparation",
@@ -261,26 +325,22 @@ fn install_development(
     options: Options,
     local_clone: &Path,
     install_dir: &Path,
+    verified: repo_verify::VerifiedDevelopment,
+    replace_owned_destination: bool,
 ) -> Result<Item> {
-    if !local_clone.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "prepared development checkout is no longer available",
-        )
-        .into());
-    }
+    verified.authorize(local_clone)?;
 
     let previous_target = fs::read_link(install_dir).ok();
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
     let revision_path = stamp::revision_path(&context.roots.state_dir, &entry.name);
     let rev_before = stamp::revision_read(&revision_path)?;
-    let mut status = git_status(context.runner, local_clone);
+    let mut status = development_git_status(&verified, context.runner, local_clone)?;
     let mut refresh_stamp = false;
     let mut pull_failed = false;
 
     if !stamp::remote_fresh(&stamp_path, options.freshness()) && status.is_clean() {
-        if has_upstream(context.runner, local_clone) {
-            if pull(context.runner, local_clone) {
+        if development_has_upstream(&verified, context.runner, local_clone)? {
+            if development_pull(&verified, context.runner, local_clone)? {
                 refresh_stamp = true;
             } else {
                 // A local development clone is user-owned, so shdeps must not
@@ -294,29 +354,24 @@ fn install_development(
             // stamp avoids repeating an upstream probe on every warm update.
             refresh_stamp = true;
         }
-        status = git_status(context.runner, local_clone);
+        status = development_git_status(&verified, context.runner, local_clone)?;
     }
 
-    let rev_after = git_head(context.runner, local_clone);
+    let rev_after = development_git_head(&verified, context.runner, local_clone)?;
 
+    if !verified.revalidate(local_clone, context.runner)? {
+        return Ok(missing_command_item(entry));
+    }
     if let Some(parent) = install_dir.parent() {
         fs::create_dir_all(parent)?;
     }
-    // `install_dir` is shdeps-owned for repo installs, even when it is only a
-    // symlink to a development checkout. Replacing stale managed directories
-    // here lets method transitions converge on the same canonical path without
-    // ever deleting the real clone under `SHDEPS_GIT_DEV_DIR`.
-    if let Some(item) = missing_explicit_command(entry, local_clone) {
-        return Ok(item);
-    }
+    publish_development_link(local_clone, install_dir, replace_owned_destination)?;
     if let Some(revision) = &rev_after {
         stamp::revision_touch(&revision_path, revision)?;
     }
     if refresh_stamp {
         stamp::remote_touch(&stamp_path, options.now)?;
     }
-    replace_symlink(local_clone, install_dir)?;
-
     record_success(entry, context, install_dir)?;
 
     let changed = options.reinstall
@@ -682,6 +737,85 @@ fn git_status(runner: &impl Runner, dir: &Path) -> GitStatus {
     }
 }
 
+fn development_git_status(
+    verified: &repo_verify::VerifiedDevelopment,
+    runner: &impl Runner,
+    dir: &Path,
+) -> Result<GitStatus> {
+    let output = verified.run_git(
+        dir,
+        runner,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
+    if output.timed_out {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "development checkout status timed out",
+        )
+        .into());
+    }
+    if !output.success {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "development checkout status failed",
+        )
+        .into());
+    }
+    Ok(GitStatus {
+        dirty: !output.stdout.is_empty(),
+        reported: true,
+    })
+}
+
+fn development_has_upstream(
+    verified: &repo_verify::VerifiedDevelopment,
+    runner: &impl Runner,
+    dir: &Path,
+) -> Result<bool> {
+    let output = verified.run_git(
+        dir,
+        runner,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )?;
+    if output.timed_out {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "development checkout upstream lookup timed out",
+        )
+        .into());
+    }
+    Ok(output.success)
+}
+
+fn development_pull(
+    verified: &repo_verify::VerifiedDevelopment,
+    runner: &impl Runner,
+    dir: &Path,
+) -> Result<bool> {
+    Ok(verified.run_pull(dir, runner)?.success)
+}
+
+fn development_git_head(
+    verified: &repo_verify::VerifiedDevelopment,
+    runner: &impl Runner,
+    dir: &Path,
+) -> Result<Option<String>> {
+    let output = verified.run_git(dir, runner, &["rev-parse", "HEAD"])?;
+    if output.timed_out {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "development checkout HEAD lookup timed out",
+        )
+        .into());
+    }
+    Ok(output.success.then(|| output.stdout.trim().to_owned()))
+}
+
 fn pull_failure_detail(status: GitStatus) -> String {
     format!("pull failed ({})", pull_failure_cause(status))
 }
@@ -698,20 +832,6 @@ fn pull_failure_cause(status: GitStatus) -> &'static str {
     } else {
         "no fast-forward"
     }
-}
-
-fn has_upstream(runner: &impl Runner, dir: &Path) -> bool {
-    git(
-        runner,
-        dir,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    )
-    .is_some()
 }
 
 fn git_head(runner: &impl Runner, dir: &Path) -> Option<String> {
@@ -820,7 +940,11 @@ fn remove_any(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn replace_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+fn publish_development_link(
+    target: &std::path::Path,
+    link: &std::path::Path,
+    replace_owned_destination: bool,
+) -> Result<()> {
     use std::os::unix::fs::symlink;
 
     match fs::symlink_metadata(link) {
@@ -834,8 +958,17 @@ fn replace_symlink(target: &std::path::Path, link: &std::path::Path) -> Result<(
             // manifest row proving ownership of the link.
             return Ok(());
         }
-        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(link)?,
-        Ok(_) => fs::remove_file(link)?,
+        Ok(metadata) if replace_owned_destination && metadata.file_type().is_dir() => {
+            fs::remove_dir_all(link)?
+        }
+        Ok(_) if replace_owned_destination => fs::remove_file(link)?,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "repository destination appeared before development-link publication",
+            )
+            .into());
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }

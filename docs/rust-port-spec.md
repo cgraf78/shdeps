@@ -804,6 +804,14 @@ Behavior:
 - An unrecorded repo containing executable files directly under `bin/` MUST
   have an explicit configured command; that command MUST be a tracked
   executable regular file. Asset-only repos remain adoptable without one.
+- A selected development path MUST itself be the checkout root. For a
+  canonical GitHub configuration, both the raw and Git-effective origin MUST
+  canonicalize to that repository. For another explicit
+  `SHDEPS_<NAME>_REPO` override, both origins MUST exactly match the configured
+  value. An explicitly configured command MUST be a tracked `100755` regular
+  blob at `HEAD` and a live regular executable. Dirty edits to already tracked
+  index/worktree content remain supported and MUST NOT be represented as an
+  exact-revision proof.
 - Fresh clones use shallow clone behavior.
 - Private repo clone failures over HTTPS should fall back to normal GitHub SSH
   clone where possible.
