@@ -1399,8 +1399,9 @@ mod tests {
     use std::io;
     use std::io::Cursor;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::Duration;
 
     use super::{Context, Item, ItemReason, Options, Summary, run, run_with_progress};
@@ -1417,7 +1418,7 @@ mod tests {
     use crate::hooks::BashCustomProbe;
     use crate::http::Client;
     use crate::link_state::{self, Kind};
-    use crate::manifest::{self, ManifestEntry};
+    use crate::manifest::{self, Manifest, ManifestEntry};
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
     use crate::runtime::Roots;
@@ -6151,7 +6152,7 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
-    fn update_github_repo_reuses_existing_local_clone_symlink() {
+    fn update_github_repo_reuses_recorded_local_clone_symlink() {
         let fixture = Fixture::new("repo-local-unchanged");
         fixture.write_lib();
         let local_clone = fixture.roots.git_dev_dir.join("ds");
@@ -6160,10 +6161,12 @@ version() { printf 'saw-pkg\n'; }
         fs::create_dir_all(install_link.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&local_clone, &install_link).unwrap();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let installed = record_repo_manifest(&manifest_path, "cgraf78/ds", "ds", &install_link);
+        let manifest_before = fs::read(&manifest_path).unwrap();
 
         let summary = run(
             &[parse_entry("cgraf78/ds|github:repo|ds|-|-", None)],
-            &manifest::Manifest::default(),
+            &installed,
             &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
             Options::default(),
         )
@@ -6172,6 +6175,18 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert!(!summary.items[0].changed);
         assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
+        let public = fixture.roots.bin_dir.join("ds");
+        assert_eq!(fs::read_link(&public).unwrap(), install_link.join("bin/ds"));
+        assert_eq!(
+            link_state::read(&link_state::path(
+                &fixture.roots.state_dir,
+                "cgraf78/ds",
+                Kind::Bin,
+            ))
+            .unwrap(),
+            [public]
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
     }
 
     #[test]
@@ -6726,10 +6741,10 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let install_dir = fixture.roots.install_dir.join("private/tool");
-        fs::create_dir_all(install_dir.join(".git")).unwrap();
         write_executable(&install_dir.join("bin/tool"));
         fs::create_dir_all(install_dir.join("src")).unwrap();
         fs::write(install_dir.join("src/_tool"), "#compdef tool\n").unwrap();
+        initialize_git_checkout(&install_dir, "https://github.com/private/tool");
         fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o777)).unwrap();
         fs::set_permissions(install_dir.join("src"), fs::Permissions::from_mode(0o777)).unwrap();
         fs::set_permissions(
@@ -6775,6 +6790,129 @@ version() { printf 'saw-pkg\n'; }
                 & 0o022,
             0
         );
+        let public = fixture.roots.bin_dir.join("tool");
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            install_dir.join("bin/tool")
+        );
+        assert_eq!(
+            link_state::read(&link_state::path(
+                &fixture.roots.state_dir,
+                "private/tool",
+                Kind::Bin,
+            ))
+            .unwrap(),
+            [public]
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("private/tool"),
+            Some(&ManifestEntry::new(
+                "private/tool",
+                "github:repo",
+                "tool",
+                install_dir.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn update_github_repo_adopts_valid_existing_asset_only_checkout() {
+        let fixture = Fixture::new("repo-existing-asset-only");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/plugin");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("plugin.zsh"), "# plugin\n").unwrap();
+        initialize_git_checkout(&install_dir, "https://github.com/owner/plugin");
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/plugin", "repo"),
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/plugin|github:repo", None)],
+            &Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "fresh");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/plugin"),
+            Some(&ManifestEntry::new(
+                "owner/plugin",
+                "github:repo",
+                "plugin",
+                install_dir.display().to_string(),
+            ))
+        );
+        assert!(
+            !link_state::path(&fixture.roots.state_dir, "owner/plugin", Kind::Bin).exists(),
+            "an asset-only checkout must not acquire public-command ownership"
+        );
+        assert!(!fixture.roots.bin_dir.join("plugin").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_repo_warm_recorded_checkout_preserves_unowned_regular_command() {
+        let fixture = Fixture::new("repo-warm-regular-command");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        write_executable(&install_dir.join("bin/tool"));
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&public);
+        fs::write(&public, "#!/bin/sh\nexec client-adapter \"$@\"\n").unwrap();
+        let public_before = fs::read(&public).unwrap();
+        let public_metadata = fs::metadata(&public).unwrap();
+        let installed = record_repo_manifest(&manifest_path, "owner/tool", "tool", &install_dir);
+        let manifest_before = fs::read(&manifest_path).unwrap();
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo"),
+            1_700_000_000,
+        )
+        .unwrap();
+        let runner = FakeRunner::default();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(!summary.items[0].changed);
+        assert_eq!(summary.items[0].detail, "fresh");
+        assert_eq!(fs::read(&public).unwrap(), public_before);
+        let public_after = fs::metadata(&public).unwrap();
+        assert_eq!(public_after.ino(), public_metadata.ino());
+        assert_eq!(public_after.mode(), public_metadata.mode());
+        assert!(
+            !link_state::path(&fixture.roots.state_dir, "owner/tool", Kind::Bin).exists(),
+            "a preserved regular adapter must remain outside Shdeps link ownership"
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .all(|call| !call.contains("\0clone\0") && !call.contains("\0pull\0")),
+            "a fresh recorded checkout must not clone or pull"
+        );
     }
 
     #[test]
@@ -6783,7 +6921,9 @@ version() { printf 'saw-pkg\n'; }
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let install_dir = fixture.roots.install_dir.join("owner/tool");
-        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("README.md"), "fixture\n").unwrap();
+        initialize_git_checkout(&install_dir, "https://github.com/owner/tool");
         let stamp_path = crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo");
         crate::stamp::remote_touch(&stamp_path, 1_700_000_000).unwrap();
 
@@ -6919,6 +7059,7 @@ version() { printf 'saw-pkg\n'; }
         let install_dir = fixture.roots.install_dir.join("owner/tool");
         fs::create_dir_all(install_dir.join(".git")).unwrap();
         write_executable(&install_dir.join("bin/tool"));
+        let installed = record_repo_manifest(&manifest_path, "owner/tool", "tool", &install_dir);
         let runner = FakeRunner::default()
             // No SSH retry: pretend origin has no GitHub fallback.
             .with_failure(
@@ -6962,7 +7103,7 @@ version() { printf 'saw-pkg\n'; }
 
         let summary = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
-            &manifest::Manifest::default(),
+            &installed,
             &fixture.context(&manifest_path, &runner, "apt"),
             Options::default(),
         )
@@ -6986,6 +7127,7 @@ version() { printf 'saw-pkg\n'; }
         let install_dir = fixture.roots.install_dir.join("owner/tool");
         fs::create_dir_all(install_dir.join(".git")).unwrap();
         write_executable(&install_dir.join("bin/tool"));
+        let installed = record_repo_manifest(&manifest_path, "owner/tool", "tool", &install_dir);
         let runner = FakeRunner::default()
             .with_failure(
                 "git",
@@ -7027,7 +7169,7 @@ version() { printf 'saw-pkg\n'; }
 
         let summary = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
-            &manifest::Manifest::default(),
+            &installed,
             &fixture.context(&manifest_path, &runner, "apt"),
             Options::default(),
         )
@@ -7048,6 +7190,7 @@ version() { printf 'saw-pkg\n'; }
         let install_dir = fixture.roots.install_dir.join("private/tool");
         fs::create_dir_all(install_dir.join(".git")).unwrap();
         write_executable(&install_dir.join("bin/tool"));
+        let installed = record_repo_manifest(&manifest_path, "private/tool", "tool", &install_dir);
         let runner = FakeRunner::default()
             .with_success(
                 "git",
@@ -7114,7 +7257,7 @@ version() { printf 'saw-pkg\n'; }
 
         let summary = run(
             &[parse_entry("private/tool|github:repo|tool|-|-", None)],
-            &manifest::Manifest::default(),
+            &installed,
             &fixture.context(&manifest_path, &runner, "apt"),
             Options {
                 reinstall: true,
@@ -7135,6 +7278,7 @@ version() { printf 'saw-pkg\n'; }
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let install_dir = fixture.roots.install_dir.join("owner/tool");
         fs::create_dir_all(install_dir.join(".git")).unwrap();
+        let installed = record_repo_manifest(&manifest_path, "owner/tool", "tool", &install_dir);
         let stamp_path = crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo");
         let runner = FakeRunner::default()
             .with_failure(
@@ -7166,7 +7310,7 @@ version() { printf 'saw-pkg\n'; }
 
         let summary = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
-            &manifest::Manifest::default(),
+            &installed,
             &fixture.context(&manifest_path, &runner, "apt"),
             Options {
                 now: 1_700_000_000,
@@ -7182,11 +7326,14 @@ version() { printf 'saw-pkg\n'; }
             !stamp_path.exists(),
             "missing explicit command must not refresh the repo TTL"
         );
-        assert!(
-            manifest::read(&manifest_path)
-                .unwrap()
-                .get("owner/tool")
-                .is_none()
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_dir.display().to_string(),
+            ))
         );
     }
 
@@ -7625,6 +7772,67 @@ version() { printf 'saw-pkg\n'; }
         let mut perms = fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn record_repo_manifest(
+        manifest_path: &std::path::Path,
+        name: &str,
+        cmd: &str,
+        install_dir: &std::path::Path,
+    ) -> Manifest {
+        manifest::upsert(
+            manifest_path,
+            ManifestEntry::new(name, "github:repo", cmd, install_dir.display().to_string()),
+        )
+        .unwrap();
+        manifest::read(manifest_path).unwrap()
+    }
+
+    fn initialize_git_checkout(root: &std::path::Path, origin: &str) {
+        // Adoption fixtures must be real repositories. An empty `.git`
+        // directory would let today's permissive implementation pass while
+        // forcing the future verifier either to special-case tests or to
+        // reject what the characterization suite called valid.
+        fixture_git(root, &["init", "--quiet"]);
+        fixture_git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        fixture_git(root, &["add", "--all"]);
+        fixture_git(
+            root,
+            &[
+                "-c",
+                "user.name=Shdeps Test",
+                "-c",
+                "user.email=shdeps@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+        fixture_git(root, &["remote", "add", "origin", origin]);
+        fixture_git(root, &["config", "branch.main.remote", "origin"]);
+        fixture_git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+        fixture_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+
+    fn fixture_git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "core.hooksPath=/dev/null", "-C"])
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git fixture command failed: git -C {} {}\n{}",
+            root.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     fn release_response(cmd: &str, tag: &str, url: &str) -> Vec<u8> {
