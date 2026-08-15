@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::repo;
 
@@ -20,17 +20,64 @@ const MAX_REF_ENTRIES: usize = 10_000;
 const MAX_HOOK_ENTRIES: usize = 256;
 
 /// Validated shape of an unrecorded managed destination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Destination {
     /// No object exists, so a fresh install may publish the root.
     Absent,
     /// A real ordinary checkout passed inert metadata inspection.
-    OrdinaryCheckout,
+    Ordinary(OrdinaryCandidate),
     /// The root has the exact configured development-link shape.
     ///
     /// Repository identity and tracked-command checks belong to the separate
     /// development-source gate; this variant grants no exact-revision claim.
     DevelopmentLink,
+}
+
+/// Inert claims read from an ordinary checkout without invoking Git.
+///
+/// These values are not authorization by themselves. The quarantine verifier
+/// must independently reproduce them from the configured remote before any
+/// live mutation may consume the checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrdinaryCandidate {
+    repository: String,
+    // Retained only so final reinspection detects config replacement. Remote
+    // execution must use caller configuration, never this candidate claim.
+    claimed_origin: String,
+    branch: String,
+    head_oid: String,
+    root_identity: RootIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootIdentity {
+    canonical: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl OrdinaryCandidate {
+    /// Returns the canonical configured `owner/repository` identity.
+    pub(crate) fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    /// Returns the attached branch claimed by the candidate HEAD.
+    pub(crate) fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Returns the lowercase SHA-1 commit claimed by the candidate branch.
+    pub(crate) fn head_oid(&self) -> &str {
+        &self.head_oid
+    }
+
+    /// Revalidates that one path still names the exact inspected directory.
+    pub(crate) fn matches_root(&self, path: &Path) -> io::Result<bool> {
+        Ok(root_identity(path)? == self.root_identity)
+    }
 }
 
 /// Classifies and validates any unrecorded object at the managed destination.
@@ -50,8 +97,7 @@ pub(crate) fn inspect_destination(
         Err(error) => return Err(error),
     };
     if metadata.file_type().is_dir() {
-        inspect(root, expected_repo)?;
-        return Ok(Destination::OrdinaryCheckout);
+        return inspect(root, expected_repo).map(Destination::Ordinary);
     }
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(root)?;
@@ -74,8 +120,9 @@ pub(crate) fn inspect_destination(
 
 // Inspect only inert identity and control metadata; complete content and remote
 // equivalence are deliberately delegated to the quarantine verification layer.
-fn inspect(root: &Path, expected_repo: &str) -> io::Result<()> {
+pub(crate) fn inspect(root: &Path, expected_repo: &str) -> io::Result<OrdinaryCandidate> {
     require_directory(root, "checkout root")?;
+    let root_identity = root_identity(root)?;
     let git_dir = root.join(".git");
     require_directory(&git_dir, "checkout .git directory")?;
     validate_object_store_boundaries(&git_dir)?;
@@ -89,9 +136,32 @@ fn inspect(root: &Path, expected_repo: &str) -> io::Result<()> {
     }
 
     let config = read_required_text(&git_dir.join("config"), "config")?;
-    validate_config(&config, &branch, expected_repo)?;
+    let claimed_origin = validate_config(&config, &branch, expected_repo)?;
     validate_hooks(&git_dir.join("hooks"))?;
-    Ok(())
+    Ok(OrdinaryCandidate {
+        repository: expected_repo.to_owned(),
+        claimed_origin,
+        branch,
+        head_oid: oid.to_ascii_lowercase(),
+        root_identity,
+    })
+}
+
+// Bind the inert claim to one canonical directory generation so a final
+// pre-publication reinspection can detect ordinary replacement races.
+fn root_identity(path: &Path) -> io::Result<RootIdentity> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(invalid("checkout root is no longer a real directory"));
+    }
+    let canonical = fs::canonicalize(path)?;
+    Ok(RootIdentity {
+        canonical,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
 }
 
 // Require a non-symlink directory where adoption must own the directory inode.
@@ -407,7 +477,7 @@ enum Section {
 
 // Parse the small ordinary-clone config grammar as data, excluding every key
 // that could redirect execution, credentials, transport, or object behavior.
-fn validate_config(config: &str, branch: &str, expected_repo: &str) -> io::Result<()> {
+fn validate_config(config: &str, branch: &str, expected_repo: &str) -> io::Result<String> {
     let mut section = None;
     let mut core = BTreeMap::new();
     let mut origin_url = None;
@@ -520,7 +590,7 @@ fn validate_config(config: &str, branch: &str, expected_repo: &str) -> io::Resul
     if branch_merge.as_deref() != Some(&format!("refs/heads/{branch}")) {
         return Err(invalid("checkout branch merge ref does not match HEAD"));
     }
-    Ok(())
+    Ok(origin_url)
 }
 
 // Admit only core, origin, and the exact active branch sections; unknown

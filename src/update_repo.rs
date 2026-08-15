@@ -1,9 +1,9 @@
 //! `github:repo` update execution.
 //!
-//! Start with the local-dev-clone strategy because it is deterministic, fast,
-//! and important for this repo's own workflow: a clone under `SHDEPS_GIT_DEV_DIR`
-//! wins over network clone/pull and is exposed through a symlink in the managed
-//! install directory.
+//! Local development clones remain the preferred source for absent or already
+//! managed destinations. An unrecorded ordinary destination is different: it
+//! is preserved and independently verified before a development clone may
+//! replace anything at the canonical managed path.
 
 use std::fs;
 #[cfg(unix)]
@@ -19,6 +19,7 @@ use crate::method;
 use crate::process::Runner;
 use crate::repo;
 use crate::repo_adopt;
+use crate::repo_verify;
 use crate::stamp;
 use crate::update::{Context, Item, ItemReason, Options, detail_with_action, verbose_enabled};
 
@@ -33,69 +34,240 @@ pub(crate) enum DestinationOwnership {
     Unrecorded,
 }
 
-pub(crate) fn install(
+/// Result of the inert repository preparation phase.
+pub(crate) enum Preparation {
+    /// All proof succeeded and the mutating phase may consume this plan.
+    Ready(Box<InstallPlan>),
+    /// A normal user-facing compatibility failure occurred before mutation.
+    Failed(Item),
+}
+
+/// Opaque plan binding source selection and any adoption capability to one run.
+pub(crate) struct InstallPlan {
+    source: repo::Source,
+    local_clone: PathBuf,
+    install_dir: PathBuf,
+    route: InstallRoute,
+}
+
+enum InstallRoute {
+    Managed,
+    Fresh,
+    Development,
+    Adopted(repo_verify::VerifiedOrdinary),
+}
+
+/// Inspects and verifies a repo install without changing transition or live
+/// installation state. Callers must run this before transition preparation.
+pub(crate) fn prepare(
+    entry: &Entry,
+    context: &Context<'_, impl Runner>,
+    install_dir: &Path,
+    ownership: DestinationOwnership,
+) -> Result<Preparation> {
+    // Resolve the development source before any network work. It wins for an
+    // absent or already managed destination, but it never grants permission to
+    // replace an unrecorded ordinary checkout: that root must be preserved and
+    // independently adopted first.
+    let source = repo::source(&entry.name, context.env_vars);
+    let local_clone = context.roots.git_dev_dir.join(&source.short);
+    let route = if ownership != DestinationOwnership::Unrecorded {
+        InstallRoute::Managed
+    } else {
+        let configured_repository = repo::canonical_github_repo(&source.url);
+        let inspected_repository = configured_repository.as_deref().unwrap_or(&source.name);
+        let destination = match repo_adopt::inspect_destination(
+            install_dir,
+            &local_clone,
+            inspected_repository,
+        ) {
+            Ok(destination) => destination,
+            Err(error) => return Ok(Preparation::Failed(adoption_failure(entry, error))),
+        };
+        match destination {
+            repo_adopt::Destination::Absent if local_clone.is_dir() => InstallRoute::Development,
+            repo_adopt::Destination::Absent => InstallRoute::Fresh,
+            repo_adopt::Destination::DevelopmentLink => InstallRoute::Development,
+            repo_adopt::Destination::Ordinary(candidate) => {
+                if configured_repository.is_none() {
+                    return Ok(Preparation::Failed(adoption_failure(
+                        entry,
+                        "configured repository URL is not a supported GitHub origin",
+                    )));
+                }
+                let verification = match verify_ordinary_with_fallback(
+                    &candidate,
+                    install_dir,
+                    &context.roots.state_dir,
+                    &source.url,
+                    entry,
+                    context,
+                ) {
+                    Ok(verification) => verification,
+                    Err(error) => {
+                        return Ok(Preparation::Failed(adoption_failure(entry, error)));
+                    }
+                };
+                match verification {
+                    repo_verify::Verification::Verified(verified) => {
+                        InstallRoute::Adopted(verified)
+                    }
+                    repo_verify::Verification::MissingCommand => {
+                        return Ok(Preparation::Failed(missing_command_item(entry)));
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(Preparation::Ready(Box::new(InstallPlan {
+        source,
+        local_clone,
+        install_dir: install_dir.to_path_buf(),
+        route,
+    })))
+}
+
+fn verify_ordinary_with_fallback(
+    candidate: &repo_adopt::OrdinaryCandidate,
+    install_dir: &Path,
+    state_dir: &Path,
+    origin: &str,
+    entry: &Entry,
+    context: &Context<'_, impl Runner>,
+) -> Result<repo_verify::Verification> {
+    let request = repo_verify::OrdinaryRequest {
+        root: install_dir,
+        state_dir,
+        approved_origin: origin,
+        command: &entry.cmd,
+        command_explicit: entry.cmd_explicit,
+        env_vars: context.env_vars,
+        trusted_home: &context.roots.home,
+    };
+    match repo_verify::verify_ordinary(candidate, &request, context.runner) {
+        Ok(verification) => Ok(verification),
+        Err(primary) if primary.allows_ssh_fallback() => {
+            let Some(fallback) = repo::ssh_fallback(origin) else {
+                return Err(std::io::Error::other(primary.to_string()).into());
+            };
+            let fallback_request = repo_verify::OrdinaryRequest {
+                approved_origin: &fallback,
+                ..request
+            };
+            repo_verify::verify_ordinary(candidate, &fallback_request, context.runner).map_err(
+                |secondary| {
+                    std::io::Error::other(format!(
+                        "HTTPS verification failed: {primary}; SSH fallback failed: {secondary}"
+                    ))
+                    .into()
+                },
+            )
+        }
+        Err(error) => Err(std::io::Error::other(error.to_string()).into()),
+    }
+}
+
+/// Applies one already-prepared plan while the shared checkout lock is held.
+pub(crate) fn apply(
+    plan: InstallPlan,
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     options: Options,
-    install_dir: &Path,
-    ownership: DestinationOwnership,
 ) -> Result<Item> {
-    // Local development clones deliberately win before any network work. This
-    // keeps shdeps useful while hacking on cgraf78 repos: a fleet machine can
-    // point at the checked-out repo under `~/git`, and update becomes a cheap
-    // relink instead of a clone/pull against GitHub.
-    let source = repo::source(&entry.name, context.env_vars);
-    let local_clone = context.roots.git_dev_dir.join(&source.short);
-    install_locked(
-        entry,
-        context,
-        options,
-        &source,
-        &local_clone,
-        install_dir,
-        ownership,
+    match plan.route {
+        InstallRoute::Managed if plan.local_clone.is_dir() => install_development(
+            entry,
+            context,
+            options,
+            &plan.local_clone,
+            &plan.install_dir,
+        ),
+        InstallRoute::Managed if plan.install_dir.join(".git").is_dir() => {
+            install_existing(entry, context, options, &plan.install_dir)
+        }
+        InstallRoute::Managed => {
+            install_fresh(entry, context, options, &plan.install_dir, &plan.source.url)
+        }
+        InstallRoute::Fresh => {
+            require_still_absent(&plan.install_dir)?;
+            install_fresh(entry, context, options, &plan.install_dir, &plan.source.url)
+        }
+        InstallRoute::Development => {
+            require_development_destination(&plan.install_dir, &plan.local_clone)?;
+            install_development(
+                entry,
+                context,
+                options,
+                &plan.local_clone,
+                &plan.install_dir,
+            )
+        }
+        InstallRoute::Adopted(verified) => {
+            install_verified_existing(entry, context, options, &plan.install_dir, verified)
+        }
+    }
+}
+
+fn adoption_failure(entry: &Entry, error: impl std::fmt::Display) -> Item {
+    Item::failed(
+        entry.name.clone(),
+        ItemReason::InstallFailed,
+        format!("refusing to adopt existing checkout: {error}"),
     )
 }
 
-// Apply one repo install at the normalized root supplied by the lock coordinator.
-fn install_locked(
+// The absence proof is part of source selection. Rechecking it prevents an
+// uncoordinated writer from turning a safe fresh plan into recursive deletion.
+fn require_still_absent(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "repository destination appeared after preparation",
+        )
+        .into()),
+    }
+}
+
+// Development publication may preserve only the exact link prepared earlier
+// or an absent destination. Every other late object remains untouched.
+fn require_development_destination(path: &Path, local_clone: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(path) {
+            Ok(target) if target == local_clone => Ok(()),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "repository destination changed after development-source preparation",
+            )
+            .into()),
+            Err(error) => Err(error.into()),
+        },
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "repository destination changed after development-source preparation",
+        )
+        .into()),
+    }
+}
+
+// Publish and refresh a deliberately selected local development checkout.
+fn install_development(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     options: Options,
-    source: &repo::Source,
     local_clone: &Path,
     install_dir: &Path,
-    ownership: DestinationOwnership,
 ) -> Result<Item> {
-    let destination = if ownership == DestinationOwnership::Unrecorded {
-        match repo_adopt::inspect_destination(install_dir, local_clone, &source.name) {
-            Ok(destination) => Some(destination),
-            Err(error) => {
-                return Ok(Item::failed(
-                    entry.name.clone(),
-                    ItemReason::InstallFailed,
-                    format!("refusing to adopt existing checkout: {error}"),
-                ));
-            }
-        }
-    } else {
-        None
-    };
-
-    // A valid ordinary checkout won adoption on its own merits. The mere
-    // presence of a developer clone must not convert that proof into permission
-    // to recursively delete the accepted directory. A later manifest-owned run
-    // can use the recoverable directory-to-development publication transaction.
-    if destination == Some(repo_adopt::Destination::OrdinaryCheckout) {
-        return install_existing(entry, context, options, install_dir);
-    }
-
     if !local_clone.is_dir() {
-        return if install_dir.join(".git").is_dir() {
-            install_existing(entry, context, options, install_dir)
-        } else {
-            install_fresh(entry, context, options, install_dir, &source.url)
-        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "prepared development checkout is no longer available",
+        )
+        .into());
     }
 
     let previous_target = fs::read_link(install_dir).ok();
@@ -177,6 +349,56 @@ fn install_locked(
     } else {
         Item::current(entry.name.clone(), ItemReason::Installed, detail)
     })
+}
+
+// Adopt a checkout only after quarantine proved its exact root and contents.
+// Unlike an already-recorded checkout, this path does not pull: the verifier
+// independently established that the candidate equals the current remote
+// default before granting the capability consumed here.
+fn install_verified_existing(
+    entry: &Entry,
+    context: &Context<'_, impl Runner>,
+    options: Options,
+    install_dir: &Path,
+    verified: repo_verify::VerifiedOrdinary,
+) -> Result<Item> {
+    verified.authorize(install_dir)?;
+    let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
+    let was_fresh = stamp::remote_fresh(&stamp_path, options.freshness());
+    sync_ssh_push_url(context.runner, install_dir);
+    secure_managed_clone_permissions(install_dir)?;
+    if let Some(item) = missing_explicit_command(entry, install_dir) {
+        return Ok(item);
+    }
+    if !was_fresh {
+        stamp::remote_touch(&stamp_path, options.now)?;
+    }
+    record_success(entry, context, install_dir)?;
+
+    if was_fresh {
+        let detail = verbose_repo_detail(None, install_dir, context, options, "fresh");
+        Ok(Item::current(entry.name.clone(), ItemReason::Fresh, detail))
+    } else if options.reinstall {
+        let detail = verbose_repo_detail(
+            Some("reinstalled"),
+            install_dir,
+            context,
+            options,
+            "reinstalled",
+        );
+        Ok(Item::changed(
+            entry.name.clone(),
+            ItemReason::Installed,
+            detail,
+        ))
+    } else {
+        let detail = verbose_repo_detail(None, install_dir, context, options, "updated");
+        Ok(Item::current(
+            entry.name.clone(),
+            ItemReason::Installed,
+            detail,
+        ))
+    }
 }
 
 fn install_existing(
@@ -382,11 +604,15 @@ fn missing_explicit_command(entry: &Entry, install_dir: &Path) -> Option<Item> {
         return None;
     }
 
-    Some(Item::failed(
+    Some(missing_command_item(entry))
+}
+
+fn missing_command_item(entry: &Entry) -> Item {
+    Item::failed(
         entry.name.clone(),
         ItemReason::MissingBinary,
         format!("configured command `{}` not found in repo bin", entry.cmd),
-    ))
+    )
 }
 
 fn record_success(

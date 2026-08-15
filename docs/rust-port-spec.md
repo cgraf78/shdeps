@@ -789,9 +789,28 @@ Behavior:
   produce a structured warning with an actionable cause in human and JSONL
   output; it MUST NOT be reported as current.
 - Existing clones are pulled/updated according to current behavior.
+- An unrecorded existing managed root MUST be inspected and independently
+  verified before transition preparation, candidate Git execution, permission
+  changes, link publication, stamps, or manifest writes. Verification MUST use
+  a private environment-cleared Git quarantine, fetch only the configured
+  GitHub repository's remote default branch, and require the candidate attached
+  branch, HEAD, copied index, complete worktree, file types, executable modes,
+  and blob bytes to match that fetched revision. Git MUST NOT receive candidate
+  config, refs, object storage, hooks, index path, or worktree paths while
+  establishing this proof.
+- Adoption MUST reject and preserve foreign, malformed, dirty, divergent,
+  unsupported, or concurrently replaced roots. A fresh remote stamp MUST NOT
+  bypass adoption verification.
+- An unrecorded repo containing executable files directly under `bin/` MUST
+  have an explicit configured command; that command MUST be a tracked
+  executable regular file. Asset-only repos remain adoptable without one.
 - Fresh clones use shallow clone behavior.
 - Private repo clone failures over HTTPS should fall back to normal GitHub SSH
   clone where possible.
+- Adoption's SSH fallback MUST ignore user and system SSH configuration, MUST
+  require an existing trusted GitHub key in `~/.ssh/known_hosts`, MUST NOT
+  accept a new host key, and MAY pass through only a validated agent socket
+  outside the candidate checkout.
 - Every executable directly under the repo `bin/` dir is linked into
   `$SHDEPS_BIN_DIR`.
 - Existing regular files in `$SHDEPS_BIN_DIR` MUST be preserved.
