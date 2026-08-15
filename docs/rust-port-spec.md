@@ -811,7 +811,8 @@ Behavior:
   value. An explicitly configured command MUST be a tracked `100755` regular
   blob at `HEAD` and a live regular executable. Dirty edits to already tracked
   index/worktree content remain supported and MUST NOT be represented as an
-  exact-revision proof.
+  exact-revision proof. GitHub URL identity MUST match the versioned
+  Actions-owned `tests/fixtures/github-repo-identity-v1.tsv` vectors.
 - Fresh clones use shallow clone behavior.
 - Private repo clone failures over HTTPS should fall back to normal GitHub SSH
   clone where possible.

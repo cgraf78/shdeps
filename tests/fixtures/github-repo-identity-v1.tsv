@@ -1,0 +1,21 @@
+# cgraf78 checkout installer GitHub repository identity v1
+# disposition	url	expected
+accept	https://github.com/owner/tool	owner/tool
+accept	https://GITHUB.COM/Owner/Tool.git	Owner/Tool
+accept	ssh://git@github.com/owner/tool	owner/tool
+accept	ssh://git@GITHUB.COM/Owner/Tool.git	Owner/Tool
+accept	git@github.com:owner/tool	owner/tool
+accept	git@GITHUB.COM:Owner/Tool.git	Owner/Tool
+reject	http://github.com/owner/tool	-
+reject	https://user@github.com/owner/tool	-
+reject	https://github.com:443/owner/tool	-
+reject	https://github.com/owner/tool/	-
+reject	https://github.com/owner/tool?ref=main	-
+reject	https://github.com/owner/tool#main	-
+reject	https://github.com/owner%2ftool	-
+reject	ssh://owner@github.com/owner/tool	-
+reject	ssh://git@github.com:22/owner/tool	-
+reject	git@github.com:owner/tool/extra	-
+reject	git@github.com:owner/../tool	-
+reject	git@example.com:owner/tool	-
+reject	owner/tool	-

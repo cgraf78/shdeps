@@ -240,6 +240,10 @@ configured command must already be a tracked `100755` regular file at `HEAD`
 whose live path remains a regular executable. Staged or unstaged edits to
 already tracked development content are allowed and served live; this check
 grants no claim that the checkout matches its remote.
+The accepted GitHub HTTPS, `ssh://`, and scp-style identity spellings are
+locked to the Actions-owned
+`tests/fixtures/github-repo-identity-v1.tsv` vectors so bootstrap and
+steady-state ownership checks cannot drift independently.
 
 On a stale or forced check, shdeps updates a clean local clone with
 `git pull --ff-only`. If that pull fails, shdeps leaves the user-owned clone

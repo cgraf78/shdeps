@@ -1697,7 +1697,7 @@ install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
 
     #[test]
     #[cfg(unix)]
-    fn update_transition_rejects_unrecovered_checkout_installer_transaction() {
+    fn update_transition_treats_development_installer_transaction_as_opaque() {
         let fixture = Fixture::new("repo-installer-transaction-wiring");
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
@@ -1720,7 +1720,14 @@ install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
             .unwrap()
             .join(".tool.install.transaction");
         fs::create_dir_all(&installer_transaction).unwrap();
-        fs::write(installer_transaction.join("identity.partial"), "preserve\n").unwrap();
+        fs::write(
+            installer_transaction.join("identity.development"),
+            format!(
+                "cgraf78 checkout installer development-to-managed transaction v1\n{}\nowner/tool\nmain\n/dev/tool\nsupport/install-checkout.sh\n\n",
+                install_root.display()
+            ),
+        )
+        .unwrap();
         let expected_binary = fixture.roots.install_dir.join("tool/bin/tool");
         let runner = FakeRunner::default()
             .with_command("cargo")
