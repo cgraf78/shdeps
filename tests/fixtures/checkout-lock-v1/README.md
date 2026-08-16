@@ -2,7 +2,7 @@
 
 These files are byte-for-byte copies of the authoritative fixtures owned by
 `cgraf78/actions` at commit
-`f5771e11959c9474a4f759a78564323264131c14`. Shdeps consumes the same records,
+`b679aa6d58291178ea12ea89f9909f052373a767`. Shdeps consumes the same records,
 wire values, state transitions, and checkout-root vectors so the generated
 installer and the compiled manager cannot silently develop incompatible lock
 or path semantics.
