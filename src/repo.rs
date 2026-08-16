@@ -68,11 +68,10 @@ pub fn canonical_github_repo(url: &str) -> Option<String> {
         let (authority, path) = rest.split_once('/')?;
         let (user, host) = authority.split_once('@')?;
         (user == "git" && host.eq_ignore_ascii_case("github.com")).then_some(path)?
-    } else if let Some(rest) = url.strip_prefix("git@") {
+    } else {
+        let rest = url.strip_prefix("git@")?;
         let (host, path) = rest.split_once(':')?;
         host.eq_ignore_ascii_case("github.com").then_some(path)?
-    } else {
-        return None;
     };
 
     canonical_github_path(path)
