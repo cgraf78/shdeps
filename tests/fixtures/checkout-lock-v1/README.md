@@ -1,11 +1,11 @@
 # Checkout lock v1 conformance fixtures
 
 These files are byte-for-byte copies of the authoritative fixtures owned by
-`cgraf78/actions` at commit
-`b679aa6d58291178ea12ea89f9909f052373a767`. Shdeps consumes the same records,
-wire values, state transitions, and checkout-root vectors so the generated
-installer and the compiled manager cannot silently develop incompatible lock
-or path semantics.
+`cgraf78/actions` at the immutable revision recorded in
+[`.github/cgraf78-actions.lock`](../../../.github/cgraf78-actions.lock). Shdeps
+consumes the same records, wire values, state transitions, and checkout-root
+vectors so the generated installer and the compiled manager cannot silently
+develop incompatible lock or path semantics.
 
 The corresponding public protocol is vendored at
 [`docs/checkout-lock-v1.md`](../../../docs/checkout-lock-v1.md). Update the
