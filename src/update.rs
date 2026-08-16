@@ -8095,7 +8095,8 @@ version() { printf 'saw-pkg\n'; }
         fs::create_dir_all(fixture.roots.home.join(".ssh")).unwrap();
         let known_hosts = fixture.roots.home.join(".ssh/known_hosts");
         fs::write(&known_hosts, "github.com ssh-ed25519 test-key\n").unwrap();
-        let socket = fixture.roots.home.join("agent.sock");
+        let socket_root = crate::test_support::short_temp_dir();
+        let socket = socket_root.join("agent.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         let socket_link = fixture.roots.home.join("agent-link.sock");
         symlink(&socket, &socket_link).unwrap();
@@ -8186,6 +8187,7 @@ version() { printf 'saw-pkg\n'; }
 
         let mut fixture = Fixture::new("repo-existing-candidate-agent-socket");
         fixture.write_lib();
+        fixture.roots.install_dir = crate::test_support::short_temp_dir().join("share");
         fixture.env_vars.insert(
             "SHDEPS_TOOL_REPO".to_owned(),
             "git@github.com:owner/tool.git".to_owned(),

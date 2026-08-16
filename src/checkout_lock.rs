@@ -2459,6 +2459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn non_utf8_owner_bearing_claim_fails_closed() {
         let requested = checkout("non-utf8-claim");
         let paths = Paths::new(&requested).unwrap();
