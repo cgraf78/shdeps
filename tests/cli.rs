@@ -3413,6 +3413,13 @@ fn fixture_removes_its_temp_tree_on_drop() {
     );
 }
 
+#[test]
+fn fixture_returns_the_physical_temp_tree() {
+    let fixture = Fixture::new("physical-temp-tree");
+
+    assert_eq!(fixture.dir, fs::canonicalize(&fixture.dir).unwrap());
+}
+
 impl Fixture {
     fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
@@ -3422,6 +3429,10 @@ impl Fixture {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        // Production normalizes checkout roots before comparing and publishing
+        // them. Match that spelling here because macOS exposes the same temp
+        // directory through `/var` while canonical paths use `/private/var`.
+        let dir = fs::canonicalize(&dir).unwrap();
         Self { dir }
     }
 
