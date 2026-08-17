@@ -7,9 +7,10 @@
 
 use crate::Result;
 use crate::config::{self, Entry};
-use crate::manifest::{self, ManifestEntry};
+use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::method;
 use crate::package_cache;
+use crate::package_proof;
 use crate::pkg;
 use crate::process::{self, Output, Runner};
 use crate::update::{
@@ -29,6 +30,57 @@ pub(crate) struct Queued {
 pub(crate) enum SudoStatus {
     Available,
     UnavailableQuiet,
+}
+
+pub(crate) fn required_proofs(
+    entries: &[Entry],
+    manifest: &Manifest,
+    context: &Context<'_, impl Runner>,
+) -> BTreeSet<String> {
+    entries
+        .iter()
+        .filter(|entry| entry.method == method::PKG && active(entry, context.env))
+        .filter_map(|entry| {
+            let package = config::resolve_override_for_runtime(
+                &entry.name,
+                &entry.aliases,
+                Some(context.pkg_mgr),
+                context.env.is_android(),
+            );
+            let tracked = manifest.get(&entry.name).is_some_and(|installed| {
+                installed.method == method::PKG && installed.cmd == entry.cmd
+            });
+            (package != "NONE"
+                && (!tracked
+                    || !package_proof::current(
+                        &context.roots.state_dir,
+                        &entry.name,
+                        context.pkg_mgr,
+                        &package,
+                        &entry.cmd,
+                    )))
+            .then(|| entry.name.clone())
+        })
+        .collect()
+}
+
+pub(crate) fn record_proof(entry: &Entry, context: &Context<'_, impl Runner>) -> Result<()> {
+    let package = config::resolve_override_for_runtime(
+        &entry.name,
+        &entry.aliases,
+        Some(context.pkg_mgr),
+        context.env.is_android(),
+    );
+    if package == "NONE" {
+        return Ok(());
+    }
+    package_proof::write(
+        &context.roots.state_dir,
+        &entry.name,
+        context.pkg_mgr,
+        &package,
+        &entry.cmd,
+    )
 }
 
 pub(crate) fn cache_status(
@@ -133,9 +185,9 @@ pub(crate) fn package_versions(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     options: Options,
-    transitions: &BTreeSet<String>,
+    required_proofs: &BTreeSet<String>,
 ) -> std::collections::BTreeMap<String, String> {
-    if !needs_package_version_snapshot(entries, context, options, transitions) {
+    if !needs_package_version_snapshot(entries, context, options, required_proofs) {
         return std::collections::BTreeMap::new();
     }
     process::package_versions(context.runner, context.pkg_mgr)
@@ -145,9 +197,9 @@ pub(crate) fn sudo_status(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     package_versions: &std::collections::BTreeMap<String, String>,
-    transitions: &BTreeSet<String>,
+    required_proofs: &BTreeSet<String>,
 ) -> Result<SudoStatus> {
-    if !needs_package_work(entries, context, package_versions, transitions) {
+    if !needs_package_work(entries, context, package_versions, required_proofs) {
         return Ok(SudoStatus::Available);
     }
     if pkg::Elevation::for_manager(context.pkg_mgr, context.env) == pkg::Elevation::Direct
@@ -169,11 +221,11 @@ pub(crate) fn prepare(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     package_versions: &std::collections::BTreeMap<String, String>,
-    transitions: &BTreeSet<String>,
+    required_proofs: &BTreeSet<String>,
     sudo: SudoStatus,
     progress: &mut dyn Progress,
 ) -> Result<()> {
-    if !needs_package_work(entries, context, package_versions, transitions) {
+    if !needs_package_work(entries, context, package_versions, required_proofs) {
         return Ok(());
     }
     if sudo == SudoStatus::UnavailableQuiet {
@@ -189,7 +241,7 @@ fn needs_package_version_snapshot(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     _options: Options,
-    transitions: &BTreeSet<String>,
+    required_proofs: &BTreeSet<String>,
 ) -> bool {
     // Batch package versions are useful only when command lookup alone cannot
     // prove every active package dependency. Avoiding the manager-wide query on
@@ -207,7 +259,7 @@ fn needs_package_version_snapshot(
             context.env.is_android(),
         );
         resolved != "NONE"
-            && (transitions.contains(&entry.name) || !context.runner.exists(&entry.cmd))
+            && (required_proofs.contains(&entry.name) || !context.runner.exists(&entry.cmd))
     })
 }
 
@@ -218,7 +270,7 @@ pub(crate) fn install(
     sudo: SudoStatus,
     queued: &mut Vec<Queued>,
     package_versions: &std::collections::BTreeMap<String, String>,
-    transitioning: bool,
+    require_proof: bool,
 ) -> Result<Item> {
     let resolved = config::resolve_override_for_runtime(
         &entry.name,
@@ -234,8 +286,11 @@ pub(crate) fn install(
         ));
     }
 
-    let installed = installed(entry, &resolved, context, package_versions, transitioning);
+    let installed = installed(entry, &resolved, context, package_versions, require_proof);
     if installed {
+        if require_proof {
+            record_proof(entry, context)?;
+        }
         manifest::upsert(
             context.manifest_path,
             ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
@@ -346,7 +401,7 @@ fn needs_package_work(
     entries: &[Entry],
     context: &Context<'_, impl Runner>,
     package_versions: &std::collections::BTreeMap<String, String>,
-    transitions: &BTreeSet<String>,
+    required_proofs: &BTreeSet<String>,
 ) -> bool {
     if context.pkg_mgr.is_empty() {
         return false;
@@ -369,7 +424,7 @@ fn needs_package_work(
                 &resolved,
                 context,
                 package_versions,
-                transitions.contains(&entry.name),
+                required_proofs.contains(&entry.name),
             )
     })
 }
@@ -379,9 +434,9 @@ fn installed(
     package: &str,
     context: &Context<'_, impl Runner>,
     package_versions: &std::collections::BTreeMap<String, String>,
-    transitioning: bool,
+    require_proof: bool,
 ) -> bool {
-    if transitioning {
+    if require_proof {
         // A command owned by the old method must not satisfy the new package
         // provider: transition cleanup will remove that command afterward.
         return package_versions.contains_key(package)

@@ -279,11 +279,9 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
     let probe = match pkg_mgr {
         "brew" => Some(("brew", vec!["list", "--versions", package_name])),
         "apt" => Some(("dpkg", vec!["-s", package_name])),
-        "dnf" => Some(("rpm", vec!["-q", package_name])),
+        "dnf" | "zypper" => Some(("rpm", vec!["-q", package_name])),
         "pacman" => Some(("pacman", vec!["-Q", package_name])),
-        // Bash currently detects these managers for install selection but
-        // does not use them in `_shdeps_exists`. Keep that asymmetry until the
-        // reference behavior intentionally changes.
+        "apk" => Some(("apk", vec!["info", "-e", package_name])),
         _ => None,
     };
 
@@ -902,10 +900,12 @@ mod tests {
     fn package_installed_preserves_bash_manager_coverage() {
         let runner = FakeRunner::default()
             .with_output("dpkg", ["-s", "font"], true, "Package: font", "")
+            .with_output("rpm", ["-q", "font"], true, "font-1.0", "")
             .with_output("apk", ["info", "-e", "font"], true, "font", "");
 
         assert!(package_installed(&runner, "font", "apt"));
-        assert!(!package_installed(&runner, "font", "apk"));
+        assert!(package_installed(&runner, "font", "zypper"));
+        assert!(package_installed(&runner, "font", "apk"));
     }
 
     #[test]

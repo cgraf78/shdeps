@@ -31,6 +31,7 @@ pub(crate) struct Transition {
     extra_links: Vec<PathBuf>,
     archive_state: ArchiveState,
     archive_root_identity: Option<FileIdentity>,
+    public_regular_identity: Option<cleanup::FileIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,13 +64,8 @@ pub(crate) fn reject_identity_handoffs(
             )
         })
         .collect::<Vec<_>>();
-    let active_names = active_entries
-        .iter()
-        .map(|entry| entry.name.as_str())
-        .collect::<BTreeSet<_>>();
-
     for old in manifest.entries() {
-        if old.cmd.is_empty() || active_names.contains(old.name.as_str()) {
+        if old.cmd.is_empty() {
             continue;
         }
         if let Some(new) = active_entries
@@ -80,7 +76,7 @@ pub(crate) fn reject_identity_handoffs(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "unsupported dependency identity handoff for command `{}`: manifest `{}` conflicts with configured `{}`; prune the old identity before updating the replacement",
+                    "unsupported dependency identity handoff for command `{}`: manifest `{}` conflicts with configured `{}`; remove the old declaration, run `shdeps prune`, then retry the replacement",
                     old.cmd, old.name, new.name
                 ),
             )
@@ -130,6 +126,11 @@ pub(crate) fn by_name(
             } else {
                 None
             };
+            let public_regular_identity = if entry.method == method::GITHUB_RELEASE {
+                cleanup::regular_file_identity(&roots.bin_dir.join(&entry.cmd))?
+            } else {
+                None
+            };
             Ok((
                 entry.name.clone(),
                 Transition {
@@ -138,6 +139,7 @@ pub(crate) fn by_name(
                     extra_links,
                     archive_state,
                     archive_root_identity,
+                    public_regular_identity,
                 },
             ))
         })
@@ -285,9 +287,9 @@ pub(crate) fn cleanup_successful(
     transition: Option<&Transition>,
     roots: &Roots,
     locked_repo_root: Option<&Path>,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     let Some(transition) = transition else {
-        return Ok(false);
+        return Ok(None);
     };
     if transition.old.method == method::GITHUB_REPO && locked_repo_root.is_none() {
         return Err(std::io::Error::new(
@@ -297,7 +299,9 @@ pub(crate) fn cleanup_successful(
         .into());
     }
 
-    Ok(cleanup_snapshot(entry, transition, roots, locked_repo_root).is_err())
+    Ok(cleanup_snapshot(entry, transition, roots, locked_repo_root)
+        .err()
+        .map(|error| error.to_string()))
 }
 
 /// Restores the old manifest row after a transition install fails.
@@ -408,6 +412,7 @@ fn cleanup_snapshot(
             // System packages are not shdeps-owned. Once another method has
             // succeeded, the manifest swap is enough; the OS package remains
             // available for anything else on the machine that might use it.
+            crate::package_proof::remove(&roots.state_dir, &transition.old.name)?;
         }
         method::GITHUB_REPO => {
             let install_path = locked_repo_root.ok_or_else(|| {
@@ -416,12 +421,20 @@ fn cleanup_snapshot(
                     "github:repo transition cleanup requires an acquired checkout-lock root",
                 )
             })?;
+            let owner_roots = [
+                roots.install_dir.join(config::canonical_name(
+                    &transition.old.name,
+                    method::GITHUB_REPO,
+                )),
+                install_path.to_path_buf(),
+            ];
             unlink_snapshot(
                 &roots.state_dir,
                 &transition.old.name,
                 Kind::Bin,
                 &transition.bin_links,
                 &preserve,
+                &owner_roots,
             )?;
             unlink_snapshot(
                 &roots.state_dir,
@@ -429,6 +442,7 @@ fn cleanup_snapshot(
                 Kind::Extras,
                 &transition.extra_links,
                 &preserve,
+                &owner_roots,
             )?;
 
             // Repository ownership comes from the validated dependency name,
@@ -460,6 +474,12 @@ fn cleanup_snapshot(
         }
         binary if method::is_binary_install_root(binary) => {
             let public_bin = roots.bin_dir.join(&transition.old.cmd);
+            let install_root = roots.install_dir.join(&transition.old.name);
+            let owner_roots = [
+                install_root.clone(),
+                crate::cleanup::physical_install_root(&roots.install_dir)
+                    .join(&transition.old.name),
+            ];
             let preserve_public_launcher = binary == method::GITHUB_RELEASE
                 && transition.archive_state != ArchiveState::None
                 && github_release_install::is_non_symlink(&public_bin);
@@ -469,6 +489,7 @@ fn cleanup_snapshot(
                 Kind::Bin,
                 &transition.bin_links,
                 &preserve,
+                &owner_roots,
             )?;
             unlink_snapshot(
                 &roots.state_dir,
@@ -476,13 +497,18 @@ fn cleanup_snapshot(
                 Kind::Extras,
                 &transition.extra_links,
                 &preserve,
+                &owner_roots,
             )?;
-            if !preserve_public_launcher {
-                remove_any_unless_preserved(&public_bin, &preserve)?;
+            if !preserve_public_launcher && !preserve.contains(&public_bin) {
+                let removed = cleanup::unlink_owned_symlink(&public_bin, &owner_roots)?;
+                if !removed && binary == method::GITHUB_RELEASE {
+                    if let Some(identity) = transition.public_regular_identity {
+                        cleanup::remove_owned_regular_file(&public_bin, identity)?;
+                    }
+                }
             }
 
-            let install_root = roots.install_dir.join(&transition.old.name);
-            if !preserve.contains(&install_root) {
+            if !owner_roots.iter().any(|root| preserve.contains(root)) {
                 remove_any(&install_root)?;
                 remove_empty_install_parents(&install_root, &roots.install_dir)?;
             }
@@ -522,6 +548,7 @@ fn preserve_paths(
     match entry.method.as_str() {
         symlink if method::is_symlink_install_root(symlink) => {
             preserve.insert(roots.bin_dir.join(&entry.cmd));
+            preserve.insert(roots.install_dir.join(&entry.name));
             preserve.insert(locked_repo_root.map_or_else(
                 || crate::cleanup::physical_install_root(&roots.install_dir).join(&entry.name),
                 Path::to_path_buf,
@@ -557,6 +584,7 @@ fn preserve_paths(
             )? == ArchiveState::Proven
                 || release_install_root_is_owned(&install_root, &public_bin)
             {
+                preserve.insert(roots.install_dir.join(&entry.name));
                 preserve.insert(install_root);
             }
         }
@@ -630,17 +658,13 @@ fn unlink_snapshot(
     kind: Kind,
     snapshot: &[PathBuf],
     preserve: &BTreeSet<PathBuf>,
+    owner_roots: &[PathBuf],
 ) -> Result<()> {
     for link in snapshot {
         if preserve.contains(link) {
             continue;
         }
-        if fs::symlink_metadata(link)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            fs::remove_file(link)?;
-        }
+        cleanup::unlink_owned_symlink(link, owner_roots)?;
     }
 
     // Clear the snapshot entries from the link-state file rather than
@@ -667,13 +691,6 @@ fn unlink_snapshot(
 
 fn remove_stamps(state_dir: &Path, name: &str) -> Result<()> {
     cleanup::remove_stamps(state_dir, name, &mut cleanup::Summary::default())
-}
-
-fn remove_any_unless_preserved(path: &Path, preserve: &BTreeSet<PathBuf>) -> Result<()> {
-    if preserve.contains(path) {
-        return Ok(());
-    }
-    remove_any(path)
 }
 
 fn remove_any(path: &Path) -> Result<()> {
@@ -762,6 +779,24 @@ mod tests {
         let manifest = Manifest::parse("owner/old|github:release|tool|/tmp/old\n");
         let entries = [
             parse_entry("owner/old|github:release|tool|-|os:macos", Some("apt")),
+            parse_entry("replacement|pkg|tool|-|-", Some("apt")),
+        ];
+
+        let error =
+            reject_identity_handoffs(&manifest, &entries, &RuntimeEnv::new("linux", "host"))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("owner/old"));
+        assert!(error.to_string().contains("replacement"));
+        assert!(error.to_string().contains("remove the old declaration"));
+        assert!(error.to_string().contains("shdeps prune"));
+    }
+
+    #[test]
+    fn identity_handoff_guard_rejects_reuse_after_same_name_command_change() {
+        let manifest = Manifest::parse("owner/old|github:release|tool|/tmp/old\n");
+        let entries = [
+            parse_entry("owner/old|github:release|other|-|-", Some("apt")),
             parse_entry("replacement|pkg|tool|-|-", Some("apt")),
         ];
 
@@ -861,6 +896,7 @@ mod tests {
             Kind::Extras,
             &snapshot,
             &BTreeSet::new(),
+            std::slice::from_ref(&target),
         )
         .unwrap();
 
@@ -941,6 +977,7 @@ mod tests {
             Kind::Extras,
             &snapshot,
             &BTreeSet::new(),
+            std::slice::from_ref(&target),
         )
         .unwrap();
 
@@ -1007,6 +1044,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1059,12 +1097,16 @@ mod tests {
         };
         fs::create_dir_all(&roots.bin_dir).unwrap();
         fs::create_dir_all(roots.state_dir.join("owner")).unwrap();
-        let target = dir.join("target");
+        let install_root = roots.install_dir.join("owner/tool");
+        let target = install_root.join("bin/tool");
+        let helper_target = install_root.join("bin/tool-helper");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, "old").unwrap();
+        fs::write(&helper_target, "old helper").unwrap();
         let public = roots.bin_dir.join("tool");
         let helper = roots.bin_dir.join("tool-helper");
         symlink(&target, &public).unwrap();
-        symlink(&target, &helper).unwrap();
+        symlink(&helper_target, &helper).unwrap();
         link_state::write(
             &link_state::path(&roots.state_dir, "owner/tool", Kind::Bin),
             &[public.clone(), helper.clone()],
@@ -1081,6 +1123,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1096,6 +1139,237 @@ mod tests {
         assert!(!public.exists());
         assert!(!helper.exists());
         assert!(!link_state::path(&roots.state_dir, "owner/tool", Kind::Bin).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_snapshot_preserves_regular_path_from_symlink_only_method() {
+        let dir = temp_dir("binary-regular-replacement");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let install_root = roots.install_dir.join("owner/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::write(&public, "replacement command").unwrap();
+        link_state::write(
+            &link_state::path(&roots.state_dir, "owner/tool", Kind::Bin),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "cargo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+            bin_links: vec![public.clone()],
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+            archive_root_identity: None,
+            public_regular_identity: None,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "other".to_owned(),
+            cmd_explicit: true,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
+
+        assert_eq!(fs::read_to_string(public).unwrap(), "replacement command");
+        assert!(!install_root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_snapshot_preserves_raw_command_replaced_after_transition_snapshot() {
+        let dir = temp_dir("release-regular-replacement-after-snapshot");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let install_root = roots.install_dir.join("owner/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::write(&public, "old raw release").unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:release|tool|{}\n",
+            public.display()
+        ));
+        let new_entry = parse_entry("owner/tool|pkg|other|-|-", Some("apt"));
+        let transitions = by_name(&manifest, std::slice::from_ref(&new_entry), &roots).unwrap();
+        let replacement = roots.bin_dir.join(".tool.replacement");
+        fs::write(&replacement, "foreign replacement").unwrap();
+        fs::rename(&replacement, &public).unwrap();
+
+        cleanup_snapshot_for_test(&new_entry, &transitions["owner/tool"], &roots).unwrap();
+
+        assert_eq!(fs::read_to_string(public).unwrap(), "foreign replacement");
+        assert!(!install_root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_snapshot_preserves_retargeted_old_command_symlink() {
+        let dir = temp_dir("binary-retargeted-replacement");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let install_root = roots.install_dir.join("owner/tool");
+        let replacement = roots.install_dir.join("replacement/bin/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::create_dir_all(replacement.parent().unwrap()).unwrap();
+        fs::write(&replacement, "replacement command").unwrap();
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        symlink(&replacement, &public).unwrap();
+        link_state::write(
+            &link_state::path(&roots.state_dir, "owner/tool", Kind::Bin),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "cargo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+            bin_links: vec![public.clone()],
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+            archive_root_identity: None,
+            public_regular_identity: None,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "other".to_owned(),
+            cmd_explicit: true,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
+
+        assert_eq!(fs::read_link(public).unwrap(), replacement);
+        assert!(!install_root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_snapshot_preserves_new_root_through_symlinked_install_dir() {
+        let dir = temp_dir("binary-symlinked-install-dir");
+        let physical = dir.join("physical-install");
+        let logical = dir.join("logical-install");
+        fs::create_dir_all(&physical).unwrap();
+        symlink(&physical, &logical).unwrap();
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: logical.clone(),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let new_root = physical.join("owner/tool");
+        let new_target = new_root.join("bin/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(new_target.parent().unwrap()).unwrap();
+        fs::write(&new_target, "new command").unwrap();
+        fs::write(new_root.join("sentinel"), "preserve").unwrap();
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        symlink(&new_target, &public).unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+            bin_links: vec![public.clone()],
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+            archive_root_identity: None,
+            public_regular_identity: None,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "cargo".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: false,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(new_root.join("sentinel")).unwrap(),
+            "preserve"
+        );
+        assert_eq!(fs::read_link(public).unwrap(), new_target);
+        assert_eq!(fs::read_link(logical).unwrap(), physical);
+    }
+
+    #[test]
+    fn cleanup_snapshot_retires_old_package_proof() {
+        let dir = temp_dir("retire-package-proof");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        crate::package_proof::write(&roots.state_dir, "tool", "apt", "tool", "tool").unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new("tool", "pkg", "tool", ""),
+            bin_links: Vec::new(),
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+            archive_root_identity: None,
+            public_regular_identity: None,
+        };
+        let new_entry = Entry {
+            name: "tool".to_owned(),
+            method: "custom".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: false,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
+
+        assert!(!crate::package_proof::path(&roots.state_dir, "tool").exists());
     }
 
     #[test]
@@ -1139,6 +1413,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::Proven,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1172,11 +1447,14 @@ mod tests {
         fs::create_dir_all(&roots.bin_dir).unwrap();
         fs::create_dir_all(roots.state_dir.join("owner")).unwrap();
         let target = dir.join("target");
+        let old_helper = roots.install_dir.join("owner/tool/bin/tool-helper");
+        fs::create_dir_all(old_helper.parent().unwrap()).unwrap();
         fs::write(&target, "new").unwrap();
+        fs::write(&old_helper, "old helper").unwrap();
         let public = roots.bin_dir.join("tool");
         let helper = roots.bin_dir.join("tool-helper");
         symlink(&target, &public).unwrap();
-        symlink(&target, &helper).unwrap();
+        symlink(&old_helper, &helper).unwrap();
         link_state::write(
             &link_state::path(&roots.state_dir, "owner/tool", Kind::Bin),
             std::slice::from_ref(&public),
@@ -1193,6 +1471,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1246,6 +1525,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1294,6 +1574,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1345,6 +1626,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1411,6 +1693,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -1473,6 +1756,7 @@ mod tests {
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
             archive_root_identity: None,
+            public_regular_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),

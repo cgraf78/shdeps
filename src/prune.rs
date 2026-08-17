@@ -182,8 +182,17 @@ pub fn run(
     let mut removed = Vec::new();
     for entry in &orphans {
         cleanup::validate_manifest_artifact_entry(entry)?;
+        let cleanup_evidence = cleanup::capture_evidence(entry, &cleanup_roots)?;
         let hook = hooks.uninstall(&entry.name, roots)?;
-        let (cleanup, cleanup_error) = cleanup_orphan(entry, manifest_path, &cleanup_roots)?;
+        let preserve_regular_public =
+            regular_public_claimed_by_survivor(entry, &fresh_manifest, config);
+        let (cleanup, cleanup_error) = cleanup_orphan(
+            entry,
+            manifest_path,
+            &cleanup_roots,
+            preserve_regular_public,
+            cleanup_evidence,
+        )?;
         removed.push(Item {
             entry: entry.clone(),
             hook,
@@ -205,6 +214,8 @@ fn cleanup_orphan(
     entry: &ManifestEntry,
     manifest_path: &Path,
     cleanup_roots: &cleanup::Roots,
+    preserve_regular_public: bool,
+    cleanup_evidence: cleanup::Evidence,
 ) -> Result<(Option<cleanup::Summary>, Option<String>)> {
     let cleanup = |repo_root: Option<&Path>| -> Result<(Option<cleanup::Summary>, Option<String>)> {
         // A pending bin-link record is recovery authority, not ordinary
@@ -217,7 +228,13 @@ fn cleanup_orphan(
             crate::link_state::Kind::Bin,
         );
         crate::link_state::recover_reconcile(&bin_state)?;
-        let result = match cleanup::remove_builtin_with_repo_root(entry, cleanup_roots, repo_root) {
+        let result = match cleanup::remove_builtin_with_evidence(
+            entry,
+            cleanup_roots,
+            repo_root,
+            preserve_regular_public,
+            cleanup_evidence,
+        ) {
             Ok(summary) => (Some(summary), None),
             Err(error) => (None, Some(error.to_string())),
         };
@@ -250,6 +267,27 @@ fn cleanup_orphan(
     {
         cleanup(Some(&root))
     }
+}
+
+fn regular_public_claimed_by_survivor(
+    orphan: &ManifestEntry,
+    manifest: &Manifest,
+    config: &[Entry],
+) -> bool {
+    if orphan.method != crate::method::GITHUB_RELEASE {
+        return false;
+    }
+    config.iter().any(|entry| {
+        entry.name != orphan.name
+            && matches!(
+                entry.method.as_str(),
+                crate::method::GITHUB | crate::method::GITHUB_RELEASE
+            )
+            && entry.cmd == orphan.cmd
+            && manifest.get(&entry.name).is_some_and(|installed| {
+                installed.method == crate::method::GITHUB_RELEASE && installed.cmd == orphan.cmd
+            })
+    })
 }
 
 fn orphans(manifest: &Manifest, config: &[Entry]) -> Vec<ManifestEntry> {
@@ -336,6 +374,142 @@ mod tests {
         assert_eq!(summary.removed[0].hook, Uninstall::MissingHook);
         assert!(!bin.exists());
         assert!(!fixture.roots.install_dir.join("owner/tool").exists());
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn prune_preserves_regular_command_owned_by_surviving_raw_release() {
+        let fixture = Fixture::new("prune-raw-release-handoff");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "replacement release\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/replacement",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[parse_entry(
+                "owner/replacement|github:release|tool|-|-",
+                None,
+            )],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(public).unwrap(), "replacement release\n");
+        let remaining = manifest::read(&manifest_path).unwrap();
+        assert!(remaining.get("owner/old").is_none());
+        assert!(remaining.get("owner/replacement").is_some());
+    }
+
+    #[test]
+    fn prune_does_not_treat_package_survivor_as_regular_command_owner() {
+        let fixture = Fixture::new("prune-package-command-handoff");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "old raw release\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("replacement", "pkg", "tool", ""),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[parse_entry("replacement|pkg|tool|-|-", None)],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(fs::symlink_metadata(public).is_err());
+    }
+
+    #[test]
+    fn prune_preserves_raw_command_replaced_by_uninstall_hook() {
+        let fixture = Fixture::new("prune-hook-replaces-raw-command");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "old raw release\n");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            r#"uninstall() {
+  printf 'replacement from hook\n' > "$SHDEPS_BIN_DIR/.tool.new"
+  mv -f "$SHDEPS_BIN_DIR/.tool.new" "$SHDEPS_BIN_DIR/tool"
+}
+"#,
+        );
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.removed[0].hook, Uninstall::Removed);
+        assert_eq!(
+            fs::read_to_string(public).unwrap(),
+            "replacement from hook\n"
+        );
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
     }
 

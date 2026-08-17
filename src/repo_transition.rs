@@ -689,7 +689,7 @@ fn replace_owned_symlink(checkout: &Path, target: &Path) -> Result<()> {
 /// generation during transaction rollback. The supported fleet platforms all
 /// expose an atomic exclusive rename; unknown Unix targets fail closed rather
 /// than silently falling back to clobbering semantics.
-fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

@@ -1057,6 +1057,11 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
         "conf/deps.conf",
         "tool pkg tool apt:NONE\nother pkg other\n",
     );
+    fixture.write("state/manifest", "other|pkg|other|\n");
+    fixture.write(
+        "state/other.pkg-proof",
+        "shdeps-pkg-proof-v1\nmanager=apt\npackage=other\ncommand=other\n",
+    );
     fixture.write_executable("fakebin/apt-get", "#!/bin/sh\n");
     fixture.write_executable("fakebin/other", "#!/bin/sh\n");
     let mut command = fixture.command(["update"]);
@@ -2950,6 +2955,11 @@ version() { printf '1.2.3\n'; }
 fn update_verbose_reports_package_versions_only_when_verbose() {
     let fixture = Fixture::new("update-verbose-pkg-version");
     fixture.write("conf/deps.conf", "tool pkg tool\n");
+    fixture.write("state/manifest", "tool|pkg|tool|\n");
+    fixture.write(
+        "state/tool.pkg-proof",
+        "shdeps-pkg-proof-v1\nmanager=apt\npackage=tool\ncommand=tool\n",
+    );
     fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
     fixture.write_executable(
         "fakebin/tool",
