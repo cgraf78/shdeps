@@ -741,8 +741,37 @@ impl<'a, R: Runner> CleanGit<'a, R> {
     ) -> io::Result<Self> {
         let candidate_root = fs::canonicalize(candidate_root)?;
         let program = trusted_program(runner, "git", &candidate_root)?;
+        let program_parent = program
+            .parent()
+            .ok_or_else(|| invalid("isolated Git executable has no parent directory"))?;
+        let mut executable_dirs = vec![program_parent.to_owned()];
+        if runner.path("bash").is_some() {
+            let bash = trusted_program(runner, "bash", &candidate_root)?;
+            let bash_parent = bash
+                .parent()
+                .ok_or_else(|| invalid("isolated Bash executable has no parent directory"))?
+                .to_owned();
+            if !executable_dirs.contains(&bash_parent) {
+                executable_dirs.push(bash_parent);
+            }
+        }
+        for directory in [Path::new("/usr/bin"), Path::new("/bin")] {
+            let directory = directory.to_owned();
+            if !executable_dirs.contains(&directory) {
+                executable_dirs.push(directory);
+            }
+        }
+        let executable_path = std::env::join_paths(executable_dirs.iter())
+            .map_err(|_| invalid("isolated executable path is not representable"))?;
 
         let mut env = BTreeMap::new();
+        // Git or a host-selected wrapper may dispatch a helper through
+        // `#!/usr/bin/env bash`. Preserve environment isolation while making
+        // only the validated Git and Bash directories plus standard immutable
+        // system directories discoverable; never admit the caller or checkout
+        // PATH. The separate Bash directory matters on Termux when a client
+        // wrapper selects Git outside the shared $PREFIX/bin tool root.
+        env.insert("PATH".into(), executable_path);
         insert_env(&mut env, "HOME", &quarantine.home);
         insert_env(&mut env, "XDG_CONFIG_HOME", &quarantine.xdg_config);
         insert_env(&mut env, "XDG_DATA_HOME", &quarantine.xdg_data);
@@ -1589,9 +1618,13 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::Duration;
 
+    use crate::process::{Output, Runner};
     use crate::{repo, repo_adopt};
 
     use super::{
@@ -1785,6 +1818,65 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn isolated_git_can_resolve_a_separate_trusted_bash_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = super::create_unique_private_dir(&std::env::temp_dir()).unwrap();
+        let source = root.join("source");
+        let origin = root.join("origin.git");
+        let host_bin = root.join("host-bin");
+        let shell_bin = root.join("shell-bin");
+        let git_wrapper = host_bin.join("git");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&origin).unwrap();
+        fs::create_dir_all(&host_bin).unwrap();
+        fs::create_dir_all(&shell_bin).unwrap();
+
+        let real_bash = crate::process::Process.path("bash").unwrap();
+        fs::write(
+            &git_wrapper,
+            format!(
+                "#!/usr/bin/env bash\nprintf 'ref: refs/heads/main\\tHEAD\\n{}\\tHEAD\\n'\n",
+                OID
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&git_wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::copy(&real_bash, shell_bin.join("bash")).unwrap();
+        fs::set_permissions(shell_bin.join("bash"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let quarantine = Quarantine::create(&root.join("state")).unwrap();
+        let runner = CleanEnvRunner {
+            git: git_wrapper.clone(),
+            bash: shell_bin.join("bash"),
+        };
+        let origin_text = format!("file://{}", origin.display());
+        let git = CleanGit::new(
+            &runner,
+            &source,
+            &origin_text,
+            &BTreeMap::new(),
+            &root,
+            &quarantine,
+        )
+        .unwrap();
+
+        let physical_host_bin = fs::canonicalize(&host_bin).unwrap();
+        let physical_shell_bin = fs::canonicalize(&shell_bin).unwrap();
+        let expected_path = std::env::join_paths([
+            physical_host_bin.as_os_str(),
+            physical_shell_bin.as_os_str(),
+            Path::new("/usr/bin").as_os_str(),
+            Path::new("/bin").as_os_str(),
+        ])
+        .unwrap();
+        assert_eq!(git.env.get(&OsString::from("PATH")), Some(&expected_path));
+        super::discover_remote_head(&git, &origin_text).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn stock_git_adopts_checkout_from_exact_local_origin_override() {
         let root = super::create_unique_private_dir(&std::env::temp_dir()).unwrap();
         let source = root.join("source");
@@ -1955,5 +2047,55 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    struct CleanEnvRunner {
+        git: PathBuf,
+        bash: PathBuf,
+    }
+
+    impl Runner for CleanEnvRunner {
+        fn exists(&self, command: &str) -> bool {
+            matches!(command, "git" | "bash")
+        }
+
+        fn path(&self, command: &str) -> Option<PathBuf> {
+            match command {
+                "git" => Some(self.git.clone()),
+                "bash" => Some(self.bash.clone()),
+                _ => None,
+            }
+        }
+
+        fn run(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _timeout: Option<Duration>,
+        ) -> std::io::Result<Output> {
+            unreachable!("isolated verification must use run_env_clear")
+        }
+
+        fn run_env_clear(
+            &self,
+            program: &Path,
+            cwd: &Path,
+            args: &[OsString],
+            env: &BTreeMap<OsString, OsString>,
+            _timeout: Duration,
+        ) -> std::io::Result<Output> {
+            let output = Command::new(program)
+                .current_dir(cwd)
+                .args(args)
+                .env_clear()
+                .envs(env)
+                .output()?;
+            Ok(Output {
+                success: output.status.success(),
+                timed_out: false,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        }
     }
 }

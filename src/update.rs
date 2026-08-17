@@ -11033,7 +11033,19 @@ version() { printf 'saw-pkg\n'; }
     }
 
     fn expected_clean_git_env(quarantine: &Path) -> BTreeMap<OsString, OsString> {
+        let git = fs::canonicalize(host_command_path("git")).unwrap();
+        let git_parent = git.parent().unwrap();
+        let mut executable_dirs = vec![git_parent];
+        for directory in [Path::new("/usr/bin"), Path::new("/bin")] {
+            if directory != git_parent && !executable_dirs.contains(&directory) {
+                executable_dirs.push(directory);
+            }
+        }
         BTreeMap::from([
+            (
+                "PATH".into(),
+                std::env::join_paths(executable_dirs).unwrap(),
+            ),
             ("HOME".into(), quarantine.join("home").into_os_string()),
             (
                 "XDG_CONFIG_HOME".into(),
