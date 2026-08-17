@@ -9,6 +9,10 @@
 
 use std::fs;
 #[cfg(unix)]
+use std::hash::{Hash, Hasher};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -23,6 +27,60 @@ use crate::method;
 
 #[cfg(unix)]
 static UNLINK_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+struct DirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LogicalBaseIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    kind: LogicalBaseKind,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogicalBaseKind {
+    Directory,
+    Symlink(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+struct ManagedRootIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    kind: ManagedRootKind,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    tree_fingerprint: Option<u64>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedRootKind {
+    Directory,
+    Symlink(PathBuf),
+}
 
 /// Filesystem roots needed for built-in artifact cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,9 +105,133 @@ pub struct Summary {
 }
 
 /// Filesystem identity captured before arbitrary cleanup hooks can mutate paths.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Evidence {
     public_regular_identity: Option<FileIdentity>,
+    logical_install_base_identity: Option<LogicalBaseIdentity>,
+    logical_install_base_was_absent: bool,
+    physical_install_base: Option<PathBuf>,
+    physical_install_base_identity: Option<DirectoryIdentity>,
+    managed_install_root: Option<PathBuf>,
+    managed_install_root_identity: Option<ManagedRootIdentity>,
+}
+
+impl Evidence {
+    pub(crate) fn public_regular_identity(&self) -> Option<&FileIdentity> {
+        self.public_regular_identity.as_ref()
+    }
+
+    pub(crate) fn managed_install_root(&self) -> Option<&Path> {
+        self.managed_install_root.as_deref()
+    }
+
+    pub(crate) fn physical_install_base(&self) -> Option<&Path> {
+        self.physical_install_base.as_deref()
+    }
+
+    pub(crate) fn install_base_matches(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.physical_install_base
+                .as_deref()
+                .zip(self.physical_install_base_identity.as_ref())
+                .is_some_and(|(path, identity)| identity.matches(path))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn managed_root_matches(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.managed_install_root
+                .as_deref()
+                .zip(self.managed_install_root_identity.as_ref())
+                .is_some_and(|(path, identity)| identity.matches_before_removal(path))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn managed_root_link_authority(&self) -> bool {
+        #[cfg(unix)]
+        {
+            if let Some(identity) = self.managed_install_root_identity.as_ref() {
+                return self
+                    .managed_install_root
+                    .as_deref()
+                    .is_some_and(|path| identity.matches_before_removal(path));
+            }
+            self.managed_install_root.as_deref().is_some_and(|path| {
+                fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn logical_base_matches(&self, install_dir: &Path) -> bool {
+        match self.logical_install_base_identity.as_ref() {
+            Some(identity) => {
+                identity.matches(install_dir)
+                    || fs::symlink_metadata(install_dir)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            }
+            None if self.logical_install_base_was_absent => fs::symlink_metadata(install_dir)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            None => false,
+        }
+    }
+
+    pub(crate) fn owner_roots(&self, install_dir: &Path, logical_root: PathBuf) -> Vec<PathBuf> {
+        if !self.managed_root_link_authority() {
+            return Vec::new();
+        }
+        let mut roots = Vec::new();
+        if self.logical_base_matches(install_dir) {
+            roots.push(logical_root);
+        }
+        if self.install_base_matches()
+            && let Some(root) = self.managed_install_root.as_ref()
+            && !roots.contains(root)
+        {
+            roots.push(root.clone());
+        }
+        roots
+    }
+
+    pub(crate) fn authorizes_managed_root(&self, install_dir: &Path, expected_root: &Path) -> bool {
+        self.managed_install_root.as_deref() == Some(expected_root)
+            && self.managed_root_link_authority()
+            && (self.install_base_matches() || self.logical_base_matches(install_dir))
+    }
+
+    pub(crate) fn remove_managed_root(&self) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            let (Some(root), Some(identity)) = (
+                self.managed_install_root.as_ref(),
+                self.managed_install_root_identity.as_ref(),
+            ) else {
+                return Ok(false);
+            };
+            if !self.install_base_matches() || !self.managed_root_matches() {
+                return Ok(false);
+            }
+            remove_owned_managed_root(root, identity, &mut Summary::default())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
 }
 
 impl Summary {
@@ -128,8 +310,63 @@ pub(crate) fn capture_evidence(entry: &ManifestEntry, roots: &Roots) -> Result<E
     } else {
         None
     };
+    let captures_install_root = entry.method == method::GITHUB_REPO
+        || method::is_external(&entry.method)
+        || (entry.method == method::GITHUB_RELEASE
+            && github_release_install::archive_state(
+                &roots.state_dir,
+                &roots.install_dir,
+                &roots.bin_dir.join(&entry.cmd),
+                &entry.name,
+            )
+            .is_ok_and(|state| state == ArchiveState::Proven));
+    let (logical_install_base_identity, logical_install_base_was_absent) = if captures_install_root
+    {
+        match logical_base_identity(&roots.install_dir)? {
+            Some(identity) => (Some(identity), false),
+            None => (None, true),
+        }
+    } else {
+        (None, false)
+    };
+    let physical_install_base = if captures_install_root {
+        match fs::canonicalize(&roots.install_dir) {
+            Ok(base) => Some(base),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let physical_install_base_identity = physical_install_base
+        .as_ref()
+        .map(|base| directory_identity(base))
+        .transpose()?
+        .flatten();
+    let managed_install_root = captures_install_root.then(|| {
+        let name = if entry.method == method::GITHUB_REPO {
+            config::canonical_name(&entry.name, method::GITHUB_REPO)
+        } else {
+            entry.name.clone()
+        };
+        physical_install_base
+            .as_ref()
+            .unwrap_or(&roots.install_dir)
+            .join(name)
+    });
+    let managed_install_root_identity = managed_install_root
+        .as_ref()
+        .map(|root| managed_root_identity(root))
+        .transpose()?
+        .flatten();
     Ok(Evidence {
         public_regular_identity,
+        logical_install_base_identity,
+        logical_install_base_was_absent,
+        physical_install_base,
+        physical_install_base_identity,
+        managed_install_root,
+        managed_install_root_identity,
     })
 }
 
@@ -166,39 +403,68 @@ pub(crate) fn remove_builtin_with_evidence(
         }
         method::GITHUB_REPO => {
             let repo_root = locked_repo_root.expect("validated above");
+            let root_authority = evidence.authorizes_managed_root(&roots.install_dir, repo_root);
+            if !root_authority {
+                return Err(std::io::Error::other(format!(
+                    "repository root changed after cleanup evidence was captured: {}",
+                    repo_root.display()
+                ))
+                .into());
+            }
             let logical_root = roots
                 .install_dir
                 .join(config::canonical_name(&entry.name, method::GITHUB_REPO));
-            let owner_roots = [logical_root, repo_root.to_path_buf()];
+            let mut owner_roots = vec![repo_root.to_path_buf()];
+            if evidence.logical_base_matches(&roots.install_dir) {
+                owner_roots.push(logical_root);
+            }
             unlink_state(roots, &entry.name, Kind::Bin, &owner_roots, &mut summary)?;
             unlink_state(roots, &entry.name, Kind::Extras, &owner_roots, &mut summary)?;
-            if let Some(path) = remove_legacy_repo_command(entry, roots, repo_root)? {
+            if let Some(path) = remove_legacy_repo_command(entry, roots, &owner_roots)? {
                 summary.note_removed(path);
             }
 
             // Human-editable state may be missing or point at another managed
             // dependency. Cleanup authority comes only from the normalized
             // root yielded by the checkout lock.
-            remove_any(repo_root, &mut summary)?;
+            #[cfg(unix)]
+            if let Some(identity) = evidence.managed_install_root_identity.as_ref() {
+                remove_owned_managed_root(repo_root, identity, &mut summary)?;
+            }
 
             remove_stamps(&roots.state_dir, &entry.name, &mut summary)?;
         }
         binary if method::is_binary_install_root(binary) => {
             let public_bin = roots.bin_dir.join(&entry.cmd);
-            let install_root = roots.install_dir.join(&entry.name);
-            let physical_root = physical_install_root(&roots.install_dir).join(&entry.name);
-            let owner_roots = [install_root.clone(), physical_root];
-            let preserve_public_launcher = if binary == method::GITHUB_RELEASE {
-                github_release_install::archive_state(
-                    &roots.state_dir,
-                    &roots.install_dir,
-                    &public_bin,
-                    &entry.name,
-                )? != ArchiveState::None
-                    && github_release_install::is_non_symlink(&public_bin)
+            let logical_root = roots.install_dir.join(&entry.name);
+            let physical_root = evidence.managed_install_root.as_ref();
+            let physical_base = evidence.physical_install_base.as_ref();
+            let root_authority = evidence.install_base_matches() && evidence.managed_root_matches();
+            let mut owner_roots = Vec::new();
+            if root_authority {
+                if evidence.logical_base_matches(&roots.install_dir) {
+                    owner_roots.push(logical_root);
+                }
+                if let Some(physical_root) = physical_root {
+                    owner_roots.push(physical_root.clone());
+                }
+            }
+            let archive_state = if binary == method::GITHUB_RELEASE {
+                match physical_base.filter(|_| evidence.install_base_matches()) {
+                    Some(physical_base) => github_release_install::archive_state(
+                        &roots.state_dir,
+                        physical_base,
+                        &public_bin,
+                        &entry.name,
+                    )?,
+                    None => ArchiveState::None,
+                }
             } else {
-                false
+                ArchiveState::None
             };
+            let preserve_public_launcher = binary == method::GITHUB_RELEASE
+                && archive_state != ArchiveState::None
+                && github_release_install::is_non_symlink(&public_bin);
             let public_regular_identity = if binary == method::GITHUB_RELEASE
                 && !preserve_public_launcher
                 && !preserve_regular_public
@@ -213,7 +479,7 @@ pub(crate) fn remove_builtin_with_evidence(
             if !preserve_public_launcher {
                 let mut removed_public = unlink_owned_symlink(&public_bin, &owner_roots)?;
                 if !removed_public && binary == method::GITHUB_RELEASE && !preserve_regular_public {
-                    if let Some(identity) = public_regular_identity {
+                    if let Some(identity) = public_regular_identity.as_ref() {
                         removed_public = remove_owned_regular_file(&public_bin, identity)?;
                     }
                 }
@@ -222,8 +488,24 @@ pub(crate) fn remove_builtin_with_evidence(
                 }
             }
 
-            remove_any(&install_root, &mut summary)?;
-            remove_empty_install_parents(&install_root, &roots.install_dir, &mut summary)?;
+            if binary != method::GITHUB_RELEASE || archive_state == ArchiveState::Proven {
+                #[cfg(unix)]
+                if root_authority {
+                    if let (Some(physical_root), Some(physical_base), Some(identity)) = (
+                        physical_root,
+                        physical_base,
+                        evidence.managed_install_root_identity.as_ref(),
+                    ) {
+                        if remove_owned_managed_root(physical_root, identity, &mut summary)? {
+                            remove_empty_install_parents(
+                                physical_root,
+                                physical_base,
+                                &mut summary,
+                            )?;
+                        }
+                    }
+                }
+            }
             remove_stamps(&roots.state_dir, &entry.name, &mut summary)?;
         }
         method::CUSTOM => {
@@ -251,7 +533,7 @@ pub(crate) fn remove_builtin_with_evidence(
 pub(crate) fn remove_legacy_repo_command(
     entry: &ManifestEntry,
     roots: &Roots,
-    locked_repo_root: &Path,
+    owner_roots: &[PathBuf],
 ) -> Result<Option<PathBuf>> {
     let canonical_name = config::canonical_name(&entry.name, method::GITHUB_REPO);
     let short = config::short_name(&canonical_name);
@@ -265,12 +547,10 @@ pub(crate) fn remove_legacy_repo_command(
         return Ok(None);
     }
     let target = fs::read_link(&public)?;
-    let canonical_root = roots.install_dir.join(&canonical_name);
-    let mut expected = vec![canonical_root.join("bin").join(short)];
-    let physical = locked_repo_root.join("bin").join(short);
-    if !expected.contains(&physical) {
-        expected.push(physical);
-    }
+    let expected = owner_roots
+        .iter()
+        .map(|root| root.join("bin").join(short))
+        .collect::<Vec<_>>();
     if !expected.contains(&target) {
         return Ok(None);
     }
@@ -390,7 +670,7 @@ pub(crate) fn unlink_owned_symlink(path: &Path, roots: &[PathBuf]) -> Result<boo
     }
 }
 
-fn unlink_symlink_with_exact_target(path: &Path, expected: &[PathBuf]) -> Result<bool> {
+pub(crate) fn unlink_symlink_with_exact_target(path: &Path, expected: &[PathBuf]) -> Result<bool> {
     if !symlink_targets_any_exact_path(path, expected) {
         return Ok(false);
     }
@@ -470,16 +750,252 @@ fn quarantine_matching_with(
     .into())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(unix)]
+fn remove_owned_managed_root(
+    path: &Path,
+    identity: &ManagedRootIdentity,
+    summary: &mut Summary,
+) -> Result<bool> {
+    if !identity.matches_before_removal(path) {
+        return Ok(false);
+    }
+    // The caller holds the Shdeps state lock and has already run any arbitrary
+    // uninstall hook before this final generation check. Delete the stable path
+    // directly so a process death cannot strand the whole install tree under a
+    // hidden quarantine name. Non-cooperating writers outside Shdeps' advisory
+    // lock remain outside the state-lock threat model.
+    match identity.kind {
+        ManagedRootKind::Directory => fs::remove_dir_all(path)?,
+        ManagedRootKind::Symlink(_) => fs::remove_file(path)?,
+    }
+    summary.note_removed(path);
+    Ok(true)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FileIdentity {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    length: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(unix)]
+    mode: u32,
     #[cfg(not(unix))]
     length: u64,
     #[cfg(not(unix))]
     modified: Option<std::time::SystemTime>,
+}
+
+impl PartialEq for FileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device
+                && self.inode == other.inode
+                && self.length == other.length
+                && self.modified_seconds == other.modified_seconds
+                && self.modified_nanoseconds == other.modified_nanoseconds
+                && self.changed_seconds == other.changed_seconds
+                && self.changed_nanoseconds == other.changed_nanoseconds
+                && self.mode == other.mode
+        }
+        #[cfg(not(unix))]
+        {
+            self.length == other.length && self.modified == other.modified
+        }
+    }
+}
+
+impl Eq for FileIdentity {}
+
+fn logical_base_identity(path: &Path) -> Result<Option<LogicalBaseIdentity>> {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(LogicalBaseIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            kind: LogicalBaseKind::Directory,
+        })),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(LogicalBaseIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            kind: LogicalBaseKind::Symlink(fs::read_link(path)?),
+        })),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "managed install base is neither a directory nor a symlink: {}",
+                path.display()
+            ),
+        )
+        .into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn directory_identity(path: &Path) -> Result<Option<DirectoryIdentity>> {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(DirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn managed_root_identity(path: &Path) -> Result<Option<ManagedRootIdentity>> {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(ManagedRootIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            kind: ManagedRootKind::Directory,
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            mode: metadata.mode(),
+            tree_fingerprint: Some(tree_fingerprint(path)?),
+        })),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(ManagedRootIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            kind: ManagedRootKind::Symlink(fs::read_link(path)?),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            mode: metadata.mode(),
+            tree_fingerprint: None,
+        })),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+impl DirectoryIdentity {
+    fn matches(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.file_type().is_dir()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode
+        })
+    }
+}
+
+#[cfg(unix)]
+impl LogicalBaseIdentity {
+    fn matches(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            if metadata.dev() != self.device || metadata.ino() != self.inode {
+                return false;
+            }
+            match &self.kind {
+                LogicalBaseKind::Directory => metadata.file_type().is_dir(),
+                LogicalBaseKind::Symlink(target) => {
+                    metadata.file_type().is_symlink()
+                        && fs::read_link(path).is_ok_and(|current| current == *target)
+                }
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+impl ManagedRootIdentity {
+    fn matches_before_removal(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            if metadata.dev() != self.device || metadata.ino() != self.inode {
+                return false;
+            }
+            match &self.kind {
+                ManagedRootKind::Directory => {
+                    metadata.file_type().is_dir()
+                        && metadata.mtime() == self.modified_seconds
+                        && metadata.mtime_nsec() == self.modified_nanoseconds
+                        && metadata.ctime() == self.changed_seconds
+                        && metadata.ctime_nsec() == self.changed_nanoseconds
+                        && metadata.mode() == self.mode
+                        && tree_fingerprint(path).ok() == self.tree_fingerprint
+                }
+                ManagedRootKind::Symlink(target) => {
+                    metadata.file_type().is_symlink()
+                        && fs::read_link(path).is_ok_and(|current| current == *target)
+                }
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+fn tree_fingerprint(root: &Path) -> Result<u64> {
+    fn visit(root: &Path, dir: &Path, hasher: &mut impl Hasher) -> Result<()> {
+        let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed-root entry escaped its captured root",
+                )
+            })?;
+            relative.as_os_str().as_bytes().hash(hasher);
+            let metadata = fs::symlink_metadata(&path)?;
+            metadata.dev().hash(hasher);
+            metadata.ino().hash(hasher);
+            metadata.mode().hash(hasher);
+            metadata.size().hash(hasher);
+            metadata.mtime().hash(hasher);
+            metadata.mtime_nsec().hash(hasher);
+            metadata.ctime().hash(hasher);
+            metadata.ctime_nsec().hash(hasher);
+            if metadata.file_type().is_symlink() {
+                fs::read_link(&path)?.as_os_str().as_bytes().hash(hasher);
+            } else if metadata.file_type().is_dir() {
+                visit(root, &path, hasher)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    visit(root, root, &mut hasher)?;
+    Ok(hasher.finish())
 }
 
 pub(crate) fn regular_file_identity(path: &Path) -> Result<Option<FileIdentity>> {
@@ -489,6 +1005,12 @@ pub(crate) fn regular_file_identity(path: &Path) -> Result<Option<FileIdentity>>
             let identity = FileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                length: metadata.size(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+                mode: metadata.mode(),
             };
             #[cfg(not(unix))]
             let identity = FileIdentity {
@@ -503,24 +1025,94 @@ pub(crate) fn regular_file_identity(path: &Path) -> Result<Option<FileIdentity>>
     }
 }
 
-pub(crate) fn remove_owned_regular_file(path: &Path, identity: FileIdentity) -> Result<bool> {
+pub(crate) fn remove_owned_regular_file(path: &Path, identity: &FileIdentity) -> Result<bool> {
     #[cfg(unix)]
     {
-        quarantine_matching_with(
+        quarantine_regular_file_with(
             path,
-            |claimed| regular_file_identity(claimed).ok().flatten() == Some(identity),
+            identity,
+            true,
             crate::repo_transition::rename_noreplace,
         )
     }
 
     #[cfg(not(unix))]
     {
-        if regular_file_identity(path)? == Some(identity) {
+        if regular_file_identity(path)?.as_ref() == Some(identity) {
             fs::remove_file(path)?;
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+}
+
+pub(crate) fn remove_owned_regular_file_after_rename(
+    path: &Path,
+    identity: &FileIdentity,
+) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        quarantine_regular_file_with(
+            path,
+            identity,
+            false,
+            crate::repo_transition::rename_noreplace,
+        )
+    }
+
+    #[cfg(not(unix))]
+    {
+        remove_owned_regular_file(path, identity)
+    }
+}
+
+pub(crate) fn regular_file_matches_after_rename(
+    path: &Path,
+    identity: &FileIdentity,
+) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        #[cfg(unix)]
+        Ok(metadata) => Ok(identity.matches_after_rename(&metadata)),
+        #[cfg(not(unix))]
+        Ok(_) => Ok(regular_file_identity(path)?.as_ref() == Some(identity)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn quarantine_regular_file_with(
+    path: &Path,
+    identity: &FileIdentity,
+    require_unchanged_ctime: bool,
+    rename_noreplace: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<bool> {
+    let owned = if require_unchanged_ctime {
+        regular_file_identity(path)?.as_ref() == Some(identity)
+    } else {
+        regular_file_matches_after_rename(path, identity)?
+    };
+    if !owned {
+        return Ok(false);
+    }
+    quarantine_matching_with(
+        path,
+        |claimed| regular_file_matches_after_rename(claimed, identity).unwrap_or(false),
+        rename_noreplace,
+    )
+}
+
+#[cfg(unix)]
+impl FileIdentity {
+    fn matches_after_rename(&self, metadata: &fs::Metadata) -> bool {
+        metadata.file_type().is_file()
+            && self.device == metadata.dev()
+            && self.inode == metadata.ino()
+            && self.length == metadata.size()
+            && self.modified_seconds == metadata.mtime()
+            && self.modified_nanoseconds == metadata.mtime_nsec()
+            && self.mode == metadata.mode()
     }
 }
 
@@ -603,22 +1195,6 @@ pub(crate) fn validate_manifest_artifact_entry(entry: &ManifestEntry) -> Result<
         )
         .into());
     }
-    Ok(())
-}
-
-fn remove_any(path: &Path, summary: &mut Summary) -> Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(path)?;
-    } else {
-        fs::remove_file(path)?;
-    }
-    summary.note_removed(path);
     Ok(())
 }
 
@@ -782,7 +1358,13 @@ mod tests {
 
         let removed = quarantine_matching_with(
             &public,
-            |claimed| super::regular_file_identity(claimed).ok().flatten() == Some(identity),
+            |claimed| {
+                super::regular_file_identity(claimed)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    == Some(&identity)
+            },
             |source, destination| {
                 if source == public && !swapped {
                     swapped = true;
@@ -969,10 +1551,12 @@ mod tests {
         let entry = ManifestEntry::new("owner/tool", "github:repo", "tool", "");
         let locked_root = safe_repo_root(&entry, &roots).unwrap();
         assert_eq!(locked_root, root_a);
+        let evidence = super::capture_evidence(&entry, &roots).unwrap();
 
         fs::remove_file(&logical).unwrap();
         symlink(&physical_b, &logical).unwrap();
-        remove_builtin_with_repo_root(&entry, &roots, Some(&locked_root)).unwrap();
+        super::remove_builtin_with_evidence(&entry, &roots, Some(&locked_root), false, evidence)
+            .unwrap();
 
         assert!(!root_a.exists());
         assert_eq!(

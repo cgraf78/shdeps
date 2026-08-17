@@ -1102,6 +1102,73 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
 }
 
 #[test]
+fn update_allows_real_provider_to_share_command_with_none_package_override() {
+    let fixture = Fixture::new("update-none-package-command-claim");
+    fixture.write(
+        "conf/deps.conf",
+        "disabled-pkg pkg tool apt:NONE\nprovider custom tool\n",
+    );
+    fixture.write(
+        "conf/hooks.d/provider.sh",
+        "exists() { return 0; }\nversion() { printf '1.0.0\\n'; }\n",
+    );
+    fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
+
+    let output = run(fixture.command(["update"]).env("SHDEPS_PKG_MGR", "apt"));
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
+    assert!(
+        !text(&output.stdout).contains("duplicate active command claim"),
+        "a package-manager NONE override is runtime-inactive: {}",
+        text(&output.stdout)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn update_bulk_transitions_fit_within_common_low_file_descriptor_limit() {
+    use std::os::unix::process::CommandExt;
+
+    let fixture = Fixture::new("update-transition-fd-budget");
+    let mut config = String::new();
+    let mut manifest = String::new();
+    for index in 0..24 {
+        let name = format!("tool-{index}");
+        let command = format!("cmd-{index}");
+        config.push_str(&format!("{name} pkg {command} apt:NONE\n"));
+        let public = fixture.dir.join("bin").join(&command);
+        manifest.push_str(&format!(
+            "{name}|github:release|{command}|{}\n",
+            public.display()
+        ));
+        fixture.write_executable(PathBuf::from("bin").join(&command), "#!/bin/sh\nexit 0\n");
+    }
+    fixture.write("conf/deps.conf", &config);
+    fixture.write("state/manifest", &manifest);
+    fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
+    let mut command = fixture.command(["update"]);
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 104,
+                rlim_max: 104,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
+}
+
+#[test]
 fn update_jsonl_warns_when_local_clone_cannot_fast_forward() {
     let fixture = Fixture::new("update-jsonl-local-clone-diverged");
     fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");

@@ -518,6 +518,24 @@ where
     pub client: &'a dyn Client,
 }
 
+impl<'a, R> Context<'a, R>
+where
+    R: Runner,
+{
+    fn with_manifest_path<'b>(&'b self, manifest_path: &'b std::path::Path) -> Context<'b, R> {
+        Context {
+            manifest_path,
+            roots: self.roots,
+            env: self.env,
+            hooks: self.hooks,
+            runner: self.runner,
+            pkg_mgr: self.pkg_mgr,
+            env_vars: self.env_vars,
+            client: self.client,
+        }
+    }
+}
+
 impl Summary {
     /// Returns whether the update had any failure.
     ///
@@ -607,10 +625,17 @@ where
     // lock. Another updater may have committed a newer method or ownership row
     // while this invocation waited, so all transition and cleanup decisions
     // below must be rebuilt from the now-serialized on-disk state.
+    let initial_manifest = manifest::read(context.manifest_path)?;
+    update_transition::recover_pending_publications(
+        entries,
+        &initial_manifest,
+        context.manifest_path,
+        context.roots,
+    )?;
     let fresh_manifest = manifest::read(context.manifest_path)?;
     let manifest = &fresh_manifest;
 
-    update_transition::reject_identity_handoffs(manifest, entries, context.env)?;
+    update_transition::reject_identity_handoffs(manifest, entries, context.env, context.pkg_mgr)?;
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
     let package_transitions = transitions.keys().cloned().collect::<BTreeSet<_>>();
     let mut package_proofs = update_pkg::required_proofs(entries, manifest, context);
@@ -1255,11 +1280,21 @@ where
             }
         };
         let result = match entry.method.as_str() {
-            method::GITHUB_RELEASE => {
-                update_transition::install_with_prepared(entry, transition, context.roots, || {
-                    update_release::install_with_prefetch(entry, context, options, release_prefetch)
-                })
-            }
+            method::GITHUB_RELEASE => update_transition::install_with_prepared(
+                entry,
+                transition,
+                context.roots,
+                context.manifest_path,
+                |manifest_path| {
+                    let install_context = context.with_manifest_path(manifest_path);
+                    update_release::install_with_prefetch(
+                        entry,
+                        &install_context,
+                        options,
+                        release_prefetch,
+                    )
+                },
+            ),
             method::GITHUB_REPO => {
                 let install_dir = repo_root.expect("repo method requires a checkout lock root");
                 match update_repo::prepare(entry, context, install_dir, repo_destination)? {
@@ -1269,15 +1304,26 @@ where
                             entry,
                             transition,
                             context.roots,
-                            || update_repo::apply(*plan, entry, context, options),
+                            context.manifest_path,
+                            |manifest_path| {
+                                let install_context = context.with_manifest_path(manifest_path);
+                                update_repo::apply(*plan, entry, &install_context, options)
+                            },
                         )
                     }
                 }
             }
             candidate if method::requires_external_plan(candidate) => {
-                update_transition::install_with_prepared(entry, transition, context.roots, || {
-                    update_external::install(entry, context, options)
-                })
+                update_transition::install_with_prepared(
+                    entry,
+                    transition,
+                    context.roots,
+                    context.manifest_path,
+                    |manifest_path| {
+                        let install_context = context.with_manifest_path(manifest_path);
+                        update_external::install(entry, &install_context, options)
+                    },
+                )
             }
             method => Ok(Item::failed(
                 entry.name.clone(),
