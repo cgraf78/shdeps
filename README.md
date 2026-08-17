@@ -137,9 +137,12 @@ provider transitions.
 
 Treat `name` as a stable manifest identity. To rename a dependency while
 reusing its command, first remove the old declaration, run `shdeps prune`, then
-add the replacement declaration. Shdeps rejects an active
+add the replacement declaration. Shdeps rejects an unrecorded active
 replacement that conflicts with a differently named manifest row so the old
-command cannot be mistaken for proof that the new provider is installed.
+command cannot be mistaken for proof that the new provider is installed. An
+already-recorded active owner may coexist with a configured-but-inactive
+platform provider or a prior command spelling; normal method checks revalidate
+that recorded owner and same-name updates refresh stale rows.
 
 ### Environment Variables
 
