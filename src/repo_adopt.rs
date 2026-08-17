@@ -40,7 +40,7 @@ pub(crate) enum Destination {
 /// live mutation may consume the checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OrdinaryCandidate {
-    repository: String,
+    origin_policy: repo::OriginPolicy,
     // Retained only so final reinspection detects config replacement. Remote
     // execution must use caller configuration, never this candidate claim.
     claimed_origin: String,
@@ -59,9 +59,9 @@ struct RootIdentity {
 }
 
 impl OrdinaryCandidate {
-    /// Returns the canonical configured `owner/repository` identity.
-    pub(crate) fn repository(&self) -> &str {
-        &self.repository
+    /// Returns the configured origin policy used for final reinspection.
+    pub(crate) fn origin_policy(&self) -> &repo::OriginPolicy {
+        &self.origin_policy
     }
 
     /// Returns the attached branch claimed by the candidate HEAD.
@@ -89,7 +89,7 @@ impl OrdinaryCandidate {
 pub(crate) fn inspect_destination(
     root: &Path,
     development_root: &Path,
-    expected_repo: &str,
+    origin_policy: &repo::OriginPolicy,
 ) -> io::Result<Destination> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
@@ -97,7 +97,7 @@ pub(crate) fn inspect_destination(
         Err(error) => return Err(error),
     };
     if metadata.file_type().is_dir() {
-        return inspect(root, expected_repo).map(Destination::Ordinary);
+        return inspect_with_policy(root, origin_policy).map(Destination::Ordinary);
     }
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(root)?;
@@ -120,7 +120,16 @@ pub(crate) fn inspect_destination(
 
 // Inspect only inert identity and control metadata; complete content and remote
 // equivalence are deliberately delegated to the quarantine verification layer.
+#[cfg(test)]
 pub(crate) fn inspect(root: &Path, expected_repo: &str) -> io::Result<OrdinaryCandidate> {
+    let configured = format!("https://github.com/{expected_repo}");
+    inspect_with_policy(root, &repo::OriginPolicy::new(&configured))
+}
+
+pub(crate) fn inspect_with_policy(
+    root: &Path,
+    origin_policy: &repo::OriginPolicy,
+) -> io::Result<OrdinaryCandidate> {
     require_directory(root, "checkout root")?;
     let root_identity = root_identity(root)?;
     let git_dir = root.join(".git");
@@ -136,10 +145,10 @@ pub(crate) fn inspect(root: &Path, expected_repo: &str) -> io::Result<OrdinaryCa
     }
 
     let config = read_required_text(&git_dir.join("config"), "config")?;
-    let claimed_origin = validate_config(&config, &branch, expected_repo)?;
+    let claimed_origin = validate_config(&config, &branch, origin_policy)?;
     validate_hooks(&git_dir.join("hooks"))?;
     Ok(OrdinaryCandidate {
-        repository: expected_repo.to_owned(),
+        origin_policy: origin_policy.clone(),
         claimed_origin,
         branch,
         head_oid: oid.to_ascii_lowercase(),
@@ -477,7 +486,11 @@ enum Section {
 
 // Parse the small ordinary-clone config grammar as data, excluding every key
 // that could redirect execution, credentials, transport, or object behavior.
-fn validate_config(config: &str, branch: &str, expected_repo: &str) -> io::Result<String> {
+fn validate_config(
+    config: &str,
+    branch: &str,
+    origin_policy: &repo::OriginPolicy,
+) -> io::Result<String> {
     let mut section = None;
     let mut core = BTreeMap::new();
     let mut origin_url = None;
@@ -562,9 +575,9 @@ fn validate_config(config: &str, branch: &str, expected_repo: &str) -> io::Resul
         ));
     }
     let origin_url = origin_url.ok_or_else(|| invalid("checkout origin URL is missing"))?;
-    validate_repo_url(&origin_url, expected_repo, "origin")?;
+    validate_repo_url(&origin_url, origin_policy, "origin")?;
     if let Some(push_url) = origin_push_url {
-        validate_repo_url(&push_url, expected_repo, "origin push URL")?;
+        validate_repo_url(&push_url, origin_policy, "origin push URL")?;
     }
     // Ordinary clones use the wildcard refspec, while the shared Actions
     // bootstrap deliberately uses a shallow, no-tags, single-branch clone.
@@ -672,12 +685,17 @@ fn set_once(slot: &mut Option<String>, value: &str, label: &str) -> io::Result<(
     Ok(())
 }
 
-// Compare every accepted URL through the shared strict GitHub canonicalizer so
-// installer and Shdeps identities cannot drift by transport spelling.
-fn validate_repo_url(url: &str, expected_repo: &str, label: &str) -> io::Result<()> {
-    if repo::canonical_github_repo(url).as_deref() != Some(expected_repo) {
+// Apply the shared origin policy to inert config bytes. GitHub transports
+// compare by repository identity; explicit other sources compare exactly.
+fn validate_repo_url(url: &str, origin_policy: &repo::OriginPolicy, label: &str) -> io::Result<()> {
+    if !origin_policy.matches(url) {
+        if let Some(repository) = origin_policy.github_repository() {
+            return Err(invalid(format!(
+                "checkout {label} does not identify configured repository `{repository}`"
+            )));
+        }
         return Err(invalid(format!(
-            "checkout {label} does not identify configured repository `{expected_repo}`"
+            "checkout {label} does not exactly match configured repository override"
         )));
     }
     Ok(())

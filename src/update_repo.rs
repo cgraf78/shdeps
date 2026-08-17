@@ -74,7 +74,7 @@ pub(crate) fn prepare(
     // independently adopted first.
     let source = repo::source(&entry.name, context.env_vars);
     let local_clone = context.roots.git_dev_dir.join(&source.short);
-    let configured_repository = repo::canonical_github_repo(&source.url);
+    let origin_policy = repo::OriginPolicy::new(&source.url);
     let route = if ownership != DestinationOwnership::Unrecorded {
         if local_clone.is_dir() {
             match development_route(entry, context, &local_clone, &source.url, true) {
@@ -85,15 +85,11 @@ pub(crate) fn prepare(
             InstallRoute::Managed
         }
     } else {
-        let inspected_repository = configured_repository.as_deref().unwrap_or(&source.name);
-        let destination = match repo_adopt::inspect_destination(
-            install_dir,
-            &local_clone,
-            inspected_repository,
-        ) {
-            Ok(destination) => destination,
-            Err(error) => return Ok(Preparation::Failed(adoption_failure(entry, error))),
-        };
+        let destination =
+            match repo_adopt::inspect_destination(install_dir, &local_clone, &origin_policy) {
+                Ok(destination) => destination,
+                Err(error) => return Ok(Preparation::Failed(adoption_failure(entry, error))),
+            };
         match destination {
             repo_adopt::Destination::Absent if local_clone.is_dir() => {
                 match development_route(entry, context, &local_clone, &source.url, false) {
@@ -109,12 +105,6 @@ pub(crate) fn prepare(
                 }
             }
             repo_adopt::Destination::Ordinary(candidate) => {
-                if configured_repository.is_none() {
-                    return Ok(Preparation::Failed(adoption_failure(
-                        entry,
-                        "configured repository URL is not a supported GitHub origin",
-                    )));
-                }
                 let verification = match verify_ordinary_with_fallback(
                     &candidate,
                     install_dir,

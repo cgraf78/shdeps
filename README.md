@@ -217,14 +217,17 @@ continuing to use a live checkout.
 If the canonical managed root already contains an unrecorded checkout, shdeps
 preserves it unless it can prove safe ownership before any transition or live
 repository mutation. The adoption gate reads local Git control files only as
-inert data, independently fetches the configured GitHub default branch into a
-private environment, and requires the candidate branch, index, complete
-worktree, modes, and bytes to match that fetched revision. Repositories that
-publish a command directly under `bin/` require an explicit command column for
-adoption, and the configured command must be a tracked executable regular file
-rather than a symlink. Foreign, dirty, malformed, or unsupported roots remain
-untouched and are reported as install failures; a fresh TTL never bypasses this
-proof.
+inert data, independently fetches the configured default branch into a private
+environment, and requires the candidate branch, index, complete worktree,
+modes, and bytes to match that fetched revision. Normal GitHub URLs use the
+same canonical owner/repository identity as development checkouts. An explicit
+non-GitHub `SHDEPS_<NAME>_REPO` override instead requires the candidate origin
+to match that override byte-for-byte and admits only an isolated HTTPS, SSH, or
+absolute-path/file-URL transport. Repositories that publish a command directly
+under `bin/` require an explicit command column for adoption, and the
+configured command must be a tracked executable regular file rather than a
+symlink. Foreign, dirty, malformed, or unsupported roots remain untouched and
+are reported as install failures; a fresh TTL never bypasses this proof.
 Private-repository verification retries GitHub SSH without inheriting user or
 system SSH configuration. The noninteractive retry requires a trusted
 `~/.ssh/known_hosts` entry for GitHub and may reuse only a validated external

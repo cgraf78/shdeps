@@ -2,7 +2,8 @@
 //!
 //! Ordinary unrecorded adoption is the strict path: candidate metadata is only
 //! a claim, so Git runs entirely inside an independent quarantine and never
-//! receives a candidate path, config, ref, object store, or hook.
+//! receives candidate config, refs, object storage, or hooks. Explicit local
+//! overrides supply only their separately configured remote path.
 //!
 //! An explicitly selected development checkout has a deliberately different
 //! contract. It may be dirty and Git must inspect its local repository, but a
@@ -71,7 +72,7 @@ pub(crate) enum Verification {
 pub(crate) struct VerifiedDevelopment {
     identity: FollowedRootIdentity,
     git: DevelopmentGit,
-    origin: DevelopmentOrigin,
+    origin: repo::OriginPolicy,
     command: Option<String>,
 }
 
@@ -269,8 +270,8 @@ pub(crate) fn verify_ordinary(
     // checkout lock excludes the installer and other Shdeps writers, while
     // this final comparison catches ordinary concurrent replacement before
     // the capability crosses into the mutating phase.
-    let final_candidate =
-        repo_adopt::inspect(root, candidate.repository()).map_err(VerificationError::rejected)?;
+    let final_candidate = repo_adopt::inspect_with_policy(root, candidate.origin_policy())
+        .map_err(VerificationError::rejected)?;
     if &final_candidate != candidate {
         return Err(VerificationError::rejected(invalid(
             "candidate changed during isolated verification",
@@ -303,7 +304,7 @@ pub(crate) fn verify_development(
         env_vars,
     } = request;
     let identity = followed_root_identity(root)?;
-    let origin = DevelopmentOrigin::new(configured_origin);
+    let origin = repo::OriginPolicy::new(configured_origin);
     let git = DevelopmentGit::new(runner, root, env_vars)?;
     let command = command_explicit.then(|| (*command).to_owned());
     let command_available =
@@ -335,7 +336,7 @@ pub(crate) fn verify_development(
 fn validate_development_state(
     root: &Path,
     git: &DevelopmentGit,
-    origin_policy: &DevelopmentOrigin,
+    origin_policy: &repo::OriginPolicy,
     command: Option<&str>,
     runner: &impl Runner,
 ) -> io::Result<bool> {
@@ -394,45 +395,6 @@ fn validate_development_state(
         }
     }
     Ok(true)
-}
-
-/// Exact policy derived only from the configured clone URL. Canonical GitHub
-/// spellings may vary by transport; arbitrary supported overrides retain their
-/// historical behavior but must match byte-for-byte after Git's rewrite rules.
-#[derive(Debug)]
-enum DevelopmentOrigin {
-    GitHub {
-        configured: String,
-        repository: String,
-    },
-    Exact(String),
-}
-
-impl DevelopmentOrigin {
-    fn new(configured: &str) -> Self {
-        match repo::canonical_github_repo(configured) {
-            Some(repository) => Self::GitHub {
-                configured: configured.to_owned(),
-                repository,
-            },
-            None => Self::Exact(configured.to_owned()),
-        }
-    }
-
-    fn configured(&self) -> &str {
-        match self {
-            Self::GitHub { configured, .. } | Self::Exact(configured) => configured,
-        }
-    }
-
-    fn matches(&self, observed: &str) -> bool {
-        match self {
-            Self::GitHub { repository, .. } => {
-                repo::canonical_github_repo(observed).as_deref() == Some(repository)
-            }
-            Self::Exact(configured) => observed == configured,
-        }
-    }
 }
 
 /// Reusable, environment-sanitized Git capability for one trusted dirty
@@ -797,11 +759,36 @@ impl<'a, R: Runner> CleanGit<'a, R> {
         env.insert("LANG".into(), "C".into());
         insert_env(&mut env, "GIT_CEILING_DIRECTORIES", &quarantine.root);
 
-        let transport = if origin.starts_with("https://") {
-            "protocol.https.allow=always"
-        } else {
-            configure_ssh(runner, &candidate_root, trusted_home, env_vars, &mut env)?;
-            "protocol.ssh.allow=always"
+        let origin_policy = repo::OriginPolicy::new(origin);
+        let transport = match origin_policy.transport() {
+            Some(repo::OriginTransport::Https) => "protocol.https.allow=always",
+            Some(repo::OriginTransport::Ssh) => {
+                configure_ssh(runner, &candidate_root, trusted_home, env_vars, &mut env)?;
+                "protocol.ssh.allow=always"
+            }
+            Some(repo::OriginTransport::File) => {
+                let remote_path = origin_policy.file_path().ok_or_else(|| {
+                    invalid("configured local repository override is unavailable")
+                })?;
+                if remote_path.starts_with(&candidate_root) {
+                    return Err(invalid(
+                        "configured local repository override is inside the candidate checkout",
+                    ));
+                }
+                let remote = fs::canonicalize(remote_path)
+                    .map_err(|_| invalid("configured local repository override is unavailable"))?;
+                if remote.starts_with(&candidate_root) {
+                    return Err(invalid(
+                        "configured local repository override is inside the candidate checkout",
+                    ));
+                }
+                "protocol.file.allow=always"
+            }
+            None => {
+                return Err(invalid(
+                    "configured repository override uses an unsupported adoption transport",
+                ));
+            }
         };
         let common = vec![
             "--no-pager".into(),
@@ -1605,10 +1592,13 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    use crate::{repo, repo_adopt};
+
     use super::{
-        CleanGit, Quarantine, TreeEntry, TreeKind, copy_candidate_index, copy_open_regular,
-        development_tree_has_command, initialize_quarantine, parse_remote_head, parse_tree,
-        safe_relative_utf8, validate_command_policy, verify_candidate_index,
+        CleanGit, OrdinaryRequest, Quarantine, TreeEntry, TreeKind, Verification,
+        copy_candidate_index, copy_open_regular, development_tree_has_command,
+        initialize_quarantine, parse_remote_head, parse_tree, safe_relative_utf8,
+        validate_command_policy, verify_candidate_index, verify_ordinary,
     };
 
     const OID: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1790,6 +1780,113 @@ mod tests {
         fixture_git(&candidate, &["add", "--all"]);
         copy_candidate_index(&candidate, &quarantine.candidate_index).unwrap();
         assert!(verify_candidate_index(&git, &quarantine).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stock_git_adopts_checkout_from_exact_local_origin_override() {
+        let root = super::create_unique_private_dir(&std::env::temp_dir()).unwrap();
+        let source = root.join("source");
+        let origin = root.join("dot-origin.git");
+        let candidate = root.join("candidate");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("README.md"), "locked checkout\n").unwrap();
+        fixture_git(&source, &["init", "--quiet"]);
+        fixture_git(&source, &["add", "--all"]);
+        fixture_git(
+            &source,
+            &[
+                "-c",
+                "user.name=Shdeps Test",
+                "-c",
+                "user.email=shdeps@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+        fixture_git(&source, &["branch", "-M", "main"]);
+
+        let bare = Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["clone", "--quiet", "--bare", "--"])
+            .arg(&source)
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(
+            bare.status.success(),
+            "bare origin clone failed: {}",
+            String::from_utf8_lossy(&bare.stderr)
+        );
+        let origin_text = format!("file://{}", origin.display());
+        let checkout = Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "clone",
+                "--quiet",
+                "--depth=1",
+                "--single-branch",
+                "--branch=main",
+                "--no-tags",
+                "--",
+            ])
+            .arg(&origin_text)
+            .arg(&candidate)
+            .output()
+            .unwrap();
+        assert!(
+            checkout.status.success(),
+            "candidate clone failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+
+        let origin_policy = repo::OriginPolicy::new(&origin_text);
+        let inspected = repo_adopt::inspect_with_policy(&candidate, &origin_policy).unwrap();
+        let state_dir = root.join("state");
+        let request = OrdinaryRequest {
+            root: &candidate,
+            state_dir: &state_dir,
+            approved_origin: &origin_text,
+            command: "tool",
+            command_explicit: false,
+            env_vars: &BTreeMap::new(),
+            trusted_home: &root,
+        };
+        assert!(matches!(
+            verify_ordinary(&inspected, &request, &crate::process::Process).unwrap(),
+            Verification::Verified(_)
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_override_cannot_select_the_untrusted_candidate_as_its_remote() {
+        let root = super::create_unique_private_dir(&std::env::temp_dir()).unwrap();
+        let candidate = root.join("candidate");
+        fs::create_dir_all(&candidate).unwrap();
+        fixture_git(&candidate, &["init", "--quiet"]);
+        let quarantine = Quarantine::create(&root.join("state")).unwrap();
+        let origin = format!("file://{}", candidate.display());
+
+        assert!(
+            CleanGit::new(
+                &crate::process::Process,
+                &candidate,
+                &origin,
+                &BTreeMap::new(),
+                &root,
+                &quarantine,
+            )
+            .is_err()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
