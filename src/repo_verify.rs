@@ -1847,8 +1847,9 @@ mod tests {
         )
         .unwrap();
 
+        let physical_host_bin = fs::canonicalize(&host_bin).unwrap();
         let expected_path = std::env::join_paths([
-            host_bin.as_os_str(),
+            physical_host_bin.as_os_str(),
             Path::new("/usr/bin").as_os_str(),
             Path::new("/bin").as_os_str(),
         ])
