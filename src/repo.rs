@@ -27,6 +27,100 @@ pub struct Source {
     pub url: String,
 }
 
+/// Identity policy derived from one configured repository URL.
+///
+/// Normal GitHub spellings compare by canonical owner/repository so HTTPS and
+/// SSH transports remain interchangeable. An explicit non-GitHub override is
+/// caller-supplied source authority and therefore compares byte-for-byte. The
+/// same rule is used for development checkout selection and exact ordinary
+/// checkout adoption so those two entrances cannot drift independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OriginPolicy {
+    GitHub {
+        configured: String,
+        repository: String,
+    },
+    Exact(String),
+}
+
+/// Network/file transport admitted by isolated ordinary-checkout verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginTransport {
+    Https,
+    Ssh,
+    File,
+}
+
+impl OriginPolicy {
+    #[must_use]
+    pub(crate) fn new(configured: &str) -> Self {
+        match canonical_github_repo(configured) {
+            Some(repository) => Self::GitHub {
+                configured: configured.to_owned(),
+                repository,
+            },
+            None => Self::Exact(configured.to_owned()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn configured(&self) -> &str {
+        match self {
+            Self::GitHub { configured, .. } | Self::Exact(configured) => configured,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn github_repository(&self) -> Option<&str> {
+        match self {
+            Self::GitHub { repository, .. } => Some(repository),
+            Self::Exact(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn matches(&self, observed: &str) -> bool {
+        match self {
+            Self::GitHub { repository, .. } => {
+                canonical_github_repo(observed).as_deref() == Some(repository)
+            }
+            Self::Exact(configured) => observed == configured,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn file_path(&self) -> Option<&Path> {
+        let configured = self.configured();
+        if let Some(path) = configured.strip_prefix("file://") {
+            return Path::new(path).is_absolute().then(|| Path::new(path));
+        }
+        Path::new(configured)
+            .is_absolute()
+            .then(|| Path::new(configured))
+    }
+
+    /// Selects only transports the quarantine can isolate explicitly.
+    #[must_use]
+    pub(crate) fn transport(&self) -> Option<OriginTransport> {
+        let configured = self.configured();
+        if configured.starts_with("https://") {
+            return Some(OriginTransport::Https);
+        }
+        if self.file_path().is_some() {
+            return Some(OriginTransport::File);
+        }
+        if configured.starts_with("ssh://")
+            || configured
+                .split_once('@')
+                .and_then(|(_, remainder)| remainder.split_once(':'))
+                .is_some()
+        {
+            return Some(OriginTransport::Ssh);
+        }
+        None
+    }
+}
+
 /// Builds the source decision for a `github:repo` dependency.
 #[must_use]
 pub fn source(name: &str, env: &BTreeMap<String, String>) -> Source {
@@ -183,7 +277,47 @@ fn safe_github_path(path: &str) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{Source, canonical_github_repo, override_var, source, ssh_fallback};
+    use super::{
+        OriginPolicy, OriginTransport, Source, canonical_github_repo, override_var, source,
+        ssh_fallback,
+    };
+
+    #[test]
+    fn origin_policy_canonicalizes_github_and_exactly_matches_other_overrides() {
+        let github = OriginPolicy::new("https://github.com/owner/tool.git");
+        assert!(github.matches("git@github.com:owner/tool.git"));
+        assert!(!github.matches("https://github.com/other/tool"));
+
+        let exact = OriginPolicy::new("/tmp/locked/tool.git");
+        assert!(exact.matches("/tmp/locked/tool.git"));
+        assert!(!exact.matches("file:///tmp/locked/tool.git"));
+    }
+
+    #[test]
+    fn origin_policy_selects_only_explicitly_isolated_adoption_transports() {
+        for (origin, expected) in [
+            ("https://github.com/owner/tool", OriginTransport::Https),
+            ("git@github.com:owner/tool.git", OriginTransport::Ssh),
+            ("ssh://git@example.com/owner/tool", OriginTransport::Ssh),
+            ("file:///tmp/tool.git", OriginTransport::File),
+            ("/tmp/tool.git", OriginTransport::File),
+        ] {
+            assert_eq!(
+                OriginPolicy::new(origin).transport(),
+                Some(expected),
+                "{origin}"
+            );
+        }
+        assert_eq!(OriginPolicy::new("relative/tool.git").transport(), None);
+        assert_eq!(
+            OriginPolicy::new("file://relative/tool.git").transport(),
+            None
+        );
+        assert_eq!(
+            OriginPolicy::new("git://example.com/tool.git").transport(),
+            None
+        );
+    }
 
     #[test]
     fn canonical_github_repo_accepts_only_documented_transport_spellings() {

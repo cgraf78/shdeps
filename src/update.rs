@@ -7935,8 +7935,8 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
-    fn update_github_repo_rejects_unsupported_configured_adoption_origin() {
-        let mut fixture = Fixture::new("repo-existing-unsupported-configured-origin");
+    fn update_github_repo_rejects_mismatched_exact_origin_override() {
+        let mut fixture = Fixture::new("repo-existing-mismatched-exact-origin");
         fixture.write_lib();
         fixture.env_vars.insert(
             "SHDEPS_TOOL_REPO".to_owned(),
@@ -7959,7 +7959,7 @@ version() { printf 'saw-pkg\n'; }
         assert!(
             summary.items[0]
                 .detail
-                .contains("configured repository URL")
+                .contains("does not exactly match configured repository override")
         );
         assert!(install_dir.join(".git").is_dir());
         assert!(!fixture.roots.bin_dir.join("tool").exists());
@@ -7969,6 +7969,47 @@ version() { printf 'saw-pkg\n'; }
                 .get("owner/tool")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn update_github_repo_adopts_existing_checkout_from_exact_origin_override() {
+        let mut fixture = Fixture::new("repo-existing-exact-origin-override");
+        fixture.write_lib();
+        let configured_origin_path = fixture.roots.home.join("bootstrap/dot-origin.git");
+        fs::create_dir_all(&configured_origin_path).unwrap();
+        let configured_origin = configured_origin_path.display().to_string();
+        fixture
+            .env_vars
+            .insert("SHDEPS_TOOL_REPO".to_owned(), configured_origin.clone());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        write_executable(&install_dir.join("bin/tool"));
+        initialize_git_checkout(&install_dir, &configured_origin);
+        let runner = verified_adoption_runner(&install_dir);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{}", summary.items[0].detail);
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_dir.display().to_string(),
+            ))
+        );
+        assert!(runner.clean_calls().iter().any(|call| {
+            call.args
+                .iter()
+                .any(|argument| argument == OsStr::new(&configured_origin))
+        }));
     }
 
     #[test]
