@@ -741,16 +741,14 @@ impl<'a, R: Runner> CleanGit<'a, R> {
     ) -> io::Result<Self> {
         let candidate_root = fs::canonicalize(candidate_root)?;
         let program = trusted_program(runner, "git", &candidate_root)?;
-        let bash = trusted_program(runner, "bash", &candidate_root)?;
         let program_parent = program
             .parent()
             .ok_or_else(|| invalid("isolated Git executable has no parent directory"))?;
-        let bash_parent = bash
-            .parent()
-            .ok_or_else(|| invalid("isolated Bash executable has no parent directory"))?;
         let mut executable_dirs = vec![program_parent];
-        if bash_parent != program_parent {
-            executable_dirs.push(bash_parent);
+        for directory in [Path::new("/usr/bin"), Path::new("/bin")] {
+            if directory != program_parent && !executable_dirs.contains(&directory) {
+                executable_dirs.push(directory);
+            }
         }
         let executable_path = std::env::join_paths(executable_dirs)
             .map_err(|_| invalid("isolated executable path is not representable"))?;
@@ -758,8 +756,10 @@ impl<'a, R: Runner> CleanGit<'a, R> {
         let mut env = BTreeMap::new();
         // Git may dispatch a host-owned helper whose shebang uses `env`, as
         // Termux's packaged Git does for Bash helpers. Preserve environment
-        // isolation while making only the independently trusted Git and Bash
-        // directories discoverable; never admit the caller or checkout PATH.
+        // isolation while making only the trusted Git directory and standard
+        // immutable system directories discoverable; never admit the caller
+        // or checkout PATH. The Git directory covers Termux's shared tool root,
+        // while /usr/bin and /bin keep host launchers portable on Unix.
         env.insert("PATH".into(), executable_path);
         insert_env(&mut env, "HOME", &quarantine.home);
         insert_env(&mut env, "XDG_CONFIG_HOME", &quarantine.xdg_config);
@@ -1835,7 +1835,6 @@ mod tests {
         let quarantine = Quarantine::create(&root.join("state")).unwrap();
         let runner = CleanEnvRunner {
             git: git_wrapper.clone(),
-            bash: real_bash,
         };
         let origin_text = format!("file://{}", origin.display());
         let git = CleanGit::new(
@@ -1850,7 +1849,8 @@ mod tests {
 
         let expected_path = std::env::join_paths([
             host_bin.as_os_str(),
-            runner.bash.parent().unwrap().as_os_str(),
+            Path::new("/usr/bin").as_os_str(),
+            Path::new("/bin").as_os_str(),
         ])
         .unwrap();
         assert_eq!(git.env.get(&OsString::from("PATH")), Some(&expected_path));
@@ -2033,20 +2033,15 @@ mod tests {
 
     struct CleanEnvRunner {
         git: PathBuf,
-        bash: PathBuf,
     }
 
     impl Runner for CleanEnvRunner {
         fn exists(&self, command: &str) -> bool {
-            matches!(command, "git" | "bash")
+            command == "git"
         }
 
         fn path(&self, command: &str) -> Option<PathBuf> {
-            match command {
-                "git" => Some(self.git.clone()),
-                "bash" => Some(self.bash.clone()),
-                _ => None,
-            }
+            (command == "git").then(|| self.git.clone())
         }
 
         fn run(
