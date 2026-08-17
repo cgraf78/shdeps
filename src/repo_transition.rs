@@ -689,7 +689,7 @@ fn replace_owned_symlink(checkout: &Path, target: &Path) -> Result<()> {
 /// generation during transaction rollback. The supported fleet platforms all
 /// expose an atomic exclusive rename; unknown Unix targets fail closed rather
 /// than silently falling back to clobbering semantics.
-fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -743,6 +743,60 @@ fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Atomically exchanges two existing filesystem entries without an absent path window.
+pub(crate) fn rename_exchange(left: &Path, right: &Path) -> std::io::Result<()> {
+    let left = CString::new(left.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "left path contains a NUL byte",
+        )
+    })?;
+    let right = CString::new(right.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "right path contains a NUL byte",
+        )
+    })?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let status = unsafe {
+        // SAFETY: both paths are valid live C strings and RENAME_EXCHANGE is
+        // the kernel's atomic two-entry swap contract.
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        ) as libc::c_int
+    };
+
+    #[cfg(target_os = "macos")]
+    let status = unsafe {
+        // SAFETY: both paths are valid live C strings and RENAME_SWAP is the
+        // macOS atomic two-entry exchange contract.
+        libc::renamex_np(left.as_ptr(), right.as_ptr(), libc::RENAME_SWAP)
+    };
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic filesystem exchange is unsupported on this Unix platform",
+        ))
+    }
+}
+
 fn is_real_directory(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
@@ -786,7 +840,8 @@ mod tests {
 
     use super::{
         Desired, Identity, actions_transaction_path, begin, journal_path, publish_development,
-        publish_directory, publish_transaction, recover, rename_noreplace, restore_parked_previous,
+        publish_directory, publish_transaction, recover, rename_exchange, rename_noreplace,
+        restore_parked_previous,
     };
 
     #[test]
@@ -801,6 +856,20 @@ mod tests {
 
         assert_eq!(fs::read_link(&checkout).unwrap(), development);
         assert!(!journal_path(&checkout).unwrap().exists());
+    }
+
+    #[test]
+    fn atomic_exchange_swaps_two_existing_entries() {
+        let dir = temp_dir("atomic-exchange");
+        let left = dir.join("left");
+        let right = dir.join("right");
+        write_file(&left, "left");
+        write_file(&right, "right");
+
+        rename_exchange(&left, &right).unwrap();
+
+        assert_eq!(fs::read_to_string(left).unwrap(), "right");
+        assert_eq!(fs::read_to_string(right).unwrap(), "left");
     }
 
     #[test]

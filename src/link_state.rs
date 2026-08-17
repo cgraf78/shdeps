@@ -218,23 +218,41 @@ pub(crate) fn recover_reconcile(path: &Path) -> Result<()> {
 
 /// Removes symlinks listed in a link-state file, then removes the state file.
 pub fn unlink_tracked(path: &Path) -> Result<()> {
-    recover_reconcile(path)?;
-    for link in read(path)? {
-        // `symlink_metadata` observes dangling symlinks too. That is important
-        // for cleanup after a target install directory has already been
-        // removed; `metadata` would follow the link, fail, and leave stale
-        // public paths behind.
-        if fs::symlink_metadata(&link)
+    unlink_tracked_matching(path, |link| {
+        if fs::symlink_metadata(link)
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(false)
         {
             fs::remove_file(link)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })
+    .map(|_| ())
+}
+
+/// Runs an ownership-aware unlink operation, then retires the state file.
+///
+/// Cleanup callers use this to prove that a live symlink still belongs to the
+/// dependency whose historical path ledger mentioned it. A later install may
+/// legitimately retarget the same public command before the old dependency is
+/// pruned; path-only state must not grant authority over that replacement.
+pub(crate) fn unlink_tracked_matching(
+    path: &Path,
+    mut unlink: impl FnMut(&Path) -> Result<bool>,
+) -> Result<Vec<PathBuf>> {
+    recover_reconcile(path)?;
+    let mut removed = Vec::new();
+    for link in read(path)? {
+        if unlink(&link)? {
+            removed.push(link);
         }
     }
 
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(removed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(removed),
         Err(error) => Err(error.into()),
     }
 }

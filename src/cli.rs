@@ -1864,6 +1864,14 @@ where
     Ok(())
 }
 
+fn cleanup_leftover_message(summary: &update::Summary, name: &str) -> String {
+    let base = format!("{name}: old-method cleanup left artifacts behind");
+    summary
+        .leftover_details
+        .get(name)
+        .map_or(base.clone(), |detail| format!("{base}: {detail}"))
+}
+
 fn write_update_summary<W, E>(
     summary: &update::Summary,
     entries: &[Entry],
@@ -1897,11 +1905,7 @@ where
     }
 
     for name in &summary.leftovers {
-        write_row(
-            stderr,
-            "warning",
-            &format!("{name}: old-method cleanup left artifacts behind"),
-        )?;
+        write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
 
     if !quiet {
@@ -1958,11 +1962,7 @@ where
     }
 
     for name in &summary.leftovers {
-        write_row(
-            stderr,
-            "warning",
-            &format!("{name}: old-method cleanup left artifacts behind"),
-        )?;
+        write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
 
     Ok(())
@@ -2010,11 +2010,7 @@ where
     }
 
     for name in &summary.leftovers {
-        write_row(
-            stderr,
-            "warning",
-            &format!("{name}: old-method cleanup left artifacts behind"),
-        )?;
+        write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
 
     Ok(())
@@ -2153,11 +2149,7 @@ where
     }
 
     for name in &summary.leftovers {
-        write_row(
-            stderr,
-            "warning",
-            &format!("{name}: old-method cleanup left artifacts behind"),
-        )?;
+        write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
 
     let counts = update_counts(summary, active_count);
@@ -3295,6 +3287,21 @@ mod tests {
 
         assert!(String::from_utf8(stdout).unwrap().is_empty());
         assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleanup_leftover_message_surfaces_recovery_detail() {
+        let mut summary = Summary::default();
+        summary.leftovers.push("tool".to_owned());
+        summary.leftover_details.insert(
+            "tool".to_owned(),
+            "preserved replacement at /tmp/.tool.shdeps-unlink.1".to_owned(),
+        );
+
+        assert_eq!(
+            super::cleanup_leftover_message(&summary, "tool"),
+            "tool: old-method cleanup left artifacts behind: preserved replacement at /tmp/.tool.shdeps-unlink.1"
+        );
     }
 
     #[test]

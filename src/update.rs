@@ -268,6 +268,11 @@ pub struct Summary {
     /// can opt in with `SHDEPS_STRICT_LEFTOVERS=1`, which is checked by
     /// `has_errors`.
     pub leftovers: Vec<String>,
+    /// Cleanup failure details keyed by dependency name.
+    ///
+    /// This preserves recovery paths from atomic quarantine failures instead
+    /// of collapsing every cleanup problem into a generic warning.
+    pub leftover_details: BTreeMap<String, String>,
     /// Per-group runtime summaries for renderers that want compact detail.
     pub groups: Vec<GroupSummary>,
 }
@@ -513,6 +518,24 @@ where
     pub client: &'a dyn Client,
 }
 
+impl<'a, R> Context<'a, R>
+where
+    R: Runner,
+{
+    fn with_manifest_path<'b>(&'b self, manifest_path: &'b std::path::Path) -> Context<'b, R> {
+        Context {
+            manifest_path,
+            roots: self.roots,
+            env: self.env,
+            hooks: self.hooks,
+            runner: self.runner,
+            pkg_mgr: self.pkg_mgr,
+            env_vars: self.env_vars,
+            client: self.client,
+        }
+    }
+}
+
 impl Summary {
     /// Returns whether the update had any failure.
     ///
@@ -602,11 +625,19 @@ where
     // lock. Another updater may have committed a newer method or ownership row
     // while this invocation waited, so all transition and cleanup decisions
     // below must be rebuilt from the now-serialized on-disk state.
+    let initial_manifest = manifest::read(context.manifest_path)?;
+    update_transition::recover_pending_publications(
+        entries,
+        &initial_manifest,
+        context.manifest_path,
+        context.roots,
+    )?;
     let fresh_manifest = manifest::read(context.manifest_path)?;
     let manifest = &fresh_manifest;
 
+    update_transition::reject_identity_handoffs(manifest, entries, context.env, context.pkg_mgr)?;
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
-    let package_transitions = transitions.keys().cloned().collect::<BTreeSet<_>>();
+    let package_proofs = update_pkg::required_proofs(entries, manifest, context);
 
     let mut summary = Summary::default();
     let mut changed = Vec::new();
@@ -637,6 +668,10 @@ where
         progress.phase(phase_for_group(GROUP_PACKAGES, 0, package_total))?;
         let package_cache = if installable_package_count == 0 {
             package_cache::Status::Hit { count: 0 }
+        } else if !package_proofs.is_empty() {
+            package_cache::Status::Miss {
+                reason: "package-manager ownership proof required".to_owned(),
+            }
         } else {
             update_pkg::cache_status(entries, context, installable_package_count, options)?
         };
@@ -658,14 +693,14 @@ where
             }
         } else {
             let package_versions =
-                update_pkg::package_versions(entries, context, options, &package_transitions);
+                update_pkg::package_versions(entries, context, options, &package_proofs);
             let sudo =
-                update_pkg::sudo_status(entries, context, &package_versions, &package_transitions)?;
+                update_pkg::sudo_status(entries, context, &package_versions, &package_proofs)?;
             update_pkg::prepare(
                 entries,
                 context,
                 &package_versions,
-                &package_transitions,
+                &package_proofs,
                 sudo,
                 progress,
             )?;
@@ -685,7 +720,7 @@ where
                     sudo,
                     &mut queued,
                     &package_versions,
-                    package_transitions.contains(&entry.name),
+                    package_proofs.contains(&entry.name),
                 )?;
                 if !item.failed {
                     match item.reason {
@@ -741,6 +776,13 @@ where
                     let Some(entry) = entries.iter().find(|entry| entry.name == item.name) else {
                         continue;
                     };
+                    if let Err(error) = update_pkg::record_proof(entry, context) {
+                        update_transition::restore_failed(
+                            transitions.get(&entry.name),
+                            context.manifest_path,
+                        )?;
+                        return Err(error);
+                    }
                     cleanup_successful_transition(
                         entry,
                         transitions.get(&entry.name),
@@ -855,8 +897,11 @@ where
         },
     )?;
     for outcome in builtin_outcomes {
-        if outcome.cleanup_leftover {
+        if let Some(detail) = outcome.cleanup_error {
             summary.leftovers.push(outcome.item.name.clone());
+            summary
+                .leftover_details
+                .insert(outcome.item.name.clone(), detail);
         }
         if outcome.item.failed {
             summary.failed.push(outcome.item.name.clone());
@@ -882,7 +927,7 @@ where
             context,
             &hook_txn,
             options,
-            transitions.get(&entry.name).map(update_transition::old),
+            transitions.get(&entry.name),
         )?;
         let item = outcome.item;
         if outcome.cleanup_leftover {
@@ -1075,7 +1120,7 @@ struct CustomOutcome {
 
 struct BuiltinOutcome {
     item: Item,
-    cleanup_leftover: bool,
+    cleanup_error: Option<String>,
 }
 
 // Return the one repo root whose ownership changes during this transition.
@@ -1233,11 +1278,21 @@ where
             }
         };
         let result = match entry.method.as_str() {
-            method::GITHUB_RELEASE => {
-                update_transition::install_with_prepared(entry, transition, context.roots, || {
-                    update_release::install_with_prefetch(entry, context, options, release_prefetch)
-                })
-            }
+            method::GITHUB_RELEASE => update_transition::install_with_prepared(
+                entry,
+                transition,
+                context.roots,
+                context.manifest_path,
+                |manifest_path| {
+                    let install_context = context.with_manifest_path(manifest_path);
+                    update_release::install_with_prefetch(
+                        entry,
+                        &install_context,
+                        options,
+                        release_prefetch,
+                    )
+                },
+            ),
             method::GITHUB_REPO => {
                 let install_dir = repo_root.expect("repo method requires a checkout lock root");
                 match update_repo::prepare(entry, context, install_dir, repo_destination)? {
@@ -1247,15 +1302,26 @@ where
                             entry,
                             transition,
                             context.roots,
-                            || update_repo::apply(*plan, entry, context, options),
+                            context.manifest_path,
+                            |manifest_path| {
+                                let install_context = context.with_manifest_path(manifest_path);
+                                update_repo::apply(*plan, entry, &install_context, options)
+                            },
                         )
                     }
                 }
             }
             candidate if method::requires_external_plan(candidate) => {
-                update_transition::install_with_prepared(entry, transition, context.roots, || {
-                    update_external::install(entry, context, options)
-                })
+                update_transition::install_with_prepared(
+                    entry,
+                    transition,
+                    context.roots,
+                    context.manifest_path,
+                    |manifest_path| {
+                        let install_context = context.with_manifest_path(manifest_path);
+                        update_external::install(entry, &install_context, options)
+                    },
+                )
             }
             method => Ok(Item::failed(
                 entry.name.clone(),
@@ -1272,15 +1338,15 @@ where
                 error.to_string(),
             ),
         };
-        let cleanup_leftover = if item.failed {
-            false
+        let cleanup_error = if item.failed {
+            None
         } else {
             update_transition::cleanup_successful(entry, transition, context.roots, repo_root)
-                .unwrap_or(true)
+                .unwrap_or_else(|error| Some(error.to_string()))
         };
         Ok(BuiltinOutcome {
             item,
-            cleanup_leftover,
+            cleanup_error,
         })
     });
 
@@ -1290,7 +1356,7 @@ where
             ItemReason::InstallFailed,
             error.to_string(),
         ),
-        cleanup_leftover: false,
+        cleanup_error: None,
     })
 }
 
@@ -1299,58 +1365,34 @@ fn successful_custom(
     context: &Context<'_, impl Runner>,
     changed: bool,
     detail: String,
-    transition: Option<&ManifestEntry>,
+    transition: Option<&update_transition::Transition>,
 ) -> Result<CustomOutcome> {
-    with_old_repo_checkout_lock(transition, context, |repo_root| {
-        if transition.is_some_and(|old| old.method == method::GITHUB_REPO) && repo_root.is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "github:repo transition cleanup requires an acquired checkout-lock root",
-            )
-            .into());
+    let old = transition.map(update_transition::old);
+    with_old_repo_checkout_lock(old, context, |_repo_root| {
+        if old.is_some_and(|entry| entry.method == method::PKG) {
+            crate::package_proof::remove(&context.roots.state_dir, &entry.name)?;
         }
-
         manifest::upsert(
             context.manifest_path,
             ManifestEntry::new(&entry.name, method::CUSTOM, &entry.cmd, ""),
         )?;
+        Ok(())
+    })?;
 
-        let cleanup_leftover = match transition {
-            Some(old) => cleanup_transition(old, context.roots, repo_root)?,
-            None => false,
-        };
-
-        Ok(CustomOutcome {
-            item: if changed {
-                Item::changed(entry.name.clone(), ItemReason::Installed, detail)
-            } else {
-                Item::current(entry.name.clone(), ItemReason::Installed, detail)
-            },
-            cleanup_leftover,
-            marked: Vec::new(),
-        })
+    // Custom hooks can publish to any path, including the old method's public
+    // command or managed root. Once the hook succeeds there is no ownership
+    // proof that lets generic cleanup distinguish fresh custom output from old
+    // artifacts, so preserve both and report a cleanup leftover instead of
+    // risking deletion of the new install.
+    Ok(CustomOutcome {
+        item: if changed {
+            Item::changed(entry.name.clone(), ItemReason::Installed, detail)
+        } else {
+            Item::current(entry.name.clone(), ItemReason::Installed, detail)
+        },
+        cleanup_leftover: old.is_some_and(|entry| entry.method != method::PKG),
+        marked: Vec::new(),
     })
-}
-
-fn cleanup_transition(
-    old: &ManifestEntry,
-    roots: &Roots,
-    repo_root: Option<&Path>,
-) -> Result<bool> {
-    if old.method == method::GITHUB_REPO && repo_root.is_none() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "github:repo transition cleanup requires an acquired checkout-lock root",
-        )
-        .into());
-    }
-    // Transition cleanup happens after the new method is recorded so a cleanup
-    // failure cannot erase the working install. Do not run `uninstall()` here:
-    // the hook path is keyed only by dependency name, so after a switch there
-    // is no reliable way to source the old method's hook separately from the
-    // new method's hook. Running the current hook after a successful custom
-    // install could undo the install we just accepted.
-    Ok(cleanup::remove_builtin_with_repo_root(old, &cleanup_roots(roots), repo_root).is_err())
 }
 
 fn cleanup_successful_transition(
@@ -1363,8 +1405,11 @@ fn cleanup_successful_transition(
         transition.map(update_transition::old),
         context,
         |repo_root| {
-            if update_transition::cleanup_successful(entry, transition, context.roots, repo_root)? {
+            if let Some(detail) =
+                update_transition::cleanup_successful(entry, transition, context.roots, repo_root)?
+            {
                 summary.leftovers.push(entry.name.clone());
+                summary.leftover_details.insert(entry.name.clone(), detail);
             }
             Ok(())
         },
@@ -1390,7 +1435,7 @@ fn install_custom(
     context: &Context<'_, impl Runner>,
     txn: &Txn,
     options: Options,
-    transition: Option<&ManifestEntry>,
+    transition: Option<&update_transition::Transition>,
 ) -> Result<CustomOutcome> {
     let install =
         context
@@ -1629,7 +1674,8 @@ install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
         .unwrap();
 
         assert!(!summary.has_errors());
-        assert!(!install_root.exists());
+        assert!(install_root.exists());
+        assert_eq!(summary.leftovers, ["owner/tool"]);
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("owner/tool"),
             Some(&ManifestEntry::new("owner/tool", "custom", "tool", ""))
@@ -1894,7 +1940,7 @@ post() { printf 'helper post\n' > "$SHDEPS_STATE_DIR/helper-post"; }
     }
 
     #[test]
-    fn update_cleans_old_method_after_custom_install_succeeds() {
+    fn update_preserves_ambiguous_old_artifacts_after_custom_install() {
         let fixture = Fixture::new("transition");
         fixture.write_lib();
         fixture.write_hook(
@@ -1920,7 +1966,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         .unwrap();
         let manifest = manifest::read(&manifest_path).unwrap();
 
-        run(
+        let summary = run(
             &[parse_entry("tool|custom|tool|-|-", None)],
             &manifest,
             &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
@@ -1928,12 +1974,68 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         )
         .unwrap();
 
-        assert!(!old_install.exists());
+        assert!(old_install.exists());
+        assert_eq!(summary.leftovers, ["tool"]);
         assert!(!fixture.roots.state_dir.join("tool-uninstalled").exists());
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("tool"),
             Some(&ManifestEntry::new("tool", "custom", "tool", ""))
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_to_custom_recovery_failure_preserves_old_manifest_for_retry() {
+        let fixture = Fixture::new("repo-to-custom-recovery-failure");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { return 1; }
+install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
+"#,
+        );
+        let old_install = fixture.roots.install_dir.join("tool");
+        let old_public = fixture.roots.bin_dir.join("tool");
+        write_executable(&old_install.join("bin/tool"));
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_install.join("bin/tool"), &old_public).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old_manifest = ManifestEntry::new(
+            "tool",
+            "github:repo",
+            "tool",
+            old_install.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
+        let installer_transaction = old_install
+            .parent()
+            .unwrap()
+            .join(".tool.install.transaction");
+        fs::create_dir_all(&installer_transaction).unwrap();
+        fs::write(installer_transaction.join("identity.partial"), "preserve\n").unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+
+        let error = run(
+            &[parse_entry("tool|custom|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rerun the checkout installer"));
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old_manifest)
+        );
+        assert!(old_install.join("bin/tool").exists());
+        assert_eq!(
+            fs::read_link(&old_public).unwrap(),
+            old_install.join("bin/tool")
+        );
+        assert!(installer_transaction.is_dir());
+        assert!(fixture.roots.state_dir.join("tool-installed").exists());
     }
 
     #[test]
@@ -2373,6 +2475,71 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
 
     #[test]
     #[cfg(unix)]
+    fn update_rejects_stale_command_handoff_before_package_detection() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("cross-identity-pkg");
+        fixture.write_lib();
+        let old_install = fixture.roots.install_dir.join("owner/old-tool");
+        let old_target = old_install.join("bin/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&old_target);
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&old_target, &public).unwrap();
+
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old_manifest = ManifestEntry::new(
+            "owner/old-tool",
+            "github:release",
+            "tool",
+            old_install.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default()
+            .with_command("tool")
+            .with_success(
+                "apt-cache",
+                ["show", "replacement"],
+                "Package: replacement\n",
+            )
+            .with_success("sudo", ["apt-get", "install", "-y", "replacement"], "");
+
+        let error = run(
+            &[
+                parse_entry("owner/old-tool|github:release|other|-|-", None),
+                parse_entry("replacement|pkg|tool|-|-", None),
+            ],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("owner/old-tool"));
+        assert!(error.to_string().contains("replacement"));
+        assert!(error.to_string().contains("tool"));
+        assert!(
+            runner.calls().is_empty(),
+            "package detection ran before the unsupported handoff was rejected"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/old-tool"),
+            Some(&old_manifest)
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("replacement")
+                .is_none()
+        );
+        assert_eq!(fs::read_link(public).unwrap(), old_target);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_pkg_transition_cleans_old_builtin_artifacts_without_uninstalling_package() {
         use std::os::unix::fs::symlink;
 
@@ -2457,12 +2624,16 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             let runner = if already_installed {
                 FakeRunner::default().with_success(
                     "dpkg-query",
-                    ["-W", "-f=${Package}\t${Version}\n"],
-                    "tool\t1.0\n",
+                    ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                    "install ok installed\ttool\t1.0\n",
                 )
             } else {
                 FakeRunner::default()
-                    .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+                    .with_success(
+                        "dpkg-query",
+                        ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                        "",
+                    )
                     .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
                     .with_success("sudo", ["apt-get", "install", "-y", "tool"], "")
             };
@@ -2491,6 +2662,74 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
     }
 
     #[test]
+    #[cfg(unix)]
+    fn package_proof_failure_preserves_old_transition_for_retry() {
+        use std::os::unix::fs::symlink;
+
+        for already_installed in [true, false] {
+            let fixture = Fixture::new(if already_installed {
+                "pkg-proof-failure-installed"
+            } else {
+                "pkg-proof-failure-queued"
+            });
+            fixture.write_lib();
+            let old_install = fixture.roots.install_dir.join("tool");
+            let old_target = old_install.join("bin/tool");
+            let public = fixture.roots.bin_dir.join("tool");
+            write_executable(&old_target);
+            fs::create_dir_all(public.parent().unwrap()).unwrap();
+            symlink(&old_target, &public).unwrap();
+            let manifest_path = manifest::path(&fixture.roots.state_dir);
+            let old_manifest = ManifestEntry::new(
+                "tool",
+                "github:release",
+                "tool",
+                old_install.display().to_string(),
+            );
+            manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
+            fs::create_dir_all(crate::package_proof::path(&fixture.roots.state_dir, "tool"))
+                .unwrap();
+            let installed = manifest::read(&manifest_path).unwrap();
+            let runner = if already_installed {
+                FakeRunner::default().with_success(
+                    "dpkg-query",
+                    ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                    "install ok installed\ttool\t1.0\n",
+                )
+            } else {
+                FakeRunner::default()
+                    .with_success(
+                        "dpkg-query",
+                        ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                        "",
+                    )
+                    .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
+                    .with_success("sudo", ["apt-get", "install", "-y", "tool"], "")
+            };
+
+            let result = run(
+                &[parse_entry("tool|pkg|tool|-|-", None)],
+                &installed,
+                &fixture.context(&manifest_path, &runner, "apt"),
+                Options::default(),
+            );
+
+            assert!(result.is_err(), "already_installed={already_installed}");
+            assert_eq!(
+                manifest::read(&manifest_path).unwrap().get("tool"),
+                Some(&old_manifest),
+                "already_installed={already_installed}"
+            );
+            assert!(old_target.exists(), "already_installed={already_installed}");
+            assert_eq!(
+                fs::read_link(&public).unwrap(),
+                old_target,
+                "already_installed={already_installed}"
+            );
+        }
+    }
+
+    #[test]
     fn update_pkg_transition_restores_old_manifest_when_package_install_fails() {
         let fixture = Fixture::new("transition-pkg-failure");
         fixture.write_lib();
@@ -2506,6 +2745,16 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
         let manifest = manifest::read(&manifest_path).unwrap();
         let runner = FakeRunner::default()
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "deinstall ok config-files\ttool\t1.0\n",
+            )
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\n", "tool"],
+                "deinstall ok config-files\n",
+            )
             .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
             .with_failure("sudo", ["apt-get", "install", "-y", "tool"]);
 
@@ -2519,6 +2768,12 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
 
         assert!(summary.has_errors());
         assert_eq!(summary.failed, ["tool"]);
+        assert!(
+            runner
+                .calls()
+                .contains(&key("sudo", ["apt-get", "install", "-y", "tool"])),
+            "residual dpkg config state must not prove package ownership"
+        );
         assert!(old_install.exists());
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("tool"),
@@ -2829,7 +3084,11 @@ install() { return 42; }
         let fixture = Fixture::new("pkg-existing");
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
-        let runner = FakeRunner::default().with_command("jq");
+        let runner = FakeRunner::default().with_command("jq").with_success(
+            "dpkg-query",
+            ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+            "install ok installed\tjq\t1.0\n",
+        );
 
         let summary = run(
             &[parse_entry("jq|pkg|jq|-|-", None)],
@@ -2845,6 +3104,102 @@ install() { return 42; }
             manifest::read(&manifest_path).unwrap().get("jq"),
             Some(&ManifestEntry::new("jq", "pkg", "jq", ""))
         );
+        assert!(crate::package_proof::current(
+            &fixture.roots.state_dir,
+            "jq",
+            "apt",
+            "jq",
+            "jq"
+        ));
+    }
+
+    #[test]
+    fn update_unproven_package_command_requires_manager_ownership() {
+        let fixture = Fixture::new("pkg-unproven-command");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default()
+            .with_command("tool")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "",
+            )
+            .with_success(
+                "apt-cache",
+                ["show", "replacement"],
+                "Package: replacement\n",
+            )
+            .with_success("sudo", ["apt-get", "install", "-y", "replacement"], "");
+
+        let summary = run(
+            &[parse_entry("replacement|pkg|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(
+            runner
+                .calls()
+                .contains(&key("sudo", ["apt-get", "install", "-y", "replacement"])),
+            "a foreign command must not stand in for package-manager ownership"
+        );
+    }
+
+    #[test]
+    fn failed_package_adoption_keeps_manager_proof_required() {
+        let fixture = Fixture::new("pkg-unproven-retry");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entry = parse_entry("replacement|pkg|tool|-|-", None);
+        let first_runner = FakeRunner::default()
+            .with_command("tool")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "",
+            )
+            .with_failure("apt-cache", ["show", "replacement"]);
+
+        let first = run(
+            std::slice::from_ref(&entry),
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &first_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(first.items[0].reason, super::ItemReason::PackageUnavailable);
+
+        let recorded = manifest::read(&manifest_path).unwrap();
+        let second_runner = FakeRunner::default()
+            .with_command("tool")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "",
+            )
+            .with_success(
+                "apt-cache",
+                ["show", "replacement"],
+                "Package: replacement\n",
+            )
+            .with_success("sudo", ["apt-get", "install", "-y", "replacement"], "");
+        run(
+            std::slice::from_ref(&entry),
+            &recorded,
+            &fixture.context(&manifest_path, &second_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(
+            second_runner
+                .calls()
+                .contains(&key("sudo", ["apt-get", "install", "-y", "replacement"]))
+        );
     }
 
     #[test]
@@ -2857,8 +3212,8 @@ install() { return 42; }
         let entries = [parse_entry("font|pkg|font|-|-", None)];
         let first_runner = FakeRunner::default().with_success(
             "dpkg-query",
-            ["-W", "-f=${Package}\t${Version}\n"],
-            "font\t1.0\n",
+            ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+            "install ok installed\tfont\t1.0\n",
         );
 
         let first = run(
@@ -2897,8 +3252,8 @@ install() { return 42; }
         let entries = [parse_entry("font|pkg|font|-|-", None)];
         let first_runner = FakeRunner::default().with_success(
             "dpkg-query",
-            ["-W", "-f=${Package}\t${Version}\n"],
-            "font\t1.0\n",
+            ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+            "install ok installed\tfont\t1.0\n",
         );
 
         run(
@@ -2912,8 +3267,8 @@ install() { return 42; }
         let manifest = manifest::read(&manifest_path).unwrap();
         let forced_runner = FakeRunner::default().with_success(
             "dpkg-query",
-            ["-W", "-f=${Package}\t${Version}\n"],
-            "font\t1.0\n",
+            ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+            "install ok installed\tfont\t1.0\n",
         );
         let forced = run(
             &entries,
@@ -2928,9 +3283,10 @@ install() { return 42; }
 
         assert_eq!(forced.items[0].detail, "installed");
         assert!(
-            forced_runner
-                .calls()
-                .contains(&key("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"])),
+            forced_runner.calls().contains(&key(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"]
+            )),
             "force mode must re-prove package state instead of trusting the warm cache"
         );
     }
@@ -2940,6 +3296,16 @@ install() { return 42; }
         let fixture = Fixture::new("pkg-force-command-only");
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(&manifest_path, ManifestEntry::new("jq", "pkg", "jq", "")).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("ripgrep", "pkg", "rg", ""),
+        )
+        .unwrap();
+        crate::package_proof::write(&fixture.roots.state_dir, "jq", "apt", "jq", "jq").unwrap();
+        crate::package_proof::write(&fixture.roots.state_dir, "ripgrep", "apt", "ripgrep", "rg")
+            .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
         let runner = FakeRunner::default().with_command("jq").with_command("rg");
 
         let summary = run(
@@ -2947,7 +3313,7 @@ install() { return 42; }
                 parse_entry("jq|pkg|jq|-|-", None),
                 parse_entry("ripgrep|pkg|rg|-|-", None),
             ],
-            &manifest::Manifest::default(),
+            &installed,
             &fixture.context(&manifest_path, &runner, "apt"),
             Options {
                 force: true,
@@ -2961,9 +3327,10 @@ install() { return 42; }
             item.status == super::ItemStatus::Current && item.reason == super::ItemReason::Installed
         }));
         assert!(
-            !runner
-                .calls()
-                .contains(&key("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"])),
+            !runner.calls().contains(&key(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"]
+            )),
             "forced package checks still need to re-prove command presence, but the expensive manager-wide version snapshot is unnecessary when every command is present"
         );
     }
@@ -2996,6 +3363,45 @@ install() { return 42; }
     }
 
     #[test]
+    fn update_skipped_package_transition_does_not_require_manager_proof() {
+        let fixture = Fixture::new("pkg-none-transition");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "tool",
+            "cargo",
+            "tool",
+            fixture
+                .roots
+                .install_dir
+                .join("tool/bin/tool")
+                .display()
+                .to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default();
+
+        let summary = run(
+            &[parse_entry("tool|pkg|tool|apt:NONE|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.items[0].reason,
+            super::ItemReason::PackageManagerOverride
+        );
+        assert!(runner.calls().is_empty());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+    }
+
+    #[test]
     fn update_records_unavailable_package_as_compatibility_skip() {
         let fixture = Fixture::new("pkg-unavailable");
         fixture.write_lib();
@@ -3023,11 +3429,14 @@ install() { return 42; }
         let fixture = Fixture::new("pkg-quiet-installed").with_env_var("SHDEPS_QUIET", "1");
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(&manifest_path, ManifestEntry::new("jq", "pkg", "jq", "")).unwrap();
+        crate::package_proof::write(&fixture.roots.state_dir, "jq", "apt", "jq", "jq").unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
         let runner = FakeRunner::default().with_command("jq");
 
         let summary = run(
             &[parse_entry("jq|pkg|jq|-|-", None)],
-            &manifest::Manifest::default(),
+            &installed,
             &fixture.context(&manifest_path, &runner, "apt"),
             Options::default(),
         )
@@ -3290,7 +3699,11 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/jq-post"; }
         fixture.env = RuntimeEnv::new("linux", "phone").with_android(true);
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default()
-            .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "",
+            )
             .with_success("apt-get", ["update", "-qq"], "")
             .with_success("apt-cache", ["show", "termux-jq"], "Package: termux-jq\n")
             .with_success("apt-get", ["install", "-y", "termux-jq"], "");

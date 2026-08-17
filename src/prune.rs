@@ -87,8 +87,8 @@ pub fn run(
     // row for a configured dep silently disarm the guard even when
     // every other tracked dep is about to be pruned.
     let unique_manifest_deps: std::collections::BTreeSet<&str> = manifest
-        .entries()
-        .iter()
+        .effective_entries()
+        .into_iter()
         .map(|entry| entry.name.as_str())
         .collect();
     let unique_orphan_deps: std::collections::BTreeSet<&str> =
@@ -142,6 +142,13 @@ pub fn run(
     // would change it, and racing against that is out of scope —
     // the operator is expected to re-run prune if they edit config
     // mid-run.
+    let initial_manifest = manifest::read(manifest_path)?;
+    crate::update_transition::recover_pending_publications(
+        config,
+        &initial_manifest,
+        manifest_path,
+        roots,
+    )?;
     let fresh_manifest = manifest::read(manifest_path)?;
     let orphans = self::orphans(&fresh_manifest, config);
     if orphans.is_empty() {
@@ -161,8 +168,8 @@ pub fn run(
     // re-check the mutation loop would silently bulk-delete every
     // currently-tracked dep without the `--yes` confirmation.
     let fresh_unique_manifest: std::collections::BTreeSet<&str> = fresh_manifest
-        .entries()
-        .iter()
+        .effective_entries()
+        .into_iter()
         .map(|entry| entry.name.as_str())
         .collect();
     let fresh_unique_orphans: std::collections::BTreeSet<&str> =
@@ -182,8 +189,17 @@ pub fn run(
     let mut removed = Vec::new();
     for entry in &orphans {
         cleanup::validate_manifest_artifact_entry(entry)?;
+        let cleanup_evidence = capture_cleanup_evidence(entry, &cleanup_roots)?;
         let hook = hooks.uninstall(&entry.name, roots)?;
-        let (cleanup, cleanup_error) = cleanup_orphan(entry, manifest_path, &cleanup_roots)?;
+        let preserve_regular_public =
+            regular_public_claimed_by_survivor(entry, &fresh_manifest, config);
+        let (cleanup, cleanup_error) = cleanup_orphan(
+            entry,
+            manifest_path,
+            &cleanup_roots,
+            preserve_regular_public,
+            cleanup_evidence,
+        )?;
         removed.push(Item {
             entry: entry.clone(),
             hook,
@@ -200,12 +216,47 @@ pub fn run(
     })
 }
 
+fn capture_cleanup_evidence(
+    entry: &ManifestEntry,
+    roots: &cleanup::Roots,
+) -> Result<cleanup::Evidence> {
+    if entry.method != crate::method::GITHUB_REPO {
+        return cleanup::capture_evidence(entry, roots);
+    }
+    let root = cleanup::safe_repo_root(entry, roots).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsafe repository identity in manifest: {}", entry.name),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        crate::checkout_lock::with_checkout_lock_process_env(&root, |normalized| {
+            crate::repo_transition::recover(normalized)?;
+            cleanup::capture_evidence(entry, roots)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        cleanup::capture_evidence(entry, roots)
+    }
+}
+
 // Clean one orphan under its checkout lock only after arbitrary hooks have returned.
 fn cleanup_orphan(
     entry: &ManifestEntry,
     manifest_path: &Path,
     cleanup_roots: &cleanup::Roots,
+    preserve_regular_public: bool,
+    cleanup_evidence: cleanup::Evidence,
 ) -> Result<(Option<cleanup::Summary>, Option<String>)> {
+    let captured_repo_root = (entry.method == crate::method::GITHUB_REPO)
+        .then(|| {
+            cleanup_evidence
+                .managed_install_root()
+                .map(Path::to_path_buf)
+        })
+        .flatten();
     let cleanup = |repo_root: Option<&Path>| -> Result<(Option<cleanup::Summary>, Option<String>)> {
         // A pending bin-link record is recovery authority, not ordinary
         // best-effort cleanup. Resolve or reject it before the legacy cleanup
@@ -217,7 +268,13 @@ fn cleanup_orphan(
             crate::link_state::Kind::Bin,
         );
         crate::link_state::recover_reconcile(&bin_state)?;
-        let result = match cleanup::remove_builtin_with_repo_root(entry, cleanup_roots, repo_root) {
+        let result = match cleanup::remove_builtin_with_evidence(
+            entry,
+            cleanup_roots,
+            repo_root,
+            preserve_regular_public,
+            cleanup_evidence,
+        ) {
             Ok(summary) => (Some(summary), None),
             Err(error) => (None, Some(error.to_string())),
         };
@@ -233,7 +290,7 @@ fn cleanup_orphan(
     if entry.method != crate::method::GITHUB_REPO {
         return cleanup(None);
     }
-    let root = cleanup::safe_repo_root(entry, cleanup_roots).ok_or_else(|| {
+    let root = captured_repo_root.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unsafe repository identity in manifest: {}", entry.name),
@@ -252,18 +309,30 @@ fn cleanup_orphan(
     }
 }
 
-fn orphans(manifest: &Manifest, config: &[Entry]) -> Vec<ManifestEntry> {
+fn regular_public_claimed_by_survivor(
+    orphan: &ManifestEntry,
+    manifest: &Manifest,
+    config: &[Entry],
+) -> bool {
+    if orphan.method != crate::method::GITHUB_RELEASE {
+        return false;
+    }
     let configured = config
         .iter()
         .map(|entry| entry.name.as_str())
         .collect::<BTreeSet<_>>();
+    manifest.effective_entries().into_iter().any(|installed| {
+        installed.name != orphan.name
+            && configured.contains(installed.name.as_str())
+            && installed.cmd == orphan.cmd
+            && (installed.method == crate::method::GITHUB_RELEASE
+                || installed.method == crate::method::CUSTOM
+                || crate::method::is_symlink_install_root(&installed.method))
+    })
+}
 
-    manifest
-        .entries()
-        .iter()
-        .filter(|entry| !configured.contains(entry.name.as_str()))
-        .cloned()
-        .collect()
+fn orphans(manifest: &Manifest, config: &[Entry]) -> Vec<ManifestEntry> {
+    manifest.orphans(config)
 }
 
 fn cleanup_roots(roots: &runtime::Roots) -> cleanup::Roots {
@@ -337,6 +406,995 @@ mod tests {
         assert!(!bin.exists());
         assert!(!fixture.roots.install_dir.join("owner/tool").exists());
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn prune_preserves_regular_command_owned_by_surviving_raw_release() {
+        let fixture = Fixture::new("prune-raw-release-handoff");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "replacement release\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/replacement",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[parse_entry("owner/replacement|github:repo|tool|-|-", None)],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(public).unwrap(), "replacement release\n");
+        let remaining = manifest::read(&manifest_path).unwrap();
+        assert!(remaining.get("owner/old").is_none());
+        assert!(remaining.get("owner/replacement").is_some());
+    }
+
+    #[test]
+    fn prune_preserves_regular_command_claimed_by_surviving_custom_provider() {
+        let fixture = Fixture::new("prune-custom-command-handoff");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "custom replacement\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("replacement", "custom", "tool", ""),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[parse_entry("replacement|custom|tool|-|-", None)],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(public).unwrap(), "custom replacement\n");
+    }
+
+    #[test]
+    fn prune_preserves_regular_command_claimed_by_surviving_symlink_provider() {
+        for (case, survivor, config_line) in [
+            (
+                "repo",
+                ManifestEntry::new(
+                    "owner/replacement",
+                    "github:repo",
+                    "tool",
+                    "/managed/owner/replacement",
+                ),
+                "owner/replacement|github:repo|tool|-|-",
+            ),
+            (
+                "cargo",
+                ManifestEntry::new("replacement", "cargo", "tool", "/managed/replacement"),
+                "replacement|cargo|tool|-|-",
+            ),
+        ] {
+            let fixture = Fixture::new(&format!("prune-symlink-provider-handoff-{case}"));
+            let manifest_path = manifest::path(&fixture.roots.state_dir);
+            let public = fixture.roots.bin_dir.join("tool");
+            fixture.write(&public, "surviving adapter\n");
+            manifest::upsert(
+                &manifest_path,
+                ManifestEntry::new(
+                    "owner/old",
+                    "github:release",
+                    "tool",
+                    public.display().to_string(),
+                ),
+            )
+            .unwrap();
+            manifest::upsert(&manifest_path, survivor).unwrap();
+            let manifest = manifest::read(&manifest_path).unwrap();
+
+            run(
+                &[parse_entry(config_line, None)],
+                &manifest,
+                &manifest_path,
+                &fixture.roots,
+                &fixture.hooks,
+                Options {
+                    yes: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(fs::read_to_string(public).unwrap(), "surviving adapter\n");
+        }
+    }
+
+    #[test]
+    fn prune_uses_only_effective_duplicate_manifest_row() {
+        let fixture = Fixture::new("prune-effective-duplicate-row");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "preserve\n");
+        fixture.write(
+            &manifest_path,
+            &format!(
+                "orphan|github:release|tool|{}\n\
+                 orphan|pkg|other|\n\
+                 keep|custom|keep|\n",
+                public.display()
+            ),
+        );
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("keep|custom|keep|-|-", None)],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.orphans.len(), 1);
+        assert_eq!(summary.removed.len(), 1);
+        assert_eq!(summary.removed[0].entry.method, "pkg");
+        assert_eq!(fs::read_to_string(public).unwrap(), "preserve\n");
+    }
+
+    #[test]
+    fn prune_does_not_treat_package_survivor_as_regular_command_owner() {
+        let fixture = Fixture::new("prune-package-command-handoff");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "old raw release\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("replacement", "pkg", "tool", ""),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[parse_entry("replacement|pkg|tool|-|-", None)],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(fs::symlink_metadata(public).is_err());
+    }
+
+    #[test]
+    fn prune_preserves_raw_command_replaced_by_uninstall_hook() {
+        let fixture = Fixture::new("prune-hook-replaces-raw-command");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "old raw release\n");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            r#"uninstall() {
+  printf 'replacement from hook\n' > "$SHDEPS_BIN_DIR/.tool.new"
+  mv -f "$SHDEPS_BIN_DIR/.tool.new" "$SHDEPS_BIN_DIR/tool"
+}
+"#,
+        );
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.removed[0].hook, Uninstall::Removed);
+        assert_eq!(
+            fs::read_to_string(public).unwrap(),
+            "replacement from hook\n"
+        );
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_preserves_raw_command_modified_in_place_by_uninstall_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new("prune-hook-modifies-raw-command-in-place");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "old\n");
+        let timestamp = fixture.roots.state_dir.join("tool.original-time");
+        fs::copy(&public, &timestamp).unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&timestamp, fs::Permissions::from_mode(0o600)).unwrap();
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            r#"uninstall() {
+  printf 'new\n' > "$SHDEPS_BIN_DIR/tool"
+  touch -r "$SHDEPS_STATE_DIR/tool.original-time" "$SHDEPS_BIN_DIR/tool"
+}
+"#,
+        );
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(public).unwrap(), "new\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_removes_execute_only_raw_release_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new("prune-execute-only-raw-command");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o111)).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(fs::symlink_metadata(public).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_raw_release_preserves_unreadable_coincidental_install_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new("prune-raw-unreadable-coincidental-root");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let coincidental = fixture.roots.install_dir.join("owner/old");
+        fixture.write(&public, "old raw release\n");
+        fixture.write(&coincidental.join("sentinel"), "preserve\n");
+        fs::set_permissions(&coincidental, fs::Permissions::from_mode(0o000)).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let result = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        );
+
+        fs::set_permissions(&coincidental, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert!(coincidental.join("sentinel").is_file());
+        assert_eq!(fs::read_to_string(public).unwrap(), "old raw release\n");
+    }
+
+    #[test]
+    fn prune_raw_release_ignores_coincidental_non_directory_install_root() {
+        let fixture = Fixture::new("prune-raw-coincidental-file-root");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let coincidental = fixture.roots.install_dir.join("owner/old");
+        fixture.write(&public, "old raw release\n");
+        fixture.write(&coincidental, "unrelated\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(coincidental).unwrap(), "unrelated\n");
+        assert!(fs::symlink_metadata(public).is_err());
+    }
+
+    #[test]
+    fn prune_raw_release_ignores_coincidental_non_directory_ancestor() {
+        let fixture = Fixture::new("prune-raw-coincidental-file-ancestor");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let coincidental = fixture.roots.install_dir.join("owner");
+        fixture.write(&public, "old raw release\n");
+        fixture.write(&coincidental, "unrelated\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(coincidental).unwrap(), "unrelated\n");
+        assert!(fs::symlink_metadata(public).is_err());
+    }
+
+    #[test]
+    fn prune_preserves_ambiguous_legacy_release_launcher() {
+        let fixture = Fixture::new("prune-ambiguous-release-launcher");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let legacy_root = fixture.roots.install_dir.join("owner/old");
+        fixture.write(&public, "launcher\n");
+        fixture.write(&legacy_root.join("payload"), "legacy archive\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(public).unwrap(), "launcher\n");
+        assert_eq!(
+            fs::read_to_string(legacy_root.join("payload")).unwrap(),
+            "legacy archive\n"
+        );
+    }
+
+    #[test]
+    fn prune_rejects_corrupt_explicit_release_marker_before_retiring_state() {
+        let fixture = Fixture::new("prune-corrupt-release-marker");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let root = fixture.roots.install_dir.join("owner/old");
+        fixture.write(&public, "launcher\n");
+        fixture.write(&root.join(".shdeps-release-layout"), "unknown\n");
+        let bin_state = crate::link_state::path(
+            &fixture.roots.state_dir,
+            "owner/old",
+            crate::link_state::Kind::Bin,
+        );
+        crate::link_state::write(&bin_state, std::slice::from_ref(&public)).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let error = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown release archive marker"));
+        assert_eq!(fs::read_to_string(public).unwrap(), "launcher\n");
+        assert!(root.is_dir());
+        assert!(bin_state.is_file());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/old")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_uses_install_root_captured_before_uninstall_hook_retargets_base() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("prune-hook-retargets-install-base");
+        let physical_a = fixture.roots.home.join("physical-a");
+        let physical_b = fixture.roots.home.join("physical-b");
+        fs::create_dir_all(physical_a.join("tool")).unwrap();
+        fs::write(physical_a.join("tool/old"), "remove\n").unwrap();
+        fs::create_dir_all(physical_b.join("tool")).unwrap();
+        fs::write(physical_b.join("tool/replacement"), "preserve\n").unwrap();
+        symlink(&physical_a, &fixture.roots.install_dir).unwrap();
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            r#"uninstall() {
+  rm -f "$SHDEPS_INSTALL_DIR"
+  ln -s "$SHDEPS_STATE_DIR/../physical-b" "$SHDEPS_INSTALL_DIR"
+}
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                "cargo",
+                "tool",
+                physical_a.join("tool/bin/tool").display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!physical_a.join("tool").exists());
+        assert_eq!(
+            fs::read_to_string(physical_b.join("tool/replacement")).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(
+            fs::canonicalize(&fixture.roots.install_dir).unwrap(),
+            physical_b
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_preserves_external_root_recreated_by_uninstall_hook() {
+        let fixture = Fixture::new("prune-hook-recreates-external-root");
+        let root = fixture.roots.install_dir.join("tool");
+        fixture.write(&root.join("old"), "old\n");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            r#"uninstall() {
+  rm -rf "$SHDEPS_INSTALL_DIR/tool"
+  mkdir -p "$SHDEPS_INSTALL_DIR/tool"
+  printf 'replacement\n' > "$SHDEPS_INSTALL_DIR/tool/replacement"
+}
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                "cargo",
+                "tool",
+                root.join("bin/tool").display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("replacement")).unwrap(),
+            "replacement\n"
+        );
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_preserves_external_root_modified_in_place_by_uninstall_hook() {
+        let fixture = Fixture::new("prune-hook-modifies-external-root-in-place");
+        let root = fixture.roots.install_dir.join("tool");
+        let payload = root.join("deep/payload");
+        let timestamp = fixture.roots.state_dir.join("payload.original-time");
+        fixture.write(&payload, "old\n");
+        fs::copy(&payload, &timestamp).unwrap();
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            r#"uninstall() {
+  printf 'new\n' > "$SHDEPS_INSTALL_DIR/tool/deep/payload"
+  touch -r "$SHDEPS_STATE_DIR/payload.original-time" "$SHDEPS_INSTALL_DIR/tool/deep/payload"
+}
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                "cargo",
+                "tool",
+                root.join("bin/tool").display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(payload).unwrap(), "new\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_preserves_repo_root_recreated_by_uninstall_hook() {
+        let fixture = Fixture::new("prune-hook-recreates-repo-root");
+        let root = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&root.join("old"), "old\n");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/tool.sh"),
+            r#"uninstall() {
+  rm -rf "$SHDEPS_INSTALL_DIR/owner/tool"
+  mkdir -p "$SHDEPS_INSTALL_DIR/owner/tool"
+  printf 'replacement\n' > "$SHDEPS_INSTALL_DIR/owner/tool/replacement"
+}
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("replacement")).unwrap(),
+            "replacement\n"
+        );
+        assert!(summary.removed[0].cleanup_error.is_some());
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_accepts_repo_root_removed_by_uninstall_hook() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("prune-hook-removes-repo-root");
+        let root = fixture.roots.install_dir.join("owner/tool");
+        let target = root.join("bin/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&target, "old\n");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(&target, &public).unwrap();
+        let bin_state = crate::link_state::path(
+            &fixture.roots.state_dir,
+            "owner/tool",
+            crate::link_state::Kind::Bin,
+        );
+        crate::link_state::write(&bin_state, std::slice::from_ref(&public)).unwrap();
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/tool.sh"),
+            "uninstall() { rm -rf \"$SHDEPS_INSTALL_DIR/owner/tool\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.removed[0].cleanup_error.is_none());
+        assert!(fs::symlink_metadata(public).is_err());
+        assert!(fs::symlink_metadata(bin_state).is_err());
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_does_not_follow_install_base_created_by_uninstall_hook() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("prune-hook-creates-install-base-link");
+        let foreign = fixture.roots.state_dir.parent().unwrap().join("foreign");
+        let logical_target = fixture.roots.install_dir.join("tool/bin/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(&logical_target, &public).unwrap();
+        crate::link_state::write(
+            &crate::link_state::path(
+                &fixture.roots.state_dir,
+                "tool",
+                crate::link_state::Kind::Bin,
+            ),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            r#"uninstall() {
+  mkdir -p "$SHDEPS_STATE_DIR/../foreign/tool/bin"
+  printf 'replacement\n' > "$SHDEPS_STATE_DIR/../foreign/tool/bin/tool"
+  ln -s "$SHDEPS_STATE_DIR/../foreign" "$SHDEPS_INSTALL_DIR"
+}
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                "cargo",
+                "tool",
+                logical_target.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(foreign.join("tool/bin/tool")).unwrap(),
+            "replacement\n"
+        );
+        assert_eq!(fs::read_link(&public).unwrap(), logical_target);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_removes_tracked_dangling_external_link_when_root_is_absent() {
+        use std::os::unix::fs::symlink;
+
+        for case in ["missing-root", "missing-base", "broken-base"] {
+            let fixture = Fixture::new(&format!("prune-dangling-external-{case}"));
+            let logical_target = fixture.roots.install_dir.join("tool/bin/tool");
+            let public = fixture.roots.bin_dir.join("tool");
+            match case {
+                "missing-root" => fs::create_dir_all(&fixture.roots.install_dir).unwrap(),
+                "broken-base" => {
+                    symlink(
+                        fixture.roots.home.join("missing-target"),
+                        &fixture.roots.install_dir,
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+            symlink(&logical_target, &public).unwrap();
+            let bin_state = crate::link_state::path(
+                &fixture.roots.state_dir,
+                "tool",
+                crate::link_state::Kind::Bin,
+            );
+            crate::link_state::write(&bin_state, std::slice::from_ref(&public)).unwrap();
+            let manifest_path = manifest::path(&fixture.roots.state_dir);
+            manifest::upsert(
+                &manifest_path,
+                ManifestEntry::new(
+                    "tool",
+                    "cargo",
+                    "tool",
+                    logical_target.display().to_string(),
+                ),
+            )
+            .unwrap();
+            let manifest = manifest::read(&manifest_path).unwrap();
+
+            run(
+                &[],
+                &manifest,
+                &manifest_path,
+                &fixture.roots,
+                &fixture.hooks,
+                Options {
+                    yes: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+
+            assert!(fs::symlink_metadata(public).is_err(), "case: {case}");
+            assert!(fs::symlink_metadata(bin_state).is_err(), "case: {case}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_removes_dangling_logical_link_when_install_alias_disappears() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("prune-hook-removes-install-base-link");
+        let physical = fixture.roots.home.join("physical");
+        let root = physical.join("tool");
+        let logical_target = fixture.roots.install_dir.join("tool/bin/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&root.join("bin/tool"), "old\n");
+        symlink(&physical, &fixture.roots.install_dir).unwrap();
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(&logical_target, &public).unwrap();
+        crate::link_state::write(
+            &crate::link_state::path(
+                &fixture.roots.state_dir,
+                "tool",
+                crate::link_state::Kind::Bin,
+            ),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            "uninstall() { rm -f \"$SHDEPS_INSTALL_DIR\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                "cargo",
+                "tool",
+                logical_target.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(fs::symlink_metadata(public).is_err());
+        assert!(!root.exists());
+        assert!(fs::symlink_metadata(&fixture.roots.install_dir).is_err());
     }
 
     #[test]

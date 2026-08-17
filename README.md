@@ -135,6 +135,12 @@ share one dependency name; Shdeps selects the last matching declaration before
 applying its normal last-wins rule, preserving one manifest identity across
 provider transitions.
 
+Treat `name` as a stable manifest identity. To rename a dependency while
+reusing its command, first remove the old declaration, run `shdeps prune`, then
+add the replacement declaration. Shdeps rejects an active
+replacement that conflicts with a differently named manifest row so the old
+command cannot be mistaken for proof that the new provider is installed.
+
 ### Environment Variables
 
 | Variable             | Default                                                 | Description                                                                                                                                                                           |
@@ -161,6 +167,11 @@ provider transitions.
 ### `pkg` — System Packages
 
 Installs via the detected package manager (brew, apt, dnf, pacman, zypper, or apk). Packages are batched into a single install command for speed. On Android, Termux's APT prefix is owned by the app user, so shdeps runs `apt-get` directly instead of requiring `sudo`.
+
+On first adoption, and whenever the manager, package alias, or command changes,
+Shdeps verifies package-manager ownership even if the command already exists.
+It records that proof so later healthy updates retain the command-only fast
+path.
 
 ```text
 jq        pkg

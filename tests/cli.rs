@@ -1057,6 +1057,11 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
         "conf/deps.conf",
         "tool pkg tool apt:NONE\nother pkg other\n",
     );
+    fixture.write("state/manifest", "other|pkg|other|\n");
+    fixture.write(
+        "state/other.pkg-proof",
+        "shdeps-pkg-proof-v1\nmanager=apt\npackage=other\ncommand=other\n",
+    );
     fixture.write_executable("fakebin/apt-get", "#!/bin/sh\n");
     fixture.write_executable("fakebin/other", "#!/bin/sh\n");
     let mut command = fixture.command(["update"]);
@@ -1094,6 +1099,73 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
             && event["status"] == "skipped"),
         "expected skipped package override item in {events:#?}"
     );
+}
+
+#[test]
+fn update_allows_real_provider_to_share_command_with_none_package_override() {
+    let fixture = Fixture::new("update-none-package-command-claim");
+    fixture.write(
+        "conf/deps.conf",
+        "disabled-pkg pkg tool apt:NONE\nprovider custom tool\n",
+    );
+    fixture.write(
+        "conf/hooks.d/provider.sh",
+        "exists() { return 0; }\nversion() { printf '1.0.0\\n'; }\n",
+    );
+    fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
+
+    let output = run(fixture.command(["update"]).env("SHDEPS_PKG_MGR", "apt"));
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
+    assert!(
+        !text(&output.stdout).contains("duplicate active command claim"),
+        "a package-manager NONE override is runtime-inactive: {}",
+        text(&output.stdout)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn update_bulk_transitions_fit_within_common_low_file_descriptor_limit() {
+    use std::os::unix::process::CommandExt;
+
+    let fixture = Fixture::new("update-transition-fd-budget");
+    let mut config = String::new();
+    let mut manifest = String::new();
+    for index in 0..24 {
+        let name = format!("tool-{index}");
+        let command = format!("cmd-{index}");
+        config.push_str(&format!("{name} pkg {command} apt:NONE\n"));
+        let public = fixture.dir.join("bin").join(&command);
+        manifest.push_str(&format!(
+            "{name}|github:release|{command}|{}\n",
+            public.display()
+        ));
+        fixture.write_executable(PathBuf::from("bin").join(&command), "#!/bin/sh\nexit 0\n");
+    }
+    fixture.write("conf/deps.conf", &config);
+    fixture.write("state/manifest", &manifest);
+    fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
+    let mut command = fixture.command(["update"]);
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 104,
+                rlim_max: 104,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(text(&output.stderr), "");
 }
 
 #[test]
@@ -1579,11 +1651,7 @@ fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
     fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
     fixture.write_executable(
         "fakebin/dpkg-query",
-        "#!/bin/sh\nlast=\nfor arg do last=$arg; done\nprintf 'query %s\\n' \"$last\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$last\" = font-package ] || exit 1\nprintf 'font-package\\t9.8.7\\n'\n",
-    );
-    fixture.write_executable(
-        "fakebin/dpkg",
-        "#!/bin/sh\nprintf 'package %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$*\" = '-s font-package' ]\n",
+        "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase $2 in *Package*) kind=version ;; *) kind=status ;; esac\nprintf 'query %s %s\\n' \"$kind\" \"$last\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$last\" = font-package ] || exit 1\nif [ \"$kind\" = version ]; then\n  printf 'install ok installed\\tfont-package\\t9.8.7\\n'\nelse\n  printf 'install ok installed\\n'\nfi\n",
     );
     fixture.write_executable(
         "fakebin/fake-tool",
@@ -1601,7 +1669,7 @@ fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
         probes
             .lines()
             .filter(|line| line.starts_with("query "))
-            .all(|line| line == "query fake-package"),
+            .all(|line| line == "query version fake-package"),
         "single-dependency check should not enumerate every installed package: {probes}"
     );
 
@@ -1616,7 +1684,7 @@ fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
     );
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        "query font-package\n",
+        "query version font-package\n",
         "package-only dependencies should retain version detail from one targeted probe"
     );
 
@@ -1628,7 +1696,7 @@ fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
     assert_eq!(text(&missing.stdout), "missing-package: not installed\n");
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        "query missing-package\npackage -s missing-package\n"
+        "query version missing-package\nquery status missing-package\n"
     );
 }
 
@@ -2950,6 +3018,11 @@ version() { printf '1.2.3\n'; }
 fn update_verbose_reports_package_versions_only_when_verbose() {
     let fixture = Fixture::new("update-verbose-pkg-version");
     fixture.write("conf/deps.conf", "tool pkg tool\n");
+    fixture.write("state/manifest", "tool|pkg|tool|\n");
+    fixture.write(
+        "state/tool.pkg-proof",
+        "shdeps-pkg-proof-v1\nmanager=apt\npackage=tool\ncommand=tool\n",
+    );
     fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
     fixture.write_executable(
         "fakebin/tool",

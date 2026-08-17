@@ -276,14 +276,22 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
         return false;
     }
 
+    if pkg_mgr == "apt" {
+        return runner
+            .run(
+                "dpkg-query",
+                &["-W", "-f=${Status}\n", package_name],
+                Some(PACKAGE_PROBE_TIMEOUT),
+            )
+            .ok()
+            .is_some_and(|output| output.success && apt_status_installed(output.stdout.trim()));
+    }
+
     let probe = match pkg_mgr {
         "brew" => Some(("brew", vec!["list", "--versions", package_name])),
-        "apt" => Some(("dpkg", vec!["-s", package_name])),
-        "dnf" => Some(("rpm", vec!["-q", package_name])),
+        "dnf" | "zypper" => Some(("rpm", vec!["-q", package_name])),
         "pacman" => Some(("pacman", vec!["-Q", package_name])),
-        // Bash currently detects these managers for install selection but
-        // does not use them in `_shdeps_exists`. Keep that asymmetry until the
-        // reference behavior intentionally changes.
+        "apk" => Some(("apk", vec!["info", "-e", package_name])),
         _ => None,
     };
 
@@ -307,7 +315,7 @@ pub fn package_versions(runner: &impl Runner, pkg_mgr: &str) -> BTreeMap<String,
         ),
         "apt" => runner.run(
             "dpkg-query",
-            &["-W", "-f=${Package}\t${Version}\n"],
+            &["-W", "-f=${Status}\t${Package}\t${Version}\n"],
             Some(PACKAGE_PROBE_TIMEOUT),
         ),
         "dnf" => runner.run(
@@ -347,7 +355,7 @@ pub fn package_version(runner: &impl Runner, package_name: &str, pkg_mgr: &str) 
         ),
         "apt" => runner.run(
             "dpkg-query",
-            &["-W", "-f=${Package}\t${Version}\n", package_name],
+            &["-W", "-f=${Status}\t${Package}\t${Version}\n", package_name],
             Some(PACKAGE_PROBE_TIMEOUT),
         ),
         "dnf" => runner.run(
@@ -556,7 +564,8 @@ fn parse_package_versions(pkg_mgr: &str, output: &str) -> BTreeMap<String, Strin
     for line in output.lines() {
         let parsed = match pkg_mgr {
             "brew" | "pacman" => parse_space_version_line(line),
-            "apt" | "dnf" => parse_tab_version_line(line),
+            "apt" => parse_apt_version_line(line),
+            "dnf" => parse_tab_version_line(line),
             _ => None,
         };
         if let Some((name, version)) = parsed {
@@ -564,6 +573,23 @@ fn parse_package_versions(pkg_mgr: &str, output: &str) -> BTreeMap<String, Strin
         }
     }
     versions
+}
+
+fn parse_apt_version_line(line: &str) -> Option<(&str, &str)> {
+    let mut fields = line.splitn(3, '\t');
+    let status = fields.next()?;
+    let name = fields.next()?;
+    let version = fields.next()?;
+    (apt_status_installed(status) && !name.is_empty() && !version.is_empty())
+        .then_some((name, version))
+}
+
+fn apt_status_installed(status: &str) -> bool {
+    let mut fields = status.split_whitespace();
+    fields.next().is_some()
+        && fields.next() == Some("ok")
+        && fields.next() == Some("installed")
+        && fields.next().is_none()
 }
 
 fn parse_space_version_line(line: &str) -> Option<(&str, &str)> {
@@ -875,8 +901,8 @@ mod tests {
     #[test]
     fn dependency_exists_prefers_command_before_package_probe() {
         let runner = FakeRunner::default().with_command("bat").with_output(
-            "dpkg",
-            ["-s", "bat"],
+            "dpkg-query",
+            ["-W", "-f=${Status}\n", "bat"],
             false,
             "",
             "missing",
@@ -901,11 +927,40 @@ mod tests {
     #[test]
     fn package_installed_preserves_bash_manager_coverage() {
         let runner = FakeRunner::default()
-            .with_output("dpkg", ["-s", "font"], true, "Package: font", "")
+            .with_output(
+                "dpkg-query",
+                ["-W", "-f=${Status}\n", "font"],
+                true,
+                "install ok installed\n",
+                "",
+            )
+            .with_output(
+                "dpkg-query",
+                ["-W", "-f=${Status}\n", "held"],
+                true,
+                "hold ok installed\n",
+                "",
+            )
+            .with_output("rpm", ["-q", "font"], true, "font-1.0", "")
             .with_output("apk", ["info", "-e", "font"], true, "font", "");
 
         assert!(package_installed(&runner, "font", "apt"));
-        assert!(!package_installed(&runner, "font", "apk"));
+        assert!(package_installed(&runner, "held", "apt"));
+        assert!(package_installed(&runner, "font", "zypper"));
+        assert!(package_installed(&runner, "font", "apk"));
+    }
+
+    #[test]
+    fn package_installed_rejects_apt_residual_config_state() {
+        let runner = FakeRunner::default().with_output(
+            "dpkg-query",
+            ["-W", "-f=${Status}\n", "font"],
+            true,
+            "deinstall ok config-files\n",
+            "",
+        );
+
+        assert!(!package_installed(&runner, "font", "apt"));
     }
 
     #[test]
@@ -939,9 +994,12 @@ mod tests {
         let runner = FakeRunner::default()
             .with_output(
                 "dpkg-query",
-                ["-W", "-f=${Package}\t${Version}\n"],
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
                 true,
-                "bat\t1.2.3-1\nfd-find\t8.7.0\n",
+                "install ok installed\tbat\t1.2.3-1\n\
+                 hold ok installed\theld\t4.0\n\
+                 deinstall ok config-files\tremoved\t2.0\n\
+                 install ok installed\tfd-find\t8.7.0\n",
                 "",
             )
             .with_output(
@@ -955,6 +1013,8 @@ mod tests {
         let apt = package_versions(&runner, "apt");
         assert_eq!(apt.get("bat").map(String::as_str), Some("1.2.3-1"));
         assert_eq!(apt.get("fd-find").map(String::as_str), Some("8.7.0"));
+        assert_eq!(apt.get("held").map(String::as_str), Some("4.0"));
+        assert!(!apt.contains_key("removed"));
 
         let brew = package_versions(&runner, "brew");
         assert_eq!(brew.get("fzf").map(String::as_str), Some("0.62.0"));
@@ -966,9 +1026,13 @@ mod tests {
         let runner = FakeRunner::default()
             .with_output(
                 "dpkg-query",
-                ["-W", "-f=${Package}\t${Version}\n", "font-package"],
+                [
+                    "-W",
+                    "-f=${Status}\t${Package}\t${Version}\n",
+                    "font-package",
+                ],
                 true,
-                "font-package\t9.8.7\n",
+                "install ok installed\tfont-package\t9.8.7\n",
                 "",
             )
             .with_output(
@@ -1143,12 +1207,14 @@ mod tests {
         fn run(
             &self,
             program: &str,
-            _args: &[&str],
+            args: &[&str],
             timeout: Option<Duration>,
         ) -> io::Result<Output> {
             self.timeouts.lock().unwrap().push(timeout);
-            let stdout = if program == "dpkg-query" {
-                "tool\t1.0\n"
+            let stdout = if program == "dpkg-query" && args.get(1) == Some(&"-f=${Status}\n") {
+                "install ok installed\n"
+            } else if program == "dpkg-query" {
+                "install ok installed\ttool\t1.0\n"
             } else {
                 ""
             };

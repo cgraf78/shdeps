@@ -39,6 +39,7 @@ pub mod link_state;
 pub mod manifest;
 mod method;
 pub mod package_cache;
+mod package_proof;
 pub mod pkg;
 pub mod platform;
 pub mod process;

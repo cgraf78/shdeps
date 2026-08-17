@@ -195,11 +195,25 @@ Values within one prefix are alternatives; different prefixes must all match.
 A filter containing only package-manager exclusions matches an unknown manager.
 Filtered declarations may share one dependency name; the last matching
 declaration is selected before ordinary last-wins override handling.
+.PP
+Treat
+.B name
+as a stable manifest identity.
+To rename a dependency while reusing its command, first remove the old
+declaration, run
+.BR "shdeps prune" ,
+then add the replacement declaration.
+Shdeps rejects a replacement that conflicts with a differently named manifest
+row so the old command cannot be mistaken for proof that the new provider is
+installed.
 .SS Install Methods
 .TP
 .B pkg
 Uses the detected system package manager (brew, apt, dnf, pacman, zypper, or apk).
 Batches all pkg installs into one command; retries individually on failure.
+On first adoption, and whenever the manager, package alias, or command changes,
+Shdeps verifies package-manager ownership even if the command already exists.
+A durable proof preserves the command-only fast path on later healthy updates.
 .TP
 .B github:repo
 Clones from GitHub (the

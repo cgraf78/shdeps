@@ -20,7 +20,7 @@ use crate::state;
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One manifest row: `name|method|cmd|install_path`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ManifestEntry {
     /// Dependency name and manifest key.
     pub name: String,
@@ -121,6 +121,20 @@ impl Manifest {
         &self.entries
     }
 
+    /// Returns one effective row per dependency using last-row-wins semantics.
+    #[must_use]
+    pub fn effective_entries(&self) -> Vec<&ManifestEntry> {
+        let mut seen = BTreeSet::new();
+        let mut effective = self
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| seen.insert(entry.name.as_str()))
+            .collect::<Vec<_>>();
+        effective.reverse();
+        effective
+    }
+
     /// Returns the effective entry for a dependency.
     ///
     /// Bash loads the manifest into an associative array, so later duplicate
@@ -174,8 +188,8 @@ impl Manifest {
             .map(|entry| entry.name.as_str())
             .collect::<BTreeSet<_>>();
 
-        self.entries
-            .iter()
+        self.effective_entries()
+            .into_iter()
             .filter(|entry| !configured.contains(entry.name.as_str()))
             .cloned()
             .collect()
@@ -297,6 +311,10 @@ mod tests {
         );
 
         assert_eq!(manifest.count("tool-a"), 2);
+        assert_eq!(
+            manifest.effective_entries(),
+            vec![manifest.get("tool-a").unwrap()]
+        );
         assert_eq!(
             manifest.get("tool-a"),
             Some(&ManifestEntry::new(
