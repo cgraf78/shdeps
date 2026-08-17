@@ -135,6 +135,12 @@ share one dependency name; Shdeps selects the last matching declaration before
 applying its normal last-wins rule, preserving one manifest identity across
 provider transitions.
 
+Treat `name` as a stable manifest identity. To rename a dependency while
+reusing its command, first remove the old declaration, run `shdeps update` and
+`shdeps prune`, then add the replacement declaration. Shdeps rejects an active
+replacement that conflicts with a differently named manifest row so the old
+command cannot be mistaken for proof that the new provider is installed.
+
 ### Environment Variables
 
 | Variable             | Default                                                 | Description                                                                                                                                                                           |

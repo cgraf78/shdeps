@@ -195,6 +195,19 @@ Values within one prefix are alternatives; different prefixes must all match.
 A filter containing only package-manager exclusions matches an unknown manager.
 Filtered declarations may share one dependency name; the last matching
 declaration is selected before ordinary last-wins override handling.
+.PP
+Treat
+.B name
+as a stable manifest identity.
+To rename a dependency while reusing its command, first remove the old
+declaration, run
+.B shdeps update
+and
+.BR "shdeps prune" ,
+then add the replacement declaration.
+Shdeps rejects a replacement that conflicts with a differently named manifest
+row so the old command cannot be mistaken for proof that the new provider is
+installed.
 .SS Install Methods
 .TP
 .B pkg
