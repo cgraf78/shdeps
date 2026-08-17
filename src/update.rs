@@ -1096,7 +1096,9 @@ fn repo_lock_root(
     cleanup::safe_repo_root(old, &roots)
 }
 
-// Enforce state-lock then checkout-lock ordering around every repo ownership change.
+// Enforce state-lock then checkout-lock ordering around every repo ownership
+// change. Shdeps always owns the outer state lock; Actions participates only
+// in the shared checkout lock, and no path may acquire these in reverse order.
 fn with_repo_checkout_lock<T>(
     entry: &Entry,
     transition: Option<&update_transition::Transition>,
@@ -1141,6 +1143,11 @@ fn with_old_repo_checkout_lock<T>(
     #[cfg(unix)]
     {
         crate::checkout_lock::with_checkout_lock(&root, context.env_vars, |normalized| {
+            // Old-root recovery must happen before cleanup derives ownership.
+            // In particular, a package transition may already have written its
+            // new manifest row. In that path, the caller restores the prior row
+            // if recovery fails so the next run can retry the same cleanup
+            // coherently.
             crate::repo_transition::recover(normalized)?;
             operation(Some(normalized))
         })

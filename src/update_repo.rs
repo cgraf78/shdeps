@@ -301,8 +301,12 @@ fn require_still_absent(path: &Path) -> Result<()> {
     }
 }
 
-// Development publication may preserve only the exact link prepared earlier
-// or an absent destination. Every other late object remains untouched.
+// This is a post-lock race check, not ownership discovery. Unrecorded plans
+// accept only absence or the exact prepared development link.
+// `replace_owned_destination` is granted by structural manifest/transition
+// evidence; filesystem-derived release evidence is additionally revalidated
+// under the checkout lock. It lets `repo_transition` replace an owned directory
+// or symlink while unsupported objects still fail closed.
 fn require_development_destination(
     path: &Path,
     local_clone: &Path,

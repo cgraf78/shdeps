@@ -1428,6 +1428,11 @@ fn acquire(paths: &Paths, timeout: Duration) -> io::Result<CheckoutLock> {
                 owner,
                 ..
             } => {
+                // Classification is only a race snapshot. Recovery failure may
+                // mean another claimant completed the handoff, so reclassify
+                // instead of surfacing a stale error. Stable malformed state
+                // is reported by the fresh classification; live contenders
+                // remain subject to the bounded wait.
                 if recover_dead_owner(paths, owner).is_ok() {
                     continue;
                 }
@@ -1439,6 +1444,9 @@ fn acquire(paths: &Paths, timeout: Duration) -> io::Result<CheckoutLock> {
                 claim_dir,
                 ..
             } => {
+                // The same reclassification rule applies to abandoned claims:
+                // recovery is an optimistic transition, not durable evidence
+                // that the previously classified state still exists.
                 if recover_dead_claim(paths, claim_dir, owner_nonce, owner_target).is_ok() {
                     continue;
                 }

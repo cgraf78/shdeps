@@ -274,6 +274,11 @@ pub(crate) fn publish_directory(
     }
 }
 
+// Ordering is the crash-recovery contract: persist recovery authority before
+// vacating the stable path, park the exact previous generation, publish the
+// desired object, then use the same classifier for commit or rollback. Moving
+// any live mutation before `begin` could strand an unrecorded generation after
+// SIGKILL.
 fn publish_transaction(
     checkout: &Path,
     previous: Identity,
@@ -345,6 +350,13 @@ fn begin(checkout: &Path, previous: Identity, desired: Desired) -> Result<PathBu
     Ok(journal)
 }
 
+/// Recovers the private journal with authority appropriate to this observation.
+///
+/// `allow_later_writer` is true at public, pre-transaction recovery entrypoints,
+/// where a real directory may be a checkout-installer generation that filled
+/// Shdeps' crash gap. Internal recovery of a transition started by the current
+/// call passes false: a collision first observed during that transition is not
+/// retroactively granted co-owner authority and must be marked blocked instead.
 fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<()> {
     let journal = journal_path(checkout)?;
     let metadata = match fs::symlink_metadata(&journal) {
@@ -642,6 +654,11 @@ fn remove_journal(journal: &Path, record: &Record) -> Result<()> {
 }
 
 fn replace_owned_symlink(checkout: &Path, target: &Path) -> Result<()> {
+    // This is the sole intentional replace-style publication: the shared lock
+    // is held and recorded Shdeps state authorizes destination replacement.
+    // Symlink-to-symlink rename is one atomic commit and needs no vacancy
+    // journal. Absent, unrecorded, and directory roots instead require
+    // no-replace publication or the recoverable transaction above.
     let parent = checkout.parent().ok_or_else(|| {
         invalid_transition("repository checkout has no parent for symlink publication")
     })?;

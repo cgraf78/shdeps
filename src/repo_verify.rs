@@ -326,6 +326,12 @@ pub(crate) fn verify_development(
     }))
 }
 
+// Recheck the mutable development-source contract: the selected path remains
+// the repository root, both stored and Git-effective origins match policy, and
+// an explicit command is tracked at HEAD and live as a regular executable.
+// Checking both origins catches URL rewrites; checking HEAD plus the live path
+// permits dirty tracked contents without trusting an untracked or symlinked
+// command.
 fn validate_development_state(
     root: &Path,
     git: &DevelopmentGit,
@@ -451,6 +457,10 @@ impl DevelopmentGit {
         require_development_metadata_root(&cwd)?;
         let program = trusted_program(runner, "git", &cwd)?;
         let mut env = BTreeMap::new();
+        // Preserve the trusted developer's networking and authentication
+        // environment, but only through this whitelist. Ambient GIT_* repo,
+        // config, object-store, and executable selectors are intentionally
+        // omitted so they cannot redirect verification away from `cwd`.
         for key in [
             "HOME",
             "XDG_CONFIG_HOME",
