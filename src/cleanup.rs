@@ -380,7 +380,12 @@ fn capture_release_archive_state(
     match fs::symlink_metadata(&root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => return Ok(Some(ArchiveState::None)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
             return Ok(Some(ArchiveState::None));
         }
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
