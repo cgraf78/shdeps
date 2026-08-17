@@ -605,6 +605,7 @@ where
     let fresh_manifest = manifest::read(context.manifest_path)?;
     let manifest = &fresh_manifest;
 
+    update_transition::reject_identity_handoffs(manifest, entries, context.env)?;
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
     let package_transitions = transitions.keys().cloned().collect::<BTreeSet<_>>();
 
@@ -2369,6 +2370,68 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             manifest::read(&manifest_path).unwrap().get("owner/tool"),
             Some(&old)
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_rejects_cross_identity_command_handoff_before_package_detection() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("cross-identity-pkg");
+        fixture.write_lib();
+        let old_install = fixture.roots.install_dir.join("owner/old-tool");
+        let old_target = old_install.join("bin/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&old_target);
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&old_target, &public).unwrap();
+
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old_manifest = ManifestEntry::new(
+            "owner/old-tool",
+            "github:release",
+            "tool",
+            old_install.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default()
+            .with_command("tool")
+            .with_success(
+                "apt-cache",
+                ["show", "replacement"],
+                "Package: replacement\n",
+            )
+            .with_success("sudo", ["apt-get", "install", "-y", "replacement"], "");
+
+        let error = run(
+            &[parse_entry("replacement|pkg|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("owner/old-tool"));
+        assert!(error.to_string().contains("replacement"));
+        assert!(error.to_string().contains("tool"));
+        assert!(
+            runner.calls().is_empty(),
+            "package detection ran before the unsupported handoff was rejected"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/old-tool"),
+            Some(&old_manifest)
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("replacement")
+                .is_none()
+        );
+        assert_eq!(fs::read_link(public).unwrap(), old_target);
     }
 
     #[test]

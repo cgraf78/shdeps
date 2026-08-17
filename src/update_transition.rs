@@ -19,6 +19,7 @@ use crate::github_release_install::{self, ArchiveState};
 use crate::link_state::{self, Kind};
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::method;
+use crate::platform::{self, RuntimeEnv};
 use crate::runtime::Roots;
 use crate::update::Item;
 
@@ -38,6 +39,56 @@ struct FileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+}
+
+/// Rejects an implicit dependency rename that reuses an installed command.
+///
+/// Method transitions are transactional only when the logical dependency name
+/// stays stable. A differently named config entry can otherwise mistake the
+/// old command for proof that its new provider is installed, while later prune
+/// treats the old manifest row as unrelated. Require the operator to prune the
+/// old identity first instead of guessing replacement intent from a command
+/// collision alone.
+pub(crate) fn reject_identity_handoffs(
+    manifest: &Manifest,
+    entries: &[Entry],
+    env: &RuntimeEnv,
+) -> Result<()> {
+    let active_entries = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                platform::filter_match(&entry.filter, env),
+                platform::FilterMatch::Match
+            )
+        })
+        .collect::<Vec<_>>();
+    let active_names = active_entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    for old in manifest.entries() {
+        if old.cmd.is_empty() || active_names.contains(old.name.as_str()) {
+            continue;
+        }
+        if let Some(new) = active_entries
+            .iter()
+            .copied()
+            .find(|entry| entry.name != old.name && entry.cmd == old.cmd)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported dependency identity handoff for command `{}`: manifest `{}` conflicts with configured `{}`; prune the old identity before updating the replacement",
+                    old.cmd, old.name, new.name
+                ),
+            )
+            .into());
+        }
+    }
+
+    Ok(())
 }
 
 /// Builds a transition map keyed by dependency name.
@@ -662,11 +713,15 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    use super::{Transition, by_name, cleanup_snapshot, points_into, unlink_snapshot};
+    use super::{
+        Transition, by_name, cleanup_snapshot, points_into, reject_identity_handoffs,
+        unlink_snapshot,
+    };
     use crate::config::{Entry, parse_entry};
     use crate::github_release_install::{self, ArchiveState};
     use crate::link_state::{self, Kind, ReconcileLink};
     use crate::manifest::{Manifest, ManifestEntry};
+    use crate::platform::RuntimeEnv;
     use crate::runtime::Roots;
     use std::collections::BTreeSet;
 
@@ -684,6 +739,38 @@ mod tests {
             .then(|| crate::cleanup::safe_repo_root(&transition.old, &cleanup_roots))
             .flatten();
         cleanup_snapshot(entry, transition, roots, repo_root.as_deref())
+    }
+
+    #[test]
+    fn identity_handoff_guard_ignores_inactive_replacement() {
+        let manifest = Manifest::parse("owner/old|github:release|tool|/tmp/old\n");
+        let entries = [parse_entry("replacement|pkg|tool|-|os:macos", Some("apt"))];
+
+        reject_identity_handoffs(&manifest, &entries, &RuntimeEnv::new("linux", "host")).unwrap();
+    }
+
+    #[test]
+    fn identity_handoff_guard_allows_same_name_method_transition() {
+        let manifest = Manifest::parse("tool|github:release|tool|/tmp/tool\n");
+        let entries = [parse_entry("tool|pkg|tool|-|-", Some("apt"))];
+
+        reject_identity_handoffs(&manifest, &entries, &RuntimeEnv::new("linux", "host")).unwrap();
+    }
+
+    #[test]
+    fn identity_handoff_guard_rejects_inactive_old_name_with_active_replacement() {
+        let manifest = Manifest::parse("owner/old|github:release|tool|/tmp/old\n");
+        let entries = [
+            parse_entry("owner/old|github:release|tool|-|os:macos", Some("apt")),
+            parse_entry("replacement|pkg|tool|-|-", Some("apt")),
+        ];
+
+        let error =
+            reject_identity_handoffs(&manifest, &entries, &RuntimeEnv::new("linux", "host"))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("owner/old"));
+        assert!(error.to_string().contains("replacement"));
     }
 
     #[test]
