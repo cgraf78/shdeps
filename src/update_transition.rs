@@ -130,6 +130,24 @@ pub(crate) fn reject_identity_handoffs(
             .copied()
             .find(|entry| entry.name != old.name && entry.cmd == old.cmd)
         {
+            // A prior Shdeps version may already have completed and recorded
+            // this provider change while retaining a configured-but-inactive
+            // platform row (or the old command spelling for another active
+            // dependency). In that state there is no rename left to infer:
+            // the manifest already names the sole active owner of the exact
+            // command. Let the normal method-specific ownership checks verify
+            // it and let same-name updates refresh any stale old row.
+            //
+            // Do not extend this to name-only or method-only matches. Without
+            // the exact recorded command, a newly configured provider could
+            // still mistake the old provider's executable for its own proof.
+            if configured_identity_relinquished_command(old, entries, env, pkg_mgr)
+                && manifest
+                    .get(&new.name)
+                    .is_some_and(|installed| installed.cmd == new.cmd)
+            {
+                continue;
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
@@ -310,6 +328,27 @@ fn same_file_identity(before: Option<FileIdentity>, current: Option<FileIdentity
         let _ = (before, current);
         false
     }
+}
+
+// Returns whether the still-configured old identity no longer owns its saved command here.
+fn configured_identity_relinquished_command(
+    old: &ManifestEntry,
+    entries: &[Entry],
+    env: &RuntimeEnv,
+    pkg_mgr: &str,
+) -> bool {
+    entries.iter().any(|entry| {
+        entry.name == old.name
+            && (entry.cmd != old.cmd
+                || platform::filter_match(&entry.filter, env) != platform::FilterMatch::Match
+                || (entry.method == method::PKG
+                    && config::resolve_override_for_runtime(
+                        &entry.name,
+                        &entry.aliases,
+                        Some(pkg_mgr),
+                        env.is_android(),
+                    ) == "NONE"))
+    })
 }
 
 // Probe a no-follow ownership marker while preserving all errors except true
@@ -1553,6 +1592,90 @@ mod tests {
         assert!(error.to_string().contains("owner/old"));
         assert!(error.to_string().contains("replacement"));
         assert!(error.to_string().contains("remove the old declaration"));
+        assert!(error.to_string().contains("shdeps prune"));
+    }
+
+    #[test]
+    fn identity_handoff_guard_allows_recorded_platform_replacement() {
+        let manifest = Manifest::parse(
+            "platform-package|pkg|tool|\n\
+             owner/tool|github:release|tool|/tmp/tool\n",
+        );
+        let entries = [
+            parse_entry("platform-package|pkg|tool|-|os:macos", Some("apt")),
+            parse_entry("owner/tool|github|tool|-|os:!macos", Some("apt")),
+        ];
+
+        reject_identity_handoffs(
+            &manifest,
+            &entries,
+            &RuntimeEnv::new("linux", "host"),
+            "apt",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn identity_handoff_guard_allows_recorded_command_reassignment() {
+        let manifest = Manifest::parse(
+            "python|pkg|python3|\n\
+             python-minimum|custom|python3|\n",
+        );
+        let entries = [
+            parse_entry("python|pkg|python|-|-", Some("apt")),
+            parse_entry("python-minimum|custom|python3|-|-", Some("apt")),
+        ];
+
+        reject_identity_handoffs(
+            &manifest,
+            &entries,
+            &RuntimeEnv::new("linux", "host"),
+            "apt",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn identity_handoff_guard_rejects_mismatched_recorded_replacement() {
+        let manifest = Manifest::parse(
+            "owner/old|github:release|tool|/tmp/old\n\
+             replacement|custom|other|\n",
+        );
+        let entries = [
+            parse_entry("owner/old|github:release|tool|-|os:macos", Some("apt")),
+            parse_entry("replacement|custom|tool|-|-", Some("apt")),
+        ];
+
+        let error = reject_identity_handoffs(
+            &manifest,
+            &entries,
+            &RuntimeEnv::new("linux", "host"),
+            "apt",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("owner/old"));
+        assert!(error.to_string().contains("replacement"));
+    }
+
+    #[test]
+    fn identity_handoff_guard_rejects_recorded_rename_after_old_declaration_is_removed() {
+        let manifest = Manifest::parse(
+            "owner/old|github:release|tool|/tmp/old\n\
+             replacement|custom|tool|\n",
+        );
+        let entries = [parse_entry("replacement|custom|tool|-|-", Some("apt"))];
+
+        let error = reject_identity_handoffs(
+            &manifest,
+            &entries,
+            &RuntimeEnv::new("linux", "host"),
+            "apt",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("owner/old"));
+        assert!(error.to_string().contains("replacement"));
         assert!(error.to_string().contains("shdeps prune"));
     }
 

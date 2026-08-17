@@ -1640,6 +1640,66 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
     }
 
     #[test]
+    fn update_converges_recorded_command_reassignment() {
+        let fixture = Fixture::new("recorded-command-reassignment");
+        fixture.write_lib();
+        fixture.write_hook(
+            "python-minimum",
+            r#"
+exists() { return 0; }
+version() { printf 'Python 3.12\n'; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("python", "pkg", "python3", ""),
+        )
+        .unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("python-minimum", "custom", "python3", ""),
+        )
+        .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default()
+            .with_command("python")
+            .with_command("python3")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "install ok installed\tpython3\t3.12\n",
+            );
+
+        let summary = run(
+            &[
+                parse_entry("python|pkg|python|apt:python3|-", Some("apt")),
+                parse_entry("python-minimum|custom|python3|-|-", Some("apt")),
+            ],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        let converged = manifest::read(&manifest_path).unwrap();
+        assert_eq!(
+            converged.get("python"),
+            Some(&ManifestEntry::new("python", "pkg", "python", ""))
+        );
+        assert_eq!(
+            converged.get("python-minimum"),
+            Some(&ManifestEntry::new(
+                "python-minimum",
+                "custom",
+                "python3",
+                ""
+            ))
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn update_lock_normalizes_legacy_repo_manifest_path() {
         let fixture = Fixture::new("repo-lock-legacy-curdir");
