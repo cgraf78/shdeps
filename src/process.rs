@@ -7,8 +7,9 @@
 //! `list`, `check`, package installs, and future cache probes the same answers.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -74,6 +75,28 @@ pub trait Runner {
 
     /// Runs `program` with `args`, optionally enforcing `timeout`.
     fn run(&self, program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Output>;
+
+    /// Runs an absolute program from an absolute working directory with only
+    /// the explicitly supplied environment and a mandatory timeout.
+    ///
+    /// This capability is intentionally fail-closed. Security-sensitive
+    /// callers use it when inherited process state could select configuration,
+    /// credentials, hooks, or helper programs. Ordinary fake runners must not
+    /// silently degrade that boundary to `run`; they opt in only when their
+    /// tests model the complete clean execution request.
+    fn run_env_clear(
+        &self,
+        _program: &Path,
+        _cwd: &Path,
+        _args: &[OsString],
+        _env: &BTreeMap<OsString, OsString>,
+        _timeout: Duration,
+    ) -> io::Result<Output> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runner does not support environment-cleared commands",
+        ))
+    }
 }
 
 /// Real host subprocess runner.
@@ -91,6 +114,17 @@ impl Runner for Process {
 
     fn run(&self, program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Output> {
         run(program, args, timeout)
+    }
+
+    fn run_env_clear(
+        &self,
+        program: &Path,
+        cwd: &Path,
+        args: &[OsString],
+        env: &BTreeMap<OsString, OsString>,
+        timeout: Duration,
+    ) -> io::Result<Output> {
+        run_env_clear(program, cwd, args, env, timeout)
     }
 }
 
@@ -343,8 +377,31 @@ pub fn executable_path(path: &Path) -> bool {
 
 fn run(program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Output> {
     let mut command = Command::new(program);
+    command.args(args);
+    run_command(command, timeout)
+}
+
+fn run_env_clear(
+    program: &Path,
+    cwd: &Path,
+    args: &[OsString],
+    env: &BTreeMap<OsString, OsString>,
+    timeout: Duration,
+) -> io::Result<Output> {
+    if !program.is_absolute() || !cwd.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "environment-cleared commands require absolute program and working-directory paths",
+        ));
+    }
+
+    let mut command = Command::new(program);
+    command.current_dir(cwd).args(args).env_clear().envs(env);
+    run_command(command, Some(timeout))
+}
+
+fn run_command(mut command: Command, timeout: Option<Duration>) -> io::Result<Output> {
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -355,10 +412,26 @@ fn run(program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Ou
 
     isolate_process_group(&mut command);
     let mut child = command.spawn()?;
+    // Drain both pipes while the child runs. Waiting for exit first can
+    // deadlock once either pipe fills: the producer blocks on write while the
+    // parent waits for a status that the blocked producer cannot reach.
+    let stdout_reader = spawn_pipe_reader(
+        child
+            .stdout
+            .take()
+            .expect("piped child stdout must be available"),
+    );
+    let stderr_reader = spawn_pipe_reader(
+        child
+            .stderr
+            .take()
+            .expect("piped child stderr must be available"),
+    );
     let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
     loop {
         if child.try_wait()?.is_some() {
-            return child.wait_with_output().map(convert_output);
+            break;
         }
         if Instant::now() >= deadline {
             // Version probes are intentionally best-effort. Send SIGTERM
@@ -367,12 +440,37 @@ fn run(program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Ou
             // grace window, then SIGKILL if it has not exited. This
             // mirrors POSIX shells' default behavior for `timeout(1)`.
             terminate_then_kill(&mut child);
-            let mut output = child.wait_with_output().map(convert_output)?;
-            output.timed_out = true;
-            return Ok(output);
+            timed_out = true;
+            break;
         }
         thread::sleep(WAIT_POLL);
     }
+
+    let status = child.wait()?;
+    let stdout = join_pipe_reader(stdout_reader)?;
+    let stderr = join_pipe_reader(stderr_reader)?;
+    Ok(Output {
+        success: status.success(),
+        timed_out,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+fn spawn_pipe_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn join_pipe_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("subprocess output reader panicked"))?
 }
 
 /// Sends SIGTERM, waits up to `SIGTERM_GRACE`, and then SIGKILLs if the
@@ -521,13 +619,16 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::OsString;
+    use std::fs;
     use std::io;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::Duration;
 
     use super::{
-        Output, Runner, dep_exists, dep_version, detect_package_manager, package_installed,
-        package_version, package_versions,
+        Output, Process, Runner, command_path, dep_exists, dep_version, detect_package_manager,
+        package_installed, package_version, package_versions,
     };
 
     #[derive(Debug, Default)]
@@ -594,6 +695,124 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing fake command"))
         }
+    }
+
+    #[test]
+    fn environment_cleared_execution_fails_closed_for_runners_without_support() {
+        let error = FakeRunner::default()
+            .run_env_clear(
+                Path::new("/absolute/program"),
+                Path::new("/absolute/workdir"),
+                &[],
+                &BTreeMap::new(),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("environment-cleared"));
+    }
+
+    #[test]
+    fn process_environment_cleared_execution_uses_only_explicit_environment() {
+        let program = command_path("env").expect("test host must provide env");
+        let cwd = crate::test_support::temp_dir("shdeps-process-clean-env");
+        let environment =
+            BTreeMap::from([(OsString::from("SHDEPS_EXPLICIT"), OsString::from("present"))]);
+
+        let output = Process
+            .run_env_clear(&program, &cwd, &[], &environment, Duration::from_secs(2))
+            .unwrap();
+
+        assert!(output.success, "{}", output.stderr);
+        assert_eq!(output.stdout, "SHDEPS_EXPLICIT=present\n");
+    }
+
+    #[test]
+    fn process_environment_cleared_execution_uses_requested_working_directory() {
+        let program = command_path("pwd").expect("test host must provide pwd");
+        // macOS commonly spells temporary paths through `/var`, while a
+        // process with no inherited `PWD` reports the physical `/private/var`
+        // path. Canonicalize the fixture so the assertion checks the requested
+        // directory rather than an OS path alias.
+        let cwd =
+            fs::canonicalize(crate::test_support::temp_dir("shdeps-process-clean-cwd")).unwrap();
+
+        let output = Process
+            .run_env_clear(
+                &program,
+                &cwd,
+                &[],
+                &BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+
+        assert!(output.success, "{}", output.stderr);
+        assert_eq!(Path::new(output.stdout.trim()), cwd);
+    }
+
+    #[test]
+    fn process_environment_cleared_execution_drains_large_stdout_and_stderr() {
+        let program = command_path("sh").expect("test host must provide sh");
+        let cwd = crate::test_support::temp_dir("shdeps-process-large-output");
+        let stdout_chunk = "a".repeat(1024);
+        let stderr_chunk = "b".repeat(1024);
+        let script = format!(
+            "i=0; while [ \"$i\" -lt 2048 ]; do \
+             printf '%s' '{stdout_chunk}'; \
+             printf '%s' '{stderr_chunk}' >&2; \
+             i=$((i + 1)); done"
+        );
+
+        let output = Process
+            .run_env_clear(
+                &program,
+                &cwd,
+                &[OsString::from("-c"), OsString::from(script)],
+                &BTreeMap::new(),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+
+        assert!(
+            output.success,
+            "large producer timed out: {}",
+            output.stderr
+        );
+        assert!(!output.timed_out);
+        assert_eq!(output.stdout.len(), 2 * 1024 * 1024);
+        assert_eq!(output.stderr.len(), 2 * 1024 * 1024);
+        assert!(output.stdout.bytes().all(|byte| byte == b'a'));
+        assert!(output.stderr.bytes().all(|byte| byte == b'b'));
+    }
+
+    #[test]
+    fn process_environment_cleared_execution_rejects_relative_paths() {
+        let cwd = crate::test_support::temp_dir("shdeps-process-clean-relative");
+        let environment = BTreeMap::<OsString, OsString>::new();
+
+        let relative_program = Process
+            .run_env_clear(
+                Path::new("env"),
+                &cwd,
+                &[],
+                &environment,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        let relative_cwd = Process
+            .run_env_clear(
+                Path::new("/absolute/program"),
+                Path::new("relative/workdir"),
+                &[],
+                &environment,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert_eq!(relative_program.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(relative_cwd.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

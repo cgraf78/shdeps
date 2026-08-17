@@ -789,13 +789,64 @@ Behavior:
   produce a structured warning with an actionable cause in human and JSONL
   output; it MUST NOT be reported as current.
 - Existing clones are pulled/updated according to current behavior.
+- An unrecorded existing managed root MUST be inspected and independently
+  verified before transition preparation, candidate Git execution, permission
+  changes, link publication, stamps, or manifest writes. Verification MUST use
+  a private environment-cleared Git quarantine, fetch only the configured
+  GitHub repository's remote default branch, and require the candidate attached
+  branch, HEAD, copied index, complete worktree, file types, executable modes,
+  and blob bytes to match that fetched revision. Git MUST NOT receive candidate
+  config, refs, object storage, hooks, index path, or worktree paths while
+  establishing this proof.
+- Adoption MUST reject and preserve foreign, malformed, dirty, divergent,
+  unsupported, or concurrently replaced roots. A fresh remote stamp MUST NOT
+  bypass adoption verification.
+- An unrecorded repo containing executable files directly under `bin/` MUST
+  have an explicit configured command; that command MUST be a tracked
+  executable regular file. Asset-only repos remain adoptable without one.
+- A selected development path MUST itself be the checkout root. For a
+  canonical GitHub configuration, both the raw and Git-effective origin MUST
+  canonicalize to that repository. For another explicit
+  `SHDEPS_<NAME>_REPO` override, both origins MUST exactly match the configured
+  value. An explicitly configured command MUST be a tracked `100755` regular
+  blob at `HEAD` and a live regular executable. Dirty edits to already tracked
+  index/worktree content remain supported and MUST NOT be represented as an
+  exact-revision proof. GitHub URL identity MUST match the versioned
+  Actions-owned `tests/fixtures/github-repo-identity-v1.tsv` vectors.
 - Fresh clones use shallow clone behavior.
 - Private repo clone failures over HTTPS should fall back to normal GitHub SSH
   clone where possible.
+- Adoption's SSH fallback MUST ignore user and system SSH configuration, MUST
+  require an existing trusted GitHub key in `~/.ssh/known_hosts`, MUST NOT
+  accept a new host key, and MAY pass through only a validated agent socket
+  outside the candidate checkout.
 - Every executable directly under the repo `bin/` dir is linked into
   `$SHDEPS_BIN_DIR`.
 - Existing regular files in `$SHDEPS_BIN_DIR` MUST be preserved.
-- Bin links are tracked.
+- Replacing an owned managed checkout, including transitions in both
+  directions between a managed directory and a development symlink, MUST use a
+  same-parent recoverable transaction under the shared checkout lock. Recovery
+  MUST roll back an absent stable path, finish the exact desired publication,
+  or preserve a new real checkout generation published by the checkout
+  installer while retiring only Shdeps-owned backup state. Publication into an
+  absent/unowned root and transaction rollback MUST use atomic no-replace
+  semantics and MUST preserve and reject any late destination.
+- Shdeps MUST fail closed when the checkout installer's sibling
+  `.install.transaction` remains after lock acquisition. The installer is the
+  sole parser and recovery owner for that format.
+- Bin links are tracked. Reconciliation MUST inventory desired commands and
+  publish exact intended link/target recovery authority before live mutation,
+  publish desired links before retiring stale links, atomically persist a
+  superset recovery ledger, and then atomically persist final ownership.
+  Cleanup MUST recognize every exact desired link that became live before an
+  interruption; the next update publishes any remaining desired commands and
+  converges the ledger without deleting a previously live desired command
+  first.
+- A regular command path MUST remain unmodified even when stale `.binlinks`
+  state names it, and MUST be removed from final Shdeps ownership. This rule
+  applies to the path type observed during the state-locked Shdeps operation;
+  unrelated processes concurrently replacing the same public path are outside
+  the cooperative serialization contract.
 - Extras are discovered and linked.
 
 ### `github:release`

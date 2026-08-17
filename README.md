@@ -154,6 +154,7 @@ provider transitions.
 | `SHDEPS_LOG_LEVEL`   | `1`                                                     | 0=quiet, 1=normal, 2=verbose                                                                                                                                                          |
 | `SHDEPS_JOBS`        | auto (`nproc`)                                          | Max concurrent read-only probes. Explicit values win; `1` = sequential.                                                                                                               |
 | `SHDEPS_STATE_LOCK_TIMEOUT_SECS` | `1800`                                      | Max seconds a mutating command waits for another live `shdeps update`/`prune` holder before failing with lock metadata.                                                               |
+| `SHDEPS_CHECKOUT_LOCK_TIMEOUT_SECS` | `1800`                                   | Max seconds a `github:repo` mutation waits for the shared installer/Shdeps checkout lock. Values use the strict v1 grammar: a nonnegative decimal integer of at most 9 digits.          |
 
 ## Install Methods
 
@@ -213,6 +214,37 @@ including `github:release`, ignore `$SHDEPS_GIT_DEV_DIR` so changing a dep's
 method cleanly changes ownership and install behavior instead of accidentally
 continuing to use a live checkout.
 
+If the canonical managed root already contains an unrecorded checkout, shdeps
+preserves it unless it can prove safe ownership before any transition or live
+repository mutation. The adoption gate reads local Git control files only as
+inert data, independently fetches the configured GitHub default branch into a
+private environment, and requires the candidate branch, index, complete
+worktree, modes, and bytes to match that fetched revision. Repositories that
+publish a command directly under `bin/` require an explicit command column for
+adoption, and the configured command must be a tracked executable regular file
+rather than a symlink. Foreign, dirty, malformed, or unsupported roots remain
+untouched and are reported as install failures; a fresh TTL never bypasses this
+proof.
+Private-repository verification retries GitHub SSH without inheriting user or
+system SSH configuration. The noninteractive retry requires a trusted
+`~/.ssh/known_hosts` entry for GitHub and may reuse only a validated external
+`SSH_AUTH_SOCK`; it never accepts a new host key during adoption.
+
+A selected `$SHDEPS_GIT_DEV_DIR/<repo>` checkout uses a separate development
+trust rule rather than the exact-revision adoption proof. The selected path
+must itself be the checkout root. For normal GitHub URLs, both the raw and
+Git-effective `origin` must identify the configured repository across the
+supported HTTPS/SSH spellings. For another explicit `SHDEPS_<NAME>_REPO`
+override, both values must exactly match that override. An explicitly
+configured command must already be a tracked `100755` regular file at `HEAD`
+whose live path remains a regular executable. Staged or unstaged edits to
+already tracked development content are allowed and served live; this check
+grants no claim that the checkout matches its remote.
+The accepted GitHub HTTPS, `ssh://`, and scp-style identity spellings are
+locked to the Actions-owned
+`tests/fixtures/github-repo-identity-v1.tsv` vectors so bootstrap and
+steady-state ownership checks cannot drift independently.
+
 On a stale or forced check, shdeps updates a clean local clone with
 `git pull --ff-only`. If that pull fails, shdeps leaves the user-owned clone
 untouched and emits a non-fatal warning naming the dependency and the checkout
@@ -220,6 +252,33 @@ state it could observe. The installed links keep working, but may serve stale
 code until the clone's branch divergence or connectivity problem is resolved.
 This warning is also emitted in JSONL progress so parent tools such as dotfiles
 managers cannot silently present the checkout as current.
+
+Repository-root publication and replacement uses a private same-parent
+recovery journal while the shared checkout lock is held whenever an owned
+managed directory and a development symlink change places. The same recovery
+also covers replacement of an owned managed checkout. A later Shdeps run rolls
+an interrupted move back or finishes it from the exact recorded inode; if the
+generated checkout installer filled the temporarily vacant path with a new
+managed checkout, that new generation wins and Shdeps retires only its own
+backup. Publishing into an absent/unowned root and restoring a parked backup
+use atomic no-replace renames, so a late destination is preserved rather than
+overwritten. Installer-owned `.install.transaction` state is not reimplemented
+by Shdeps: it fails closed with guidance to rerun the installer that owns that
+format.
+
+Public command relinking is desired-first. Shdeps inventories the complete
+repo `bin/` directory, records the exact intended link/target pairs before the
+first publication, publishes usable desired links, atomically records a
+superset recovery ledger, and only then removes stale tracked symlinks before
+writing final ownership. It never removes a previously live desired command
+before its replacement is published. After a crash, cleanup can claim every
+exact desired link that became live, while a later update publishes any
+remaining desired commands and converges the ledger. A regular file at a
+tracked or desired command path is preserved byte-for-byte and is omitted from
+the final Shdeps ownership state. This no-clobber rule is serialized across
+Shdeps runs; as with the existing extras linker, an unrelated process racing to
+replace the same path between a no-follow check and atomic rename/unlink is
+outside that cooperative locking contract.
 
 ```text
 cgraf78/ds    github:repo

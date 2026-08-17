@@ -145,9 +145,9 @@ pub fn parse_entry_for_runtime(raw: &str, pkg_mgr: Option<&str>, android: bool) 
     // staging (`release_activate::activate`) time. `Path::join` discards
     // its left operand whenever the right operand is absolute, so a
     // config line with `cmd=/etc/passwd` would let shdeps symlink-over /
-    // remove that exact path — outside any managed root and outside the
-    // `safe_managed_path` containment we already enforce for
-    // manifest `install_path`. Reject the same hostile forms
+    // remove that exact path — outside any managed root. Repository cleanup
+    // derives its root from the validated dependency name, but commands still
+    // need their own basename boundary. Reject the same hostile forms
     // `valid_dep_name` rejects (absolute, `..`/`.`, separators,
     // backslashes) and fall back to the dep's short name, which is
     // already validated upstream. The fallback is silent — the dep

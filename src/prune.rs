@@ -181,17 +181,9 @@ pub fn run(
     let cleanup_roots = cleanup_roots(roots);
     let mut removed = Vec::new();
     for entry in &orphans {
+        cleanup::validate_manifest_artifact_entry(entry)?;
         let hook = hooks.uninstall(&entry.name, roots)?;
-        let (cleanup, cleanup_error) = match cleanup::remove_builtin(entry, &cleanup_roots) {
-            Ok(summary) => (Some(summary), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-
-        // Bash removes tracking even when cleanup warns. Preserve that bias so
-        // a broken uninstall hook or partially missing filesystem state does not
-        // strand the manifest forever. Real filesystem errors are still surfaced
-        // through the summary so the CLI exits non-zero.
-        manifest::remove(manifest_path, &entry.name)?;
+        let (cleanup, cleanup_error) = cleanup_orphan(entry, manifest_path, &cleanup_roots)?;
         removed.push(Item {
             entry: entry.clone(),
             hook,
@@ -206,6 +198,58 @@ pub fn run(
         guarded_all_orphans: false,
         quiet_skipped: false,
     })
+}
+
+// Clean one orphan under its checkout lock only after arbitrary hooks have returned.
+fn cleanup_orphan(
+    entry: &ManifestEntry,
+    manifest_path: &Path,
+    cleanup_roots: &cleanup::Roots,
+) -> Result<(Option<cleanup::Summary>, Option<String>)> {
+    let cleanup = |repo_root: Option<&Path>| -> Result<(Option<cleanup::Summary>, Option<String>)> {
+        // A pending bin-link record is recovery authority, not ordinary
+        // best-effort cleanup. Resolve or reject it before the legacy cleanup
+        // wrapper converts filesystem failures into a warning and removes the
+        // manifest row.
+        let bin_state = crate::link_state::path(
+            &cleanup_roots.state_dir,
+            &entry.name,
+            crate::link_state::Kind::Bin,
+        );
+        crate::link_state::recover_reconcile(&bin_state)?;
+        let result = match cleanup::remove_builtin_with_repo_root(entry, cleanup_roots, repo_root) {
+            Ok(summary) => (Some(summary), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+
+        // Bash removes tracking even when cleanup warns. Preserve that bias so
+        // a partially missing filesystem state does not strand the manifest
+        // forever. Lock-acquisition failures return before this point because
+        // no checkout cleanup decision was safely made.
+        manifest::remove(manifest_path, &entry.name)?;
+        Ok(result)
+    };
+
+    if entry.method != crate::method::GITHUB_REPO {
+        return cleanup(None);
+    }
+    let root = cleanup::safe_repo_root(entry, cleanup_roots).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsafe repository identity in manifest: {}", entry.name),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        crate::checkout_lock::with_checkout_lock_process_env(&root, |normalized| {
+            crate::repo_transition::recover(normalized)?;
+            cleanup(Some(normalized))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        cleanup(Some(&root))
+    }
 }
 
 fn orphans(manifest: &Manifest, config: &[Entry]) -> Vec<ManifestEntry> {
@@ -227,7 +271,6 @@ fn cleanup_roots(roots: &runtime::Roots) -> cleanup::Roots {
         state_dir: roots.state_dir.clone(),
         install_dir: roots.install_dir.clone(),
         bin_dir: roots.bin_dir.clone(),
-        home: roots.home.clone(),
     }
 }
 
@@ -294,6 +337,336 @@ mod tests {
         assert!(!bin.exists());
         assert!(!fixture.roots.install_dir.join("owner/tool").exists());
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_normalizes_legacy_repo_manifest_path_before_locking() {
+        let fixture = Fixture::new("prune-repo-legacy-curdir");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&install_root.join("artifact"), "managed\n");
+        let legacy_spelling = format!("{}/./owner/tool", fixture.roots.install_dir.display());
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("owner/tool", "github:repo", "tool", legacy_spelling),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!install_root.exists());
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(summary.removed[0].cleanup_error.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_refuses_cleanup_when_checkout_lock_is_malformed() {
+        let fixture = Fixture::new("prune-repo-lock-structural-wiring");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&install_root.join("artifact"), "managed\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let malformed_lock = install_root.parent().unwrap().join(".tool.install.lock");
+        fs::write(&malformed_lock, "foreign\n").unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let result = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(install_root.join("artifact").exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_recovers_interrupted_repo_transition_before_cleanup() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = Fixture::new("prune-repo-transition-recovery");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&install_root.join("artifact"), "managed\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let metadata = fs::symlink_metadata(&install_root).unwrap();
+        let journal = install_root
+            .parent()
+            .unwrap()
+            .join(".tool.shdeps-repo-transition-v1");
+        fs::create_dir_all(&journal).unwrap();
+        let record = serde_json::json!({
+            "format": "shdeps repository transition v1",
+            "checkout": install_root.clone(),
+            "previous": {
+                "kind": "directory",
+                "device": metadata.dev(),
+                "inode": metadata.ino(),
+                "target": null
+            },
+            "desired": {
+                "Symlink": fixture.roots.git_dev_dir.join("tool")
+            }
+        });
+        fs::write(
+            journal.join("record"),
+            format!("{}\n", serde_json::to_string_pretty(&record).unwrap()),
+        )
+        .unwrap();
+        fs::rename(&install_root, journal.join("previous")).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.removed[0].cleanup_error.is_none());
+        assert!(!install_root.exists());
+        assert!(!journal.exists());
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_rejects_unrecovered_checkout_installer_transaction() {
+        let fixture = Fixture::new("prune-installer-transaction");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&install_root.join("artifact"), "managed\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let installer_transaction = install_root
+            .parent()
+            .unwrap()
+            .join(".tool.install.transaction");
+        fs::create_dir_all(&installer_transaction).unwrap();
+        fs::write(installer_transaction.join("identity.partial"), "preserve\n").unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let error = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rerun the checkout installer"));
+        assert!(install_root.join("artifact").exists());
+        assert!(installer_transaction.is_dir());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_rejects_malformed_link_recovery_before_removing_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("prune-malformed-link-recovery");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        let source = install_root.join("bin/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&source, "#!/bin/sh\n");
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&source, &public).unwrap();
+        let bin_state = crate::link_state::path(
+            &fixture.roots.state_dir,
+            "owner/tool",
+            crate::link_state::Kind::Bin,
+        );
+        crate::link_state::write(&bin_state, std::slice::from_ref(&public)).unwrap();
+        let transaction = bin_state.with_file_name("tool.binlinks.reconcile-v1");
+        fs::write(&transaction, "not json\n").unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let error = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("malformed link reconciliation"));
+        assert!(install_root.is_dir());
+        assert_eq!(fs::read_link(&public).unwrap(), source);
+        assert!(transaction.is_file());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn prune_rejects_unsafe_manifest_name_before_hooks_or_cleanup() {
+        let fixture = Fixture::new("prune-unsafe-manifest-name");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let outside = fixture.roots.install_dir.parent().unwrap().join("outside");
+        fixture.write(&outside.join("sentinel"), "preserve\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("../outside", "github:repo", "outside", ""),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let result = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        );
+
+        let error = result.expect_err("unsafe manifest name was accepted for pruning");
+        assert!(error.to_string().contains("unsafe dependency name"));
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("../outside")
+                .is_some(),
+            "malformed state must remain available for manual recovery"
+        );
+    }
+
+    #[test]
+    fn prune_rejects_unsafe_manifest_command_before_cleanup() {
+        let fixture = Fixture::new("prune-unsafe-manifest-command");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let outside = fixture
+            .roots
+            .bin_dir
+            .parent()
+            .unwrap()
+            .join("outside-command");
+        fixture.write(&outside, "preserve\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("owner/tool", "github:release", "../outside-command", ""),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let result = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        );
+
+        let error = result.expect_err("unsafe manifest command was accepted for pruning");
+        assert!(error.to_string().contains("unsafe command name"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "preserve\n");
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_some(),
+            "malformed state must remain available for manual recovery"
+        );
     }
 
     #[test]

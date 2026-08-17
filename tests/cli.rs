@@ -1101,10 +1101,27 @@ fn update_jsonl_warns_when_local_clone_cannot_fast_forward() {
     let fixture = Fixture::new("update-jsonl-local-clone-diverged");
     fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");
     fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\n");
+    fixture.initialize_dev_checkout("tool", "https://github.com/owner/tool");
     fixture.write_executable(
         "fakebin/git",
         r##"#!/bin/sh
 case " $* " in
+  *" rev-parse --show-toplevel ")
+    pwd
+    exit 0
+    ;;
+  *" config --local --no-includes --get-all remote.origin.url ")
+    printf 'https://github.com/owner/tool\n'
+    exit 0
+    ;;
+  *" remote get-url --all origin ")
+    printf 'https://github.com/owner/tool\n'
+    exit 0
+    ;;
+  *" ls-tree -z --full-tree HEAD -- bin/tool ")
+    printf '100755 blob 0000000000000000000000000000000000000000\tbin/tool\0'
+    exit 0
+    ;;
   *" status --porcelain --untracked-files=normal ") exit 0 ;;
   *" rev-parse --abbrev-ref --symbolic-full-name @{upstream} ")
     printf 'origin/main\n'
@@ -1154,6 +1171,40 @@ esac
         fs::read_link(fixture.dir.join("share/owner/tool")).unwrap(),
         fixture.dir.join("git/tool")
     );
+}
+
+#[test]
+fn update_development_verification_ignores_ambient_git_dir() {
+    let fixture = Fixture::new("update-development-ambient-git-dir");
+    fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");
+    fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\n");
+    fixture.initialize_dev_checkout("tool", "https://github.com/other/tool");
+    fixture.write_executable("git/approved/bin/tool", "#!/bin/sh\n");
+    fixture.initialize_dev_checkout("approved", "https://github.com/owner/tool");
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_PROGRESS", "jsonl")
+        .env("GIT_DIR", fixture.dir.join("git/approved/.git"));
+    let output = run(&mut command);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr={:?}",
+        text(&output.stderr)
+    );
+    let events = jsonl(&output.stdout);
+    assert!(events.iter().any(|event| {
+        event["event"] == "item"
+            && event["name"] == "owner/tool"
+            && event["status"] == "failed"
+            && event["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("development checkout"))
+    }));
+    assert!(!fixture.dir.join("share/owner/tool").exists());
+    assert!(!fixture.dir.join("bin/tool").exists());
 }
 
 #[test]
@@ -1274,6 +1325,7 @@ fn update_verbose_groups_items_by_update_area() {
         "owner/tool github:repo tool\ncustom-tool custom\n",
     );
     fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\n");
+    fixture.initialize_dev_checkout("tool", "https://github.com/owner/tool");
     fixture.write(
         "conf/hooks.d/custom-tool.sh",
         r#"
@@ -1281,13 +1333,28 @@ exists() { return 0; }
 version() { printf '9.9.9\n'; }
 "#,
     );
+    let head = Command::new("git")
+        .args([
+            "-C",
+            fixture.dir.join("git/tool").to_str().unwrap(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).unwrap();
 
     let output = run(&mut fixture.command(["-v", "update"]));
 
     assert_success(&output);
     assert_eq!(
         text(&output.stdout),
-        "Tools\n  running  checking configured dependencies\n  GitHub\n    changed  owner/tool: added (local clone)\n  Custom\n    ok       custom-tool: 9.9.9\n  changed  1 changed, 1 current\n"
+        format!(
+            "Tools\n  running  checking configured dependencies\n  GitHub\n    changed  owner/tool: added -- commit {} (local clone)\n  Custom\n    ok       custom-tool: 9.9.9\n  changed  1 changed, 1 current\n",
+            head.trim()
+        )
     );
     assert_eq!(text(&output.stderr), "");
 }
@@ -1639,6 +1706,7 @@ fn update_explicit_github_repo_does_not_fetch_release_metadata() {
     let fixture = Fixture::new("update-explicit-github-repo");
     fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");
     fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
+    fixture.initialize_dev_checkout("tool", "https://github.com/owner/tool");
     fixture.write_fake_curl(
         &release_json("v1.0.0", &[host_linux_asset("tool", "v1.0.0").as_str()]),
         "unused",
@@ -1668,6 +1736,7 @@ fn update_bare_github_falls_back_to_repo_and_uses_local_clone() {
     let fixture = Fixture::new("update-github-repo");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
     fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
+    fixture.initialize_dev_checkout("tool", "https://github.com/owner/tool");
     fixture.write_fake_curl(
         &release_json("v1.0.0", &["tool-v1.0.0-darwin-aarch64"]),
         "unused",
@@ -1701,6 +1770,7 @@ fn update_bare_github_metadata_failure_rejects_repo_missing_explicit_command() {
     let fixture = Fixture::new("update-github-rate-limited-repo-missing-command");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
     fixture.write("git/tool/README.md", "source checkout without bin/tool\n");
+    fixture.initialize_dev_checkout("tool", "https://github.com/owner/tool");
     fixture.write_executable(
         "fakebin/curl",
         "#!/bin/sh\nprintf 'rate limited\\n' >&2\nexit 22\n",
@@ -1799,6 +1869,7 @@ fn update_bare_github_transitions_release_to_repo_when_release_is_unavailable() 
     let fixture = Fixture::new("update-github-release-to-repo");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
     fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
+    fixture.initialize_dev_checkout("tool", "https://github.com/owner/tool");
     fixture.write_executable("bin/tool", "#!/bin/sh\nprintf 'old release\\n'\n");
     fixture.write(
         "state/manifest",
@@ -3342,6 +3413,13 @@ fn fixture_removes_its_temp_tree_on_drop() {
     );
 }
 
+#[test]
+fn fixture_returns_the_physical_temp_tree() {
+    let fixture = Fixture::new("physical-temp-tree");
+
+    assert_eq!(fixture.dir, fs::canonicalize(&fixture.dir).unwrap());
+}
+
 impl Fixture {
     fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
@@ -3351,6 +3429,10 @@ impl Fixture {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        // Production normalizes checkout roots before comparing and publishing
+        // them. Match that spelling here because macOS exposes the same temp
+        // directory through `/var` while canonical paths use `/private/var`.
+        let dir = fs::canonicalize(&dir).unwrap();
         Self { dir }
     }
 
@@ -3410,6 +3492,42 @@ impl Fixture {
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn initialize_dev_checkout(&self, short_name: &str, origin: &str) {
+        let root = self.dir.join("git").join(short_name);
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["-c", "core.hooksPath=/dev/null", "-C"])
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git -C {} {} failed: {}",
+                root.display(),
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "--quiet"]);
+        run(&["add", "--all"]);
+        run(&[
+            "-c",
+            "user.name=Shdeps Test",
+            "-c",
+            "user.email=shdeps@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        run(&["remote", "add", "origin", origin]);
     }
 
     fn write_fake_curl(&self, releases_json: &str, asset_body: &str) {

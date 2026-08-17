@@ -1,0 +1,13 @@
+# case	canonical	owner_record	owner_liveness	claim_count	claim_liveness	tombstone	expected
+missing	missing	-	-	0	-	-	acquire
+live-owner	valid-symlink	valid	live	0	-	absent	wait
+dead-owner	valid-symlink	valid	dead	0	-	absent	claim
+remote-owner	valid-symlink	valid	unknown	0	-	absent	wait
+legacy-empty	legacy-directory	-	-	0	-	-	wait-legacy
+malformed-record	valid-symlink	malformed	-	0	-	absent	fail
+hostile-target	hostile-symlink	-	-	0	-	-	fail
+dangling-no-claim	dangling-symlink	valid	dead	0	-	absent	retry
+dangling-live-claim	dangling-symlink	valid	dead	1	live	absent	wait
+dangling-dead-claim	dangling-symlink	valid	dead	1	dead	absent	reclaim
+dangling-multiple-claims	dangling-symlink	valid	dead	2	dead	absent	fail
+detached-tombstone	missing	valid	dead	1	dead	present	cleanup-acquire

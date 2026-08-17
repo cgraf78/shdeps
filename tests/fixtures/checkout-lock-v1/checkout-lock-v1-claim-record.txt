@@ -1,0 +1,9 @@
+cgraf78 checkout mutation lock v1
+role=636c61696d
+nonce=fedcba9876543210fedcba9876543210
+owner_nonce=0123456789abcdef0123456789abcdef
+pid=456
+host_hex=686f7374
+start_kind_hex=70732d6c7374617274
+start_token_hex=4d6f6e204a616e2020312030303a30303a30302032303236
+checkout_hex=2f746d702f746f6f6c

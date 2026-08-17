@@ -26,8 +26,6 @@ pub struct Roots {
     pub install_dir: PathBuf,
     /// Public command directory, normally `~/.local/bin`.
     pub bin_dir: PathBuf,
-    /// Home directory used to interpret legacy relative manifest paths.
-    pub home: PathBuf,
 }
 
 /// Summary of built-in cleanup decisions.
@@ -65,10 +63,38 @@ pub fn method_transitions(
 /// Removes built-in artifacts for one manifest entry.
 ///
 /// Hook `uninstall()` execution intentionally lives outside this function. Hooks
-/// can run arbitrary shell and must not inherit the broad state lock; this layer
-/// is the deterministic filesystem cleanup that runs before/after hook handling
-/// depending on the higher-level prune or transition flow.
+/// can run arbitrary shell, so coordinators run them outside the non-reentrant
+/// checkout lock and acquire that narrower lock only for deterministic filesystem
+/// cleanup. The broader Shdeps state lock remains held across the full update or
+/// prune transaction.
 pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
+    if entry.method == method::GITHUB_REPO {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "github:repo cleanup requires an acquired checkout-lock root",
+        )
+        .into());
+    }
+    remove_builtin_with_repo_root(entry, roots, None)
+}
+
+/// Removes built-in artifacts while honoring an already locked repo root.
+///
+/// Coordinators pass the normalized path yielded by checkout-lock acquisition
+/// so a configured install-root symlink cannot be retargeted between locking
+/// and cleanup. Non-repository methods ignore this argument.
+pub(crate) fn remove_builtin_with_repo_root(
+    entry: &ManifestEntry,
+    roots: &Roots,
+    locked_repo_root: Option<&Path>,
+) -> Result<Summary> {
+    if entry.method == method::GITHUB_REPO && locked_repo_root.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "github:repo cleanup requires an acquired checkout-lock root",
+        )
+        .into());
+    }
     let mut summary = Summary::default();
 
     match entry.method.as_str() {
@@ -83,24 +109,16 @@ pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
             unlink_state(roots, &entry.name, Kind::Bin, &mut summary)?;
             unlink_state(roots, &entry.name, Kind::Extras, &mut summary)?;
 
-            if !entry.install_path.is_empty() {
-                // The manifest file is human-editable text. A corrupted or
-                // hand-edited `install_path` value (absolute path or
-                // `..`-escape into another tree) would otherwise hand
-                // `remove_dir_all` an arbitrary path. `safe_managed_path`
-                // refuses anything not lexically contained under
-                // `install_dir` or `home`, so the worst case is a skipped
-                // cleanup with a noted leftover rather than a destructive
-                // delete outside the shdeps-managed tree.
-                if let Some(install_path) = safe_managed_path(&entry.install_path, roots) {
-                    remove_any(&install_path, &mut summary)?;
-                }
+            let repo_root = locked_repo_root.expect("validated above");
+            if let Some(path) = remove_legacy_repo_command(entry, roots, repo_root)? {
+                summary.note_removed(path);
             }
 
-            remove_any(
-                &roots.bin_dir.join(config::short_name(&entry.name)),
-                &mut summary,
-            )?;
+            // Human-editable state may be missing or point at another managed
+            // dependency. Cleanup authority comes only from the normalized
+            // root yielded by the checkout lock.
+            remove_any(repo_root, &mut summary)?;
+
             remove_stamps(&roots.state_dir, &entry.name, &mut summary)?;
         }
         binary if method::is_binary_install_root(binary) => {
@@ -139,6 +157,45 @@ pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
     }
 
     Ok(summary)
+}
+
+/// Removes only a legacy repo command symlink whose target proves Shdeps ownership.
+///
+/// Modern installs record every public command in `.binlinks`, so the normal
+/// tracked unlink above is authoritative. This fallback exists for older state
+/// that predated that ledger. A regular file is always unowned, and a symlink
+/// is removed only when its literal target is the expected command under the
+/// configured logical checkout or the checkout-lock-normalized physical root.
+/// That rule preserves generated client adapters and foreign symlinks during
+/// prune or method transitions without trusting human-editable manifest paths.
+pub(crate) fn remove_legacy_repo_command(
+    entry: &ManifestEntry,
+    roots: &Roots,
+    locked_repo_root: &Path,
+) -> Result<Option<PathBuf>> {
+    let canonical_name = config::canonical_name(&entry.name, method::GITHUB_REPO);
+    let short = config::short_name(&canonical_name);
+    let public = roots.bin_dir.join(short);
+    let metadata = match fs::symlink_metadata(&public) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let target = fs::read_link(&public)?;
+    let canonical_root = roots.install_dir.join(&canonical_name);
+    let mut expected = vec![canonical_root.join("bin").join(short)];
+    let physical = locked_repo_root.join("bin").join(short);
+    if !expected.contains(&physical) {
+        expected.push(physical);
+    }
+    if !expected.contains(&target) {
+        return Ok(None);
+    }
+    fs::remove_file(&public)?;
+    Ok(Some(public))
 }
 
 /// Removes TTL and revision stamps for a dependency name.
@@ -192,52 +249,61 @@ fn unlink_state(roots: &Roots, name: &str, kind: Kind, summary: &mut Summary) ->
     Ok(())
 }
 
-fn manifest_path(path: &str, home: &Path) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        path
-    } else {
-        home.join(path)
-    }
-}
-
-/// Returns a manifest-supplied install path only when it lexically
-/// resolves inside the shdeps-managed install tree.
+/// Returns the only checkout root a manifest row may authorize for locking.
 ///
-/// The manifest is a human-readable text file with no schema
-/// enforcement, so a corrupt record or a hand edit could plant any
-/// absolute path or a `..`-escape into `entry.install_path`. Without
-/// this guard, the cleanup path would hand that value straight to
-/// `remove_dir_all`. Rather than canonicalize (which would follow
-/// symlinks and could mask escapes through link targets), the check
-/// rejects anything with a `..` component and requires lexical
-/// containment under `install_dir`.
-///
-/// Earlier versions of this predicate also accepted any path under
-/// `$HOME`. That was overly permissive: a tampered manifest entry
-/// pointing at, say, `$HOME/.ssh` or `$HOME/Documents/project` would
-/// pass the guard and be removed during prune. shdeps's own writes
-/// always target `install_dir` (configurable via `SHDEPS_INSTALL_DIR`,
-/// defaulting to `$HOME/.local/share`), so the install-tree
-/// containment is sufficient for legitimate entries. Relative paths
-/// written by older fleet bootstraps (e.g., `.local/share/<dep>`)
-/// still work in the default configuration because they resolve to
-/// `$HOME/.local/share/<dep>` which IS under the default
-/// `install_dir`.
-///
-/// Visible to `update_transition::cleanup_snapshot`, which has its
-/// own `github:repo` cleanup path and must apply the same
-/// containment hardening. Without sharing this predicate, the
-/// second consumer silently bypasses the install-path guard.
-pub(crate) fn safe_managed_path(install_path: &str, roots: &Roots) -> Option<PathBuf> {
-    let path = manifest_path(install_path, &roots.home);
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+/// Repository ownership is structural: a valid dependency name owns exactly
+/// `<install_dir>/<name>`. The human-editable `install_path` is diagnostic
+/// state, not authority to select a sibling dependency or arbitrary path.
+/// Physicalizing the configured install root also keeps cleanup on the same
+/// root the checkout lock serialized when that root contains a symlink.
+pub(crate) fn safe_repo_root(entry: &ManifestEntry, roots: &Roots) -> Option<PathBuf> {
+    let name = config::canonical_name(&entry.name, method::GITHUB_REPO);
+    if !config::valid_dep_name(&name) {
         return None;
     }
-    path.starts_with(&roots.install_dir).then_some(path)
+    Some(physical_install_root(&roots.install_dir).join(name))
+}
+
+/// Resolves the configured install root once before ownership-sensitive work.
+pub(crate) fn physical_install_root(install_dir: &Path) -> PathBuf {
+    fs::canonicalize(install_dir).unwrap_or_else(|_| install_dir.to_path_buf())
+}
+
+/// Recovers the physical install-root boundary from one locked repo path.
+pub(crate) fn install_root_for_repo(repo_root: &Path, name: &str) -> Option<PathBuf> {
+    let name = config::canonical_name(name, method::GITHUB_REPO);
+    if !config::valid_dep_name(&name) {
+        return None;
+    }
+    let mut root = repo_root;
+    for _ in Path::new(&name).components() {
+        root = root.parent()?;
+    }
+    Some(root.to_path_buf())
+}
+
+/// Validates manifest fields before they select hooks or artifact paths.
+///
+/// The manifest is intentionally human-editable and older versions did not
+/// validate rows while loading them. Mutation coordinators therefore enforce
+/// the current config grammar immediately before using a saved name or command
+/// in any filesystem path, while leaving malformed state intact for recovery.
+pub(crate) fn validate_manifest_artifact_entry(entry: &ManifestEntry) -> Result<()> {
+    if !config::valid_dep_name(&entry.name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsafe dependency name in manifest: {}", entry.name),
+        )
+        .into());
+    }
+    if !config::valid_cmd_basename(&entry.cmd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsafe command name in manifest: {}", entry.cmd),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn remove_any(path: &Path, summary: &mut Summary) -> Result<()> {
@@ -299,15 +365,23 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
 
     use super::{
-        Roots, Summary, method_transitions, remove_builtin, remove_stamps, safe_managed_path,
+        Roots, Summary, method_transitions, remove_builtin_with_repo_root, remove_stamps,
+        safe_repo_root,
     };
     use crate::config::Entry;
     use crate::github_release_install;
     use crate::link_state::{self, Kind};
     use crate::manifest::{Manifest, ManifestEntry};
+
+    fn remove_for_test(entry: &ManifestEntry, roots: &Roots) -> crate::Result<Summary> {
+        let repo_root = (entry.method == crate::method::GITHUB_REPO)
+            .then(|| safe_repo_root(entry, roots))
+            .flatten();
+        remove_builtin_with_repo_root(entry, roots, repo_root.as_deref())
+    }
 
     #[test]
     fn method_transitions_ignore_orphans_and_return_method_changes() {
@@ -323,26 +397,41 @@ mod tests {
     }
 
     #[test]
+    fn github_repo_cleanup_rejects_missing_lock_authority() {
+        let fixture = Fixture::new("repo-missing-lock-authority");
+        let entry = ManifestEntry::new("owner/tool", "github:repo", "tool", "");
+
+        let error = super::remove_builtin(&entry, &fixture.roots).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an acquired checkout-lock root")
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn github_repo_cleanup_removes_symlink_install_and_tracked_links_but_preserves_target() {
         let fixture = Fixture::new("repo-symlink");
         let target = fixture.dir.join("target");
-        // Install path is under `install_dir` (the only tree
-        // `safe_managed_path` accepts since the round-6 tightening
-        // of the `$HOME` acceptance).
+        // The validated dependency name owns this exact install root. The
+        // recorded path is retained only to prove that it cannot redirect
+        // cleanup elsewhere.
         let install_link = fixture.roots.install_dir.join("repo-tool");
         let short_bin = fixture.roots.bin_dir.join("repo-tool");
         let extra_bin = fixture.roots.bin_dir.join("repo-extra");
         // Extras live wherever the linker placed them. `man_link` is
         // just a tracked symlink used to verify unlink_tracked clears
         // it; the path does not need to be in install_dir.
-        let man_link = fixture.roots.home.join(".local/share/man/man1/repo-tool.1");
-        fs::create_dir_all(&target).unwrap();
+        let man_link = fixture.dir.join("home/.local/share/man/man1/repo-tool.1");
+        fs::create_dir_all(target.join("bin")).unwrap();
+        fs::write(target.join("bin/repo-tool"), "#!/bin/sh\n").unwrap();
         fs::create_dir_all(install_link.parent().unwrap()).unwrap();
         fs::create_dir_all(short_bin.parent().unwrap()).unwrap();
         fs::create_dir_all(man_link.parent().unwrap()).unwrap();
         symlink(&target, &install_link).unwrap();
-        symlink(&target, &short_bin).unwrap();
+        symlink(install_link.join("bin/repo-tool"), &short_bin).unwrap();
         symlink(&target, &extra_bin).unwrap();
         symlink(&target, &man_link).unwrap();
         link_state::write(
@@ -357,7 +446,7 @@ mod tests {
         .unwrap();
         fixture.write_state("repo-tool.repo.stamp", "1\n");
 
-        remove_builtin(
+        remove_for_test(
             &ManifestEntry::new(
                 "repo-tool",
                 "github:repo",
@@ -380,6 +469,116 @@ mod tests {
                 .join("repo-tool.repo.stamp")
                 .exists()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn github_repo_cleanup_preserves_unowned_regular_command() {
+        let fixture = Fixture::new("repo-regular-command");
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(install_root.join("bin")).unwrap();
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        fs::write(install_root.join("bin/tool"), "managed command").unwrap();
+        fs::write(&public, "generated client adapter").unwrap();
+        let before = fs::metadata(&public).unwrap();
+
+        let summary = remove_for_test(
+            &ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_root.to_string_lossy(),
+            ),
+            &fixture.roots,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "generated client adapter"
+        );
+        let after = fs::metadata(&public).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.mode(), before.mode());
+        assert!(!install_root.exists());
+        assert!(!summary.removed.contains(&public));
+        assert!(
+            !link_state::path(&fixture.roots.state_dir, "owner/tool", Kind::Bin).exists(),
+            "preserved regular commands must never acquire Shdeps ownership state"
+        );
+    }
+
+    #[test]
+    fn github_repo_cleanup_cannot_target_another_managed_dependency() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("repo-cross-dependency-path");
+        let owned = fixture.roots.install_dir.join("owner/a");
+        let other = fixture.roots.install_dir.join("owner/b");
+        let public = fixture.roots.bin_dir.join("a");
+        fs::create_dir_all(&owned).unwrap();
+        fs::create_dir_all(other.join("bin")).unwrap();
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        fs::write(owned.join("owned"), "remove\n").unwrap();
+        fs::write(other.join("sentinel"), "preserve\n").unwrap();
+        fs::write(other.join("bin/a"), "other command\n").unwrap();
+        symlink(other.join("bin/a"), &public).unwrap();
+
+        remove_for_test(
+            &ManifestEntry::new("owner/a", "github:repo", "a", other.display().to_string()),
+            &fixture.roots,
+        )
+        .unwrap();
+
+        assert!(!owned.exists());
+        assert_eq!(
+            fs::read_to_string(other.join("sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert!(
+            fs::symlink_metadata(public)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn github_repo_cleanup_uses_locked_root_after_install_alias_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("repo-locked-root-retarget");
+        let physical_a = fixture.dir.join("physical-a");
+        let physical_b = fixture.dir.join("physical-b");
+        let logical = fixture.dir.join("install-link");
+        let root_a = physical_a.join("owner/tool");
+        let root_b = physical_b.join("owner/tool");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        fs::write(root_a.join("owned"), "remove\n").unwrap();
+        fs::write(root_b.join("sentinel"), "preserve\n").unwrap();
+        symlink(&physical_a, &logical).unwrap();
+        let roots = Roots {
+            install_dir: logical.clone(),
+            ..fixture.roots.clone()
+        };
+        let entry = ManifestEntry::new("owner/tool", "github:repo", "tool", "");
+        let locked_root = safe_repo_root(&entry, &roots).unwrap();
+        assert_eq!(locked_root, root_a);
+
+        fs::remove_file(&logical).unwrap();
+        symlink(&physical_b, &logical).unwrap();
+        remove_builtin_with_repo_root(&entry, &roots, Some(&locked_root)).unwrap();
+
+        assert!(!root_a.exists());
+        assert_eq!(
+            fs::read_to_string(root_b.join("sentinel")).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(fs::read_link(logical).unwrap(), physical_b);
     }
 
     #[test]
@@ -416,7 +615,7 @@ mod tests {
         fixture.write_install("owner/binary-tool/artifact", "data\n");
         fixture.write_state("owner/binary-tool.release.stamp", "1\n");
 
-        remove_builtin(&entry, &fixture.roots).unwrap();
+        remove_for_test(&entry, &fixture.roots).unwrap();
 
         assert!(!fixture.roots.bin_dir.join("binary-tool").exists());
         assert!(!helper.exists());
@@ -468,7 +667,7 @@ mod tests {
         )
         .unwrap();
 
-        remove_builtin(&entry, &fixture.roots).unwrap();
+        remove_for_test(&entry, &fixture.roots).unwrap();
 
         assert_eq!(
             fs::read_to_string(&public).unwrap(),
@@ -492,7 +691,7 @@ mod tests {
         let fixture = Fixture::new("pkg");
         fixture.write_bin("pkg-tool", "#!/bin/sh\n");
 
-        let summary = remove_builtin(
+        let summary = remove_for_test(
             &ManifestEntry::new("pkg-tool", "pkg", "pkg-tool", ""),
             &fixture.roots,
         )
@@ -507,7 +706,7 @@ mod tests {
         let fixture = Fixture::new("custom");
         fixture.write_state("custom-tool.custom.stamp", "1\n");
 
-        let summary = remove_builtin(
+        let summary = remove_for_test(
             &ManifestEntry::new("custom-tool", "custom", "custom-tool", ""),
             &fixture.roots,
         )
@@ -554,115 +753,43 @@ mod tests {
     }
 
     #[test]
-    fn safe_managed_path_accepts_relative_paths_that_resolve_under_install_dir() {
-        // The historical Bash layout stored install paths as
-        // `.local/share/...` relative to `$HOME`. In a real shdeps
-        // configuration `install_dir` defaults to
-        // `$HOME/.local/share`, so the relative path resolves UNDER
-        // `install_dir` and remains acceptable. The fixture below
-        // mirrors that real-world overlap so the legacy entry passes.
-        let dir = crate::test_support::temp_dir("shdeps-cleanup-safe-rel");
+    fn safe_repo_root_uses_named_fallback_when_recorded_path_is_empty() {
+        let dir = crate::test_support::temp_dir("shdeps-cleanup-empty-repo-path");
         let roots = Roots {
             state_dir: dir.join("state"),
-            install_dir: dir.join("home/.local/share"),
+            install_dir: dir.join("home"),
             bin_dir: dir.join("bin"),
-            home: dir.join("home"),
         };
-        let resolved = safe_managed_path(".local/share/repo-tool", &roots).unwrap();
-        assert_eq!(resolved, roots.home.join(".local/share/repo-tool"));
-        // Sanity-check that the resolved path is indeed under
-        // install_dir (the load-bearing containment).
-        assert!(resolved.starts_with(&roots.install_dir));
+        let entry = ManifestEntry::new("owner/tool", "github:repo", "tool", "");
+
+        assert_eq!(
+            safe_repo_root(&entry, &roots),
+            Some(roots.install_dir.join("owner/tool"))
+        );
     }
 
     #[test]
-    fn safe_managed_path_rejects_paths_under_home_but_outside_install_dir() {
-        // Round-6 codex finding: a tampered manifest record pointing
-        // at e.g. `$HOME/.ssh` or `$HOME/Documents/private-project`
-        // used to pass the guard because the predicate accepted any
-        // path under `$HOME`. The new predicate restricts to
-        // `install_dir`, which keeps sensitive home subdirs out of
-        // reach of the prune cleanup loop.
-        let fixture = Fixture::new("safe-home-but-not-install");
-        // The Fixture's `install_dir` is `dir/share`; `home` is
-        // `dir/home`. Both `.ssh/id_rsa` and a sibling under home
-        // resolve outside install_dir.
-        assert!(safe_managed_path(".ssh/id_rsa", &fixture.roots).is_none());
-        assert!(safe_managed_path("Documents/project", &fixture.roots).is_none());
-        let abs_home_sensitive = fixture
-            .roots
-            .home
-            .join(".gnupg")
-            .to_string_lossy()
-            .into_owned();
-        assert!(safe_managed_path(&abs_home_sensitive, &fixture.roots).is_none());
+    fn safe_repo_root_canonicalizes_legacy_git_suffix() {
+        let fixture = Fixture::new("repo-root-git-suffix");
+        let entry = ManifestEntry::new("owner/tool.git", "github:repo", "tool", "");
+
+        assert_eq!(
+            safe_repo_root(&entry, &fixture.roots),
+            Some(fixture.roots.install_dir.join("owner/tool"))
+        );
     }
 
     #[test]
-    fn safe_managed_path_accepts_absolute_paths_under_install_dir() {
-        // Newer github:repo records may carry an absolute path under the
-        // managed install root. Lexical containment of `install_dir` covers
-        // that case.
-        let fixture = Fixture::new("safe-abs-install");
-        let absolute = fixture.roots.install_dir.join("owner/repo");
-        let resolved = safe_managed_path(absolute.to_str().unwrap(), &fixture.roots).unwrap();
-        assert_eq!(resolved, absolute);
-    }
-
-    #[test]
-    fn safe_managed_path_rejects_absolute_path_outside_managed_roots() {
-        // A corrupt manifest record could otherwise hand `remove_dir_all` an
-        // arbitrary system path. The guard must refuse it rather than treat
-        // the record as authoritative.
-        let fixture = Fixture::new("safe-escape-abs");
-        assert!(safe_managed_path("/etc/passwd", &fixture.roots).is_none());
-        assert!(safe_managed_path("/tmp/unrelated", &fixture.roots).is_none());
-    }
-
-    #[test]
-    fn safe_managed_path_rejects_parent_dir_escapes() {
-        // `..` segments would lexically allow a path to escape the
-        // `starts_with` check even when the prefix matches one of the
-        // managed roots. They are refused outright.
-        let fixture = Fixture::new("safe-escape-parent");
-        assert!(safe_managed_path("../../etc/passwd", &fixture.roots).is_none());
-        assert!(safe_managed_path(".local/share/../../../etc", &fixture.roots).is_none());
-    }
-
-    #[test]
-    fn safe_managed_path_accepts_curdir_components_in_legitimate_paths() {
-        // An older fleet bootstrap could have written paths like
-        // `./<dep>` (with a leading CurDir) into the manifest. `.`
-        // components are benign on their own (`join` resolves them
-        // away), so rejecting them along with `..` would silently
-        // skip cleanup for legitimate older entries. Only `..` is
-        // the real escape vector. The fixture below uses an
-        // install_dir-rooted relative path so the post-round-6
-        // containment guard accepts it.
-        let dir = crate::test_support::temp_dir("shdeps-cleanup-safe-curdir");
-        let roots = Roots {
-            state_dir: dir.join("state"),
-            install_dir: dir.join("home/.local/share"),
-            bin_dir: dir.join("bin"),
-            home: dir.join("home"),
-        };
-        let resolved = safe_managed_path("./.local/share/repo-tool", &roots).unwrap();
-        assert!(resolved.starts_with(&roots.install_dir));
-    }
-
-    #[test]
-    fn github_repo_cleanup_skips_install_path_outside_managed_roots() {
-        // End-to-end: a tampered manifest record with an absolute escape path
-        // must not result in `remove_dir_all` being called on that path. The
-        // bin-dir cleanup and stamp removal still run, but the external file
-        // must be left untouched.
+    fn github_repo_cleanup_ignores_tampered_recorded_install_path() {
+        // Repository cleanup derives ownership from the validated name. A
+        // recorded absolute path is diagnostic only and cannot redirect it.
         let fixture = Fixture::new("tampered-install-path");
         let bystander = fixture.dir.join("bystander");
         fs::create_dir_all(&bystander).unwrap();
         fs::write(bystander.join("data"), "user-owned").unwrap();
         let absolute = bystander.to_string_lossy().into_owned();
 
-        remove_builtin(
+        remove_for_test(
             &ManifestEntry::new("repo-tool", "github:repo", "repo-tool", &absolute),
             &fixture.roots,
         )
@@ -695,7 +822,6 @@ mod tests {
                 state_dir: dir.join("state"),
                 install_dir: dir.join("share"),
                 bin_dir: dir.join("bin"),
-                home: dir.join("home"),
             };
             Self { dir, roots }
         }

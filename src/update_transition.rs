@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
@@ -27,6 +29,15 @@ pub(crate) struct Transition {
     bin_links: Vec<PathBuf>,
     extra_links: Vec<PathBuf>,
     archive_state: ArchiveState,
+    archive_root_identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 /// Builds a transition map keyed by dependency name.
@@ -38,8 +49,16 @@ pub(crate) fn by_name(
     cleanup::method_transitions(manifest, entries)
         .into_iter()
         .map(|entry| {
-            let bin_links =
-                link_state::read(&link_state::path(&roots.state_dir, &entry.name, Kind::Bin))?;
+            // A saved row is human-editable state. Validate it before its name
+            // or command participates in link-state and public-bin paths.
+            cleanup::validate_manifest_artifact_entry(&entry)?;
+            let bin_state = link_state::path(&roots.state_dir, &entry.name, Kind::Bin);
+            // A method change may be the first operation after a killed repo
+            // relink. Recover prepublication command ownership before taking
+            // the old-method snapshot so cleanup cannot strand a newly live
+            // symlink merely because the repo disappeared from configuration.
+            link_state::recover_reconcile(&bin_state)?;
+            let bin_links = link_state::read(&bin_state)?;
             let extra_links = link_state::read(&link_state::path(
                 &roots.state_dir,
                 &entry.name,
@@ -55,6 +74,11 @@ pub(crate) fn by_name(
             } else {
                 ArchiveState::None
             };
+            let archive_root_identity = if entry.method == method::GITHUB_RELEASE {
+                file_identity(&roots.install_dir.join(&entry.name))?
+            } else {
+                None
+            };
             Ok((
                 entry.name.clone(),
                 Transition {
@@ -62,6 +86,7 @@ pub(crate) fn by_name(
                     bin_links,
                     extra_links,
                     archive_state,
+                    archive_root_identity,
                 },
             ))
         })
@@ -71,6 +96,117 @@ pub(crate) fn by_name(
 /// Returns the old manifest row for a transition.
 pub(crate) fn old(transition: &Transition) -> &ManifestEntry {
     &transition.old
+}
+
+/// Returns whether the previous built-in method proves ownership of the
+/// canonical install root that a new `github:repo` install will reuse.
+///
+/// External toolchains always install beneath that managed root. A GitHub
+/// release owns it only when archive evidence is proven; raw release binaries,
+/// packages, and custom hooks do not authorize deleting a coincidental path.
+pub(crate) fn owns_repo_destination(transition: &Transition) -> bool {
+    method::is_external(&transition.old.method)
+        || (transition.old.method == method::GITHUB_RELEASE
+            && transition.archive_state == ArchiveState::Proven)
+}
+
+/// Refreshes filesystem-derived transition evidence under the checkout lock.
+///
+/// `by_name` runs before workers acquire dependency checkout locks. Structural
+/// state in the manifest remains valid across that wait, but an installer may
+/// legally replace a release root while holding the shared lock. Re-reading the
+/// archive marker and live links from the lock-normalized physical root keeps a
+/// stale pre-worker snapshot from authorizing deletion of the new generation.
+pub(crate) fn revalidate_for_repo_install(
+    transition: Option<&Transition>,
+    roots: &Roots,
+    locked_repo_root: &Path,
+) -> Result<Option<Transition>> {
+    let Some(transition) = transition else {
+        return Ok(None);
+    };
+    let mut refreshed = transition.clone();
+    if refreshed.old.method == method::GITHUB_RELEASE {
+        let install_base = cleanup::install_root_for_repo(locked_repo_root, &refreshed.old.name)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cannot derive install root from acquired checkout-lock path",
+                )
+            })?;
+        let explicit =
+            github_release_install::explicit_archive_state(&install_base, &refreshed.old.name)?;
+        let current_identity = file_identity(locked_repo_root)?;
+        let checkout_metadata_present = path_entry_exists(&locked_repo_root.join(".git"))?;
+        refreshed.archive_state = if explicit == ArchiveState::Proven {
+            ArchiveState::Proven
+        } else if !checkout_metadata_present
+            && refreshed.archive_state == ArchiveState::Proven
+            && same_file_identity(refreshed.archive_root_identity, current_identity)
+        {
+            github_release_install::archive_state(
+                &roots.state_dir,
+                &install_base,
+                &roots.bin_dir.join(&refreshed.old.cmd),
+                &refreshed.old.name,
+            )?
+        } else {
+            // Legacy archive proof is path-based: a public symlink can keep
+            // resolving after another writer replaces the directory at the
+            // same name. It authorizes only the exact root generation whose
+            // identity was observed before waiting for the checkout lock.
+            ArchiveState::None
+        };
+        refreshed.archive_root_identity = current_identity;
+    }
+    Ok(Some(refreshed))
+}
+
+// Snapshot one real directory generation on Unix; platforms without a stable
+// inode API intentionally cannot retain legacy path-only archive proof.
+fn file_identity(path: &Path) -> Result<Option<FileIdentity>> {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(Some(FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// Require a present, unchanged Unix identity rather than allowing None == None
+// to become accidental ownership evidence.
+fn same_file_identity(before: Option<FileIdentity>, current: Option<FileIdentity>) -> bool {
+    #[cfg(unix)]
+    {
+        before.is_some() && before == current
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (before, current);
+        false
+    }
+}
+
+// Probe a no-follow ownership marker while preserving all errors except true
+// absence; a malformed .git entry must still disqualify legacy archive proof.
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Runs an installer with transition-only public-bin preparation.
@@ -97,12 +233,20 @@ pub(crate) fn cleanup_successful(
     entry: &Entry,
     transition: Option<&Transition>,
     roots: &Roots,
+    locked_repo_root: Option<&Path>,
 ) -> Result<bool> {
     let Some(transition) = transition else {
         return Ok(false);
     };
+    if transition.old.method == method::GITHUB_REPO && locked_repo_root.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "github:repo transition cleanup requires an acquired checkout-lock root",
+        )
+        .into());
+    }
 
-    Ok(cleanup_snapshot(entry, transition, roots).is_err())
+    Ok(cleanup_snapshot(entry, transition, roots, locked_repo_root).is_err())
 }
 
 /// Restores the old manifest row after a transition install fails.
@@ -200,8 +344,13 @@ fn backup_path(path: &Path) -> PathBuf {
     backup
 }
 
-fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Result<()> {
-    let preserve = preserve_paths(entry, roots)?;
+fn cleanup_snapshot(
+    entry: &Entry,
+    transition: &Transition,
+    roots: &Roots,
+    locked_repo_root: Option<&Path>,
+) -> Result<()> {
+    let preserve = preserve_paths(entry, roots, locked_repo_root)?;
 
     match transition.old.method.as_str() {
         method::PKG => {
@@ -210,6 +359,12 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
             // available for anything else on the machine that might use it.
         }
         method::GITHUB_REPO => {
+            let install_path = locked_repo_root.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "github:repo transition cleanup requires an acquired checkout-lock root",
+                )
+            })?;
             unlink_snapshot(
                 &roots.state_dir,
                 &transition.old.name,
@@ -225,35 +380,31 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
                 &preserve,
             )?;
 
-            if !transition.old.install_path.is_empty() {
-                // Mirror the containment hardening that
-                // `cleanup::remove_builtin` applies to the same field.
-                // Without this guard, a tampered manifest record
-                // pointing `install_path` at, say, `/etc` would be
-                // handed straight to `remove_dir_all` during a method
-                // transition. The shared `safe_managed_path` is the
-                // single source of truth for "is this path in a
-                // shdeps-managed tree" — duplicating the check here
-                // would invite drift the next time the predicate
-                // tightens.
+            // Repository ownership comes from the validated dependency name,
+            // never the human-editable recorded install path.
+            if !preserve.contains(install_path) {
+                remove_any(install_path)?;
+                let install_root =
+                    crate::cleanup::install_root_for_repo(install_path, &transition.old.name)
+                        .unwrap_or_else(|| {
+                            crate::cleanup::physical_install_root(&roots.install_dir)
+                        });
+                remove_empty_install_parents(install_path, &install_root)?;
+            }
+
+            let legacy_bin = roots.bin_dir.join(config::short_name(&transition.old.name));
+            if !preserve.contains(&legacy_bin) {
                 let cleanup_roots = crate::cleanup::Roots {
                     state_dir: roots.state_dir.clone(),
                     install_dir: roots.install_dir.clone(),
                     bin_dir: roots.bin_dir.clone(),
-                    home: roots.home.clone(),
                 };
-                if let Some(install_path) =
-                    crate::cleanup::safe_managed_path(&transition.old.install_path, &cleanup_roots)
-                {
-                    if !preserve.contains(&install_path) {
-                        remove_any(&install_path)?;
-                        remove_empty_install_parents(&install_path, &roots.install_dir)?;
-                    }
-                }
+                crate::cleanup::remove_legacy_repo_command(
+                    &transition.old,
+                    &cleanup_roots,
+                    install_path,
+                )?;
             }
-
-            let legacy_bin = roots.bin_dir.join(config::short_name(&transition.old.name));
-            remove_any_unless_preserved(&legacy_bin, &preserve)?;
             remove_stamps(&roots.state_dir, &transition.old.name)?;
         }
         binary if method::is_binary_install_root(binary) => {
@@ -293,7 +444,11 @@ fn cleanup_snapshot(entry: &Entry, transition: &Transition, roots: &Roots) -> Re
     Ok(())
 }
 
-fn preserve_paths(entry: &Entry, roots: &Roots) -> Result<BTreeSet<PathBuf>> {
+fn preserve_paths(
+    entry: &Entry,
+    roots: &Roots,
+    locked_repo_root: Option<&Path>,
+) -> Result<BTreeSet<PathBuf>> {
     let mut preserve = BTreeSet::new();
 
     // New-method link state may live at the same `<name>.links` path as the
@@ -316,16 +471,36 @@ fn preserve_paths(entry: &Entry, roots: &Roots) -> Result<BTreeSet<PathBuf>> {
     match entry.method.as_str() {
         symlink if method::is_symlink_install_root(symlink) => {
             preserve.insert(roots.bin_dir.join(&entry.cmd));
-            preserve.insert(roots.install_dir.join(&entry.name));
+            preserve.insert(locked_repo_root.map_or_else(
+                || crate::cleanup::physical_install_root(&roots.install_dir).join(&entry.name),
+                Path::to_path_buf,
+            ));
         }
         method::GITHUB_RELEASE => {
             let public_bin = roots.bin_dir.join(&entry.cmd);
             preserve.insert(public_bin.clone());
 
-            let install_root = roots.install_dir.join(&entry.name);
+            // A repo-to-release transition holds the checkout lock for one
+            // physical root. Treat that path as the ownership authority all
+            // the way through cleanup: the configured install directory may be
+            // a symlink that is retargeted after the release installer writes
+            // the new archive but before this preservation check runs.
+            let install_base = match locked_repo_root {
+                Some(repo_root) => crate::cleanup::install_root_for_repo(repo_root, &entry.name)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "cannot derive install root from acquired checkout-lock path",
+                        )
+                    })?,
+                None => crate::cleanup::physical_install_root(&roots.install_dir),
+            };
+            let install_root = locked_repo_root
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| install_base.join(&entry.name));
             if github_release_install::archive_state(
                 &roots.state_dir,
-                &roots.install_dir,
+                &install_base,
                 &public_bin,
                 &entry.name,
             )? == ArchiveState::Proven
@@ -487,13 +662,29 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    use super::{Transition, cleanup_snapshot, points_into, unlink_snapshot};
-    use crate::config::Entry;
+    use super::{Transition, by_name, cleanup_snapshot, points_into, unlink_snapshot};
+    use crate::config::{Entry, parse_entry};
     use crate::github_release_install::{self, ArchiveState};
-    use crate::link_state::{self, Kind};
-    use crate::manifest::ManifestEntry;
+    use crate::link_state::{self, Kind, ReconcileLink};
+    use crate::manifest::{Manifest, ManifestEntry};
     use crate::runtime::Roots;
     use std::collections::BTreeSet;
+
+    fn cleanup_snapshot_for_test(
+        entry: &Entry,
+        transition: &Transition,
+        roots: &Roots,
+    ) -> crate::Result<()> {
+        let cleanup_roots = crate::cleanup::Roots {
+            state_dir: roots.state_dir.clone(),
+            install_dir: roots.install_dir.clone(),
+            bin_dir: roots.bin_dir.clone(),
+        };
+        let repo_root = (transition.old.method == crate::method::GITHUB_REPO)
+            .then(|| crate::cleanup::safe_repo_root(&transition.old, &cleanup_roots))
+            .flatten();
+        cleanup_snapshot(entry, transition, roots, repo_root.as_deref())
+    }
 
     #[test]
     #[cfg(unix)]
@@ -597,6 +788,48 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn transition_snapshot_recovers_prepublished_repo_command() {
+        let dir = temp_dir("prepublished-repo-command");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let source = roots.install_dir.join("owner/tool/bin/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        fs::write(&source, "#!/bin/sh\n").unwrap();
+        let bin_state = link_state::path(&roots.state_dir, "owner/tool", Kind::Bin);
+        link_state::begin_reconcile(
+            &bin_state,
+            &[ReconcileLink::new(public.clone(), source.clone())],
+        )
+        .unwrap();
+        symlink(&source, &public).unwrap();
+        let manifest = Manifest::parse(&format!(
+            "owner/tool|github:repo|tool|{}\n",
+            roots.install_dir.join("owner/tool").display()
+        ));
+        let entry = parse_entry("owner/tool|cargo|tool|-|-", None);
+
+        let transitions = by_name(&manifest, std::slice::from_ref(&entry), &roots).unwrap();
+        let transition = transitions.get("owner/tool").unwrap();
+
+        assert_eq!(transition.bin_links, [public]);
+        assert!(
+            !bin_state
+                .with_file_name("tool.binlinks.reconcile-v1")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn unlink_snapshot_clears_state_even_when_external_entry_was_deleted() {
         // The complementary case: state file is missing one of the
         // snapshot entries (a prior partial cleanup removed it from
@@ -635,22 +868,17 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn cleanup_snapshot_skips_tampered_install_path_outside_managed_roots() {
-        // Regression for round-6 finding: the `github:repo` cleanup
-        // path in `cleanup_snapshot` had its own `manifest_path +
-        // remove_any` sequence that bypassed the `safe_managed_path`
-        // hardening added to `cleanup::remove_builtin`. A method
-        // transition with a tampered `old.install_path = /<bystander>`
-        // would have removed that bystander on transition. After the
-        // fix, the shared helper rejects out-of-tree paths and the
-        // bystander survives.
+    fn cleanup_snapshot_ignores_tampered_repo_install_path() {
+        // The `github:repo` cleanup path once trusted the recorded manifest
+        // path. A transition with a tampered
+        // `old.install_path = /<bystander>` would therefore remove that
+        // bystander. Cleanup authority now comes from the validated dependency
+        // name and the checkout-lock root, so the recorded path is inert.
         //
-        // Beyond the bystander assertion, this test also verifies that
-        // the *rest* of the `github:repo` cleanup branch still ran —
-        // the install-path guard must not short-circuit the legacy
-        // public-bin removal or stamp cleanup. A regression that
-        // bailed early on tampered paths would silently leave stale
-        // bins and stamps behind on every transition.
+        // Beyond the bystander assertion, this test also verifies that the
+        // rest of the `github:repo` cleanup branch still runs. Ignoring the
+        // recorded path must not skip legacy public-bin reconciliation or
+        // stamp cleanup.
         let dir = temp_dir("tampered-install-path");
         let bystander = dir.join("bystander");
         fs::create_dir_all(&bystander).unwrap();
@@ -691,6 +919,7 @@ mod tests {
             bin_links: Vec::new(),
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -701,7 +930,7 @@ mod tests {
             filter: String::new(),
         };
 
-        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
 
         assert!(bystander.exists(), "bystander dir must be preserved");
         assert!(
@@ -719,9 +948,9 @@ mod tests {
             "preserved public bin must not be removed during transition"
         );
         // The stamp belongs to the old method and is not preserved;
-        // it must be removed by `remove_stamps`. If a regression
-        // short-circuited the cleanup branch after the install_path
-        // guard, this assertion would catch it.
+        // it must be removed by `remove_stamps`. If a regression skipped the
+        // rest of cleanup while ignoring the tampered path, this assertion
+        // would catch it.
         assert!(
             !stamp_file.exists(),
             "old-method stamp must be removed even when install_path is tampered"
@@ -764,6 +993,7 @@ mod tests {
             bin_links: vec![public.clone(), helper.clone()],
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -774,7 +1004,7 @@ mod tests {
             filter: String::new(),
         };
 
-        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
 
         assert!(!public.exists());
         assert!(!helper.exists());
@@ -821,6 +1051,7 @@ mod tests {
             bin_links: vec![public.clone()],
             extra_links: Vec::new(),
             archive_state: ArchiveState::Proven,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -831,7 +1062,7 @@ mod tests {
             filter: String::new(),
         };
 
-        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
 
         assert_eq!(fs::read_to_string(&public).unwrap(), "user launcher");
         assert!(!install_root.exists());
@@ -874,6 +1105,7 @@ mod tests {
             bin_links: vec![public.clone(), helper.clone()],
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -884,13 +1116,170 @@ mod tests {
             filter: String::new(),
         };
 
-        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
 
         assert!(public.exists());
         assert!(!helper.exists());
         assert_eq!(
             link_state::read(&link_state::path(&roots.state_dir, "owner/tool", Kind::Bin)).unwrap(),
             vec![public]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_transition_preserves_unowned_regular_command() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = temp_dir("repo-unowned-regular-command");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let install_root = roots.install_dir.join("owner/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(install_root.join("bin")).unwrap();
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::write(install_root.join("bin/tool"), "managed command").unwrap();
+        fs::write(&public, "generated client adapter").unwrap();
+        let before = fs::metadata(&public).unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_root.to_string_lossy(),
+            ),
+            bin_links: Vec::new(),
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+            archive_root_identity: None,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: true,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "generated client adapter"
+        );
+        let after = fs::metadata(&public).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.mode(), before.mode());
+        assert!(!install_root.exists());
+    }
+
+    #[test]
+    fn repo_transition_cleanup_rejects_missing_lock_authority() {
+        let dir = temp_dir("repo-transition-missing-lock");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let install_root = roots.install_dir.join("owner/tool");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("artifact"), "preserve\n").unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                install_root.display().to_string(),
+            ),
+            bin_links: Vec::new(),
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+            archive_root_identity: None,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: true,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        let error = cleanup_snapshot(&new_entry, &transition, &roots, None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an acquired checkout-lock root")
+        );
+        assert!(install_root.join("artifact").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_transition_preserves_new_root_through_symlinked_install_dir() {
+        let dir = temp_dir("repo-transition-symlinked-install-root");
+        let physical_install = dir.join("physical-install");
+        let logical_install = dir.join("install-link");
+        fs::create_dir_all(&physical_install).unwrap();
+        symlink(&physical_install, &logical_install).unwrap();
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: logical_install.clone(),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let physical_root = physical_install.join("owner/tool");
+        fs::create_dir_all(&physical_root).unwrap();
+        fs::write(physical_root.join("new-artifact"), "preserve\n").unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                physical_root.display().to_string(),
+            ),
+            bin_links: Vec::new(),
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+            archive_root_identity: None,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "cargo".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: true,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(physical_root.join("new-artifact")).unwrap(),
+            "preserve\n"
+        );
+        assert!(physical_install.exists());
+        assert!(
+            fs::symlink_metadata(logical_install)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
@@ -934,6 +1323,7 @@ mod tests {
             bin_links: Vec::new(),
             extra_links: Vec::new(),
             archive_state: ArchiveState::None,
+            archive_root_identity: None,
         };
         let new_entry = Entry {
             name: "owner/tool".to_owned(),
@@ -944,13 +1334,80 @@ mod tests {
             filter: String::new(),
         };
 
-        cleanup_snapshot(&new_entry, &transition, &roots).unwrap();
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
 
         assert_eq!(fs::read_to_string(&public).unwrap(), "user launcher");
         assert_eq!(
             fs::read_to_string(install_root.join("tool")).unwrap(),
             "archive binary"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_to_archive_transition_uses_locked_root_after_install_alias_retarget() {
+        let dir = temp_dir("archive-locked-root-retarget");
+        let physical_a = dir.join("physical-a");
+        let physical_b = dir.join("physical-b");
+        let logical_install = dir.join("install-link");
+        fs::create_dir_all(&physical_a).unwrap();
+        fs::create_dir_all(&physical_b).unwrap();
+        symlink(&physical_a, &logical_install).unwrap();
+
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: logical_install.clone(),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let locked_root = physical_a.join("owner/tool");
+        fs::create_dir_all(&locked_root).unwrap();
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::write(locked_root.join("tool"), "archive binary\n").unwrap();
+        fs::write(
+            github_release_install::archive_layout_path(&physical_a, "owner/tool"),
+            "v1 archive\n",
+        )
+        .unwrap();
+        let public = roots.bin_dir.join("tool");
+        fs::write(&public, "user launcher\n").unwrap();
+
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                locked_root.to_string_lossy(),
+            ),
+            bin_links: Vec::new(),
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::None,
+            archive_root_identity: None,
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "github:release".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: false,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        fs::remove_file(&logical_install).unwrap();
+        symlink(&physical_b, &logical_install).unwrap();
+
+        cleanup_snapshot(&new_entry, &transition, &roots, Some(&locked_root)).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(locked_root.join("tool")).unwrap(),
+            "archive binary\n"
+        );
+        assert_eq!(fs::read_to_string(public).unwrap(), "user launcher\n");
+        assert!(!physical_b.join("owner/tool").try_exists().unwrap());
+        assert_eq!(fs::read_link(logical_install).unwrap(), physical_b);
     }
 
     fn temp_dir(name: &str) -> PathBuf {

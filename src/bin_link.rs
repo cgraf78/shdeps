@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
-use crate::link_state::{self, Kind};
+use crate::link_state::{self, Kind, ReconcileLink};
 
 /// Result of trying to expose one binary in the public bin directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,26 +81,45 @@ pub fn from_dir(
     install_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     let state_path = link_state::path(state_dir, name, Kind::Bin);
-    link_state::unlink_tracked(&state_path)?;
-
     let source_dir = install_dir.join("bin");
-    let Ok(entries) = fs::read_dir(&source_dir) else {
-        return Ok(Vec::new());
+    let entries = match fs::read_dir(&source_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
 
+    // Build the complete desired command inventory before changing any public
+    // path. A malformed or unreadable repo `bin` directory must not make a
+    // previously working command disappear merely because scanning failed.
     let mut sources = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if !crate::process::executable_path(&path) {
-            continue;
+    if let Some(entries) = entries {
+        for entry in entries {
+            let path = entry?.path();
+            if !crate::process::executable_path(&path) {
+                continue;
+            }
+            let Some(cmd) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            sources.push((cmd.to_owned(), path));
         }
-        let Some(cmd) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        sources.push((cmd.to_owned(), path));
     }
     sources.sort_by(|left, right| left.0.cmp(&right.0));
 
+    if !sources.is_empty() {
+        fs::create_dir_all(bin_dir)?;
+    }
+    let mut planned = Vec::new();
+    for (cmd, source) in &sources {
+        let target = bin_dir.join(cmd);
+        // Record every desired pair. Recovery still claims ownership only when
+        // the live path is an exact symlink to this source, so a regular client
+        // adapter remains unowned. Recording it closes the opposite race: if
+        // that regular file disappears and `one` creates the desired symlink,
+        // a crash must not leave the new link invisible to prune.
+        planned.push(ReconcileLink::new(target, source.clone()));
+    }
+    let tracked = link_state::begin_reconcile(&state_path, &planned)?;
     let mut created = Vec::new();
     for (cmd, path) in sources {
         if let Link::Linked(link) = one(bin_dir, &cmd, &path)? {
@@ -108,17 +127,40 @@ pub fn from_dir(
         }
     }
 
+    created.sort();
+    created.dedup();
+    let desired = created
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    // This consumes the prepublication record only after it has converted the
+    // exact live desired links into a superset recovery ledger. Prune calls the
+    // same recovery path, so ownership remains discoverable even if the dep is
+    // removed from config before another update runs.
+    link_state::recover_reconcile(&state_path)?;
+
+    for stale in tracked.iter().filter(|path| !desired.contains(*path)) {
+        if is_symlink(stale) {
+            fs::remove_file(stale)?;
+        }
+    }
     link_state::write(&state_path, &created)?;
     Ok(created)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
 
     use super::{Link, one};
+    use crate::link_state::{self, Kind, ReconcileLink};
 
     #[test]
     #[cfg(unix)]
@@ -253,6 +295,118 @@ mod tests {
 
         assert_eq!(created, [bin_dir.join("tool-a")]);
         assert!(fs::symlink_metadata(bin_dir.join("tool-b")).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_from_dir_scan_failure_preserves_prior_links_and_state() {
+        let dir = temp_dir("scan-failure");
+        let install = dir.join("share/repo");
+        let bin_dir = dir.join("bin");
+        let public = bin_dir.join("tool");
+        let prior_source = dir.join("prior/tool");
+        let state = link_state::path(&dir.join("state"), "owner/repo", Kind::Bin);
+        write_executable(&prior_source);
+        fs::create_dir_all(&bin_dir).unwrap();
+        symlink(&prior_source, &public).unwrap();
+        link_state::write(&state, std::slice::from_ref(&public)).unwrap();
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("bin"), "not a directory").unwrap();
+        let state_before = fs::read(&state).unwrap();
+
+        let error =
+            super::from_dir(&dir.join("state"), &bin_dir, "owner/repo", &install).unwrap_err();
+
+        assert!(error.to_string().contains("Not a directory"));
+        assert_eq!(fs::read_link(&public).unwrap(), prior_source);
+        assert_eq!(fs::read(&state).unwrap(), state_before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_from_dir_retires_stale_ownership_without_touching_regular_adapter() {
+        let dir = temp_dir("regular-adapter");
+        let install = dir.join("share/repo");
+        let bin_dir = dir.join("bin");
+        let public = bin_dir.join("tool");
+        let state = link_state::path(&dir.join("state"), "owner/repo", Kind::Bin);
+        write_executable(&install.join("bin/tool"));
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(&public, "#!/bin/sh\nexec client-owned-adapter \"$@\"\n").unwrap();
+        let mut permissions = fs::metadata(&public).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&public, permissions).unwrap();
+        link_state::write(&state, std::slice::from_ref(&public)).unwrap();
+        let before = fs::metadata(&public).unwrap();
+        let bytes = fs::read(&public).unwrap();
+
+        let owned = super::from_dir(&dir.join("state"), &bin_dir, "owner/repo", &install).unwrap();
+
+        let after = fs::metadata(&public).unwrap();
+        assert!(owned.is_empty());
+        assert_eq!(fs::read(&public).unwrap(), bytes);
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.mode(), before.mode());
+        assert!(!state.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_from_dir_recovers_each_durable_reconciliation_phase() {
+        for phase in [
+            "prepublication",
+            "desired-live",
+            "union-ledger",
+            "stale-retired",
+        ] {
+            let dir = temp_dir(&format!("recovery-{phase}"));
+            let install = dir.join("share/repo");
+            let bin_dir = dir.join("bin");
+            let desired = bin_dir.join("tool");
+            let stale = bin_dir.join("old-tool");
+            let desired_source = install.join("bin/tool");
+            let stale_source = dir.join("old/tool");
+            let state = link_state::path(&dir.join("state"), "owner/repo", Kind::Bin);
+            write_executable(&desired_source);
+            write_executable(&stale_source);
+            fs::create_dir_all(&bin_dir).unwrap();
+            symlink(&stale_source, &stale).unwrap();
+            link_state::write(&state, std::slice::from_ref(&stale)).unwrap();
+            link_state::begin_reconcile(
+                &state,
+                &[ReconcileLink::new(desired.clone(), desired_source.clone())],
+            )
+            .unwrap();
+            if phase != "prepublication" {
+                symlink(&desired_source, &desired).unwrap();
+            }
+            if phase == "union-ledger" || phase == "stale-retired" {
+                link_state::recover_reconcile(&state).unwrap();
+            }
+            if phase == "stale-retired" {
+                fs::remove_file(&stale).unwrap();
+            }
+
+            let owned =
+                super::from_dir(&dir.join("state"), &bin_dir, "owner/repo", &install).unwrap();
+
+            assert_eq!(
+                owned.as_slice(),
+                std::slice::from_ref(&desired),
+                "phase {phase}"
+            );
+            assert_eq!(
+                fs::read_link(&desired).unwrap(),
+                desired_source,
+                "phase {phase}"
+            );
+            assert!(fs::symlink_metadata(&stale).is_err(), "phase {phase}");
+            assert_eq!(
+                link_state::read(&state).unwrap(),
+                [desired],
+                "phase {phase}"
+            );
+        }
     }
 
     fn write_executable(path: &PathBuf) {
