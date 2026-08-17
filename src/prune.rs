@@ -799,6 +799,43 @@ mod tests {
     }
 
     #[test]
+    fn prune_raw_release_ignores_coincidental_non_directory_install_root() {
+        let fixture = Fixture::new("prune-raw-coincidental-file-root");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let coincidental = fixture.roots.install_dir.join("owner/old");
+        fixture.write(&public, "old raw release\n");
+        fixture.write(&coincidental, "unrelated\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(coincidental).unwrap(), "unrelated\n");
+        assert!(fs::symlink_metadata(public).is_err());
+    }
+
+    #[test]
     fn prune_preserves_ambiguous_legacy_release_launcher() {
         let fixture = Fixture::new("prune-ambiguous-release-launcher");
         let manifest_path = manifest::path(&fixture.roots.state_dir);

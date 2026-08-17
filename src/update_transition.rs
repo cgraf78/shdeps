@@ -399,6 +399,18 @@ fn public_symlink_matches(path: &Path, source: &Path) -> bool {
 }
 
 #[cfg(unix)]
+fn remove_recorded_transition_symlink(path: &Path, source: &Path) -> Result<bool> {
+    if !public_symlink_matches(path, source) {
+        return Ok(false);
+    }
+    // Transition swap names are unique and, once journaled, are already the
+    // recovery location. Moving one through the generic unlink quarantine
+    // would create an unrecorded second crash state.
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
 fn read_public_transition(public: &Path) -> Result<Option<(PathBuf, PublicTransitionRecord)>> {
     let journal = public_transition_path(public)?;
     let metadata = match fs::symlink_metadata(&journal) {
@@ -544,7 +556,7 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
         }
 
         if public_symlink_matches(&swap, &record.source) {
-            cleanup::unlink_symlink_with_exact_target(&swap, std::slice::from_ref(&record.source))?;
+            remove_recorded_transition_symlink(&swap, &record.source)?;
         } else if fs::symlink_metadata(&swap).is_ok() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -595,7 +607,7 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
         )
         .into());
     } else if swap_is_new {
-        cleanup::unlink_symlink_with_exact_target(&swap, std::slice::from_ref(&record.source))?;
+        remove_recorded_transition_symlink(&swap, &record.source)?;
     }
     remove_public_transition_journal(&journal)?;
     Ok(())
@@ -703,13 +715,17 @@ fn begin_public_transition(
         expected,
     };
     if let Err(error) = write_public_transition_record(&journal, &record) {
-        let _ = cleanup::unlink_symlink_with_exact_target(&swap, std::slice::from_ref(&source));
+        let _ = remove_recorded_transition_symlink(&swap, &source);
         return Err(error);
     }
     if let Err(error) = crate::repo_transition::rename_exchange(&public, &swap) {
-        let _ = cleanup::unlink_symlink_with_exact_target(&swap, std::slice::from_ref(&source));
-        let _ = remove_public_transition_journal(&journal);
-        return Err(error.into());
+        return match recover_public_transition(manifest_path, &public, roots) {
+            Ok(()) => Err(error.into()),
+            Err(recovery) => Err(std::io::Error::other(format!(
+                "public command exchange failed ({error}); recovery also failed ({recovery})"
+            ))
+            .into()),
+        };
     }
     if !cleanup::regular_file_matches_after_rename(&swap, &record.expected)? {
         let recovery = recover_public_transition(manifest_path, &public, roots);
@@ -2713,6 +2729,7 @@ mod tests {
         recover_public_transition(&manifest_path, &public, &roots).unwrap();
         assert_eq!(fs::read(&public).unwrap(), old_bytes);
         assert!(fs::symlink_metadata(public_transition_path(&public).unwrap()).is_err());
+        assert_eq!(fs::read_dir(&roots.bin_dir).unwrap().count(), 1);
 
         let manifest = crate::manifest::read(&manifest_path).unwrap();
         let refreshed = by_name(&manifest, std::slice::from_ref(&entry), &roots)

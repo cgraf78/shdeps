@@ -313,25 +313,7 @@ pub(crate) fn capture_evidence(entry: &ManifestEntry, roots: &Roots) -> Result<E
     } else {
         None
     };
-    let release_archive_state = if entry.method == method::GITHUB_RELEASE {
-        let marker = github_release_install::archive_layout_path(&roots.install_dir, &entry.name);
-        match fs::symlink_metadata(&marker) {
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                Some(ArchiveState::Ambiguous)
-            }
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                return Err(error.into());
-            }
-            _ => Some(github_release_install::archive_state(
-                &roots.state_dir,
-                &roots.install_dir,
-                &roots.bin_dir.join(&entry.cmd),
-                &entry.name,
-            )?),
-        }
-    } else {
-        None
-    };
+    let release_archive_state = capture_release_archive_state(entry, roots)?;
     let captures_install_root = entry.method == method::GITHUB_REPO
         || method::is_external(&entry.method)
         || release_archive_state == Some(ArchiveState::Proven);
@@ -384,6 +366,41 @@ pub(crate) fn capture_evidence(entry: &ManifestEntry, roots: &Roots) -> Result<E
         managed_install_root,
         managed_install_root_identity,
     })
+}
+
+fn capture_release_archive_state(
+    entry: &ManifestEntry,
+    roots: &Roots,
+) -> Result<Option<ArchiveState>> {
+    if entry.method != method::GITHUB_RELEASE {
+        return Ok(None);
+    }
+
+    let root = roots.install_dir.join(&entry.name);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(Some(ArchiveState::None)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(ArchiveState::None));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(Some(ArchiveState::Ambiguous));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let marker = github_release_install::archive_layout_path(&roots.install_dir, &entry.name);
+    if fs::symlink_metadata(&marker)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        return Ok(Some(ArchiveState::Ambiguous));
+    }
+    Ok(Some(github_release_install::archive_state(
+        &roots.state_dir,
+        &roots.install_dir,
+        &roots.bin_dir.join(&entry.cmd),
+        &entry.name,
+    )?))
 }
 
 /// Removes built-in artifacts using identity captured before caller-owned hooks.

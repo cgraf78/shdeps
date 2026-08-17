@@ -284,9 +284,7 @@ pub fn package_installed(runner: &impl Runner, package_name: &str, pkg_mgr: &str
                 Some(PACKAGE_PROBE_TIMEOUT),
             )
             .ok()
-            .is_some_and(|output| {
-                output.success && output.stdout.trim() == "install ok installed"
-            });
+            .is_some_and(|output| output.success && apt_status_installed(output.stdout.trim()));
     }
 
     let probe = match pkg_mgr {
@@ -582,8 +580,16 @@ fn parse_apt_version_line(line: &str) -> Option<(&str, &str)> {
     let status = fields.next()?;
     let name = fields.next()?;
     let version = fields.next()?;
-    (status == "install ok installed" && !name.is_empty() && !version.is_empty())
+    (apt_status_installed(status) && !name.is_empty() && !version.is_empty())
         .then_some((name, version))
+}
+
+fn apt_status_installed(status: &str) -> bool {
+    let mut fields = status.split_whitespace();
+    fields.next().is_some()
+        && fields.next() == Some("ok")
+        && fields.next() == Some("installed")
+        && fields.next().is_none()
 }
 
 fn parse_space_version_line(line: &str) -> Option<(&str, &str)> {
@@ -928,10 +934,18 @@ mod tests {
                 "install ok installed\n",
                 "",
             )
+            .with_output(
+                "dpkg-query",
+                ["-W", "-f=${Status}\n", "held"],
+                true,
+                "hold ok installed\n",
+                "",
+            )
             .with_output("rpm", ["-q", "font"], true, "font-1.0", "")
             .with_output("apk", ["info", "-e", "font"], true, "font", "");
 
         assert!(package_installed(&runner, "font", "apt"));
+        assert!(package_installed(&runner, "held", "apt"));
         assert!(package_installed(&runner, "font", "zypper"));
         assert!(package_installed(&runner, "font", "apk"));
     }
@@ -983,6 +997,7 @@ mod tests {
                 ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
                 true,
                 "install ok installed\tbat\t1.2.3-1\n\
+                 hold ok installed\theld\t4.0\n\
                  deinstall ok config-files\tremoved\t2.0\n\
                  install ok installed\tfd-find\t8.7.0\n",
                 "",
@@ -998,6 +1013,7 @@ mod tests {
         let apt = package_versions(&runner, "apt");
         assert_eq!(apt.get("bat").map(String::as_str), Some("1.2.3-1"));
         assert_eq!(apt.get("fd-find").map(String::as_str), Some("8.7.0"));
+        assert_eq!(apt.get("held").map(String::as_str), Some("4.0"));
         assert!(!apt.contains_key("removed"));
 
         let brew = package_versions(&runner, "brew");
