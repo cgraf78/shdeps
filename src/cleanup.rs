@@ -106,10 +106,9 @@ pub(crate) fn remove_builtin_with_repo_root(
             summary.preserved_package = true;
         }
         method::GITHUB_REPO => {
-            unlink_state(roots, &entry.name, Kind::Bin, &mut summary)?;
-            unlink_state(roots, &entry.name, Kind::Extras, &mut summary)?;
-
             let repo_root = locked_repo_root.expect("validated above");
+            unlink_state(roots, &entry.name, Kind::Bin, repo_root, &mut summary)?;
+            unlink_state(roots, &entry.name, Kind::Extras, repo_root, &mut summary)?;
             if let Some(path) = remove_legacy_repo_command(entry, roots, repo_root)? {
                 summary.note_removed(path);
             }
@@ -123,6 +122,11 @@ pub(crate) fn remove_builtin_with_repo_root(
         }
         binary if method::is_binary_install_root(binary) => {
             let public_bin = roots.bin_dir.join(&entry.cmd);
+            let install_root = roots.install_dir.join(&entry.name);
+            let public_bin_is_symlink = fs::symlink_metadata(&public_bin)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            let public_bin_still_owned =
+                !public_bin_is_symlink || points_into(&public_bin, &install_root);
             let preserve_public_launcher = if binary == method::GITHUB_RELEASE {
                 github_release_install::archive_state(
                     &roots.state_dir,
@@ -135,13 +139,18 @@ pub(crate) fn remove_builtin_with_repo_root(
                 false
             };
 
-            unlink_state(roots, &entry.name, Kind::Bin, &mut summary)?;
-            unlink_state(roots, &entry.name, Kind::Extras, &mut summary)?;
-            if !preserve_public_launcher {
+            unlink_state(roots, &entry.name, Kind::Bin, &install_root, &mut summary)?;
+            unlink_state(
+                roots,
+                &entry.name,
+                Kind::Extras,
+                &install_root,
+                &mut summary,
+            )?;
+            if !preserve_public_launcher && public_bin_still_owned {
                 remove_any(&public_bin, &mut summary)?;
             }
 
-            let install_root = roots.install_dir.join(&entry.name);
             remove_any(&install_root, &mut summary)?;
             remove_empty_install_parents(&install_root, &roots.install_dir, &mut summary)?;
             remove_stamps(&roots.state_dir, &entry.name, &mut summary)?;
@@ -234,19 +243,38 @@ pub fn remove_stamps(state_dir: &Path, name: &str, summary: &mut Summary) -> Res
     Ok(())
 }
 
-fn unlink_state(roots: &Roots, name: &str, kind: Kind, summary: &mut Summary) -> Result<()> {
+fn unlink_state(
+    roots: &Roots,
+    name: &str,
+    kind: Kind,
+    owner_root: &Path,
+    summary: &mut Summary,
+) -> Result<()> {
     let state_path = link_state::path(&roots.state_dir, name, kind);
     let had_state = state_path.exists();
-    let links = link_state::read(&state_path)?;
-    link_state::unlink_tracked(&state_path)?;
+    let removed =
+        link_state::unlink_tracked_matching(&state_path, |link| points_into(link, owner_root))?;
 
-    for link in links {
+    for link in removed {
         summary.note_removed(link);
     }
     if had_state {
         summary.note_removed(state_path);
     }
     Ok(())
+}
+
+fn points_into(path: &Path, root: &Path) -> bool {
+    let resolved = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(_) => match fs::read_link(path) {
+            Ok(target) if target.is_absolute() => target,
+            Ok(target) => path.parent().unwrap_or_else(|| Path::new("/")).join(target),
+            Err(_) => return false,
+        },
+    };
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    resolved.starts_with(canonical_root)
 }
 
 /// Returns the only checkout root a manifest row may authorize for locking.
@@ -631,6 +659,45 @@ mod tests {
                 .join("owner/binary-tool.release.stamp")
                 .exists()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn binary_method_cleanup_preserves_tracked_command_retargeted_to_another_install() {
+        let fixture = Fixture::new("binary-retargeted-command");
+        let old_root = fixture.roots.install_dir.join("old-tool");
+        let replacement_root = fixture.roots.install_dir.join("replacement-tool");
+        let old_target = old_root.join("bin/tool");
+        let replacement_target = replacement_root.join("bin/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+
+        fs::create_dir_all(old_target.parent().unwrap()).unwrap();
+        fs::write(&old_target, "old command\n").unwrap();
+        fs::create_dir_all(replacement_target.parent().unwrap()).unwrap();
+        fs::write(&replacement_target, "replacement command\n").unwrap();
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(&replacement_target, &public).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "old-tool", Kind::Bin),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+
+        let summary = remove_for_test(
+            &ManifestEntry::new("old-tool", "cargo", "tool", old_root.to_string_lossy()),
+            &fixture.roots,
+        )
+        .unwrap();
+
+        assert!(!old_root.exists());
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            replacement_target,
+            "stale path-only ownership must not remove another install's live command"
+        );
+        assert!(replacement_root.exists());
+        assert!(!summary.removed.contains(&public));
+        assert!(!link_state::path(&fixture.roots.state_dir, "old-tool", Kind::Bin).exists());
     }
 
     #[test]
