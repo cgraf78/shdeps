@@ -580,13 +580,11 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
     }
     ensure_transitioned_binlink(&record, roots)?;
     if cleanup::regular_file_matches_after_rename(&swap, &record.expected)? {
-        if !cleanup::remove_owned_regular_file_after_rename(&swap, &record.expected)? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "could not retire the recorded previous public command",
-            )
-            .into());
-        }
+        // `swap` is already a unique, journal-recorded recovery path whose
+        // exact file generation was validated above. Moving it through the
+        // generic cleanup quarantine would create a second, unjournaled crash
+        // window, so retire the recorded generation in place.
+        fs::remove_file(&swap)?;
     } else if swap_exists && !swap_is_new {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -734,6 +732,24 @@ pub(crate) fn install_with_prepared(
     manifest_path: &Path,
     install: impl FnOnce(&Path) -> Result<Item>,
 ) -> Result<Item> {
+    install_with_prepared_and_commit(
+        entry,
+        transition,
+        roots,
+        manifest_path,
+        install,
+        manifest::upsert,
+    )
+}
+
+fn install_with_prepared_and_commit(
+    entry: &Entry,
+    transition: Option<&Transition>,
+    roots: &Roots,
+    manifest_path: &Path,
+    install: impl FnOnce(&Path) -> Result<Item>,
+    commit_manifest: impl FnOnce(&Path, ManifestEntry) -> Result<()>,
+) -> Result<Item> {
     let prepared_manifest = prepare_manifest(entry, transition, roots, manifest_path)?;
     let mut item = match install(prepared_manifest.as_deref().unwrap_or(manifest_path)) {
         Ok(item) => item,
@@ -795,19 +811,19 @@ pub(crate) fn install_with_prepared(
     }
 
     if let Some(committed_entry) = committed_entry {
-        if let Err(error) = manifest::upsert(manifest_path, committed_entry) {
+        if let Err(error) = commit_manifest(manifest_path, committed_entry) {
             #[cfg(unix)]
-            if let Some(public) = pending_public.as_deref()
-                && let Err(recovery) = recover_public_transition(manifest_path, public, roots)
-            {
-                return Err(with_prepared_cleanup(
-                    std::io::Error::other(format!(
-                        "manifest commit failed ({error}); public command recovery also failed ({recovery})"
-                    ))
-                    .into(),
-                    prepared_manifest.as_deref(),
-                    &roots.state_dir,
-                ));
+            if let Some(public) = pending_public.as_deref() {
+                if let Err(recovery) = recover_public_transition(manifest_path, public, roots) {
+                    return Err(with_prepared_cleanup(
+                        std::io::Error::other(format!(
+                            "manifest commit failed ({error}); public command recovery also failed ({recovery})"
+                        ))
+                        .into(),
+                        prepared_manifest.as_deref(),
+                        &roots.state_dir,
+                    ));
+                }
             }
             return Err(with_prepared_cleanup(
                 error,
@@ -817,15 +833,15 @@ pub(crate) fn install_with_prepared(
         }
     }
     #[cfg(unix)]
-    if let Some(public) = pending_public.as_deref()
-        && let Err(error) = recover_public_transition(manifest_path, public, roots)
-    {
-        item.status = crate::update::ItemStatus::Warning;
-        item.reason = crate::update::ItemReason::Other;
-        item.detail = format!(
-            "{}; committed the new provider but public command finalization needs recovery: {error}",
-            item.detail
-        );
+    if let Some(public) = pending_public.as_deref() {
+        if let Err(error) = recover_public_transition(manifest_path, public, roots) {
+            item.status = crate::update::ItemStatus::Warning;
+            item.reason = crate::update::ItemReason::Other;
+            item.detail = format!(
+                "{}; committed the new provider but public command finalization needs recovery: {error}",
+                item.detail
+            );
+        }
     }
     if let Err(error) = remove_prepared_manifest(prepared_manifest.as_deref(), &roots.state_dir) {
         item.status = crate::update::ItemStatus::Warning;
@@ -1442,8 +1458,9 @@ mod tests {
 
     use super::{
         Transition, begin_public_transition, by_name, cleanup_snapshot, install_with_prepared,
-        points_into, prepare_manifest_with_nonce, public_transition_path,
-        recover_public_transition, reject_identity_handoffs, unlink_snapshot,
+        install_with_prepared_and_commit, points_into, prepare_manifest_with_nonce,
+        public_transition_path, recover_public_transition, reject_identity_handoffs,
+        unlink_snapshot,
     };
     use crate::config::{Entry, parse_entry};
     use crate::github_release_install::{self, ArchiveState};
@@ -2627,7 +2644,7 @@ mod tests {
             raw_release_transition("manifest-commit-failure");
         let old_bytes = fs::read(&public).unwrap();
 
-        let error = install_with_prepared(
+        let error = install_with_prepared_and_commit(
             &entry,
             Some(&transition),
             &roots,
@@ -2642,18 +2659,27 @@ mod tests {
                         source.to_string_lossy(),
                     ),
                 )?;
-                fs::set_permissions(&roots.state_dir, fs::Permissions::from_mode(0o500))?;
                 Ok(Item::changed(
                     entry.name.clone(),
                     ItemReason::Installed,
                     "installed",
                 ))
             },
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected manifest commit failure",
+                )
+                .into())
+            },
         )
         .unwrap_err();
-        fs::set_permissions(&roots.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(error.to_string().contains("Permission denied"));
+        assert!(
+            error
+                .to_string()
+                .contains("injected manifest commit failure")
+        );
         assert_eq!(fs::read(&public).unwrap(), old_bytes);
         assert!(
             fs::symlink_metadata(public_transition_path(&public).unwrap()).is_err(),
@@ -2698,6 +2724,7 @@ mod tests {
         recover_public_transition(&manifest_path, &public, &roots).unwrap();
         assert_eq!(fs::read_link(&public).unwrap(), source);
         assert!(fs::symlink_metadata(public_transition_path(&public).unwrap()).is_err());
+        assert_eq!(fs::read_dir(&roots.bin_dir).unwrap().count(), 1);
     }
 
     #[test]

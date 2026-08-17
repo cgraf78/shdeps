@@ -108,6 +108,7 @@ pub struct Summary {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Evidence {
     public_regular_identity: Option<FileIdentity>,
+    release_archive_state: Option<ArchiveState>,
     logical_install_base_identity: Option<LogicalBaseIdentity>,
     logical_install_base_was_absent: bool,
     physical_install_base: Option<PathBuf>,
@@ -161,10 +162,11 @@ impl Evidence {
         #[cfg(unix)]
         {
             if let Some(identity) = self.managed_install_root_identity.as_ref() {
-                return self
-                    .managed_install_root
-                    .as_deref()
-                    .is_some_and(|path| identity.matches_before_removal(path));
+                return self.managed_install_root.as_deref().is_some_and(|path| {
+                    identity.matches_before_removal(path)
+                        || fs::symlink_metadata(path)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                });
             }
             self.managed_install_root.as_deref().is_some_and(|path| {
                 fs::symlink_metadata(path)
@@ -198,11 +200,12 @@ impl Evidence {
         if self.logical_base_matches(install_dir) {
             roots.push(logical_root);
         }
-        if self.install_base_matches()
-            && let Some(root) = self.managed_install_root.as_ref()
-            && !roots.contains(root)
-        {
-            roots.push(root.clone());
+        if self.install_base_matches() {
+            if let Some(root) = self.managed_install_root.as_ref() {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
         }
         roots
     }
@@ -310,16 +313,28 @@ pub(crate) fn capture_evidence(entry: &ManifestEntry, roots: &Roots) -> Result<E
     } else {
         None
     };
-    let captures_install_root = entry.method == method::GITHUB_REPO
-        || method::is_external(&entry.method)
-        || (entry.method == method::GITHUB_RELEASE
-            && github_release_install::archive_state(
+    let release_archive_state = if entry.method == method::GITHUB_RELEASE {
+        let marker = github_release_install::archive_layout_path(&roots.install_dir, &entry.name);
+        match fs::symlink_metadata(&marker) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                Some(ArchiveState::Ambiguous)
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error.into());
+            }
+            _ => Some(github_release_install::archive_state(
                 &roots.state_dir,
                 &roots.install_dir,
                 &roots.bin_dir.join(&entry.cmd),
                 &entry.name,
-            )
-            .is_ok_and(|state| state == ArchiveState::Proven));
+            )?),
+        }
+    } else {
+        None
+    };
+    let captures_install_root = entry.method == method::GITHUB_REPO
+        || method::is_external(&entry.method)
+        || release_archive_state == Some(ArchiveState::Proven);
     let (logical_install_base_identity, logical_install_base_was_absent) = if captures_install_root
     {
         match logical_base_identity(&roots.install_dir)? {
@@ -361,6 +376,7 @@ pub(crate) fn capture_evidence(entry: &ManifestEntry, roots: &Roots) -> Result<E
         .flatten();
     Ok(Evidence {
         public_regular_identity,
+        release_archive_state,
         logical_install_base_identity,
         logical_install_base_was_absent,
         physical_install_base,
@@ -440,25 +456,9 @@ pub(crate) fn remove_builtin_with_evidence(
             let physical_root = evidence.managed_install_root.as_ref();
             let physical_base = evidence.physical_install_base.as_ref();
             let root_authority = evidence.install_base_matches() && evidence.managed_root_matches();
-            let mut owner_roots = Vec::new();
-            if root_authority {
-                if evidence.logical_base_matches(&roots.install_dir) {
-                    owner_roots.push(logical_root);
-                }
-                if let Some(physical_root) = physical_root {
-                    owner_roots.push(physical_root.clone());
-                }
-            }
+            let owner_roots = evidence.owner_roots(&roots.install_dir, logical_root);
             let archive_state = if binary == method::GITHUB_RELEASE {
-                match physical_base.filter(|_| evidence.install_base_matches()) {
-                    Some(physical_base) => github_release_install::archive_state(
-                        &roots.state_dir,
-                        physical_base,
-                        &public_bin,
-                        &entry.name,
-                    )?,
-                    None => ArchiveState::None,
-                }
+                evidence.release_archive_state.unwrap_or(ArchiveState::None)
             } else {
                 ArchiveState::None
             };
@@ -1044,26 +1044,6 @@ pub(crate) fn remove_owned_regular_file(path: &Path, identity: &FileIdentity) ->
         } else {
             Ok(false)
         }
-    }
-}
-
-pub(crate) fn remove_owned_regular_file_after_rename(
-    path: &Path,
-    identity: &FileIdentity,
-) -> Result<bool> {
-    #[cfg(unix)]
-    {
-        quarantine_regular_file_with(
-            path,
-            identity,
-            false,
-            crate::repo_transition::rename_noreplace,
-        )
-    }
-
-    #[cfg(not(unix))]
-    {
-        remove_owned_regular_file(path, identity)
     }
 }
 

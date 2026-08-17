@@ -637,9 +637,7 @@ where
 
     update_transition::reject_identity_handoffs(manifest, entries, context.env, context.pkg_mgr)?;
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
-    let package_transitions = transitions.keys().cloned().collect::<BTreeSet<_>>();
-    let mut package_proofs = update_pkg::required_proofs(entries, manifest, context);
-    package_proofs.extend(package_transitions.iter().cloned());
+    let package_proofs = update_pkg::required_proofs(entries, manifest, context);
 
     let mut summary = Summary::default();
     let mut changed = Vec::new();
@@ -2626,12 +2624,16 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             let runner = if already_installed {
                 FakeRunner::default().with_success(
                     "dpkg-query",
-                    ["-W", "-f=${Package}\t${Version}\n"],
-                    "tool\t1.0\n",
+                    ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                    "install ok installed\ttool\t1.0\n",
                 )
             } else {
                 FakeRunner::default()
-                    .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+                    .with_success(
+                        "dpkg-query",
+                        ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                        "",
+                    )
                     .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
                     .with_success("sudo", ["apt-get", "install", "-y", "tool"], "")
             };
@@ -2691,12 +2693,16 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             let runner = if already_installed {
                 FakeRunner::default().with_success(
                     "dpkg-query",
-                    ["-W", "-f=${Package}\t${Version}\n"],
-                    "tool\t1.0\n",
+                    ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                    "install ok installed\ttool\t1.0\n",
                 )
             } else {
                 FakeRunner::default()
-                    .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+                    .with_success(
+                        "dpkg-query",
+                        ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                        "",
+                    )
                     .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
                     .with_success("sudo", ["apt-get", "install", "-y", "tool"], "")
             };
@@ -2739,6 +2745,16 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         manifest::upsert(&manifest_path, old_manifest.clone()).unwrap();
         let manifest = manifest::read(&manifest_path).unwrap();
         let runner = FakeRunner::default()
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "deinstall ok config-files\ttool\t1.0\n",
+            )
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\n", "tool"],
+                "deinstall ok config-files\n",
+            )
             .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
             .with_failure("sudo", ["apt-get", "install", "-y", "tool"]);
 
@@ -2752,6 +2768,12 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
 
         assert!(summary.has_errors());
         assert_eq!(summary.failed, ["tool"]);
+        assert!(
+            runner
+                .calls()
+                .contains(&key("sudo", ["apt-get", "install", "-y", "tool"])),
+            "residual dpkg config state must not prove package ownership"
+        );
         assert!(old_install.exists());
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("tool"),
@@ -3064,8 +3086,8 @@ install() { return 42; }
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default().with_command("jq").with_success(
             "dpkg-query",
-            ["-W", "-f=${Package}\t${Version}\n"],
-            "jq\t1.0\n",
+            ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+            "install ok installed\tjq\t1.0\n",
         );
 
         let summary = run(
@@ -3098,7 +3120,11 @@ install() { return 42; }
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default()
             .with_command("tool")
-            .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "",
+            )
             .with_success(
                 "apt-cache",
                 ["show", "replacement"],
@@ -3131,7 +3157,11 @@ install() { return 42; }
         let entry = parse_entry("replacement|pkg|tool|-|-", None);
         let first_runner = FakeRunner::default()
             .with_command("tool")
-            .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "",
+            )
             .with_failure("apt-cache", ["show", "replacement"]);
 
         let first = run(
@@ -3146,7 +3176,11 @@ install() { return 42; }
         let recorded = manifest::read(&manifest_path).unwrap();
         let second_runner = FakeRunner::default()
             .with_command("tool")
-            .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "",
+            )
             .with_success(
                 "apt-cache",
                 ["show", "replacement"],
@@ -3178,8 +3212,8 @@ install() { return 42; }
         let entries = [parse_entry("font|pkg|font|-|-", None)];
         let first_runner = FakeRunner::default().with_success(
             "dpkg-query",
-            ["-W", "-f=${Package}\t${Version}\n"],
-            "font\t1.0\n",
+            ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+            "install ok installed\tfont\t1.0\n",
         );
 
         let first = run(
@@ -3218,8 +3252,8 @@ install() { return 42; }
         let entries = [parse_entry("font|pkg|font|-|-", None)];
         let first_runner = FakeRunner::default().with_success(
             "dpkg-query",
-            ["-W", "-f=${Package}\t${Version}\n"],
-            "font\t1.0\n",
+            ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+            "install ok installed\tfont\t1.0\n",
         );
 
         run(
@@ -3233,8 +3267,8 @@ install() { return 42; }
         let manifest = manifest::read(&manifest_path).unwrap();
         let forced_runner = FakeRunner::default().with_success(
             "dpkg-query",
-            ["-W", "-f=${Package}\t${Version}\n"],
-            "font\t1.0\n",
+            ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+            "install ok installed\tfont\t1.0\n",
         );
         let forced = run(
             &entries,
@@ -3249,9 +3283,10 @@ install() { return 42; }
 
         assert_eq!(forced.items[0].detail, "installed");
         assert!(
-            forced_runner
-                .calls()
-                .contains(&key("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"])),
+            forced_runner.calls().contains(&key(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"]
+            )),
             "force mode must re-prove package state instead of trusting the warm cache"
         );
     }
@@ -3292,9 +3327,10 @@ install() { return 42; }
             item.status == super::ItemStatus::Current && item.reason == super::ItemReason::Installed
         }));
         assert!(
-            !runner
-                .calls()
-                .contains(&key("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"])),
+            !runner.calls().contains(&key(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"]
+            )),
             "forced package checks still need to re-prove command presence, but the expensive manager-wide version snapshot is unnecessary when every command is present"
         );
     }
@@ -3323,6 +3359,45 @@ install() { return 42; }
                 .unwrap()
                 .get("tool")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn update_skipped_package_transition_does_not_require_manager_proof() {
+        let fixture = Fixture::new("pkg-none-transition");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "tool",
+            "cargo",
+            "tool",
+            fixture
+                .roots
+                .install_dir
+                .join("tool/bin/tool")
+                .display()
+                .to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let runner = FakeRunner::default();
+
+        let summary = run(
+            &[parse_entry("tool|pkg|tool|apt:NONE|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.items[0].reason,
+            super::ItemReason::PackageManagerOverride
+        );
+        assert!(runner.calls().is_empty());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
         );
     }
 
@@ -3624,7 +3699,11 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/jq-post"; }
         fixture.env = RuntimeEnv::new("linux", "phone").with_android(true);
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         let runner = FakeRunner::default()
-            .with_success("dpkg-query", ["-W", "-f=${Package}\t${Version}\n"], "")
+            .with_success(
+                "dpkg-query",
+                ["-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                "",
+            )
             .with_success("apt-get", ["update", "-qq"], "")
             .with_success("apt-cache", ["show", "termux-jq"], "Package: termux-jq\n")
             .with_success("apt-get", ["install", "-y", "termux-jq"], "");

@@ -1651,11 +1651,7 @@ fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
     fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 0\n");
     fixture.write_executable(
         "fakebin/dpkg-query",
-        "#!/bin/sh\nlast=\nfor arg do last=$arg; done\nprintf 'query %s\\n' \"$last\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$last\" = font-package ] || exit 1\nprintf 'font-package\\t9.8.7\\n'\n",
-    );
-    fixture.write_executable(
-        "fakebin/dpkg",
-        "#!/bin/sh\nprintf 'package %s\\n' \"$*\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$*\" = '-s font-package' ]\n",
+        "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase $2 in *Package*) kind=version ;; *) kind=status ;; esac\nprintf 'query %s %s\\n' \"$kind\" \"$last\" >>\"$SHDEPS_TEST_LOG\"\n[ \"$last\" = font-package ] || exit 1\nif [ \"$kind\" = version ]; then\n  printf 'install ok installed\\tfont-package\\t9.8.7\\n'\nelse\n  printf 'install ok installed\\n'\nfi\n",
     );
     fixture.write_executable(
         "fakebin/fake-tool",
@@ -1673,7 +1669,7 @@ fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
         probes
             .lines()
             .filter(|line| line.starts_with("query "))
-            .all(|line| line == "query fake-package"),
+            .all(|line| line == "query version fake-package"),
         "single-dependency check should not enumerate every installed package: {probes}"
     );
 
@@ -1688,7 +1684,7 @@ fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
     );
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        "query font-package\n",
+        "query version font-package\n",
         "package-only dependencies should retain version detail from one targeted probe"
     );
 
@@ -1700,7 +1696,7 @@ fn check_pkg_uses_targeted_probes_instead_of_full_inventory() {
     assert_eq!(text(&missing.stdout), "missing-package: not installed\n");
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        "query missing-package\npackage -s missing-package\n"
+        "query version missing-package\nquery status missing-package\n"
     );
 }
 
