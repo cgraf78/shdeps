@@ -1843,7 +1843,19 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&git_wrapper, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::copy(&real_bash, shell_bin.join("bash")).unwrap();
+        // Do not copy the ELF and execute it immediately: Debian's overlay
+        // filesystem can report ETXTBSY while the freshly written binary is
+        // still settling. An absolute-interpreter shim exercises the same
+        // separate trusted PATH entry without that filesystem race.
+        fs::write(
+            shell_bin.join("bash"),
+            format!(
+                "#!{}\nexec \"{}\" \"$@\"\n",
+                real_bash.display(),
+                real_bash.display()
+            ),
+        )
+        .unwrap();
         fs::set_permissions(shell_bin.join("bash"), fs::Permissions::from_mode(0o755)).unwrap();
 
         let quarantine = Quarantine::create(&root.join("state")).unwrap();
