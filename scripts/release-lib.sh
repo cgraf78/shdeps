@@ -508,11 +508,112 @@ Options:
 EOF
 }
 
+release_restore_bounded_command_traps() {
+  if [[ -n "$old_hup_trap" ]]; then eval "$old_hup_trap"; else trap - HUP; fi
+  if [[ -n "$old_int_trap" ]]; then eval "$old_int_trap"; else trap - INT; fi
+  if [[ -n "$old_term_trap" ]]; then eval "$old_term_trap"; else trap - TERM; fi
+}
+
+release_signal_command_group() {
+  local root=$1 signal=$2 member members
+
+  members=$(ps -eo pid=,pgid= 2>/dev/null |
+    awk -v group="$root" -v root="$root" '$2 == group && $1 != root { print $1 }')
+  for member in $members; do
+    kill -s "$signal" "$member" 2>/dev/null || true
+  done
+  kill -s "$signal" "$root" 2>/dev/null || true
+}
+
+release_abort_bounded_command() {
+  local signal=$1
+
+  if [[ -n "$pid" ]]; then
+    release_signal_command_group "$pid" TERM
+    release_signal_command_group "$pid" KILL
+    wait "$pid" 2>/dev/null || true
+  fi
+  if [[ -n "$watchdog" ]]; then
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+  fi
+  [[ "$monitor_enabled" == 1 ]] || set +m
+  rm -f "$marker"
+  release_restore_bounded_command_traps
+  kill -s "$signal" "$bounded_command_shell_pid"
+}
+
+release_bounded_command() {
+  local timeout_seconds=${RELEASE_NETWORK_TIMEOUT_SECONDS:-120}
+  local kill_after=${RELEASE_NETWORK_KILL_AFTER_SECONDS:-5}
+  local bounded_command_shell_pid marker old_hup_trap old_int_trap old_term_trap
+  local monitor_enabled=0 pid='' watchdog='' status
+
+  marker=$(mktemp "${TMPDIR:-/tmp}/release-network-timeout.XXXXXX") || return 1
+  rm -f "$marker"
+  bounded_command_shell_pid=$(sh -c 'printf "%s\n" "$PPID"')
+  old_hup_trap=$(trap -p HUP)
+  old_int_trap=$(trap -p INT)
+  old_term_trap=$(trap -p TERM)
+  trap 'release_abort_bounded_command HUP' HUP
+  trap 'release_abort_bounded_command INT' INT
+  trap 'release_abort_bounded_command TERM' TERM
+  [[ $- != *m* ]] || monitor_enabled=1
+  set -m
+  "$@" &
+  pid=$!
+  [[ "$monitor_enabled" == 1 ]] || set +m
+  (
+    local sleeper=
+    trap '[[ -z "$sleeper" ]] || kill "$sleeper" 2>/dev/null || true' EXIT
+    trap 'exit 0' HUP INT TERM
+
+    sleep "$timeout_seconds" &
+    sleeper=$!
+    wait "$sleeper" 2>/dev/null || exit 0
+    sleeper=
+    if kill -0 "$pid" 2>/dev/null; then
+      : >"$marker"
+      release_signal_command_group "$pid" TERM
+      sleep "$kill_after" &
+      sleeper=$!
+      wait "$sleeper" 2>/dev/null || exit 0
+      sleeper=
+      release_signal_command_group "$pid" KILL
+    fi
+  ) &
+  watchdog=$!
+  if wait "$pid"; then status=0; else status=$?; fi
+  if [[ ! -f "$marker" ]]; then
+    kill "$watchdog" 2>/dev/null || true
+  fi
+  wait "$watchdog" 2>/dev/null || true
+  release_restore_bounded_command_traps
+  if [[ -f "$marker" ]]; then status=124; fi
+  rm -f "$marker"
+  return "$status"
+}
+
+release_network_git() {
+  GIT_TERMINAL_PROMPT=0 \
+    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes -oConnectTimeout=15 -oServerAliveInterval=15 -oServerAliveCountMax=2}" \
+    release_bounded_command git \
+    -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 "$@"
+}
+
+release_remote_ref_matches() {
+  local remote=$1 ref=$2 expected=$3 output actual
+
+  output=$(release_network_git ls-remote --exit-code "$remote" "$ref") || return 1
+  actual=${output%%[[:space:]]*}
+  [[ "$actual" == "$expected" ]]
+}
+
 # Cut (and optionally publish) the release tag for the current HEAD.
 release_cut() {
   local push=0 dry_run=0
   local remote branch remote_ref head_commit remote_commit tag tag_type tagged_commit
-  local tag_exists=0
+  local remote_tag_status gh_error push_status tag_exists=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -550,7 +651,8 @@ release_cut() {
   # Fetch before deriving the tag so local release cuts are anchored to the same
   # commit that GitHub will build. The explicit refspec keeps this independent of
   # whatever upstream tracking configuration a developer happens to have locally.
-  git fetch --quiet --tags "$remote" "+refs/heads/$branch:$remote_ref" || return 1
+  release_network_git fetch --quiet --tags "$remote" \
+    "+refs/heads/$branch:$remote_ref" || return 1
 
   head_commit=$(git rev-parse HEAD)
   remote_commit=$(git rev-parse "$remote_ref")
@@ -585,14 +687,34 @@ release_cut() {
     tag_exists=1
   fi
 
-  if git ls-remote --exit-code --tags "$remote" "refs/tags/$tag" >/dev/null 2>&1; then
+  if release_network_git ls-remote --exit-code --tags "$remote" \
+    "refs/tags/$tag" >/dev/null 2>&1; then
+    remote_tag_status=0
+  else
+    remote_tag_status=$?
+  fi
+  if [[ "$remote_tag_status" -eq 0 ]]; then
     release_die "$remote already has tag $tag"
     return 1
+  elif [[ "$remote_tag_status" -ne 2 ]]; then
+    release_die "cannot determine whether $remote already has tag $tag"
+    return "$remote_tag_status"
   fi
 
-  if command -v gh >/dev/null 2>&1 && gh release view "$tag" >/dev/null 2>&1; then
-    release_die "GitHub release $tag already exists"
-    return 1
+  if command -v gh >/dev/null 2>&1; then
+    gh_error=$(mktemp "${TMPDIR:-/tmp}/release-gh-view.XXXXXX") || return 1
+    if release_bounded_command gh release view "$tag" >/dev/null 2>"$gh_error"; then
+      rm -f "$gh_error"
+      release_die "GitHub release $tag already exists"
+      return 1
+    elif ! grep -Eqi 'release not found|HTTP 404|status.?404|none of the git remotes configured|To use GitHub CLI in a GitHub Actions workflow|To get started with GitHub CLI|not logged into any GitHub hosts' \
+      "$gh_error"; then
+      cat "$gh_error" >&2
+      rm -f "$gh_error"
+      release_die "cannot determine whether GitHub release $tag exists"
+      return 1
+    fi
+    rm -f "$gh_error"
   fi
 
   if [[ "$dry_run" == 1 ]]; then
@@ -624,8 +746,26 @@ release_cut() {
   fi
 
   if [[ "$push" == 1 ]]; then
-    git push --quiet "$remote" "$branch" || return 1
-    git push --quiet "$remote" "refs/tags/$tag" || return 1
+    if release_network_git push --quiet "$remote" "$branch"; then
+      push_status=0
+    else
+      push_status=$?
+    fi
+    if [[ "$push_status" -ne 0 ]]; then
+      release_remote_ref_matches "$remote" "refs/heads/$branch" "$head_commit" ||
+        return "$push_status"
+      printf 'release: branch push reached %s after an ambiguous client error\n' "$remote"
+    fi
+    if release_network_git push --quiet "$remote" "refs/tags/$tag"; then
+      push_status=0
+    else
+      push_status=$?
+    fi
+    if [[ "$push_status" -ne 0 ]]; then
+      release_remote_ref_matches "$remote" "refs/tags/$tag" "$head_commit" ||
+        return "$push_status"
+      printf 'release: tag push reached %s after an ambiguous client error\n' "$remote"
+    fi
     pushed_tag=1
     printf 'release: pushed tag %s\n' "$tag"
   else
