@@ -60,6 +60,19 @@ shdeps_unskip() { command shdeps __api skip-clear "$@"; }
 shdeps_find_runtime() { command shdeps __api find-runtime "$@"; }
 shdeps_write_wrapper() { command shdeps __api write-wrapper "$@"; }
 
+# Download helper carrying the same stall guards as shdeps' own transport.
+#
+# Hooks reach the network with bare `curl`, which waits forever for a body that
+# never arrives; a wedged release download then hangs the whole update with no
+# output. Owning the policy here keeps every hook consistent with the engine
+# instead of each one restating (or forgetting) its own timeouts.
+#
+# `--speed-limit`/`--speed-time` rather than a fixed `--max-time`, so a large
+# but healthy asset is not killed for being slow.
+shdeps_curl() {
+  curl --connect-timeout 10 --speed-limit 1024 --speed-time 60 --retry 3 "$@"
+}
+
 shdeps_log() { printf '%s\n' "$*"; }
 shdeps_warn() { printf '%s\n' "$*" >&2; }
 shdeps_log_warn() { shdeps_warn "$@"; }
