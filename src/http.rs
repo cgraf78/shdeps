@@ -15,6 +15,14 @@ pub trait Client: Sync {
     /// Downloads `url`, optionally adding a GitHub bearer token.
     fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>>;
 
+    /// Downloads a small metadata response with an aggregate deadline.
+    ///
+    /// Test clients and callers without a distinct transport policy retain
+    /// the normal GET behavior by default.
+    fn get_metadata(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+        self.get(url, token)
+    }
+
     /// Downloads a GitHub release asset through the REST asset endpoint.
     fn get_github_asset(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
         self.get(url, token)
@@ -105,11 +113,26 @@ const CURL_GET_ARGS: [&str; 6] = [
     "--config",
     "-",
 ];
+// GitHub JSON and redirect responses are small. Unlike release assets, they
+// need a total retry budget so a resolver with many repositories cannot spend
+// the caller's whole deadline in successive waves of individually bounded
+// requests.
+// One 20-second attempt, one retry, and a fixed one-second delay cap each
+// metadata request at about 41 seconds. Stating the arithmetic explicitly is
+// important: curl's `--retry-max-time` only decides whether to start another
+// attempt and does not terminate an attempt already in flight.
+const CURL_METADATA_ARGS: [&str; 6] = ["--max-time", "20", "--retry", "1", "--retry-delay", "1"];
 const CURL_REDIRECT_ARGS: [&str; 4] = ["--silent", "--show-error", "--config", "-"];
 
 impl Client for Curl {
     fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
         self.get_with_accept(url, token, GithubAccept::Json)
+    }
+
+    fn get_metadata(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+        let config = curl_config(url, token, GithubAccept::Json)?;
+        let output = run_curl(&CURL_GET_ARGS, &CURL_METADATA_ARGS, &config)?;
+        response(output)
     }
 
     fn get_github_asset(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
@@ -132,7 +155,7 @@ impl Client for Curl {
 
     fn redirect_location(&self, url: &str) -> io::Result<Option<String>> {
         let config = redirect_curl_config(url)?;
-        let output = run_curl(&CURL_REDIRECT_ARGS, &config)?;
+        let output = run_curl(&CURL_REDIRECT_ARGS, &CURL_METADATA_ARGS, &config)?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             return Err(io::Error::other(detail));
@@ -151,31 +174,15 @@ impl Curl {
         accept: GithubAccept,
     ) -> io::Result<Vec<u8>> {
         let config = curl_config(url, token, accept)?;
-        let output = run_curl(&CURL_GET_ARGS, &config)?;
-        let has_status_trailer = output.status.success() || output.status.code() == Some(22);
-        let (body, status) = if has_status_trailer {
-            split_status_suffix(output.stdout)
-        } else {
-            (output.stdout, None)
-        };
-        if output.status.success() {
-            return Ok(body);
-        }
-
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        // Attach the HTTP status only when curl actually saw a response
-        // (status "000" means DNS/connect failure - keep the legacy shape so
-        // callers do not misclassify network errors as HTTP errors).
-        if let Some(status) = status.filter(|&status| status >= 400) {
-            return Err(io::Error::other(HttpStatusError::new(status, detail)));
-        }
-        Err(io::Error::other(detail))
+        let output = run_curl(&CURL_GET_ARGS, &[], &config)?;
+        response(output)
     }
 }
 
-fn run_curl(args: &[&str], config: &str) -> io::Result<Output> {
+fn run_curl(args: &[&str], request_bounds: &[&str], config: &str) -> io::Result<Output> {
     let mut child = Command::new("curl")
         .args(CURL_STALL_ARGS)
+        .args(request_bounds)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -187,6 +194,26 @@ fn run_curl(args: &[&str], config: &str) -> io::Result<Output> {
     }
 
     child.wait_with_output()
+}
+
+fn response(output: Output) -> io::Result<Vec<u8>> {
+    let has_status_trailer = output.status.success() || output.status.code() == Some(22);
+    let (body, status) = if has_status_trailer {
+        split_status_suffix(output.stdout)
+    } else {
+        (output.stdout, None)
+    };
+    if output.status.success() {
+        return Ok(body);
+    }
+
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    // Attach the HTTP status only when curl actually saw a response (status
+    // "000" means DNS/connect failure, which is not an HTTP response).
+    if let Some(status) = status.filter(|&status| status >= 400) {
+        return Err(io::Error::other(HttpStatusError::new(status, detail)));
+    }
+    Err(io::Error::other(detail))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,8 +318,8 @@ fn split_status_suffix(mut stdout: Vec<u8>) -> (Vec<u8>, Option<u16>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURL_GET_ARGS, CURL_REDIRECT_ARGS, CURL_STALL_ARGS, GithubAccept, curl_config,
-        redirect_curl_config,
+        CURL_GET_ARGS, CURL_METADATA_ARGS, CURL_REDIRECT_ARGS, CURL_STALL_ARGS, GithubAccept,
+        curl_config, redirect_curl_config,
     };
 
     #[test]
@@ -437,6 +464,17 @@ mod tests {
         // The per-call arrays must not restate the policy.
         assert!(!CURL_GET_ARGS.contains(&"--connect-timeout"));
         assert!(!CURL_REDIRECT_ARGS.contains(&"--connect-timeout"));
+    }
+
+    #[test]
+    fn metadata_requests_have_an_aggregate_retry_deadline() {
+        assert_eq!(
+            CURL_METADATA_ARGS,
+            ["--max-time", "20", "--retry", "1", "--retry-delay", "1"]
+        );
+
+        // Release assets can be large and must retain progress-based bounds.
+        assert!(!CURL_GET_ARGS.contains(&"--max-time"));
     }
 
     #[test]

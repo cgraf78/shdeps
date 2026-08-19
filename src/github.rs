@@ -84,7 +84,7 @@ pub fn fetch_releases_with_token(
     token: Option<&str>,
 ) -> Result<Vec<Release>> {
     let url = releases_url(repo);
-    let bytes = client.get(&url, token)?;
+    let bytes = client.get_metadata(&url, token)?;
     let json = String::from_utf8_lossy(&bytes);
     parse_releases(&json)
 }
@@ -929,7 +929,11 @@ mod tests {
     }
 
     impl Client for FakeClient {
-        fn get(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+        fn get(&self, url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+            panic!("release metadata must use the bounded metadata transport for {url}");
+        }
+
+        fn get_metadata(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
             assert_eq!(url, self.expected_url);
             assert_eq!(token, self.expected_token.as_deref());
             Ok(self.body.clone())

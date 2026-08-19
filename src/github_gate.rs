@@ -106,6 +106,10 @@ impl Client for GatedClient<'_> {
         self.call(url, token, || self.inner.get(url, token))
     }
 
+    fn get_metadata(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+        self.call(url, token, || self.inner.get_metadata(url, token))
+    }
+
     fn get_github_asset(&self, url: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
         // API asset 403s can also mean token scope/SSO/resource policy failures.
         // Do not let one download failure suppress unrelated metadata checks.
@@ -210,6 +214,21 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct MetadataInner {
+        calls: AtomicUsize,
+    }
+
+    impl Client for MetadataInner {
+        fn get(&self, url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+            panic!("metadata forwarding must not use the unbounded GET path for {url}");
+        }
+
+        fn get_metadata(&self, _url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(b"[]".to_vec())
+        }
+    }
+
     impl Client for OkInner {
         fn get(&self, _url: &str, _token: Option<&str>) -> io::Result<Vec<u8>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -219,6 +238,18 @@ mod tests {
 
     const API_URL: &str = "https://api.github.com/repos/owner/tool/releases";
     const BROWSER_URL: &str = "https://github.com/owner/tool/releases/download/v1/t.tar.gz";
+
+    #[test]
+    fn gate_preserves_the_inner_metadata_transport() {
+        let inner = MetadataInner {
+            calls: AtomicUsize::new(0),
+        };
+        let gate = GatedClient::new(&inner);
+
+        assert_eq!(gate.get_metadata(API_URL, Some("token")).unwrap(), b"[]");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(gate.saw_token());
+    }
 
     #[test]
     fn gate_short_circuits_api_calls_after_first_rate_limit() {
