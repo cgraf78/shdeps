@@ -70,6 +70,33 @@ impl std::error::Error for HttpStatusError {}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Curl;
 
+/// Stall guards applied to every outbound request.
+///
+/// curl waits forever for a response body that never arrives, so a transfer
+/// that connects and then goes quiet blocks the whole run: observed CI stalls
+/// spent 35+ minutes inside a single request with no output and no failure.
+/// A fixed `--max-time` deadline cannot express the intent here, because large
+/// release assets are legitimately slow; `--speed-limit` with `--speed-time`
+/// aborts only a transfer that has actually stopped making progress.
+///
+/// `--retry` covers the transient statuses curl recognizes on its own. It does
+/// not mask a rate limit from the GitHub circuit breaker: 403 and 429 responses
+/// arrive as completed HTTP transactions, and `--retry` without
+/// `--retry-all-errors` leaves those for `github_gate` to observe.
+///
+/// `run_curl` prepends these to every invocation so the policy has one owner
+/// and cannot drift between the GET and redirect paths.
+const CURL_STALL_ARGS: [&str; 8] = [
+    "--connect-timeout",
+    "10",
+    "--speed-limit",
+    "1024",
+    "--speed-time",
+    "60",
+    "--retry",
+    "3",
+];
+
 const CURL_GET_ARGS: [&str; 6] = [
     "--fail",
     "--silent",
@@ -148,6 +175,7 @@ impl Curl {
 
 fn run_curl(args: &[&str], config: &str) -> io::Result<Output> {
     let mut child = Command::new("curl")
+        .args(CURL_STALL_ARGS)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -262,7 +290,10 @@ fn split_status_suffix(mut stdout: Vec<u8>) -> (Vec<u8>, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CURL_REDIRECT_ARGS, GithubAccept, curl_config, redirect_curl_config};
+    use super::{
+        CURL_GET_ARGS, CURL_REDIRECT_ARGS, CURL_STALL_ARGS, GithubAccept, curl_config,
+        redirect_curl_config,
+    };
 
     #[test]
     fn curl_get_github_asset_refuses_non_api_github_host() {
@@ -385,6 +416,27 @@ mod tests {
         assert!(config.contains("write-out = \"%{redirect_url}\""));
         assert!(!config.contains("Authorization: Bearer"));
         assert!(!CURL_REDIRECT_ARGS.contains(&"--location"));
+    }
+
+    #[test]
+    fn curl_stall_args_bound_connect_and_stalled_transfers() {
+        // Every request is spawned through `run_curl`, which prepends these, so
+        // asserting the set here covers the GET and redirect paths at once.
+        assert!(CURL_STALL_ARGS.contains(&"--connect-timeout"));
+        assert!(CURL_STALL_ARGS.contains(&"--speed-limit"));
+        assert!(CURL_STALL_ARGS.contains(&"--speed-time"));
+
+        // A fixed deadline would kill legitimately slow large release assets;
+        // the speed guard must stay the mechanism instead.
+        assert!(!CURL_STALL_ARGS.contains(&"--max-time"));
+
+        // `--retry-all-errors` would retry 403/429 responses and hide rate
+        // limits from the github_gate circuit breaker.
+        assert!(!CURL_STALL_ARGS.contains(&"--retry-all-errors"));
+
+        // The per-call arrays must not restate the policy.
+        assert!(!CURL_GET_ARGS.contains(&"--connect-timeout"));
+        assert!(!CURL_REDIRECT_ARGS.contains(&"--connect-timeout"));
     }
 
     #[test]
