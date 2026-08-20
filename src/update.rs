@@ -1475,11 +1475,15 @@ fn install_custom(
                 marked,
             })
         }
-        Install::Failed => Ok(CustomOutcome {
+        Install::Failed { detail } => Ok(CustomOutcome {
             item: Item::failed(
                 entry.name.clone(),
                 ItemReason::CustomInstallFailed,
-                "custom install failed",
+                if detail.is_empty() {
+                    "custom install failed".to_owned()
+                } else {
+                    format!("custom install failed -- {detail}")
+                },
             ),
             cleanup_leftover: false,
             marked,
@@ -3115,7 +3119,11 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             "tool",
             r#"
 exists() { return 1; }
-install() { return 42; }
+install() {
+  printf '%s\n' 'curl: request failed for https://secret.example/?token=hidden' >&2
+  printf '%s\n' 'shdeps-hook-warning: google-java-format metadata download failed' >&2
+  return 42
+}
 "#,
         );
         let manifest_path = manifest::path(&fixture.roots.state_dir);
@@ -3130,13 +3138,46 @@ install() { return 42; }
 
         assert!(summary.has_errors());
         assert_eq!(summary.failed, ["tool"]);
-        assert_eq!(summary.items[0].detail, "custom install failed");
+        assert_eq!(
+            summary.items[0].detail,
+            "custom install failed -- google-java-format metadata download failed"
+        );
+        assert!(!summary.items[0].detail.contains("secret.example"));
+        assert!(!summary.items[0].detail.contains("hidden"));
         assert!(
             manifest::read(&manifest_path)
                 .unwrap()
                 .get("tool")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn update_rejects_unsafe_custom_install_warning_detail() {
+        let fixture = Fixture::new("custom-failure-unsafe-warning");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { return 1; }
+install() {
+  printf '%s\n' 'shdeps-hook-warning: token at https://secret.example/' >&2
+  return 42
+}
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("tool|custom|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.items[0].detail, "custom install failed");
     }
 
     #[test]

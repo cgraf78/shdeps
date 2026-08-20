@@ -53,6 +53,8 @@ const DEFAULT_HOOK_MAX_OUTPUT_BYTES: usize = 1 << 20;
 /// per custom dependency. This matches the general timed subprocess runner;
 /// even a five-minute install performs only 30,000 nonblocking wait checks.
 const HOOK_WAIT_POLL: Duration = Duration::from_millis(10);
+const HOOK_WARNING_PREFIX: &str = "shdeps-hook-warning: ";
+const HOOK_WARNING_MAX_BYTES: usize = 256;
 
 /// Runs a configured hook command with a wall-clock timeout and a
 /// per-stream output cap.
@@ -330,8 +332,11 @@ pub enum Install {
         /// Optional version output from `version(name)`.
         detail: String,
     },
-    /// `install(name)` failed.
-    Failed,
+    /// `install(name)` failed, optionally with a sanitized hook-authored warning.
+    Failed {
+        /// Safe phase context emitted through `shdeps_warn`.
+        detail: String,
+    },
     /// `install(name)` ran successfully.
     Installed {
         /// Optional version output after install.
@@ -486,7 +491,9 @@ impl BashCustomProbe {
             Some(20) => Install::Already { detail },
             Some(10 | 13) => Install::MissingFunction,
             Some(11 | 12) => Install::SourceFailed,
-            _ => Install::Failed,
+            _ => Install::Failed {
+                detail: failed_hook_detail(&output.stderr),
+            },
         })
     }
 
@@ -544,6 +551,41 @@ impl BashCustomProbe {
     fn available(&self) -> bool {
         self.inline_source.is_some() || self.shdeps_lib.is_file()
     }
+}
+
+fn failed_hook_detail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    text.lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix(HOOK_WARNING_PREFIX))
+        .map(str::trim)
+        .find(|detail| safe_hook_detail(detail))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn safe_hook_detail(detail: &str) -> bool {
+    if detail.is_empty() || detail.len() > HOOK_WARNING_MAX_BYTES {
+        return false;
+    }
+    let lowered = detail.to_ascii_lowercase();
+    if [
+        "://",
+        "authorization",
+        "bearer",
+        "password",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+    {
+        return false;
+    }
+    detail.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, ' ' | '-' | '_' | '.' | ':' | ',' | '(' | ')')
+    })
 }
 
 fn apply_hook_env(
@@ -643,6 +685,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::process::Command;
 
     use super::{BashCustomProbe, Install, Post, Txn, Uninstall, read_capped};
     use crate::config::parse_entry;
@@ -819,6 +862,76 @@ version() { printf '2.0.0\n'; }
         assert_eq!(
             fs::read_to_string(roots.state_dir.join("tool-installed")).unwrap(),
             "1\n"
+        );
+    }
+
+    #[test]
+    fn rust_prelude_preserves_safe_install_failure_warning() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        write_hook(
+            &roots.hooks_dir.join("tool.sh"),
+            r#"
+exists() { return 1; }
+install() {
+  shdeps_warn 'google-java-format metadata download failed'
+  return 42
+}
+"#,
+        );
+
+        let result = BashCustomProbe::rust_prelude()
+            .install("tool", &roots, false)
+            .unwrap();
+
+        assert_eq!(
+            result,
+            Install::Failed {
+                detail: "google-java-format metadata download failed".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn compatibility_layer_preserves_safe_install_failure_warning() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        write_hook(
+            &roots.hooks_dir.join("tool.sh"),
+            r#"
+exists() { return 1; }
+install() {
+  shdeps_warn 'php-cs-fixer asset download failed'
+  return 42
+}
+"#,
+        );
+
+        let compatibility_layer = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shdeps.sh");
+        let result = BashCustomProbe::new(compatibility_layer)
+            .install("tool", &roots, false)
+            .unwrap();
+
+        let supported_bash = Command::new("bash")
+            .args([
+                "-c",
+                "((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3)))",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        if !supported_bash {
+            assert_eq!(result, Install::SourceFailed);
+            return;
+        }
+
+        assert_eq!(
+            result,
+            Install::Failed {
+                detail: "php-cs-fixer asset download failed".to_owned()
+            }
         );
     }
 

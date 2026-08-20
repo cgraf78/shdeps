@@ -112,6 +112,11 @@ _assert_eq "wrapper: shdeps_log suppresses at quiet log level" \
   "" "$(SHDEPS_LOG_LEVEL=0 shdeps_log "test message")"
 _warn_output=$(SHDEPS_LOG_LEVEL=1 shdeps_warn "test warning" 2>&1)
 _assert_eq "wrapper: shdeps_warn writes stderr" "test warning" "$_warn_output"
+_warn_output=$(SHDEPS_LOG_LEVEL=1 SHDEPS_HOOK_PHASE=install shdeps_warn "asset download failed" 2>&1)
+_assert_eq "wrapper: hook warning carries the parent marker" \
+  "shdeps-hook-warning: asset download failed" "$_warn_output"
+_assert_eq "wrapper: hook warning stays quiet at quiet log level" \
+  "" "$(SHDEPS_LOG_LEVEL=0 SHDEPS_HOOK_PHASE=install shdeps_warn "asset download failed" 2>&1)"
 _assert_eq "wrapper: shdeps_log_ok delegates to shdeps_log" \
   "test ok" "$(SHDEPS_LOG_LEVEL=1 shdeps_log_ok "test ok")"
 _assert_eq "wrapper: shdeps_log_dim delegates to shdeps_log" \

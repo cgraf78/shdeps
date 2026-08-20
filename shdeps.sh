@@ -259,8 +259,16 @@ shdeps_unskip() { _shdepsw_call __api skip-clear "$@"; }
 shdeps_find_runtime() { _shdepsw_call __api find-runtime "$@"; }
 shdeps_write_wrapper() { _shdepsw_call __api write-wrapper "$@"; }
 
+_shdepsw_warn() {
+  _shdepsw_should_log || return 0
+  if [[ -n "${SHDEPS_HOOK_PHASE:-}" ]]; then
+    printf 'shdeps-hook-warning: %s\n' "$*" >&2
+  else
+    printf '%s\n' "$*" >&2
+  fi
+}
 shdeps_log() { if _shdepsw_should_log; then printf '%s\n' "$*"; fi; }
-shdeps_warn() { if _shdepsw_should_log; then printf '%s\n' "$*" >&2; fi; }
+shdeps_warn() { _shdepsw_warn "$@"; }
 shdeps_log_warn() { shdeps_warn "$@"; }
 shdeps_log_ok() { shdeps_log "$@"; }
 shdeps_log_dim() { shdeps_log "$@"; }
