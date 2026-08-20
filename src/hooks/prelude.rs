@@ -74,7 +74,9 @@ shdeps_curl() {
 }
 
 shdeps_log() { printf '%s\n' "$*"; }
-shdeps_warn() { printf '%s\n' "$*" >&2; }
+# Prefix explicitly safe hook-authored warnings so the Rust parent can retain
+# phase context on failure without forwarding arbitrary child stderr.
+shdeps_warn() { printf 'shdeps-hook-warning: %s\n' "$*" >&2; }
 shdeps_log_warn() { shdeps_warn "$@"; }
 shdeps_log_ok() { shdeps_log "$@"; }
 shdeps_log_dim() { shdeps_log "$@"; }
