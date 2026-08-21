@@ -14,6 +14,7 @@
 #   SHDEPS_LUA_DIR      Stable Lua API link     (default: ~/.local/lib/shdeps)
 #   SHDEPS_LIB          Direct path to shdeps.sh for explicit/dev bootstrap use
 #   SHDEPS_GIT_DEV_DIR  Dev clone directory    (default: ~/git)
+#   SHDEPS_BOOTSTRAP_FORCE  Force bootstrap provider freshness only
 
 # Strict mode when executed directly; skip when sourced (--bootstrap)
 # to avoid infecting the caller's shell options.
@@ -357,7 +358,8 @@ _repair_release_if_needed() {
       return "$rc"
     fi
     [[ "$rc" -eq 0 ]] || return 1
-  elif [[ "${SHDEPS_FORCE:-0}" == 1 ]]; then
+  elif [[ "${SHDEPS_FORCE:-0}" == 1 ||
+    "${SHDEPS_BOOTSTRAP_FORCE:-0}" == 1 ]]; then
     # Preserve the existing best-effort force behavior: a transient GitHub
     # failure must not disable an otherwise compatible local release.
     _install_release >/dev/null 2>&1 || rc=$?
@@ -1977,6 +1979,12 @@ _bootstrap_self_update() {
     # pass the bootstrap-selected checkout through the environment.
     local SHDEPS_DIR="$shdeps_dir"
     export SHDEPS_DIR
+    if [[ "${SHDEPS_BOOTSTRAP_FORCE:-0}" == 1 ]]; then
+      # Provider-only freshness must reach this one self-update child without
+      # becoming the wrapper's cached dependency-update force setting.
+      local SHDEPS_FORCE=1
+      export SHDEPS_FORCE
+    fi
     shdeps_self_update
   fi
 }
@@ -2223,12 +2231,12 @@ _bootstrap() {
   # can therefore leave its functions defined without a usable installation;
   # only the sentinel written after links and stale-state cleanup is readiness.
   # Bind it to the effective inputs because sourced callers can bootstrap more
-  # than one isolated install in the same shell, and SHDEPS_FORCE must remain a
-  # real request even after a normal bootstrap completed.
-  printf -v _bs_ready_key '%q %q %q %q %q %q %q %q %q %q %q' \
+  # than one isolated install in the same shell, and force requests must remain
+  # real even after a normal bootstrap completed.
+  printf -v _bs_ready_key '%q %q %q %q %q %q %q %q %q %q %q %q' \
     "$SHDEPS_DIR" "$SHDEPS_BIN" "$SHDEPS_REPO" "${SHDEPS_LIB:-}" \
     "${SHDEPS_GIT_DEV_DIR:-$HOME/git}" "${SHDEPS_FORCE:-0}" \
-    "${SHDEPS_RELEASE_API_URL:-}" \
+    "${SHDEPS_BOOTSTRAP_FORCE:-0}" "${SHDEPS_RELEASE_API_URL:-}" \
     "${SHDEPS_INSTALL_DIR:-$HOME/.local/share}" \
     "${SHDEPS_BIN_DIR:-$HOME/.local/bin}" \
     "${SHDEPS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/shdeps}" \
@@ -2322,8 +2330,8 @@ _bootstrap() {
   # Pull source checkouts during bootstrap, but keep release installs local.
   # Release freshness checks can involve GitHub redirects or API calls; doing
   # that before the caller has rendered any UI caused slow/noisy `dot update`
-  # startup during transient GitHub 504s. `SHDEPS_FORCE=1` still refreshes
-  # release installs above, which keeps explicit "check now" behavior.
+  # startup during transient GitHub 504s. `SHDEPS_FORCE=1` and the scoped
+  # `SHDEPS_BOOTSTRAP_FORCE=1` both refresh release installs above.
   if [[ -n "$_bs_dir" && "$_bs_release_install" -eq 0 ]]; then
     # Bootstrap is sourced into callers, so stdout belongs to the caller's
     # script. Self-update is opportunistic here and ignored on failure; keep it

@@ -53,6 +53,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 | `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                               | Post-install hooks                                                                                         |
 | `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`     | Cache/state dir                                                                                            |
 | `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache                                                                                           |
+| `SHDEPS_BOOTSTRAP_FORCE` | `0`                                          | Force provider freshness during bootstrap without forcing dependency updates                              |
 | `SHDEPS_REINSTALL`   | `0`                                                | Force reinstall all deps                                                                                   |
 | `SHDEPS_QUIET`       | `0`                                                | Suppress non-result output and interactive prompts                                                             |
 | `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                                       |
