@@ -2948,6 +2948,137 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-pos
 }
 
 #[test]
+fn update_custom_hook_with_cached_sudo_does_not_prompt_parent() {
+    let fixture = custom_sudo_fixture("custom-sudo-cached", &["tool"]);
+    fixture.write("sudo-cache", "cached\n");
+
+    let output = run(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool install\ninstall sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/tool-installed").is_file());
+}
+
+#[test]
+fn update_custom_hook_prompts_parent_and_retries_once_when_sudo_cache_is_cold() {
+    let fixture = custom_sudo_fixture("custom-sudo-cold", &["tool"]);
+
+    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool install\ninstall sudo -n true\nparent sudo true\n\
+         tool install\ninstall sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/tool-installed").is_file());
+    let events = jsonl(&output.stdout);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "prompt"
+                && event["detail"] == "waiting for sudo authentication")
+            .count(),
+        1,
+        "cold hook sudo should yield progress exactly once: {events:#?}"
+    );
+}
+
+#[test]
+fn update_multiple_custom_hooks_share_one_parent_sudo_prompt() {
+    let fixture = custom_sudo_fixture("custom-sudo-multiple", &["first", "second"]);
+
+    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+
+    assert_success(&output);
+    let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
+    assert_eq!(log.matches("parent sudo true\n").count(), 1, "{log}");
+    assert_eq!(log.matches("first install\n").count(), 2, "{log}");
+    assert_eq!(log.matches("second install\n").count(), 1, "{log}");
+    assert!(fixture.dir.join("state/first-installed").is_file());
+    assert!(fixture.dir.join("state/second-installed").is_file());
+    let events = jsonl(&output.stdout);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "prompt")
+            .count(),
+        1,
+        "one cached credential should cover the remaining hooks: {events:#?}"
+    );
+}
+
+#[test]
+fn update_quiet_custom_hook_never_prompts_or_retries_for_sudo() {
+    let fixture = custom_sudo_fixture("custom-sudo-quiet", &["tool"]);
+
+    let output = run(&mut custom_sudo_command(&fixture, ["--quiet", "update"]));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        "  failed   tool: custom install failed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool install\ninstall sudo -n true\n"
+    );
+    assert!(!fixture.dir.join("state/tool-installed").exists());
+}
+
+#[test]
+fn update_current_custom_hook_never_probes_or_prompts_for_sudo() {
+    let fixture = custom_sudo_fixture("custom-sudo-current", &["tool"]);
+    fixture.write("state/tool-installed", "installed\n");
+
+    let output = run(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&output);
+    assert!(!fixture.dir.join("sudo.log").exists());
+}
+
+#[test]
+fn custom_hook_timeout_still_kills_its_detached_grandchild() {
+    let fixture = Fixture::new("custom-hook-timeout-grandchild");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  /bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+  printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/grandchild.pid"
+  wait
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
+    let (output, elapsed) = timed(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "hook timeout should remain bounded: {elapsed:?}"
+    );
+    let pid = fs::read_to_string(fixture.dir.join("state/grandchild.pid"))
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(pid),
+        "timed-out hook grandchild to exit",
+    );
+}
+
+#[test]
 fn custom_hooks_receive_detected_package_manager_in_every_phase() {
     let fixture = Fixture::new("custom-hook-package-manager");
     let binary = env!("CARGO_BIN_EXE_shdeps");
@@ -3456,6 +3587,81 @@ fn jsonl(bytes: &[u8]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("progress line should be valid JSON"))
         .collect()
+}
+
+fn custom_sudo_fixture(name: &str, deps: &[&str]) -> Fixture {
+    let fixture = Fixture::new(name);
+    let binary = env!("CARGO_BIN_EXE_shdeps");
+    let config = deps
+        .iter()
+        .map(|dep| format!("{dep} custom\n"))
+        .collect::<String>();
+    fixture.write("conf/deps.conf", &config);
+    for dep in deps {
+        fixture.write(
+            format!("conf/hooks.d/{dep}.sh"),
+            r#"
+exists() { test -f "$SHDEPS_STATE_DIR/$1-installed"; }
+install() {
+  printf '%s install\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  printf 'installed\n' >"$SHDEPS_STATE_DIR/$1-installed"
+}
+"#,
+        );
+    }
+    fixture.write_executable("fakebin/id", "#!/bin/sh\nprintf '1000\\n'\n");
+    fixture.write_executable(
+        "fakebin/sudo",
+        r#"#!/bin/sh
+phase=${SHDEPS_HOOK_PHASE:-parent}
+printf '%s sudo %s\n' "$phase" "$*" >>"$SHDEPS_TEST_SUDO_LOG"
+if [ "$1:$2" = '-n:true' ]; then
+  test -f "$SHDEPS_TEST_SUDO_CACHE"
+  exit $?
+fi
+if [ "$1" = true ]; then
+  if [ "$phase" != parent ]; then
+    exit 1
+  fi
+  : >"$SHDEPS_TEST_SUDO_CACHE"
+  exit 0
+fi
+exit 2
+"#,
+    );
+    fixture.write_executable(
+        "fakebin/shdeps",
+        &format!("#!/bin/sh\nexec {binary} \"$@\"\n"),
+    );
+    fixture
+}
+
+fn custom_sudo_command<const N: usize>(fixture: &Fixture, args: [&str; N]) -> Command {
+    let mut command = fixture.command(args);
+    command
+        .env("SHDEPS_TEST_SUDO_LOG", fixture.dir.join("sudo.log"))
+        .env("SHDEPS_TEST_SUDO_CACHE", fixture.dir.join("sudo-cache"));
+    command
+}
+
+fn process_is_running(pid: u32) -> bool {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps should be available in CLI tests");
+    output.status.success() && !text(&output.stdout).trim_start().starts_with('Z')
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool, description: &str) {
+    let started = Instant::now();
+    while !condition() {
+        assert!(
+            started.elapsed() < timeout,
+            "timed out waiting for {description}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn host_arch() -> String {
