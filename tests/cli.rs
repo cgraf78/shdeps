@@ -3012,6 +3012,75 @@ fn update_multiple_custom_hooks_share_one_parent_sudo_prompt() {
 }
 
 #[test]
+fn update_custom_post_hook_uses_the_same_parent_sudo_retry() {
+    let fixture = custom_sudo_fixture("custom-post-sudo-cold", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() { printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"; }
+post() {
+  printf '%s post\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  printf 'post\n' >"$SHDEPS_STATE_DIR/tool-posted"
+}
+"#,
+    );
+
+    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool post\npost sudo -n true\nparent sudo true\n\
+         tool post\npost sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/tool-posted").is_file());
+}
+
+#[test]
+fn prune_custom_uninstall_hook_uses_parent_sudo_retry() {
+    let fixture = custom_sudo_fixture("custom-uninstall-sudo-cold", &["tool"]);
+    fixture.write("conf/deps.conf", "");
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+uninstall() {
+  printf '%s uninstall\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  printf 'uninstalled\n' >"$SHDEPS_STATE_DIR/tool-uninstalled"
+}
+"#,
+    );
+
+    let output = run(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool uninstall\nuninstall sudo -n true\nparent sudo true\n\
+         tool uninstall\nuninstall sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/tool-uninstalled").is_file());
+}
+
+#[test]
+fn update_custom_hook_retries_only_once_when_sudo_cache_stays_cold() {
+    let fixture = custom_sudo_fixture("custom-sudo-one-retry", &["tool"]);
+
+    let output =
+        run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_TEST_SUDO_STICKY_FAIL", "1"));
+
+    assert_eq!(output.status.code(), Some(1));
+    let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
+    assert_eq!(log.matches("parent sudo true\n").count(), 1, "{log}");
+    assert_eq!(log.matches("tool install\n").count(), 2, "{log}");
+    assert_eq!(log.matches("install sudo -n true\n").count(), 2, "{log}");
+    assert!(!fixture.dir.join("state/tool-installed").exists());
+}
+
+#[test]
 fn update_quiet_custom_hook_never_prompts_or_retries_for_sudo() {
     let fixture = custom_sudo_fixture("custom-sudo-quiet", &["tool"]);
 
@@ -3624,7 +3693,9 @@ if [ "$1" = true ]; then
   if [ "$phase" != parent ]; then
     exit 1
   fi
-  : >"$SHDEPS_TEST_SUDO_CACHE"
+  if [ "${SHDEPS_TEST_SUDO_STICKY_FAIL:-0}" != 1 ]; then
+    : >"$SHDEPS_TEST_SUDO_CACHE"
+  fi
   exit 0
 fi
 exit 2
