@@ -34,7 +34,7 @@ _wrapper_lint=$(
       if ($0 ~ /\{.*\}/) {
         next
       }
-      if (name == "shdeps_dep_source" || name == "shdeps_mark_changed") {
+      if (name == "shdeps_dep_source" || name == "shdeps_mark_changed" || name == "shdeps_require_sudo") {
         next
       }
       print name " is not a one-line public shim"
@@ -117,6 +117,45 @@ _assert_eq "wrapper: hook warning carries the parent marker" \
   "shdeps-hook-warning: asset download failed" "$_warn_output"
 _assert_eq "wrapper: hook warning stays quiet at quiet log level" \
   "" "$(SHDEPS_LOG_LEVEL=0 SHDEPS_HOOK_PHASE=install shdeps_warn "asset download failed" 2>&1)"
+
+_sudo_request_fake=$(_tmpdir)/shdeps
+cat >"$_sudo_request_fake" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}:${2:-}" in
+  __api:version)
+    printf '%s\n' "abi:1"
+    ;;
+  __api:env-snapshot)
+    printf '%s\n' \
+      "install_dir=/sudo/install" \
+      "bin_dir=/sudo/bin" \
+      "git_dev_dir=/sudo/git" \
+      "platform=linux" \
+      "pkg_mgr=" \
+      "force=0" \
+      "reinstall=0"
+    ;;
+  __api:require-sudo)
+    exit 75
+    ;;
+  *) exit 9 ;;
+esac
+SH
+chmod +x "$_sudo_request_fake"
+_sudo_hook_output=$(
+  SHDEPS_RUST_CLI="$_sudo_request_fake" \
+    SHDEPS_HOOK_SUDO_REQUEST=/tmp/request \
+    bash -c '. "$1"; shdeps_require_sudo; printf after' bash "$SHDEPS_DIR/shdeps.sh"
+)
+_sudo_hook_rc=$?
+_assert_exit "wrapper: hook sudo request exits detached hook" 75 "$_sudo_hook_rc"
+_assert_eq "wrapper: hook sudo request stops hook immediately" "" "$_sudo_hook_output"
+_sudo_direct_output=$(
+  SHDEPS_RUST_CLI="$_sudo_request_fake" \
+    bash -c '. "$1"; shdeps_require_sudo; printf "%s\n" "$?"; printf after' bash "$SHDEPS_DIR/shdeps.sh"
+)
+_assert_eq "wrapper: direct sudo request retains return semantics" $'75\nafter' "$_sudo_direct_output"
+
 _assert_eq "wrapper: shdeps_log_ok delegates to shdeps_log" \
   "test ok" "$(SHDEPS_LOG_LEVEL=1 shdeps_log_ok "test ok")"
 _assert_eq "wrapper: shdeps_log_dim delegates to shdeps_log" \

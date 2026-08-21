@@ -1108,6 +1108,17 @@ The stable Bash API is:
 | `shdeps_log_header <message...>` | header log line when enabled | `0` |
 | `shdeps_mark_changed <name>` | none | `0`; records that `post(name)` should run in the current update context |
 
+Mutating hook subprocesses MUST remain detached from the controlling terminal
+with stdin closed. If `shdeps_require_sudo` cannot authenticate with `sudo -n`
+inside `install`, `post`, or `uninstall`, it MUST signal the attached parent.
+The parent pauses live progress, performs the interactive sudo authentication,
+and retries that hook exactly once. `SHDEPS_QUIET=1` MUST suppress both the
+prompt and retry. Calls outside this hook handshake retain the direct helper's
+normal prompt behavior. Since retry restarts the hook function, hook authors
+MUST call `shdeps_require_sudo` before any side effect. If the first install
+attempt changes `exists()` before requesting sudo, the retry MUST fail closed
+rather than accepting partial state or invoking `install()` twice.
+
 Source mode default config dir:
 
 - When sourced directly as a library, config defaults to `./shdeps` unless env

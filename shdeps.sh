@@ -230,7 +230,14 @@ shdeps_reinstall() { [[ "${SHDEPS_REINSTALL:-${_SHDEPSW_REINSTALL:-0}}" == "1" ]
 shdeps_pkg_mgr() { printf '%s\n' "${SHDEPS_PKG_MGR:-${_SHDEPSW_PKG_MGR:-}}"; }
 shdeps_pkg_install() { SHDEPS_PKG_MGR="$(shdeps_pkg_mgr)" _shdepsw_call __api pkg-install "$@"; }
 shdeps_pkg_install_for_mgr() { SHDEPS_PKG_MGR="$(shdeps_pkg_mgr)" _shdepsw_call __api pkg-install-for-mgr "$@"; }
-shdeps_require_sudo() { _shdepsw_call __api require-sudo "$@"; }
+# Exit 75 is the private parent-prompt request returned only for a detached hook.
+shdeps_require_sudo() {
+  local status
+  _shdepsw_call __api require-sudo "$@"
+  status=$?
+  if [[ "$status" -eq 75 && -n "${SHDEPS_HOOK_SUDO_REQUEST:-}" ]]; then exit "$status"; fi
+  return "$status"
+}
 shdeps_install_dir() { printf '%s\n' "${SHDEPS_INSTALL_DIR:-${_SHDEPSW_INSTALL_DIR:-$(_shdepsw_call __api install-dir)}}"; }
 shdeps_git_dev_dir() { printf '%s\n' "${SHDEPS_GIT_DEV_DIR:-${_SHDEPSW_GIT_DEV_DIR:-$(_shdepsw_call __api git-dev-dir)}}"; }
 shdeps_bin_dir() { printf '%s\n' "${SHDEPS_BIN_DIR:-${_SHDEPSW_BIN_DIR:-$(_shdepsw_call __api bin-dir)}}"; }

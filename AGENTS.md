@@ -157,6 +157,21 @@ behavior lives in Rust (`src/hook_toolkit.rs`, bridged through `__api`).
   `<interp> <args...> <payload> "$@"`. `--env` lines are emitted before the exec
   (e.g. a gem `PATH=...:$PATH`). Prints the wrapper path.
 
+Mutating hook subprocesses are deliberately detached with closed stdin so
+timeouts can kill their complete process group. `shdeps_require_sudo` must not
+prompt from that detached child: after a failed `sudo -n` probe it requests
+authentication from the attached parent, which pauses progress, runs the
+prompt, and retries the hook once. Keep quiet mode noninteractive, preserve the
+direct helper's normal prompt behavior outside hooks, and never prompt for an
+`install()` that was skipped because `exists()` already succeeded.
+Hooks are trusted same-user code, but the request file still requires a private,
+parent-created regular file and a no-follow open on Unix; do not weaken that
+defense or treat an exit status alone as a prompt request.
+The retry restarts the hook function, so hooks that need sudo must call
+`shdeps_require_sudo` before any side effect. If an install attempt changes its
+`exists()` result before requesting sudo, the retry fails closed instead of
+silently accepting the partial installation or running it twice.
+
 ## Code Quality
 
 - ShellCheck must pass on every program in `.github/shellcheck-files.txt`;

@@ -579,6 +579,15 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_log_dim`                  | Dimmed / low-importance line                                                                |
 | `shdeps_log_header`               | Section header                                                                              |
 
+`shdeps_require_sudo` first checks root or cached credentials with
+`sudo -n`. Mutating hooks remain detached from the terminal so their timeout
+and process-group cleanup stay reliable. If a hook needs an interactive sudo
+authentication, the attached `shdeps update` or `shdeps prune` parent prompts
+and retries that hook once. Quiet mode never prompts or retries, and an already
+current custom dependency never reaches the sudo helper. Because the retry
+restarts the hook function, hooks must call `shdeps_require_sudo` before making
+filesystem changes or starting other side effects.
+
 `shdeps_dep_root` follows the same ownership rules as installation. For
 `github:repo`, it prefers `$SHDEPS_GIT_DEV_DIR/<repo>` when a local development
 clone exists, then falls back to `$SHDEPS_INSTALL_DIR/<owner>/<repo>`. For

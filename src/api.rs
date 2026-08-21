@@ -21,6 +21,7 @@ use crate::errors::Error;
 use crate::extras;
 use crate::github_release_install;
 use crate::hook_toolkit::{self, RuntimeQuery, WrapperSpec};
+use crate::hooks;
 use crate::http::Curl;
 use crate::link_state::{self, Kind};
 use crate::method;
@@ -819,6 +820,14 @@ fn require_sudo() -> Result<i32> {
 
     if std::env::var("SHDEPS_QUIET").as_deref() == Ok("1") {
         return Ok(1);
+    }
+
+    // Mutating hooks run in a detached session with stdin closed so one
+    // blocked prompt cannot defeat their timeout or process-group cleanup.
+    // Ask the still-attached parent to authenticate instead; the hook helper
+    // turns this reserved status into an immediate hook-process exit.
+    if hooks::signal_parent_sudo_request()? {
+        return Ok(hooks::SUDO_REQUEST_EXIT_CODE);
     }
 
     // Match the Bash helper's escalation order: only the final attempt may
