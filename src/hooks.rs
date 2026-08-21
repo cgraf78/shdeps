@@ -70,6 +70,12 @@ struct HookOutput {
     sudo_requested: bool,
 }
 
+#[derive(Clone, Copy)]
+enum HookIsolation {
+    DetachedSession,
+    ParentSession,
+}
+
 struct SudoRequest {
     path: PathBuf,
     file: File,
@@ -133,43 +139,53 @@ impl Drop for SudoRequest {
 
 /// Runs a configured hook command with a wall-clock timeout and a
 /// per-stream output cap.
-fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
+fn run_hook_command(
+    mut command: Command,
+    isolation: HookIsolation,
+) -> io::Result<std::process::Output> {
     let timeout = hook_timeout();
     let max_bytes = hook_max_bytes();
 
-    // Put the child in its own process group on Unix so timeout-kill
-    // can reach grandchildren too. Without this, `child.kill()` only
-    // terminates the immediate bash process; a hook that backgrounds
-    // a subprocess (`some-tool &`) leaves that subprocess holding the
-    // inherited stdout/stderr pipes open, so the reader threads block
-    // on EOF until the grandchild exits — defeating
-    // `SHDEPS_HOOK_TIMEOUT_SECS`. With the child as a process-group
-    // leader (via `setsid`), `kill(-pgid, SIG)` signals the whole
-    // group atomically.
+    // Put the child in its own process group on Unix so timeout-kill can reach
+    // grandchildren too. The initial attempt also starts a new session so it
+    // cannot prompt through the parent's controlling terminal. An authenticated
+    // retry must preserve that session because sudo may scope its timestamp to
+    // the terminal/session; `setpgid` keeps the retry killable without hiding
+    // the ticket the attached parent just refreshed.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` is async-signal-safe and the pre-exec
-        // callback runs between fork and exec where only
-        // async-signal-safe calls are valid. Detaching from the
-        // parent's controlling terminal is the documented purpose.
+        // SAFETY: `setsid` and `setpgid` are async-signal-safe and the pre-exec
+        // callback runs between fork and exec where only async-signal-safe calls
+        // are valid.
         unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    let err = std::io::Error::last_os_error();
-                    // EPERM means the caller is already a process-group
-                    // leader, so setsid refuses — but the child inherits
-                    // that leader status, which is exactly the state we
-                    // wanted (kill(-pgid) will reach the whole group).
-                    // Any other errno genuinely blocks detachment.
-                    if err.raw_os_error() != Some(libc::EPERM) {
-                        return Err(err);
+            command.pre_exec(move || {
+                match isolation {
+                    HookIsolation::DetachedSession => {
+                        if libc::setsid() == -1 {
+                            let err = std::io::Error::last_os_error();
+                            // EPERM means the caller is already a process-group
+                            // leader, so setsid refuses — but the child inherits
+                            // that leader status, which is exactly the state we
+                            // wanted (kill(-pgid) will reach the whole group).
+                            // Any other errno genuinely blocks detachment.
+                            if err.raw_os_error() != Some(libc::EPERM) {
+                                return Err(err);
+                            }
+                        }
+                    }
+                    HookIsolation::ParentSession => {
+                        if libc::setpgid(0, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                 }
                 Ok(())
             });
         }
     }
+    #[cfg(not(unix))]
+    let _ = isolation;
 
     let mut child = command
         .stdin(Stdio::null())
@@ -224,7 +240,7 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
 fn kill_hook_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        // The child was placed in its own session by `setsid` above, so its
+        // Both isolation modes make the child a process-group leader, so its
         // PID is also its PGID. This remains the group's stable identity even
         // after the leader exits while a grandchild still holds a pipe open.
         let pgid = -(child.id() as i32);
@@ -240,10 +256,14 @@ fn kill_hook_process_group(child: &mut std::process::Child) {
     }
 }
 
-fn run_mutating_hook_command(mut command: Command, state_dir: &Path) -> io::Result<HookOutput> {
+fn run_mutating_hook_command(
+    mut command: Command,
+    state_dir: &Path,
+    isolation: HookIsolation,
+) -> io::Result<HookOutput> {
     let mut request = SudoRequest::new(state_dir)?;
     request.apply(&mut command);
-    let output = run_hook_command(command)?;
+    let output = run_hook_command(command, isolation)?;
     let sudo_requested =
         output.status.code() == Some(SUDO_REQUEST_EXIT_CODE) && request.requested();
     Ok(HookOutput {
@@ -254,19 +274,9 @@ fn run_mutating_hook_command(mut command: Command, state_dir: &Path) -> io::Resu
 
 /// Signals that a detached mutating hook needs its parent to authenticate sudo.
 pub(crate) fn signal_parent_sudo_request() -> Result<bool> {
-    let phase = std::env::var("SHDEPS_HOOK_PHASE").unwrap_or_default();
-    if !matches!(phase.as_str(), "install" | "post" | "uninstall") {
-        return Ok(false);
-    }
-    let Some(request_path) = std::env::var_os(SUDO_REQUEST_ENV).map(PathBuf::from) else {
+    let Some(request_path) = sudo_request_path() else {
         return Ok(false);
     };
-    let Some(state_dir) = std::env::var_os("SHDEPS_STATE_DIR").map(PathBuf::from) else {
-        return Ok(false);
-    };
-    if request_path.parent() != Some(state_dir.join(SUDO_REQUEST_DIR).as_path()) {
-        return Ok(false);
-    }
     let mut options = OpenOptions::new();
     options.write(true);
     #[cfg(unix)]
@@ -277,6 +287,24 @@ pub(crate) fn signal_parent_sudo_request() -> Result<bool> {
     }
     request.write_all(SUDO_REQUEST_TOKEN)?;
     Ok(true)
+}
+
+/// Returns whether this process has a syntactically valid parent-sudo channel.
+pub(crate) fn parent_sudo_request_configured() -> bool {
+    sudo_request_path().is_some()
+}
+
+fn sudo_request_path() -> Option<PathBuf> {
+    let phase = std::env::var("SHDEPS_HOOK_PHASE").unwrap_or_default();
+    if !matches!(phase.as_str(), "install" | "post" | "uninstall") {
+        return None;
+    }
+    let request_path = std::env::var_os(SUDO_REQUEST_ENV).map(PathBuf::from)?;
+    let state_dir = std::env::var_os("SHDEPS_STATE_DIR").map(PathBuf::from)?;
+    if request_path.parent() != Some(state_dir.join(SUDO_REQUEST_DIR).as_path()) {
+        return None;
+    }
+    Some(request_path)
 }
 
 fn read_capped<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
@@ -586,6 +614,20 @@ impl BashCustomProbe {
 
     /// Runs the optional `uninstall(name)` hook for prune and method cleanup.
     pub fn uninstall(&self, name: &str, roots: &Roots) -> Result<Uninstall> {
+        self.uninstall_with_isolation(name, roots, HookIsolation::DetachedSession)
+    }
+
+    /// Retries `uninstall(name)` after the parent authenticated sudo.
+    pub(crate) fn retry_uninstall(&self, name: &str, roots: &Roots) -> Result<Uninstall> {
+        self.uninstall_with_isolation(name, roots, HookIsolation::ParentSession)
+    }
+
+    fn uninstall_with_isolation(
+        &self,
+        name: &str,
+        roots: &Roots,
+        isolation: HookIsolation,
+    ) -> Result<Uninstall> {
         let hook = roots.hooks_dir.join(format!("{name}.sh"));
         if !hook.is_file() {
             return Ok(Uninstall::MissingHook);
@@ -604,7 +646,7 @@ impl BashCustomProbe {
             None,
             self.quiet,
         );
-        let output = run_mutating_hook_command(command, &roots.state_dir)?;
+        let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
 
         if output.sudo_requested {
             return Ok(Uninstall::SudoRequired);
@@ -631,6 +673,28 @@ impl BashCustomProbe {
         reinstall: bool,
         txn: Option<&Txn>,
     ) -> Result<Install> {
+        self.install_with_txn_isolation(name, roots, reinstall, txn, HookIsolation::DetachedSession)
+    }
+
+    /// Retries `install(name)` after the parent authenticated sudo.
+    pub(crate) fn retry_install_with_txn(
+        &self,
+        name: &str,
+        roots: &Roots,
+        reinstall: bool,
+        txn: Option<&Txn>,
+    ) -> Result<Install> {
+        self.install_with_txn_isolation(name, roots, reinstall, txn, HookIsolation::ParentSession)
+    }
+
+    fn install_with_txn_isolation(
+        &self,
+        name: &str,
+        roots: &Roots,
+        reinstall: bool,
+        txn: Option<&Txn>,
+        isolation: HookIsolation,
+    ) -> Result<Install> {
         let hook = roots.hooks_dir.join(format!("{name}.sh"));
         if !hook.is_file() {
             return Ok(Install::MissingHook);
@@ -650,7 +714,7 @@ impl BashCustomProbe {
             txn,
             self.quiet,
         );
-        let output = run_mutating_hook_command(command, &roots.state_dir)?;
+        let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
 
         if output.sudo_requested {
             return Ok(Install::SudoRequired);
@@ -682,6 +746,26 @@ impl BashCustomProbe {
         roots: &Roots,
         txn: Option<&Txn>,
     ) -> Result<Post> {
+        self.post_with_txn_isolation(name, roots, txn, HookIsolation::DetachedSession)
+    }
+
+    /// Retries `post(name)` after the parent authenticated sudo.
+    pub(crate) fn retry_post_with_txn(
+        &self,
+        name: &str,
+        roots: &Roots,
+        txn: Option<&Txn>,
+    ) -> Result<Post> {
+        self.post_with_txn_isolation(name, roots, txn, HookIsolation::ParentSession)
+    }
+
+    fn post_with_txn_isolation(
+        &self,
+        name: &str,
+        roots: &Roots,
+        txn: Option<&Txn>,
+        isolation: HookIsolation,
+    ) -> Result<Post> {
         let hook = roots.hooks_dir.join(format!("{name}.sh"));
         if !hook.is_file() {
             return Ok(Post::MissingHook);
@@ -700,7 +784,7 @@ impl BashCustomProbe {
             txn,
             self.quiet,
         );
-        let output = run_mutating_hook_command(command, &roots.state_dir)?;
+        let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
 
         if output.sudo_requested {
             return Ok(Post::SudoRequired);
@@ -869,7 +953,7 @@ impl CustomProbe for BashCustomProbe {
             None,
             self.quiet,
         );
-        let output = run_hook_command(command)?;
+        let output = run_hook_command(command, HookIsolation::DetachedSession)?;
 
         if !output.status.success() {
             return Ok(None);

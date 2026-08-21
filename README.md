@@ -580,13 +580,16 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_log_header`               | Section header                                                                              |
 
 `shdeps_require_sudo` first checks root or cached credentials with
-`sudo -n`. Mutating hooks remain detached from the terminal so their timeout
-and process-group cleanup stay reliable. If a hook needs an interactive sudo
-authentication, the attached `shdeps update` or `shdeps prune` parent prompts
-and retries that hook once. Quiet mode never prompts or retries, and an already
-current custom dependency never reaches the sudo helper. Because the retry
-restarts the hook function, hooks must call `shdeps_require_sudo` before making
-filesystem changes or starting other side effects.
+`sudo -n`. The initial mutating hook attempt runs in a detached session with a
+dedicated process group. If it needs interactive authentication, the attached
+`shdeps update` or `shdeps prune` parent prompts and retries that hook once in a
+new process group while preserving the parent's session and controlling
+terminal. That lets sudo policies with terminal-scoped timestamps recognize
+the freshly cached credential without weakening timeout cleanup; hook stdin
+remains closed in both attempts. Quiet mode never prompts or retries, and an
+already current custom dependency never reaches the sudo helper. Because the
+retry restarts the hook function, hooks must call `shdeps_require_sudo` before
+making filesystem changes or starting other side effects.
 
 `shdeps_dep_root` follows the same ownership rules as installation. For
 `github:repo`, it prefers `$SHDEPS_GIT_DEV_DIR/<repo>` when a local development
