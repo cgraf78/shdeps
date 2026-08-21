@@ -591,6 +591,14 @@ already current custom dependency never reaches the sudo helper. Because the
 retry restarts the hook function, hooks must call `shdeps_require_sudo` before
 making filesystem changes or starting other side effects.
 
+Parent interfaces that consume `SHDEPS_PROGRESS=jsonl` and draw on the same
+terminal may set `SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO they have
+already opened read/write. On a `prompt` event, the parent must suspend or clear its live
+display and write exactly `ready\n` to that FIFO. Shdeps waits up to five
+seconds for the acknowledgement, then writes a visible status line to
+`/dev/tty` and starts sudo. If the variable is unset, JSONL output keeps its
+standalone behavior and does not wait for an acknowledgement.
+
 `shdeps_dep_root` follows the same ownership rules as installation. For
 `github:repo`, it prefers `$SHDEPS_GIT_DEV_DIR/<repo>` when a local development
 clone exists, then falls back to `$SHDEPS_INSTALL_DIR/<owner>/<repo>`. For
