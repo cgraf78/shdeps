@@ -33,6 +33,12 @@ const WAIT_POLL: Duration = Duration::from_millis(10);
 /// warm path, but long enough for typical handlers to run.
 const SIGTERM_GRACE: Duration = Duration::from_millis(250);
 
+#[derive(Clone, Copy)]
+enum TimedIsolation {
+    DetachedSession,
+    ParentSession,
+}
+
 /// Captured subprocess output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
@@ -389,6 +395,18 @@ fn run(program: &str, args: &[&str], timeout: Option<Duration>) -> io::Result<Ou
     run_command(command, timeout)
 }
 
+/// Runs a bounded command in a new process group without leaving the caller's
+/// session, so terminal-scoped credentials remain visible.
+pub(crate) fn run_in_current_session(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    run_command_with_isolation(command, Some(timeout), TimedIsolation::ParentSession)
+}
+
 fn run_env_clear(
     program: &Path,
     cwd: &Path,
@@ -408,7 +426,15 @@ fn run_env_clear(
     run_command(command, Some(timeout))
 }
 
-fn run_command(mut command: Command, timeout: Option<Duration>) -> io::Result<Output> {
+fn run_command(command: Command, timeout: Option<Duration>) -> io::Result<Output> {
+    run_command_with_isolation(command, timeout, TimedIsolation::DetachedSession)
+}
+
+fn run_command_with_isolation(
+    mut command: Command,
+    timeout: Option<Duration>,
+    isolation: TimedIsolation,
+) -> io::Result<Output> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -418,7 +444,7 @@ fn run_command(mut command: Command, timeout: Option<Duration>) -> io::Result<Ou
         return command.output().map(convert_output);
     };
 
-    isolate_process_group(&mut command);
+    isolate_process_group(&mut command, isolation);
     let mut child = command.spawn()?;
     // Drain both pipes while the child runs. Waiting for exit first can
     // deadlock once either pipe fills: the producer blocks on write while the
@@ -436,25 +462,40 @@ fn run_command(mut command: Command, timeout: Option<Duration>) -> io::Result<Ou
             .expect("piped child stderr must be available"),
     );
     let deadline = Instant::now() + timeout;
+    let mut status = None;
     let mut timed_out = false;
     loop {
-        if child.try_wait()?.is_some() {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
             break;
         }
         if Instant::now() >= deadline {
-            // Version probes are intentionally best-effort. Send SIGTERM
-            // first so the child can run its signal handlers (TTY
-            // restoration, sub-process-group cleanup) within a short
-            // grace window, then SIGKILL if it has not exited. This
-            // mirrors POSIX shells' default behavior for `timeout(1)`.
-            terminate_then_kill(&mut child);
+            if status.is_some() {
+                // The leader exited but a descendant still owns one of its
+                // pipes. Kill the stable process group before joining readers;
+                // otherwise an early-exiting shell can defeat the deadline.
+                kill_exited_leader_process_group(&mut child);
+            } else {
+                // Version probes are intentionally best-effort. Send SIGTERM
+                // first so the child can run its signal handlers (TTY
+                // restoration, sub-process-group cleanup) within a short
+                // grace window, then SIGKILL if it has not exited. This
+                // mirrors POSIX shells' default behavior for `timeout(1)`.
+                terminate_then_kill(&mut child);
+                status = Some(child.wait()?);
+            }
             timed_out = true;
             break;
         }
         thread::sleep(WAIT_POLL);
     }
 
-    let status = child.wait()?;
+    let status = match status {
+        Some(status) => status,
+        None => child.wait()?,
+    };
     let stdout = join_pipe_reader(stdout_reader)?;
     let stderr = join_pipe_reader(stderr_reader)?;
     Ok(Output {
@@ -505,10 +546,7 @@ fn terminate_then_kill(child: &mut std::process::Child) {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
-        let pgid = -(child.id() as i32);
-        unsafe {
-            libc::kill(pgid, libc::SIGTERM);
-        }
+        kill_process_group(child, libc::SIGTERM);
         let grace_deadline = Instant::now() + SIGTERM_GRACE;
         while Instant::now() < grace_deadline {
             if matches!(child.try_wait(), Ok(Some(_))) {
@@ -522,32 +560,59 @@ fn terminate_then_kill(child: &mut std::process::Child) {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
-        unsafe {
-            libc::kill(pgid, libc::SIGKILL);
-        }
+        kill_process_group(child, libc::SIGKILL);
     }
     let _ = child.kill();
 }
 
-fn isolate_process_group(command: &mut Command) {
+#[cfg(unix)]
+fn kill_process_group(child: &std::process::Child, signal: libc::c_int) {
+    let pgid = -(child.id() as i32);
+    // SAFETY: timed commands enter a dedicated process group before exec, so
+    // a negative PID targets only that invocation and descendants that kept
+    // its group identity.
+    unsafe {
+        libc::kill(pgid, signal);
+    }
+}
+
+fn kill_exited_leader_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    kill_process_group(child, libc::SIGKILL);
+    #[cfg(not(unix))]
+    let _ = child.kill();
+}
+
+fn isolate_process_group(command: &mut Command, isolation: TimedIsolation) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` is async-signal-safe and runs in the child after
-        // fork and before exec. Timed probes get their own process group so
-        // timeout cleanup reaches grandchildren that inherited our pipes.
+        // SAFETY: `setsid` and `setpgid` are async-signal-safe and run in the
+        // child after fork and before exec. Timed commands get their own process
+        // group so timeout cleanup reaches grandchildren that inherited pipes.
         unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::EPERM) {
-                        return Err(error);
+            command.pre_exec(move || {
+                match isolation {
+                    TimedIsolation::DetachedSession => {
+                        if libc::setsid() == -1 {
+                            let error = std::io::Error::last_os_error();
+                            if error.raw_os_error() != Some(libc::EPERM) {
+                                return Err(error);
+                            }
+                        }
+                    }
+                    TimedIsolation::ParentSession => {
+                        if libc::setpgid(0, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                 }
                 Ok(())
             });
         }
     }
+    #[cfg(not(unix))]
+    let _ = isolation;
 }
 
 fn convert_output(output: std::process::Output) -> Output {
@@ -1185,6 +1250,26 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "timeout cleanup should not wait for a pipe-holding grandchild"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_session_timed_run_kills_pipe_holding_grandchild_after_leader_exits() {
+        let started = std::time::Instant::now();
+        let output = super::run_in_current_session(
+            "sh",
+            &["-c", "sleep 3 & printf ready; exit 1"],
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert!(output.timed_out);
+        assert!(!output.success);
+        assert_eq!(output.stdout, "ready");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout cleanup should not join a pipe-holding grandchild"
         );
     }
 

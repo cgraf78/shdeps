@@ -1439,7 +1439,7 @@ fn install_custom(
             .install_with_txn(&entry.name, context.roots, options.reinstall, Some(txn))?;
     if install == Install::SudoRequired {
         install = if authenticate_hook_sudo(context.runner, progress)? {
-            match context.hooks.install_with_txn(
+            match context.hooks.retry_install_with_txn(
                 &entry.name,
                 context.roots,
                 options.reinstall,
@@ -1553,7 +1553,7 @@ fn run_post_hooks(
             post = if authenticate_hook_sudo(context.runner, progress)? {
                 match context
                     .hooks
-                    .post_with_txn(name, context.roots, Some(txn))?
+                    .retry_post_with_txn(name, context.roots, Some(txn))?
                 {
                     Post::SudoRequired => Post::Failed,
                     retried => retried,

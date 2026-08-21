@@ -1118,6 +1118,12 @@ normal prompt behavior. Since retry restarts the hook function, hook authors
 MUST call `shdeps_require_sudo` before any side effect. If the first install
 attempt changes `exists()` before requesting sudo, the retry MUST fail closed
 rather than accepting partial state or invoking `install()` twice.
+When a parent terminal renderer consumes `SHDEPS_PROGRESS=jsonl`, it may set
+`SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO it holds open read/write. Shdeps
+flushes each `prompt` event, waits at most five seconds for the exact token
+`ready\n`, then writes a visible prompt status to `/dev/tty` and invokes sudo.
+The consumer MUST suspend or clear its renderer before acknowledging. An unset
+variable preserves standalone JSONL behavior without an acknowledgement wait.
 
 Source mode default config dir:
 

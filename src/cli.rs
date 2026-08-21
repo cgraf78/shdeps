@@ -7,10 +7,13 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::OpenOptions;
-use std::io::IsTerminal;
-use std::io::Write;
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{IsTerminal, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::Result;
 use crate::api;
@@ -1000,7 +1003,18 @@ where
     out: &'a mut W,
     prompt_out: Option<&'a mut dyn Write>,
     prompt_tty: bool,
+    prompt_ack: Option<PromptAck>,
 }
+
+struct PromptAck {
+    path: PathBuf,
+    timeout: Duration,
+}
+
+const PROMPT_ACK_ENV: &str = "SHDEPS_PROGRESS_PROMPT_ACK";
+const PROMPT_ACK_TOKEN: &[u8] = b"ready\n";
+const PROMPT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const PROMPT_ACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl<W> JsonlProgress<'_, W>
 where
@@ -1011,6 +1025,7 @@ where
             out,
             prompt_out: None,
             prompt_tty: false,
+            prompt_ack: None,
         }
     }
 
@@ -1019,6 +1034,12 @@ where
             out,
             prompt_out: None,
             prompt_tty: true,
+            prompt_ack: env::var_os(PROMPT_ACK_ENV)
+                .filter(|path| !path.is_empty())
+                .map(|path| PromptAck {
+                    path: PathBuf::from(path),
+                    timeout: PROMPT_ACK_TIMEOUT,
+                }),
         }
     }
 
@@ -1028,6 +1049,24 @@ where
             out,
             prompt_out: Some(prompt_out),
             prompt_tty: false,
+            prompt_ack: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_prompt_out_and_ack<'a>(
+        out: &'a mut W,
+        prompt_out: &'a mut dyn Write,
+        path: PathBuf,
+    ) -> JsonlProgress<'a, W> {
+        JsonlProgress {
+            out,
+            prompt_out: Some(prompt_out),
+            prompt_tty: false,
+            prompt_ack: Some(PromptAck {
+                path,
+                timeout: PROMPT_ACK_TIMEOUT,
+            }),
         }
     }
 
@@ -1038,17 +1077,24 @@ where
         Ok(())
     }
 
-    fn fresh_prompt_line(&mut self) -> Result<()> {
+    fn fresh_prompt_line(&mut self, detail: &str) -> Result<()> {
         if let Some(out) = self.prompt_out.as_deref_mut() {
-            writeln!(out)?;
+            write_prompt_status(out, detail, false)?;
             out.flush()?;
         } else if self.prompt_tty {
             if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
-                writeln!(tty)?;
+                write_prompt_status(&mut tty, detail, color_enabled())?;
                 tty.flush()?;
             }
         }
         Ok(())
+    }
+
+    fn wait_for_prompt_ack(&self) -> Result<()> {
+        let Some(ack) = &self.prompt_ack else {
+            return Ok(());
+        };
+        wait_for_prompt_ack(ack)
     }
 }
 
@@ -1085,8 +1131,96 @@ where
             "status": "running",
             "detail": detail,
         }))?;
-        self.fresh_prompt_line()
+        self.wait_for_prompt_ack()?;
+        self.fresh_prompt_line(detail)
     }
+}
+
+#[cfg(unix)]
+fn wait_for_prompt_ack(ack: &PromptAck) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    let mut input = options.open(&ack.path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "cannot open progress prompt acknowledgement {}: {error}",
+                ack.path.display()
+            ),
+        )
+    })?;
+    if !input.metadata()?.file_type().is_fifo() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "progress prompt acknowledgement is not a FIFO: {}",
+                ack.path.display()
+            ),
+        )
+        .into());
+    }
+
+    let deadline = Instant::now() + ack.timeout;
+    let mut received = Vec::with_capacity(PROMPT_ACK_TOKEN.len());
+    loop {
+        let mut bytes = [0_u8; 16];
+        match input.read(&mut bytes) {
+            Ok(0) => {}
+            Ok(count) => {
+                received.extend_from_slice(&bytes[..count]);
+                if let Some(newline) = received.iter().position(|byte| *byte == b'\n') {
+                    if newline + 1 == received.len() && received == PROMPT_ACK_TOKEN {
+                        return Ok(());
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid progress prompt acknowledgement (expected ready)",
+                    )
+                    .into());
+                }
+                if received.len() > 64 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid progress prompt acknowledgement (expected ready)",
+                    )
+                    .into());
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for progress prompt acknowledgement from {}",
+                    ack.path.display()
+                ),
+            )
+            .into());
+        }
+        std::thread::sleep(PROMPT_ACK_POLL_INTERVAL.min(deadline - now));
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_prompt_ack(ack: &PromptAck) -> Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "progress prompt acknowledgement is unsupported on this platform: {}",
+            ack.path.display()
+        ),
+    )
+    .into())
 }
 
 struct TtyProgress<'a, W>
@@ -1408,13 +1542,10 @@ where
         Ok(())
     }
 
-    fn pause_for_prompt(&mut self, _detail: &str) -> Result<()> {
-        if self.active && !self.finished {
-            writeln!(self.out)?;
-            self.out.flush()?;
-            self.active = false;
-            self.rendered_rows = 0;
-        }
+    fn pause_for_prompt(&mut self, detail: &str) -> Result<()> {
+        self.clear_unfinished()?;
+        write_prompt_status(self.out, detail, self.color)?;
+        self.out.flush()?;
         Ok(())
     }
 }
@@ -2486,6 +2617,20 @@ where
     Ok(())
 }
 
+fn write_prompt_status<W>(out: &mut W, detail: &str, color_enabled: bool) -> Result<()>
+where
+    W: Write + ?Sized,
+{
+    writeln!(
+        out,
+        "  {}{:<8}{} {detail}",
+        color_when("running", color_enabled),
+        "running",
+        color_when("reset", color_enabled)
+    )?;
+    Ok(())
+}
+
 fn write_nested_row<W>(stdout: &mut W, status: &str, detail: &str) -> Result<()>
 where
     W: Write,
@@ -3015,10 +3160,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::ffi::CString;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::sync::mpsc;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     use super::{
         UpdatePrerequisite, install_dir_from_exe, package_bootstraps_prerequisite, run,
@@ -3414,7 +3567,111 @@ mod tests {
         assert_eq!(event["event"], "prompt");
         assert_eq!(event["status"], "running");
         assert_eq!(event["detail"], "waiting for sudo authentication");
-        assert_eq!(String::from_utf8(prompt_out).unwrap(), "\n");
+        assert_eq!(
+            String::from_utf8(prompt_out).unwrap(),
+            "  running  waiting for sudo authentication\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_progress_waits_for_renderer_ack_before_showing_prompt() {
+        let dir = temp_dir("prompt-ack");
+        let events_path = dir.join("events.jsonl");
+        let prompt_path = dir.join("prompt.txt");
+        let ack_path = dir.join("prompt-ack.fifo");
+        let ack_path_c = CString::new(ack_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(ack_path_c.as_ptr(), 0o600) }, 0);
+        let (finished_tx, finished_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut events = fs::File::create(&events_path).unwrap();
+                let mut prompt = fs::File::create(&prompt_path).unwrap();
+                let mut progress = super::JsonlProgress::with_prompt_out_and_ack(
+                    &mut events,
+                    &mut prompt,
+                    ack_path.clone(),
+                );
+                let result = crate::update::Progress::pause_for_prompt(
+                    &mut progress,
+                    "waiting for sudo authentication",
+                );
+                finished_tx.send(result).unwrap();
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if fs::read_to_string(&events_path)
+                    .is_ok_and(|events| events.contains("\"event\":\"prompt\""))
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "prompt event was not flushed before acknowledgement"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            assert_eq!(fs::read(&prompt_path).unwrap(), b"");
+            assert!(
+                finished_rx.try_recv().is_err(),
+                "sudo prompt preparation must wait for the renderer acknowledgement"
+            );
+
+            let mut ack = fs::OpenOptions::new().write(true).open(&ack_path).unwrap();
+            std::io::Write::write_all(&mut ack, b"ready\n").unwrap();
+            drop(ack);
+
+            finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("prompt preparation should finish after acknowledgement")
+                .unwrap();
+        });
+
+        assert_eq!(
+            fs::read_to_string(prompt_path).unwrap(),
+            "  running  waiting for sudo authentication\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_progress_fails_before_prompt_when_renderer_does_not_ack() {
+        let dir = temp_dir("prompt-ack-timeout");
+        let ack_path = dir.join("prompt-ack.fifo");
+        let ack_path_c = CString::new(ack_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(ack_path_c.as_ptr(), 0o600) }, 0);
+        let mut stdout = Vec::new();
+        let mut prompt_out = Vec::new();
+        let mut progress =
+            super::JsonlProgress::with_prompt_out_and_ack(&mut stdout, &mut prompt_out, ack_path);
+        progress.prompt_ack.as_mut().unwrap().timeout = Duration::from_millis(50);
+
+        let started = Instant::now();
+        let error = crate::update::Progress::pause_for_prompt(
+            &mut progress,
+            "waiting for sudo authentication",
+        )
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "missing renderer acknowledgement must fail promptly"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for progress prompt acknowledgement"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            String::from_utf8(stdout)
+                .unwrap()
+                .contains("\"event\":\"prompt\"")
+        );
+        assert_eq!(prompt_out, b"");
     }
 
     #[test]
@@ -3431,7 +3688,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_progress_moves_to_fresh_line_before_prompt() {
+    fn terminal_progress_clears_for_visible_prompt_and_resumes_below_it() {
         let mut stdout = Vec::new();
 
         {
@@ -3456,16 +3713,26 @@ mod tests {
 
             assert!(!progress.active);
             assert_eq!(progress.rendered_rows, 0);
+            progress
+                .progress_row("Packages", crate::update::PHASE_PACKAGES, 1, 1)
+                .unwrap();
+            assert!(progress.active);
         }
 
         let stdout = String::from_utf8(stdout).unwrap();
+        let prompt = "  running  waiting for sudo authentication\n";
         assert!(
-            stdout.ends_with('\n'),
-            "progress output should put sudo on a fresh line without clearing rows: {stdout:?}"
+            stdout.contains(prompt),
+            "prompt pause should render a visible status line: {stdout:?}"
+        );
+        let resumed = stdout.split_once(prompt).unwrap().1;
+        assert!(
+            resumed.contains("Packages"),
+            "progress should resume below the prompt status: {stdout:?}"
         );
         assert!(
-            !stdout.ends_with("\r\x1b[K"),
-            "prompt pause should not erase live progress rows: {stdout:?}"
+            stdout.matches("\r\x1b[K").count() >= 4,
+            "prompt pause should clear the rendered dashboard before waiting: {stdout:?}"
         );
     }
 

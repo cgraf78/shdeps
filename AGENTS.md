@@ -157,13 +157,23 @@ behavior lives in Rust (`src/hook_toolkit.rs`, bridged through `__api`).
   `<interp> <args...> <payload> "$@"`. `--env` lines are emitted before the exec
   (e.g. a gem `PATH=...:$PATH`). Prints the wrapper path.
 
-Mutating hook subprocesses are deliberately detached with closed stdin so
-timeouts can kill their complete process group. `shdeps_require_sudo` must not
-prompt from that detached child: after a failed `sudo -n` probe it requests
+Initial mutating hook subprocesses are deliberately detached with closed stdin
+so timeouts can kill their complete process group. `shdeps_require_sudo` must
+not prompt from that detached child: after a failed `sudo -n` probe it requests
 authentication from the attached parent, which pauses progress, runs the
-prompt, and retries the hook once. Keep quiet mode noninteractive, preserve the
-direct helper's normal prompt behavior outside hooks, and never prompt for an
-`install()` that was skipped because `exists()` already succeeded.
+prompt, and retries the hook once. The authenticated retry must keep closed
+stdin and its own killable process group but remain in the parent's session so
+terminal-scoped sudo timestamps and subsequent direct `sudo` commands work.
+Keep quiet mode noninteractive, preserve the direct helper's normal prompt
+behavior outside hooks, and never prompt for an `install()` that was skipped
+because `exists()` already succeeded.
+JSONL progress adapters that render on the controlling terminal can set
+`SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO held open read/write. Shdeps flushes
+the `prompt` event and waits up to five seconds for an exact `ready\n` token
+before writing the visible prompt status to `/dev/tty` and invoking sudo. This
+acknowledgement is the renderer-suspension boundary: consumers must clear or
+pause their live display before acknowledging. Without the variable, JSONL
+progress remains standalone-compatible and does not wait.
 Hooks are trusted same-user code, but the request file still requires a private,
 parent-created regular file and a no-follow open on Unix; do not weaken that
 defense or treat an exit status alone as a prompt request.

@@ -2988,6 +2988,83 @@ fn update_custom_hook_prompts_parent_and_retries_once_when_sudo_cache_is_cold() 
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn update_custom_hook_retry_reuses_parent_session_sudo_ticket() {
+    let fixture = Fixture::new("custom-sudo-session-ticket");
+    let binary = env!("CARGO_BIN_EXE_shdeps");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() {
+  printf 'hook install\n' >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  sudo /bin/sh -c 'printf "installed\n" >"$1"' _ "$SHDEPS_STATE_DIR/tool-installed"
+}
+"#,
+    );
+    fixture.write_executable("fakebin/id", "#!/bin/sh\nprintf '1000\\n'\n");
+    fixture.write_executable(
+        "fakebin/sudo",
+        r#"#!/bin/sh
+IFS= read -r stat <"/proc/$$/stat" || exit 90
+fields=${stat##*) }
+IFS=' ' read -r state ppid pgrp session rest <<EOF
+$fields
+EOF
+cache="$SHDEPS_TEST_SUDO_CACHE.$session"
+phase=${SHDEPS_HOOK_PHASE:-parent}
+if [ "$1:$2" = '-n:true' ]; then
+  printf '%s probe %s\n' "$phase" "$session" >>"$SHDEPS_TEST_SUDO_LOG"
+  test -f "$cache"
+  exit $?
+fi
+if [ "$1" = true ]; then
+  printf '%s auth %s\n' "$phase" "$session" >>"$SHDEPS_TEST_SUDO_LOG"
+  test "$phase" = parent || exit 1
+  : >"$cache"
+  exit 0
+fi
+printf '%s command %s\n' "$phase" "$session" >>"$SHDEPS_TEST_SUDO_LOG"
+test -f "$cache" || exit 1
+exec "$@"
+"#,
+    );
+    fixture.write_executable(
+        "fakebin/shdeps",
+        &format!("#!/bin/sh\nexec {binary} \"$@\"\n"),
+    );
+
+    let output = run(&mut custom_sudo_command(&fixture, ["update"]));
+
+    let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?} sudo_log={log:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    assert!(fixture.dir.join("state/tool-installed").is_file());
+    let lines = log.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 6, "{log}");
+    assert_eq!(lines[0], "hook install");
+    assert!(lines[1].starts_with("install probe "), "{log}");
+    assert!(lines[2].starts_with("parent auth "), "{log}");
+    assert_eq!(lines[3], "hook install");
+    assert!(lines[4].starts_with("install probe "), "{log}");
+    assert!(lines[5].starts_with("install command "), "{log}");
+    let initial_session = lines[1].rsplit_once(' ').unwrap().1;
+    let parent_session = lines[2].rsplit_once(' ').unwrap().1;
+    let retry_session = lines[4].rsplit_once(' ').unwrap().1;
+    let command_session = lines[5].rsplit_once(' ').unwrap().1;
+    assert_ne!(initial_session, parent_session, "{log}");
+    assert_eq!(retry_session, parent_session, "{log}");
+    assert_eq!(command_session, parent_session, "{log}");
+}
+
 #[test]
 fn update_multiple_custom_hooks_share_one_parent_sudo_prompt() {
     let fixture = custom_sudo_fixture("custom-sudo-multiple", &["first", "second"]);
@@ -3196,6 +3273,94 @@ install() {
         Duration::from_secs(2),
         || !process_is_running(pid),
         "pre-sudo hook grandchild to exit",
+    );
+}
+
+#[test]
+fn update_custom_hook_authenticated_retry_keeps_grandchild_cleanup_bounded() {
+    let fixture = custom_sudo_fixture("custom-sudo-retry-grandchild", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  printf '%s install\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  /bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+  printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/retry-grandchild.pid"
+  wait
+}
+"#,
+    );
+    let mut command = custom_sudo_command(&fixture, ["update"]);
+    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
+
+    let (output, elapsed) = timed(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the authenticated retry deadline must remain bounded: {elapsed:?}"
+    );
+    let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
+    assert_eq!(log.matches("parent sudo true\n").count(), 1, "{log}");
+    assert_eq!(log.matches("tool install\n").count(), 2, "{log}");
+    let pid = fs::read_to_string(fixture.dir.join("state/retry-grandchild.pid"))
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(pid),
+        "authenticated retry grandchild to exit",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn update_custom_hook_timeout_kills_inflight_sudo_probe_group() {
+    let fixture = custom_sudo_fixture("custom-sudo-probe-timeout", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        "exists() { return 1; }\ninstall() { shdeps_require_sudo; }\n",
+    );
+    fixture.write_executable(
+        "fakebin/sudo",
+        r#"#!/bin/sh
+if [ "$1:$2" = '-n:true' ]; then
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/sudo-probe.pid"
+  /bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+  printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/sudo-probe-child.pid"
+  wait
+fi
+exit 1
+"#,
+    );
+    let mut command = custom_sudo_command(&fixture, ["update"]);
+    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
+
+    let (output, elapsed) = timed(&mut command);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the outer hook deadline must remain authoritative: {elapsed:?}"
+    );
+    let probe_pid = read_pid(&fixture.dir.join("state/sudo-probe.pid"));
+    let child_pid = read_pid(&fixture.dir.join("state/sudo-probe-child.pid"));
+    let probe_running = process_is_running(probe_pid);
+    let child_running = process_is_running(child_pid);
+    if probe_running {
+        kill_process(probe_pid);
+    }
+    if child_running {
+        kill_process(child_pid);
+    }
+    assert!(!probe_running, "sudo probe survived hook timeout");
+    assert!(
+        !child_running,
+        "sudo probe descendant survived hook timeout"
     );
 }
 
@@ -3875,6 +4040,18 @@ fn process_is_running(pid: u32) -> bool {
             .output()
             .expect("ps should be available in non-Linux CLI tests");
         output.status.success() && !text(&output.stdout).trim_start().starts_with('Z')
+    }
+}
+
+fn read_pid(path: &Path) -> u32 {
+    fs::read_to_string(path).unwrap().trim().parse().unwrap()
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    // SAFETY: tests pass a PID read from a child process they just created.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
     }
 }
 

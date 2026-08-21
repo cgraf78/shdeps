@@ -580,13 +580,24 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_log_header`               | Section header                                                                              |
 
 `shdeps_require_sudo` first checks root or cached credentials with
-`sudo -n`. Mutating hooks remain detached from the terminal so their timeout
-and process-group cleanup stay reliable. If a hook needs an interactive sudo
-authentication, the attached `shdeps update` or `shdeps prune` parent prompts
-and retries that hook once. Quiet mode never prompts or retries, and an already
-current custom dependency never reaches the sudo helper. Because the retry
-restarts the hook function, hooks must call `shdeps_require_sudo` before making
-filesystem changes or starting other side effects.
+`sudo -n`. The initial mutating hook attempt runs in a detached session with a
+dedicated process group. If it needs interactive authentication, the attached
+`shdeps update` or `shdeps prune` parent prompts and retries that hook once in a
+new process group while preserving the parent's session and controlling
+terminal. That lets sudo policies with terminal-scoped timestamps recognize
+the freshly cached credential without weakening timeout cleanup; hook stdin
+remains closed in both attempts. Quiet mode never prompts or retries, and an
+already current custom dependency never reaches the sudo helper. Because the
+retry restarts the hook function, hooks must call `shdeps_require_sudo` before
+making filesystem changes or starting other side effects.
+
+Parent interfaces that consume `SHDEPS_PROGRESS=jsonl` and draw on the same
+terminal may set `SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO they have
+already opened read/write. On a `prompt` event, the parent must suspend or clear its live
+display and write exactly `ready\n` to that FIFO. Shdeps waits up to five
+seconds for the acknowledgement, then writes a visible status line to
+`/dev/tty` and starts sudo. If the variable is unset, JSONL output keeps its
+standalone behavior and does not wait for an acknowledgement.
 
 `shdeps_dep_root` follows the same ownership rules as installation. For
 `github:repo`, it prefers `$SHDEPS_GIT_DEV_DIR/<repo>` when a local development

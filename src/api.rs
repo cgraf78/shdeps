@@ -813,7 +813,14 @@ fn require_sudo() -> Result<i32> {
         return Ok(0);
     }
 
-    let non_interactive = Process.run("sudo", &["-n", "true"], Some(Duration::from_secs(2)))?;
+    let non_interactive = if hooks::parent_sudo_request_configured() {
+        // Keep the probe in the hook's process group so the outer hook deadline
+        // remains authoritative and cannot strand a nested sudo process. The
+        // hook runner supplies the overall timeout for this path.
+        Process.run("sudo", &["-n", "true"], None)?
+    } else {
+        process::run_in_current_session("sudo", &["-n", "true"], Duration::from_secs(2))?
+    };
     if non_interactive.success {
         return Ok(0);
     }
@@ -822,10 +829,11 @@ fn require_sudo() -> Result<i32> {
         return Ok(1);
     }
 
-    // Mutating hooks run in a detached session with stdin closed so one
-    // blocked prompt cannot defeat their timeout or process-group cleanup.
-    // Ask the still-attached parent to authenticate instead; the hook helper
-    // turns this reserved status into an immediate hook-process exit.
+    // Hook stdin is closed, and the initial attempt is detached so one blocked
+    // prompt cannot defeat timeout or process-group cleanup. Ask the attached
+    // parent to authenticate instead; the hook helper turns this reserved
+    // status into an immediate hook-process exit. An authenticated retry keeps
+    // the parent's session so terminal-scoped sudo timestamps remain visible.
     if hooks::signal_parent_sudo_request()? {
         return Ok(hooks::SUDO_REQUEST_EXIT_CODE);
     }

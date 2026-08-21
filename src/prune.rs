@@ -194,7 +194,7 @@ pub fn run(
         let mut hook = hooks.uninstall(&entry.name, roots)?;
         if hook == Uninstall::SudoRequired {
             hook = if Process.run("sudo", &["true"], None)?.success {
-                match hooks.uninstall(&entry.name, roots)? {
+                match hooks.retry_uninstall(&entry.name, roots)? {
                     Uninstall::SudoRequired => Uninstall::Failed,
                     retried => retried,
                 }
