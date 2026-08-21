@@ -2948,6 +2948,82 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" >"$SHDEPS_STATE_DIR/tool-pos
 }
 
 #[test]
+fn custom_hooks_receive_detected_package_manager_in_every_phase() {
+    let fixture = Fixture::new("custom-hook-package-manager");
+    let binary = env!("CARGO_BIN_EXE_shdeps");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+record_manager() {
+  printf '%s=%s\n' "$SHDEPS_HOOK_PHASE" "$(shdeps_pkg_mgr)" >>"$SHDEPS_STATE_DIR/hook-managers"
+}
+exists() {
+  record_manager
+  test -f "$SHDEPS_STATE_DIR/tool-installed"
+}
+install() {
+  record_manager
+  printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"
+}
+version() { printf '1.2.3\n'; }
+post() { record_manager; }
+uninstall() { record_manager; }
+"#,
+    );
+    fixture.write_executable("fakebin/dnf", "#!/bin/sh\nexit 0\n");
+    fixture.write_executable("fakebin/bash", "#!/bin/sh\nexec /bin/bash \"$@\"\n");
+    fixture.write_executable(
+        "fakebin/shdeps",
+        &format!("#!/bin/sh\nexec {binary} \"$@\"\n"),
+    );
+    let path = fixture.dir.join("fakebin");
+
+    let updated = run(fixture
+        .command(["update"])
+        .env("PATH", &path)
+        .env("SHDEPS_PKG_MGR", "spoofed"));
+    assert_success(&updated);
+    let managers = fs::read_to_string(fixture.dir.join("state/hook-managers")).unwrap();
+    assert!(managers.lines().any(|line| line == "install=dnf"));
+    assert!(managers.lines().any(|line| line == "post=dnf"));
+    assert!(managers.lines().all(|line| line.ends_with("=dnf")));
+
+    fs::write(fixture.dir.join("state/hook-managers"), "").unwrap();
+    let checked = run(fixture
+        .command(["check", "tool"])
+        .env("PATH", &path)
+        .env("SHDEPS_PKG_MGR", "spoofed"));
+    assert_success(&checked);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/hook-managers")).unwrap(),
+        "exists=dnf\n"
+    );
+
+    fs::write(fixture.dir.join("state/hook-managers"), "").unwrap();
+    let listed = run(fixture
+        .command(["list"])
+        .env("PATH", &path)
+        .env("SHDEPS_PKG_MGR", "spoofed"));
+    assert_success(&listed);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/hook-managers")).unwrap(),
+        "exists=dnf\n"
+    );
+
+    fs::write(fixture.dir.join("state/hook-managers"), "").unwrap();
+    fixture.write("conf/deps.conf", "");
+    let pruned = run(fixture
+        .command(["prune", "-y"])
+        .env("PATH", &path)
+        .env("SHDEPS_PKG_MGR", "spoofed"));
+    assert_success(&pruned);
+
+    let managers = fs::read_to_string(fixture.dir.join("state/hook-managers")).unwrap();
+    assert_eq!(managers, "uninstall=dnf\n");
+}
+
+#[test]
 fn update_nested_output_omits_standalone_heading() {
     let fixture = Fixture::new("update-nested");
     fixture.write("conf/deps.conf", "tool custom\n");

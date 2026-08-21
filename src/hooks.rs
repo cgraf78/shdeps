@@ -364,6 +364,7 @@ pub enum Post {
 pub struct BashCustomProbe {
     shdeps_lib: PathBuf,
     inline_source: Option<&'static str>,
+    package_manager: Option<String>,
 }
 
 /// Per-update hook coordination marker directory.
@@ -417,6 +418,7 @@ impl BashCustomProbe {
         Self {
             shdeps_lib: shdeps_lib.into(),
             inline_source: None,
+            package_manager: None,
         }
     }
 
@@ -426,7 +428,15 @@ impl BashCustomProbe {
         Self {
             shdeps_lib: PathBuf::from("__shdeps_inline_prelude__"),
             inline_source: Some(prelude::source()),
+            package_manager: None,
         }
+    }
+
+    /// Uses the package manager already detected by the parent command.
+    #[must_use]
+    pub fn with_package_manager(mut self, package_manager: impl Into<String>) -> Self {
+        self.package_manager = Some(package_manager.into());
+        self
     }
 
     /// Returns the configured compatibility-layer path.
@@ -446,7 +456,14 @@ impl BashCustomProbe {
         }
 
         let mut command = self.command(UNINSTALL_SCRIPT, name, &hook);
-        apply_hook_env(&mut command, roots, name, "uninstall", None);
+        apply_hook_env(
+            &mut command,
+            roots,
+            name,
+            "uninstall",
+            self.package_manager.as_deref(),
+            None,
+        );
         let output = run_hook_command(command)?;
 
         Ok(match output.status.code() {
@@ -480,7 +497,14 @@ impl BashCustomProbe {
 
         let mut command = self.command(INSTALL_SCRIPT, name, &hook);
         command.arg(if reinstall { "1" } else { "0" });
-        apply_hook_env(&mut command, roots, name, "install", txn);
+        apply_hook_env(
+            &mut command,
+            roots,
+            name,
+            "install",
+            self.package_manager.as_deref(),
+            txn,
+        );
         let output = run_hook_command(command)?;
 
         let detail = String::from_utf8_lossy(&output.stdout)
@@ -518,7 +542,14 @@ impl BashCustomProbe {
         }
 
         let mut command = self.command(POST_SCRIPT, name, &hook);
-        apply_hook_env(&mut command, roots, name, "post", txn);
+        apply_hook_env(
+            &mut command,
+            roots,
+            name,
+            "post",
+            self.package_manager.as_deref(),
+            txn,
+        );
         let output = run_hook_command(command)?;
 
         Ok(match output.status.code() {
@@ -593,6 +624,7 @@ fn apply_hook_env(
     roots: &Roots,
     name: &str,
     phase: &str,
+    package_manager: Option<&str>,
     txn: Option<&Txn>,
 ) {
     command
@@ -612,6 +644,14 @@ fn apply_hook_env(
         // exported SHDEPS_STATE_LOCK_HELD in their shell" bypass —
         // see `state::REENTRY_ENV` for the full rationale.
         .env(crate::state::REENTRY_ENV, std::process::id().to_string());
+    if let Some(package_manager) = package_manager {
+        // Hooks must use the same manager the parent command already
+        // detected. Setting even an empty value explicitly prevents an
+        // inherited shell cache from spoofing a different runtime through
+        // `shdeps_pkg_mgr`. Direct library callers that did not supply a
+        // detected manager retain the inherited environment for compatibility.
+        command.env("SHDEPS_PKG_MGR", package_manager);
+    }
     if let Some(txn) = txn {
         // This env var is the only parent/child coordination channel for
         // `shdeps_mark_changed`. Keeping it opaque prevents hooks from
@@ -662,7 +702,14 @@ impl CustomProbe for BashCustomProbe {
         // subprocess. Report the phase as `exists` because that is the required
         // predicate gate; hooks that need phase-specific install/post behavior
         // get separate subprocesses with more precise phases.
-        apply_hook_env(&mut command, roots, &entry.name, "exists", None);
+        apply_hook_env(
+            &mut command,
+            roots,
+            &entry.name,
+            "exists",
+            self.package_manager.as_deref(),
+            None,
+        );
         let output = run_hook_command(command)?;
 
         if !output.status.success() {
@@ -687,7 +734,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
-    use super::{BashCustomProbe, Install, Post, Txn, Uninstall, read_capped};
+    use super::{BashCustomProbe, Install, Post, Txn, Uninstall, apply_hook_env, read_capped};
     use crate::config::parse_entry;
     use crate::runtime::Roots;
     use crate::status::CustomProbe;
@@ -804,6 +851,52 @@ version() { printf '%s\n' "$SHDEPS_BIN_DIR"; }
             .unwrap();
 
         assert_eq!(detail.as_deref(), Some(roots.bin_dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn hook_environment_only_overrides_package_manager_when_configured() {
+        let roots = roots();
+        let mut inherited = Command::new("true");
+        apply_hook_env(&mut inherited, &roots, "tool", "exists", None, None);
+        assert!(
+            inherited
+                .get_envs()
+                .all(|(name, _)| name != "SHDEPS_PKG_MGR")
+        );
+
+        let mut detected_empty = Command::new("true");
+        apply_hook_env(
+            &mut detected_empty,
+            &roots,
+            "tool",
+            "exists",
+            Some(""),
+            None,
+        );
+        assert_eq!(
+            detected_empty
+                .get_envs()
+                .find(|(name, _)| *name == "SHDEPS_PKG_MGR")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new(""))
+        );
+
+        let mut detected_dnf = Command::new("true");
+        apply_hook_env(
+            &mut detected_dnf,
+            &roots,
+            "tool",
+            "exists",
+            Some("dnf"),
+            None,
+        );
+        assert_eq!(
+            detected_dnf
+                .get_envs()
+                .find(|(name, _)| *name == "SHDEPS_PKG_MGR")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("dnf"))
+        );
     }
 
     #[test]
