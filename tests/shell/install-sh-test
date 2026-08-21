@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091,SC2329
+# shellcheck disable=SC1091,SC2030,SC2031,SC2329
 # install-sh-test — focused tests for install.sh helper functions.
+# SC2030/SC2031: command-substitution fixtures intentionally isolate exported
+# bootstrap variables, while mocked helpers inspect their dynamic local scope.
 # SC2329: subshell-local `uname` mocks are invoked indirectly by install.sh.
 #
 # install.sh is the curl-pipe bootstrap script; its helpers cannot be
@@ -284,7 +286,7 @@ mkdir -p "$_bootstrap_link_dir"
 printf 'shdeps_update() { :; }\n' >"$_bootstrap_link_dir/shdeps.sh"
 _bootstrap_retry_report=$(
   unset -f shdeps_update shdeps_self_update shdeps_link_extras 2>/dev/null || true
-  unset _SHDEPS_BOOTSTRAP_READY_KEY
+  unset _SHDEPS_BOOTSTRAP_READY_KEY SHDEPS_BOOTSTRAP_FORCE
   SHDEPS_LIB="$_bootstrap_link_dir/shdeps.sh"
   SHDEPS_DIR="$_fixture_dir/unrelated-install-root"
   export SHDEPS_LIB SHDEPS_DIR
@@ -311,12 +313,40 @@ _bootstrap_retry_report=$(
   SHDEPS_STATE_DIR="$_fixture_dir/alternate-state-root"
   export SHDEPS_STATE_DIR
   _bootstrap >>"$_bootstrap_link_out" 2>&1 || _fifth_rc=$?
-  printf '%s:%s:%s:%s:%s:%s:%s\n' \
-    "$_first_rc" "$_second_rc" "$_third_rc" "$_fourth_rc" "$_fifth_rc" \
+  SHDEPS_BOOTSTRAP_FORCE=1
+  export SHDEPS_BOOTSTRAP_FORCE
+  _sixth_rc=0
+  _bootstrap >>"$_bootstrap_link_out" 2>&1 || _sixth_rc=$?
+  printf '%s:%s:%s:%s:%s:%s:%s:%s\n' \
+    "$_first_rc" "$_second_rc" "$_third_rc" "$_fourth_rc" "$_fifth_rc" "$_sixth_rc" \
     "$_setup_attempts" "$_cleanup_attempts"
 )
-_assert_eq "bootstrap activation: failure is retried before readiness" \
-  "77:0:0:0:0:4:3" "$_bootstrap_retry_report"
+_assert_eq "bootstrap activation: retries failures and invalidates readiness for force" \
+  "77:0:0:0:0:0:5:4" "$_bootstrap_retry_report"
+
+echo "=== install.sh: bootstrap self-update force scope ==="
+
+_bootstrap_force_report=$(
+  unset SHDEPS_FORCE
+  SHDEPS_BOOTSTRAP_FORCE=1
+  export SHDEPS_BOOTSTRAP_FORCE
+  shdeps_self_update() {
+    printf 'bootstrap:%s:%s\n' "$SHDEPS_DIR" "${SHDEPS_FORCE-unset}"
+  }
+  _bootstrap_self_update "$_fixture_dir/source-checkout"
+  printf 'caller:%s\n' "${SHDEPS_FORCE-unset}"
+
+  SHDEPS_BOOTSTRAP_FORCE=0
+  SHDEPS_FORCE=1
+  export SHDEPS_BOOTSTRAP_FORCE SHDEPS_FORCE
+  _bootstrap_self_update "$_fixture_dir/source-checkout"
+  printf 'caller:%s\n' "$SHDEPS_FORCE"
+)
+_assert_eq "bootstrap self-update: provider force is child-scoped and legacy force survives" \
+  "bootstrap:$_fixture_dir/source-checkout:1
+caller:unset
+bootstrap:$_fixture_dir/source-checkout:1
+caller:1" "$_bootstrap_force_report"
 
 echo "=== install.sh: Lua API link ownership ==="
 

@@ -364,7 +364,7 @@ else
   cp -R "$_updated_payload/." "$_dev_release_inst/"
 
   (
-    unset SHDEPS_LIB SHDEPS_FORCE
+    unset SHDEPS_LIB SHDEPS_FORCE SHDEPS_BOOTSTRAP_FORCE
     HOME="$_dev_home" PATH="$_build_bin:$PATH" \
       SHDEPS_TEST_FAKE_SHDEPS="$_fake_shdeps" \
       SHDEPS_GIT_DEV_DIR="$_dev_parent" \
@@ -468,6 +468,7 @@ else
   echo "=== install.sh bootstrap release refresh ==="
 
   unset -f shdeps_update 2>/dev/null
+  unset SHDEPS_FORCE SHDEPS_BOOTSTRAP_FORCE
   _bootstrap_state=$(_tmpdir)/bootstrap-current
   _bootstrap_bin=$(_tmpdir)/bootstrap-bin
   _bootstrap_markers=$(_tmpdir)/bootstrap-markers
@@ -561,6 +562,41 @@ SH
     "$_bootstrap_force_markers/archive"
   _assert_file_exists "bootstrap forced release: downloads checksum" \
     "$_bootstrap_force_markers/checksum"
+
+  unset -f shdeps_update 2>/dev/null
+  _bootstrap_provider_force=$(_tmpdir)/bootstrap-provider-force
+  _bootstrap_provider_force_bin=$(_tmpdir)/bootstrap-provider-force-bin
+  _bootstrap_provider_force_markers=$(_tmpdir)/bootstrap-provider-force-markers
+  mkdir -p "$_bootstrap_provider_force" "$_bootstrap_provider_force_bin"
+  cp -R "$_payload/." "$_bootstrap_provider_force/"
+  _bootstrap_provider_force_rc=0
+  (
+    unset SHDEPS_FORCE _SHDEPSW_ENV_BIN _SHDEPSW_FORCE
+    export SHDEPS_BOOTSTRAP_FORCE=1
+    export HOME="$_bootstrap_home" PATH="$_release_fakebin:$PATH"
+    export SHDEPS_TEST_RELEASE_DIR="$_release_dir"
+    export SHDEPS_TEST_RELEASE_TAG="$_updated_tag"
+    export SHDEPS_TEST_MARKER_DIR="$_bootstrap_provider_force_markers"
+    export SHDEPS_GIT_DEV_DIR="$_bootstrap_home/git"
+    export SHDEPS_RELEASE_API_URL="https://api.github.com/repos/cgraf78/shdeps/releases/latest"
+    export SHDEPS_DIR="$_bootstrap_provider_force"
+    export SHDEPS_BIN="$_bootstrap_provider_force_bin/shdeps"
+    . "$_bootstrap_provider_force/install.sh" --bootstrap || exit $?
+    if shdeps_force; then
+      exit 91
+    fi
+    exit 0
+  ) || _bootstrap_provider_force_rc=$?
+  _assert_exit "bootstrap provider force: does not enable dependency force" \
+    0 "$_bootstrap_provider_force_rc"
+  _assert_eq "bootstrap provider force: CLI updates to latest" \
+    "shdeps $_updated_tag" "$("$_bootstrap_provider_force_bin/shdeps" version)"
+  _assert_file_exists "bootstrap provider force: checks latest" \
+    "$_bootstrap_provider_force_markers/latest"
+  _assert_file_exists "bootstrap provider force: downloads archive" \
+    "$_bootstrap_provider_force_markers/archive"
+  _assert_file_exists "bootstrap provider force: downloads checksum" \
+    "$_bootstrap_provider_force_markers/checksum"
 fi
 
 _test_summary

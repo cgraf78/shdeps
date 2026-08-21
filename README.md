@@ -152,6 +152,7 @@ that recorded owner and same-name updates refresh stale rows.
 | `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                                    | Post-install hooks directory                                                                                                                                                          |
 | `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`          | Cache/state directory                                                                                                                                                                 |
 | `SHDEPS_FORCE`       | `0`                                                     | Bypass TTL cache (check for updates now)                                                                                                                                              |
+| `SHDEPS_BOOTSTRAP_FORCE` | `0`                                                | Force provider freshness during `install.sh --bootstrap` without forcing the subsequent dependency update                                                                            |
 | `SHDEPS_REINSTALL`   | `0`                                                     | Force reinstall all deps                                                                                                                                                              |
 | `SHDEPS_QUIET`       | `0`                                                     | Suppress non-result output and interactive prompts                                                                                                                                         |
 | `SHDEPS_REMOTE_TTL`  | `3600`                                                  | Cache TTL in seconds                                                                                                                                                                  |
@@ -530,7 +531,7 @@ The `--bootstrap` flag:
 - **Sources it** into the caller (all `shdeps_*` functions become available)
 - **Symlinks the CLI** into `$SHDEPS_BIN` (default `~/.local/bin/shdeps`)
 - **Symlinks the Lua API tree** into `$SHDEPS_LUA_DIR` (default `~/.local/lib/shdeps`)
-- **Keeps bootstrap fast** by avoiding release freshness checks unless `SHDEPS_FORCE=1`
+- **Keeps bootstrap fast** by avoiding release freshness checks unless `SHDEPS_FORCE=1` or `SHDEPS_BOOTSTRAP_FORCE=1`
 - **Is idempotent** — safe to call multiple times
 - **Does not leak `set -e`** into the caller's shell
 
