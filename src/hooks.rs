@@ -17,9 +17,13 @@
 //! `<install_dir>/<name>` layout the install path uses for the same
 //! deps, keeping hooks parallel to their dep's install root.
 
-use std::io::{self, Read};
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +59,77 @@ const DEFAULT_HOOK_MAX_OUTPUT_BYTES: usize = 1 << 20;
 const HOOK_WAIT_POLL: Duration = Duration::from_millis(10);
 const HOOK_WARNING_PREFIX: &str = "shdeps-hook-warning: ";
 const HOOK_WARNING_MAX_BYTES: usize = 256;
+pub(crate) const SUDO_REQUEST_EXIT_CODE: i32 = 75;
+const SUDO_REQUEST_ENV: &str = "SHDEPS_HOOK_SUDO_REQUEST";
+const SUDO_REQUEST_DIR: &str = ".hook-sudo-requests";
+const SUDO_REQUEST_TOKEN: &[u8] = b"shdeps-hook-sudo-v1\n";
+static SUDO_REQUEST_NONCE: AtomicU64 = AtomicU64::new(0);
+
+struct HookOutput {
+    output: std::process::Output,
+    sudo_requested: bool,
+}
+
+struct SudoRequest {
+    path: PathBuf,
+    file: File,
+}
+
+impl SudoRequest {
+    fn new(state_dir: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(state_dir)?;
+        let dir = state_dir.join(SUDO_REQUEST_DIR);
+        let mut builder = DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::other(format!(
+                "hook sudo request path is not a directory: {}",
+                dir.display()
+            )));
+        }
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let path = dir.join(format!(
+            "{}-{}",
+            txn_id(),
+            SUDO_REQUEST_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&path)?;
+        Ok(Self { path, file })
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command.env(SUDO_REQUEST_ENV, &self.path);
+    }
+
+    fn requested(&mut self) -> bool {
+        if self.file.seek(SeekFrom::Start(0)).is_err() {
+            return false;
+        }
+        let mut bytes = Vec::new();
+        self.file.read_to_end(&mut bytes).is_ok() && bytes == SUDO_REQUEST_TOKEN
+    }
+}
+
+impl Drop for SudoRequest {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
 
 /// Runs a configured hook command with a wall-clock timeout and a
 /// per-stream output cap.
@@ -112,48 +187,96 @@ fn run_hook_command(mut command: Command) -> io::Result<std::process::Output> {
     let stdout_handle = thread::spawn(move || read_capped(stdout, max_bytes));
     let stderr_handle = thread::spawn(move || read_capped(stderr, max_bytes));
 
+    // The deadline covers both the hook leader and inherited output pipes.
+    // A shell can exit while a background child keeps those pipes open; keep
+    // polling instead of joining the readers immediately so that descendant
+    // is still terminated at the configured deadline.
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some() && stdout_handle.is_finished() && stderr_handle.is_finished() {
+            break;
         }
         if Instant::now() >= deadline {
             // Hook timed out. Signal the whole process group so any
             // grandchildren the hook backgrounded are reaped too —
             // otherwise they keep the inherited pipes open and the
             // reader threads hang past the timeout.
-            #[cfg(unix)]
-            {
-                // The child was placed in its own session by
-                // `setsid` above, so its PID is also its PGID. Negate
-                // the PID to signal the whole group.
-                let pgid = -(child.id() as i32);
-                // SAFETY: `kill` with a negative PID is a documented
-                // POSIX way to signal a process group. The pgid is
-                // the child's own session-leader PID which we just
-                // created via setsid in pre_exec; it cannot have
-                // been reused while the child is still alive
-                // (per `try_wait` above returning None).
-                unsafe {
-                    libc::kill(pgid, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = child.kill();
-            }
-            break child.wait()?;
+            kill_hook_process_group(&mut child);
+            status = Some(child.wait()?);
+            break;
         }
         thread::sleep(HOOK_WAIT_POLL);
-    };
+    }
 
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
     Ok(std::process::Output {
-        status,
+        status: status.expect("hook status set before reader completion"),
         stdout,
         stderr,
     })
+}
+
+fn kill_hook_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The child was placed in its own session by `setsid` above, so its
+        // PID is also its PGID. This remains the group's stable identity even
+        // after the leader exits while a grandchild still holds a pipe open.
+        let pgid = -(child.id() as i32);
+        // SAFETY: negative PIDs target a POSIX process group created by this
+        // parent for this hook invocation.
+        unsafe {
+            libc::kill(pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
+fn run_mutating_hook_command(mut command: Command, state_dir: &Path) -> io::Result<HookOutput> {
+    let mut request = SudoRequest::new(state_dir)?;
+    request.apply(&mut command);
+    let output = run_hook_command(command)?;
+    let sudo_requested =
+        output.status.code() == Some(SUDO_REQUEST_EXIT_CODE) && request.requested();
+    Ok(HookOutput {
+        output,
+        sudo_requested,
+    })
+}
+
+/// Signals that a detached mutating hook needs its parent to authenticate sudo.
+pub(crate) fn signal_parent_sudo_request() -> Result<bool> {
+    let phase = std::env::var("SHDEPS_HOOK_PHASE").unwrap_or_default();
+    if !matches!(phase.as_str(), "install" | "post" | "uninstall") {
+        return Ok(false);
+    }
+    let Some(request_path) = std::env::var_os(SUDO_REQUEST_ENV).map(PathBuf::from) else {
+        return Ok(false);
+    };
+    let Some(state_dir) = std::env::var_os("SHDEPS_STATE_DIR").map(PathBuf::from) else {
+        return Ok(false);
+    };
+    if request_path.parent() != Some(state_dir.join(SUDO_REQUEST_DIR).as_path()) {
+        return Ok(false);
+    }
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut request = options.open(request_path)?;
+    if !request.metadata()?.file_type().is_file() {
+        return Ok(false);
+    }
+    request.write_all(SUDO_REQUEST_TOKEN)?;
+    Ok(true)
 }
 
 fn read_capped<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
@@ -312,6 +435,8 @@ pub enum Uninstall {
     MissingFunction,
     /// The hook file or compatibility layer failed to source.
     SourceFailed,
+    /// The detached hook needs its attached parent to authenticate sudo.
+    SudoRequired,
     /// `uninstall(name)` exists but returned non-zero.
     Failed,
     /// `uninstall(name)` ran successfully.
@@ -327,6 +452,8 @@ pub enum Install {
     MissingFunction,
     /// Hook file or compatibility layer failed to source.
     SourceFailed,
+    /// The detached hook needs its attached parent to authenticate sudo.
+    SudoRequired,
     /// `exists(name)` reported the dependency was already installed.
     Already {
         /// Optional version output from `version(name)`.
@@ -353,6 +480,8 @@ pub enum Post {
     MissingFunction,
     /// Hook file or compatibility layer failed to source.
     SourceFailed,
+    /// The detached hook needs its attached parent to authenticate sudo.
+    SudoRequired,
     /// `post(name)` returned non-zero.
     Failed,
     /// `post(name)` ran successfully.
@@ -365,6 +494,7 @@ pub struct BashCustomProbe {
     shdeps_lib: PathBuf,
     inline_source: Option<&'static str>,
     package_manager: Option<String>,
+    quiet: Option<bool>,
 }
 
 /// Per-update hook coordination marker directory.
@@ -419,6 +549,7 @@ impl BashCustomProbe {
             shdeps_lib: shdeps_lib.into(),
             inline_source: None,
             package_manager: None,
+            quiet: None,
         }
     }
 
@@ -429,6 +560,7 @@ impl BashCustomProbe {
             shdeps_lib: PathBuf::from("__shdeps_inline_prelude__"),
             inline_source: Some(prelude::source()),
             package_manager: None,
+            quiet: None,
         }
     }
 
@@ -436,6 +568,13 @@ impl BashCustomProbe {
     #[must_use]
     pub fn with_package_manager(mut self, package_manager: impl Into<String>) -> Self {
         self.package_manager = Some(package_manager.into());
+        self
+    }
+
+    /// Uses the parent command's parsed quiet policy for hook subprocesses.
+    #[must_use]
+    pub fn with_quiet(mut self, quiet: bool) -> Self {
+        self.quiet = Some(quiet);
         self
     }
 
@@ -463,10 +602,15 @@ impl BashCustomProbe {
             "uninstall",
             self.package_manager.as_deref(),
             None,
+            self.quiet,
         );
-        let output = run_hook_command(command)?;
+        let output = run_mutating_hook_command(command, &roots.state_dir)?;
 
-        Ok(match output.status.code() {
+        if output.sudo_requested {
+            return Ok(Uninstall::SudoRequired);
+        }
+
+        Ok(match output.output.status.code() {
             Some(0) => Uninstall::Removed,
             Some(10) => Uninstall::MissingFunction,
             Some(11 | 12) => Uninstall::SourceFailed,
@@ -504,19 +648,24 @@ impl BashCustomProbe {
             "install",
             self.package_manager.as_deref(),
             txn,
+            self.quiet,
         );
-        let output = run_hook_command(command)?;
+        let output = run_mutating_hook_command(command, &roots.state_dir)?;
 
-        let detail = String::from_utf8_lossy(&output.stdout)
+        if output.sudo_requested {
+            return Ok(Install::SudoRequired);
+        }
+
+        let detail = String::from_utf8_lossy(&output.output.stdout)
             .trim_end_matches(['\r', '\n'])
             .to_owned();
-        Ok(match output.status.code() {
+        Ok(match output.output.status.code() {
             Some(0) => Install::Installed { detail },
             Some(20) => Install::Already { detail },
             Some(10 | 13) => Install::MissingFunction,
             Some(11 | 12) => Install::SourceFailed,
             _ => Install::Failed {
-                detail: failed_hook_detail(&output.stderr),
+                detail: failed_hook_detail(&output.output.stderr),
             },
         })
     }
@@ -549,10 +698,15 @@ impl BashCustomProbe {
             "post",
             self.package_manager.as_deref(),
             txn,
+            self.quiet,
         );
-        let output = run_hook_command(command)?;
+        let output = run_mutating_hook_command(command, &roots.state_dir)?;
 
-        Ok(match output.status.code() {
+        if output.sudo_requested {
+            return Ok(Post::SudoRequired);
+        }
+
+        Ok(match output.output.status.code() {
             Some(0) => Post::Ran,
             Some(10) => Post::MissingFunction,
             Some(11 | 12) => Post::SourceFailed,
@@ -626,6 +780,7 @@ fn apply_hook_env(
     phase: &str,
     package_manager: Option<&str>,
     txn: Option<&Txn>,
+    quiet: Option<bool>,
 ) {
     command
         .env("SHDEPS_CONF_DIR", &roots.conf_dir)
@@ -651,6 +806,9 @@ fn apply_hook_env(
         // `shdeps_pkg_mgr`. Direct library callers that did not supply a
         // detected manager retain the inherited environment for compatibility.
         command.env("SHDEPS_PKG_MGR", package_manager);
+    }
+    if let Some(quiet) = quiet {
+        command.env("SHDEPS_QUIET", if quiet { "1" } else { "0" });
     }
     if let Some(txn) = txn {
         // This env var is the only parent/child coordination channel for
@@ -709,6 +867,7 @@ impl CustomProbe for BashCustomProbe {
             "exists",
             self.package_manager.as_deref(),
             None,
+            self.quiet,
         );
         let output = run_hook_command(command)?;
 
@@ -730,11 +889,14 @@ impl CustomProbe for BashCustomProbe {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::process::Command;
 
-    use super::{BashCustomProbe, Install, Post, Txn, Uninstall, apply_hook_env, read_capped};
+    use super::{
+        BashCustomProbe, Install, Post, SUDO_REQUEST_TOKEN, SudoRequest, Txn, Uninstall,
+        apply_hook_env, read_capped,
+    };
     use crate::config::parse_entry;
     use crate::runtime::Roots;
     use crate::status::CustomProbe;
@@ -775,6 +937,51 @@ mod tests {
 
         drop(txn);
         assert!(!marker_dir.exists());
+    }
+
+    #[test]
+    fn sudo_request_is_private_and_bound_to_parent_created_inode() {
+        let roots = roots();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let mut request = SudoRequest::new(&roots.state_dir).unwrap();
+        let request_path = request.path.clone();
+        let request_dir = request_path.parent().unwrap().to_path_buf();
+
+        assert_eq!(
+            fs::metadata(&request_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&request_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let replacement = roots.state_dir.join("replacement-request");
+        fs::write(&replacement, SUDO_REQUEST_TOKEN).unwrap();
+        fs::remove_file(&request_path).unwrap();
+        symlink(&replacement, &request_path).unwrap();
+
+        assert!(
+            !request.requested(),
+            "path replacement must not authenticate a request the parent did not receive"
+        );
+    }
+
+    #[test]
+    fn sudo_request_refuses_symlinked_control_directory() {
+        let roots = roots();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let replacement = roots.state_dir.join("replacement-directory");
+        fs::create_dir_all(&replacement).unwrap();
+        symlink(&replacement, roots.state_dir.join(super::SUDO_REQUEST_DIR)).unwrap();
+
+        let error = match SudoRequest::new(&roots.state_dir) {
+            Ok(_) => panic!("symlinked request directory must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("is not a directory"));
+        assert!(fs::read_dir(&replacement).unwrap().next().is_none());
     }
 
     #[test]
@@ -857,7 +1064,7 @@ version() { printf '%s\n' "$SHDEPS_BIN_DIR"; }
     fn hook_environment_only_overrides_package_manager_when_configured() {
         let roots = roots();
         let mut inherited = Command::new("true");
-        apply_hook_env(&mut inherited, &roots, "tool", "exists", None, None);
+        apply_hook_env(&mut inherited, &roots, "tool", "exists", None, None, None);
         assert!(
             inherited
                 .get_envs()
@@ -871,6 +1078,7 @@ version() { printf '%s\n' "$SHDEPS_BIN_DIR"; }
             "tool",
             "exists",
             Some(""),
+            None,
             None,
         );
         assert_eq!(
@@ -888,6 +1096,7 @@ version() { printf '%s\n' "$SHDEPS_BIN_DIR"; }
             "tool",
             "exists",
             Some("dnf"),
+            None,
             None,
         );
         assert_eq!(

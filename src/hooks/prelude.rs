@@ -33,7 +33,16 @@ shdeps_reinstall() { command shdeps __api reinstall "$@"; }
 shdeps_pkg_mgr() { command shdeps __api pkg-mgr "$@"; }
 shdeps_pkg_install() { command shdeps __api pkg-install "$@"; }
 shdeps_pkg_install_for_mgr() { command shdeps __api pkg-install-for-mgr "$@"; }
-shdeps_require_sudo() { command shdeps __api require-sudo "$@"; }
+# Exit 75 is the private parent-prompt request returned only for this hook.
+shdeps_require_sudo() {
+  local _shdeps_sudo_status
+  command shdeps __api require-sudo "$@"
+  _shdeps_sudo_status=$?
+  if [[ "$_shdeps_sudo_status" -eq 75 && -n "${SHDEPS_HOOK_SUDO_REQUEST:-}" ]]; then
+    exit "$_shdeps_sudo_status"
+  fi
+  return "$_shdeps_sudo_status"
+}
 shdeps_install_dir() { command shdeps __api install-dir "$@"; }
 shdeps_git_dev_dir() { command shdeps __api git-dev-dir "$@"; }
 shdeps_bin_dir() { command shdeps __api bin-dir "$@"; }

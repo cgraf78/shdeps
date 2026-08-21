@@ -431,7 +431,7 @@ where
     } else {
         BTreeMap::new()
     };
-    let custom = custom_probe(&pkg_mgr);
+    let custom = custom_probe(&pkg_mgr, options.quiet);
     let context = StatusContext {
         roots: &roots,
         env: &env,
@@ -509,7 +509,7 @@ where
             }
         }
     }
-    let custom = custom_probe(&pkg_mgr);
+    let custom = custom_probe(&pkg_mgr, options.quiet);
     let context = StatusContext {
         roots: &roots,
         env: &env,
@@ -568,7 +568,7 @@ where
 
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
-    let hooks = custom_probe(&pkg_mgr);
+    let hooks = custom_probe(&pkg_mgr, options.quiet);
     let env_vars = env_vars(options);
     if let Some(message) =
         update_prerequisite_error(&entries, &env, &Process, UpdatePrerequisitePhase::Initial)
@@ -1453,7 +1453,7 @@ where
     let manifest = manifest::read(&manifest_path)?;
     let entries =
         resolve_github_entries(&entries, &roots, Some(&manifest), &env, &env_vars, options)?;
-    let hooks = custom_probe(&pkg_mgr);
+    let hooks = custom_probe(&pkg_mgr, options.quiet);
     let detected = prune::run(
         &entries,
         &manifest,
@@ -2663,6 +2663,9 @@ where
                 )?;
             }
             Uninstall::MissingHook | Uninstall::MissingFunction | Uninstall::Removed => {}
+            Uninstall::SudoRequired => {
+                unreachable!("sudo requests are resolved before prune rendering")
+            }
         }
 
         if let Some(cleanup) = &item.cleanup {
@@ -2907,11 +2910,12 @@ fn self_update_ttl() -> u64 {
         .unwrap_or(3600)
 }
 
-fn custom_probe(pkg_mgr: &str) -> BashCustomProbe {
+fn custom_probe(pkg_mgr: &str, quiet: bool) -> BashCustomProbe {
     shdeps_lib_path()
         .map(BashCustomProbe::new)
         .unwrap_or_else(BashCustomProbe::rust_prelude)
         .with_package_manager(pkg_mgr)
+        .with_quiet(quiet)
 }
 
 fn shdeps_lib_path() -> Option<PathBuf> {

@@ -15,6 +15,7 @@ use crate::cleanup;
 use crate::config::Entry;
 use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::manifest::{self, Manifest, ManifestEntry};
+use crate::process::{Process, Runner};
 use crate::runtime;
 
 /// User options for `shdeps prune`.
@@ -190,7 +191,17 @@ pub fn run(
     for entry in &orphans {
         cleanup::validate_manifest_artifact_entry(entry)?;
         let cleanup_evidence = capture_cleanup_evidence(entry, &cleanup_roots)?;
-        let hook = hooks.uninstall(&entry.name, roots)?;
+        let mut hook = hooks.uninstall(&entry.name, roots)?;
+        if hook == Uninstall::SudoRequired {
+            hook = if Process.run("sudo", &["true"], None)?.success {
+                match hooks.uninstall(&entry.name, roots)? {
+                    Uninstall::SudoRequired => Uninstall::Failed,
+                    retried => retried,
+                }
+            } else {
+                Uninstall::Failed
+            };
+        }
         let preserve_regular_public =
             regular_public_claimed_by_survivor(entry, &fresh_manifest, config);
         let (cleanup, cleanup_error) = cleanup_orphan(

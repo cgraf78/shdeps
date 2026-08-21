@@ -928,6 +928,7 @@ where
             &hook_txn,
             options,
             transitions.get(&entry.name),
+            progress,
         )?;
         let item = outcome.item;
         if outcome.cleanup_leftover {
@@ -955,13 +956,7 @@ where
     // inline with each method. Many hooks repair shell completions, symlinks,
     // or dependent tools, so they should see the final state for the full
     // update pass instead of an intermediate per-method view.
-    run_post_hooks(
-        &changed,
-        context.roots,
-        context.hooks,
-        &hook_txn,
-        &mut summary,
-    )?;
+    run_post_hooks(&changed, context, &hook_txn, &mut summary, progress)?;
     Ok(summary)
 }
 
@@ -1436,11 +1431,34 @@ fn install_custom(
     txn: &Txn,
     options: Options,
     transition: Option<&update_transition::Transition>,
+    progress: &mut dyn Progress,
 ) -> Result<CustomOutcome> {
-    let install =
+    let mut install =
         context
             .hooks
             .install_with_txn(&entry.name, context.roots, options.reinstall, Some(txn))?;
+    if install == Install::SudoRequired {
+        install = if authenticate_hook_sudo(context.runner, progress)? {
+            match context.hooks.install_with_txn(
+                &entry.name,
+                context.roots,
+                options.reinstall,
+                Some(txn),
+            )? {
+                Install::Already { .. } => Install::Failed {
+                    detail: "hook changed install state before sudo authentication".to_owned(),
+                },
+                Install::SudoRequired => Install::Failed {
+                    detail: String::new(),
+                },
+                retried => retried,
+            }
+        } else {
+            Install::Failed {
+                detail: String::new(),
+            }
+        };
+    }
     let marked = txn.collect()?;
     let verbose = verbose_enabled(options, context.env_vars);
     match install {
@@ -1488,7 +1506,13 @@ fn install_custom(
             cleanup_leftover: false,
             marked,
         }),
+        Install::SudoRequired => unreachable!("sudo requests are resolved before classification"),
     }
+}
+
+fn authenticate_hook_sudo(runner: &impl Runner, progress: &mut dyn Progress) -> Result<bool> {
+    progress.pause_for_prompt("waiting for sudo authentication")?;
+    Ok(runner.run("sudo", &["true"], None)?.success)
 }
 
 pub(crate) fn verbose_enabled(options: Options, env_vars: &BTreeMap<String, String>) -> bool {
@@ -1516,15 +1540,32 @@ fn record_changed(changed: &mut Vec<String>, name: String) {
 
 fn run_post_hooks(
     changed: &[String],
-    roots: &Roots,
-    hooks: &BashCustomProbe,
+    context: &Context<'_, impl Runner>,
     txn: &Txn,
     summary: &mut Summary,
+    progress: &mut dyn Progress,
 ) -> Result<()> {
     for name in changed {
-        match hooks.post_with_txn(name, roots, Some(txn))? {
+        let mut post = context
+            .hooks
+            .post_with_txn(name, context.roots, Some(txn))?;
+        if post == Post::SudoRequired {
+            post = if authenticate_hook_sudo(context.runner, progress)? {
+                match context
+                    .hooks
+                    .post_with_txn(name, context.roots, Some(txn))?
+                {
+                    Post::SudoRequired => Post::Failed,
+                    retried => retried,
+                }
+            } else {
+                Post::Failed
+            };
+        }
+        match post {
             Post::Ran | Post::MissingHook | Post::MissingFunction => {}
             Post::SourceFailed | Post::Failed => summary.failed.push(name.clone()),
+            Post::SudoRequired => unreachable!("sudo requests are resolved before classification"),
         }
     }
     Ok(())

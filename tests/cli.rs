@@ -2960,6 +2960,7 @@ fn update_custom_hook_with_cached_sudo_does_not_prompt_parent() {
         "tool install\ninstall sudo -n true\n"
     );
     assert!(fixture.dir.join("state/tool-installed").is_file());
+    assert!(!fixture.dir.join("state/.hook-sudo-requests").exists());
 }
 
 #[test]
@@ -3066,6 +3067,33 @@ uninstall() {
 }
 
 #[test]
+fn prune_quiet_custom_uninstall_never_prompts_or_retries_for_sudo() {
+    let fixture = custom_sudo_fixture("custom-uninstall-sudo-quiet", &["tool"]);
+    fixture.write("conf/deps.conf", "");
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+uninstall() {
+  printf '%s uninstall\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+}
+"#,
+    );
+
+    let output = run(&mut custom_sudo_command(
+        &fixture,
+        ["--quiet", "prune", "-y"],
+    ));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool uninstall\nuninstall sudo -n true\n"
+    );
+}
+
+#[test]
 fn update_custom_hook_retries_only_once_when_sudo_cache_stays_cold() {
     let fixture = custom_sudo_fixture("custom-sudo-one-retry", &["tool"]);
 
@@ -3078,6 +3106,116 @@ fn update_custom_hook_retries_only_once_when_sudo_cache_stays_cold() {
     assert_eq!(log.matches("tool install\n").count(), 2, "{log}");
     assert_eq!(log.matches("install sudo -n true\n").count(), 2, "{log}");
     assert!(!fixture.dir.join("state/tool-installed").exists());
+}
+
+#[test]
+fn update_custom_hook_does_not_retry_when_parent_sudo_fails() {
+    let fixture = custom_sudo_fixture("custom-sudo-parent-fails", &["tool"]);
+
+    let output = run(custom_sudo_command(&fixture, ["update"])
+        .env("SHDEPS_TEST_SUDO_PARENT_FAIL", "1")
+        .env("SHDEPS_PROGRESS", "jsonl"));
+
+    assert_eq!(output.status.code(), Some(1));
+    let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
+    assert_eq!(log.matches("parent sudo true\n").count(), 1, "{log}");
+    assert_eq!(log.matches("tool install\n").count(), 1, "{log}");
+    assert_eq!(log.matches("install sudo -n true\n").count(), 1, "{log}");
+    assert!(!fixture.dir.join("state/tool-installed").exists());
+    let events = jsonl(&output.stdout);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "prompt")
+            .count(),
+        1,
+        "failed parent authentication must not loop: {events:#?}"
+    );
+}
+
+#[test]
+fn update_custom_hook_partial_mutation_before_sudo_fails_closed() {
+    let fixture = custom_sudo_fixture("custom-sudo-partial-mutation", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() {
+  printf '%s install\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  printf 'partial\n' >"$SHDEPS_STATE_DIR/tool-installed"
+  shdeps_require_sudo || return $?
+  printf 'complete\n' >"$SHDEPS_STATE_DIR/tool-privileged"
+}
+"#,
+    );
+
+    let output = run(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_eq!(output.status.code(), Some(1));
+    let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
+    assert_eq!(log.matches("parent sudo true\n").count(), 1, "{log}");
+    assert_eq!(log.matches("tool install\n").count(), 1, "{log}");
+    assert!(fixture.dir.join("state/tool-installed").is_file());
+    assert!(!fixture.dir.join("state/tool-privileged").exists());
+    assert!(!fixture.dir.join("state/manifest").exists());
+}
+
+#[test]
+fn update_custom_hook_sudo_request_keeps_grandchild_cleanup_bounded() {
+    let fixture = custom_sudo_fixture("custom-sudo-background-before-request", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() {
+  if [ ! -f "$SHDEPS_TEST_SUDO_CACHE" ]; then
+    /bin/sh -c '/bin/sleep 5' &
+    printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/grandchild.pid"
+  fi
+  shdeps_require_sudo || return $?
+  printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"
+}
+"#,
+    );
+    let mut command = custom_sudo_command(&fixture, ["update"]);
+    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
+
+    let (output, elapsed) = timed(&mut command);
+
+    assert_success(&output);
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the hook deadline must still apply after the leader requests sudo: {elapsed:?}"
+    );
+    let pid = fs::read_to_string(fixture.dir.join("state/grandchild.pid"))
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(pid),
+        "pre-sudo hook grandchild to exit",
+    );
+}
+
+#[test]
+fn update_custom_hook_exit_75_without_request_does_not_prompt() {
+    let fixture = custom_sudo_fixture("custom-exit-75", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        "exists() { return 1; }\ninstall() { exit 75; }\n",
+    );
+
+    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!fixture.dir.join("sudo.log").exists());
+    let events = jsonl(&output.stdout);
+    assert!(
+        events.iter().all(|event| event["event"] != "prompt"),
+        "an unrelated hook exit code must not request authentication: {events:#?}"
+    );
 }
 
 #[test]
@@ -3693,6 +3831,9 @@ if [ "$1" = true ]; then
   if [ "$phase" != parent ]; then
     exit 1
   fi
+  if [ "${SHDEPS_TEST_SUDO_PARENT_FAIL:-0}" = 1 ]; then
+    exit 1
+  fi
   if [ "${SHDEPS_TEST_SUDO_STICKY_FAIL:-0}" != 1 ]; then
     : >"$SHDEPS_TEST_SUDO_CACHE"
   fi
@@ -3717,11 +3858,24 @@ fn custom_sudo_command<const N: usize>(fixture: &Fixture, args: [&str; N]) -> Co
 }
 
 fn process_is_running(pid: u32) -> bool {
-    let output = Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .expect("ps should be available in CLI tests");
-    output.status.success() && !text(&output.stdout).trim_start().starts_with('Z')
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(") ")
+            .and_then(|(_, fields)| fields.chars().next())
+            .is_some_and(|state| state != 'Z')
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps should be available in non-Linux CLI tests");
+        output.status.success() && !text(&output.stdout).trim_start().starts_with('Z')
+    }
 }
 
 fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool, description: &str) {
