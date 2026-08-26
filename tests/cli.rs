@@ -7,6 +7,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use shdeps::cli::{HELP, PUBLIC_COMMANDS};
 
+// Hosted runners can deschedule one short subprocess without indicating a
+// user-visible regression. Three samples keep the median sensitive to a
+// persistent slowdown while discarding one isolated scheduler outlier.
+const CI_PERFORMANCE_SAMPLES: usize = 3;
+
 fn shdeps() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shdeps"))
 }
@@ -845,16 +850,34 @@ fn dep_file_stays_fast_with_many_configured_dependencies() {
         "share/sley/shell.sh",
     ])));
 
-    let started = Instant::now();
-    let output = run(&mut fixture.command(["dep-file", "cgraf78/sley", "share/sley/shell.sh"]));
-    let elapsed = started.elapsed();
+    let (output, samples) =
+        timed_samples(|| fixture.command(["dep-file", "cgraf78/sley", "share/sley/shell.sh"]));
 
-    assert_success(&output);
-    assert!(
-        elapsed <= Duration::from_millis(200),
-        "dep-file should stay under the CI cheap-command budget; elapsed={elapsed:?}, stdout={:?}, stderr={:?}",
-        text(&output.stdout),
-        text(&output.stderr)
+    assert_ci_budget("dep-file", Duration::from_millis(200), &output, &samples);
+}
+
+#[test]
+fn representative_duration_ignores_one_scheduler_outlier() {
+    let samples = [
+        Duration::from_millis(295),
+        Duration::from_millis(10),
+        Duration::from_millis(12),
+    ];
+
+    assert_eq!(representative_duration(&samples), Duration::from_millis(12));
+}
+
+#[test]
+fn representative_duration_preserves_persistent_slowdown() {
+    let samples = [
+        Duration::from_millis(250),
+        Duration::from_millis(10),
+        Duration::from_millis(260),
+    ];
+
+    assert_eq!(
+        representative_duration(&samples),
+        Duration::from_millis(250)
     );
 }
 
@@ -884,43 +907,40 @@ fn cheap_path_and_status_commands_stay_within_ci_budget() {
     // precise benchmark number.
     assert_success(&run(&mut fixture.command(["version"])));
 
-    let (dep_root, root_elapsed) = timed(&mut fixture.command(["dep-root", "cgraf78/sley"]));
-    assert_success(&dep_root);
-    assert!(
-        root_elapsed <= Duration::from_millis(200),
-        "dep-root should stay under the CI cheap-command budget; elapsed={root_elapsed:?}, stdout={:?}, stderr={:?}",
-        text(&dep_root.stdout),
-        text(&dep_root.stderr)
+    let (dep_root, root_samples) = timed_samples(|| fixture.command(["dep-root", "cgraf78/sley"]));
+    assert_ci_budget(
+        "dep-root",
+        Duration::from_millis(200),
+        &dep_root,
+        &root_samples,
     );
 
-    let (dep_path, path_elapsed) =
-        timed(&mut fixture.command(["dep-path", "cgraf78/sley", "share/sley/shell.sh"]));
-    assert_success(&dep_path);
-    assert!(
-        path_elapsed <= Duration::from_millis(200),
-        "dep-path should stay under the CI cheap-command budget; elapsed={path_elapsed:?}, stdout={:?}, stderr={:?}",
-        text(&dep_path.stdout),
-        text(&dep_path.stderr)
+    let (dep_path, path_samples) =
+        timed_samples(|| fixture.command(["dep-path", "cgraf78/sley", "share/sley/shell.sh"]));
+    assert_ci_budget(
+        "dep-path",
+        Duration::from_millis(200),
+        &dep_path,
+        &path_samples,
     );
 
     fixture.write_executable("share/cgraf78/sley/bin/sley", "#!/bin/sh\n");
-    let (dep_links, links_elapsed) = timed(&mut fixture.command(["dep-links", "cgraf78/sley"]));
-    assert_success(&dep_links);
-    assert!(
-        links_elapsed <= Duration::from_millis(200),
-        "dep-links should stay under the CI cheap-command budget; elapsed={links_elapsed:?}, stdout={:?}, stderr={:?}",
-        text(&dep_links.stdout),
-        text(&dep_links.stderr)
+    let (dep_links, links_samples) =
+        timed_samples(|| fixture.command(["dep-links", "cgraf78/sley"]));
+    assert_ci_budget(
+        "dep-links",
+        Duration::from_millis(200),
+        &dep_links,
+        &links_samples,
     );
 
-    let (check, check_elapsed) = timed(&mut fixture.command(["check", "asset"]));
-    assert_success(&check);
+    let (check, check_samples) = timed_samples(|| fixture.command(["check", "asset"]));
     assert_eq!(text(&check.stdout), "asset: installed\n");
-    assert!(
-        check_elapsed <= Duration::from_millis(300),
-        "manifest-backed check should stay under the CI budget; elapsed={check_elapsed:?}, stdout={:?}, stderr={:?}",
-        text(&check.stdout),
-        text(&check.stderr)
+    assert_ci_budget(
+        "manifest-backed check",
+        Duration::from_millis(300),
+        &check,
+        &check_samples,
     );
 }
 
@@ -3938,6 +3958,34 @@ fn timed(command: &mut Command) -> (Output, Duration) {
     let started = Instant::now();
     let output = run(command);
     (output, started.elapsed())
+}
+
+fn timed_samples(mut command: impl FnMut() -> Command) -> (Output, Vec<Duration>) {
+    let mut output = None;
+    let mut samples = Vec::with_capacity(CI_PERFORMANCE_SAMPLES);
+    for _ in 0..CI_PERFORMANCE_SAMPLES {
+        let (current_output, elapsed) = timed(&mut command());
+        assert_success(&current_output);
+        output = Some(current_output);
+        samples.push(elapsed);
+    }
+    (output.expect("at least one timing sample"), samples)
+}
+
+fn representative_duration(samples: &[Duration]) -> Duration {
+    let mut ordered = samples.to_vec();
+    ordered.sort_unstable();
+    ordered[ordered.len() / 2]
+}
+
+fn assert_ci_budget(command: &str, budget: Duration, output: &Output, samples: &[Duration]) {
+    let representative = representative_duration(samples);
+    assert!(
+        representative <= budget,
+        "{command} should stay under the CI budget; representative={representative:?}, budget={budget:?}, samples={samples:?}, stdout={:?}, stderr={:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
 }
 
 fn assert_success(output: &Output) {
