@@ -1100,6 +1100,7 @@ The stable Bash API is:
 | `shdeps_link_extras <name> <dir>` | normally none | `0`; discovers and tracks extras symlinks |
 | `shdeps_unlink_extras <name>` | normally none | `0`; removes tracked extras symlinks |
 | `shdeps_github_release_install <name> <cmd> [owner/repo] [bin_path]` | human logs | `0` only when release install succeeds or is already current |
+| `shdeps_curl <curl-args...>` | curl stdout/stderr | curl exit status, with bounded connect/stall handling and transient retries |
 | `shdeps_log <message...>` | log line when enabled | `0` |
 | `shdeps_warn <message...>` | warning line to stderr when logging is enabled | `0` |
 | `shdeps_log_warn <message...>` | warning line to stderr when logging is enabled | `0` |
@@ -1177,6 +1178,7 @@ logic.
 | `shdeps_link_extras` | `link_extras()` | `shdeps __api link-extras <name> <dir>` |
 | `shdeps_unlink_extras` | `unlink_extras()` | `shdeps __api unlink-extras <name>` |
 | `shdeps_github_release_install` | `github_release_install()` | `shdeps __api github-release-install <name> <cmd> [owner/repo] [bin_path]` |
+| `shdeps_curl` | bounded curl transport policy | local Bash/prelude helper |
 | `shdeps_log` | `logging` | local Bash/prelude diagnostic helper or `shdeps __api log` |
 | `shdeps_warn` | `logging` | local Bash/prelude diagnostic helper or `shdeps __api warn` |
 | `shdeps_log_warn` | `logging` | local Bash/prelude diagnostic helper or `shdeps __api warn` |
