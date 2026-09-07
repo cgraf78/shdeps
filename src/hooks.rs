@@ -1300,15 +1300,7 @@ install() {
             .install("tool", &roots, false)
             .unwrap();
 
-        let supported_bash = Command::new("bash")
-            .args([
-                "-c",
-                "((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3)))",
-            ])
-            .status()
-            .unwrap()
-            .success();
-        if !supported_bash {
+        if !compatibility_bash_supported() {
             assert_eq!(result, Install::SourceFailed);
             return;
         }
@@ -1318,6 +1310,52 @@ install() {
             Install::Failed {
                 detail: "php-cs-fixer asset download failed".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn compatibility_layer_exposes_bounded_curl_to_custom_hooks() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        write_hook(
+            &roots.hooks_dir.join("tool.sh"),
+            r#"
+exists() { return 1; }
+curl() { printf '%s\n' "$@" > "$SHDEPS_STATE_DIR/curl-args"; }
+install() {
+  shdeps_curl -fsSL --no-netrc https://example.invalid/tool.tar.gz -o /dev/null
+}
+"#,
+        );
+
+        let compatibility_layer = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shdeps.sh");
+        let result = BashCustomProbe::new(compatibility_layer)
+            .install("tool", &roots, false)
+            .unwrap();
+
+        if !compatibility_bash_supported() {
+            assert_eq!(result, Install::SourceFailed);
+            return;
+        }
+
+        assert_eq!(
+            result,
+            Install::Installed {
+                detail: String::new()
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(roots.state_dir.join("curl-args")).unwrap(),
+            concat!(
+                "--connect-timeout\n10\n",
+                "--speed-limit\n1024\n",
+                "--speed-time\n60\n",
+                "--retry\n3\n",
+                "-fsSL\n--no-netrc\n",
+                "https://example.invalid/tool.tar.gz\n",
+                "-o\n/dev/null\n"
+            )
         );
     }
 
@@ -1419,6 +1457,17 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" > "$SHDEPS_STATE_DIR/post-ra
         let mut perms = fs::metadata(path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn compatibility_bash_supported() -> bool {
+        Command::new("bash")
+            .args([
+                "-c",
+                "((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3)))",
+            ])
+            .status()
+            .unwrap()
+            .success()
     }
 
     fn roots() -> Roots {

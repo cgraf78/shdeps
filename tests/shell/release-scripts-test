@@ -122,6 +122,10 @@ _assert_contains "release workflow: uses exact reusable tag command" \
   'tag-command: scripts/release-tag.sh' "$_release_workflow"
 _assert_contains "release workflow: enables Android x86_64 artifact" \
   "android-x86_64: true" "$_release_workflow"
+_assert_contains "release workflow: permits OIDC token issuance" \
+  "id-token: write" "$_release_workflow"
+_assert_contains "release workflow: permits artifact attestations" \
+  "attestations: write" "$_release_workflow"
 
 _test_workflow=$(cat "$SHDEPS_DIR/.github/workflows/test.yml")
 _assert_contains "test workflow: only pushes on main" \

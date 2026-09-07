@@ -573,6 +573,7 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir                          |
 | `shdeps_unlink_extras <name>`     | Remove all extras symlinks tracked for a dep                                                |
 | `shdeps_require_sudo`             | Acquire sudo; returns 0 if root or sudo obtained                                            |
+| `shdeps_curl <curl-args...>`       | Run curl with bounded connect/stall handling and transient retries                          |
 | `shdeps_log`                      | Normal log line                                                                             |
 | `shdeps_warn`                     | Warning (always shown unless quiet)                                                         |
 | `shdeps_log_ok`                   | Success highlight                                                                           |

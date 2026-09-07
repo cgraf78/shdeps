@@ -258,6 +258,10 @@ shdeps_dep_source() {
 shdeps_link_extras() { _shdepsw_call __api link-extras "$@"; }
 shdeps_unlink_extras() { _shdepsw_call __api unlink-extras "$@"; }
 shdeps_github_release_install() { _shdepsw_call __api github-release-install "$@"; }
+# Keep source-backed hooks on the same bounded transfer policy as the embedded
+# Rust prelude. Hooks use this helper for arbitrary downloads, so it remains a
+# thin curl wrapper rather than duplicating the release installer's semantics.
+shdeps_curl() { curl --connect-timeout 10 --speed-limit 1024 --speed-time 60 --retry 3 "$@"; }
 
 shdeps_skip() { _shdepsw_call __api skip-mark "$@"; }
 shdeps_skipped() { _shdepsw_call __api skip-check "$@"; }
