@@ -252,6 +252,12 @@ pub struct Summary {
     pub items: Vec<Item>,
     /// Dependencies whose install or post hook failed.
     pub failed: Vec<String>,
+    /// Failure details keyed by dependency name.
+    ///
+    /// Install failures already carry detail on their `Item`; post-hook
+    /// failures have no item, so their sanitized hook-authored warning is
+    /// recorded here instead of collapsing into a generic failure.
+    pub failed_details: BTreeMap<String, String>,
     /// Dependencies whose old-method cleanup needs a later retry.
     ///
     /// Method-transition cleanup runs after the new method has been recorded.
@@ -1555,16 +1561,26 @@ fn run_post_hooks(
                     .hooks
                     .retry_post_with_txn(name, context.roots, Some(txn))?
                 {
-                    Post::SudoRequired => Post::Failed,
+                    Post::SudoRequired => Post::Failed {
+                        detail: String::new(),
+                    },
                     retried => retried,
                 }
             } else {
-                Post::Failed
+                Post::Failed {
+                    detail: String::new(),
+                }
             };
         }
         match post {
-            Post::Ran | Post::MissingHook | Post::MissingFunction => {}
-            Post::SourceFailed | Post::Failed => summary.failed.push(name.clone()),
+            Post::Ran | Post::MissingHook | Post::MissingFunction | Post::Skipped => {}
+            Post::SourceFailed => summary.failed.push(name.clone()),
+            Post::Failed { detail } => {
+                if !detail.is_empty() {
+                    summary.failed_details.insert(name.clone(), detail);
+                }
+                summary.failed.push(name.clone());
+            }
             Post::SudoRequired => unreachable!("sudo requests are resolved before classification"),
         }
     }
@@ -3191,6 +3207,68 @@ install() {
                 .get("tool")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn update_records_post_failure_detail_in_summary() {
+        let fixture = Fixture::new("custom-post-failure");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/tool-installed" ]]; }
+install() { printf 'yes\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
+version() { printf '1.2.3\n'; }
+post() {
+  printf '%s\n' 'shdeps-hook-warning: link farm refresh failed' >&2
+  return 1
+}
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("tool|custom|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(summary.failed, ["tool"]);
+        assert_eq!(
+            summary.failed_details.get("tool").map(String::as_str),
+            Some("link farm refresh failed")
+        );
+    }
+
+    #[test]
+    fn update_treats_post_exit_two_as_skipped() {
+        let fixture = Fixture::new("custom-post-skipped");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/tool-installed" ]]; }
+install() { printf 'yes\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
+version() { printf '1.2.3\n'; }
+post() { return 2; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[parse_entry("tool|custom|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert!(summary.failed.is_empty());
+        assert!(summary.failed_details.is_empty());
     }
 
     #[test]
