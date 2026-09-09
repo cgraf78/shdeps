@@ -500,7 +500,7 @@ pub enum Install {
 }
 
 /// Result of running optional `post(name)` after a dependency changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Post {
     /// Hook file does not exist.
     MissingHook,
@@ -510,8 +510,14 @@ pub enum Post {
     SourceFailed,
     /// The detached hook needs its attached parent to authenticate sudo.
     SudoRequired,
-    /// `post(name)` returned non-zero.
-    Failed,
+    /// `post(name)` declined with exit code 2 (hook-declined/mismatch
+    /// convention). The hook chose not to run, so this is not a failure.
+    Skipped,
+    /// `post(name)` failed, optionally with a sanitized hook-authored warning.
+    Failed {
+        /// Safe phase context emitted through `shdeps_warn`.
+        detail: String,
+    },
     /// `post(name)` ran successfully.
     Ran,
 }
@@ -792,9 +798,12 @@ impl BashCustomProbe {
 
         Ok(match output.output.status.code() {
             Some(0) => Post::Ran,
+            Some(2) => Post::Skipped,
             Some(10) => Post::MissingFunction,
             Some(11 | 12) => Post::SourceFailed,
-            _ => Post::Failed,
+            _ => Post::Failed {
+                detail: failed_hook_detail(&output.output.stderr),
+            },
         })
     }
 
@@ -1418,6 +1427,47 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" > "$SHDEPS_STATE_DIR/post-ra
             fs::read_to_string(roots.state_dir.join("post-ran")).unwrap(),
             "tool:post\n"
         );
+    }
+
+    #[test]
+    fn post_failure_carries_sanitized_stderr_detail() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        write_hook(
+            &roots.hooks_dir.join("tool.sh"),
+            r#"
+post() {
+  shdeps_warn 'link farm refresh failed'
+  return 1
+}
+"#,
+        );
+
+        let result = BashCustomProbe::rust_prelude()
+            .post("tool", &roots)
+            .unwrap();
+
+        assert_eq!(
+            result,
+            Post::Failed {
+                detail: "link farm refresh failed".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn post_exit_code_two_is_skipped_not_failed() {
+        let roots = roots();
+        fs::create_dir_all(&roots.hooks_dir).unwrap();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let lib = roots.home.join("shdeps.sh");
+        fs::write(&lib, "shdeps_version() { :; }\n").unwrap();
+        write_hook(&roots.hooks_dir.join("tool.sh"), "post() { return 2; }\n");
+
+        let result = BashCustomProbe::new(&lib).post("tool", &roots).unwrap();
+
+        assert_eq!(result, Post::Skipped);
     }
 
     #[test]

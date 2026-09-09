@@ -2003,6 +2003,14 @@ fn cleanup_leftover_message(summary: &update::Summary, name: &str) -> String {
         .map_or(base.clone(), |detail| format!("{base}: {detail}"))
 }
 
+fn post_failed_message(summary: &update::Summary, name: &str) -> String {
+    let base = format!("{name}: post hook failed");
+    summary
+        .failed_details
+        .get(name)
+        .map_or(base.clone(), |detail| format!("{base} -- {detail}"))
+}
+
 fn write_update_summary<W, E>(
     summary: &update::Summary,
     entries: &[Entry],
@@ -2031,7 +2039,7 @@ where
 
     for name in &summary.failed {
         if !item_failures.contains(name.as_str()) {
-            write_row(stderr, "failed", &format!("{name}: post hook failed"))?;
+            write_row(stderr, "failed", &post_failed_message(summary, name))?;
         }
     }
 
@@ -2088,7 +2096,7 @@ where
 
     for name in &summary.failed {
         if !item_failures.contains(name.as_str()) {
-            write_row(stderr, "failed", &format!("{name}: post hook failed"))?;
+            write_row(stderr, "failed", &post_failed_message(summary, name))?;
         }
     }
 
@@ -2136,7 +2144,7 @@ where
 
     for name in &summary.failed {
         if !item_failures.contains(name.as_str()) {
-            write_row(stderr, "failed", &format!("{name}: post hook failed"))?;
+            write_row(stderr, "failed", &post_failed_message(summary, name))?;
         }
     }
 
@@ -2275,7 +2283,7 @@ where
 
     for name in &summary.failed {
         if !item_failures.contains(name.as_str()) {
-            write_row(stderr, "failed", &format!("{name}: post hook failed"))?;
+            write_row(stderr, "failed", &post_failed_message(summary, name))?;
         }
     }
 
@@ -3459,6 +3467,24 @@ mod tests {
         assert_eq!(
             super::cleanup_leftover_message(&summary, "tool"),
             "tool: old-method cleanup left artifacts behind: preserved replacement at /tmp/.tool.shdeps-unlink.1"
+        );
+    }
+
+    #[test]
+    fn post_failed_message_surfaces_hook_detail() {
+        let mut summary = Summary::default();
+        summary.failed.push("tool".to_owned());
+        summary
+            .failed_details
+            .insert("tool".to_owned(), "link farm refresh failed".to_owned());
+
+        assert_eq!(
+            super::post_failed_message(&summary, "tool"),
+            "tool: post hook failed -- link farm refresh failed"
+        );
+        assert_eq!(
+            super::post_failed_message(&Summary::default(), "tool"),
+            "tool: post hook failed"
         );
     }
 
