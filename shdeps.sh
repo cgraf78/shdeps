@@ -112,6 +112,14 @@ _shdepsw_call_from_dir() {
 _shdepsw_prepend_bin_dir() {
   local bin_dir
   bin_dir="${SHDEPS_BIN_DIR:-${_SHDEPSW_BIN_DIR:-$(_shdepsw_call __api bin-dir)}}"
+  # An empty bin dir (failed `__api bin-dir`) must never reach PATH: a
+  # leading empty entry resolves to the caller's current directory for every
+  # later command in the update shell. Fail closed instead; `shdeps_update`
+  # short-circuits on this so `update` never runs with a poisoned PATH.
+  if [[ -z "$bin_dir" ]]; then
+    printf 'shdeps: refusing update: empty bin dir\n' >&2
+    return 1
+  fi
   case ":${PATH:-}:" in
     *":$bin_dir:"*) ;;
     *)
@@ -120,7 +128,13 @@ _shdepsw_prepend_bin_dir() {
       # hooks in the same `dot update` or bootstrap process. Rust can only
       # mutate its child environment, so the sourceable wrapper preserves that
       # parent-shell contract here and leaves all install behavior in Rust.
-      export PATH="$bin_dir:${PATH:-}"
+      # Only append the old PATH when it is non-empty: a trailing empty
+      # entry also means the current directory on PATH.
+      if [[ -n "${PATH:-}" ]]; then
+        export PATH="$bin_dir:$PATH"
+      else
+        export PATH="$bin_dir"
+      fi
       ;;
   esac
 }

@@ -379,6 +379,131 @@ _assert_contains "wrapper update: child sees source dir" \
 _assert_contains "wrapper self-update: child sees source dir" \
   "self-update dir=$SHDEPS_DIR" "$(cat "$_path_log")"
 
+_path_dedup_output=$(
+  SHDEPS_RUST_CLI="$_path_fake" \
+    SHDEPS_WRAPPER_PATH_LOG="$_path_log" \
+    PATH="/path/bin:/usr/bin:/bin" \
+    "$(command -v bash)" -c "
+      unset SHDEPS_BIN_DIR
+      . \"\$1\"
+      shdeps_update
+      printf '%s\n' \"\$PATH\"
+    " \
+    bash "$SHDEPS_DIR/shdeps.sh"
+)
+_assert_eq "wrapper update: bin dir already on PATH stays untouched" \
+  "/path/bin:/usr/bin:/bin" "$_path_dedup_output"
+
+# An empty bin dir (failed `__api bin-dir`) must fail the update instead of
+# exporting a leading `:` entry, which would put the caller's cwd on PATH.
+_path_empty_fake=$(_tmpdir)/shdeps
+cat >"$_path_empty_fake" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}:${2:-}" in
+  __api:version)
+    printf '%s\n' "abi:1"
+    ;;
+  __api:env-snapshot)
+    printf '%s\n' \
+      "install_dir=/empty/install" \
+      "bin_dir=" \
+      "git_dev_dir=/empty/git" \
+      "platform=linux" \
+      "pkg_mgr=" \
+      "force=0" \
+      "reinstall=0"
+    ;;
+  __api:bin-dir)
+    exit 1
+    ;;
+  update:)
+    printf 'update ran\n' >>"${SHDEPS_WRAPPER_PATH_LOG:?missing path log}"
+    ;;
+  *)
+    printf 'unexpected wrapper path call: %s\n' "$*" >&2
+    exit 9
+    ;;
+esac
+SH
+chmod +x "$_path_empty_fake"
+_path_empty_log=$(_tmpdir)/wrapper-path-empty.log
+: >"$_path_empty_log"
+_path_empty_output=$(
+  SHDEPS_RUST_CLI="$_path_empty_fake" \
+    SHDEPS_WRAPPER_PATH_LOG="$_path_empty_log" \
+    PATH="/usr/bin:/bin" \
+    "$(command -v bash)" -c "
+      unset SHDEPS_BIN_DIR
+      . \"\$1\"
+      if shdeps_update; then
+        printf 'update ran path=%s\n' \"\$PATH\"
+      else
+        printf 'update refused path=%s\n' \"\$PATH\"
+      fi
+    " \
+    bash "$SHDEPS_DIR/shdeps.sh" 2>&1
+)
+_assert_eq "wrapper update: empty bin dir refuses update without touching PATH" \
+  $'shdeps: refusing update: empty bin dir\nupdate refused path=/usr/bin:/bin' "$_path_empty_output"
+_assert_eq "wrapper update: refused update never reaches Rust" \
+  "" "$(cat "$_path_empty_log")"
+
+# An empty PATH must yield exactly the bin dir: appending `:$PATH` would
+# leave a trailing `:` entry, which also means cwd on PATH.
+_path_empty_env_fake=$(_tmpdir)/shdeps
+# The child empties PATH before `update`, so this fake cannot use an
+# `env`-based shebang (PATH lookup would fail); resolve bash absolutely.
+printf '#!%s\n' "$(command -v bash)" >"$_path_empty_env_fake"
+cat >>"$_path_empty_env_fake" <<'SH'
+set -euo pipefail
+case "${1:-}:${2:-}" in
+  __api:version)
+    printf '%s\n' "abi:1"
+    ;;
+  __api:env-snapshot)
+    printf '%s\n' \
+      "install_dir=/emptyenv/install" \
+      "bin_dir=/emptyenv/bin" \
+      "git_dev_dir=/emptyenv/git" \
+      "platform=linux" \
+      "pkg_mgr=" \
+      "force=0" \
+      "reinstall=0"
+    ;;
+  update:)
+    printf 'update ran\n' >>"${SHDEPS_WRAPPER_PATH_LOG:?missing path log}"
+    ;;
+  *)
+    printf 'unexpected wrapper path call: %s\n' "$*" >&2
+    exit 9
+    ;;
+esac
+SH
+chmod +x "$_path_empty_env_fake"
+_path_empty_env_log=$(_tmpdir)/wrapper-path-empty-env.log
+: >"$_path_empty_env_log"
+_path_empty_env_output=$(
+  SHDEPS_RUST_CLI="$_path_empty_env_fake" \
+    SHDEPS_WRAPPER_PATH_LOG="$_path_empty_env_log" \
+    PATH="/usr/bin:/bin" \
+    "$(command -v bash)" -c "
+      unset SHDEPS_BIN_DIR
+      . \"\$1\"
+      PATH=
+      if shdeps_update; then
+        printf 'update ran path=%s\n' \"\$PATH\"
+      else
+        printf 'update refused path=%s\n' \"\$PATH\"
+      fi
+    " \
+    bash "$SHDEPS_DIR/shdeps.sh" 2>&1
+)
+_assert_eq "wrapper update: empty PATH yields exactly the bin dir" \
+  "update ran path=/emptyenv/bin" "$_path_empty_env_output"
+_assert_eq "wrapper update: empty PATH still runs update" \
+  "update ran" "$(cat "$_path_empty_env_log")"
+
 _fake=$(_tmpdir)/shdeps
 cat >"$_fake" <<'SH'
 #!/usr/bin/env bash
