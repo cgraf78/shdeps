@@ -28,7 +28,8 @@ use crate::method;
 #[cfg(unix)]
 static UNLINK_NONCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DirectoryIdentity {
     #[cfg(unix)]
     device: u64,
@@ -36,7 +37,8 @@ struct DirectoryIdentity {
     inode: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LogicalBaseIdentity {
     #[cfg(unix)]
     device: u64,
@@ -47,13 +49,15 @@ struct LogicalBaseIdentity {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum LogicalBaseKind {
     Directory,
     Symlink(PathBuf),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedRootIdentity {
     #[cfg(unix)]
     device: u64,
@@ -76,7 +80,8 @@ struct ManagedRootIdentity {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum ManagedRootKind {
     Directory,
     Symlink(PathBuf),
@@ -105,7 +110,8 @@ pub struct Summary {
 }
 
 /// Filesystem identity captured before arbitrary cleanup hooks can mutate paths.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Evidence {
     public_regular_identity: Option<FileIdentity>,
     release_archive_state: Option<ArchiveState>,
@@ -118,6 +124,112 @@ pub(crate) struct Evidence {
 }
 
 impl Evidence {
+    /// Validates persisted cleanup authority against the configured state roots.
+    ///
+    /// A transition journal is durable authorization to remove an old provider
+    /// after the manifest has moved on.  Its path-bearing evidence therefore
+    /// has to remain bound to the same install root and dependency name that
+    /// produced it; a merely well-formed JSON record is not enough.
+    pub(crate) fn validate_for(&self, entry: &ManifestEntry, roots: &Roots) -> Result<()> {
+        validate_manifest_artifact_entry(entry)?;
+
+        let release = entry.method == method::GITHUB_RELEASE;
+        if !release
+            && (self.public_regular_identity.is_some() || self.release_archive_state.is_some())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transition cleanup evidence assigns release ownership to another method",
+            )
+            .into());
+        }
+
+        let captures_root = entry.method == method::GITHUB_REPO
+            || method::is_external(&entry.method)
+            || self.release_archive_state == Some(ArchiveState::Proven);
+        if !captures_root {
+            if self.logical_install_base_identity.is_some()
+                || self.logical_install_base_was_absent
+                || self.physical_install_base.is_some()
+                || self.physical_install_base_identity.is_some()
+                || self.managed_install_root.is_some()
+                || self.managed_install_root_identity.is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "transition cleanup evidence contains an unexpected managed root",
+                )
+                .into());
+            }
+            return Ok(());
+        }
+
+        if self.logical_install_base_identity.is_none() && !self.logical_install_base_was_absent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transition cleanup evidence has no logical install-root identity",
+            )
+            .into());
+        }
+        if self.physical_install_base.is_some() != self.physical_install_base_identity.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transition cleanup evidence has incomplete install-root identity",
+            )
+            .into());
+        }
+        if self.managed_install_root.is_none() && self.managed_install_root_identity.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transition cleanup evidence has incomplete managed-root identity",
+            )
+            .into());
+        }
+
+        if let Some(base) = self.physical_install_base.as_deref() {
+            let current = fs::canonicalize(&roots.install_dir).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot revalidate transition install root {}: {error}",
+                        roots.install_dir.display()
+                    ),
+                )
+            })?;
+            if current != base
+                || !self.install_base_matches()
+                || !self.logical_base_matches(&roots.install_dir)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "transition cleanup evidence no longer matches the configured install root",
+                )
+                .into());
+            }
+        }
+
+        if let Some(root) = self.managed_install_root.as_deref() {
+            let name = if entry.method == method::GITHUB_REPO {
+                config::canonical_name(&entry.name, method::GITHUB_REPO)
+            } else {
+                entry.name.clone()
+            };
+            let expected = self
+                .physical_install_base
+                .as_deref()
+                .unwrap_or(&roots.install_dir)
+                .join(name);
+            if root != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "transition cleanup evidence names an unexpected managed root",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn public_regular_identity(&self) -> Option<&FileIdentity> {
         self.public_regular_identity.as_ref()
     }
@@ -233,6 +345,26 @@ impl Evidence {
         #[cfg(not(unix))]
         {
             Ok(false)
+        }
+    }
+
+    /// Returns the previously owned root when it still exists but no longer
+    /// matches the captured generation. Generic transition cleanup cannot
+    /// distinguish a new provider's in-place writes from stale old content in
+    /// that state, so callers must preserve the path and retain a retryable
+    /// leftover rather than silently acknowledging cleanup.
+    pub(crate) fn unresolved_managed_root(&self) -> Result<Option<&Path>> {
+        let (Some(root), Some(identity)) = (
+            self.managed_install_root.as_deref(),
+            self.managed_install_root_identity.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        match fs::symlink_metadata(root) {
+            Ok(_) if !identity.matches_before_removal(root) => Ok(Some(root)),
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 }

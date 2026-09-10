@@ -6,11 +6,12 @@
 //! wipe unless explicitly confirmed, run optional hook cleanup, then remove
 //! shdeps-owned artifacts and manifest tracking.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 
 use crate::Result;
+use crate::cancellation;
 use crate::cleanup;
 use crate::config::Entry;
 use crate::hooks::{BashCustomProbe, Uninstall};
@@ -73,6 +74,33 @@ pub fn run(
     hooks: &BashCustomProbe,
     options: Options,
 ) -> Result<Summary> {
+    cancellation::check()?;
+    // A fresh checkout can be durably published before its manifest row and
+    // transition journal are finalized. Discover that ownership from the
+    // state index, not current config or the caller's stale manifest snapshot.
+    // Only take the state lock early when such recovery exists, preserving the
+    // normal nonblocking dry-run/empty fast path.
+    #[cfg(unix)]
+    let mut recovery_lock = if crate::repo_transition::pending_fresh_publications(
+        &roots.state_dir,
+        &roots.install_dir,
+    )?
+    .is_empty()
+    {
+        None
+    } else {
+        Some(crate::state::StateLock::acquire(&roots.state_dir)?)
+    };
+    #[cfg(not(unix))]
+    let mut recovery_lock: Option<crate::state::StateLock> = None;
+    if recovery_lock.is_some() {
+        recover_fresh_repo_publications(roots, manifest_path)?;
+    }
+    let recovered_manifest = recovery_lock
+        .as_ref()
+        .map(|_| manifest::read(manifest_path))
+        .transpose()?;
+    let manifest = recovered_manifest.as_ref().unwrap_or(manifest);
     let orphans = orphans(manifest, config);
     // The "all orphans" guard prevents a silent bulk-delete of every
     // shdeps-tracked dep without explicit `--yes`. The pre-fix gate
@@ -104,7 +132,20 @@ pub fn run(
             quiet_skipped: false,
         });
     }
-    if orphans.is_empty() || options.dry_run {
+    if options.dry_run {
+        return Ok(Summary {
+            orphans,
+            removed: Vec::new(),
+            guarded_all_orphans: false,
+            quiet_skipped: false,
+        });
+    }
+    // A later update OR prune must retry post-swap cleanup. An otherwise
+    // orphan-free run still takes the state lock when method-transition state
+    // exists so committed cleanups are retried and their journals retired.
+    // The probe is intentionally non-validating; strict validation fails
+    // closed under the lock inside recovery.
+    if orphans.is_empty() && !crate::update_transition::has_pending_durable_transitions(roots) {
         return Ok(Summary {
             orphans,
             removed: Vec::new(),
@@ -129,7 +170,11 @@ pub fn run(
     // read-only preview. Real mutation paths below this point need
     // the lock to keep manifest writes and link-state mutations
     // coherent with a concurrent update.
-    let _lock = crate::state::StateLock::acquire(&roots.state_dir)?;
+    let _lock = match recovery_lock.take() {
+        Some(lock) => lock,
+        None => crate::state::StateLock::acquire(&roots.state_dir)?,
+    };
+    cancellation::check()?;
 
     // Re-read the manifest now that we hold the lock. The `orphans`
     // computed above is based on the caller's pre-lock snapshot; a
@@ -143,6 +188,7 @@ pub fn run(
     // would change it, and racing against that is out of scope —
     // the operator is expected to re-run prune if they edit config
     // mid-run.
+    recover_fresh_repo_publications(roots, manifest_path)?;
     let initial_manifest = manifest::read(manifest_path)?;
     crate::update_transition::recover_pending_publications(
         config,
@@ -150,9 +196,53 @@ pub fn run(
         manifest_path,
         roots,
     )?;
+    cancellation::check()?;
+    // Retry committed method transitions before orphan removal, mirroring the
+    // update recovery order. Prune is a commit-only caller: `Installing`
+    // journals whose target still matches are deferred untouched for a
+    // same-installer update, while a removed or changed target and malformed
+    // state fail closed before any hook, artifact cleanup, or manifest
+    // mutation below.
+    // Prune evaluates the full config (it does not platform-filter orphans),
+    // matching the publications recovery above.
+    let recovery_entries: Vec<Entry> = config.to_vec();
+    let custom_fingerprints = recovery_entries
+        .iter()
+        .filter(|entry| entry.method == crate::method::CUSTOM)
+        .map(|entry| {
+            hooks
+                .install_fingerprint(&entry.name, roots)
+                .map(|fingerprint| (entry.name.clone(), fingerprint))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    let mut recovered_items = Vec::new();
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    for pending in crate::update_transition::recover_pending_transitions(
+        &recovery_entries,
+        &custom_fingerprints,
+        manifest_path,
+        roots,
+        None,
+    )? {
+        let old = pending.old().clone();
+        if let Some(detail) = finish_pending_transition_cleanup(pending, roots, &old)? {
+            // Ambiguous cleanup can never complete exactly. Keep the new row
+            // (when present) so the next run retries coherently instead of
+            // stranding the journal with neither row matching, and surface the
+            // failure while still pruning unrelated orphans.
+            blocked.insert(old.name.clone());
+            recovered_items.push(Item {
+                entry: old,
+                hook: Uninstall::MissingHook,
+                cleanup: None,
+                cleanup_error: Some(detail),
+            });
+        }
+    }
+    cancellation::check()?;
     let fresh_manifest = manifest::read(manifest_path)?;
     let orphans = self::orphans(&fresh_manifest, config);
-    if orphans.is_empty() {
+    if orphans.is_empty() && recovered_items.is_empty() {
         return Ok(Summary {
             orphans,
             removed: Vec::new(),
@@ -180,20 +270,27 @@ pub fn run(
     if post_lock_prunes_everything && !options.yes {
         return Ok(Summary {
             orphans,
-            removed: Vec::new(),
+            removed: recovered_items,
             guarded_all_orphans: true,
             quiet_skipped: false,
         });
     }
 
     let cleanup_roots = cleanup_roots(roots);
-    let mut removed = Vec::new();
+    let mut removed = recovered_items;
     for entry in &orphans {
+        cancellation::check()?;
+        if blocked.contains(entry.name.as_str()) {
+            continue;
+        }
         cleanup::validate_manifest_artifact_entry(entry)?;
         let cleanup_evidence = capture_cleanup_evidence(entry, &cleanup_roots)?;
+        cancellation::check()?;
         let mut hook = hooks.uninstall(&entry.name, roots)?;
+        cancellation::check()?;
         if hook == Uninstall::SudoRequired {
             hook = if Process.run("sudo", &["true"], None)?.success {
+                cancellation::check()?;
                 match hooks.retry_uninstall(&entry.name, roots)? {
                     Uninstall::SudoRequired => Uninstall::Failed,
                     retried => retried,
@@ -201,9 +298,14 @@ pub fn run(
             } else {
                 Uninstall::Failed
             };
+            cancellation::check()?;
         }
         let preserve_regular_public =
             regular_public_claimed_by_survivor(entry, &fresh_manifest, config);
+        // Cleanup plus manifest removal is one commit boundary. Honor a
+        // latched signal before entering it, then let recovery invariants
+        // complete rather than interrupting halfway through filesystem state.
+        cancellation::check()?;
         let (cleanup, cleanup_error) = cleanup_orphan(
             entry,
             manifest_path,
@@ -253,6 +355,42 @@ fn capture_cleanup_evidence(
     }
 }
 
+// Finishes one recovered post-commit cleanup under the old checkout lock,
+// mirroring the update recovery path: lock, installer-transaction recovery,
+// exact-evidence finish. Lock and recovery failures abort prune loudly; an
+// ambiguous-cleanup warning is returned so the caller can contain it without
+// deleting the new row out from under the retained journal.
+fn finish_pending_transition_cleanup(
+    pending: crate::update_transition::PendingCleanup,
+    roots: &runtime::Roots,
+    old: &ManifestEntry,
+) -> Result<Option<String>> {
+    if old.method != crate::method::GITHUB_REPO {
+        return pending.finish(roots, None);
+    }
+    let cleanup_roots = cleanup_roots(roots);
+    let Some(root) = cleanup::safe_repo_root(old, &cleanup_roots) else {
+        return pending.finish(roots, None);
+    };
+    #[cfg(unix)]
+    {
+        crate::checkout_lock::with_checkout_lock_process_env(&root, |normalized| {
+            if crate::repo_transition::recover(normalized)?.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fresh repository ownership was not finalized before transition cleanup",
+                )
+                .into());
+            }
+            pending.finish(roots, Some(normalized))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        pending.finish(roots, Some(&root))
+    }
+}
+
 // Clean one orphan under its checkout lock only after arbitrary hooks have returned.
 fn cleanup_orphan(
     entry: &ManifestEntry,
@@ -261,6 +399,7 @@ fn cleanup_orphan(
     preserve_regular_public: bool,
     cleanup_evidence: cleanup::Evidence,
 ) -> Result<(Option<cleanup::Summary>, Option<String>)> {
+    cancellation::check()?;
     let captured_repo_root = (entry.method == crate::method::GITHUB_REPO)
         .then(|| {
             cleanup_evidence
@@ -346,6 +485,51 @@ fn orphans(manifest: &Manifest, config: &[Entry]) -> Vec<ManifestEntry> {
     manifest.orphans(config)
 }
 
+#[cfg(unix)]
+fn recover_fresh_repo_publications(roots: &runtime::Roots, manifest_path: &Path) -> Result<()> {
+    for publication in
+        crate::repo_transition::pending_fresh_publications(&roots.state_dir, &roots.install_dir)?
+    {
+        crate::checkout_lock::with_checkout_lock_process_env(
+            &publication.checkout,
+            |normalized| {
+                match crate::repo_transition::recover(normalized)? {
+                    Some(ownership) => {
+                        if ownership != publication.ownership {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "fresh repository journal and durable index disagree",
+                            )
+                            .into());
+                        }
+                        crate::update_repo::recover_fresh_publication(
+                            roots,
+                            manifest_path,
+                            normalized,
+                            &ownership,
+                        )?;
+                    }
+                    None => {
+                        let manifest = manifest::read(manifest_path)?;
+                        crate::repo_transition::finish_index_without_journal(
+                            &roots.state_dir,
+                            &publication,
+                            &manifest,
+                        )?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn recover_fresh_repo_publications(_roots: &runtime::Roots, _manifest_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn cleanup_roots(roots: &runtime::Roots) -> cleanup::Roots {
     cleanup::Roots {
         state_dir: roots.state_dir.clone(),
@@ -362,14 +546,19 @@ impl fmt::Display for Item {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-
     use super::{Options, run};
-    use crate::config::parse_entry;
+    use crate::config::{Entry, parse_entry};
     use crate::hooks::{BashCustomProbe, Uninstall};
     use crate::manifest::{self, ManifestEntry};
     use crate::runtime::Roots;
+    use crate::update_transition;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    fn run_signal_boundary_subprocess(test_name: &str, child_env: &str) {
+        crate::test_support::run_signal_boundary_subprocess(test_name, child_env);
+    }
 
     #[test]
     #[cfg(unix)]
@@ -417,6 +606,120 @@ mod tests {
         assert!(!bin.exists());
         assert!(!fixture.roots.install_dir.join("owner/tool").exists());
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_recovers_committed_fresh_repo_before_empty_manifest_fast_path() {
+        let fixture = Fixture::new("prune-pending-fresh-repo");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let checkout = fixture.roots.install_dir.join("owner/tool");
+        let staged = fixture.roots.install_dir.join("owner/tool.tmp.123");
+        fixture.write(&staged.join("bin/tool"), "#!/bin/sh\n");
+        let ownership = ManifestEntry::new(
+            "owner/tool",
+            "github:repo",
+            "tool",
+            checkout.display().to_string(),
+        );
+        crate::repo_transition::publish_fresh_directory(
+            &checkout,
+            &staged,
+            ownership.clone(),
+            &fixture.roots.state_dir,
+        )
+        .unwrap();
+        // Model an uncatchable stop after manifest publication but before the
+        // fresh-publication journal and its durable index were retired.
+        manifest::upsert(&manifest_path, ownership).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest::Manifest::default(),
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.removed.len(), 1);
+        assert!(!checkout.exists());
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(
+            crate::repo_transition::pending_fresh_publications(
+                &fixture.roots.state_dir,
+                &fixture.roots.install_dir,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_before_prune_commit_preserves_artifacts_and_manifest() {
+        use std::os::unix::fs::symlink;
+
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_BEFORE_PRUNE_COMMIT";
+        const TEST_NAME: &str =
+            "prune::tests::cancellation_before_prune_commit_preserves_artifacts_and_manifest";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let fixture = Fixture::new("cancel-before-prune-commit");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        let archive_bin = install_root.join("bin/tool");
+        fixture.write(&archive_bin, "#!/bin/sh\n");
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&archive_bin, &public).unwrap();
+        let entry = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            public.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        let cleanup_roots = super::cleanup_roots(&fixture.roots);
+        let evidence = super::capture_cleanup_evidence(&entry, &cleanup_roots).unwrap();
+
+        // Model an injected uninstall hook that returned success while
+        // delivering TERM immediately before the prune commit boundary.
+        // SAFETY: this subprocess installed the Shdeps signal owner above.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let result = super::cleanup_orphan(&entry, &manifest_path, &cleanup_roots, false, evidence);
+
+        assert!(
+            result.is_err(),
+            "latched cancellation must reject prune commit"
+        );
+        assert!(
+            archive_bin.exists(),
+            "cancelled prune removed owned artifacts"
+        );
+        assert!(
+            public.exists(),
+            "cancelled prune removed its public command"
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_some(),
+            "cancelled prune removed its manifest row"
+        );
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
     }
 
     #[test]
@@ -1910,6 +2213,553 @@ mod tests {
             "custom\n"
         );
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    /// Starts a cargo-to-pkg method journal bound to the apt installer.
+    #[cfg(unix)]
+    fn begin_pkg_journal(
+        fixture: &Fixture,
+        manifest_path: &Path,
+        entry: &Entry,
+    ) -> update_transition::DurableTransition {
+        let manifest = manifest::read(manifest_path).unwrap();
+        let transition =
+            update_transition::by_name(&manifest, std::slice::from_ref(entry), &fixture.roots)
+                .unwrap()
+                .remove(entry.name.as_str())
+                .unwrap();
+        let apt = update_transition::PkgInstallerIdentity::for_target(
+            &entry.name,
+            &entry.aliases,
+            "apt",
+            false,
+        );
+        update_transition::begin_durable_transition(
+            entry,
+            Some(&transition),
+            &fixture.roots,
+            manifest_path,
+            Some(apt),
+        )
+        .unwrap()
+        .expect("cargo-to-pkg starts a durable transition")
+    }
+
+    /// Starts a method journal targeting the custom provider with a fixed hook
+    /// fingerprint.
+    #[cfg(unix)]
+    fn begin_custom_journal(
+        fixture: &Fixture,
+        manifest_path: &Path,
+        entry: &Entry,
+    ) -> update_transition::DurableTransition {
+        let manifest = manifest::read(manifest_path).unwrap();
+        let transition =
+            update_transition::by_name(&manifest, std::slice::from_ref(entry), &fixture.roots)
+                .unwrap()
+                .remove(entry.name.as_str())
+                .unwrap();
+        update_transition::begin_custom_durable_transition(
+            entry,
+            Some(&transition),
+            &fixture.roots,
+            manifest_path,
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap()
+        .expect("starts a durable custom transition")
+    }
+
+    /// Drives a custom journal to `ManifestCommitted`, simulating a crash
+    /// after the manifest swap but before old cleanup.
+    #[cfg(unix)]
+    fn commit_custom_journal(fixture: &Fixture, manifest_path: &Path, entry: &Entry) {
+        let mut durable = begin_custom_journal(fixture, manifest_path, entry);
+        durable.mark_installing(&fixture.roots).unwrap();
+        manifest::upsert(
+            durable.manifest_path(),
+            ManifestEntry::new(entry.name.clone(), "custom", entry.cmd.clone(), ""),
+        )
+        .unwrap();
+        durable.mark_installed(entry, &fixture.roots).unwrap();
+        durable
+            .commit(entry, &fixture.roots, manifest_path)
+            .unwrap();
+    }
+
+    /// Sets up an old cargo provider with owned artifacts and manifest row.
+    #[cfg(unix)]
+    fn write_old_cargo_provider(fixture: &Fixture) -> (PathBuf, ManifestEntry) {
+        let old_root = fixture.roots.install_dir.join("tool");
+        fixture.write(&old_root.join("bin/tool"), "#!/bin/sh\n");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new("tool", "cargo", "tool", old_root.display().to_string());
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        (manifest_path, old)
+    }
+
+    /// Sets up an old github:repo provider with owned checkout and manifest row.
+    #[cfg(unix)]
+    fn write_old_repo_provider(fixture: &Fixture) -> (PathBuf, ManifestEntry) {
+        let old_root = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&old_root.join("bin/tool"), "#!/bin/sh\n");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:repo",
+            "tool",
+            old_root.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        (manifest_path, old)
+    }
+
+    /// Sets up an old github:release archive provider with proven marker and
+    /// manifest row.
+    #[cfg(unix)]
+    fn write_old_release_provider(fixture: &Fixture) -> (PathBuf, ManifestEntry) {
+        let old_root = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&old_root.join("bin/tool"), "#!/bin/sh\n");
+        fixture.write(
+            &crate::github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/tool",
+            ),
+            "v1 archive\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            old_root.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        (manifest_path, old)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_retries_committed_transition_cleanup_with_no_orphans() {
+        let fixture = Fixture::new("transition-cleanup-no-orphans");
+        let (manifest_path, _old) = write_old_cargo_provider(&fixture);
+        let entry = parse_entry("tool|pkg|tool|-|-", Some("apt"));
+        let mut durable = begin_pkg_journal(&fixture, &manifest_path, &entry);
+        durable.mark_installing(&fixture.roots).unwrap();
+        manifest::upsert(
+            durable.manifest_path(),
+            ManifestEntry::new("tool", "pkg", "tool", ""),
+        )
+        .unwrap();
+        durable.mark_installed(&entry, &fixture.roots).unwrap();
+        durable
+            .commit(&entry, &fixture.roots, &manifest_path)
+            .unwrap();
+        drop(durable);
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        assert!(manifest.orphans(std::slice::from_ref(&entry)).is_empty());
+        let summary = run(
+            std::slice::from_ref(&entry),
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(summary.removed.is_empty());
+        assert!(
+            !fixture.roots.install_dir.join("tool").exists(),
+            "prune must retry post-swap cleanup even with no orphans"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "acknowledged cleanup must retire its transition journal"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("tool")
+                .unwrap()
+                .method,
+            "pkg"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_surfaces_persistent_committed_transition_cleanup_failure() {
+        let fixture = Fixture::new("transition-cleanup-failure");
+        let checkout = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&checkout.join("bin/tool"), "#!/bin/sh\n");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:repo",
+                "tool",
+                checkout.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let entry = parse_entry("owner/tool|pkg|tool|-|-", Some("apt"));
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let transition =
+            update_transition::by_name(&manifest, std::slice::from_ref(&entry), &fixture.roots)
+                .unwrap()
+                .remove(entry.name.as_str())
+                .unwrap();
+        let apt = update_transition::PkgInstallerIdentity::for_target(
+            &entry.name,
+            &entry.aliases,
+            "apt",
+            false,
+        );
+        let mut durable = update_transition::begin_durable_transition(
+            &entry,
+            Some(&transition),
+            &fixture.roots,
+            &manifest_path,
+            Some(apt),
+        )
+        .unwrap()
+        .unwrap();
+        durable.mark_installing(&fixture.roots).unwrap();
+        manifest::upsert(
+            durable.manifest_path(),
+            ManifestEntry::new("owner/tool", "pkg", "tool", ""),
+        )
+        .unwrap();
+        durable.mark_installed(&entry, &fixture.roots).unwrap();
+        durable
+            .commit(&entry, &fixture.roots, &manifest_path)
+            .unwrap();
+        drop(durable);
+        // Modify the old checkout after the snapshot so repository cleanup
+        // disagrees persistently (a hard failure, not a silent preserve).
+        fixture.write(&checkout.join("intruder"), "x\n");
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let summary = run(
+            std::slice::from_ref(&entry),
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors(), "{summary:?}");
+        assert_eq!(summary.removed.len(), 1);
+        assert!(summary.removed[0].cleanup_error.is_some());
+        assert!(
+            checkout.exists(),
+            "ambiguous old artifacts must be preserved"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .is_dir(),
+            "failed cleanup must retain its journal for retry"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .unwrap()
+                .method,
+            "pkg"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_finishes_committed_cleanup_then_prunes_removed_provider() {
+        let fixture = Fixture::new("transition-cleanup-removed");
+        let (manifest_path, _old) = write_old_cargo_provider(&fixture);
+        let entry = parse_entry("tool|pkg|tool|-|-", Some("apt"));
+        let mut durable = begin_pkg_journal(&fixture, &manifest_path, &entry);
+        durable.mark_installing(&fixture.roots).unwrap();
+        manifest::upsert(
+            durable.manifest_path(),
+            ManifestEntry::new("tool", "pkg", "tool", ""),
+        )
+        .unwrap();
+        durable.mark_installed(&entry, &fixture.roots).unwrap();
+        durable
+            .commit(&entry, &fixture.roots, &manifest_path)
+            .unwrap();
+        drop(durable);
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(
+            !fixture.roots.install_dir.join("tool").exists(),
+            "prune must finish old cleanup before pruning the new provider"
+        );
+        assert!(
+            manifest::read(&manifest_path).unwrap().entries().is_empty(),
+            "the removed new provider must be pruned"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "no journal may remain to wedge a future update"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_finishes_cargo_to_custom_cleanup_then_prunes_removed_provider() {
+        let fixture = Fixture::new("transition-cleanup-custom-removed");
+        let (manifest_path, _old) = write_old_cargo_provider(&fixture);
+        let entry = parse_entry("tool|custom|tool|-|-", None);
+        commit_custom_journal(&fixture, &manifest_path, &entry);
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(
+            !fixture.roots.install_dir.join("tool").exists(),
+            "prune must finish old cleanup before pruning the new provider"
+        );
+        assert!(
+            manifest::read(&manifest_path).unwrap().entries().is_empty(),
+            "the removed new provider must be pruned"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "no journal may remain to wedge a future update"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_finishes_repo_to_custom_cleanup_then_prunes_removed_provider() {
+        let fixture = Fixture::new("transition-cleanup-repo-custom-removed");
+        let (manifest_path, _old) = write_old_repo_provider(&fixture);
+        let entry = parse_entry("owner/tool|custom|tool|-|-", None);
+        commit_custom_journal(&fixture, &manifest_path, &entry);
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(
+            !fixture.roots.install_dir.join("owner/tool").exists(),
+            "prune must finish old checkout cleanup before pruning the new provider"
+        );
+        assert!(
+            manifest::read(&manifest_path).unwrap().entries().is_empty(),
+            "the removed new provider must be pruned"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "no journal may remain to wedge a future update"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_finishes_release_to_custom_cleanup_then_prunes_removed_provider() {
+        let fixture = Fixture::new("transition-cleanup-release-custom-removed");
+        let (manifest_path, _old) = write_old_release_provider(&fixture);
+        let entry = parse_entry("owner/tool|custom|tool|-|-", None);
+        commit_custom_journal(&fixture, &manifest_path, &entry);
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(
+            !fixture.roots.install_dir.join("owner/tool").exists(),
+            "prune must finish old archive cleanup before pruning the new provider"
+        );
+        assert!(
+            manifest::read(&manifest_path).unwrap().entries().is_empty(),
+            "the removed new provider must be pruned"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "no journal may remain to wedge a future update"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_refuses_installing_transition_with_removed_config_before_any_mutation() {
+        let fixture = Fixture::new("transition-installing-removed");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            "uninstall() { printf '%s\\n' \"$1\" > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+        );
+        let (manifest_path, old) = write_old_cargo_provider(&fixture);
+        let entry = parse_entry("tool|pkg|tool|-|-", Some("apt"));
+        let mut durable = begin_pkg_journal(&fixture, &manifest_path, &entry);
+        durable.mark_installing(&fixture.roots).unwrap();
+        drop(durable);
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let error = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("no longer matches configuration"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            message.contains("remove the stale transition record"),
+            "wedge error must name the escape remedy: {error}"
+        );
+        assert!(
+            !fixture.roots.state_dir.join("hook-ran").exists(),
+            "no uninstall hook may run before the fail-closed check"
+        );
+        assert!(
+            fixture.roots.install_dir.join("tool/bin/tool").exists(),
+            "old ownership needed for safe retry must survive"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .is_dir(),
+            "the ambiguous journal must be retained for retry"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_rejects_malformed_transition_state_before_mutating() {
+        let fixture = Fixture::new("transition-malformed");
+        let (manifest_path, old) = write_old_cargo_provider(&fixture);
+        let transition_dir = fixture.roots.state_dir.join(".method-transitions-v1");
+        fs::create_dir_all(&transition_dir).unwrap();
+        fs::write(
+            transition_dir.join(format!("{}.json", "0".repeat(64))),
+            "{invalid",
+        )
+        .unwrap();
+
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let error = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            !error.to_string().is_empty(),
+            "malformed transition state must fail prune"
+        );
+        assert!(
+            fixture.roots.install_dir.join("tool/bin/tool").exists(),
+            "no artifact cleanup may run before transition validation"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
     }
 
     struct Fixture {

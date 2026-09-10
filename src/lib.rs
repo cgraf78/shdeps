@@ -14,6 +14,7 @@
 pub mod api;
 pub mod archive;
 pub mod bin_link;
+pub mod cancellation;
 #[cfg(unix)]
 mod checkout_lock;
 pub mod checksum;

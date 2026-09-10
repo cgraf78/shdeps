@@ -121,6 +121,10 @@ General exit codes:
 - `1`: runtime error, not installed, failed install, unknown dependency, or
   intentionally aborted guarded operation.
 - `2`: usage error.
+- `128+N`: HUP, INT, QUIT, or TERM signal `N`, returned only after
+  synchronously owned subprocesses have been stopped, drained, and reaped.
+  Incomplete cleanup is a runtime error (`1`) with diagnostics, not a signal
+  acknowledgement.
 
 Commands MAY return narrower meanings documented below, but MUST preserve these
 classes.
@@ -973,18 +977,49 @@ binary at `$SHDEPS_BIN_DIR/<cmd>`.
 If a configured dependency's method differs from its manifest method:
 
 - It is not an orphan.
-- shdeps MUST stage the new method install before mutating manifest or
-  bin-links: download, extract, run external installers, and verify the new
-  artifact is present and runnable in a staging location.
-- Once staging succeeds, shdeps MUST atomically swap manifest row and bin
-  symlink to the new method.
+- shdeps MUST record a durable method-transition journal before installing
+  new method artifacts: the old manifest row, the configured target (method,
+  cmd, aliases, filter, custom hook fingerprint), and the phase. The journal
+  lives in `$SHDEPS_STATE_DIR/.method-transitions-v1/<sha256(name)>.json`
+  next to a prepared manifest holding the staged ownership evidence at
+  `<sha256(name)>.manifest` in the same directory.
+- Stageable methods (repo clones, release downloads) MUST stage the new
+  artifact in a private location and verify it is present and runnable
+  before the manifest swap.
+- Package (`pkg`) and custom installers are NOT stageable: they mutate live
+  system state (package-manager databases, arbitrary hook output) that
+  cannot be staged before side effects. Their journals instead record the
+  exact operation started so a later run resumes or verifies it rather than
+  repeating blind side effects. A `pkg` journal MUST bind the exact
+  normalized installer identity (package manager, Android/runtime selector,
+  resolved package). Retry under a different identity MUST fail closed
+  before any package query, as MUST a legacy journal without that binding.
+- Once the new method is installed and verified, shdeps MUST atomically swap
+  the manifest row (and bin symlink for link-based methods) to the new
+  method and advance the journal phase: `Prepared` -> `Installing` ->
+  `Installed` -> `ManifestCommitted`.
 - After the swap, shdeps MUST clean old non-`pkg` managed artifacts (old
   install root, old `.links`/`.binlinks` entries, old TTL/rev stamps).
+  Custom transitions exact-clean only snapshot paths that still match the
+  saved pre-install state; changed or ambiguous paths are preserved and the
+  journal is retained for a later retry.
 - If cleanup fails after a successful swap, the system MUST remain usable:
   the new method works, and the leftover artifacts are reported as
   orphaned-leftover via the verbose log. A subsequent `shdeps update` or
   `shdeps prune` MUST re-attempt cleanup. Cleanup failure MUST NOT roll back
   the swap.
+- Recovery on a later run MUST classify each journaled transition against
+  the live manifest: `Prepared` with the old row still live is abandoned
+  and its journal retired (nothing was installed yet); `Installing`
+  re-validates configuration and installer identity before resuming. An
+  `Installing` journal whose configured target no longer matches MUST fail
+  closed with a named remedy: restore the matching config entry and retry,
+  or verify installed state, remove the stale `<sha256(name)>.json` (and
+  `.manifest`) record from `.method-transitions-v1/`, and retry;
+  `Installed` re-verifies the prepared ownership evidence before swapping;
+  `ManifestCommitted` (or a live manifest already showing the journaled new
+  row) re-attempts old cleanup. A live manifest matching neither the old
+  nor the journaled new row MUST fail closed.
 - `pkg` transition MUST clear tracking but MUST NOT uninstall system packages.
 - Hook `uninstall(name)` MAY run as part of post-swap cleanup when present.
   It runs in the same isolated-subprocess regime as other hook phases.
@@ -1120,11 +1155,16 @@ MUST call `shdeps_require_sudo` before any side effect. If the first install
 attempt changes `exists()` before requesting sudo, the retry MUST fail closed
 rather than accepting partial state or invoking `install()` twice.
 When a parent terminal renderer consumes `SHDEPS_PROGRESS=jsonl`, it may set
-`SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO it holds open read/write. Shdeps
-flushes each `prompt` event, waits at most five seconds for the exact token
-`ready\n`, then writes a visible prompt status to `/dev/tty` and invokes sudo.
-The consumer MUST suspend or clear its renderer before acknowledging. An unset
-variable preserves standalone JSONL behavior without an acknowledgement wait.
+`SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO it creates. Shdeps MUST open and
+validate the nonblocking read end before flushing each `prompt` event. The
+consumer MUST then suspend or clear its renderer, open the FIFO
+write-only/nonblocking, write the exact token `ready\n`, and close it; `ENXIO`
+means no live acknowledgement reader remains. Shdeps waits at most five seconds
+before writing a visible prompt status to `/dev/tty` and invoking sudo. An
+unset variable preserves standalone JSONL behavior without an acknowledgement
+wait. Consumers MUST probe `prompt-fifo-reader-before-event-v1` before relying
+on this ordering because older wrapper-ABI-1 binaries may emit the event before
+opening their reader.
 
 Source mode default config dir:
 
@@ -1282,7 +1322,7 @@ The bridge command registry MUST be defined before the Bash wrapper cutover.
 The initial registry SHOULD include only commands needed by public Bash API
 functions and hook preludes:
 
-- `version` — prints the wrapper-binary ABI version (e.g. `abi:1`). The
+- `version` — prints the wrapper-binary ABI version (currently `abi:1`). The
   wrapper invokes this once on source to negotiate compatibility (see
   Δ6). MUST be cheap; MUST NOT load config, detect package managers,
   source hooks, or touch the network. MUST be backwards-compatible: a
@@ -1290,7 +1330,48 @@ functions and hook preludes:
   any future binary.
 - `capability <name>` — returns a machine-clean predicate status for one
   orchestrator-facing behavioral contract without tying callers to a release
-  tag.
+  tag. `owned-subprocess-cancellation-v1` guarantees that a parent signal is
+  not acknowledged until Shdeps has sent TERM, applied bounded KILL escalation,
+  drained output, and reaped each synchronously owned subprocess. Inherited
+  terminal-using children retain the caller's session but run in an owned
+  process group, temporarily receiving the controlling terminal foreground
+  when available. Their retained process lineage is addressed without
+  signaling the caller's group. An internal inherited boundary marker keeps
+  ordinary descendants attributable after group/session changes and leader
+  exit, while a private inherited descriptor proves the common no-descendant
+  exit without a system-wide process scan. A process that deliberately strips
+  the marker, closes the ownership descriptor, and daemonizes out of every
+  owned topology is outside this synchronous subprocess contract.
+  An open ownership descriptor vetoes an otherwise-empty cleanup proof, so a
+  marker lookup failure cannot produce a false signal acknowledgement.
+  Detached subprocesses receive the same attributed-lineage cleanup; adopted
+  descendants are reaped directly where the kernel supports subreapers. Linux
+  and Android can recover a direct adopted descendant that erased its marker
+  and closed the ownership descriptor only when one active boundary owns the
+  otherwise ambiguous adoptee. macOS reparents such a process away, so only
+  marker-preserving or retained-group escapes can be attributed safely there.
+  Linux and Android runtime-probe pidfd open, signal, and wait support before
+  using exact escaped-process authority. With that authority, each initial or
+  newly discovered member receives the catchable signal once. The portable
+  fallback sends the catchable signal once to the retained group; a member
+  created afterward is guaranteed only the bounded group KILL. Other Unix
+  platforms retain safe process-group authority but never raw-signal an
+  unpinned escaped PID. For descendants still evidenced by a retained group,
+  an open ownership descriptor, a matching marker, or an already-observed
+  pinned identity, a missing primitive, ambiguous ownership, or incomplete
+  delivery/reap/drain produces diagnostics and status `1`, never a false
+  `128+signal` acknowledgement. A descendant that removes every attribution
+  channel and escapes all owned topology before its first observation is
+  deliberately outside this contract and cannot be detected portably.
+  Supervising callers negotiate this contract through the capability response,
+  retain the exact Shdeps PID, and forward cancellation to it. The standalone
+  CLI provides the same semantics without an opt-in mode.
+  `prompt-fifo-reader-before-event-v1` independently guarantees that a
+  configured prompt-ack FIFO has been opened and validated for nonblocking
+  reads before the corresponding JSONL `prompt` event is flushed. This remains
+  additive to wrapper ABI 1 so consumers can negotiate the ordering without
+  rejecting older binaries for unrelated bridge calls. It is advertised only
+  on Unix platforms, where the FIFO handshake is implemented.
 - `adopt-release-archive-launcher <name> <cmd>` — explicitly resolves a
   pre-marker archive whose Shdeps-created public symlink was replaced by a
   regular consumer-owned launcher. It requires a matching `github:release`
@@ -1346,9 +1427,9 @@ schema between hook and parent.
 
 Design (deliberately simple):
 
-- Every hook-callable `shdeps_*` helper in the prelude is a one-line shim
-  that invokes `command shdeps __api <name> "$@"`. Anything that mutates
-  state (`shdeps_link_extras`, `shdeps_unlink_extras`,
+- Hook-callable helpers that need Rust behavior are one-line shims invoking
+  `command shdeps __api <name> "$@"`. Anything that mutates state
+  (`shdeps_link_extras`, `shdeps_unlink_extras`,
   `shdeps_github_release_install`, `shdeps_pkg_install`,
   `shdeps_pkg_install_for_mgr`) runs as a fresh `__api` subprocess that
   acquires the state lock for its own short read-modify-write window and
@@ -1356,11 +1437,13 @@ Design (deliberately simple):
   subprocess exits; no record-apply step is needed.
 - `shdeps_mark_changed <name>` is the only helper whose effect must surface
   back into the parent's in-process update transaction. It writes a sentinel
-  file: `$SHDEPS_STATE_DIR/.changed-markers/<txn_id>/<name>`. The parent
-  enumerates and unlinks markers in this directory after each hook exits,
-  feeding the names into its post-hook scheduling. `<txn_id>` is a unique
-  identifier the parent generates per `shdeps update` and exports to the
-  hook subprocess via `SHDEPS_UPDATE_TXN_ID`.
+  at `$SHDEPS_STATE_DIR/.changed-markers/<txn_id>/<name>` and a durable
+  pending-post marker. The parent promotes any sentinel before deleting its
+  transaction directory, including during cancellation; the next update also
+  promotes abandoned transaction directories after an uncatchable exit.
+  Pending markers are acknowledged only after the matching post hook is
+  classified. `<txn_id>` is a unique identifier the parent generates per
+  `shdeps update` and exports through `SHDEPS_UPDATE_TXN_ID`.
 - Logging helpers (`shdeps_log`, `shdeps_warn`, `shdeps_log_*`) write
   directly to stdout/stderr from the subprocess; the parent does not
   reformat. The wrapper one-liner discipline (see Code Quality requirements)
@@ -1382,13 +1465,13 @@ subprocess so the prelude and `__api` calls share context:
 
 State-lock invariant (critical):
 
-The parent MUST NOT hold the state lock when forking a hook subprocess.
-Hook subprocesses' `__api` calls acquire the lock fresh in their own short
-windows. Holding the parent lock across a hook fork deadlocks the first
-`__api` call. A regression test MUST cover this: a custom hook whose
-`install()` calls `shdeps_link_extras` during `shdeps update` completes
-without deadlock. The lock acquisition path MUST have a timeout (e.g., 30s)
-that fails with a structured error rather than hanging indefinitely.
+The parent holds the state lock across an update. Before forking a hook it
+exports a reentry token bound to its exact PID; a direct hook child may then
+invoke short `__api` mutations without reacquiring the parent's lock.
+Independent commands and forged or stale tokens still take the real lock.
+A regression test MUST cover this: a custom hook whose `install()` calls
+`shdeps_link_extras` during `shdeps update` completes without deadlock. Real
+lock acquisition remains bounded and cancellation-aware.
 
 Why no versioned protocol:
 

@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::Result;
+use crate::cancellation;
 use crate::config::Entry;
 use crate::github;
 use crate::github_release;
 use crate::github_release_install;
+use crate::hooks::MutationIntent;
 use crate::http::Client;
 use crate::jobs;
 use crate::manifest::{self, ManifestEntry};
@@ -33,7 +35,9 @@ pub(crate) fn install_with_prefetch(
     context: &Context<'_, impl Runner>,
     options: Options,
     prefetch: &Prefetch,
+    mutation: &mut MutationIntent,
 ) -> Result<Item> {
+    cancellation::check()?;
     let bin_path = context.roots.bin_dir.join(&entry.cmd);
     let request = ReleaseRequest {
         name: &entry.name,
@@ -41,19 +45,23 @@ pub(crate) fn install_with_prefetch(
         repo: &entry.name,
         public_bin: &bin_path,
     };
-    let request_context = RequestContext {
-        roots: context.roots,
-        runtime_env: context.env,
-        env_vars: context.env_vars,
-        runner: context.runner,
-        client: context.client,
-        options,
-        prefetch,
-        prior_release: manifest::read(context.manifest_path)?
-            .get(&entry.name)
-            .is_some_and(|installed| installed.method == method::GITHUB_RELEASE),
+    let outcome = {
+        let mut request_context = RequestContext {
+            roots: context.roots,
+            runtime_env: context.env,
+            env_vars: context.env_vars,
+            runner: context.runner,
+            client: context.client,
+            options,
+            prefetch,
+            prior_release: manifest::read(context.manifest_path)?
+                .get(&entry.name)
+                .is_some_and(|installed| installed.method == method::GITHUB_RELEASE),
+            mutation: Some(mutation),
+        };
+        install_request(&request, &mut request_context)?
     };
-    let outcome = install_request(&request, &request_context)?;
+    cancellation::check()?;
     if !outcome.failed {
         // Ordering matters: write the manifest record BEFORE refreshing the
         // TTL stamp. If a crash/SIGINT lands between the two writes, the next
@@ -69,6 +77,7 @@ pub(crate) fn install_with_prefetch(
             stamp::remote_touch(&stamp_path, options.now)?;
         }
     }
+    let _ = mutation.resolve(outcome.changed)?;
 
     Ok(match (outcome.failed, outcome.changed) {
         (true, _) => Item::failed(
@@ -126,6 +135,7 @@ pub(crate) fn prefetch<R>(
 where
     R: Runner + Sync,
 {
+    cancellation::check()?;
     let candidates = prefetch_candidates(entries, context.roots, options);
     if candidates.is_empty() {
         return Ok(Prefetch::default());
@@ -144,6 +154,7 @@ where
     let jobs = jobs::github_max(context.env_vars);
     if jobs <= 1 || candidates.len() <= 1 {
         for candidate in &candidates {
+            cancellation::check()?;
             if let Some(releases) = cached_releases(&candidate.repo, context.roots, options) {
                 prefetch.releases.insert(candidate.repo.clone(), releases);
             }
@@ -176,6 +187,7 @@ where
                 ))
             },
         )? {
+            cancellation::check()?;
             let Some((name, version)) = fetched else {
                 continue;
             };
@@ -227,6 +239,7 @@ where
     .into_iter()
     .flatten()
     {
+        cancellation::check()?;
         match probe {
             RemoteProbe::Current(name) => {
                 prefetch.current.insert(name);
@@ -296,6 +309,7 @@ pub(crate) struct RequestContext<'a, R: Runner> {
     pub(crate) options: Options,
     pub(crate) prefetch: &'a Prefetch,
     pub(crate) prior_release: bool,
+    pub(crate) mutation: Option<&'a mut MutationIntent>,
 }
 
 pub(crate) struct ReleaseOutcome {
@@ -313,8 +327,9 @@ pub(crate) struct ReleaseOutcome {
 
 pub(crate) fn install_request(
     request: &ReleaseRequest<'_>,
-    context: &RequestContext<'_, impl Runner>,
+    context: &mut RequestContext<'_, impl Runner>,
 ) -> Result<ReleaseOutcome> {
+    cancellation::check()?;
     let stamp_path = stamp::remote_path(&context.roots.state_dir, request.name, "release");
     // Marker repair precedes every fast return. Existing installs can therefore
     // gain durable archive ownership without a download, while read-only
@@ -333,6 +348,7 @@ pub(crate) fn install_request(
         // write release markers into a checkout before the new method succeeds.
         github_release_install::explicit_archive_state(&context.roots.install_dir, request.name)?
     };
+    cancellation::check()?;
     if process::executable_path(request.public_bin)
         && (stamp::remote_fresh(&stamp_path, context.options.freshness())
             || checked_this_run(&stamp_path, context.options))
@@ -346,6 +362,15 @@ pub(crate) fn install_request(
         // matters when a user prunes a completion/manpage symlink by hand while
         // keeping the binary; a fresh stamp should skip the network, not leave
         // related shell integration broken until the next forced reinstall.
+        let detail = if verbose_enabled(context.options, context.env_vars) {
+            process::dep_version(context.runner, request.cmd).unwrap_or_else(|| "fresh".to_owned())
+        } else {
+            "fresh".to_owned()
+        };
+        cancellation::check()?;
+        if let Some(mutation) = context.mutation.as_deref_mut() {
+            mutation.begin()?;
+        }
         let install_dir = context.roots.install_dir.join(request.name);
         crate::extras::link(
             &context.roots.state_dir,
@@ -353,11 +378,10 @@ pub(crate) fn install_request(
             request.name,
             &install_dir,
         )?;
-        let detail = if verbose_enabled(context.options, context.env_vars) {
-            process::dep_version(context.runner, request.cmd).unwrap_or_else(|| "fresh".to_owned())
-        } else {
-            "fresh".to_owned()
-        };
+        cancellation::check()?;
+        if let Some(mutation) = context.mutation.as_deref_mut() {
+            let _ = mutation.resolve(false)?;
+        }
         return Ok(ReleaseOutcome {
             changed: false,
             failed: false,
@@ -377,6 +401,7 @@ pub(crate) fn install_request(
                 .then(|| process::dep_version(context.runner, request.cmd))
                 .flatten()
         });
+    cancellation::check()?;
 
     let redirect_confirms_current = context.prefetch.is_current(request.name)
         || (!context.options.reinstall
@@ -385,8 +410,16 @@ pub(crate) fn install_request(
                 github::latest_release_matches(request.repo, current, context.client)
                     .unwrap_or(false)
             }));
+    cancellation::check()?;
     if redirect_confirms_current {
+        if let Some(mutation) = context.mutation.as_deref_mut() {
+            mutation.begin()?;
+        }
         link_existing_extras(context.roots, request.name)?;
+        cancellation::check()?;
+        if let Some(mutation) = context.mutation.as_deref_mut() {
+            let _ = mutation.resolve(false)?;
+        }
         return Ok(ReleaseOutcome {
             changed: false,
             failed: false,
@@ -438,7 +471,15 @@ pub(crate) fn install_request(
                         }
                         (None, _) => "release metadata unavailable".to_owned(),
                     };
+                    cancellation::check()?;
+                    if let Some(mutation) = context.mutation.as_deref_mut() {
+                        mutation.begin()?;
+                    }
                     link_existing_extras(context.roots, request.name)?;
+                    cancellation::check()?;
+                    if let Some(mutation) = context.mutation.as_deref_mut() {
+                        let _ = mutation.resolve(false)?;
+                    }
                     return Ok(ReleaseOutcome {
                         changed: false,
                         failed: false,
@@ -460,6 +501,7 @@ pub(crate) fn install_request(
                 }));
             }
         };
+        cancellation::check()?;
         &fetched_releases
     };
     if let Some(latest) = github_release::latest_stable(releases) {
@@ -475,7 +517,15 @@ pub(crate) fn install_request(
             // changed. Bash compared the probed command version to the latest
             // release tag before asset selection, so keep that no-op path even
             // if the release has no asset we would install from scratch today.
+            cancellation::check()?;
+            if let Some(mutation) = context.mutation.as_deref_mut() {
+                mutation.begin()?;
+            }
             link_existing_extras(context.roots, request.name)?;
+            cancellation::check()?;
+            if let Some(mutation) = context.mutation.as_deref_mut() {
+                let _ = mutation.resolve(false)?;
+            }
             return Ok(ReleaseOutcome {
                 changed: false,
                 failed: false,
@@ -494,6 +544,7 @@ pub(crate) fn install_request(
     else {
         return Ok(failed("no matching release asset"));
     };
+    cancellation::check()?;
     let Some(asset_kind) = crate::release_asset::install_kind(&selection.url) else {
         return Ok(failed("release asset type is not implemented yet"));
     };
@@ -524,6 +575,7 @@ pub(crate) fn install_request(
         Ok(bytes) => bytes,
         Err(_) => return Ok(failed("release asset download failed")),
     };
+    cancellation::check()?;
     // Best-effort integrity verification: when the release publishes a
     // recognized checksum asset, verify the downloaded bytes against the
     // expected digest before letting the binary touch the install dir.
@@ -563,6 +615,7 @@ pub(crate) fn install_request(
                     return Ok(failed(&format!("{}: checksum unavailable", selection.tag)));
                 }
             };
+            cancellation::check()?;
             let checksum_text = String::from_utf8_lossy(&checksum_bytes);
             if crate::checksum::verify_any(&checksum_text, &selection.asset_name, &bytes) {
                 verified = true;
@@ -594,6 +647,10 @@ pub(crate) fn install_request(
                 &bytes,
             )));
         }
+    }
+    cancellation::check()?;
+    if let Some(mutation) = context.mutation.as_deref_mut() {
+        mutation.begin()?;
     }
     match asset_kind {
         AssetKind::Plain => {

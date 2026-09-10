@@ -11,6 +11,8 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::{IsTerminal, Write};
 #[cfg(unix)]
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -140,6 +142,7 @@ Exit codes:
   0  Success
   1  Error
   2  Usage error
+  128+N  Interrupted by signal N after owned subprocess cleanup
 ";
 
 /// Runs the Rust CLI and returns the process exit code.
@@ -556,11 +559,20 @@ where
         ..UpdateOptions::default()
     };
     self_update_before_update(&roots, update_options, options, stderr)?;
+    crate::cancellation::check()?;
 
     let pkg_mgr = process::detect_package_manager(&Process);
     let env = runtime_env_for_manager(&pkg_mgr);
     let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
     let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
+    let manifest_path = manifest::path(&roots.state_dir);
+    let env_vars = env_vars(options);
+    // Recovery owns method-selection evidence. Hold the update state lock from
+    // recovery through resolution and installation so a crash-finalized repo
+    // cannot be misclassified from a stale manifest snapshot.
+    let (update_lock, manifest) =
+        update::prepare_for_resolution(&roots, &manifest_path, &env_vars)?;
+    let mut update_lock = Some(update_lock);
     if entries.is_empty() {
         if options.quiet {
             return Ok(0);
@@ -569,10 +581,7 @@ where
         return Ok(0);
     }
 
-    let manifest_path = manifest::path(&roots.state_dir);
-    let manifest = manifest::read(&manifest_path)?;
     let hooks = custom_probe(&pkg_mgr, options.quiet);
-    let env_vars = env_vars(options);
     if let Some(message) =
         update_prerequisite_error(&entries, &env, &Process, UpdatePrerequisitePhase::Initial)
     {
@@ -628,13 +637,15 @@ where
             .iter()
             .filter(|entry| update::active(entry, &env))
             .count();
-        let summary = update::run_with_progress(
+        let summary = update::run_with_progress_locked(
             &entries,
             &manifest,
             &context,
             update_options,
             &mut progress,
+            update_lock.take().expect("update lock is consumed once"),
         )?;
+        crate::cancellation::check()?;
         let footer = if nested {
             None
         } else {
@@ -710,9 +721,25 @@ where
 
         let summary = if progress_jsonl {
             let mut progress = JsonlProgress::with_prompt_tty(stdout);
-            update::run_with_progress(&entries, &manifest, &context, update_options, &mut progress)?
+            let summary = update::run_with_progress_locked(
+                &entries,
+                &manifest,
+                &context,
+                update_options,
+                &mut progress,
+                update_lock.take().expect("update lock is consumed once"),
+            )?;
+            crate::cancellation::check()?;
+            summary
         } else {
-            let summary = update::run(&entries, &manifest, &context, update_options)?;
+            let summary = update::run_locked(
+                &entries,
+                &manifest,
+                &context,
+                update_options,
+                update_lock.take().expect("update lock is consumed once"),
+            )?;
+            crate::cancellation::check()?;
             write_update_summary(
                 &summary,
                 &entries,
@@ -728,6 +755,7 @@ where
         (entries, summary, active_count)
     };
 
+    crate::cancellation::check()?;
     let manifest = manifest::read(&manifest_path)?;
     let orphans = manifest.orphans(&entries);
     if !orphans.is_empty() && !options.quiet {
@@ -778,9 +806,11 @@ fn self_update_before_update<E>(
 where
     E: Write,
 {
+    crate::cancellation::check()?;
     let dir = match shdeps_install_dir() {
         Ok(dir) => dir,
         Err(error) => {
+            crate::cancellation::check()?;
             if options.verbose {
                 writeln!(
                     stderr,
@@ -793,6 +823,7 @@ where
     let target = match self_update::target(&dir) {
         Ok(target) => target,
         Err(error) => {
+            crate::cancellation::check()?;
             if options.verbose {
                 writeln!(
                     stderr,
@@ -802,6 +833,7 @@ where
             return Ok(());
         }
     };
+    crate::cancellation::check()?;
 
     let has_explicit_install_dir = env::var_os("SHDEPS_DIR").is_some();
     if matches!(target, Target::SourceCheckout) && !has_explicit_install_dir {
@@ -833,12 +865,15 @@ where
     match target {
         Target::SourceCheckout => match self_update::source_checkout(&dir, &Process) {
             Ok(summary) => {
+                crate::cancellation::check()?;
                 if summary.outcome != Outcome::DirtySkipped {
                     touch_self_update_stamp(&stamp_path, update_options.now, options, stderr)?;
                 }
+                crate::cancellation::check()?;
                 write_update_source_self_update_result(&summary, options.verbose, stderr)?;
             }
             Err(error) => {
+                crate::cancellation::check()?;
                 if options.verbose {
                     writeln!(
                         stderr,
@@ -853,7 +888,10 @@ where
             // managing dependencies without making every subsequent run
             // immediately retry the same failing endpoint.
             touch_self_update_stamp(&stamp_path, update_options.now, options, stderr)?;
-            match self_update::release_archive(&dir, &metadata, &ProcessEnv, &Process, &Curl) {
+            let result =
+                self_update::release_archive(&dir, &metadata, &ProcessEnv, &Process, &Curl);
+            crate::cancellation::check()?;
+            match result {
                 Ok(summary) => {
                     write_update_release_self_update_result(&summary, options.verbose, stderr)?;
                 }
@@ -868,6 +906,7 @@ where
             }
         }
         Target::Unsupported { .. } => {
+            crate::cancellation::check()?;
             if options.verbose {
                 writeln!(
                     stderr,
@@ -889,7 +928,9 @@ fn touch_self_update_stamp<E>(
 where
     E: Write,
 {
-    if let Err(error) = stamp::remote_touch(stamp_path, now) {
+    crate::cancellation::check()?;
+    if let Err(error) = stamp::remote_touch_cancellable(stamp_path, now) {
+        crate::cancellation::check()?;
         if options.verbose {
             writeln!(
                 stderr,
@@ -1071,6 +1112,7 @@ where
     }
 
     fn event(&mut self, value: serde_json::Value) -> Result<()> {
+        crate::cancellation::check()?;
         serde_json::to_writer(&mut self.out, &value)?;
         writeln!(self.out)?;
         self.out.flush()?;
@@ -1090,11 +1132,22 @@ where
         Ok(())
     }
 
-    fn wait_for_prompt_ack(&self) -> Result<()> {
+    fn open_prompt_ack(&self) -> Result<Option<std::fs::File>> {
         let Some(ack) = &self.prompt_ack else {
+            return Ok(None);
+        };
+        open_prompt_ack(ack).map(Some)
+    }
+
+    fn wait_for_prompt_ack(&self, input: Option<std::fs::File>) -> Result<()> {
+        let Some(ack) = &self.prompt_ack else {
+            debug_assert!(input.is_none());
             return Ok(());
         };
-        wait_for_prompt_ack(ack)
+        wait_for_prompt_ack(
+            ack,
+            input.expect("configured prompt acknowledgement must be open"),
+        )
     }
 }
 
@@ -1126,23 +1179,42 @@ where
     }
 
     fn pause_for_prompt(&mut self, detail: &str) -> Result<()> {
+        crate::cancellation::check()?;
+        let spawn_guard = self
+            .prompt_ack
+            .as_ref()
+            .map(|ack| {
+                crate::cancellation::exclusive_spawn_guard(
+                    Instant::now() + ack.timeout.max(Duration::from_secs(1)),
+                )
+            })
+            .transpose()?;
+        // Hold the read end before advertising the prompt. A supervising
+        // writer can then use O_WRONLY|O_NONBLOCK: ENXIO means there is no
+        // longer a live acknowledgement receiver. Excluding concurrent owned
+        // forks for the lease lifetime prevents a pre-exec child from
+        // inheriting that reader before O_CLOEXEC takes effect.
+        let prompt_ack = self.open_prompt_ack()?;
         self.event(json!({
             "event": "prompt",
             "status": "running",
             "detail": detail,
         }))?;
-        self.wait_for_prompt_ack()?;
-        self.fresh_prompt_line(detail)
+        self.wait_for_prompt_ack(prompt_ack)?;
+        crate::cancellation::check()?;
+        let result = self.fresh_prompt_line(detail);
+        drop(spawn_guard);
+        result
     }
 }
 
 #[cfg(unix)]
-fn wait_for_prompt_ack(ack: &PromptAck) -> Result<()> {
+fn open_prompt_ack(ack: &PromptAck) -> Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    let mut input = options.open(&ack.path).map_err(|error| {
+    let input = options.open(&ack.path).map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!(
@@ -1161,26 +1233,24 @@ fn wait_for_prompt_ack(ack: &PromptAck) -> Result<()> {
         )
         .into());
     }
+    Ok(input)
+}
 
+#[cfg(unix)]
+fn wait_for_prompt_ack(ack: &PromptAck, mut input: std::fs::File) -> Result<()> {
     let deadline = Instant::now() + ack.timeout;
     let mut received = Vec::with_capacity(PROMPT_ACK_TOKEN.len());
     loop {
+        crate::cancellation::check()?;
         let mut bytes = [0_u8; 16];
         match input.read(&mut bytes) {
+            Ok(0) if received == PROMPT_ACK_TOKEN => return Ok(()),
             Ok(0) => {}
             Ok(count) => {
                 received.extend_from_slice(&bytes[..count]);
-                if let Some(newline) = received.iter().position(|byte| *byte == b'\n') {
-                    if newline + 1 == received.len() && received == PROMPT_ACK_TOKEN {
-                        return Ok(());
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "invalid progress prompt acknowledgement (expected ready)",
-                    )
-                    .into());
-                }
-                if received.len() > 64 {
+                if received.len() > PROMPT_ACK_TOKEN.len()
+                    || !PROMPT_ACK_TOKEN.starts_with(&received)
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "invalid progress prompt acknowledgement (expected ready)",
@@ -1212,7 +1282,7 @@ fn wait_for_prompt_ack(ack: &PromptAck) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn wait_for_prompt_ack(ack: &PromptAck) -> Result<()> {
+fn open_prompt_ack(ack: &PromptAck) -> Result<std::fs::File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         format!(
@@ -1221,6 +1291,11 @@ fn wait_for_prompt_ack(ack: &PromptAck) -> Result<()> {
         ),
     )
     .into())
+}
+
+#[cfg(not(unix))]
+fn wait_for_prompt_ack(_ack: &PromptAck, _input: std::fs::File) -> Result<()> {
+    unreachable!("unsupported prompt acknowledgement cannot produce an open reader")
 }
 
 struct TtyProgress<'a, W>
@@ -1532,6 +1607,7 @@ where
     W: Write,
 {
     fn phase(&mut self, phase: update::Phase<'_>) -> Result<()> {
+        crate::cancellation::check()?;
         if phase.total == 0 || phase.status != "running" {
             return Ok(());
         }
@@ -1543,6 +1619,7 @@ where
     }
 
     fn pause_for_prompt(&mut self, detail: &str) -> Result<()> {
+        crate::cancellation::check()?;
         self.clear_unfinished()?;
         write_prompt_status(self.out, detail, self.color)?;
         self.out.flush()?;
@@ -1596,6 +1673,7 @@ where
             ..prune_options
         },
     )?;
+    crate::cancellation::check()?;
 
     if detected.guarded_all_orphans {
         writeln!(
@@ -1622,10 +1700,12 @@ where
         return Ok(0);
     }
 
+    crate::cancellation::check()?;
     if !prune_options.yes && !confirm_prune(stdout)? {
         writeln!(stdout, "Aborted.")?;
         return Ok(0);
     }
+    crate::cancellation::check()?;
 
     let manifest = manifest::read(&manifest_path)?;
     let summary = prune::run(
@@ -1640,6 +1720,7 @@ where
             quiet: false,
         },
     )?;
+    crate::cancellation::check()?;
     write_prune_results(&summary.removed, stdout, stderr)?;
     Ok(if summary.has_errors() { 1 } else { 0 })
 }
@@ -1663,12 +1744,14 @@ where
     match self_update::target(&dir)? {
         Target::SourceCheckout => {
             let summary = self_update::source_checkout(&dir, &Process)?;
+            crate::cancellation::check()?;
             write_source_self_update(&summary, stderr)?;
             Ok(summary.exit_code())
         }
         Target::ReleaseArchive(metadata) => {
             match self_update::release_archive(&dir, &metadata, &ProcessEnv, &Process, &Curl) {
                 Ok(summary) => {
+                    crate::cancellation::check()?;
                     write_release_self_update(&summary, options.quiet, stdout, stderr)?;
                     Ok(summary.exit_code())
                 }
@@ -3002,11 +3085,71 @@ fn confirm_prune<W>(stdout: &mut W) -> Result<bool>
 where
     W: Write,
 {
+    crate::cancellation::check()?;
     write!(stdout, "Remove? [y/N] ")?;
     stdout.flush()?;
     let mut reply = String::new();
-    std::io::stdin().read_line(&mut reply)?;
+    read_stdin_line_cancellable(&mut reply)?;
     Ok(reply.trim().eq_ignore_ascii_case("y"))
+}
+
+#[cfg(unix)]
+fn read_stdin_line_cancellable(reply: &mut String) -> std::io::Result<usize> {
+    let stdin = std::io::stdin();
+    let mut bytes = Vec::new();
+    let mut descriptor = libc::pollfd {
+        fd: stdin.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    loop {
+        crate::cancellation::check()?;
+        // SAFETY: descriptor points to one initialized pollfd for the duration
+        // of the call. A short wake interval makes the wait cancellation-aware
+        // even on platforms whose signal delivery restarts poll.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if ready > 0 {
+            crate::cancellation::check()?;
+            let mut byte = 0_u8;
+            // SAFETY: stdin remains open for this call and `byte` provides one
+            // writable byte. Reading one byte after poll cannot wait for the
+            // rest of a partial pipe line, while canonical TTY input remains
+            // line-buffered by the terminal driver.
+            let count =
+                unsafe { libc::read(stdin.as_raw_fd(), std::ptr::from_mut(&mut byte).cast(), 1) };
+            if count > 0 {
+                bytes.push(byte);
+                if byte != b'\n' {
+                    continue;
+                }
+            } else if count < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            crate::cancellation::check()?;
+            let text = String::from_utf8(bytes).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error())
+            })?;
+            let count = text.len();
+            reply.push_str(&text);
+            return Ok(count);
+        }
+        if ready == 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_stdin_line_cancellable(reply: &mut String) -> std::io::Result<usize> {
+    std::io::stdin().read_line(reply)
 }
 
 fn check_exit_code(state: &State) -> i32 {
@@ -3172,9 +3315,11 @@ mod tests {
     use std::ffi::CString;
     use std::fs;
     #[cfg(unix)]
+    use std::io::Write as _;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{OpenOptionsExt as _, symlink};
     use std::path::PathBuf;
     #[cfg(unix)]
     use std::sync::mpsc;
@@ -3602,69 +3747,136 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn jsonl_progress_waits_for_renderer_ack_before_showing_prompt() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_PROMPT_FIFO_HANDSHAKE_CHILD";
+        const TEST_NAME: &str =
+            "cli::tests::jsonl_progress_waits_for_renderer_ack_before_showing_prompt";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        struct BlockingFlushWriter {
+            bytes: Vec<u8>,
+            flushed: Option<mpsc::SyncSender<()>>,
+            resume: mpsc::Receiver<()>,
+        }
+
+        impl std::io::Write for BlockingFlushWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                if let Some(flushed) = self.flushed.take() {
+                    flushed.send(()).unwrap();
+                    self.resume
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("test must release the prompt-event flush");
+                }
+                Ok(())
+            }
+        }
+
+        fn open_nonblocking_writer(path: &std::path::Path) -> std::io::Result<fs::File> {
+            let mut options = fs::OpenOptions::new();
+            options
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+            options.open(path)
+        }
+
         let dir = temp_dir("prompt-ack");
-        let events_path = dir.join("events.jsonl");
-        let prompt_path = dir.join("prompt.txt");
         let ack_path = dir.join("prompt-ack.fifo");
         let ack_path_c = CString::new(ack_path.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(ack_path_c.as_ptr(), 0o600) }, 0);
+        let before = open_nonblocking_writer(&ack_path).unwrap_err();
+        assert_eq!(before.raw_os_error(), Some(libc::ENXIO));
+
+        let (flushed_tx, flushed_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
         let (finished_tx, finished_rx) = mpsc::channel();
+        let (spawn_acquired_tx, spawn_acquired_rx) = mpsc::sync_channel(0);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let mut events = fs::File::create(&events_path).unwrap();
-                let mut prompt = fs::File::create(&prompt_path).unwrap();
+                let mut events = BlockingFlushWriter {
+                    bytes: Vec::new(),
+                    flushed: Some(flushed_tx),
+                    resume: resume_rx,
+                };
+                let mut prompt = Vec::new();
                 let mut progress = super::JsonlProgress::with_prompt_out_and_ack(
                     &mut events,
                     &mut prompt,
                     ack_path.clone(),
                 );
+                progress.prompt_ack.as_mut().unwrap().timeout = Duration::from_millis(100);
                 let result = crate::update::Progress::pause_for_prompt(
                     &mut progress,
                     "waiting for sudo authentication",
                 );
-                finished_tx.send(result).unwrap();
+                drop(progress);
+                finished_tx.send((result, events.bytes, prompt)).unwrap();
             });
 
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if fs::read_to_string(&events_path)
-                    .is_ok_and(|events| events.contains("\"event\":\"prompt\""))
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "prompt event was not flushed before acknowledgement"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-
-            assert_eq!(fs::read(&prompt_path).unwrap(), b"");
-            assert!(
-                finished_rx.try_recv().is_err(),
-                "sudo prompt preparation must wait for the renderer acknowledgement"
-            );
-
-            let mut ack = fs::OpenOptions::new().write(true).open(&ack_path).unwrap();
-            std::io::Write::write_all(&mut ack, b"ready\n").unwrap();
-            drop(ack);
-
-            finished_rx
+            flushed_rx
                 .recv_timeout(Duration::from_secs(2))
-                .expect("prompt preparation should finish after acknowledgement")
-                .unwrap();
+                .expect("prompt event must reach its flush boundary");
+            scope.spawn(|| {
+                let _guard = crate::cancellation::test_spawn_guard().unwrap();
+                spawn_acquired_tx.send(()).unwrap();
+            });
+            assert!(
+                spawn_acquired_rx
+                    .recv_timeout(Duration::from_millis(25))
+                    .is_err(),
+                "a concurrent fork must not inherit the open prompt reader"
+            );
+            let mut ack = open_nonblocking_writer(&ack_path);
+            if let Ok(writer) = &mut ack {
+                std::io::Write::write_all(writer, b"ready\n").unwrap();
+            }
+            assert!(
+                ack.is_ok(),
+                "the flushed prompt event must advertise an already-open reader: {ack:?}"
+            );
+            drop(ack);
+            resume_tx.send(()).unwrap();
+
+            let (result, events, prompt) = finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("prompt preparation must finish after acknowledgement");
+            result.unwrap();
+            assert!(
+                String::from_utf8(events)
+                    .unwrap()
+                    .contains("\"event\":\"prompt\"")
+            );
+            assert_eq!(
+                String::from_utf8(prompt).unwrap(),
+                "  running  waiting for sudo authentication\n"
+            );
+            spawn_acquired_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("spawn exclusion must release after prompt acknowledgement");
         });
 
-        assert_eq!(
-            fs::read_to_string(prompt_path).unwrap(),
-            "  running  waiting for sudo authentication\n"
-        );
+        let after = open_nonblocking_writer(&ack_path).unwrap_err();
+        assert_eq!(after.raw_os_error(), Some(libc::ENXIO));
     }
 
     #[cfg(unix)]
     #[test]
     fn jsonl_progress_fails_before_prompt_when_renderer_does_not_ack() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_PROMPT_FIFO_TIMEOUT_CHILD";
+        const TEST_NAME: &str =
+            "cli::tests::jsonl_progress_fails_before_prompt_when_renderer_does_not_ack";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
         let dir = temp_dir("prompt-ack-timeout");
         let ack_path = dir.join("prompt-ack.fifo");
         let ack_path_c = CString::new(ack_path.as_os_str().as_bytes()).unwrap();
@@ -3692,17 +3904,206 @@ mod tests {
                 .contains("timed out waiting for progress prompt acknowledgement"),
             "unexpected error: {error}"
         );
+        let ack_path = progress.prompt_ack.as_ref().unwrap().path.clone();
+        drop(progress);
         assert!(
             String::from_utf8(stdout)
                 .unwrap()
                 .contains("\"event\":\"prompt\"")
         );
         assert_eq!(prompt_out, b"");
+        let mut writer = fs::OpenOptions::new();
+        writer
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        assert_eq!(
+            writer.open(&ack_path).unwrap_err().raw_os_error(),
+            Some(libc::ENXIO),
+            "an error must close the acknowledgement reader lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_ack_rejects_non_fifo_and_malformed_tokens() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_PROMPT_FIFO_VALIDATION_CHILD";
+        const TEST_NAME: &str = "cli::tests::prompt_ack_rejects_non_fifo_and_malformed_tokens";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        fn fifo(name: &str) -> (super::PromptAck, std::path::PathBuf) {
+            let dir = temp_dir(name);
+            let path = dir.join("prompt-ack.fifo");
+            let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+            (
+                super::PromptAck {
+                    path: path.clone(),
+                    timeout: Duration::ZERO,
+                },
+                path,
+            )
+        }
+
+        let dir = temp_dir("prompt-ack-regular");
+        let regular = dir.join("not-a-fifo");
+        fs::write(&regular, "ready\n").unwrap();
+        let error = super::open_prompt_ack(&super::PromptAck {
+            path: regular,
+            timeout: Duration::ZERO,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("is not a FIFO"));
+
+        for (name, bytes, expected) in [
+            (
+                "prompt-ack-invalid",
+                b"wrong\n".as_slice(),
+                "invalid progress prompt acknowledgement",
+            ),
+            (
+                "prompt-ack-extra",
+                b"ready\nextra".as_slice(),
+                "invalid progress prompt acknowledgement",
+            ),
+            ("prompt-ack-partial", b"rea".as_slice(), "timed out waiting"),
+        ] {
+            let (ack, path) = fifo(name);
+            let input = super::open_prompt_ack(&ack).unwrap();
+            let mut writer = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                .open(path)
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+            drop(writer);
+
+            let error = super::wait_for_prompt_ack(&ack, input).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected {name} error: {error}"
+            );
+        }
+
+        let (ack, path) = fifo("prompt-ack-split-extra");
+        let input = super::open_prompt_ack(&ack).unwrap();
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"ready\n").unwrap();
+        writer.write_all(b"extra").unwrap();
+        drop(writer);
+        let error = super::wait_for_prompt_ack(&ack, input).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid progress prompt acknowledgement")
+        );
+
+        let (ack, path) = fifo("prompt-ack-writer-held-open");
+        let input = super::open_prompt_ack(&ack).unwrap();
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"ready\n").unwrap();
+        let error = super::wait_for_prompt_ack(&ack, input).unwrap_err();
+        assert!(error.to_string().contains("timed out waiting"));
+        drop(writer);
+        let after = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&path)
+            .unwrap_err();
+        assert_eq!(after.raw_os_error(), Some(libc::ENXIO));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_event_flush_error_closes_the_fifo_reader() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_PROMPT_FIFO_FLUSH_CHILD";
+        const TEST_NAME: &str = "cli::tests::prompt_event_flush_error_closes_the_fifo_reader";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        struct FailingFlush;
+
+        impl std::io::Write for FailingFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected prompt flush failure"))
+            }
+        }
+
+        let dir = temp_dir("prompt-ack-flush-error");
+        let ack_path = dir.join("prompt-ack.fifo");
+        let ack_path_c = CString::new(ack_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(ack_path_c.as_ptr(), 0o600) }, 0);
+        let mut events = FailingFlush;
+        let mut prompt = Vec::new();
+        let mut progress = super::JsonlProgress::with_prompt_out_and_ack(
+            &mut events,
+            &mut prompt,
+            ack_path.clone(),
+        );
+
+        let error = crate::update::Progress::pause_for_prompt(
+            &mut progress,
+            "waiting for sudo authentication",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected prompt flush failure"));
+        drop(progress);
+
+        let mut options = fs::OpenOptions::new();
+        options
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        let after = options.open(&ack_path).unwrap_err();
+        assert_eq!(after.raw_os_error(), Some(libc::ENXIO));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latched_cancellation_does_not_emit_prune_prompt() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_BEFORE_PRUNE_PROMPT";
+        const TEST_NAME: &str = "cli::tests::latched_cancellation_does_not_emit_prune_prompt";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        // SAFETY: this isolated subprocess installed the Shdeps signal owner.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let mut output = Vec::new();
+
+        let result = super::confirm_prune(&mut output);
+
+        assert!(result.is_err());
+        assert!(
+            output.is_empty(),
+            "no prompt may follow latched cancellation"
+        );
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
     }
 
     #[test]
     fn jsonl_warning_event_shape_matches_consumer_contract() {
-        // dot's adapter reads `status` and `detail` from `warning` events.
+        // JSONL consumers read `status` and `detail` from `warning` events.
         let value = serde_json::json!({
             "event": "warning",
             "status": "warning",

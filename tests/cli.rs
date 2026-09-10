@@ -1,7 +1,11 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -225,6 +229,27 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert_success(&capability);
     assert_eq!(text(&capability.stdout), "");
     assert_eq!(text(&capability.stderr), "");
+
+    let cancellation =
+        run(&mut fixture.command(["__api", "capability", "owned-subprocess-cancellation-v1"]));
+    assert_eq!(
+        cancellation.status.code(),
+        Some(
+            if shdeps::cancellation::owned_subprocess_cancellation_available() {
+                0
+            } else {
+                1
+            }
+        )
+    );
+    assert_eq!(text(&cancellation.stdout), "");
+    assert_eq!(text(&cancellation.stderr), "");
+
+    let prompt_fifo =
+        run(&mut fixture.command(["__api", "capability", "prompt-fifo-reader-before-event-v1"]));
+    assert_success(&prompt_fifo);
+    assert_eq!(text(&prompt_fifo.stdout), "");
+    assert_eq!(text(&prompt_fifo.stderr), "");
 
     let unknown = run(&mut fixture.command(["__api", "capability", "not-a-real-capability"]));
     assert_eq!(unknown.status.code(), Some(1));
@@ -1545,8 +1570,9 @@ fn custom_hooks_stay_within_ci_budget() {
         30
     );
     assert_eq!(text(&output.stderr), "");
-    // Catch an exit-polling regression that adds about 1.2 seconds across these
-    // 30 serial current hooks without folding manifest I/O into the budget.
+    // Catch per-child whole-process discovery and exit-polling regressions; a
+    // 50 ms polling delay alone adds about 1.2 seconds across these 30 serial
+    // current hooks without folding manifest I/O into the budget.
     let budget = if cfg!(target_os = "macos") {
         Duration::from_millis(2_200)
     } else {
@@ -2104,6 +2130,94 @@ esac
     assert_eq!(text(&ttl_zero.stdout), "No dependencies configured.\n");
     assert_eq!(text(&ttl_zero.stderr), "");
     assert_eq!(count_release_fetches(&log), 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn nonregular_self_update_metadata_is_rejected_without_ttl() {
+    let fixture = Fixture::new("nonregular-self-update-target");
+    let install = fixture.dir.join("release-install");
+    fs::create_dir_all(&install).unwrap();
+    let metadata_path = install.join(".shdeps-install.json");
+    let metadata_path_c =
+        std::ffi::CString::new(metadata_path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: fixture path is private and represented by a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(metadata_path_c.as_ptr(), 0o600) }, 0);
+    let _held_open = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&metadata_path)
+        .unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_DIR", &install);
+    let (output, elapsed) = timed(&mut command);
+
+    assert_success(&output);
+    assert!(elapsed < Duration::from_secs(1));
+    assert!(
+        !fixture.dir.join("state/shdeps.self-update.stamp").exists(),
+        "rejected nonregular metadata consumed the durable self-update TTL"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn nonregular_install_metadata_never_blocks_update_cancellation() {
+    let fixture = Fixture::new("nonregular-self-update-metadata");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
+  trap '' HUP INT QUIT TERM
+  while :; do /bin/sleep 1; done
+}
+"#,
+    );
+    let install = fixture.dir.join("release-install");
+    fs::create_dir_all(&install).unwrap();
+    let metadata_path = install.join(".shdeps-install.json");
+    let metadata_path_c =
+        std::ffi::CString::new(metadata_path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: fixture path is private and represented by a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(metadata_path_c.as_ptr(), 0o600) }, 0);
+    let _held_open = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&metadata_path)
+        .unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_DIR", &install)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let hook_pid = wait_for_pid(
+        &fixture.dir.join("state/hook.pid"),
+        Duration::from_secs(2),
+        "hook reached after rejecting nonregular install metadata",
+    );
+    let _hook_guard = EscapedProcessGuard::new(hook_pid);
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    if process_is_running(hook_pid) {
+        kill_process_group(hook_pid);
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "a FIFO at the metadata path must be rejected without blocking update"
+    );
+    assert!(
+        !fixture.dir.join("state/shdeps.self-update.stamp").exists(),
+        "cancelled update must not publish the self-update TTL"
+    );
 }
 
 #[test]
@@ -3367,8 +3481,16 @@ exit 1
         elapsed < Duration::from_secs(3),
         "the outer hook deadline must remain authoritative: {elapsed:?}"
     );
-    let probe_pid = read_pid(&fixture.dir.join("state/sudo-probe.pid"));
-    let child_pid = read_pid(&fixture.dir.join("state/sudo-probe-child.pid"));
+    let probe_pid = wait_for_pid(
+        &fixture.dir.join("state/sudo-probe.pid"),
+        Duration::from_secs(2),
+        "timed-out sudo probe pid",
+    );
+    let child_pid = wait_for_pid(
+        &fixture.dir.join("state/sudo-probe-child.pid"),
+        Duration::from_secs(2),
+        "timed-out sudo probe descendant pid",
+    );
     let probe_running = process_is_running(probe_pid);
     let child_running = process_is_running(child_pid);
     if probe_running {
@@ -3470,6 +3592,2761 @@ install() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_initial_detached_hook_before_returning() {
+    let fixture = Fixture::new("parent-signal-detached-hook");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  trap '' HUP INT QUIT
+  trap 'printf term >"$SHDEPS_STATE_DIR/term-seen"' TERM
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
+  while :; do
+    printf x >>"$SHDEPS_STATE_DIR/mutations"
+    /bin/sleep 0.02
+  done
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let hook_pid = wait_for_pid(
+        &fixture.dir.join("state/hook.pid"),
+        Duration::from_secs(3),
+        "initial detached hook pid",
+    );
+    let _hook_guard = EscapedProcessGuard::new(hook_pid);
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let hook_survived = process_is_running(hook_pid);
+    let mutations = fixture.dir.join("state/mutations");
+    let size_after_exit = fs::metadata(&mutations).unwrap().len();
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations).unwrap().len() != size_after_exit;
+    if hook_survived {
+        kill_process_group(hook_pid);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(hook_pid),
+            "leaked hook cleanup",
+        );
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        fixture.dir.join("state/term-seen").is_file(),
+        "detached hook did not receive TERM before KILL escalation"
+    );
+    assert!(!hook_survived, "detached hook survived its signaled parent");
+    assert!(
+        !mutation_continued,
+        "detached hook mutated state after Shdeps exited"
+    );
+    assert!(
+        !fixture.dir.join("state/manifest").exists(),
+        "cancelled hook must not commit its manifest entry"
+    );
+    assert!(
+        !fixture.dir.join("state/.changed-markers").exists(),
+        "cancelled hook transaction markers must be removed"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn parent_signal_interrupts_state_lock_contention_promptly() {
+    let fixture = Fixture::new("parent-signal-state-lock");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        "exists() { return 0; }\nversion() { printf '1.0\\n'; }\n",
+    );
+    fs::create_dir_all(fixture.dir.join("state")).unwrap();
+    let lock_path = fixture.dir.join("state/.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    // SAFETY: this test owns the descriptor until after the child exits.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    // SAFETY: F_SETFD mutates only this valid test-owned descriptor. Prevent
+    // the spawned Shdeps from inheriting the holder's open file description.
+    assert_eq!(
+        unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+        0
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_STATE_LOCK_TIMEOUT_SECS", "30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    wait_until(
+        Duration::from_secs(2),
+        || process_has_open_path(shdeps.id(), &lock_path),
+        "contending update to open the held state lock",
+    );
+
+    let signaled = Instant::now();
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(1));
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+    drop(lock);
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "lock contention must observe cancellation instead of waiting for its timeout"
+    );
+    assert!(
+        signaled.elapsed() < Duration::from_secs(1),
+        "state-lock cancellation was not prompt"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_interrupts_prompt_ack_wait_before_sudo_side_effects() {
+    let fixture = Fixture::new("parent-signal-prompt-ack");
+    fixture.write("conf/deps.conf", "tool pkg\n");
+    fixture.write_executable("fakebin/apt-get", "#!/bin/sh\nexit 99\n");
+    let ack_path = fixture.dir.join("prompt-ack.fifo");
+    let ack_path_c = std::ffi::CString::new(ack_path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: the fixture path is a valid, private NUL-terminated pathname.
+    assert_eq!(unsafe { libc::mkfifo(ack_path_c.as_ptr(), 0o600) }, 0);
+    let events_path = fixture.dir.join("events.jsonl");
+    let events = fs::File::create(&events_path).unwrap();
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_PROGRESS", "jsonl")
+        .env("SHDEPS_PROGRESS_PROMPT_ACK", &ack_path)
+        .stdout(Stdio::from(events))
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    wait_until(
+        Duration::from_secs(3),
+        || {
+            fs::read_to_string(&events_path)
+                .is_ok_and(|events| events.contains("\"event\":\"prompt\""))
+        },
+        "renderer prompt event",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(1));
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "prompt acknowledgement wait must observe parent cancellation"
+    );
+    assert!(
+        !fixture.dir.join("state/manifest").exists(),
+        "cancelled prompt wait must not schedule package publication"
+    );
+    let mut ack_writer = fs::OpenOptions::new();
+    ack_writer
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    assert_eq!(
+        ack_writer.open(&ack_path).unwrap_err().raw_os_error(),
+        Some(libc::ENXIO),
+        "cancellation must close the acknowledgement reader lease"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_interrupts_interactive_prune_prompt_with_held_open_stdin() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("parent-signal-prune-prompt");
+    fixture.write("conf/deps.conf", "current custom\n");
+    fixture.write(
+        "state/manifest",
+        "current|custom|current|\nold|github:release|old|/tmp/old\n",
+    );
+    let input_path = fixture.dir.join("prompt-input.fifo");
+    let input_path_c = std::ffi::CString::new(input_path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: fixture path is private and represented by a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(input_path_c.as_ptr(), 0o600) }, 0);
+    let mut held_input = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&input_path)
+        .unwrap();
+    let output_path = fixture.dir.join("prompt-output");
+    let output = fs::File::create(&output_path).unwrap();
+
+    let mut command = fixture.command(["prune"]);
+    command
+        .stdin(Stdio::from(held_input.try_clone().unwrap()))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    wait_until(
+        Duration::from_secs(3),
+        || fs::read_to_string(&output_path).is_ok_and(|output| output.contains("Remove? [y/N] ")),
+        "interactive prune prompt",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(1));
+    if status.is_none() {
+        held_input.write_all(b"n\n").unwrap();
+        held_input.flush().unwrap();
+        let _ = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(2));
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "blocking prompt input must observe exact-PID cancellation promptly"
+    );
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("old|"),
+        "cancelled prune prompt removed its orphan"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_interrupts_prune_prompt_after_partial_input() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("parent-signal-prune-partial-input");
+    fixture.write("conf/deps.conf", "current custom\n");
+    fixture.write(
+        "state/manifest",
+        "current|custom|current|\nold|github:release|old|/tmp/old\n",
+    );
+    let input_path = fixture.dir.join("prompt-input.fifo");
+    let input_path_c = std::ffi::CString::new(input_path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: fixture path is private and represented by a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(input_path_c.as_ptr(), 0o600) }, 0);
+    let mut held_input = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&input_path)
+        .unwrap();
+    let output_path = fixture.dir.join("prompt-output");
+    let output = fs::File::create(&output_path).unwrap();
+
+    let mut command = fixture.command(["prune"]);
+    command
+        .stdin(Stdio::from(held_input.try_clone().unwrap()))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    wait_until(
+        Duration::from_secs(3),
+        || fs::read_to_string(&output_path).is_ok_and(|output| output.contains("Remove? [y/N] ")),
+        "interactive prune prompt",
+    );
+    held_input.write_all(b"y").unwrap();
+    held_input.flush().unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || pending_input_bytes(&held_input) == 0,
+        "partial prompt byte to be consumed",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(1));
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "a partial line must not turn the cancellable prompt into blocking read_line"
+    );
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("old|"),
+        "cancelled partial confirmation removed its orphan"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn first_parent_signal_keeps_exit_status_precedence_during_cleanup() {
+    let fixture = Fixture::new("parent-signal-precedence");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  trap '' HUP INT QUIT
+  trap 'printf cleanup-started >"$SHDEPS_STATE_DIR/cleanup-started"; trap "" TERM' TERM
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
+  while :; do /bin/sleep 1; done
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let hook_pid = wait_for_pid(
+        &fixture.dir.join("state/hook.pid"),
+        Duration::from_secs(3),
+        "hook pid",
+    );
+    let _hook_guard = EscapedProcessGuard::new(hook_pid);
+
+    signal_process(shdeps.id(), libc::SIGHUP);
+    wait_until(
+        Duration::from_secs(2),
+        || fs::read(fixture.dir.join("state/cleanup-started")).is_ok_and(|bytes| !bytes.is_empty()),
+        "first-signal cleanup to start",
+    );
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let hook_survived = process_is_running(hook_pid);
+    if hook_survived {
+        kill_process_group(hook_pid);
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGHUP)
+    );
+    assert!(!hook_survived, "hook survived first-signal cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_signal_during_spawn_registration_is_not_lost() {
+    let fixture = Fixture::new("parent-signal-hook-registration");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  trap '' HUP INT QUIT TERM
+  kill -TERM "$PPID"
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
+  while :; do /bin/sleep 1; done
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let hook_pid = wait_for_pid(
+        &fixture.dir.join("state/hook.pid"),
+        Duration::from_secs(3),
+        "spawn-race hook pid",
+    );
+    let _hook_guard = EscapedProcessGuard::new_if_present(hook_pid);
+    let hook_survived = process_is_running(hook_pid);
+    if hook_survived {
+        kill_process_group(hook_pid);
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        !hook_survived,
+        "hook escaped when it signaled Shdeps during spawn registration"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_hook_descendant_in_another_process_group() {
+    let fixture = Fixture::new("parent-signal-hook-session-member");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  trap '' HUP INT QUIT TERM
+  set -m
+  /bin/sh -c '
+    trap "" HUP INT QUIT TERM
+    printf "%s\n" "$$" >"$SHDEPS_STATE_DIR/descendant.pid"
+    while :; do
+      printf x >>"$SHDEPS_STATE_DIR/descendant-mutations"
+      /bin/sleep 0.02
+    done
+  ' &
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
+  wait
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let hook_pid = wait_for_pid(
+        &fixture.dir.join("state/hook.pid"),
+        Duration::from_secs(3),
+        "detached hook pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("state/descendant.pid"),
+        Duration::from_secs(3),
+        "detached descendant pid",
+    );
+    let _hook_guard = EscapedProcessGuard::new(hook_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (descendant_group, descendant_session) = process_group_and_session(descendant_pid);
+    assert_ne!(
+        descendant_group, hook_pid,
+        "fixture must escape the leader group"
+    );
+    assert_eq!(
+        descendant_session, hook_pid,
+        "fixture must remain in the hook session"
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let hook_survived = process_is_running(hook_pid);
+    let descendant_survived = process_is_running(descendant_pid);
+    if hook_survived {
+        kill_process_group(hook_pid);
+    }
+    if descendant_survived {
+        kill_process(descendant_pid);
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(!hook_survived, "detached hook leader survived cancellation");
+    assert!(
+        !descendant_survived,
+        "same-session descendant escaped through a different process group"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_detached_timed_probe_before_returning() {
+    let fixture = Fixture::new("parent-signal-detached-probe");
+    fixture.write("conf/deps.conf", "tool pkg\n");
+    fixture.write_executable(
+        "fakebin/tool",
+        r#"#!/bin/sh
+trap '' HUP INT QUIT
+trap 'printf term >"$SHDEPS_TEST_PROBE_TERM"' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_PROBE_PID"
+while :; do
+  printf x >>"$SHDEPS_TEST_PROBE_MUTATIONS"
+  /bin/sleep 0.02
+done
+"#,
+    );
+
+    let mut command = fixture.command(["list"]);
+    command
+        .env("SHDEPS_TEST_PROBE_PID", fixture.dir.join("probe.pid"))
+        .env(
+            "SHDEPS_TEST_PROBE_MUTATIONS",
+            fixture.dir.join("probe-mutations"),
+        )
+        .env("SHDEPS_TEST_PROBE_TERM", fixture.dir.join("probe-term"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let probe_pid = wait_for_pid(
+        &fixture.dir.join("probe.pid"),
+        Duration::from_secs(3),
+        "detached probe pid",
+    );
+    let _probe_guard = EscapedProcessGuard::new(probe_pid);
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let probe_survived = process_is_running(probe_pid);
+    let mutations = fixture.dir.join("probe-mutations");
+    let size_after_exit = fs::metadata(&mutations).unwrap().len();
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations).unwrap().len() != size_after_exit;
+    if probe_survived {
+        kill_process_group(probe_pid);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(probe_pid),
+            "leaked probe cleanup",
+        );
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        fixture.dir.join("probe-term").is_file(),
+        "timed probe did not receive TERM before KILL escalation"
+    );
+    assert!(!probe_survived, "timed probe survived its signaled parent");
+    assert!(
+        !mutation_continued,
+        "timed probe mutated state after Shdeps exited"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_unbounded_external_install_before_returning() {
+    let fixture = Fixture::new("parent-signal-unbounded-install");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+trap '' HUP INT QUIT
+trap 'printf term >"$SHDEPS_TEST_CHILD_TERM"' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+while :; do /bin/sleep 0.02; done
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_TEST_CHILD_PID", fixture.dir.join("external.pid"))
+        .env("SHDEPS_TEST_CHILD_TERM", fixture.dir.join("external-term"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let external_pid = wait_for_pid(
+        &fixture.dir.join("external.pid"),
+        Duration::from_secs(3),
+        "external installer pid",
+    );
+    let _external_guard = EscapedProcessGuard::new(external_pid);
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let external_survived = process_is_running(external_pid);
+    if external_survived {
+        kill_process(external_pid);
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        fixture.dir.join("external-term").is_file(),
+        "unbounded external child did not receive TERM before KILL escalation"
+    );
+    assert!(
+        !external_survived,
+        "unbounded external child survived its signaled parent"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_cancellation_resumes_stopped_child_before_term() {
+    let fixture = Fixture::new("parent-signal-stopped-child");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+trap 'printf term >"$SHDEPS_TEST_CHILD_TERM"; exit 0' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+while :; do /bin/sleep 1; done
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("stopped-child.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_CHILD_TERM",
+            fixture.dir.join("stopped-child-term"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let child_pid = wait_for_pid(
+        &fixture.dir.join("stopped-child.pid"),
+        Duration::from_secs(3),
+        "stoppable external child pid",
+    );
+    let _child_guard = EscapedProcessGuard::new(child_pid);
+    signal_process(child_pid, libc::SIGSTOP);
+    wait_until(
+        Duration::from_secs(2),
+        || process_is_stopped(child_pid),
+        "external child to stop",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        fixture.dir.join("stopped-child-term").is_file(),
+        "stopped child must receive CONT before graceful TERM"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_unbounded_external_descendant_after_leader_exits() {
+    let fixture = Fixture::new("parent-signal-unbounded-descendant");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exit 0
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_TEST_CHILD_PID", fixture.dir.join("external.pid"))
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("external-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("external-descendant-mutations"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("external.pid"),
+        Duration::from_secs(3),
+        "external installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("external-descendant.pid"),
+        Duration::from_secs(3),
+        "external installer descendant pid",
+    );
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (caller_group, caller_session) = process_group_and_session(shdeps.id());
+    let (descendant_group, descendant_session) = process_group_and_session(descendant_pid);
+    assert_eq!(
+        descendant_group, leader_pid,
+        "fixture must remain in the installer's owned PGID"
+    );
+    assert_ne!(
+        descendant_group, caller_group,
+        "installer descendants must not share the caller PGID"
+    );
+    assert_eq!(
+        descendant_session, caller_session,
+        "fixture must share caller SID"
+    );
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(leader_pid),
+        "external installer leader to exit",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let descendant_survived = process_is_running(descendant_pid);
+    let mutations = fixture.dir.join("external-descendant-mutations");
+    let size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != size_before;
+    if descendant_survived {
+        kill_process(descendant_pid);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(descendant_pid),
+            "leaked external descendant cleanup",
+        );
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "Shdeps must not block draining pipes held by an owned descendant"
+    );
+    assert!(
+        !descendant_survived,
+        "exact-child descendant survived parent cancellation"
+    );
+    assert!(
+        !mutation_continued,
+        "exact-child descendant continued mutating after Shdeps exited"
+    );
+    assert!(
+        !fixture.dir.join("state/manifest").exists(),
+        "cancelled installer must not publish its manifest entry"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn parent_signal_stops_tracked_external_descendant_after_session_escape_and_leader_exit() {
+    let fixture = Fixture::new("parent-signal-tracked-external-descendant");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/usr/bin/setsid /bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exit 0
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_TEST_CHILD_PID", fixture.dir.join("external.pid"))
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("external-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("external-descendant-mutations"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut shdeps = spawn_test_session(&mut command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("external.pid"),
+        Duration::from_secs(3),
+        "external installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("external-descendant.pid"),
+        Duration::from_secs(3),
+        "escaped external descendant pid",
+    );
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (leader_group, leader_session) = process_group_and_session(leader_pid);
+    let (descendant_group, descendant_session) = process_group_and_session(descendant_pid);
+    assert_eq!(
+        leader_group, leader_pid,
+        "installer must lead its owned PGID"
+    );
+    assert_ne!(
+        descendant_group, leader_group,
+        "fixture descendant must escape the installer PGID"
+    );
+    assert_ne!(
+        descendant_session, leader_session,
+        "fixture descendant must escape the installer session"
+    );
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(leader_pid),
+        "external installer leader to exit after spawning escaped descendant",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let descendant_survived = process_is_running(descendant_pid);
+    let mutations = fixture.dir.join("external-descendant-mutations");
+    let size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != size_before;
+    if descendant_survived {
+        kill_process_group(descendant_group);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(descendant_pid),
+            "leaked escaped external descendant cleanup",
+        );
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        !descendant_survived,
+        "tracked descendant escaped after its installer leader exited"
+    );
+    assert!(
+        !mutation_continued,
+        "tracked escaped descendant kept mutating after Shdeps returned"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn parent_signal_rediscoveries_stop_late_setsid_descendants_after_kill() {
+    let fixture = Fixture::new("parent-signal-late-setsid-descendants");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+trap '
+  trap "" TERM
+  printf started >"$SHDEPS_TEST_LATE_STARTED"
+  i=0
+  while [ "$i" -lt 100 ]; do
+    /usr/bin/setsid /bin/sh -c '\''
+      trap "" HUP INT QUIT TERM
+      printf "%s\n" "$$" >>"$SHDEPS_TEST_LATE_PIDS"
+      while :; do
+        printf x >>"$SHDEPS_TEST_LATE_MUTATIONS"
+        /bin/sleep 0.02
+      done
+    '\'' &
+    i=$((i + 1))
+    /bin/sleep 0.003
+  done
+  while :; do /bin/sleep 1; done
+' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+while :; do /bin/sleep 1; done
+"#,
+    );
+    let pids_path = fixture.dir.join("late-descendants.pids");
+    let mutations = fixture.dir.join("late-descendant-mutations");
+    let started = fixture.dir.join("late-fork-started");
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_TEST_CHILD_PID", fixture.dir.join("late-leader.pid"))
+        .env("SHDEPS_TEST_LATE_STARTED", &started)
+        .env("SHDEPS_TEST_LATE_PIDS", &pids_path)
+        .env("SHDEPS_TEST_LATE_MUTATIONS", &mutations)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut shdeps = spawn_test_session(&mut command);
+    let _leader = wait_for_pid(
+        &fixture.dir.join("late-leader.pid"),
+        Duration::from_secs(3),
+        "late-fork leader pid",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    wait_until(
+        Duration::from_secs(2),
+        || started.is_file(),
+        "late-fork TERM handler",
+    );
+    let first_descendant = wait_for_pids(
+        &pids_path,
+        1,
+        Duration::from_secs(2),
+        "first late setsid descendant",
+    )[0];
+    let mut first_guard = EscapedProcessGuard::new(first_descendant);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let mut stderr = String::new();
+    if status.is_some() {
+        use std::io::Read as _;
+        shdeps
+            .stderr
+            .take()
+            .expect("Shdeps stderr must be captured")
+            .read_to_string(&mut stderr)
+            .unwrap();
+    }
+    let pids = read_pids(&pids_path);
+    let mut guards = pids
+        .iter()
+        .copied()
+        .filter(|pid| *pid != first_descendant)
+        .filter_map(EscapedProcessGuard::new_if_present)
+        .collect::<Vec<_>>();
+    let survivors = pids
+        .iter()
+        .copied()
+        .filter(|pid| process_is_running(*pid))
+        .collect::<Vec<_>>();
+    let size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(100));
+    let mutation_continued = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != size_before;
+    first_guard.disarm_if_exited();
+    for guard in &mut guards {
+        guard.disarm_if_exited();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "late-descendant cleanup diagnostics: {stderr}; survivors: {survivors:?}"
+    );
+    assert!(
+        survivors.is_empty(),
+        "late setsid descendants survived the post-KILL sweep: {survivors:?}"
+    );
+    assert!(!mutation_continued, "late descendant mutation continued");
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_delivers_term_to_late_same_group_descendant() {
+    let fixture = Fixture::new("parent-signal-late-same-group-descendant");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/late-same-group-child",
+        r#"#!/bin/sh
+trap 'printf term >"$SHDEPS_TEST_LATE_CHILD_TERM"; exit 0' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_LATE_CHILD_PID"
+while :; do /bin/sleep 0.02; done
+"#,
+    );
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+trap '
+  "$SHDEPS_TEST_LATE_CHILD" &
+  while [ ! -s "$SHDEPS_TEST_LATE_CHILD_PID" ]; do :; done
+  while :; do /bin/sleep 1; done
+' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+while :; do /bin/sleep 1; done
+"#,
+    );
+    let child_path = fixture.dir.join("fakebin/late-same-group-child");
+    let child_pid_path = fixture.dir.join("late-same-group-child.pid");
+    let child_term_path = fixture.dir.join("late-same-group-child.term");
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("late-same-group-leader.pid"),
+        )
+        .env("SHDEPS_TEST_LATE_CHILD", &child_path)
+        .env("SHDEPS_TEST_LATE_CHILD_PID", &child_pid_path)
+        .env("SHDEPS_TEST_LATE_CHILD_TERM", &child_term_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut shdeps = spawn_test_session(&mut command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("late-same-group-leader.pid"),
+        Duration::from_secs(3),
+        "late same-group leader pid",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let child_pid = wait_for_pid(
+        &child_pid_path,
+        Duration::from_secs(2),
+        "late same-group child pid",
+    );
+    let _child_guard = EscapedProcessGuard::new(child_pid);
+    let (leader_group, _) = process_group_and_session(leader_pid);
+    let (child_group, _) = process_group_and_session(child_pid);
+    assert_eq!(
+        child_group, leader_group,
+        "fixture child must retain the leader PGID"
+    );
+
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let mut stderr = String::new();
+    if status.is_some() {
+        use std::io::Read as _;
+        shdeps
+            .stderr
+            .take()
+            .expect("Shdeps stderr must be captured")
+            .read_to_string(&mut stderr)
+            .unwrap();
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "late same-group cancellation diagnostics: {stderr}"
+    );
+    assert!(
+        child_term_path.is_file(),
+        "late same-group child did not receive the graceful TERM phase"
+    );
+    assert!(
+        !process_is_running(child_pid),
+        "late same-group child survived cancellation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_and_drains_unbounded_curl_before_returning() {
+    let fixture = Fixture::new("parent-signal-unbounded-curl");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/bin/sh
+trap '' HUP INT QUIT
+trap 'printf term >"$SHDEPS_TEST_CURL_TERM"' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_CURL_PID"
+while :; do
+  printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+  printf 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2
+done
+"#,
+    );
+
+    let mut command = fixture.command(["list"]);
+    command
+        .env("SHDEPS_TEST_CURL_PID", fixture.dir.join("curl.pid"))
+        .env("SHDEPS_TEST_CURL_TERM", fixture.dir.join("curl-term"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let curl_pid = wait_for_pid(
+        &fixture.dir.join("curl.pid"),
+        Duration::from_secs(3),
+        "curl pid",
+    );
+    let _curl_guard = EscapedProcessGuard::new(curl_pid);
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let curl_survived = process_is_running(curl_pid);
+    if curl_survived {
+        kill_process(curl_pid);
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        fixture.dir.join("curl-term").is_file(),
+        "curl did not receive TERM before KILL escalation"
+    );
+    assert!(!curl_survived, "curl survived its signaled parent");
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_interrupts_large_stdin_write_to_nonreading_curl() {
+    let fixture = Fixture::new("parent-signal-curl-stdin-backpressure");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/bin/sh
+trap '' HUP INT QUIT
+trap 'printf term >"$SHDEPS_TEST_CURL_TERM"' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_CURL_PID"
+while :; do /bin/sleep 0.02; done
+"#,
+    );
+
+    let mut command = fixture.command(["list"]);
+    command
+        .env("GH_TOKEN", "x".repeat(100 * 1024))
+        .env("SHDEPS_TEST_CURL_PID", fixture.dir.join("curl.pid"))
+        .env("SHDEPS_TEST_CURL_TERM", fixture.dir.join("curl-term"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let curl_pid = wait_for_pid(
+        &fixture.dir.join("curl.pid"),
+        Duration::from_secs(3),
+        "nonreading curl pid",
+    );
+    let _curl_guard = EscapedProcessGuard::new(curl_pid);
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let curl_survived = process_is_running(curl_pid);
+    if curl_survived {
+        kill_process_group(curl_pid);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(curl_pid),
+            "nonreading curl fallback cleanup",
+        );
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "stdin backpressure must not hide a latched parent signal"
+    );
+    assert!(
+        fixture.dir.join("curl-term").is_file(),
+        "nonreading curl did not receive TERM before bounded teardown"
+    );
+    assert!(!curl_survived, "nonreading curl survived cancellation");
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_parent_sudo_without_leaving_the_caller_session() {
+    let fixture = Fixture::new("parent-signal-parent-sudo");
+    let binary = env!("CARGO_BIN_EXE_shdeps");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        "exists() { return 1; }\ninstall() { shdeps_require_sudo; }\n",
+    );
+    fixture.write_executable("fakebin/id", "#!/bin/sh\nprintf '1000\\n'\n");
+    fixture.write_executable(
+        "fakebin/sudo",
+        r#"#!/bin/sh
+if [ "$1:$2" = '-n:true' ]; then exit 1; fi
+if [ "$1" = true ]; then
+  trap '' HUP INT QUIT
+  trap 'printf term >"$SHDEPS_TEST_SUDO_TERM"' TERM
+  printf '%s\n' "$$" >"$SHDEPS_TEST_SUDO_PID"
+  while :; do /bin/sleep 0.02; done
+fi
+exit 2
+"#,
+    );
+    fixture.write_executable(
+        "fakebin/shdeps",
+        &format!("#!/bin/sh\nexec {binary} \"$@\"\n"),
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("SHDEPS_TEST_SUDO_PID", fixture.dir.join("sudo.pid"))
+        .env("SHDEPS_TEST_SUDO_TERM", fixture.dir.join("sudo-term"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let sudo_pid = wait_for_pid(
+        &fixture.dir.join("sudo.pid"),
+        Duration::from_secs(3),
+        "parent sudo pid",
+    );
+    let _sudo_guard = EscapedProcessGuard::new(sudo_pid);
+    let (shdeps_group, shdeps_session) = process_group_and_session(shdeps.id());
+    let (sudo_group, sudo_session) = process_group_and_session(sudo_pid);
+    assert_ne!(
+        sudo_group, shdeps_group,
+        "sudo must use an owned group so cleanup cannot signal the caller"
+    );
+    assert_eq!(
+        sudo_session, shdeps_session,
+        "sudo must retain the parent session"
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let sudo_survived = process_is_running(sudo_pid);
+    if sudo_survived {
+        kill_process(sudo_pid);
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        fixture.dir.join("sudo-term").is_file(),
+        "parent-session sudo did not receive TERM before KILL escalation"
+    );
+    assert!(!sudo_survived, "parent-session sudo survived cancellation");
+    assert!(
+        !fixture.dir.join("state/.hook-sudo-requests").exists(),
+        "cancelled authentication must not retain its request channel"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cold_sudo_authentication_and_parent_session_retry_work_through_a_real_pty() {
+    use std::io::{Read as _, Write as _};
+
+    let fixture = custom_sudo_fixture("cold-sudo-real-pty", &["tool"]);
+    fixture.write_executable(
+        "fakebin/sudo",
+        r#"#!/bin/sh
+if [ "$1:$2" = '-n:true' ]; then
+  test -f "$SHDEPS_TEST_SUDO_CACHE"
+  exit $?
+fi
+if [ "$1" = true ]; then
+  printf 'test-password: ' >/dev/tty
+  IFS= read -r password </dev/tty || exit 2
+  [ "$password" = secret ] || exit 3
+  : >"$SHDEPS_TEST_SUDO_CACHE"
+  exit 0
+fi
+exit 4
+"#,
+    );
+
+    let (mut shdeps, mut master) = spawn_on_pty(custom_sudo_command(&fixture, ["update"]));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = Vec::new();
+    while !observed
+        .windows(b"test-password: ".len())
+        .any(|window| window == b"test-password: ")
+    {
+        let mut chunk = [0_u8; 512];
+        match master.read(&mut chunk) {
+            Ok(0) => {}
+            Ok(count) => observed.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => panic!("failed reading PTY prompt: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sudo prompt did not reach the PTY"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    master.write_all(b"secret\n").unwrap();
+    master.flush().unwrap();
+
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(5));
+    if status.is_none() {
+        kill_process_group(shdeps.id());
+        let _ = shdeps.wait();
+    }
+    assert_eq!(status.and_then(|status| status.code()), Some(0));
+    assert!(
+        fixture.dir.join("state/tool-installed").is_file(),
+        "authenticated parent-session retry did not finish the hook"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn terminal_interrupt_of_owned_foreground_child_returns_130() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("foreground-child-terminal-interrupt");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >\"$SHDEPS_TEST_CHILD_PID\"\nexec /bin/sleep 30\n",
+    );
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_TEST_CHILD_PID", fixture.dir.join("foreground.pid"));
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let child_pid = wait_for_pid(
+        &fixture.dir.join("foreground.pid"),
+        Duration::from_secs(3),
+        "foreground installer pid",
+    );
+    let _child_guard = EscapedProcessGuard::new(child_pid);
+    let (shdeps_group, shdeps_session) = process_group_and_session(shdeps.id());
+    let (child_group, child_session) = process_group_and_session(child_pid);
+    assert_ne!(
+        child_group, shdeps_group,
+        "child must own its process group"
+    );
+    assert_eq!(
+        child_session, shdeps_session,
+        "child must retain caller SID"
+    );
+
+    // The PTY line discipline delivers ^C to the current foreground group,
+    // exactly as a user pressing Ctrl-C would.
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    if status.is_none() {
+        kill_process_group(shdeps.id());
+        kill_process_group(child_group);
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT),
+        "Shdeps must propagate a terminal-delivered child interrupt conventionally"
+    );
+    assert!(!process_is_running(child_pid));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn terminal_interrupt_trapped_as_conventional_exit_returns_130() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("foreground-child-trapped-terminal-interrupt");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+trap 'exit 130' INT
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+while :; do /bin/sleep 1; done
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command.env(
+        "SHDEPS_TEST_CHILD_PID",
+        fixture.dir.join("foreground-trapped.pid"),
+    );
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let child_pid = wait_for_pid(
+        &fixture.dir.join("foreground-trapped.pid"),
+        Duration::from_secs(3),
+        "foreground trapped installer pid",
+    );
+    let _child_guard = EscapedProcessGuard::new(child_pid);
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    if status.is_none() {
+        kill_process_group(shdeps.id());
+        kill_process_group(child_pid);
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT),
+        "foreground conventional 130 must preserve terminal cancellation"
+    );
+    assert!(!process_is_running(child_pid));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn descendant_foreground_interrupt_cancels_parallel_work_and_restores_the_terminal() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("descendant-foreground-parallel-interrupt");
+    fixture.write("conf/deps.conf", "foreground cargo foreground\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/usr/bin/env python3
+import os
+import signal
+import time
+
+tty = os.open("/dev/tty", os.O_RDWR)
+while os.tcgetpgrp(tty) != os.getpgrp():
+    time.sleep(0.001)
+read_fd, write_fd = os.pipe()
+worker = os.fork()
+if worker == 0:
+    os.close(read_fd)
+    os.close(write_fd)
+    os.setpgid(0, 0)
+    worker_tty = os.open("/dev/tty", os.O_RDWR)
+    def stop(_signal, _frame):
+        with open(os.environ["SHDEPS_TEST_SIBLING_TERM"], "w") as marker:
+            marker.write("term\n")
+        with open(os.environ["SHDEPS_TEST_RECLAIMED_GROUP"], "w") as group_file:
+            group_file.write(f"{os.tcgetpgrp(worker_tty)}\n")
+        raise SystemExit(143)
+    signal.signal(signal.SIGTERM, stop)
+    for caught in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
+        signal.signal(caught, signal.SIG_IGN)
+    with open(os.environ["SHDEPS_TEST_SIBLING_PID"], "w") as pid_file:
+        pid_file.write(f"{os.getpid()}\n")
+    with open(os.environ["SHDEPS_TEST_SIBLING_MUTATIONS"], "ab", buffering=0) as mutations:
+        while True:
+            mutations.write(b"x")
+            time.sleep(0.01)
+
+descendant = os.fork()
+if descendant == 0:
+    os.close(read_fd)
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    def interrupted(_signal, _frame):
+        with open(os.environ["SHDEPS_TEST_DESCENDANT_INT"], "w") as marker:
+            marker.write("int\n")
+        os.write(write_fd, b"i")
+    signal.signal(signal.SIGINT, interrupted)
+    for caught in (signal.SIGHUP, signal.SIGQUIT, signal.SIGTERM):
+        signal.signal(caught, signal.SIG_IGN)
+    os.tcsetpgrp(tty, os.getpgrp())
+    with open(os.environ["SHDEPS_TEST_DESCENDANT_PID"], "w") as pid_file:
+        pid_file.write(f"{os.getpid()}\n")
+    with open(os.environ["SHDEPS_TEST_DESCENDANT_READY"], "w") as ready_file:
+        ready_file.write("ready\n")
+    while True:
+        time.sleep(1)
+
+os.close(write_fd)
+with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
+    pid_file.write(f"{os.getpid()}\n")
+os.read(read_fd, 1)
+os._exit(130)
+"#,
+    );
+    let descendant_ready = fixture.dir.join("descendant.ready");
+    let descendant_int = fixture.dir.join("descendant.int");
+    let sibling_term = fixture.dir.join("sibling.term");
+    let sibling_mutations = fixture.dir.join("sibling.mutations");
+    let reclaimed_group = fixture.dir.join("reclaimed.group");
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env("SHDEPS_TEST_DESCENDANT_READY", &descendant_ready)
+        .env("SHDEPS_TEST_DESCENDANT_INT", &descendant_int)
+        .env("SHDEPS_TEST_SIBLING_PID", fixture.dir.join("sibling.pid"))
+        .env("SHDEPS_TEST_SIBLING_TERM", &sibling_term)
+        .env("SHDEPS_TEST_SIBLING_MUTATIONS", &sibling_mutations)
+        .env("SHDEPS_TEST_RECLAIMED_GROUP", &reclaimed_group);
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let shdeps_pid = shdeps.id();
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("foreground-leader.pid"),
+        Duration::from_secs(3),
+        "foreground leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("foreground-descendant.pid"),
+        Duration::from_secs(3),
+        "foreground descendant pid",
+    );
+    let sibling_pid = wait_for_pid(
+        &fixture.dir.join("sibling.pid"),
+        Duration::from_secs(3),
+        "parallel sibling pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let mut descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let mut sibling_guard = EscapedProcessGuard::new(sibling_pid);
+    wait_until(
+        Duration::from_secs(2),
+        || descendant_ready.is_file() && terminal_group(&master) == descendant_pid,
+        "descendant to own the terminal foreground",
+    );
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || descendant_int.is_file(),
+        "descendant to acknowledge terminal Ctrl-C",
+    );
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(5));
+    descendant_guard.disarm_if_exited();
+    sibling_guard.disarm_if_exited();
+    let sibling_size = fs::metadata(&sibling_mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(100));
+    let sibling_still_mutating = fs::metadata(&sibling_mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != sibling_size;
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT),
+        "a conventional exit from the boundary owning the terminal must cancel the update"
+    );
+    assert!(sibling_term.is_file(), "parallel work did not receive TERM");
+    assert!(!process_is_running(descendant_pid));
+    assert!(!process_is_running(sibling_pid));
+    assert!(
+        !sibling_still_mutating,
+        "parallel work survived Shdeps exit"
+    );
+    assert_eq!(
+        wait_for_pid(
+            &reclaimed_group,
+            Duration::from_secs(2),
+            "parallel worker to record terminal restoration",
+        ),
+        shdeps_pid,
+        "Shdeps did not reclaim its terminal before terminating the owned boundary"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn terminal_interrupt_of_leader_stops_ignoring_pipe_holder() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("foreground-leader-interrupt-pipe-holder");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exec /bin/sleep 30
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("foreground-descendant-mutations"),
+        );
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("foreground-leader.pid"),
+        Duration::from_secs(3),
+        "foreground installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("foreground-descendant.pid"),
+        Duration::from_secs(3),
+        "foreground pipe-holder pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (leader_group, _) = process_group_and_session(leader_pid);
+    let (descendant_group, _) = process_group_and_session(descendant_pid);
+    assert_eq!(
+        leader_group, descendant_group,
+        "fixture must share the owned PGID"
+    );
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let descendant_survived = process_is_running(descendant_pid);
+    let mutations = fixture.dir.join("foreground-descendant-mutations");
+    let size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != size_before;
+    if descendant_survived {
+        kill_process_group(descendant_group);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(descendant_pid),
+            "foreground pipe-holder fallback cleanup",
+        );
+    }
+    if status.is_none() {
+        kill_process_group(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT),
+        "leader signal must be observed before inherited pipe EOF"
+    );
+    assert!(
+        !descendant_survived,
+        "pipe-holder survived terminal cancellation"
+    );
+    assert!(
+        !mutation_continued,
+        "pipe-holder kept mutating after Shdeps returned"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn terminal_interrupt_cleans_closed_pipe_session_escape_before_returning() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("foreground-interrupt-closed-pipe-escape");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/usr/bin/env python3
+import os
+import signal
+import time
+
+descendant = os.fork()
+if descendant == 0:
+    os.setsid()
+    for caught in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        signal.signal(caught, signal.SIG_IGN)
+    with open(os.environ["SHDEPS_TEST_DESCENDANT_PID"], "w") as pid_file:
+        pid_file.write(f"{os.getpid()}\n")
+    for descriptor in (0, 1, 2):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    mutation = os.open(
+        os.environ["SHDEPS_TEST_DESCENDANT_MUTATIONS"],
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o600,
+    )
+    while True:
+        os.write(mutation, b"x")
+        time.sleep(0.02)
+
+with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
+    pid_file.write(f"{os.getpid()}\n")
+while not os.path.exists(os.environ["SHDEPS_TEST_DESCENDANT_PID"]):
+    time.sleep(0.001)
+os.execl("/bin/sleep", "sleep", "30")
+"#,
+    );
+    let mutations = fixture.dir.join("closed-pipe-descendant-mutations");
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("closed-pipe-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("closed-pipe-descendant.pid"),
+        )
+        .env("SHDEPS_TEST_DESCENDANT_MUTATIONS", &mutations);
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("closed-pipe-leader.pid"),
+        Duration::from_secs(3),
+        "foreground leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("closed-pipe-descendant.pid"),
+        Duration::from_secs(3),
+        "closed-pipe escaped descendant pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let mut descendant_guard = EscapedProcessGuard::new(descendant_pid);
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let descendant_survived = process_is_running(descendant_pid);
+    let size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != size_before;
+    if descendant_survived {
+        descendant_guard.signal(libc::SIGKILL);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(descendant_pid),
+            "closed-pipe escaped descendant fallback cleanup",
+        );
+    }
+    descendant_guard.disarm_if_exited();
+    if status.is_none() {
+        kill_process_group(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT)
+    );
+    assert!(
+        !descendant_survived,
+        "closed-pipe escaped descendant survived inferred terminal cancellation"
+    );
+    assert!(
+        !mutation_continued,
+        "closed-pipe escaped descendant mutated after Shdeps returned"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn foreground_returns_to_shdeps_when_child_exits_before_pipe_holder() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("foreground-release-before-pipe-eof");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/usr/bin/env python3
+import os
+import signal
+import time
+
+descendant = os.fork()
+if descendant == 0:
+    os.setpgid(0, 0)
+    for caught in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        signal.signal(caught, signal.SIG_IGN)
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    with open(os.environ["SHDEPS_TEST_DESCENDANT_PID"], "w") as pid_file:
+        pid_file.write(f"{os.getpid()}\n")
+    while not os.path.exists(os.environ["SHDEPS_TEST_TTY_TAKEOVER"]):
+        time.sleep(0.001)
+    tty = os.open("/dev/tty", os.O_RDWR)
+    os.tcsetpgrp(tty, os.getpgrp())
+    with open(os.environ["SHDEPS_TEST_TTY_OWNER_READY"], "w") as ready_file:
+        ready_file.write("ready\n")
+    while True:
+        time.sleep(1)
+
+with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
+    pid_file.write(f"{os.getpid()}\n")
+while not os.path.exists(os.environ["SHDEPS_TEST_DESCENDANT_PID"]):
+    time.sleep(0.001)
+os._exit(0)
+"#,
+    );
+    let tty_owner_ready = fixture.dir.join("foreground-tty-owner-ready");
+    let tty_takeover = fixture.dir.join("foreground-tty-takeover");
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-exited.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-pipe-holder.pid"),
+        )
+        .env("SHDEPS_TEST_TTY_TAKEOVER", &tty_takeover)
+        .env("SHDEPS_TEST_TTY_OWNER_READY", &tty_owner_ready);
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("foreground-exited.pid"),
+        Duration::from_secs(3),
+        "foreground installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("foreground-pipe-holder.pid"),
+        Duration::from_secs(3),
+        "foreground pipe-holder pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new_if_present(leader_pid);
+    let mut descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (leader_group, _) = process_group_and_session(leader_pid);
+    let (descendant_group, _) = process_group_and_session(descendant_pid);
+    assert_ne!(
+        descendant_group, leader_group,
+        "fixture pipe holder must own the terminal from another process group"
+    );
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(leader_pid),
+        "foreground leader to exit before its descendant takes the terminal",
+    );
+    fs::write(&tty_takeover, "take terminal\n").unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || tty_owner_ready.is_file(),
+        "descendant to take the terminal after its leader exits",
+    );
+    wait_until(
+        Duration::from_secs(2),
+        || terminal_group(&master) == shdeps.id(),
+        "Shdeps to reclaim the terminal after leader exit",
+    );
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    descendant_guard.disarm_if_exited();
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT),
+        "Ctrl-C must reach Shdeps after its foreground child leader exits"
+    );
+    assert!(!process_is_running(descendant_pid));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cancellation_reclaims_terminal_from_an_owned_descendant_group() {
+    let fixture = Fixture::new("foreground-reclaim-descendant-on-cancel");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/usr/bin/env python3
+import os
+import signal
+import time
+
+tty = None
+def record_terminal_and_exit(_signal, _frame):
+    with open(os.environ["SHDEPS_TEST_RECLAIMED_GROUP"], "w") as group_file:
+        group_file.write(f"{os.tcgetpgrp(tty)}\n")
+    raise SystemExit(143)
+
+signal.signal(signal.SIGTERM, record_terminal_and_exit)
+descendant = os.fork()
+if descendant == 0:
+    os.setpgid(0, 0)
+    for caught in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        signal.signal(caught, signal.SIG_IGN)
+    with open(os.environ["SHDEPS_TEST_DESCENDANT_PID"], "w") as pid_file:
+        pid_file.write(f"{os.getpid()}\n")
+    while True:
+        time.sleep(1)
+
+with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
+    pid_file.write(f"{os.getpid()}\n")
+while not os.path.exists(os.environ["SHDEPS_TEST_DESCENDANT_PID"]):
+    time.sleep(0.001)
+tty = os.open("/dev/tty", os.O_RDWR)
+os.tcsetpgrp(tty, descendant)
+with open(os.environ["SHDEPS_TEST_TTY_OWNER_READY"], "w") as ready_file:
+    ready_file.write("ready\n")
+while True:
+    time.sleep(1)
+"#,
+    );
+    let ready = fixture.dir.join("cancel-descendant-tty-ready");
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("cancel-descendant-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("cancel-descendant-owner.pid"),
+        )
+        .env("SHDEPS_TEST_TTY_OWNER_READY", &ready)
+        .env(
+            "SHDEPS_TEST_RECLAIMED_GROUP",
+            fixture.dir.join("cancel-reclaimed-terminal-group"),
+        );
+    let (mut shdeps, master) = spawn_on_pty(command);
+    let shdeps_pid = shdeps.id();
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("cancel-descendant-leader.pid"),
+        Duration::from_secs(3),
+        "foreground leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("cancel-descendant-owner.pid"),
+        Duration::from_secs(3),
+        "foreground descendant owner pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let mut descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    wait_until(
+        Duration::from_secs(2),
+        || ready.is_file() && terminal_group(&master) == descendant_pid,
+        "descendant to acknowledge terminal ownership",
+    );
+
+    signal_process(shdeps_pid, libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    descendant_guard.disarm_if_exited();
+
+    assert_eq!(status.and_then(|status| status.code()), Some(143));
+    assert!(!process_is_running(descendant_pid));
+    let reclaimed_group = wait_for_pid(
+        &fixture.dir.join("cancel-reclaimed-terminal-group"),
+        Duration::from_secs(2),
+        "leader to record terminal ownership during cancellation",
+    );
+    assert_eq!(
+        reclaimed_group, shdeps_pid,
+        "cancellation must return the terminal from any retained owned group"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cancellation_reclaims_a_terminal_retake_during_term_grace() {
+    let fixture = Fixture::new("foreground-reclaim-late-descendant-retake");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/usr/bin/env python3
+import os
+import signal
+import time
+
+descendant = os.fork()
+if descendant == 0:
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    tty = os.open("/dev/tty", os.O_RDWR)
+    took_terminal = False
+    def take_terminal(_signal, _frame):
+        global took_terminal
+        os.tcsetpgrp(tty, os.getpgrp())
+        took_terminal = True
+        with open(os.environ["SHDEPS_TEST_LATE_TTY_READY"], "w") as ready_file:
+            ready_file.write("ready\n")
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, take_terminal)
+    for caught in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
+        signal.signal(caught, signal.SIG_IGN)
+    with open(os.environ["SHDEPS_TEST_DESCENDANT_PID"], "w") as pid_file:
+        pid_file.write(f"{os.getpid()}\n")
+    while True:
+        if took_terminal and os.tcgetpgrp(tty) != os.getpgrp():
+            with open(os.environ["SHDEPS_TEST_LATE_TTY_RECLAIMED"], "w") as reclaimed_file:
+                reclaimed_file.write("reclaimed\n")
+        time.sleep(0.01)
+
+for caught in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+    signal.signal(caught, signal.SIG_IGN)
+with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
+    pid_file.write(f"{os.getpid()}\n")
+while not os.path.exists(os.environ["SHDEPS_TEST_DESCENDANT_PID"]):
+    time.sleep(0.001)
+while True:
+    time.sleep(0.01)
+"#,
+    );
+    let late_ready = fixture.dir.join("late-terminal-owner-ready");
+    let reclaimed = fixture.dir.join("late-terminal-reclaimed");
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("late-terminal-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("late-terminal-descendant.pid"),
+        )
+        .env("SHDEPS_TEST_LATE_TTY_READY", &late_ready)
+        .env("SHDEPS_TEST_LATE_TTY_RECLAIMED", &reclaimed);
+    let (mut shdeps, master) = spawn_on_pty(command);
+    let shdeps_pid = shdeps.id();
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("late-terminal-leader.pid"),
+        Duration::from_secs(3),
+        "late-retake leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("late-terminal-descendant.pid"),
+        Duration::from_secs(3),
+        "late-retake descendant pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let mut descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    wait_until(
+        Duration::from_secs(2),
+        || terminal_group(&master) == leader_pid,
+        "leader to own the terminal before cancellation",
+    );
+
+    signal_process(shdeps_pid, libc::SIGTERM);
+    wait_until(
+        Duration::from_secs(2),
+        || late_ready.is_file(),
+        "descendant to retake the terminal from its TERM handler",
+    );
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    descendant_guard.disarm_if_exited();
+
+    assert_eq!(status.and_then(|status| status.code()), Some(143));
+    assert!(!process_is_running(descendant_pid));
+    assert!(
+        reclaimed.is_file(),
+        "the terminal lease must periodically reclaim a late takeover during teardown"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn terminal_stop_suspends_shdeps_and_resume_rehands_off_before_interrupt() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("foreground-child-stop-resume");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+trap 'printf continued >"$SHDEPS_TEST_CONTINUED"' CONT
+trap 'exit 130' INT
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+while :; do /bin/sleep 1; done
+"#,
+    );
+    let continued = fixture.dir.join("foreground-continued");
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-stopped.pid"),
+        )
+        .env("SHDEPS_TEST_CONTINUED", &continued);
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let child_pid = wait_for_pid(
+        &fixture.dir.join("foreground-stopped.pid"),
+        Duration::from_secs(3),
+        "foreground stoppable child pid",
+    );
+    let _child_guard = EscapedProcessGuard::new(child_pid);
+    wait_until(
+        Duration::from_secs(2),
+        || terminal_group(&master) == child_pid,
+        "child to own the terminal before Ctrl-Z",
+    );
+    let _ = fs::remove_file(&continued);
+
+    master.write_all(&[26]).unwrap();
+    master.flush().unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || process_is_stopped(shdeps.id()),
+        "Shdeps job to stop after its foreground child stops",
+    );
+    assert_eq!(
+        terminal_group(&master),
+        shdeps.id(),
+        "Shdeps must reclaim the terminal before suspending its own job"
+    );
+
+    signal_process(shdeps.id(), libc::SIGCONT);
+    wait_until(
+        Duration::from_secs(2),
+        || terminal_group(&master) == child_pid && continued.is_file(),
+        "resumed Shdeps to hand the terminal back and continue its child",
+    );
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT),
+        "resumed foreground child must still propagate Ctrl-C conventionally"
+    );
+    assert!(!process_is_running(child_pid));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn terminal_stop_suspends_the_complete_original_pipeline_job() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("foreground-pipeline-stop");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >\"$SHDEPS_TEST_CHILD_PID\"\nwhile :; do /bin/sleep 1; done\n",
+    );
+    fixture.write_executable(
+        "fakebin/pipeline-harness",
+        r#"#!/usr/bin/env python3
+import os
+import signal
+import time
+
+tty = os.open("/dev/tty", os.O_RDWR)
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+
+shdeps = os.fork()
+if shdeps == 0:
+    os.setpgid(0, 0)
+    os.execl(os.environ["SHDEPS_TEST_BINARY"], "shdeps", "update")
+os.setpgid(shdeps, shdeps)
+
+sibling = os.fork()
+if sibling == 0:
+    os.setpgid(0, shdeps)
+    with open(os.environ["SHDEPS_TEST_PIPELINE_SIBLING_PID"], "w") as pid_file:
+        pid_file.write(f"{os.getpid()}\n")
+    while True:
+        time.sleep(1)
+os.setpgid(sibling, shdeps)
+
+with open(os.environ["SHDEPS_TEST_PIPELINE_SHDEPS_PID"], "w") as pid_file:
+    pid_file.write(f"{shdeps}\n")
+os.tcsetpgrp(tty, shdeps)
+with open(os.environ["SHDEPS_TEST_PIPELINE_READY"], "w") as ready_file:
+    ready_file.write("ready\n")
+
+while True:
+    waited, status = os.waitpid(shdeps, os.WUNTRACED | os.WCONTINUED)
+    if waited == shdeps and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+        break
+os.kill(sibling, signal.SIGKILL)
+os.waitpid(sibling, 0)
+os.tcsetpgrp(tty, os.getpgrp())
+if os.WIFEXITED(status):
+    raise SystemExit(os.WEXITSTATUS(status))
+raise SystemExit(128 + os.WTERMSIG(status))
+"#,
+    );
+
+    let template = fixture.command(["update"]);
+    let mut command = Command::new(fixture.dir.join("fakebin/pipeline-harness"));
+    command.env_clear();
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("SHDEPS_TEST_BINARY", env!("CARGO_BIN_EXE_shdeps"))
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("pipeline-child.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_PIPELINE_SHDEPS_PID",
+            fixture.dir.join("pipeline-shdeps.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_PIPELINE_SIBLING_PID",
+            fixture.dir.join("pipeline-sibling.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_PIPELINE_READY",
+            fixture.dir.join("pipeline-ready"),
+        );
+    let (mut harness, mut master) = spawn_on_pty(command);
+    let shdeps_pid = wait_for_pid(
+        &fixture.dir.join("pipeline-shdeps.pid"),
+        Duration::from_secs(3),
+        "pipeline Shdeps pid",
+    );
+    let sibling_pid = wait_for_pid(
+        &fixture.dir.join("pipeline-sibling.pid"),
+        Duration::from_secs(3),
+        "pipeline sibling pid",
+    );
+    let child_pid = wait_for_pid(
+        &fixture.dir.join("pipeline-child.pid"),
+        Duration::from_secs(3),
+        "pipeline foreground child pid",
+    );
+    wait_until(
+        Duration::from_secs(2),
+        || fixture.dir.join("pipeline-ready").is_file() && terminal_group(&master) == child_pid,
+        "pipeline child to own the terminal",
+    );
+
+    master.write_all(&[26]).unwrap();
+    master.flush().unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || process_is_stopped(shdeps_pid),
+        "Shdeps pipeline member to stop",
+    );
+    let sibling_stopped = process_is_stopped(sibling_pid);
+    if !sibling_stopped {
+        harness.signal_session(libc::SIGKILL);
+        let _ = harness.wait();
+    }
+
+    assert!(
+        sibling_stopped,
+        "Ctrl-Z must stop every member of Shdeps' original foreground pipeline group"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn background_terminal_read_stops_and_resumes_the_shdeps_job() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("background-terminal-stop-resume");
+    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+printf 'background prompt: ' >/dev/tty
+IFS= read -r answer </dev/tty
+printf '%s\n' "$answer" >"$SHDEPS_TEST_CHILD_RESUMED"
+printf '[]\n'
+"#,
+    );
+    fixture.write_executable(
+        "fakebin/background-harness",
+        r#"#!/usr/bin/env python3
+import os
+import signal
+import time
+
+tty = os.open("/dev/tty", os.O_RDWR)
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+shdeps = os.fork()
+if shdeps == 0:
+    os.setpgid(0, 0)
+    os.execl(os.environ["SHDEPS_TEST_BINARY"], "shdeps", "list")
+os.setpgid(shdeps, shdeps)
+with open(os.environ["SHDEPS_TEST_BACKGROUND_PID"], "w") as pid_file:
+    pid_file.write(f"{shdeps}\n")
+
+waited, status = os.waitpid(shdeps, os.WUNTRACED)
+if waited != shdeps or not os.WIFSTOPPED(status):
+    raise SystemExit(70)
+with open(os.environ["SHDEPS_TEST_BACKGROUND_STOPPED"], "w") as stopped:
+    stopped.write(str(os.WSTOPSIG(status)))
+while not os.path.exists(os.environ["SHDEPS_TEST_BACKGROUND_RESUME"]):
+    time.sleep(0.001)
+os.tcsetpgrp(tty, shdeps)
+os.killpg(shdeps, signal.SIGCONT)
+
+while True:
+    waited, status = os.waitpid(shdeps, os.WUNTRACED | os.WCONTINUED)
+    if waited == shdeps and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+        break
+os.tcsetpgrp(tty, os.getpgrp())
+if os.WIFEXITED(status):
+    raise SystemExit(os.WEXITSTATUS(status))
+raise SystemExit(128 + os.WTERMSIG(status))
+"#,
+    );
+
+    let template = fixture.command(["list"]);
+    let mut command = Command::new(fixture.dir.join("fakebin/background-harness"));
+    command.env_clear();
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    let shdeps_pid_path = fixture.dir.join("background-shdeps.pid");
+    let stopped_path = fixture.dir.join("background-stopped");
+    let resume_path = fixture.dir.join("background-resume");
+    let child_pid_path = fixture.dir.join("background-child.pid");
+    let child_resumed_path = fixture.dir.join("background-child-resumed");
+    command
+        .env("SHDEPS_TEST_BINARY", env!("CARGO_BIN_EXE_shdeps"))
+        .env("SHDEPS_TEST_BACKGROUND_PID", &shdeps_pid_path)
+        .env("SHDEPS_TEST_BACKGROUND_STOPPED", &stopped_path)
+        .env("SHDEPS_TEST_BACKGROUND_RESUME", &resume_path)
+        .env("SHDEPS_TEST_CHILD_PID", &child_pid_path)
+        .env("SHDEPS_TEST_CHILD_RESUMED", &child_resumed_path);
+    let (mut harness, mut master) = spawn_on_pty(command);
+    let shdeps_pid = wait_for_pid(
+        &shdeps_pid_path,
+        Duration::from_secs(3),
+        "background Shdeps pid",
+    );
+    let child_pid = wait_for_pid(
+        &child_pid_path,
+        Duration::from_secs(3),
+        "background terminal child pid",
+    );
+    let _child_guard = EscapedProcessGuard::new(child_pid);
+    wait_until(
+        Duration::from_secs(3),
+        || stopped_path.is_file() && process_is_stopped(shdeps_pid),
+        "background Shdeps job to propagate the child's terminal stop",
+    );
+    fs::write(&resume_path, "resume\n").unwrap();
+    wait_until(
+        Duration::from_secs(3),
+        || terminal_group(&master) == child_pid,
+        "resumed Shdeps job to hand the terminal to its child",
+    );
+    master.write_all(b"continue\n").unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut harness, Duration::from_secs(5));
+
+    assert_eq!(status.and_then(|status| status.code()), Some(0));
+    assert_eq!(
+        fs::read_to_string(child_resumed_path).unwrap(),
+        "continue\n",
+        "the resumed child must complete its terminal read"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn cancellation_pending_while_shdeps_is_stopped_wakes_child_before_term() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("foreground-child-cancel-while-stopped");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+trap 'printf term >"$SHDEPS_TEST_CHILD_TERM"; exit 0' TERM
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+while :; do /bin/sleep 1; done
+"#,
+    );
+    let term = fixture.dir.join("foreground-stopped-term");
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-cancel-stopped.pid"),
+        )
+        .env("SHDEPS_TEST_CHILD_TERM", &term);
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let child_pid = wait_for_pid(
+        &fixture.dir.join("foreground-cancel-stopped.pid"),
+        Duration::from_secs(3),
+        "foreground child cancelled while stopped",
+    );
+    let _child_guard = EscapedProcessGuard::new(child_pid);
+    wait_until(
+        Duration::from_secs(2),
+        || terminal_group(&master) == child_pid,
+        "child to own the terminal before Ctrl-Z",
+    );
+
+    master.write_all(&[26]).unwrap();
+    master.flush().unwrap();
+    wait_until(
+        Duration::from_secs(2),
+        || process_is_stopped(shdeps.id()),
+        "Shdeps to suspend with its stopped foreground child",
+    );
+    signal_process(shdeps.id(), libc::SIGTERM);
+    signal_process(shdeps.id(), libc::SIGCONT);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM),
+        "the pending parent signal must retain conventional status"
+    );
+    assert!(
+        term.is_file(),
+        "the stopped child must be continued before graceful TERM delivery"
+    );
+    assert!(!process_is_running(child_pid));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn concurrent_terminal_children_serialize_foreground_leases() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("concurrent-terminal-leases");
+    fixture.write(
+        "conf/deps.conf",
+        "owner/one github one\nowner/two github two\n",
+    );
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' "$$" >>"$SHDEPS_TEST_CURL_PIDS"
+printf 'curl-%s: ' "$$" >/dev/tty
+IFS= read -r answer </dev/tty
+printf '[]\n'
+"#,
+    );
+    let pids_path = fixture.dir.join("terminal-curl.pids");
+    let mut command = fixture.command(["--force", "update"]);
+    command
+        .env("SHDEPS_JOBS", "2")
+        .env("SHDEPS_TEST_CURL_PIDS", &pids_path);
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let pids = wait_for_pids(&pids_path, 2, Duration::from_secs(3), "two curl workers");
+    let mut guards = pids
+        .iter()
+        .copied()
+        .map(EscapedProcessGuard::new)
+        .collect::<Vec<_>>();
+    let first = terminal_group(&master);
+    assert!(
+        pids.contains(&first),
+        "one curl worker must own the terminal"
+    );
+
+    master.write_all(b"continue\n").unwrap();
+    master.flush().unwrap();
+    let second = *pids.iter().find(|pid| **pid != first).unwrap();
+    wait_until(
+        Duration::from_secs(3),
+        || terminal_group(&master) == second,
+        "second curl worker to acquire the terminal lease",
+    );
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    for guard in &mut guards {
+        guard.disarm_if_exited();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT),
+        "Ctrl-C must reach the sole current terminal-lease owner"
+    );
+    assert!(pids.into_iter().all(|pid| !process_is_running(pid)));
+}
+
+#[test]
+fn non_tty_external_exit_130_remains_a_regular_failure() {
+    let fixture = Fixture::new("non-tty-exit-130");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable("fakebin/cargo", "#!/bin/sh\nexit 130\n");
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "non-terminal exit 130 must not masquerade as parent cancellation"
+    );
+}
+
+#[cfg(unix)]
+fn assert_non_tty_external_signal_is_regular_failure(signal: &str) {
+    let fixture = Fixture::new(&format!("non-tty-signal-{signal}"));
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        &format!(
+            "#!/usr/bin/env python3\nimport os, signal\nsignal.signal(signal.SIG{signal}, signal.SIG_DFL)\nos.kill(os.getpid(), signal.SIG{signal})\n"
+        ),
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a non-terminal child {signal} must remain an ordinary install failure"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_tty_external_sighup_remains_a_regular_failure() {
+    assert_non_tty_external_signal_is_regular_failure("HUP");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_tty_external_sigint_remains_a_regular_failure() {
+    assert_non_tty_external_signal_is_regular_failure("INT");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_tty_external_sigquit_remains_a_regular_failure() {
+    assert_non_tty_external_signal_is_regular_failure("QUIT");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_tty_external_sigterm_remains_a_regular_failure() {
+    assert_non_tty_external_signal_is_regular_failure("TERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_parent_session_descendant_that_escapes_the_hook_group() {
+    let fixture = custom_sudo_fixture("parent-signal-parent-hook-descendant", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  shdeps_require_sudo || return $?
+  set -m
+  /bin/sh -c '
+    trap "" HUP INT QUIT TERM
+    printf "%s\n" "$$" >"$SHDEPS_STATE_DIR/retry-descendant.pid"
+    while :; do
+      printf x >>"$SHDEPS_STATE_DIR/retry-descendant-mutations"
+      /bin/sleep 0.02
+    done
+  ' &
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/retry-hook.pid"
+  wait
+}
+
+"#,
+    );
+
+    let mut command = custom_sudo_command(&fixture, ["update"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let hook_pid = wait_for_pid(
+        &fixture.dir.join("state/retry-hook.pid"),
+        Duration::from_secs(3),
+        "authenticated retry hook pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("state/retry-descendant.pid"),
+        Duration::from_secs(3),
+        "authenticated retry descendant pid",
+    );
+    let _hook_guard = EscapedProcessGuard::new(hook_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (hook_group, hook_session) = process_group_and_session(hook_pid);
+    let (descendant_group, descendant_session) = process_group_and_session(descendant_pid);
+    let (caller_group, caller_session) = process_group_and_session(shdeps.id());
+    assert_eq!(hook_group, hook_pid, "retry hook must lead its owned PGID");
+    assert_ne!(
+        descendant_group, hook_group,
+        "fixture descendant must escape the retry hook PGID"
+    );
+    assert_eq!(
+        hook_session, caller_session,
+        "retry hook must retain caller SID"
+    );
+    assert_eq!(
+        descendant_session, caller_session,
+        "escaped descendant must retain caller SID"
+    );
+    assert_ne!(
+        hook_group, caller_group,
+        "retry hook must not own caller PGID"
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let hook_survived = process_is_running(hook_pid);
+    let descendant_survived = process_is_running(descendant_pid);
+    let mutations = fixture.dir.join("state/retry-descendant-mutations");
+    let size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != size_before;
+    if hook_survived {
+        kill_process(hook_pid);
+    }
+    if descendant_survived {
+        kill_process(descendant_pid);
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        !hook_survived,
+        "authenticated retry hook survived cancellation"
+    );
+    assert!(
+        !descendant_survived,
+        "authenticated retry descendant escaped its owned lineage"
+    );
+    assert!(
+        !mutation_continued,
+        "authenticated retry descendant continued mutating after Shdeps exited"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_signal_stops_tracked_parent_session_descendant_after_hook_exit() {
+    let fixture = custom_sudo_fixture("parent-signal-tracked-parent-hook-descendant", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  shdeps_require_sudo || return $?
+  set -m
+  /bin/sh -c '
+    trap "" HUP INT QUIT TERM
+    printf "%s\n" "$$" >"$SHDEPS_STATE_DIR/retry-descendant.pid"
+    while :; do
+      printf x >>"$SHDEPS_STATE_DIR/retry-descendant-mutations"
+      /bin/sleep 0.02
+    done
+  ' &
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/retry-hook.pid"
+  return 0
+}
+"#,
+    );
+
+    let mut command = custom_sudo_command(&fixture, ["update"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut shdeps = spawn_test_session(&mut command);
+    let hook_pid = wait_for_pid(
+        &fixture.dir.join("state/retry-hook.pid"),
+        Duration::from_secs(3),
+        "authenticated retry hook pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("state/retry-descendant.pid"),
+        Duration::from_secs(3),
+        "tracked authenticated retry descendant pid",
+    );
+    let _hook_guard = EscapedProcessGuard::new_if_present(hook_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (hook_group, hook_session) = process_group_and_session(hook_pid);
+    let (descendant_group, descendant_session) = process_group_and_session(descendant_pid);
+    assert_ne!(
+        descendant_group, hook_group,
+        "fixture must escape hook PGID"
+    );
+    assert_eq!(
+        descendant_session, hook_session,
+        "portable fixture must retain parent SID"
+    );
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(hook_pid),
+        "authenticated retry hook leader to exit after spawning escaped descendant",
+    );
+
+    signal_process(shdeps.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let descendant_survived = process_is_running(descendant_pid);
+    let mutations = fixture.dir.join("state/retry-descendant-mutations");
+    let size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != size_before;
+    if descendant_survived {
+        kill_process_group(descendant_group);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(descendant_pid),
+            "leaked tracked authenticated retry descendant cleanup",
+        );
+    }
+    if status.is_none() {
+        kill_process(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGTERM)
+    );
+    assert!(
+        !descendant_survived,
+        "tracked retry descendant escaped after its hook leader exited"
+    );
+    assert!(
+        !mutation_continued,
+        "tracked retry descendant kept mutating after Shdeps returned"
+    );
+}
+
 #[test]
 fn custom_hooks_receive_detected_package_manager_in_every_phase() {
     let fixture = Fixture::new("custom-hook-package-manager");
@@ -3544,6 +6421,140 @@ uninstall() { record_manager; }
 
     let managers = fs::read_to_string(fixture.dir.join("state/hook-managers")).unwrap();
     assert_eq!(managers, "uninstall=dnf\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_after_sourceable_hook_marker_replays_post_once() {
+    let fixture = Fixture::new("sourceable-hook-marker-cancel");
+    let binary = env!("CARGO_BIN_EXE_shdeps");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() {
+  printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"
+  : >"$SHDEPS_STATE_DIR/signal-after-marker"
+}
+version() {
+  if test -f "$SHDEPS_STATE_DIR/signal-after-marker"; then
+    rm "$SHDEPS_STATE_DIR/signal-after-marker"
+    kill -TERM "$PPID"
+  fi
+}
+post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
+"#,
+    );
+    fixture.write_executable(
+        "fakebin/shdeps",
+        &format!("#!/bin/sh\nexec {binary} \"$@\"\n"),
+    );
+    let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("shdeps.sh");
+
+    let cancelled = run(fixture.command(["update"]).env("SHDEPS_LIB", &wrapper));
+
+    assert_eq!(cancelled.status.code(), Some(143));
+    assert!(fixture.dir.join("state/tool-installed").is_file());
+    assert!(
+        fixture.dir.join("state/.pending-posts/tool").is_file(),
+        "the sourceable wrapper's committed marker must survive cancellation"
+    );
+    assert!(!fixture.dir.join("state/post-runs").exists());
+
+    let retry = run(fixture.command(["update"]).env("SHDEPS_LIB", &wrapper));
+
+    assert_success(&retry);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/post-runs")).unwrap(),
+        "post\n"
+    );
+    assert!(!fixture.dir.join("state/.pending-posts/tool").exists());
+
+    let settled = run(fixture.command(["update"]).env("SHDEPS_LIB", &wrapper));
+
+    assert_success(&settled);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/post-runs")).unwrap(),
+        "post\n",
+        "the recovered obligation must be acknowledged exactly once"
+    );
+}
+
+#[test]
+fn completed_custom_marker_is_not_replayed_on_later_updates() {
+    let fixture = Fixture::new("completed-custom-marker-once");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() { printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"; }
+post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
+"#,
+    );
+
+    let installed = run(&mut fixture.command(["update"]));
+    let current = run(&mut fixture.command(["update"]));
+    let settled = run(&mut fixture.command(["update"]));
+
+    assert_success(&installed);
+    assert_success(&current);
+    assert_success(&settled);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/post-runs")).unwrap(),
+        "post\n",
+        "one committed mutation must create exactly one post invocation"
+    );
+    assert!(!fixture.dir.join("state/.pending-posts/tool").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_after_unmarked_custom_mutation_replays_post_once() {
+    let fixture = Fixture::new("unmarked-custom-mutation-cancel");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() {
+  printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"
+  trap '' TERM
+  kill -TERM "$PPID"
+  while :; do /bin/sleep 1; done
+}
+post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
+"#,
+    );
+
+    let cancelled = run(&mut fixture.command(["update"]));
+
+    assert_eq!(cancelled.status.code(), Some(143));
+    assert!(fixture.dir.join("state/tool-installed").is_file());
+    assert!(
+        fixture.dir.join("state/.pending-posts/tool").is_file(),
+        "the intent persisted before arbitrary hook code must survive cancellation"
+    );
+    assert!(!fixture.dir.join("state/post-runs").exists());
+
+    let retry = run(&mut fixture.command(["update"]));
+
+    assert_success(&retry);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/post-runs")).unwrap(),
+        "post\n"
+    );
+    assert!(!fixture.dir.join("state/.pending-posts/tool").exists());
+
+    let settled = run(&mut fixture.command(["update"]));
+
+    assert_success(&settled);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/post-runs")).unwrap(),
+        "post\n",
+        "a settled durable obligation must not replay on a later update"
+    );
 }
 
 #[test]
@@ -4070,6 +7081,61 @@ fn custom_sudo_command<const N: usize>(fixture: &Fixture, args: [&str; N]) -> Co
     command
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_on_pty(mut command: Command) -> (GuardedChild, fs::File) {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    // SAFETY: openpty initializes both integer descriptors; optional terminal
+    // attributes and window size are intentionally left at platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: openpty returned two newly owned descriptors above.
+    let master = unsafe { fs::File::from_raw_fd(master_fd) };
+    // SAFETY: same ownership transfer for the slave descriptor.
+    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+    command
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()));
+    // SAFETY: after fork and before exec, create a private test session and
+    // attach descriptor 0's PTY as its controlling terminal.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().expect("PTY-backed command should start");
+    drop(slave);
+    // SAFETY: F_GETFL/F_SETFL operate on this valid master descriptor.
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    (GuardedChild::new(child), master)
+}
+
 fn process_is_running(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -4091,8 +7157,442 @@ fn process_is_running(pid: u32) -> bool {
     }
 }
 
-fn read_pid(path: &Path) -> u32 {
-    fs::read_to_string(path).unwrap().trim().parse().unwrap()
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_stopped(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.chars().next())
+            })
+            .is_some_and(|state| matches!(state, 'T' | 't'))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps should inspect the PTY test process");
+        output.status.success() && text(&output.stdout).trim_start().starts_with('T')
+    }
+}
+
+#[cfg(unix)]
+struct GuardedChild {
+    child: Child,
+    session: u32,
+    reaped: bool,
+}
+
+#[cfg(unix)]
+impl GuardedChild {
+    fn new(child: Child) -> Self {
+        let session = child.id();
+        Self {
+            child,
+            session,
+            reaped: false,
+        }
+    }
+
+    fn signal_session(&self, signal: libc::c_int) {
+        for pid in test_session_members(self.session) {
+            if pid == std::process::id() {
+                continue;
+            }
+            // Revalidate immediately before delivery so PID reuse cannot move
+            // cleanup outside the test-owned session.
+            if i32::try_from(pid)
+                .ok()
+                .is_some_and(|pid| unsafe { libc::getsid(pid) } == self.session as i32)
+            {
+                // SAFETY: the positive PID was revalidated against the unique
+                // session created for this test child immediately above.
+                unsafe {
+                    libc::kill(pid as i32, signal);
+                }
+            }
+        }
+    }
+
+    fn observed_status(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.reaped {
+            return self.child.try_wait();
+        }
+        // SAFETY: waitid initializes only this local siginfo, targets the
+        // retained direct child, and WNOWAIT deliberately preserves its PID
+        // and session identity until descendant cleanup is complete.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                self.child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) != 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            if info.si_pid() == 0 {
+                return Ok(None);
+            }
+            let raw = match info.si_code {
+                libc::CLD_EXITED => info.si_status() << 8,
+                libc::CLD_KILLED => info.si_status(),
+                libc::CLD_DUMPED => info.si_status() | 0x80,
+                _ => return Ok(None),
+            };
+            Ok(Some(ExitStatus::from_raw(raw)))
+        }
+    }
+
+    fn descendant_members(&self) -> Vec<u32> {
+        test_session_members(self.session)
+            .into_iter()
+            .filter(|pid| *pid != self.child.id())
+            .collect()
+    }
+
+    fn reap(&mut self) -> std::io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
+    }
+
+    fn cleanup_and_reap(&mut self) -> std::io::Result<ExitStatus> {
+        if self.reaped {
+            return self.child.wait();
+        }
+
+        self.signal_session(libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let child_done = self.observed_status()?.is_some();
+            if child_done && self.descendant_members().is_empty() {
+                return self.reap();
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        self.signal_session(libc::SIGKILL);
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !self.descendant_members().is_empty() && Instant::now() < deadline {
+            self.signal_session(libc::SIGKILL);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.reap()
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.cleanup_and_reap()
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for GuardedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for GuardedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GuardedChild {
+    fn drop(&mut self) {
+        let _ = self.cleanup_and_reap();
+    }
+}
+
+#[cfg(unix)]
+fn spawn_test_session(command: &mut Command) -> GuardedChild {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: setsid is async-signal-safe and runs after fork before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    GuardedChild::new(command.spawn().expect("guarded test process should start"))
+}
+
+#[cfg(unix)]
+fn test_session_members(session: u32) -> Vec<u32> {
+    let pids = if let Ok(entries) = fs::read_dir("/proc") {
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok()?.parse::<u32>().ok())
+            .collect::<Vec<_>>()
+    } else {
+        Command::new("ps")
+            .args(["-A", "-o", "pid="])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                text(&output.stdout)
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    pids.into_iter()
+        .filter(|pid| {
+            i32::try_from(*pid)
+                .ok()
+                .is_some_and(|pid| unsafe { libc::getsid(pid) } == session as i32)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn process_has_open_path(pid: u32, expected: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == expected))
+}
+
+#[cfg(unix)]
+fn process_group_and_session(pid: u32) -> (u32, u32) {
+    let pid = i32::try_from(pid).expect("test pid must fit pid_t");
+    // SAFETY: both calls only inspect the positive PID of a process that the
+    // test observed as live immediately before this topology assertion.
+    let group = unsafe { libc::getpgid(pid) };
+    // SAFETY: same retained positive PID as above.
+    let session = unsafe { libc::getsid(pid) };
+    assert!(
+        group > 0,
+        "getpgid failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(
+        session > 0,
+        "getsid failed: {}",
+        std::io::Error::last_os_error()
+    );
+    (group as u32, session as u32)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn terminal_group(tty: &fs::File) -> u32 {
+    // SAFETY: tcgetpgrp only inspects this live PTY descriptor.
+    let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    assert!(
+        group > 0,
+        "tcgetpgrp failed: {}",
+        std::io::Error::last_os_error()
+    );
+    group as u32
+}
+
+#[cfg(unix)]
+struct EscapedProcessGuard {
+    pid: u32,
+    group: u32,
+    session: u32,
+    start: Option<String>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl EscapedProcessGuard {
+    fn new(pid: u32) -> Self {
+        let (group, session) = process_group_and_session(pid);
+        Self {
+            pid,
+            group,
+            session,
+            start: test_process_start(pid),
+            armed: true,
+        }
+    }
+
+    fn new_if_present(pid: u32) -> Option<Self> {
+        process_group_and_session_if_present(pid).map(|(group, session)| Self {
+            pid,
+            group,
+            session,
+            start: test_process_start(pid),
+            armed: true,
+        })
+    }
+
+    fn matches(&self) -> bool {
+        process_is_running(self.pid)
+            && process_group_and_session_if_present(self.pid) == Some((self.group, self.session))
+            && test_process_start(self.pid) == self.start
+    }
+
+    fn signal(&self, signal: libc::c_int) {
+        if !self.matches() {
+            return;
+        }
+        // A process that leads its group (including a new-session escape)
+        // reserves that group identity, so cleanup can safely include its
+        // descendants. Otherwise target only the revalidated PID.
+        unsafe {
+            if self.group == self.pid {
+                libc::kill(-(self.group as i32), signal);
+            } else {
+                libc::kill(self.pid as i32, signal);
+            }
+        }
+    }
+
+    fn disarm_if_exited(&mut self) {
+        if !process_is_running(self.pid) {
+            self.armed = false;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EscapedProcessGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.signal(libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while self.matches() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.signal(libc::SIGKILL);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while self.matches() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_group_and_session_if_present(pid: u32) -> Option<(u32, u32)> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: both calls inspect one positive PID and return failure if it no
+    // longer names the process captured by the guard.
+    let group = unsafe { libc::getpgid(pid) };
+    let session = unsafe { libc::getsid(pid) };
+    (group > 0 && session > 0).then_some((group as u32, session as u32))
+}
+
+#[cfg(target_os = "linux")]
+fn test_process_start(pid: u32) -> Option<String> {
+    let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.windows(2).rposition(|part| part == b") ")?;
+    stat[end + 2..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .nth(19)
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn test_process_start(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    output.status.success().then(|| text(&output.stdout))
+}
+
+fn wait_for_pid(path: &Path, timeout: Duration, description: &str) -> u32 {
+    let started = Instant::now();
+    loop {
+        if let Ok(pid) = fs::read_to_string(path).and_then(|value| {
+            value
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|pid| *pid > 0)
+                .ok_or_else(|| std::io::Error::other("pid file is not complete"))
+        }) {
+            return pid;
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "timed out waiting for {description} at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_pids(path: &Path, count: usize, timeout: Duration, description: &str) -> Vec<u32> {
+    let started = Instant::now();
+    loop {
+        let mut pids = fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids.dedup();
+        if pids.len() >= count {
+            pids.truncate(count);
+            return pids;
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "timed out waiting for {description} at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_pids(path: &Path) -> Vec<u32> {
+    let mut pids = fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(unix)]
+fn pending_input_bytes(file: &fs::File) -> i32 {
+    let mut pending = 0_i32;
+    // SAFETY: FIONREAD writes one integer through the supplied valid pointer
+    // and only inspects this test-owned open descriptor.
+    assert_eq!(
+        unsafe { libc::ioctl(file.as_raw_fd(), libc::FIONREAD as _, &mut pending) },
+        0,
+        "FIONREAD failed: {}",
+        std::io::Error::last_os_error()
+    );
+    pending
 }
 
 #[cfg(unix)]
@@ -4101,6 +7601,35 @@ fn kill_process(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
     }
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: libc::c_int) {
+    // SAFETY: tests pass a positive PID read from a live Child handle.
+    assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+}
+
+#[cfg(unix)]
+fn kill_process_group(leader: u32) {
+    // SAFETY: the test observed this child after the production detached
+    // runner made its PID the process-group identity.
+    unsafe {
+        libc::kill(-(leader as i32), libc::SIGKILL);
+    }
+}
+
+fn wait_for_child_exit_bounded(child: &mut GuardedChild, timeout: Duration) -> Option<ExitStatus> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(status) = child
+            .observed_status()
+            .expect("child status should be observable")
+        {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
 }
 
 fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool, description: &str) {

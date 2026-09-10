@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -469,12 +469,18 @@ fn with_checkout_lock_timeout<T>(
     timeout: Duration,
     operation: impl FnOnce(&Path) -> crate::Result<T>,
 ) -> crate::Result<T> {
+    crate::cancellation::check()?;
     let normalized_checkout = normalize_requested_checkout(requested_checkout)?;
     let mut lock = CheckoutLock::acquire(&normalized_checkout, timeout)?;
-    let operation_result = operation(&lock.paths.checkout);
+    let operation_result = crate::cancellation::check()
+        .map_err(crate::Error::from)
+        .and_then(|()| operation(&lock.paths.checkout));
     let release_result = lock.release();
     match (operation_result, release_result) {
-        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Ok(())) => {
+            crate::cancellation::check()?;
+            Ok(value)
+        }
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
         (Err(operation_error), Err(release_error)) => Err(io::Error::other(format!(
@@ -618,12 +624,9 @@ fn process_identity(pid: libc::pid_t) -> io::Result<(String, String, u8)> {
 
 // Run one locale-C probe with all standard streams bounded and noninteractive.
 fn command_output(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
-    let output = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
+    let mut command = Command::new(program);
+    command.args(args).env("LC_ALL", "C");
+    let output = crate::cancellation::output(command, None)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "{program} exited with {}",
@@ -693,12 +696,11 @@ fn record_liveness(record: &Record) -> Liveness {
         };
     }
 
-    let output = Command::new("ps")
+    let mut command = Command::new("ps");
+    command
         .args(["-o", "pid=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+        .env("LC_ALL", "C");
+    let output = crate::cancellation::output(command, None);
     match output {
         Ok(output) if output.status.success() => Liveness::Unknown,
         Ok(output)
@@ -1388,11 +1390,15 @@ fn timeout_error(paths: &Paths, timeout: Duration, state: &Classified) -> io::Er
 fn acquire(paths: &Paths, timeout: Duration) -> io::Result<CheckoutLock> {
     let started = Instant::now();
     loop {
+        crate::cancellation::check()?;
         let state = classify(paths);
         match &state {
             Classified::Missing => match cleanup_detached_claims(paths)? {
                 Cleanup::Complete => {
                     let owner = prepare_owner(paths)?;
+                    if let Err(error) = crate::cancellation::check() {
+                        return discard_unpublished_owner(&owner).and(Err(error));
+                    }
                     match symlink(&owner.target, &paths.canonical) {
                         Ok(()) => {
                             if !canonical_matches(paths, &owner.target) {
@@ -1407,10 +1413,12 @@ fn acquire(paths: &Paths, timeout: Duration) -> io::Result<CheckoutLock> {
                                 None,
                                 &paths.checkout,
                             )?;
-                            return Ok(CheckoutLock {
+                            let lock = CheckoutLock {
                                 paths: paths.clone(),
                                 owner: Some(owner),
-                            });
+                            };
+                            crate::cancellation::check()?;
+                            return Ok(lock);
                         }
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                             discard_unpublished_owner(&owner)?;
@@ -1488,6 +1496,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
@@ -1520,6 +1529,88 @@ mod tests {
             .step_by(2)
             .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).unwrap())
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_signal_interrupts_checkout_lock_contention_promptly() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CHECKOUT_LOCK_CANCEL_CHILD";
+        if let Some(checkout) = std::env::var_os(CHILD_ENV) {
+            let checkout = PathBuf::from(checkout);
+            let signals = crate::cancellation::Signals::install().unwrap();
+            fs::write(
+                checkout.with_extension("ready"),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+            let result = with_checkout_lock_timeout(&checkout, Duration::from_secs(30), |_| Ok(()));
+            let code = signals.finish_result(result.map(|_| 0)).unwrap();
+            assert_eq!(code, 128 + libc::SIGTERM);
+            return;
+        }
+
+        let root = crate::test_support::temp_dir("checkout-lock-cancellation");
+        let checkout = root.join("tool");
+        let paths = Paths::new(&checkout).unwrap();
+        let owner = prepare_owner(&paths).unwrap();
+        symlink(&owner.target, &paths.canonical).unwrap();
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, &checkout)
+            .env(
+                "SHDEPS_INTERNAL_PROCESS_BOUNDARIES",
+                "test-harness-subprocess",
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = crate::cancellation::spawn_owned(
+            &mut command,
+            crate::cancellation::Isolation::DetachedSession,
+            true,
+        )
+        .unwrap();
+        let ready = checkout.with_extension("ready");
+        let started = Instant::now();
+        let child_pid = loop {
+            if let Ok(value) = fs::read_to_string(&ready) {
+                if let Ok(pid) = value.parse::<u32>() {
+                    if pid > 0 {
+                        break pid;
+                    }
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "child did not reach checkout-lock contention"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        // SAFETY: the retained Child handle supplies a live positive PID.
+        assert_eq!(unsafe { libc::kill(child_pid as i32, libc::SIGTERM) }, 0);
+        let signaled = Instant::now();
+        let status = loop {
+            if child.exited().unwrap() {
+                break Some(child.wait().unwrap());
+            }
+            if signaled.elapsed() >= Duration::from_secs(1) {
+                let _ = child.stop(crate::cancellation::KILL_SIGNAL);
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "checkout-lock waiter did not acknowledge cancellation promptly"
+        );
     }
 
     #[test]

@@ -37,7 +37,8 @@ impl Drop for RemoveOnDrop {
 }
 
 /// Evidence about a release archive root from the current filesystem state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum ArchiveState {
     /// No Shdeps-owned archive root can be established.
     None,

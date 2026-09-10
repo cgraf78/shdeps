@@ -9,6 +9,9 @@
 
 use std::fmt;
 use std::fs;
+use std::io::Read as _;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -137,11 +140,33 @@ pub fn path(shdeps_dir: &Path) -> PathBuf {
 /// Reads install metadata, treating malformed or future-schema files as invalid.
 pub fn read(shdeps_dir: &Path) -> Result<Read> {
     let metadata_path = path(shdeps_dir);
-    let content = match fs::read_to_string(&metadata_path) {
-        Ok(content) => content,
+    let metadata = match fs::symlink_metadata(&metadata_path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Read::Missing),
         Err(error) => return Err(error.into()),
     };
+    if !metadata.file_type().is_file() {
+        return Ok(Read::Invalid {
+            reason: "install metadata is not a regular file".to_owned(),
+        });
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = match options.open(&metadata_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Read::Missing),
+        Err(error) => return Err(error.into()),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(Read::Invalid {
+            reason: "install metadata changed to a non-regular file while opening".to_owned(),
+        });
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
 
     let metadata = match serde_json::from_str::<Metadata>(&content) {
         Ok(metadata) => metadata,

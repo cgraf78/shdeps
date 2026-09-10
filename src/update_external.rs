@@ -10,8 +10,10 @@ use std::fs;
 
 use crate::Result;
 use crate::bin_link;
+use crate::cancellation;
 use crate::config::Entry;
 use crate::external;
+use crate::hooks::MutationIntent;
 use crate::manifest::{self, ManifestEntry};
 use crate::pkg::CommandSpec;
 use crate::process::{self, Output, Runner};
@@ -22,7 +24,9 @@ pub(crate) fn install(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     options: Options,
+    mutation: &mut MutationIntent,
 ) -> Result<Item> {
+    cancellation::check()?;
     let Some(plan) = external::plan(
         &entry.method,
         &entry.name,
@@ -40,13 +44,20 @@ pub(crate) fn install(
     if process::executable_path(&plan.bin_path)
         && stamp::remote_fresh(&stamp_path, options.freshness())
     {
-        bin_link::one(&context.roots.bin_dir, &entry.cmd, &plan.bin_path)?;
-        write_manifest(entry, context, &plan)?;
         let detail = if verbose_enabled(options, context.env_vars) {
             process::dep_version(context.runner, &entry.cmd).unwrap_or_else(|| "fresh".to_owned())
         } else {
             "fresh".to_owned()
         };
+        cancellation::check()?;
+        mutation.begin()?;
+        // Once publication starts, complete the small link+manifest commit as
+        // one recovery unit; a later cancellation gate must not strand half of
+        // that already-entered transition.
+        bin_link::one(&context.roots.bin_dir, &entry.cmd, &plan.bin_path)?;
+        write_manifest(entry, context, &plan)?;
+        cancellation::check()?;
+        let _ = mutation.resolve(false)?;
         return Ok(Item::current(entry.name.clone(), ItemReason::Fresh, detail));
     }
 
@@ -65,7 +76,10 @@ pub(crate) fn install(
 
     fs::create_dir_all(plan.install_root.join("bin"))?;
     let command = plan.command_for(options.reinstall);
-    if !run(context.runner, &command)?.success {
+    mutation.begin()?;
+    let output = run(context.runner, &command)?;
+    cancellation::check()?;
+    if !output.success {
         // Best-effort cleanup: if the install never produced any
         // content under the freshly-created install_root, remove the
         // empty `bin/` and `install_root` so a failed first-time
@@ -101,6 +115,9 @@ pub(crate) fn install(
         ));
     }
 
+    cancellation::check()?;
+    // Link, freshness stamp, and manifest form one publication unit after the
+    // installer has completed and cancellation has been rechecked.
     bin_link::one(&context.roots.bin_dir, &entry.cmd, &plan.bin_path)?;
     stamp::remote_touch(&stamp_path, options.now)?;
     write_manifest(entry, context, &plan)?;
@@ -133,6 +150,7 @@ pub(crate) fn install(
         version.unwrap_or_else(|| "installed".to_owned())
     };
 
+    let _ = mutation.resolve(changed)?;
     Ok(if changed {
         Item::changed(entry.name.clone(), ItemReason::Installed, detail)
     } else {

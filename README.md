@@ -479,6 +479,7 @@ Exit codes:
   0  Success
   1  Error
   2  Usage error
+  128+N  Interrupted by signal N after owned subprocess cleanup
 ```
 
 ### Removing Dependencies
@@ -594,11 +595,17 @@ making filesystem changes or starting other side effects.
 
 Parent interfaces that consume `SHDEPS_PROGRESS=jsonl` and draw on the same
 terminal may set `SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO they have
-already opened read/write. On a `prompt` event, the parent must suspend or clear its live
-display and write exactly `ready\n` to that FIFO. Shdeps waits up to five
-seconds for the acknowledgement, then writes a visible status line to
-`/dev/tty` and starts sudo. If the variable is unset, JSONL output keeps its
-standalone behavior and does not wait for an acknowledgement.
+created. Callers MUST require the additive
+`prompt-fifo-reader-before-event-v1` capability before using this handshake;
+older builds can emit the event before opening the FIFO. A capable Shdeps opens
+its nonblocking read end before flushing a `prompt` event. On that event, the
+parent must suspend or clear its live display, open the FIFO
+write-only/nonblocking, write exactly `ready\n`, and close it. `ENXIO` means no
+live Shdeps reader remains. Shdeps waits up to five seconds for the
+acknowledgement, then writes a visible status line to `/dev/tty` and starts
+sudo. If the variable is unset, JSONL output keeps its standalone behavior and
+does not wait for an acknowledgement. The FIFO capability is advertised only
+on Unix platforms, where this handshake is available.
 
 `shdeps_dep_root` follows the same ownership rules as installation. For
 `github:repo`, it prefers `$SHDEPS_GIT_DEV_DIR/<repo>` when a local development
@@ -731,6 +738,44 @@ require Bash 4.3+; `install.sh` itself is kept compatible with the stock macOS
 Bash 3.2 installer path. A sourced bootstrap returns `125` when transaction
 cleanup cannot prove recovery state is safe, and `128+signal` when HUP, INT, or
 TERM cancels it; callers must not downgrade those statuses to best effort.
+
+The `owned-subprocess-cancellation-v1` capability is additive to wrapper ABI 1.
+It is an acknowledgement contract: the standalone binary catches HUP, INT,
+QUIT, and TERM and returns `128+signal` only after it has proved cleanup of its
+synchronously owned child trees. Commands needing the caller's terminal stay
+in its session but run in an owned process
+group, temporarily receiving the controlling terminal foreground when one is
+available. Their retained descendants are signaled without touching the
+caller's process group. An internal inherited boundary marker keeps ordinary
+descendants attributable if they change process group or session and their
+leader exits. A private inherited descriptor makes the common no-descendant
+exit observable without scanning the system process table. A process that
+deliberately strips the marker, closes the ownership descriptor, and daemonizes
+out of every owned topology is outside the synchronous subprocess contract.
+An open ownership descriptor vetoes an otherwise-empty cleanup proof, so a
+marker lookup failure cannot produce a false signal acknowledgement.
+Detached hooks and timed commands receive TERM, bounded KILL escalation,
+output draining, and complete attributed-lineage cleanup; adopted descendants
+are reaped directly on kernels that support subreapers. Linux and Android can
+also recover a direct adopted descendant that erased its marker and closed the
+ownership descriptor, but only while attribution to one active boundary is
+unambiguous. A process with those attributes is reparented away on macOS and
+cannot be discovered safely; marker-preserving escapes remain observable.
+Linux and Android runtime-probe pidfd operations for escaped-process authority.
+With exact pidfd authority, the initial cohort and later discoveries each
+receive a catchable signal once. The portable fallback sends one catchable
+signal to the retained group and uses the later group KILL for members created
+after that delivery. Other Unix platforms safely signal retained process
+groups but never send a raw signal to an unpinned escaped PID. For descendants
+still evidenced by a retained group, an open ownership descriptor, a matching
+marker, or an already-observed pinned identity, unavailable authority,
+delivery, reaping, draining, or verification produces diagnostics and status
+`1` instead of a false `128+signal` acknowledgement. A descendant that removes
+every attribution channel and escapes all owned topology before its first
+observation is deliberately outside this contract and cannot be detected
+portably. A supervising caller retains the exact Shdeps PID and forwards
+cancellation to it while leaving Shdeps in the caller's session so
+parent-session sudo authentication remains usable.
 
 ## Releasing
 

@@ -508,7 +508,7 @@ _fake=$(_tmpdir)/shdeps
 cat >"$_fake" <<'SH'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "__api" && "${2:-}" == "version" ]]; then
-  printf 'abi:999\n'
+  printf 'abi:0\n'
   exit 0
 fi
 exit 1
@@ -517,8 +517,8 @@ chmod +x "$_fake"
 
 _abi_output=$(SHDEPS_RUST_CLI="$_fake" bash -c '. "$1"' bash "$SHDEPS_DIR/shdeps.sh" 2>&1)
 _abi_rc=$?
-_assert_exit "wrapper: ABI mismatch refuses source" 1 "$_abi_rc"
-_assert_contains "wrapper: ABI mismatch explains refusal" "unsupported wrapper ABI" "$_abi_output"
+_assert_exit "wrapper: ABI 0 binary refuses source" 1 "$_abi_rc"
+_assert_contains "wrapper: ABI 0 refusal explains mismatch" "unsupported wrapper ABI" "$_abi_output"
 
 _bash=$(command -v bash)
 _missing_dir=$(_tmpdir)

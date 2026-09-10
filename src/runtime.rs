@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::cancellation;
 use crate::dep_path;
 use crate::platform::{self, RuntimeEnv};
 
@@ -84,7 +85,9 @@ impl Env for ProcessEnv {
     }
 
     fn command_output(&self, command: &str, args: &[&str]) -> Option<String> {
-        let output = Command::new(command).args(args).output().ok()?;
+        let mut child = Command::new(command);
+        child.args(args);
+        let output = cancellation::output(child, None).ok()?;
         output
             .status
             .success()

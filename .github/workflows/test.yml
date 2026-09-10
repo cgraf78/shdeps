@@ -36,6 +36,10 @@ jobs:
         scripts/smoke-release.sh "$ASSET_PLATFORM"
         mkdir -p .termux-ci
         tar -xzf "$archive" -C .termux-ci ./shdeps
+        android_cc_var=CC_${RUST_TARGET//-/_}
+        android_cc=${!android_cc_var}
+        "$android_cc" -std=c11 -O2 -Wall -Wextra -Werror \
+          tests/termux-pidfd-signal.c -o .termux-ci/pidfd-signal
       android-package-smoke-command: |
         # AArch64 is the dominant physical-device artifact; the x86_64 archive
         # gets the independent emulator runtime proof above. Both remain

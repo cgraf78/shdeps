@@ -103,7 +103,7 @@ shdeps_mark_changed() {
     */../*) return 1 ;;
   esac
   local _shdeps_marker="$SHDEPS_STATE_DIR/.changed-markers/$SHDEPS_UPDATE_TXN_ID/$_shdeps_name"
-  mkdir -p "$(dirname "$_shdeps_marker")" || return 1
+  [[ -d "${_shdeps_marker%/*}" ]] || mkdir -p "${_shdeps_marker%/*}" || return 1
   : >"$_shdeps_marker"
 }
 "#;
@@ -133,5 +133,6 @@ mod tests {
         );
         assert!(source.contains("shdeps_dep_source()"));
         assert!(source.contains("shdeps_mark_changed()"));
+        assert!(source.contains(r#"[[ -d "${_shdeps_marker%/*}" ]] || mkdir -p"#));
     }
 }
