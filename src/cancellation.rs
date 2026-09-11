@@ -1337,13 +1337,6 @@ impl OwnedChild {
         self.child.as_mut().and_then(|child| child.stderr.take())
     }
 
-    /// Leader PID for test-only diagnostic signals (a stuck boundary child
-    /// reports its backtrace on SIGUSR2 before the parent kills it).
-    #[cfg(test)]
-    pub(crate) fn id(&self) -> u32 {
-        self.child.as_ref().expect("owned child available").id()
-    }
-
     /// Observes leader exit without releasing its PID/session identity.
     pub(crate) fn exited(&mut self) -> std::io::Result<bool> {
         if self.leader_exited {
@@ -1392,10 +1385,14 @@ impl OwnedChild {
             let observed = self
                 .boundary
                 .observe_leader_exit(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET);
+            // Portable snapshots spawn `ps` plus per-PID identity probes, so
+            // they need the same leader-exit budget as the procfs path; the
+            // tighter track budget expires under CI load and fails the
+            // completion proof for a leader that already exited cleanly.
             #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
             let observed = self
                 .boundary
-                .track(Instant::now() + TRACK_SNAPSHOT_BUDGET)
+                .track(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET)
                 .ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::TimedOut,

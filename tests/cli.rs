@@ -4578,10 +4578,13 @@ while :; do /bin/sleep 1; done
 fn parent_signal_delivers_term_to_late_same_group_descendant() {
     let fixture = Fixture::new("parent-signal-late-same-group-descendant");
     fixture.write("conf/deps.conf", "tool cargo\n");
+    // The late child survives TERM so the topology assertion below observes
+    // a live process; teardown's KILL escalation (already required for the
+    // TERM-ignoring leader) still reaps it before the final assertion.
     fixture.write_executable(
         "fakebin/late-same-group-child",
         r#"#!/bin/sh
-trap 'printf term >"$SHDEPS_TEST_LATE_CHILD_TERM"; exit 0' TERM
+trap 'printf term >"$SHDEPS_TEST_LATE_CHILD_TERM"' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_LATE_CHILD_PID"
 while :; do /bin/sleep 0.02; done
 "#,

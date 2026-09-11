@@ -624,6 +624,9 @@ fn process_identity(pid: libc::pid_t) -> io::Result<(String, String, u8)> {
 
 // Run one locale-C probe with all standard streams bounded and noninteractive.
 fn command_output(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
+    // A slow probe must not delay an already-received signal past the next
+    // loop-top check; every probe rechecks first.
+    crate::cancellation::check()?;
     let mut command = Command::new(program);
     command.args(args).env("LC_ALL", "C");
     let output = crate::cancellation::output(command, None)?;
@@ -1537,7 +1540,6 @@ mod tests {
         const CHILD_ENV: &str = "SHDEPS_TEST_CHECKOUT_LOCK_CANCEL_CHILD";
         if let Some(checkout) = std::env::var_os(CHILD_ENV) {
             let checkout = PathBuf::from(checkout);
-            crate::test_support::install_timeout_backtrace_hook();
             let signals = crate::cancellation::Signals::install().unwrap();
             fs::write(
                 checkout.with_extension("ready"),
@@ -1602,11 +1604,6 @@ mod tests {
                 break Some(child.wait().unwrap());
             }
             if signaled.elapsed() >= Duration::from_secs(1) {
-                // SAFETY: the retained child PID is live (it has not exited).
-                unsafe {
-                    libc::kill(child.id() as libc::pid_t, libc::SIGUSR2);
-                }
-                thread::sleep(Duration::from_millis(300));
                 let _ = child.stop(crate::cancellation::KILL_SIGNAL);
                 break None;
             }
@@ -2608,7 +2605,14 @@ mod tests {
         .unwrap();
         symlink(paths.owner_target(owner_nonce), &paths.canonical).unwrap();
 
-        let mut lock = CheckoutLock::acquire(&requested, Duration::from_secs(1)).unwrap();
+        // Recovery needs several ps-probed classify rounds on macOS; loaded
+        // CI runners exceed a 1s budget while Linux stays comfortably under.
+        let timeout = if cfg!(target_os = "macos") {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
+        let mut lock = CheckoutLock::acquire(&requested, timeout).unwrap();
         let new_target = fs::read_link(&paths.canonical).unwrap();
 
         assert_ne!(

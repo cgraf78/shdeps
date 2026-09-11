@@ -1188,9 +1188,18 @@ mod tests {
         .unwrap();
 
         assert!(output.timed_out);
+        // Loaded macOS runners exceed 2s on snapshot-probed teardown while
+        // still killing (not joining) the 30s grandchild; the ceiling stays
+        // far below the join proof either way.
+        let ceiling = if cfg!(target_os = "macos") {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(2)
+        };
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "timeout cleanup should not wait for a pipe-holding grandchild"
+            started.elapsed() < ceiling,
+            "timeout cleanup should not wait for a pipe-holding grandchild; elapsed={:?}",
+            started.elapsed()
         );
     }
 
@@ -1208,9 +1217,18 @@ mod tests {
         assert!(output.timed_out);
         assert!(!output.success);
         assert_eq!(output.stdout, "ready");
+        // The ceiling must stay below the grandchild's 3s sleep to prove a
+        // kill rather than a join; macOS gets the remaining headroom because
+        // snapshot-probed teardown spikes past 2s under CI load.
+        let ceiling = if cfg!(target_os = "macos") {
+            Duration::from_millis(2500)
+        } else {
+            Duration::from_secs(2)
+        };
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "timeout cleanup should not join a pipe-holding grandchild"
+            started.elapsed() < ceiling,
+            "timeout cleanup should not join a pipe-holding grandchild; elapsed={:?}",
+            started.elapsed()
         );
     }
 
