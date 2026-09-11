@@ -100,11 +100,20 @@ pub(crate) fn run_signal_boundary_subprocess(test_name: &str, child_env: &str) {
     )
     .unwrap();
     let started = Instant::now();
+    // The subprocess runs a full signal-injection flow, and snapshot-probed
+    // teardown spawns `ps` plus per-PID probes per round, so loaded macOS
+    // runners exceed 5s while Linux stays comfortably under. The ceiling
+    // still trips on a true hang.
+    let budget = if cfg!(target_os = "macos") {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(5)
+    };
     let status = loop {
         if child.exited().unwrap() {
             break Some(child.wait().unwrap());
         }
-        if started.elapsed() >= Duration::from_secs(5) {
+        if started.elapsed() >= budget {
             let _ = child.stop(crate::cancellation::KILL_SIGNAL);
             break None;
         }
@@ -116,7 +125,7 @@ pub(crate) fn run_signal_boundary_subprocess(test_name: &str, child_env: &str) {
             panic!("signal-boundary subprocess for {test_name} exited without success: {status}")
         }
         None => panic!(
-            "signal-boundary subprocess for {test_name} did not exit within 5s and was killed"
+            "signal-boundary subprocess for {test_name} did not exit within {budget:?} and was killed"
         ),
     }
 }

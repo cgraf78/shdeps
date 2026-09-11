@@ -1599,11 +1599,18 @@ mod tests {
         // SAFETY: the retained Child handle supplies a live positive PID.
         assert_eq!(unsafe { libc::kill(child_pid as i32, libc::SIGTERM) }, 0);
         let signaled = Instant::now();
+        // Snapshot-probed teardown spawns `ps` plus per-PID identity probes;
+        // loaded macOS runners exceed 1s while Linux stays comfortably under.
+        let ack_budget = if cfg!(target_os = "macos") {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
         let status = loop {
             if child.exited().unwrap() {
                 break Some(child.wait().unwrap());
             }
-            if signaled.elapsed() >= Duration::from_secs(1) {
+            if signaled.elapsed() >= ack_budget {
                 let _ = child.stop(crate::cancellation::KILL_SIGNAL);
                 break None;
             }
