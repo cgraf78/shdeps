@@ -646,7 +646,10 @@ pub(crate) fn record_cleanup_error(error: &std::io::Error) {
     // rest of the macOS teardown telemetry once macOS is green.
     #[cfg(test)]
     if teardown_diag_enabled() {
-        eprintln!("DIAG131 cleanup_error: {diagnostic}");
+        eprintln!(
+            "DIAG131 cleanup_error: {diagnostic} test={}",
+            diag_child_name()
+        );
     }
     let mut diagnostics = CLEANUP_DIAGNOSTICS
         .lock()
@@ -664,6 +667,31 @@ fn teardown_diag_enabled() -> bool {
     std::env::var_os("SHDEPS_TEST_TEARDOWN_DIAG").is_some()
 }
 
+/// TEMP-DIAG-131: attribute every marker with the owning signal-boundary
+/// child. Each child runs one `--exact TEST` behind `--test-threads=1`,
+/// so the argv filter names the test that emitted the marker; `?` marks
+/// emissions from a process without that filter. Cached: argv never
+/// changes after process start. Revert with the macOS teardown telemetry
+/// once macOS is green.
+#[cfg(any(test, unix))]
+fn diag_child_name() -> String {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let mut args = std::env::args();
+        let mut name = String::from("?");
+        while let Some(arg) = args.next() {
+            if arg == "--exact" {
+                if let Some(exact) = args.next() {
+                    name = exact.rsplit("::").next().unwrap_or("?").to_owned();
+                }
+                break;
+            }
+        }
+        name
+    })
+    .clone()
+}
+
 /// TEMP-DIAG-131: prints scope entry/exit (see above).
 #[cfg(test)]
 struct DiagScope {
@@ -675,7 +703,7 @@ struct DiagScope {
 impl DiagScope {
     fn enter(name: &'static str) -> Self {
         if teardown_diag_enabled() {
-            eprintln!("DIAG131 enter {name}");
+            eprintln!("DIAG131 enter {name} test={}", diag_child_name());
         }
         Self {
             name,
@@ -689,9 +717,10 @@ impl Drop for DiagScope {
     fn drop(&mut self) {
         if teardown_diag_enabled() {
             eprintln!(
-                "DIAG131 exit {} elapsed_ms={}",
+                "DIAG131 exit {} elapsed_ms={} test={}",
                 self.name,
-                self.started.elapsed().as_millis()
+                self.started.elapsed().as_millis(),
+                diag_child_name()
             );
         }
     }
@@ -738,7 +767,10 @@ pub(crate) fn spawn_teardown_watchdog(test_name: &'static str) -> impl Drop {
 #[cfg(unix)]
 pub(crate) fn teardown_phase(test_name: &str, phase: &str) {
     if teardown_diag_enabled() {
-        eprintln!("DIAG131 phase {test_name} {phase}");
+        eprintln!(
+            "DIAG131 phase {test_name} {phase} test={}",
+            diag_child_name()
+        );
     }
 }
 

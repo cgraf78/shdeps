@@ -765,8 +765,12 @@ where
 
     let mut queued = Vec::new();
     let mut package_transitions = HashMap::<String, update_transition::DurableTransition>::new();
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-hook-txn");
     let hook_txn = Txn::new(&context.roots.state_dir)?;
     let mut changed = hook_txn.pending()?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-hook-txn");
 
     let active_package_entries = entries
         .iter()
@@ -1042,6 +1046,8 @@ where
         .filter(|entry| active(entry, context.env))
         .collect::<Vec<_>>();
 
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-builtins");
     let builtin_outcomes = jobs::parallel_map_with_item_progress(
         &builtin_entries,
         jobs::max_jobs(context.env_vars),
@@ -1081,6 +1087,8 @@ where
             Ok(())
         },
     )?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-builtins");
     cancellation::check()?;
     for outcome in builtin_outcomes {
         if let Some(detail) = outcome.cleanup_error {
@@ -1149,7 +1157,11 @@ where
     // inline with each method. Many hooks repair shell completions, symlinks,
     // or dependent tools, so they should see the final state for the full
     // update pass instead of an intermediate per-method view.
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-post-hooks");
     run_post_hooks(&changed, context, &hook_txn, &mut summary, progress)?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-post-hooks");
     cancellation::check()?;
     Ok(summary)
 }
@@ -9677,7 +9689,13 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
+        assert!(
+            !summary.has_errors(),
+            "failed={:?} leftovers={:?} details={:?}",
+            summary.failed,
+            summary.leftovers,
+            summary.leftover_details
+        );
         assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
         assert_eq!(
             fs::symlink_metadata(&install_link).unwrap().ino(),
