@@ -7087,6 +7087,12 @@ fn spawn_on_pty(mut command: Command) -> (GuardedChild, fs::File) {
 
     let mut master_fd = -1;
     let mut slave_fd = -1;
+    // macOS declares the termios/winsize parameters mutable; Linux declares
+    // them const. Null either way keeps platform defaults.
+    #[cfg(target_vendor = "apple")]
+    let (termp, winp) = (std::ptr::null_mut(), std::ptr::null_mut());
+    #[cfg(not(target_vendor = "apple"))]
+    let (termp, winp) = (std::ptr::null(), std::ptr::null());
     // SAFETY: openpty initializes both integer descriptors; optional terminal
     // attributes and window size are intentionally left at platform defaults.
     assert_eq!(
@@ -7095,8 +7101,8 @@ fn spawn_on_pty(mut command: Command) -> (GuardedChild, fs::File) {
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                termp,
+                winp,
             )
         },
         0,
