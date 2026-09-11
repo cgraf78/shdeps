@@ -21,7 +21,17 @@ use crate::tool_version;
 
 pub(crate) const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const PACKAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const WAIT_POLL: Duration = Duration::from_millis(10);
+/// Wait-loop poll interval for timed subprocesses.
+///
+/// Every timed spawn pays up to one interval of pure reaping latency: a child
+/// that exits just after a `try_wait` miss is only reaped after the next
+/// sleep. Warm `list`/`update` runs issue hundreds of sub-10ms probes
+/// (`--version` checks, `uname`, `dpkg-query`), so a 10ms interval added ~10ms
+/// of dead wait to nearly every one. 1ms keeps CPU overhead negligible (one
+/// extra context switch per millisecond of child runtime) while cutting that
+/// latency by 10x. Timeout semantics are unchanged: the deadline is still only
+/// observed at or after its `Instant`, so kills never fire early.
+const WAIT_POLL: Duration = Duration::from_millis(1);
 /// Grace window between SIGTERM and SIGKILL for a timed-out child.
 ///
 /// Sending SIGKILL immediately (Rust's `Child::kill`) skips the
@@ -1270,6 +1280,120 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "timeout cleanup should not join a pipe-holding grandchild"
+        );
+    }
+
+    #[test]
+    fn timed_run_reports_fast_success_with_captured_output() {
+        let output = super::run(
+            "sh",
+            &["-c", "printf out; printf err >&2"],
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+
+        assert!(output.success);
+        assert!(!output.timed_out);
+        assert_eq!(output.stdout, "out");
+        assert_eq!(output.stderr, "err");
+    }
+
+    #[test]
+    fn timed_run_preserves_nonzero_exit_without_timeout_flag() {
+        let output = super::run("sh", &["-c", "exit 3"], Some(Duration::from_secs(10))).unwrap();
+
+        assert!(!output.success);
+        assert!(!output.timed_out);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn untimed_run_captures_output_without_timeout_flag() {
+        let output = super::run("sh", &["-c", "printf out; printf err >&2; exit 3"], None).unwrap();
+
+        assert!(!output.success);
+        assert!(!output.timed_out);
+        assert_eq!(output.stdout, "out");
+        assert_eq!(output.stderr, "err");
+    }
+
+    #[test]
+    fn timed_run_marks_timeout_and_kills_slow_child() {
+        let started = std::time::Instant::now();
+        let output =
+            super::run("sh", &["-c", "sleep 30"], Some(Duration::from_millis(100))).unwrap();
+
+        assert!(output.timed_out);
+        assert!(!output.success);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a sleeping child must be reaped near the deadline, not after 30s"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_run_sigkills_child_that_ignores_sigterm() {
+        let started = std::time::Instant::now();
+        let output = super::run(
+            "sh",
+            &["-c", "trap '' TERM; sleep 30"],
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+
+        assert!(output.timed_out);
+        assert!(!output.success);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "SIGTERM-ignoring child must still be reaped via SIGKILL"
+        );
+    }
+
+    #[test]
+    fn timed_run_preserves_partial_output_on_timeout() {
+        let output = super::run(
+            "sh",
+            &["-c", "printf partial; sleep 30"],
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+
+        assert!(output.timed_out);
+        assert!(!output.success);
+        assert_eq!(output.stdout, "partial");
+    }
+
+    #[test]
+    fn timed_run_completes_many_fast_probes_without_hang() {
+        // Loose liveness smoke for the wait loop: twenty trivial probes must
+        // finish in seconds, not minutes. This guards against a stuck or
+        // spin-waiting reaper, not against millisecond regressions (see the
+        // poll-interval assertion below for that).
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            let output = super::run("sh", &["-c", "true"], Some(Duration::from_secs(10))).unwrap();
+            assert!(output.success);
+            assert!(!output.timed_out);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "twenty fast probes took too long; the wait loop may be stuck"
+        );
+    }
+
+    #[test]
+    fn wait_poll_interval_stays_at_most_one_millisecond() {
+        // Perf regression guard: the wait-loop poll interval is the per-spawn
+        // latency floor for every timed subprocess. A 10ms interval silently
+        // added ~10ms of dead wait to each of the hundreds of fast probes on
+        // warm runs. Assert on the interval itself rather than wall-clock
+        // timing so the test is deterministic on loaded CI machines.
+        assert!(
+            super::WAIT_POLL <= Duration::from_millis(1),
+            "WAIT_POLL regressed to {:?}; warm runs pay this per timed spawn",
+            super::WAIT_POLL
         );
     }
 

@@ -529,6 +529,7 @@ pub struct BashCustomProbe {
     inline_source: Option<&'static str>,
     package_manager: Option<String>,
     quiet: Option<bool>,
+    platform: Option<String>,
 }
 
 /// Per-update hook coordination marker directory.
@@ -584,6 +585,7 @@ impl BashCustomProbe {
             inline_source: None,
             package_manager: None,
             quiet: None,
+            platform: None,
         }
     }
 
@@ -595,6 +597,7 @@ impl BashCustomProbe {
             inline_source: Some(prelude::source()),
             package_manager: None,
             quiet: None,
+            platform: None,
         }
     }
 
@@ -609,6 +612,17 @@ impl BashCustomProbe {
     #[must_use]
     pub fn with_quiet(mut self, quiet: bool) -> Self {
         self.quiet = Some(quiet);
+        self
+    }
+
+    /// Uses the parent command's already-resolved platform for hook subprocesses.
+    ///
+    /// The hook prelude answers `shdeps_platform` from this export instead of
+    /// spawning a recursive `__api` call. Probes without a platform keep the
+    /// bridge fallback for compatibility.
+    #[must_use]
+    pub fn with_platform(mut self, platform: impl Into<String>) -> Self {
+        self.platform = Some(platform.into());
         self
     }
 
@@ -643,15 +657,7 @@ impl BashCustomProbe {
         }
 
         let mut command = self.command(UNINSTALL_SCRIPT, name, &hook);
-        apply_hook_env(
-            &mut command,
-            roots,
-            name,
-            "uninstall",
-            self.package_manager.as_deref(),
-            None,
-            self.quiet,
-        );
+        apply_hook_env(&mut command, roots, name, "uninstall", self, None);
         let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
 
         if output.sudo_requested {
@@ -711,15 +717,7 @@ impl BashCustomProbe {
 
         let mut command = self.command(INSTALL_SCRIPT, name, &hook);
         command.arg(if reinstall { "1" } else { "0" });
-        apply_hook_env(
-            &mut command,
-            roots,
-            name,
-            "install",
-            self.package_manager.as_deref(),
-            txn,
-            self.quiet,
-        );
+        apply_hook_env(&mut command, roots, name, "install", self, txn);
         let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
 
         if output.sudo_requested {
@@ -781,15 +779,7 @@ impl BashCustomProbe {
         }
 
         let mut command = self.command(POST_SCRIPT, name, &hook);
-        apply_hook_env(
-            &mut command,
-            roots,
-            name,
-            "post",
-            self.package_manager.as_deref(),
-            txn,
-            self.quiet,
-        );
+        apply_hook_env(&mut command, roots, name, "post", self, txn);
         let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
 
         if output.sudo_requested {
@@ -871,9 +861,8 @@ fn apply_hook_env(
     roots: &Roots,
     name: &str,
     phase: &str,
-    package_manager: Option<&str>,
+    probe: &BashCustomProbe,
     txn: Option<&Txn>,
-    quiet: Option<bool>,
 ) {
     command
         .env("SHDEPS_CONF_DIR", &roots.conf_dir)
@@ -892,7 +881,7 @@ fn apply_hook_env(
         // exported SHDEPS_STATE_LOCK_HELD in their shell" bypass —
         // see `state::REENTRY_ENV` for the full rationale.
         .env(crate::state::REENTRY_ENV, std::process::id().to_string());
-    if let Some(package_manager) = package_manager {
+    if let Some(package_manager) = probe.package_manager.as_deref() {
         // Hooks must use the same manager the parent command already
         // detected. Setting even an empty value explicitly prevents an
         // inherited shell cache from spoofing a different runtime through
@@ -900,8 +889,14 @@ fn apply_hook_env(
         // detected manager retain the inherited environment for compatibility.
         command.env("SHDEPS_PKG_MGR", package_manager);
     }
-    if let Some(quiet) = quiet {
+    if let Some(quiet) = probe.quiet {
         command.env("SHDEPS_QUIET", if quiet { "1" } else { "0" });
+    }
+    if let Some(platform) = probe.platform.as_deref() {
+        // The name is prelude-read only: the Rust runtime never consults
+        // it, so exporting the resolved value cannot leak parent CLI flags
+        // into nested invocations the way reusing `SHDEPS_FORCE` would.
+        command.env("SHDEPS_HOOK_PLATFORM", platform);
     }
     if let Some(txn) = txn {
         // This env var is the only parent/child coordination channel for
@@ -953,15 +948,7 @@ impl CustomProbe for BashCustomProbe {
         // subprocess. Report the phase as `exists` because that is the required
         // predicate gate; hooks that need phase-specific install/post behavior
         // get separate subprocesses with more precise phases.
-        apply_hook_env(
-            &mut command,
-            roots,
-            &entry.name,
-            "exists",
-            self.package_manager.as_deref(),
-            None,
-            self.quiet,
-        );
+        apply_hook_env(&mut command, roots, &entry.name, "exists", self, None);
         let output = run_hook_command(command, HookIsolation::DetachedSession)?;
 
         if !output.status.success() {
@@ -1154,26 +1141,43 @@ version() { printf '%s\n' "$SHDEPS_BIN_DIR"; }
     }
 
     #[test]
+    fn hook_environment_exports_platform_for_prelude_cache() {
+        let roots = roots();
+        let probe = BashCustomProbe::new("shdeps.sh");
+        let mut without = Command::new("true");
+        apply_hook_env(&mut without, &roots, "tool", "exists", &probe, None);
+        assert!(
+            without
+                .get_envs()
+                .all(|(name, _)| name != "SHDEPS_HOOK_PLATFORM")
+        );
+
+        let probe = BashCustomProbe::new("shdeps.sh").with_platform("linux");
+        let mut with = Command::new("true");
+        apply_hook_env(&mut with, &roots, "tool", "exists", &probe, None);
+        assert_eq!(
+            with.get_envs()
+                .find(|(name, _)| *name == "SHDEPS_HOOK_PLATFORM")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("linux"))
+        );
+    }
+
+    #[test]
     fn hook_environment_only_overrides_package_manager_when_configured() {
         let roots = roots();
+        let probe = BashCustomProbe::new("shdeps.sh");
         let mut inherited = Command::new("true");
-        apply_hook_env(&mut inherited, &roots, "tool", "exists", None, None, None);
+        apply_hook_env(&mut inherited, &roots, "tool", "exists", &probe, None);
         assert!(
             inherited
                 .get_envs()
                 .all(|(name, _)| name != "SHDEPS_PKG_MGR")
         );
 
+        let probe = BashCustomProbe::new("shdeps.sh").with_package_manager("");
         let mut detected_empty = Command::new("true");
-        apply_hook_env(
-            &mut detected_empty,
-            &roots,
-            "tool",
-            "exists",
-            Some(""),
-            None,
-            None,
-        );
+        apply_hook_env(&mut detected_empty, &roots, "tool", "exists", &probe, None);
         assert_eq!(
             detected_empty
                 .get_envs()
@@ -1182,16 +1186,9 @@ version() { printf '%s\n' "$SHDEPS_BIN_DIR"; }
             Some(std::ffi::OsStr::new(""))
         );
 
+        let probe = BashCustomProbe::new("shdeps.sh").with_package_manager("dnf");
         let mut detected_dnf = Command::new("true");
-        apply_hook_env(
-            &mut detected_dnf,
-            &roots,
-            "tool",
-            "exists",
-            Some("dnf"),
-            None,
-            None,
-        );
+        apply_hook_env(&mut detected_dnf, &roots, "tool", "exists", &probe, None);
         assert_eq!(
             detected_dnf
                 .get_envs()

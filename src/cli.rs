@@ -434,7 +434,7 @@ where
     } else {
         BTreeMap::new()
     };
-    let custom = custom_probe(&pkg_mgr, options.quiet);
+    let custom = custom_probe(&pkg_mgr, options.quiet, env.platform());
     let context = StatusContext {
         roots: &roots,
         env: &env,
@@ -512,7 +512,7 @@ where
             }
         }
     }
-    let custom = custom_probe(&pkg_mgr, options.quiet);
+    let custom = custom_probe(&pkg_mgr, options.quiet, env.platform());
     let context = StatusContext {
         roots: &roots,
         env: &env,
@@ -571,7 +571,7 @@ where
 
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
-    let hooks = custom_probe(&pkg_mgr, options.quiet);
+    let hooks = custom_probe(&pkg_mgr, options.quiet, env.platform());
     let env_vars = env_vars(options);
     if let Some(message) =
         update_prerequisite_error(&entries, &env, &Process, UpdatePrerequisitePhase::Initial)
@@ -1584,7 +1584,7 @@ where
     let manifest = manifest::read(&manifest_path)?;
     let entries =
         resolve_github_entries(&entries, &roots, Some(&manifest), &env, &env_vars, options)?;
-    let hooks = custom_probe(&pkg_mgr, options.quiet);
+    let hooks = custom_probe(&pkg_mgr, options.quiet, env.platform());
     let detected = prune::run(
         &entries,
         &manifest,
@@ -3063,12 +3063,13 @@ fn self_update_ttl() -> u64 {
         .unwrap_or(3600)
 }
 
-fn custom_probe(pkg_mgr: &str, quiet: bool) -> BashCustomProbe {
+fn custom_probe(pkg_mgr: &str, quiet: bool, platform: &str) -> BashCustomProbe {
     shdeps_lib_path()
         .map(BashCustomProbe::new)
         .unwrap_or_else(BashCustomProbe::rust_prelude)
         .with_package_manager(pkg_mgr)
         .with_quiet(quiet)
+        .with_platform(platform)
 }
 
 fn shdeps_lib_path() -> Option<PathBuf> {
