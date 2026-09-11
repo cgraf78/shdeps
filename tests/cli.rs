@@ -7575,6 +7575,7 @@ fn wait_for_pids(path: &Path, count: usize, timeout: Duration, description: &str
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_pids(path: &Path) -> Vec<u32> {
     let mut pids = fs::read_to_string(path)
         .unwrap_or_default()
