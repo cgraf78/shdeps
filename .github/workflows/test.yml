@@ -24,6 +24,10 @@ jobs:
       # The shared defaults own Clippy's locked all-target/all-feature scope and
       # rustdoc's locked missing-doc lint; local copies would add a drift site.
       msrv-toolchain: "1.85"
+      # Cancellation tests fork Python fixtures (fork/setsid ladders, pid
+      # publishers, the published-pid watchdog). Minimal Rust images do not
+      # otherwise install its interpreter.
+      profiles: python
       termux-command: scripts/termux-ci.sh
       # shdeps is installed from release archives on real machines. Build and
       # unpack that exact archive on the host before transporting its binary
