@@ -2139,9 +2139,10 @@ fn stop_boundary(
     let mut first_error = None;
     let initial_observation = boundary.observe(discovery_deadline);
     if initial_observation.is_none() {
-        first_error = Some(std::io::Error::other(
-            "could not snapshot owned subprocesses during cancellation",
-        ));
+        let suffix = snapshot_failure_suffix();
+        first_error = Some(std::io::Error::other(format!(
+            "could not snapshot owned subprocesses during cancellation{suffix}"
+        )));
     }
     retain_terminal_restore(&mut first_error, foreground, boundary);
     retain_first_error(&mut first_error, boundary.signal_stopped());
@@ -4105,6 +4106,13 @@ fn collect_linux_boundary_marker_snapshot_with(
                     }
                 }
                 Ok(Some(false) | None) => None,
+                // Android hides other apps' environ files behind permission
+                // errors, and the stat read is denied the same way; those
+                // entries cannot be owned descendants or adoptees, so skip
+                // them rather than failing a snapshot complete for
+                // everything owned.
+                #[cfg(target_os = "android")]
+                Err(error) if procfs_process_foreign(&error) => None,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                     // Permission-denied environments are common for unrelated
                     // users. Inspect their public topology before excluding
@@ -4201,7 +4209,17 @@ fn collect_linux_process_snapshot_with(
             continue;
         };
         check_snapshot_deadline(deadline)?;
-        if let Some(process) = inspect(pid)? {
+        let process = match inspect(pid) {
+            Ok(process) => process,
+            // Android hides other apps' stat files behind permission
+            // errors; those entries cannot be owned descendants, so skip
+            // them rather than failing a snapshot that is complete for
+            // everything owned.
+            #[cfg(target_os = "android")]
+            Err(error) if procfs_process_foreign(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(process) = process {
             processes.push(process);
         }
     }
@@ -4546,6 +4564,82 @@ fn procfs_process_gone(error: &std::io::Error) -> bool {
     error
         .raw_os_error()
         .is_some_and(|errno| matches!(errno, libc::ENOENT | libc::ESRCH))
+}
+
+/// Whether an unreadable procfs entry belongs to another app.
+///
+/// Android denies an app's reads of other apps' stat files, and app
+/// processes cannot change UID (no setuid), so a permission-denied entry
+/// is provably foreign to every owned session. Linux keeps denials
+/// fail-closed instead: a setuid descendant's stat stays world-readable
+/// there, so an unreadable stat indicates a genuinely partial view.
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn procfs_process_foreign(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// Error-path-only probe explaining why a process snapshot is unavailable.
+///
+/// Samples a bounded slice of the process table plus the fallback helper's
+/// presence so a failed verification names its cause instead of reporting a
+/// bare failure. No spawns, no sleeps, no retries: the diagnostic itself
+/// must never stall teardown.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn snapshot_failure_hint() -> String {
+    let mut readable = 0u32;
+    let mut denied = 0u32;
+    let mut missing = 0u32;
+    let mut unparsable = 0u32;
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(error) => return format!("cannot list /proc: {error}"),
+    };
+    for entry in entries.flatten().take(128) {
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = text.parse::<u32>() else {
+            continue;
+        };
+        match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => {
+                if parse_linux_process_stat(pid, &stat).is_ok() {
+                    readable += 1;
+                } else {
+                    unparsable += 1;
+                }
+            }
+            Err(error) if procfs_process_gone(&error) => missing += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                denied += 1;
+            }
+            Err(_) => missing += 1,
+        }
+    }
+    #[cfg(target_os = "android")]
+    let ps = "/system/bin/ps";
+    #[cfg(not(target_os = "android"))]
+    let ps = "/bin/ps";
+    format!(
+        "procfs sample: {readable} readable, {denied} denied, {missing} vanished, {unparsable} unparsable; {ps}: {}",
+        if std::path::Path::new(ps).exists() {
+            "present"
+        } else {
+            "missing"
+        }
+    )
+}
+
+/// Parenthesized snapshot-failure detail for cancellation errors; empty
+/// where procfs sampling is unavailable.
+#[cfg(unix)]
+fn snapshot_failure_suffix() -> String {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let suffix = format!(" ({})", snapshot_failure_hint());
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let suffix = String::new();
+    suffix
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -9541,9 +9635,18 @@ while True:
                     "injected persistent stat failure",
                 ))
             });
+        // Linux has setuid transitions, so an unreadable stat stays a
+        // fail-closed partial view there; Android skips provably foreign
+        // rows instead (no setuid).
+        #[cfg(not(target_os = "android"))]
         assert!(
             unreadable.is_err(),
             "a live process whose stat cannot be read must fail closed"
+        );
+        #[cfg(target_os = "android")]
+        assert!(
+            unreadable.unwrap().is_empty(),
+            "a foreign-app denial must skip the row on Android"
         );
 
         let vanished =
@@ -9623,7 +9726,12 @@ while True:
         )
         .unwrap();
         assert!(transient_adoptee.is_empty());
+        // Linux retries a transient denial through the adoptee path; Android
+        // skips the provably foreign entry on the first denial.
+        #[cfg(not(target_os = "android"))]
         assert_eq!(marker_attempts.get(), 2);
+        #[cfg(target_os = "android")]
+        assert_eq!(marker_attempts.get(), 1);
 
         let unidentifiable_adoptee = super::collect_linux_boundary_marker_snapshot_with(
             &boundary,
@@ -9650,9 +9758,17 @@ while True:
                 ))
             },
         );
+        // Linux has setuid transitions, so an unreadable adoptee marker
+        // stays fail-closed there; Android skips provably foreign rows.
+        #[cfg(not(target_os = "android"))]
         assert!(
             unidentifiable_adoptee.is_err(),
             "a live adoptee whose marker cannot be read must fail closed"
+        );
+        #[cfg(target_os = "android")]
+        assert!(
+            unidentifiable_adoptee.unwrap().is_empty(),
+            "a foreign-app denial must skip the row on Android"
         );
 
         let marker_reads = Cell::new(0_u32);
@@ -9683,6 +9799,120 @@ while True:
         assert!(
             reused.is_empty(),
             "a marker that disappears across identity validation must not claim a reused PID"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn procfs_foreign_classifies_permission_denied() {
+        assert!(super::procfs_process_foreign(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(super::procfs_process_foreign(
+            &std::io::Error::from_raw_os_error(libc::EACCES)
+        ));
+        assert!(!super::procfs_process_foreign(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn snapshot_denied_entry_is_platform_scoped() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = super::collect_linux_process_snapshot_with(
+            vec![Ok(Some(123)), Ok(Some(456))],
+            deadline,
+            |pid| {
+                if pid == 456 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+                }
+                Ok(Some(super::ProcessInfo {
+                    pid,
+                    ppid: 1,
+                    pgid: pid,
+                    sid: pid,
+                    live: true,
+                    stopped: false,
+                    identity: super::ProcessIdentity {
+                        pid,
+                        start: Some("100".to_owned()),
+                    },
+                }))
+            },
+        );
+        #[cfg(target_os = "android")]
+        {
+            let processes =
+                snapshot.expect("a foreign-app denial must skip one row, not fail the snapshot");
+            assert_eq!(processes.len(), 1);
+            assert_eq!(processes[0].pid, 123);
+        }
+        // Linux has setuid transitions, so an unreadable stat stays a
+        // fail-closed partial view there.
+        #[cfg(not(target_os = "android"))]
+        assert!(
+            snapshot.is_err(),
+            "a denied stat must fail the snapshot closed on Linux"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn marker_snapshot_denied_entry_is_platform_scoped() {
+        let boundary = super::Boundary::new(
+            41,
+            super::Isolation::ExactChild,
+            super::BoundaryMarker::without_lifetime(Some("denied-marker-boundary".to_owned())),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = super::collect_linux_boundary_marker_snapshot_with(
+            &boundary,
+            vec![Ok(Some(43)), Ok(Some(44))],
+            deadline,
+            |pid| {
+                if pid == 44 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected foreign stat denial",
+                    ));
+                }
+                Ok(Some(super::ProcessInfo {
+                    pid,
+                    ppid: 1,
+                    pgid: pid,
+                    sid: pid,
+                    live: true,
+                    stopped: false,
+                    identity: super::ProcessIdentity {
+                        pid,
+                        start: Some("marked".to_owned()),
+                    },
+                }))
+            },
+            |pid, _| {
+                if pid == 44 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected foreign environ denial",
+                    ));
+                }
+                Ok(Some(true))
+            },
+        );
+        #[cfg(target_os = "android")]
+        {
+            let processes =
+                snapshot.expect("a foreign-app denial must skip one row, not fail the snapshot");
+            assert_eq!(processes.len(), 1);
+            assert_eq!(processes[0].pid, 43);
+        }
+        // Linux has setuid transitions, so an unreadable stat stays a
+        // fail-closed partial view there.
+        #[cfg(not(target_os = "android"))]
+        assert!(
+            snapshot.is_err(),
+            "a denied stat must fail the snapshot closed on Linux"
         );
     }
 
