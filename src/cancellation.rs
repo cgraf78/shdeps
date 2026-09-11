@@ -53,6 +53,13 @@ const LEADER_EXIT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
 const CLEANUP_SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const TRACK_POLL: Duration = Duration::from_millis(50);
+// A concurrent exec can present a markerless row that gains its marker
+// microseconds later, and a short-lived unrelated child can exit between
+// back-to-back inspections. Re-verify once after this settle before the
+// adoptee policy fails closed so one transient row cannot poison every
+// concurrent boundary's completion proof.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const AMBIGUOUS_ADOPTEE_SETTLE: Duration = Duration::from_millis(50);
 #[cfg(any(test, all(unix, not(any(target_os = "linux", target_os = "android")))))]
 const PORTABLE_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 const OUTPUT_POLL: Duration = Duration::from_millis(10);
@@ -3080,6 +3087,7 @@ impl Boundary {
             deadline,
             fail_on_ambiguous,
             linux_process_info_checked,
+            |process| self.adopted_marker_disposition(process),
         )
     }
 
@@ -3091,6 +3099,7 @@ impl Boundary {
         deadline: Instant,
         fail_on_ambiguous: bool,
         mut inspect: impl FnMut(u32) -> std::io::Result<Option<ProcessInfo>>,
+        marker_disposition: impl Fn(&ProcessInfo) -> std::io::Result<BoundaryMarkerDisposition>,
     ) -> std::io::Result<bool> {
         if !process.live || process.ppid != std::process::id() {
             return Ok(false);
@@ -3163,6 +3172,49 @@ impl Boundary {
         }
         if sole_boundary {
             return Ok(true);
+        }
+        if fail_on_ambiguous && Instant::now() + AMBIGUOUS_ADOPTEE_SETTLE <= deadline {
+            // Settle and re-verify once before failing closed. A concurrent
+            // exec can present a markerless row that gains its marker
+            // microseconds later; a short-lived unrelated child can exit
+            // between the two inspections above. Either transient must not
+            // poison a concurrent boundary's completion proof.
+            std::thread::sleep(AMBIGUOUS_ADOPTEE_SETTLE);
+            let settled = inspect(process.pid)?;
+            let settled_live = settled.as_ref().is_some_and(|current| {
+                current.live
+                    && current.ppid == std::process::id()
+                    && current.identity == process.identity
+            });
+            if !settled_live {
+                // The row went stale across the settle: the short-lived
+                // adoptee exited or its PID was reused. Either way there is
+                // nothing left to attribute or clean up.
+                return Ok(false);
+            }
+            let current = settled.expect("settled live row is present");
+            match marker_disposition(&current)? {
+                // The marker appeared after the first read: this process is
+                // ours despite the earlier unknown row.
+                BoundaryMarkerDisposition::Matches => return Ok(true),
+                // Another worker's process, or a row that vanished between
+                // the settle inspection and the marker lookup.
+                BoundaryMarkerDisposition::Different | BoundaryMarkerDisposition::Gone => {
+                    return Ok(false);
+                }
+                BoundaryMarkerDisposition::Unknown => {}
+            }
+            // A same-session direct child is indistinguishable from a plain
+            // supervisor spawn: only setsid moves a process out of its
+            // inherited session. Ignoring the ambiguous row matches the
+            // leader-exit merge, which never surfaces same-session
+            // children, so local and full observations agree. Detached
+            // adoptees keep the escapee shape and still fail closed below.
+            // SAFETY: getsid observes our own session without pointers.
+            let own_sid = unsafe { libc::getsid(0) };
+            if own_sid >= 0 && current.sid == own_sid as u32 {
+                return Ok(false);
+            }
         }
         // Once a descendant has deliberately closed both attribution
         // channels, its former parent is no longer observable after
@@ -7159,6 +7211,7 @@ sys.exit(0)
                         Instant::now() + Duration::from_secs(1),
                         false,
                         |_| Ok(Some(rows[2].clone())),
+                        |_| Ok(super::BoundaryMarkerDisposition::Unknown),
                     )
                     .unwrap(),
                 "an unmarked adoptee must not be assigned while another boundary could own it"
@@ -7171,11 +7224,152 @@ sys.exit(0)
                         Instant::now() + Duration::from_secs(1),
                         true,
                         |_| Ok(Some(rows[2].clone())),
+                        |_| Ok(super::BoundaryMarkerDisposition::Unknown),
                     )
                     .is_err(),
                 "strict cleanup must not acknowledge an unattributable live adoptee"
             );
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn adoptee_that_exits_during_settle_is_not_ambiguous() {
+        // A short-lived unrelated child can overlap two back-to-back
+        // inspections yet exit before the failure branch runs. The policy
+        // must re-verify after a settle instead of failing closed on the
+        // stale row: there is nothing left to attribute or clean up.
+        let _first = super::Boundary::new(
+            u32::MAX - 10,
+            super::Isolation::DetachedSession,
+            super::BoundaryMarker::without_lifetime(Some("first-boundary".to_owned())),
+        );
+        let second = super::Boundary::new(
+            u32::MAX - 11,
+            super::Isolation::DetachedSession,
+            super::BoundaryMarker::without_lifetime(Some("second-boundary".to_owned())),
+        );
+        let dead_leader = |pid: u32, start: &str| super::ProcessInfo {
+            pid,
+            ppid: std::process::id(),
+            pgid: pid,
+            sid: pid,
+            live: false,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid,
+                start: Some(start.to_owned()),
+            },
+        };
+        let transient = super::ProcessInfo {
+            pid: u32::MAX - 12,
+            ppid: std::process::id(),
+            pgid: u32::MAX - 12,
+            sid: u32::MAX - 12,
+            live: true,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid: u32::MAX - 12,
+                start: Some("transient-generation".to_owned()),
+            },
+        };
+        let first_dead = dead_leader(u32::MAX - 10, "first-leader");
+        let second_dead = dead_leader(u32::MAX - 11, "second-leader");
+        let by_pid = std::collections::BTreeMap::from([
+            (first_dead.pid, &first_dead),
+            (second_dead.pid, &second_dead),
+            (transient.pid, &transient),
+        ]);
+        let inspections = Cell::new(0_u8);
+        assert!(
+            !second
+                .contains_unmarked_adoptee_with(
+                    &transient,
+                    &by_pid,
+                    Instant::now() + Duration::from_secs(1),
+                    true,
+                    |_| {
+                        inspections.set(inspections.get() + 1);
+                        if inspections.get() <= 2 {
+                            Ok(Some(transient.clone()))
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    |_| Ok(super::BoundaryMarkerDisposition::Unknown),
+                )
+                .unwrap(),
+            "an adoptee that exits during the ambiguity settle must not fail the proof"
+        );
+        assert_eq!(inspections.get(), 3);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ambiguous_same_session_adoptee_is_not_failed_closed() {
+        // A same-session direct child is indistinguishable from a plain
+        // supervisor spawn: only setsid moves a process out of its
+        // inherited session. Failing closed on one lets a concurrent
+        // test's live fixture fail another test's leader-exit
+        // observation. Detached adoptees (the escapee shape) still fail
+        // closed; same-session rows are ignored when ambiguous. Sole
+        // attribution upstream is unaffected.
+        // SAFETY: getsid observes our own session without pointers.
+        let own_sid = unsafe { libc::getsid(0) } as u32;
+        let _first = super::Boundary::new(
+            u32::MAX - 20,
+            super::Isolation::DetachedSession,
+            super::BoundaryMarker::without_lifetime(Some("first-boundary".to_owned())),
+        );
+        let second = super::Boundary::new(
+            u32::MAX - 21,
+            super::Isolation::DetachedSession,
+            super::BoundaryMarker::without_lifetime(Some("second-boundary".to_owned())),
+        );
+        let dead_leader = |pid: u32, start: &str| super::ProcessInfo {
+            pid,
+            ppid: std::process::id(),
+            pgid: pid,
+            sid: pid,
+            live: false,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid,
+                start: Some(start.to_owned()),
+            },
+        };
+        let plain = super::ProcessInfo {
+            pid: u32::MAX - 22,
+            ppid: std::process::id(),
+            pgid: u32::MAX - 22,
+            sid: own_sid,
+            live: true,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid: u32::MAX - 22,
+                start: Some("plain-generation".to_owned()),
+            },
+        };
+        let first_dead = dead_leader(u32::MAX - 20, "first-leader");
+        let second_dead = dead_leader(u32::MAX - 21, "second-leader");
+        let by_pid = std::collections::BTreeMap::from([
+            (first_dead.pid, &first_dead),
+            (second_dead.pid, &second_dead),
+            (plain.pid, &plain),
+        ]);
+        assert!(
+            !second
+                .contains_unmarked_adoptee_with(
+                    &plain,
+                    &by_pid,
+                    Instant::now() + Duration::from_secs(1),
+                    true,
+                    |_| Ok(Some(plain.clone())),
+                    |_| Ok(super::BoundaryMarkerDisposition::Unknown),
+                )
+                .unwrap(),
+            "an ambiguous same-session adoptee must not fail the proof closed"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -7481,6 +7675,7 @@ sys.exit(0)
                             Ok(None)
                         }
                     },
+                    |_| Ok(super::BoundaryMarkerDisposition::Unknown),
                 )
                 .unwrap(),
             "a process reaped after marker inspection must not become an ambiguous live adoptee"
@@ -7500,6 +7695,7 @@ sys.exit(0)
                     Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
                 }
             },
+            |_| Ok(super::BoundaryMarkerDisposition::Unknown),
         );
         assert!(
             unreadable.is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
