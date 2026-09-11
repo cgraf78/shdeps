@@ -625,11 +625,48 @@ fn runtime_cancellation_capability_with<T>(
 pub(crate) fn record_cleanup_error(error: &std::io::Error) {
     CLEANUP_FAILED.store(true, Ordering::SeqCst);
     let diagnostic = error.to_string();
+    // TEMP-DIAG-131: report every recorded cleanup error. Revert with the
+    // rest of the macOS teardown telemetry once macOS is green.
+    #[cfg(test)]
+    if teardown_diag_enabled() {
+        eprintln!("DIAG131 cleanup_error: {diagnostic}");
+    }
     let mut diagnostics = CLEANUP_DIAGNOSTICS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if !diagnostics.contains(&diagnostic) {
         diagnostics.push(diagnostic);
+    }
+}
+
+/// TEMP-DIAG-131: teardown failure/hang telemetry for the macOS signal
+/// tests. Test-only, env-gated, stderr-unbuffered so killed subprocesses
+/// still leave their last heartbeat. Revert once macOS is green.
+#[cfg(test)]
+fn teardown_diag_enabled() -> bool {
+    std::env::var_os("SHDEPS_TEST_TEARDOWN_DIAG").is_some()
+}
+
+/// TEMP-DIAG-131: prints scope entry/exit (see above).
+#[cfg(test)]
+struct DiagScope(&'static str);
+
+#[cfg(test)]
+impl DiagScope {
+    fn enter(name: &'static str) -> Self {
+        if teardown_diag_enabled() {
+            eprintln!("DIAG131 enter {name}");
+        }
+        Self(name)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DiagScope {
+    fn drop(&mut self) {
+        if teardown_diag_enabled() {
+            eprintln!("DIAG131 exit {}", self.0);
+        }
     }
 }
 
@@ -790,6 +827,9 @@ fn output_with_attribution(
     stdin_bytes: Option<&[u8]>,
     attribute_descendants: bool,
 ) -> std::io::Result<std::process::Output> {
+    // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
+    #[cfg(test)]
+    let _diag = DiagScope::enter("output");
     use std::io::Read as _;
 
     command
@@ -2133,6 +2173,9 @@ fn stop_boundary(
     leader_reaped: &mut bool,
     foreground: Option<&TerminalForeground>,
 ) -> std::io::Result<ExitStatus> {
+    // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
+    #[cfg(test)]
+    let _diag = DiagScope::enter("stop_boundary");
     // Capture descendants once more before terminating the leader. Previously
     // observed identities remain owned even if PPID/PGID/SID has since changed.
     let discovery_deadline = Instant::now() + CLEANUP_SNAPSHOT_BUDGET;
@@ -2666,6 +2709,9 @@ impl Boundary {
     // a fallback when local procfs traversal cannot prove completeness. Other
     // Unix platforms use the bounded portable snapshot.
     fn track(&mut self, deadline: Instant) -> Option<()> {
+        // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
+        #[cfg(test)]
+        let _diag = DiagScope::enter("track");
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let (processes, locally_owned) = linux_local_or_full_snapshot(
@@ -2690,6 +2736,9 @@ impl Boundary {
     // Records matching topology and transitive PPID lineage. Retained
     // identities remain owned after reparenting or a process-group change.
     fn observe(&mut self, deadline: Instant) -> Option<bool> {
+        // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
+        #[cfg(test)]
+        let _diag = DiagScope::enter("observe");
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.reconcile_fresh(deadline)
@@ -4854,6 +4903,9 @@ fn parse_ps_processes(
 #[cfg(any(test, all(unix, not(any(target_os = "linux", target_os = "android")))))]
 // Captures the portable `ps` fallback without creating an unbounded helper.
 fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
+    // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
+    #[cfg(test)]
+    let _diag = DiagScope::enter("snapshot");
     use std::io::Read as _;
     use std::os::fd::OwnedFd;
 

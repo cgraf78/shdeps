@@ -1567,6 +1567,8 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(CHILD_ENV, &checkout)
+            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+            .env("SHDEPS_TEST_TEARDOWN_DIAG", "1")
             .env(
                 "SHDEPS_INTERNAL_PROCESS_BOUNDARIES",
                 "test-harness-subprocess",
