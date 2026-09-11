@@ -697,6 +697,51 @@ impl Drop for DiagScope {
     }
 }
 
+/// TEMP-DIAG-131: child-side liveness watchdog for the macOS timeout
+/// victims. A detached thread prints an attributed heartbeat proving the
+/// child is alive and whether its signal latch fired; killed children
+/// leave their last tick behind. Revert with the macOS teardown
+/// telemetry once macOS is green.
+#[cfg(all(test, unix))]
+pub(crate) fn spawn_teardown_watchdog(test_name: &'static str) -> impl Drop {
+    struct Watchdog {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = std::sync::Arc::clone(&stop);
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let mut tick = 0_u32;
+        while !stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            tick += 1;
+            if teardown_diag_enabled() {
+                eprintln!(
+                    "DIAG131 watchdog {test_name} tick={tick} elapsed_ms={} received={:?} active_handlers={}",
+                    started.elapsed().as_millis(),
+                    received_signal(),
+                    ACTIVE_HANDLERS.load(std::sync::atomic::Ordering::SeqCst),
+                );
+            }
+        }
+    });
+    Watchdog { stop }
+}
+
+/// TEMP-DIAG-131: attributed phase marker for the macOS timeout
+/// victims. Revert with the macOS teardown telemetry once macOS is green.
+#[cfg(all(test, unix))]
+pub(crate) fn teardown_phase(test_name: &str, phase: &str) {
+    if teardown_diag_enabled() {
+        eprintln!("DIAG131 phase {test_name} {phase}");
+    }
+}
+
 /// Runs one foreground-compatible child in an owned process group.
 ///
 /// Commands such as interactive sudo need the caller's controlling terminal,
@@ -3924,22 +3969,31 @@ fn write_lock_until<T>(lock: &RwLock<T>, deadline: Instant) -> Option<RwLockWrit
 
 #[cfg(unix)]
 fn spawn_registration_guard() -> std::io::Result<RwLockReadGuard<'static, ()>> {
-    spawn_registration_guard_before(None)
+    spawn_registration_guard_before(None, true)
 }
 
+// Teardown observability must work during teardown. The portable snapshot's
+// `ps` helper is cleanup instrumentation, not new user work, so it takes the
+// spawn-registration read lock without the cancellation refusal. Refusing it
+// fails every cold-cache observation after a signal on platforms without
+// procfs, which both slows teardown past its proof deadlines and latches
+// CLEANUP_FAILED (misreporting 1 instead of 128+signal).
 #[cfg(any(test, all(unix, not(any(target_os = "linux", target_os = "android")))))]
-fn spawn_registration_guard_until(
+fn spawn_registration_guard_unchecked_until(
     deadline: Instant,
 ) -> std::io::Result<RwLockReadGuard<'static, ()>> {
-    spawn_registration_guard_before(Some(deadline))
+    spawn_registration_guard_before(Some(deadline), false)
 }
 
 #[cfg(unix)]
 fn spawn_registration_guard_before(
     deadline: Option<Instant>,
+    enforce_cancellation: bool,
 ) -> std::io::Result<RwLockReadGuard<'static, ()>> {
     loop {
-        check()?;
+        if enforce_cancellation {
+            check()?;
+        }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -5009,7 +5063,7 @@ fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
     }
     let (mut reader, writer) = std::os::unix::net::UnixStream::pair().ok()?;
     reader.set_nonblocking(true).ok()?;
-    let spawn_guard = spawn_registration_guard_until(deadline).ok()?;
+    let spawn_guard = spawn_registration_guard_unchecked_until(deadline).ok()?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(writer)))
@@ -10818,6 +10872,33 @@ while True:
         });
 
         assert!(!side_effect.exists(), "a timed-out snapshot helper spawned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_snapshot_spawn_survives_a_received_signal() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_SNAPSHOT_AFTER_SIGNAL_CHILD";
+        const TEST_NAME: &str =
+            "cancellation::tests::portable_snapshot_spawn_survives_a_received_signal";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let _signals = super::Signals::install().unwrap();
+        // SAFETY: the handler is installed above and targets this process only.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        assert_eq!(super::received_signal(), Some(libc::SIGTERM));
+        // Teardown snapshots observe owned subprocesses during cancellation;
+        // refusing their helper spawn fails the cleanup proof on platforms
+        // without procfs (macOS) and misreports 1 instead of 128+signal.
+        let output = super::snapshot(
+            Command::new("true"),
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(output.is_some(), "snapshot helper refused after signal");
     }
 
     #[cfg(unix)]

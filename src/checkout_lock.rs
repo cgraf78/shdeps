@@ -1541,12 +1541,26 @@ mod tests {
         if let Some(checkout) = std::env::var_os(CHILD_ENV) {
             let checkout = PathBuf::from(checkout);
             let signals = crate::cancellation::Signals::install().unwrap();
+            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+            let _watchdog = crate::cancellation::spawn_teardown_watchdog(
+                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
+            );
             fs::write(
                 checkout.with_extension("ready"),
                 std::process::id().to_string(),
             )
             .unwrap();
+            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+            crate::cancellation::teardown_phase(
+                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
+                "before-acquire",
+            );
             let result = with_checkout_lock_timeout(&checkout, Duration::from_secs(30), |_| Ok(()));
+            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+            crate::cancellation::teardown_phase(
+                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
+                "after-acquire",
+            );
             let code = signals.finish_result(result.map(|_| 0)).unwrap();
             assert_eq!(code, 128 + libc::SIGTERM);
             return;
