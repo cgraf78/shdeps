@@ -2693,9 +2693,11 @@ impl Boundary {
     // descendants that escaped both group and session without making every
     // normally completing child rescan all procfs stat records. Cancellation
     // and stable-empty cleanup continue to use `reconcile_fresh` below.
+    // Portable platforms observe leader exit through the periodic `track`
+    // path instead, so this boundary stays Linux-only.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn observe_leader_exit(&mut self, deadline: Instant) -> std::io::Result<bool> {
         let lifetime_has_holders = self.lifetime_has_holders()?;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
         let processes = {
             if lifetime_has_holders == Some(false) {
                 // EOF is a kernel observation made after the leader exited:
@@ -2713,6 +2715,19 @@ impl Boundary {
                 })?;
                 if locally_owned {
                     self.retain_owned_rows(&processes);
+                    // Local traversal cannot see an escape the kernel
+                    // reparented to this supervisor. Merge those candidates
+                    // before the unmarked-adoptee policy runs; only rows the
+                    // policy attributes may join the retained membership.
+                    let merged = linux_local_snapshot_with_supervisor_children(
+                        (*processes).clone(),
+                        deadline,
+                        linux_supervisor_children,
+                        linux_process_info_checked,
+                    )?;
+                    return self
+                        .observe_processes_with_unmarked_adoptees(&merged, deadline, true)
+                        .and_then(|empty| self.verify_empty_observation(empty, deadline));
                 }
                 return self
                     .observe_processes_with_unmarked_adoptees(&processes, deadline, true)
@@ -2721,18 +2736,6 @@ impl Boundary {
                 linux_boundary_marker_snapshot(self, deadline)?
             }
         };
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        if lifetime_has_holders == Some(false) {
-            self.current.clear();
-            return Ok(true);
-        }
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        let processes = fresh_process_snapshot(Instant::now(), deadline).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "portable process snapshot deadline expired",
-            )
-        })?;
         let empty = self.observe_processes(&processes)?;
         self.verify_empty_observation(empty, deadline)
     }
@@ -2873,6 +2876,7 @@ impl Boundary {
         self.verify_empty_observation(empty, deadline).ok()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn retain_owned_rows(&mut self, processes: &[ProcessInfo]) {
         for process in processes {
             self.retain_identity(process.identity.clone());
@@ -3595,6 +3599,9 @@ enum BoundaryMarkerDisposition {
     Matches,
     Different,
     Unknown,
+    // Only procfs lookups can prove the snapshot row vanished; portable
+    // platforms never construct this disposition.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     Gone,
 }
 
@@ -4272,6 +4279,38 @@ fn linux_owned_process_snapshot_with(
     }
 }
 
+// Local child traversal descends from the retained leader and members only,
+// so a leader that forks and exits between observations hides its escape:
+// the kernel reparents that descendant to this supervisor, outside the
+// traversed subtree. Append supervisor-adopted candidates to a local
+// snapshot so the unmarked-adoptee policy can attribute them (sole active
+// boundary) or fail closed (ambiguous) instead of publishing a false empty
+// proof. Rows already under observation are not duplicated. A child listing
+// that cannot be proven complete fails the snapshot closed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_local_snapshot_with_supervisor_children(
+    owned: Vec<ProcessInfo>,
+    deadline: Instant,
+    mut supervisor_children: impl FnMut(Instant) -> std::io::Result<Option<Vec<u32>>>,
+    mut inspect: impl FnMut(u32) -> std::io::Result<Option<ProcessInfo>>,
+) -> std::io::Result<Vec<ProcessInfo>> {
+    let mut merged = owned;
+    let mut seen = merged
+        .iter()
+        .map(|process| process.pid)
+        .collect::<BTreeSet<_>>();
+    let adoptees = supervisor_children(deadline)?.unwrap_or_default();
+    for pid in adoptees {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(process) = inspect(pid)? {
+            merged.push(process);
+        }
+    }
+    Ok(merged)
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_local_or_full_snapshot(
     local: impl FnOnce() -> std::io::Result<Vec<ProcessInfo>>,
@@ -4420,7 +4459,7 @@ fn linux_task_children_interface_at(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn check_snapshot_deadline(deadline: Instant) -> std::io::Result<()> {
     if Instant::now() >= deadline {
         Err(std::io::Error::new(
@@ -4853,7 +4892,11 @@ fn session_id(pid: u32) -> Option<u32> {
     u32::try_from(unsafe { libc::getsid(pid as i32) }).ok()
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android")),
+    not(target_vendor = "apple")
+))]
 // Reads a live process's process-group identity.
 fn process_group(pid: u32) -> Option<u32> {
     // SAFETY: getpgid observes a positive process identity without pointers.
@@ -5912,7 +5955,7 @@ sys.exit(0)
     /// Live members of the `root` process tree (inclusive) from one `/proc`
     /// snapshot, so the forced-kill test discovers stub-fork launcher chains
     /// exactly.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn intermediate_tree(root: u32) -> std::collections::HashSet<u32> {
         fn ppid_of(pid: u32) -> Option<u32> {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -6664,10 +6707,18 @@ sys.exit(0)
         };
         wait_for_zombie(orphan_pid);
         // A zombie's environment is empty on procfs, so marker matching alone
-        // cannot attribute this adopted descendant.
+        // cannot attribute this adopted descendant. Kernels that release the
+        // zombie's memory before its procfs directory goes away fail the read
+        // with ESRCH instead; either way no marker is readable, matching
+        // production's procfs_process_gone classification.
         match std::fs::read(format!("/proc/{orphan_pid}/environ")) {
             Ok(environment) => assert!(environment.is_empty()),
-            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) if super::procfs_process_gone(&error) => {}
+            Err(error) => panic!(
+                "zombie environ must be empty or unreadable, got {error:?} (errno {:?})",
+                error.raw_os_error()
+            ),
         }
 
         // SAFETY: this isolated process installed the production TERM handler.
@@ -9563,6 +9614,80 @@ while True:
                 .any(|process| process.identity == adopted.identity),
             "fresh marker reconciliation must inspect an escaped PID outside the apparent cursor interval"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn leader_exit_discovery_includes_a_supervisor_reparented_escape() {
+        // A leader that forks and exits between observations reparents its
+        // escape to this supervisor, where leader-descended traversal cannot
+        // see it. The leader-exit snapshot must merge supervisor-adopted
+        // candidates so the unmarked-adoptee policy can attribute them (sole
+        // boundary) or fail closed (ambiguous) instead of publishing a false
+        // empty proof.
+        let supervisor = std::process::id();
+        let process = |pid, ppid, pgid, sid, live, start: &str| super::ProcessInfo {
+            pid,
+            ppid,
+            pgid,
+            sid,
+            live,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid,
+                start: Some(start.to_owned()),
+            },
+        };
+        let leader = process(41, supervisor, 41, 41, false, "leader");
+        let escaped = process(7, supervisor, 7, 7, true, "escaped");
+        let rows = [leader.clone(), escaped.clone()]
+            .into_iter()
+            .map(|process| (process.pid, process))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let merged = super::linux_local_snapshot_with_supervisor_children(
+            vec![leader.clone()],
+            deadline,
+            |_| Ok(Some(vec![leader.pid, escaped.pid])),
+            |pid| Ok(rows.get(&pid).cloned()),
+        )
+        .unwrap();
+        assert!(
+            merged
+                .iter()
+                .any(|process| process.identity == escaped.identity),
+            "leader-exit discovery must see an escape reparented to the supervisor"
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|process| process.pid == leader.pid)
+                .count(),
+            1,
+            "supervisor children already under observation must not duplicate rows"
+        );
+
+        let vanished = super::linux_local_snapshot_with_supervisor_children(
+            vec![leader.clone()],
+            deadline,
+            |_| Ok(None),
+            |pid| Ok(rows.get(&pid).cloned()),
+        )
+        .unwrap();
+        assert_eq!(
+            vanished.len(),
+            1,
+            "an unreadable supervisor child list must not invent rows"
+        );
+
+        super::linux_local_snapshot_with_supervisor_children(
+            vec![leader],
+            deadline,
+            |_| Err(std::io::Error::other("children unavailable")),
+            |pid| Ok(rows.get(&pid).cloned()),
+        )
+        .expect_err("a failed supervisor child listing must fail the snapshot closed");
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
