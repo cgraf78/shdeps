@@ -2716,7 +2716,7 @@ impl Boundary {
                 }
                 return self
                     .observe_processes_with_unmarked_adoptees(&processes, deadline, true)
-                    .and_then(|empty| self.verify_empty_observation(empty));
+                    .and_then(|empty| self.verify_empty_observation(empty, deadline));
             } else {
                 linux_boundary_marker_snapshot(self, deadline)?
             }
@@ -2734,7 +2734,7 @@ impl Boundary {
             )
         })?;
         let empty = self.observe_processes(&processes)?;
-        self.verify_empty_observation(empty)
+        self.verify_empty_observation(empty, deadline)
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2758,7 +2758,7 @@ impl Boundary {
                 std::io::Error::other("could not snapshot owned subprocesses after leader reaping")
             })?;
         let empty = self.observe_processes_with_unmarked_adoptees(&processes, deadline, true)?;
-        self.verify_empty_observation(empty)
+        self.verify_empty_observation(empty, deadline)
     }
 
     fn lifetime_has_holders(&mut self) -> std::io::Result<Option<bool>> {
@@ -2786,16 +2786,53 @@ impl Boundary {
     // descendant inherited the lease but is no longer attributable through
     // its marker or retained topology. Fail closed rather than acknowledging
     // cancellation while that process can still mutate state.
-    fn verify_empty_observation(&mut self, empty: bool) -> std::io::Result<bool> {
+    //
+    // A concurrent spawn can fork while this boundary's writer is still open
+    // in the parent; until that child execs, CLOEXEC cannot release the
+    // inherited lease, and gated fixture children linger pre-exec behind
+    // release sockets. An open lease with an empty snapshot is therefore
+    // inconclusive while spawns are in flight: settle the captured cohort
+    // (bounded by the caller deadline; later launches cannot have inherited
+    // a writer this boundary already dropped) and re-read once. A lease
+    // that is still open afterwards is a genuine leak: fail closed.
+    fn verify_empty_observation(
+        &mut self,
+        empty: bool,
+        deadline: Instant,
+    ) -> std::io::Result<bool> {
         if !empty {
             return Ok(false);
         }
         match self.lifetime_has_holders()? {
-            Some(true) => Err(std::io::Error::other(
-                "owned subprocess ownership descriptor remains open after process discovery",
-            )),
             Some(false) | None => Ok(true),
+            Some(true) => {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                {
+                    if let Some(registry) = SPAWN_REGISTRATIONS.get() {
+                        let _ = registry.wait_for_snapshot_registrations(deadline);
+                    }
+                    match self.lifetime_has_holders()? {
+                        Some(false) | None => Ok(true),
+                        Some(true) => Err(Self::open_lease_error()),
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                {
+                    // Portable platforms have no spawn registry; their only
+                    // gated fixture releases on signal acknowledgement
+                    // (microseconds), so there is no lingering cohort to
+                    // settle. Keep the immediate fail-closed.
+                    let _ = deadline;
+                    Err(Self::open_lease_error())
+                }
+            }
         }
+    }
+
+    fn open_lease_error() -> std::io::Error {
+        std::io::Error::other(
+            "owned subprocess ownership descriptor remains open after process discovery",
+        )
     }
 
     // Cleanup proof boundaries must be based on a process-table view whose
@@ -2812,7 +2849,7 @@ impl Boundary {
                     self.observe_processes(&processes).ok()?;
                     let processes = linux_boundary_marker_snapshot(self, deadline).ok()?;
                     let empty = self.observe_processes(&processes).ok()?;
-                    self.verify_empty_observation(empty).ok()
+                    self.verify_empty_observation(empty, deadline).ok()
                 }
                 Err(_) => {
                     // CONFIG_PROC_CHILDREN is optional. When local traversal
@@ -2824,7 +2861,7 @@ impl Boundary {
                     let empty = self
                         .observe_processes_with_unmarked_adoptees(&processes, deadline, true)
                         .ok()?;
-                    self.verify_empty_observation(empty).ok()
+                    self.verify_empty_observation(empty, deadline).ok()
                 }
             }
         }
@@ -2833,7 +2870,7 @@ impl Boundary {
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         let empty = self.observe_processes(&processes).ok()?;
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        self.verify_empty_observation(empty).ok()
+        self.verify_empty_observation(empty, deadline).ok()
     }
 
     fn retain_owned_rows(&mut self, processes: &[ProcessInfo]) {
@@ -9631,17 +9668,23 @@ while True:
         let mut boundary =
             super::Boundary::new(u32::MAX - 101, super::Isolation::ExactChild, marker);
 
-        let error = boundary.verify_empty_observation(true).unwrap_err();
+        let error = boundary
+            .verify_empty_observation(true, Instant::now() + Duration::from_secs(1))
+            .unwrap_err();
         assert!(error.to_string().contains("ownership descriptor"));
         super::record_cleanup_error(&error);
 
         drop(retained_writer);
         assert!(
-            boundary.verify_empty_observation(true).unwrap(),
+            boundary
+                .verify_empty_observation(true, Instant::now() + Duration::from_secs(1))
+                .unwrap(),
             "EOF on the private descriptor permits the process observation to prove emptiness"
         );
         assert!(
-            !boundary.verify_empty_observation(false).unwrap(),
+            !boundary
+                .verify_empty_observation(false, Instant::now() + Duration::from_secs(1))
+                .unwrap(),
             "a non-empty process observation remains non-empty after the lease closes"
         );
         // SAFETY: this isolated process installed the production TERM handler.
@@ -9657,6 +9700,128 @@ while True:
             1,
             "an unaccounted open lease must not be acknowledged as 128+signal"
         );
+    }
+
+    // A concurrent spawn can fork while a boundary's writer is still open in
+    // the parent; gated fixture children linger pre-exec behind release
+    // sockets, so the inherited lease stays open after the owner's leader
+    // exits. The empty proof must settle that transient cohort instead of
+    // failing closed on a holder that is already on its way out.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn empty_proof_settles_a_transient_pre_exec_inheritor() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        // Ready gate: the lingering child signals before it starts its
+        // hold so the first lease read deterministically observes a
+        // holder (without the settle, this test fails).
+        let (ready_reader, ready_writer) = UnixStream::pair().unwrap();
+        let ready_fd = ready_writer.as_raw_fd();
+        // SAFETY: the child only uses async-signal-safe calls (write,
+        // nanosleep, _exit) before exiting; it never returns to Rust code.
+        let holder = unsafe { libc::fork() };
+        assert!(holder >= 0, "fork failed");
+        if holder == 0 {
+            unsafe {
+                let byte = [1_u8];
+                let _ = libc::write(ready_fd, byte.as_ptr().cast(), byte.len());
+                let hold = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 200_000_000,
+                };
+                libc::nanosleep(&hold, std::ptr::null_mut());
+                libc::_exit(0);
+            }
+        }
+        let marker = super::BoundaryMarker {
+            token: Some("transient-pre-exec-inheritor".to_owned()),
+            lifetime_reader: Some(reader),
+            lifetime_writer: Some(writer),
+        };
+        let mut boundary =
+            super::Boundary::new(u32::MAX - 102, super::Isolation::ExactChild, marker);
+        let mut ready = [0_u8; 1];
+        use std::io::Read as _;
+        (&ready_reader).read_exact(&mut ready).unwrap();
+        // Hold a registration for the cohort the settle waits on, mirroring
+        // a spawn whose fork-child is still pre-exec, and release it when
+        // the holder exits.
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            let _registration = super::SpawnRegistrationWindow::begin();
+            registered_tx.send(()).unwrap();
+            let mut status = 0;
+            // SAFETY: holder is the direct child forked above.
+            unsafe {
+                libc::waitpid(holder, &mut status, 0);
+            }
+        });
+        registered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            boundary
+                .verify_empty_observation(true, Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            "a pre-exec inheritor that exits must not fail the empty proof"
+        );
+        reaper.join().unwrap();
+    }
+
+    // The settle above is bounded: a lease that is still open once the
+    // captured spawn cohort drains (or the caller deadline expires) is a
+    // genuine leak and must still fail closed.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn empty_proof_still_fails_closed_when_the_settle_expires() {
+        use std::os::unix::net::UnixStream;
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        // SAFETY: the child only uses async-signal-safe calls (nanosleep,
+        // _exit) before exiting; it never returns to Rust code.
+        let holder = unsafe { libc::fork() };
+        assert!(holder >= 0, "fork failed");
+        if holder == 0 {
+            unsafe {
+                let hold = libc::timespec {
+                    tv_sec: 30,
+                    tv_nsec: 0,
+                };
+                libc::nanosleep(&hold, std::ptr::null_mut());
+                libc::_exit(0);
+            }
+        }
+        let marker = super::BoundaryMarker {
+            token: Some("stuck-pre-exec-inheritor".to_owned()),
+            lifetime_reader: Some(reader),
+            lifetime_writer: Some(writer),
+        };
+        let mut boundary =
+            super::Boundary::new(u32::MAX - 103, super::Isolation::ExactChild, marker);
+        // Mirror a spawn stuck behind its release gate: the registration
+        // outlives the caller deadline exactly like the holder does.
+        let _registration = super::SpawnRegistrationWindow::begin();
+        let started = Instant::now();
+        let error = boundary
+            .verify_empty_observation(true, started + Duration::from_millis(200))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ownership descriptor"),
+            "unexpected settle-expiry error: {error}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the settle must wait out the cohort before failing closed"
+        );
+        // SAFETY: holder is the direct child forked above; SIGKILL ends the
+        // hold so the test reaps a finite child.
+        unsafe {
+            libc::kill(holder, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(holder, &mut status, 0);
+        }
     }
 
     #[cfg(unix)]
