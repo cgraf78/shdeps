@@ -855,6 +855,206 @@ install() {
 }
 
 #[test]
+fn hook_prelude_snapshot_answers_match_direct_api_answers() {
+    // Transparency probe for the hook-prelude env cache: whatever the
+    // prelude helpers answer inside a real hook subprocess must equal the
+    // direct `__api` answers under the same environment, both before the
+    // cache exists (pure bridge) and after (env-hit with bridge fallback).
+    // Detection is hermetic: a fakebin-only PATH finds no package manager
+    // on any host, and platform/host come from the fixture's test overrides.
+    for (force, reinstall) in [("0", "0"), ("1", "1")] {
+        let fixture = Fixture::new("hook-prelude-snapshot");
+        fixture.write("conf/deps.conf", "tool custom\n");
+        fixture.write(
+            "conf/hooks.d/tool.sh",
+            r#"
+exists() { return 1; }
+install() {
+  {
+    printf 'platform=%s\n' "$(shdeps_platform)"
+    if shdeps_force; then printf 'force=1\n'; else printf 'force=0\n'; fi
+    if shdeps_reinstall; then printf 'reinstall=1\n'; else printf 'reinstall=0\n'; fi
+    printf 'pkg-mgr=%s\n' "$(shdeps_pkg_mgr)"
+    printf 'install-dir=%s\n' "$(shdeps_install_dir)"
+    printf 'git-dev-dir=%s\n' "$(shdeps_git_dev_dir)"
+    printf 'bin-dir=%s\n' "$(shdeps_bin_dir)"
+  } >"$SHDEPS_STATE_DIR/observed.txt"
+  printf 'installed\n'
+}
+"#,
+        );
+        fixture.write_executable(
+            "fakebin/bash",
+            &format!("#!{0}\nexec {0} \"$@\"\n", system_bash().display()),
+        );
+
+        let mut command = fixture.command(["update"]);
+        command
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    fixture.dir.join("fakebin").display(),
+                    shdeps_exe_dir().display()
+                ),
+            )
+            .env("SHDEPS_FORCE", force)
+            .env("SHDEPS_REINSTALL", reinstall);
+        let output = run(&mut command);
+        assert_success(&output);
+
+        let observed = fs::read_to_string(fixture.dir.join("state/observed.txt")).unwrap();
+        let mut expected = String::new();
+        expected.push_str(&format!(
+            "platform={}\n",
+            api_answer(&fixture, ["__api", "platform"], force, reinstall)
+        ));
+        expected.push_str(&format!(
+            "force={}\n",
+            api_flag(&fixture, ["__api", "force"], force, reinstall)
+        ));
+        expected.push_str(&format!(
+            "reinstall={}\n",
+            api_flag(&fixture, ["__api", "reinstall"], force, reinstall)
+        ));
+        expected.push_str(&format!(
+            "pkg-mgr={}\n",
+            api_answer(&fixture, ["__api", "pkg-mgr"], force, reinstall)
+        ));
+        expected.push_str(&format!(
+            "install-dir={}\n",
+            api_answer(&fixture, ["__api", "install-dir"], force, reinstall)
+        ));
+        expected.push_str(&format!(
+            "git-dev-dir={}\n",
+            api_answer(&fixture, ["__api", "git-dev-dir"], force, reinstall)
+        ));
+        expected.push_str(&format!(
+            "bin-dir={}\n",
+            api_answer(&fixture, ["__api", "bin-dir"], force, reinstall)
+        ));
+        assert_eq!(
+            observed, expected,
+            "hook-observed answers must match direct __api (force={force} reinstall={reinstall})"
+        );
+    }
+}
+
+#[test]
+fn hook_prelude_snapshot_queries_spawn_no_subprocesses() {
+    // Perf: with the parent-exported environment, the seven snapshot
+    // queries must not spawn recursive `shdeps __api` calls. A logging
+    // wrapper on the hook PATH records every subprocess invocation; the
+    // non-cached `skip-check` call proves the wrapper observes bridges.
+    let fixture = Fixture::new("hook-prelude-no-spawn");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  shdeps_platform >/dev/null
+  shdeps_force >/dev/null 2>&1; true
+  shdeps_reinstall >/dev/null 2>&1; true
+  shdeps_pkg_mgr >/dev/null
+  shdeps_install_dir >/dev/null
+  shdeps_git_dev_dir >/dev/null
+  shdeps_bin_dir >/dev/null
+  shdeps_skipped tool >/dev/null 2>&1; true
+  printf 'installed\n'
+}
+"#,
+    );
+    fixture.write_executable(
+        "fakebin/bash",
+        &format!("#!{0}\nexec {0} \"$@\"\n", system_bash().display()),
+    );
+    let log = fixture.dir.join("shdeps-calls.log");
+    fixture.write_executable(
+        "fakebin/shdeps",
+        &format!(
+            "#!{bash}\nprintf '%s\\n' \"$*\" >>\"$SHDEPS_CALL_LOG\"\nexec \"{exe}\" \"$@\"\n",
+            bash = system_bash().display(),
+            exe = env!("CARGO_BIN_EXE_shdeps"),
+        ),
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.dir.join("fakebin").display(),
+                shdeps_exe_dir().display()
+            ),
+        )
+        .env("SHDEPS_CALL_LOG", &log);
+    let output = run(&mut command);
+    assert_success(&output);
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    for query in [
+        "__api platform",
+        "__api force",
+        "__api reinstall",
+        "__api pkg-mgr",
+        "__api install-dir",
+        "__api git-dev-dir",
+        "__api bin-dir",
+    ] {
+        assert!(
+            !calls.lines().any(|line| line == query),
+            "cached query must not spawn, got {query:?} in:\n{calls}"
+        );
+    }
+    assert!(
+        calls.lines().any(|line| line == "__api skip-check tool"),
+        "non-cached queries must still bridge, got:\n{calls}"
+    );
+}
+
+fn api_answer<const N: usize>(
+    fixture: &Fixture,
+    args: [&str; N],
+    force: &str,
+    reinstall: &str,
+) -> String {
+    let mut command = fixture.command(args);
+    command
+        .env("SHDEPS_FORCE", force)
+        .env("SHDEPS_REINSTALL", reinstall);
+    let output = run(&mut command);
+    assert_success(&output);
+    text(&output.stdout).trim_end().to_owned()
+}
+
+fn api_flag<const N: usize>(
+    fixture: &Fixture,
+    args: [&str; N],
+    force: &str,
+    reinstall: &str,
+) -> &'static str {
+    let mut command = fixture.command(args);
+    command
+        .env("SHDEPS_FORCE", force)
+        .env("SHDEPS_REINSTALL", reinstall);
+    match run(&mut command).status.code() {
+        Some(0) => "1",
+        _ => "0",
+    }
+}
+
+fn system_bash() -> PathBuf {
+    for candidate in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+        if Path::new(candidate).is_file() {
+            return PathBuf::from(candidate);
+        }
+    }
+    panic!("test host must provide bash for hook subprocesses");
+}
+
+#[test]
 fn dep_file_stays_fast_with_many_configured_dependencies() {
     let fixture = Fixture::new("dep-file-perf");
     let mut config = String::new();

@@ -27,10 +27,20 @@ shdeps_platform_match() { command shdeps __api platform-match "$@"; }
 shdeps_host_match() { command shdeps __api host-match "$@"; }
 shdeps_filter_match() { command shdeps __api filter-match "$@"; }
 
-shdeps_platform() { command shdeps __api platform "$@"; }
-shdeps_force() { command shdeps __api force "$@"; }
-shdeps_reinstall() { command shdeps __api reinstall "$@"; }
-shdeps_pkg_mgr() { command shdeps __api pkg-mgr "$@"; }
+# Snapshot answers are parent-resolved and exported into every hook
+# subprocess, so read them from the environment instead of spawning a
+# recursive `shdeps __api` call per query (dozens per update). Each cached
+# form is exactly what the bridge would print: the parent exports its own
+# resolved roots, and the flag queries match the bridge's env-only semantics
+# (a nested `__api` call carries no CLI overrides). Unset-or-empty falls
+# back to the bridge so probes without an export, or hooks that unset the
+# variables, keep working; `pkg-mgr` is the exception (`-`, not `:-`)
+# because the bridge's only input is that same variable and empty already
+# means "none detected", so even an empty export is a definitive answer.
+shdeps_platform() { printf '%s\n' "${SHDEPS_HOOK_PLATFORM:-$(command shdeps __api platform "$@")}"; }
+shdeps_force() { [[ "${SHDEPS_FORCE:-0}" == "1" ]]; }
+shdeps_reinstall() { [[ "${SHDEPS_REINSTALL:-0}" == "1" ]]; }
+shdeps_pkg_mgr() { printf '%s\n' "${SHDEPS_PKG_MGR-$(command shdeps __api pkg-mgr "$@")}"; }
 shdeps_pkg_install() { command shdeps __api pkg-install "$@"; }
 shdeps_pkg_install_for_mgr() { command shdeps __api pkg-install-for-mgr "$@"; }
 # Exit 75 is the private parent-prompt request returned only for this hook.
@@ -43,9 +53,9 @@ shdeps_require_sudo() {
   fi
   return "$_shdeps_sudo_status"
 }
-shdeps_install_dir() { command shdeps __api install-dir "$@"; }
-shdeps_git_dev_dir() { command shdeps __api git-dev-dir "$@"; }
-shdeps_bin_dir() { command shdeps __api bin-dir "$@"; }
+shdeps_install_dir() { printf '%s\n' "${SHDEPS_INSTALL_DIR:-$(command shdeps __api install-dir "$@")}"; }
+shdeps_git_dev_dir() { printf '%s\n' "${SHDEPS_GIT_DEV_DIR:-$(command shdeps __api git-dev-dir "$@")}"; }
+shdeps_bin_dir() { printf '%s\n' "${SHDEPS_BIN_DIR:-$(command shdeps __api bin-dir "$@")}"; }
 
 shdeps_dep_root() { command shdeps __api dep-root "$@"; }
 shdeps_dep_path() { command shdeps __api dep-path "$@"; }
@@ -111,6 +121,224 @@ shdeps_mark_changed() {
 #[cfg(test)]
 mod tests {
     use super::source;
+
+    /// Runs `driver_bash` with the prelude sourced and a stub `shdeps` on
+    /// PATH. Returns `(combined_output, stub_call_log)`.
+    #[cfg(unix)]
+    fn run_prelude_driver(driver_bash: &str, extra_env: &[(&str, &str)]) -> (String, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::temp_dir("shdeps-prelude-driver");
+        let stub = dir.join("shdeps");
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SHDEPS_STUB_LOG"
+case "$1 $2" in
+  "__api platform") printf 'stub-platform\n' ;;
+  "__api force") exit 0 ;;
+  "__api reinstall") exit 1 ;;
+  "__api pkg-mgr") printf 'stub-pkg\n' ;;
+  "__api install-dir") printf '/stub/install\n' ;;
+  "__api git-dev-dir") printf '/stub/gitdev\n' ;;
+  "__api bin-dir") printf '/stub/bin\n' ;;
+  "__api skip-check") exit 3 ;;
+  "__api skip-reason") printf 'stub-reason\n' ;;
+  "__api platform-match") exit 4 ;;
+  "__api dep-root") printf 'stub-dep-root\n' ;;
+  "__api load-count") printf '42\n' ;;
+  *) printf 'stub-unexpected: %s\n' "$*" >&2; exit 99 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = dir.join("calls.log");
+        let driver = dir.join("driver.sh");
+        std::fs::write(
+            &driver,
+            format!(
+                "{}\n{}\n",
+                source().trim_end(),
+                driver_bash.trim_start_matches('\n')
+            ),
+        )
+        .unwrap();
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg(&driver)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .env("SHDEPS_STUB_LOG", &log);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("bash must run the prelude driver");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "driver failed: stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        (String::from_utf8_lossy(&output.stdout).into_owned(), calls)
+    }
+
+    /// Non-cacheable helpers must always bridge into `shdeps __api` with
+    /// exact argument passthrough. This pins the delegation contract for
+    /// every helper the env-cache change does not touch.
+    #[cfg(unix)]
+    #[test]
+    fn prelude_non_cached_helpers_always_delegate() {
+        let (output, calls) = run_prelude_driver(
+            r#"
+shdeps_skipped tool; printf 'skip-check=%s\n' "$?"
+printf 'skip-reason=%s\n' "$(shdeps_skip_reason tool)"
+shdeps_platform_match linux; printf 'platform-match=%s\n' "$?"
+printf 'dep-root=%s\n' "$(shdeps_dep_root tool)"
+printf 'load=%s\n' "$(shdeps_load)"
+"#,
+            &[],
+        );
+
+        assert!(output.contains("skip-check=3\n"), "{output}");
+        assert!(output.contains("skip-reason=stub-reason\n"), "{output}");
+        assert!(output.contains("platform-match=4\n"), "{output}");
+        assert!(output.contains("dep-root=stub-dep-root\n"), "{output}");
+        assert!(output.contains("load=42\n"), "{output}");
+        for expected in [
+            "__api skip-check tool",
+            "__api skip-reason tool",
+            "__api platform-match linux",
+            "__api dep-root tool",
+            "__api load-count",
+        ] {
+            assert!(
+                calls.lines().any(|line| line == expected),
+                "missing bridge call {expected:?} in:\n{calls}"
+            );
+        }
+    }
+
+    /// Snapshot queries answer from the parent-exported environment
+    /// without spawning. The stub records every `shdeps` invocation, so an
+    /// empty call log proves the helpers cost zero subprocesses; the
+    /// cli-level equivalence test proves the answers match the bridge.
+    #[cfg(unix)]
+    #[test]
+    fn prelude_snapshot_queries_answer_from_exported_env() {
+        let (output, calls) = run_prelude_driver(
+            r#"
+printf 'platform=%s\n' "$(shdeps_platform)"
+shdeps_force; printf 'force=%s\n' "$?"
+shdeps_reinstall; printf 'reinstall=%s\n' "$?"
+printf 'pkg-mgr=%s\n' "$(shdeps_pkg_mgr)"
+printf 'install-dir=%s\n' "$(shdeps_install_dir)"
+printf 'git-dev-dir=%s\n' "$(shdeps_git_dev_dir)"
+printf 'bin-dir=%s\n' "$(shdeps_bin_dir)"
+printf 'args=%s\n' "$(shdeps_platform ignored-arg)"
+"#,
+            &[
+                ("SHDEPS_HOOK_PLATFORM", "env-platform"),
+                ("SHDEPS_FORCE", "1"),
+                ("SHDEPS_REINSTALL", "0"),
+                ("SHDEPS_PKG_MGR", "env-pkg"),
+                ("SHDEPS_INSTALL_DIR", "/env/install"),
+                ("SHDEPS_GIT_DEV_DIR", "/env/gitdev"),
+                ("SHDEPS_BIN_DIR", "/env/bin"),
+            ],
+        );
+
+        assert!(output.contains("platform=env-platform\n"), "{output}");
+        assert!(output.contains("force=0\n"), "{output}");
+        assert!(output.contains("reinstall=1\n"), "{output}");
+        assert!(output.contains("pkg-mgr=env-pkg\n"), "{output}");
+        assert!(output.contains("install-dir=/env/install\n"), "{output}");
+        assert!(output.contains("git-dev-dir=/env/gitdev\n"), "{output}");
+        assert!(output.contains("bin-dir=/env/bin\n"), "{output}");
+        assert!(output.contains("args=env-platform\n"), "{output}");
+        assert!(
+            calls.is_empty(),
+            "exported env must cost zero shdeps spawns, got:\n{calls}"
+        );
+    }
+
+    /// Unset-or-empty exports fall back to the bridge, so probes without an
+    /// export and hooks that unset the variables keep working. Flag queries
+    /// have env-only semantics matching the bridge (a nested `__api` call
+    /// carries no CLI overrides), so they never spawn.
+    #[cfg(unix)]
+    #[test]
+    fn prelude_snapshot_queries_fall_back_to_bridge_when_unset() {
+        let (output, calls) = run_prelude_driver(
+            r#"
+printf 'platform=%s\n' "$(shdeps_platform)"
+shdeps_force; printf 'force=%s\n' "$?"
+shdeps_reinstall; printf 'reinstall=%s\n' "$?"
+printf 'pkg-mgr=%s\n' "$(shdeps_pkg_mgr)"
+printf 'install-dir=%s\n' "$(shdeps_install_dir)"
+printf 'git-dev-dir=%s\n' "$(shdeps_git_dev_dir)"
+printf 'bin-dir=%s\n' "$(shdeps_bin_dir)"
+printf 'args=%s\n' "$(shdeps_platform ignored-arg)"
+"#,
+            &[],
+        );
+
+        assert!(output.contains("platform=stub-platform\n"), "{output}");
+        assert!(output.contains("force=1\n"), "{output}");
+        assert!(output.contains("reinstall=1\n"), "{output}");
+        assert!(output.contains("pkg-mgr=stub-pkg\n"), "{output}");
+        assert!(output.contains("install-dir=/stub/install\n"), "{output}");
+        assert!(output.contains("git-dev-dir=/stub/gitdev\n"), "{output}");
+        assert!(output.contains("bin-dir=/stub/bin\n"), "{output}");
+        assert!(output.contains("args=stub-platform\n"), "{output}");
+        for expected in [
+            "__api platform",
+            "__api pkg-mgr",
+            "__api install-dir",
+            "__api git-dev-dir",
+            "__api bin-dir",
+            "__api platform ignored-arg",
+        ] {
+            assert!(
+                calls.lines().any(|line| line == expected),
+                "missing bridge call {expected:?} in:\n{calls}"
+            );
+        }
+        assert!(
+            !calls
+                .lines()
+                .any(|line| line == "__api force" || line == "__api reinstall"),
+            "flag queries must never spawn, got:\n{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prelude_empty_exports_fall_back_to_bridge() {
+        // An empty platform export still bridges (the bridge would detect
+        // the real platform), while an empty `SHDEPS_PKG_MGR` is already
+        // the bridge's definitive "none detected" answer.
+        let (output, calls) = run_prelude_driver(
+            r#"
+printf 'platform=%s\n' "$(shdeps_platform)"
+printf 'pkg-mgr=%s\n' "$(shdeps_pkg_mgr)"
+"#,
+            &[("SHDEPS_HOOK_PLATFORM", ""), ("SHDEPS_PKG_MGR", "")],
+        );
+
+        assert!(output.contains("platform=stub-platform\n"), "{output}");
+        assert!(output.contains("pkg-mgr=\n"), "{output}");
+        assert!(
+            calls.lines().any(|line| line == "__api platform"),
+            "an empty platform export must fall back to the bridge, got:\n{calls}"
+        );
+        assert!(
+            !calls.lines().any(|line| line == "__api pkg-mgr"),
+            "an empty pkg-mgr export is definitive, got:\n{calls}"
+        );
+    }
 
     #[test]
     fn prelude_uses_bridge_helpers_for_mutating_api() {
