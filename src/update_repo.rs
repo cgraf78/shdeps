@@ -825,7 +825,9 @@ fn git_head_direct(install_dir: &Path) -> Option<String> {
     let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     if let Some(refname) = head.strip_prefix("ref: ") {
-        if refname.is_empty() || refname.contains("..") {
+        // Absolute targets would escape the git dir via `join` (same-user,
+        // equality-only use, but there is no reason to allow them).
+        if refname.is_empty() || refname.contains("..") || refname.starts_with('/') {
             return None;
         }
         if let Ok(sha) = fs::read_to_string(git_dir.join(refname)) {
@@ -1067,6 +1069,12 @@ fn prefer_ssh_origin(runner: &impl Runner, install_dir: &Path) -> bool {
 }
 
 fn sync_ssh_push_url(runner: &impl Runner, install_dir: &Path) {
+    // System-level config is assumed at `/etc/gitconfig`: a nonstandard-prefix
+    // git (e.g. Homebrew macOS, whose system config lives under the prefix)
+    // with a system-level `insteadOf` would be under-collected and could skip
+    // a sync git would perform. Vanishingly rare; everything else about
+    // collection (missing HOME, `~user/` includes, conditional includes,
+    // unparsable lines) fails closed to the slow path instead.
     sync_ssh_push_url_with_configs(
         runner,
         install_dir,
