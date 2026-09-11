@@ -155,6 +155,32 @@ pub(crate) fn write_atomic_cancellable(path: &Path, content: &str) -> Result<()>
 }
 
 fn write_atomic_impl(path: &Path, content: &str, cancellable: bool) -> Result<()> {
+    // A concurrent acknowledge may remove parent dirs between our mkdir and
+    // file creation (parallel tools sharing a marker tree); recreate and
+    // retry instead of failing the write. Bounded: a genuinely broken path
+    // still surfaces after the retries.
+    let mut attempts = 0;
+    loop {
+        match write_atomic_once(path, content, cancellable) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_concurrent_removal(&error) && attempts < 2 => {
+                attempts += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Whether a write failed because a concurrent actor removed a parent dir
+/// mid-write rather than because the path itself is bad.
+fn is_concurrent_removal(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn write_atomic_once(path: &Path, content: &str, cancellable: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

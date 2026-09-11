@@ -1119,10 +1119,20 @@ fn collect_markers(root: &Path, dir: &Path, names: &mut Vec<String>) -> Result<(
 
 const PENDING_POSTS_DIR: &str = ".pending-posts";
 
+/// Serializes pending-post marker updates across parallel tool threads.
+///
+/// `mark` creates parent dirs while `acknowledge` removes them; without
+/// mutual exclusion the mkdir and the climbing rmdir interleave and the
+/// write fails with ENOENT. Cross-process updates serialize on the state
+/// lock, so a process-local mutex is complete (the atomic writer's ENOENT
+/// retry remains as a net for reentrant nested updates).
+static PENDING_POSTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn mark_pending_post(state_dir: &Path, name: &str) -> Result<()> {
     if !config::valid_dep_name(name) {
         return Ok(());
     }
+    let _guard = PENDING_POSTS_LOCK.lock().unwrap();
     crate::state::write_atomic(&state_dir.join(PENDING_POSTS_DIR).join(name), "pending\n")
 }
 
@@ -1139,6 +1149,7 @@ fn acknowledge_pending_post(state_dir: &Path, name: &str) -> Result<()> {
     if !config::valid_dep_name(name) {
         return Ok(());
     }
+    let _guard = PENDING_POSTS_LOCK.lock().unwrap();
     let root = state_dir.join(PENDING_POSTS_DIR);
     let marker = root.join(name);
     match std::fs::remove_file(&marker) {
@@ -1839,5 +1850,29 @@ post() {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_support::temp_dir(&format!("shdeps-{name}"))
+    }
+
+    #[test]
+    fn concurrent_pending_post_mark_and_acknowledge_never_loses_parent_dirs() {
+        use super::{acknowledge_pending_post, mark_pending_post};
+
+        let state_dir = temp_dir("pending-posts-race");
+        let mut handles = Vec::new();
+        for thread in 0..8 {
+            let dir = state_dir.clone();
+            handles.push(std::thread::spawn(move || {
+                for item in 0..200 {
+                    // Shared names empty the root often, forcing the
+                    // acknowledge-climbs-while-another-marks interleave that
+                    // parallel tools hit rarely with distinct names.
+                    let name = format!("tool-{}", (thread + item) % 2);
+                    mark_pending_post(&dir, &name).unwrap();
+                    acknowledge_pending_post(&dir, &name).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }
