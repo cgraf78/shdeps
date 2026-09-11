@@ -2716,9 +2716,10 @@ impl Boundary {
                 if locally_owned {
                     self.retain_owned_rows(&processes);
                     // Local traversal cannot see an escape the kernel
-                    // reparented to this supervisor. Merge those candidates
-                    // before the unmarked-adoptee policy runs; only rows the
-                    // policy attributes may join the retained membership.
+                    // reparented to this supervisor. Merge the detached
+                    // (different-session) candidates before the
+                    // unmarked-adoptee policy runs; only rows the policy
+                    // attributes may join the retained membership.
                     let merged = linux_local_snapshot_with_supervisor_children(
                         (*processes).clone(),
                         deadline,
@@ -4300,11 +4301,24 @@ fn linux_local_snapshot_with_supervisor_children(
         .map(|process| process.pid)
         .collect::<BTreeSet<_>>();
     let adoptees = supervisor_children(deadline)?.unwrap_or_default();
+    // SAFETY: getsid observes our own session without pointers.
+    let own_sid = unsafe { libc::getsid(0) };
     for pid in adoptees {
         if !seen.insert(pid) {
             continue;
         }
         if let Some(process) = inspect(pid)? {
+            // A direct child that shares our session is indistinguishable
+            // from a plain supervisor spawn: only setsid moves a process out
+            // of its inherited session. Merging same-session children lets
+            // one test's live fixtures fail another test's leader-exit
+            // observation under parallel shards. Only detached children
+            // (setsid daemons and reparented escapes) are escapee-shaped and
+            // may reach the unmarked-adoptee policy; an unreadable session
+            // fails closed so the policy still sees the candidate.
+            if own_sid >= 0 && process.sid == own_sid as u32 {
+                continue;
+            }
             merged.push(process);
         }
     }
@@ -9626,6 +9640,8 @@ while True:
         // boundary) or fail closed (ambiguous) instead of publishing a false
         // empty proof.
         let supervisor = std::process::id();
+        // SAFETY: getsid observes our own session without pointers.
+        let own_sid = unsafe { libc::getsid(0) } as u32;
         let process = |pid, ppid, pgid, sid, live, start: &str| super::ProcessInfo {
             pid,
             ppid,
@@ -9638,8 +9654,8 @@ while True:
                 start: Some(start.to_owned()),
             },
         };
-        let leader = process(41, supervisor, 41, 41, false, "leader");
-        let escaped = process(7, supervisor, 7, 7, true, "escaped");
+        let leader = process(41, supervisor, 41, own_sid.wrapping_add(2), false, "leader");
+        let escaped = process(7, supervisor, 7, own_sid.wrapping_add(3), true, "escaped");
         let rows = [leader.clone(), escaped.clone()]
             .into_iter()
             .map(|process| (process.pid, process))
@@ -9688,6 +9704,61 @@ while True:
             |pid| Ok(rows.get(&pid).cloned()),
         )
         .expect_err("a failed supervisor child listing must fail the snapshot closed");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn leader_exit_discovery_ignores_same_session_supervisor_children() {
+        // A direct child that shares the supervisor session is
+        // indistinguishable from a plain supervisor spawn: only setsid moves
+        // a process out of its inherited session. Surfacing same-session
+        // children lets one test's live fixtures fail another test's
+        // leader-exit observation under parallel nextest shards. Only
+        // detached (different-session) children are escapee-shaped and may
+        // reach the unmarked-adoptee policy.
+        let supervisor = std::process::id();
+        // SAFETY: getsid observes our own session without pointers.
+        let own_sid = unsafe { libc::getsid(0) } as u32;
+        let process = |pid, ppid, sid, live, start: &str| super::ProcessInfo {
+            pid,
+            ppid,
+            pgid: pid,
+            sid,
+            live,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid,
+                start: Some(start.to_owned()),
+            },
+        };
+        let leader = process(41, supervisor, 41, false, "leader");
+        let plain = process(8, supervisor, own_sid, true, "plain");
+        let detached = process(7, supervisor, own_sid.wrapping_add(1), true, "detached");
+        let rows = [leader.clone(), plain.clone(), detached.clone()]
+            .into_iter()
+            .map(|process| (process.pid, process))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let merged = super::linux_local_snapshot_with_supervisor_children(
+            vec![leader.clone()],
+            deadline,
+            |_| Ok(Some(vec![leader.pid, plain.pid, detached.pid])),
+            |pid| Ok(rows.get(&pid).cloned()),
+        )
+        .unwrap();
+        assert!(
+            !merged
+                .iter()
+                .any(|process| process.identity == plain.identity),
+            "a same-session supervisor child must not reach the adoptee policy"
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|process| process.identity == detached.identity),
+            "a detached supervisor child must stay visible to the adoptee policy"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
