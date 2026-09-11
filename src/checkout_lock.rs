@@ -1537,6 +1537,7 @@ mod tests {
         const CHILD_ENV: &str = "SHDEPS_TEST_CHECKOUT_LOCK_CANCEL_CHILD";
         if let Some(checkout) = std::env::var_os(CHILD_ENV) {
             let checkout = PathBuf::from(checkout);
+            crate::test_support::install_timeout_backtrace_hook();
             let signals = crate::cancellation::Signals::install().unwrap();
             fs::write(
                 checkout.with_extension("ready"),
@@ -1568,8 +1569,8 @@ mod tests {
                 "SHDEPS_INTERNAL_PROCESS_BOUNDARIES",
                 "test-harness-subprocess",
             )
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
         let mut child = crate::cancellation::spawn_owned(
             &mut command,
             crate::cancellation::Isolation::DetachedSession,
@@ -1601,16 +1602,24 @@ mod tests {
                 break Some(child.wait().unwrap());
             }
             if signaled.elapsed() >= Duration::from_secs(1) {
+                // SAFETY: the retained child PID is live (it has not exited).
+                unsafe {
+                    libc::kill(child.id() as libc::pid_t, libc::SIGUSR2);
+                }
+                thread::sleep(Duration::from_millis(300));
                 let _ = child.stop(crate::cancellation::KILL_SIGNAL);
                 break None;
             }
             thread::sleep(Duration::from_millis(10));
         };
 
-        assert!(
-            status.is_some_and(|status| status.success()),
-            "checkout-lock waiter did not acknowledge cancellation promptly"
-        );
+        match status {
+            Some(status) if status.success() => {}
+            Some(status) => panic!(
+                "checkout-lock waiter exited without success instead of acknowledging cancellation: {status}"
+            ),
+            None => panic!("checkout-lock waiter did not acknowledge cancellation promptly"),
+        }
     }
 
     #[test]

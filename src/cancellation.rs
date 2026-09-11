@@ -1337,6 +1337,13 @@ impl OwnedChild {
         self.child.as_mut().and_then(|child| child.stderr.take())
     }
 
+    /// Leader PID for test-only diagnostic signals (a stuck boundary child
+    /// reports its backtrace on SIGUSR2 before the parent kills it).
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> u32 {
+        self.child.as_ref().expect("owned child available").id()
+    }
+
     /// Observes leader exit without releasing its PID/session identity.
     pub(crate) fn exited(&mut self) -> std::io::Result<bool> {
         if self.leader_exited {

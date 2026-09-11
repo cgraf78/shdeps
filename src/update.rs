@@ -2223,6 +2223,7 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
             run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
             return;
         }
+        crate::test_support::install_timeout_backtrace_hook();
 
         let signals = crate::cancellation::Signals::install().unwrap();
         let fixture = Fixture::new("custom-transition-retry");
@@ -10053,6 +10054,7 @@ version() { printf 'saw-pkg\n'; }
             run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
             return;
         }
+        crate::test_support::install_timeout_backtrace_hook();
 
         let mut fixture = Fixture::new("repo-fresh-push-url-cancel");
         fixture.write_lib();
@@ -12222,6 +12224,7 @@ version() { printf 'saw-pkg\n'; }
             run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
             return;
         }
+        crate::test_support::install_timeout_backtrace_hook();
 
         let signals = crate::cancellation::Signals::install().unwrap();
         let fixture = Fixture::new("repo-existing-metadata-cancel");

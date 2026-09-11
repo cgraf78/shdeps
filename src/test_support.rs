@@ -77,6 +77,34 @@ pub(crate) fn run_subprocess(
     output
 }
 
+/// Install a last-words backtrace hook for signal-boundary children.
+///
+/// The parent pings a stuck child with SIGUSR2 before its kill deadline so
+/// the child's stderr shows where it wedged. Best-effort only: capture may
+/// deadlock against a lock the stuck thread already holds, in which case
+/// the parent's kill proceeds with no trace. Failure-only; success paths
+/// never deliver SIGUSR2.
+#[cfg(unix)]
+pub(crate) fn install_timeout_backtrace_hook() {
+    unsafe extern "C" fn dump_backtrace(_signal: i32) {
+        let trace = std::backtrace::Backtrace::capture();
+        let text = format!("TIMEOUT_BACKTRACE:\n{trace}\n");
+        let bytes = text.as_bytes();
+        // SAFETY: raw write avoids the stderr lock the stuck thread may hold.
+        unsafe {
+            libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+        }
+    }
+    // SAFETY: zeroed sigaction with an explicit mask; a failed install just
+    // leaves the default disposition, which still ends the stuck child.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = dump_backtrace as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
+    }
+}
+
 /// Runs a signal-injection unit test in its own process.
 ///
 /// The production cancellation latch is intentionally process-global. Rust's
@@ -105,15 +133,28 @@ pub(crate) fn run_signal_boundary_subprocess(test_name: &str, child_env: &str) {
             break Some(child.wait().unwrap());
         }
         if started.elapsed() >= Duration::from_secs(5) {
+            // Ask a stuck child for its backtrace before killing it. The
+            // child installs the hook on entry; a child that never got that
+            // far dies to the default disposition, which still ends the wait.
+            // SAFETY: the retained child PID is live (it has not exited).
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGUSR2);
+            }
+            std::thread::sleep(Duration::from_millis(300));
             let _ = child.stop(crate::cancellation::KILL_SIGNAL);
             break None;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(
-        status.is_some_and(|status| status.success()),
-        "signal-boundary subprocess did not complete successfully"
-    );
+    match status {
+        Some(status) if status.success() => {}
+        Some(status) => {
+            panic!("signal-boundary subprocess for {test_name} exited without success: {status}")
+        }
+        None => panic!(
+            "signal-boundary subprocess for {test_name} did not exit within 5s and was killed"
+        ),
+    }
 }
 
 fn create_temp_dir(parent: &std::path::Path, prefix: &str) -> PathBuf {
