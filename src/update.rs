@@ -10196,6 +10196,11 @@ version() { printf 'saw-pkg\n'; }
         );
 
         // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::checkout_lock::diag_dump_lock_state(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+            &[&fixture.roots.home],
+        );
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
         crate::cancellation::teardown_phase(
             "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
             "before-retry-run",
@@ -12360,6 +12365,11 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
         let retry_runner = FakeRunner::default();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::checkout_lock::diag_dump_lock_state(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            &[&fixture.roots.home],
+        );
         // TEMP-DIAG-131: revert with the macOS teardown telemetry.
         crate::cancellation::teardown_phase(
             "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",

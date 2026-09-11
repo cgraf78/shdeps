@@ -663,7 +663,7 @@ pub(crate) fn record_cleanup_error(error: &std::io::Error) {
 /// tests. Env-gated, stderr-unbuffered so killed subprocesses
 /// still leave their last heartbeat. Revert once macOS is green.
 #[cfg(unix)]
-fn teardown_diag_enabled() -> bool {
+pub(crate) fn teardown_diag_enabled() -> bool {
     std::env::var_os("SHDEPS_TEST_TEARDOWN_DIAG").is_some()
 }
 
@@ -674,7 +674,7 @@ fn teardown_diag_enabled() -> bool {
 /// changes after process start. Revert with the macOS teardown telemetry
 /// once macOS is green.
 #[cfg(any(test, unix))]
-fn diag_child_name() -> String {
+pub(crate) fn diag_child_name() -> String {
     static NAME: OnceLock<String> = OnceLock::new();
     NAME.get_or_init(|| {
         let mut args = std::env::args();
