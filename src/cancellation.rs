@@ -6,8 +6,10 @@
 //! normal Rust code performs TERM, bounded KILL escalation, output draining,
 //! and reaping.
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::collections::VecDeque;
 #[cfg(unix)]
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Child, Command, ExitStatus, Stdio};
 #[cfg(unix)]
 use std::sync::Arc;
@@ -1377,7 +1379,15 @@ impl OwnedChild {
                 .boundary
                 .observe_leader_exit(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET);
             #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-            let observed = self.boundary.track(Instant::now() + TRACK_SNAPSHOT_BUDGET);
+            let observed = self
+                .boundary
+                .track(Instant::now() + TRACK_SNAPSHOT_BUDGET)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "portable process snapshot deadline expired",
+                    )
+                });
             // A zombie leader still reserves its PID and process group for
             // safe cleanup, but it can no longer use the terminal. A retained
             // descendant may have taken the foreground in the meantime; only
@@ -3324,7 +3334,10 @@ impl Boundary {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let prefer_exact_delivery = cohort_complete && exact_descendant_authority_available();
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        let prefer_exact_delivery = false;
+        let prefer_exact_delivery = {
+            let _ = cohort_complete;
+            false
+        };
         let (phase, result) = deliver_initial_signal_phase(
             self.leader,
             self.leader_retained,
