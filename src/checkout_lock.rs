@@ -698,9 +698,12 @@ fn process_identity(pid: libc::pid_t) -> io::Result<(String, String, u8)> {
 
 // Run one locale-C probe with all standard streams bounded and noninteractive.
 fn command_output(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
-    // A slow probe must not delay an already-received signal past the next
-    // loop-top check; every probe rechecks first.
-    crate::cancellation::check()?;
+    // No cancellation check here: release and recovery run deterministically
+    // after the operation already acknowledged its signal, and they need
+    // self-identity probes to free the lock. Refusing probes under the latch
+    // leaked a self-held live lock on platforms without procfs, wedging
+    // every cancel+retry. Callers that wait (acquire) still check at their
+    // own loop top, so a mid-iteration signal only costs one bounded probe.
     let mut command = Command::new(program);
     command.args(args).env("LC_ALL", "C");
     let output = crate::cancellation::output(command, None)?;
@@ -1714,6 +1717,43 @@ mod tests {
             ),
             None => panic!("checkout-lock waiter did not acknowledge cancellation promptly"),
         }
+    }
+
+    #[test]
+    fn release_succeeds_after_signal_latch() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CHECKOUT_LOCK_RELEASE_CHILD";
+        const TEST_NAME: &str = "checkout_lock::tests::release_succeeds_after_signal_latch";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let signals = crate::cancellation::Signals::install().unwrap();
+            let root = crate::test_support::temp_dir("checkout-lock-release-latch");
+            let checkout = root.join("tool");
+            let mut lock = CheckoutLock::acquire(&checkout, Duration::from_secs(5)).unwrap();
+            // Latch a real signal the way a cancelled first run does, then
+            // release: the lock must be freed even though teardown runs
+            // under the latch (macOS identity probes used to refuse, which
+            // wedged every cancel+retry on a self-held live lock).
+            // SAFETY: signaling our own PID with an installed latch handler.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+            let latched = Instant::now();
+            while crate::cancellation::received_signal().is_none() {
+                assert!(
+                    latched.elapsed() < Duration::from_secs(2),
+                    "signal latch did not fire"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            lock.release().unwrap();
+            let canonical = Paths::new(&checkout).unwrap().canonical;
+            assert_eq!(
+                fs::symlink_metadata(&canonical).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            let code = signals.finish_result(Ok::<_, crate::Error>(0)).unwrap();
+            assert_eq!(code, 128 + libc::SIGTERM);
+            return;
+        }
+
+        crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
     }
 
     #[test]
