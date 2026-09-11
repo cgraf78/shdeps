@@ -685,10 +685,14 @@ where
     //
     // The handle is bound to a local so its `Drop` releases the lock
     // when `run` returns by any path.
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-state-lock");
     let _lock = match held_lock {
         Some(lock) => lock,
         None => crate::state::StateLock::acquire(&context.roots.state_dir)?,
     };
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-state-lock");
     cancellation::check()?;
     let mut summary = Summary::default();
 
@@ -696,14 +700,22 @@ where
     // lock. Another updater may have committed a newer method or ownership row
     // while this invocation waited, so all transition and cleanup decisions
     // below must be rebuilt from the now-serialized on-disk state.
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-fresh-recovery");
     recover_fresh_repo_publications(context)?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-fresh-recovery");
     let initial_manifest = manifest::read(context.manifest_path)?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-pending-publications");
     update_transition::recover_pending_publications(
         entries,
         &initial_manifest,
         context.manifest_path,
         context.roots,
     )?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-pending-publications");
     let recovery_entries = entries
         .iter()
         .filter(|entry| active(entry, context.env))
@@ -719,6 +731,8 @@ where
                 .map(|fingerprint| (entry.name.clone(), fingerprint))
         })
         .collect::<Result<HashMap<_, _>>>()?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-pending-transitions");
     for pending in update_transition::recover_pending_transitions(
         &recovery_entries,
         &custom_fingerprints,
@@ -726,6 +740,8 @@ where
         context.roots,
         Some((context.pkg_mgr, context.env.is_android())),
     )? {
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase("run", "pending-transition-item");
         let old = pending.old().clone();
         let leftover = with_old_repo_checkout_lock(Some(&old), context, |repo_root| {
             pending.finish(context.roots, repo_root)
@@ -735,6 +751,8 @@ where
             summary.leftover_details.insert(old.name, detail);
         }
     }
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-pending-transitions");
     // Recovery is an atomic repair boundary: once entered it runs to
     // completion, then cancellation is honored before any new work starts.
     cancellation::check()?;

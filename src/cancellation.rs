@@ -657,9 +657,9 @@ pub(crate) fn record_cleanup_error(error: &std::io::Error) {
 }
 
 /// TEMP-DIAG-131: teardown failure/hang telemetry for the macOS signal
-/// tests. Test-only, env-gated, stderr-unbuffered so killed subprocesses
+/// tests. Env-gated, stderr-unbuffered so killed subprocesses
 /// still leave their last heartbeat. Revert once macOS is green.
-#[cfg(test)]
+#[cfg(unix)]
 fn teardown_diag_enabled() -> bool {
     std::env::var_os("SHDEPS_TEST_TEARDOWN_DIAG").is_some()
 }
@@ -735,7 +735,7 @@ pub(crate) fn spawn_teardown_watchdog(test_name: &'static str) -> impl Drop {
 
 /// TEMP-DIAG-131: attributed phase marker for the macOS timeout
 /// victims. Revert with the macOS teardown telemetry once macOS is green.
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 pub(crate) fn teardown_phase(test_name: &str, phase: &str) {
     if teardown_diag_enabled() {
         eprintln!("DIAG131 phase {test_name} {phase}");
