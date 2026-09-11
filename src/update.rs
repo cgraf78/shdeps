@@ -9914,7 +9914,10 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
+        assert!(
+            !summary.has_errors(),
+            "repo install must succeed with a local clone: {summary:?}"
+        );
         assert!(fixture.roots.install_dir.join("cgraf78/ds").is_symlink());
         assert!(!fixture.roots.install_dir.join("cgraf78/ds.git").exists());
         assert!(

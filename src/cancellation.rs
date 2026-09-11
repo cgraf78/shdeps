@@ -49,7 +49,13 @@ const TRACK_SNAPSHOT_BUDGET: Duration = Duration::from_millis(250);
 const LINUX_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const LEADER_EXIT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
-#[cfg(unix)]
+// A portable snapshot spawns `ps` plus per-PID probes; on loaded macOS
+// runners a single whole-table scan can exceed 1s, which permanently
+// fails an otherwise clean teardown (the discovery error is retained).
+// 5s tolerates loaded scans while still bounding a genuinely wedged `ps`.
+#[cfg(target_os = "macos")]
+const CLEANUP_SNAPSHOT_BUDGET: Duration = Duration::from_secs(5);
+#[cfg(all(unix, not(target_os = "macos")))]
 const CLEANUP_SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const TRACK_POLL: Duration = Duration::from_millis(50);
@@ -62,6 +68,17 @@ const TRACK_POLL: Duration = Duration::from_millis(50);
 const AMBIGUOUS_ADOPTEE_SETTLE: Duration = Duration::from_millis(50);
 #[cfg(any(test, all(unix, not(any(target_os = "linux", target_os = "android")))))]
 const PORTABLE_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+// Grace-loop polling on portable platforms shares whole-system scans at
+// this cadence instead of spawning `ps` per 20ms poll. Concurrent
+// boundaries single-flight through one scan per window, which collapses
+// the fork storm that otherwise makes every scan slower (and can push a
+// single scan past CLEANUP_SNAPSHOT_BUDGET on loaded macOS runners).
+// 50ms matches the Linux fresh-discovery cadence (TRACK_POLL) and stays
+// well under the 250ms grace, so genuine exits are still acknowledged
+// within grace; see grace_empty_counts for why consecutive empties must
+// be spaced by this TTL to remain independent evidence.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const GRACE_SNAPSHOT_TTL: Duration = Duration::from_millis(50);
 const OUTPUT_POLL: Duration = Duration::from_millis(10);
 static RECEIVED: AtomicI32 = AtomicI32::new(0);
 static ACTIVE_HANDLERS: AtomicUsize = AtomicUsize::new(0);
@@ -2162,6 +2179,24 @@ fn consume_stopped(pid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+// Whether one grace-loop empty observation advances the two-proof counter.
+// Polls sharing a cached scan are not independent evidence of a stable
+// empty set: two polls 20ms apart can read the same scan and falsely
+// prove emptiness from a single enumeration. Only count an empty when at
+// least `spacing` (the cache TTL) has passed since the last counted one,
+// which guarantees a fresh enumeration happened between the two proofs.
+// A zero spacing counts every empty; Linux passes zero because its
+// per-member revalidation is already an independent observation.
+#[cfg(unix)]
+fn grace_empty_counts(now: Instant, last_counted: &mut Option<Instant>, spacing: Duration) -> bool {
+    if last_counted.is_none_or(|at| now.saturating_duration_since(at) >= spacing) {
+        *last_counted = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
 // Dispatches teardown through the boundary retained from spawn. Keeping its
 // identity set alive while the leader runs is what lets cancellation reach a
 // descendant after that descendant changes group/session and is reparented.
@@ -2194,6 +2229,7 @@ fn stop_boundary(
     });
     retain_first_error(&mut first_error, delivery);
     let mut consecutive_empty = 0;
+    let mut grace_empty_at: Option<Instant> = None;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let exact_grace_delivery = exact_descendant_authority_available();
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2223,17 +2259,26 @@ fn stop_boundary(
         };
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         let observed = boundary
-            .observe(graceful_deadline)
+            .observe_grace_cached(graceful_deadline)
             .map(|empty| empty && observe_exit(child).ok().flatten().is_some());
         retain_terminal_restore(&mut first_error, foreground, boundary);
-        if observed == Some(true) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let empty_spacing = Duration::ZERO;
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        let empty_spacing = GRACE_SNAPSHOT_TTL;
+        if observed == Some(true)
+            && grace_empty_counts(Instant::now(), &mut grace_empty_at, empty_spacing)
+        {
             consecutive_empty += 1;
             if consecutive_empty >= 2 {
                 break;
             }
-        } else {
+        } else if observed != Some(true) {
             consecutive_empty = 0;
+            grace_empty_at = None;
         }
+        // A same-window empty holds the count: no new scan evidence arrived,
+        // so the boundary repolls instead of proving from one enumeration.
         retain_first_error(&mut first_error, boundary.signal_new(first_signal));
         std::thread::sleep(POLL);
     }
@@ -2345,6 +2390,7 @@ fn stop_reaped_boundary(
     retain_first_error(&mut first_error, delivery);
 
     let mut consecutive_empty = 0;
+    let mut grace_empty_at: Option<Instant> = None;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let exact_grace_delivery = exact_descendant_authority_available();
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2361,16 +2407,25 @@ fn stop_reaped_boundary(
             Some(false)
         };
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        let observed = boundary.observe(graceful_deadline);
+        let observed = boundary.observe_grace_cached(graceful_deadline);
         retain_terminal_restore(&mut first_error, foreground, boundary);
-        if observed == Some(true) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let empty_spacing = Duration::ZERO;
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        let empty_spacing = GRACE_SNAPSHOT_TTL;
+        if observed == Some(true)
+            && grace_empty_counts(Instant::now(), &mut grace_empty_at, empty_spacing)
+        {
             consecutive_empty += 1;
             if consecutive_empty >= 2 {
                 break;
             }
-        } else {
+        } else if observed != Some(true) {
             consecutive_empty = 0;
+            grace_empty_at = None;
         }
+        // A same-window empty holds the count: no new scan evidence arrived,
+        // so the boundary repolls instead of proving from one enumeration.
         retain_first_error(&mut first_error, boundary.signal_new(first_signal));
         std::thread::sleep(POLL);
     }
@@ -2935,6 +2990,25 @@ impl Boundary {
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         let empty = self.observe_processes(&processes).ok()?;
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        self.verify_empty_observation(empty, deadline).ok()
+    }
+
+    // Grace-loop polling on portable platforms. Identical membership
+    // reconciliation to reconcile_fresh, but concurrent boundaries share
+    // whole-system scans at GRACE_SNAPSHOT_TTL instead of each spawning
+    // `ps` per poll. Callers must space consecutive-empty proofs by the
+    // same TTL (grace_empty_counts): polls sharing one cached scan are
+    // not independent evidence of a stable empty set.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    fn observe_grace_cached(&mut self, deadline: Instant) -> Option<bool> {
+        // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
+        #[cfg(test)]
+        let _diag = DiagScope::enter("observe");
+        let now = Instant::now();
+        let processes = PORTABLE_SNAPSHOT_CACHE
+            .get_or_init(SnapshotCache::default)
+            .get_or_load(now, GRACE_SNAPSHOT_TTL, deadline, process_snapshot)?;
+        let empty = self.observe_processes(&processes).ok()?;
         self.verify_empty_observation(empty, deadline).ok()
     }
 
@@ -9562,6 +9636,46 @@ while True:
             deadline.saturating_duration_since(delivered_at) >= super::KILL_SETTLE_GRACE,
             "a delivery at the end of discovery must retain a separate stable-empty verification reserve"
         );
+    }
+
+    #[test]
+    fn grace_empty_counts_first_and_spaced_observations() {
+        let spacing = Duration::from_millis(50);
+        let mut last = None;
+        let first = Instant::now();
+        assert!(super::grace_empty_counts(first, &mut last, spacing));
+        assert_eq!(last, Some(first));
+        assert!(super::grace_empty_counts(
+            first + Duration::from_millis(50),
+            &mut last,
+            spacing
+        ));
+    }
+
+    #[test]
+    fn grace_empty_holds_observations_sharing_one_scan_window() {
+        let spacing = Duration::from_millis(50);
+        let mut last = None;
+        let first = Instant::now();
+        assert!(super::grace_empty_counts(first, &mut last, spacing));
+        assert!(!super::grace_empty_counts(
+            first + Duration::from_millis(20),
+            &mut last,
+            spacing
+        ));
+        assert_eq!(
+            last,
+            Some(first),
+            "a held observation must not move the proof window"
+        );
+    }
+
+    #[test]
+    fn grace_empty_with_zero_spacing_counts_every_observation() {
+        let mut last = None;
+        let first = Instant::now();
+        assert!(super::grace_empty_counts(first, &mut last, Duration::ZERO));
+        assert!(super::grace_empty_counts(first, &mut last, Duration::ZERO));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

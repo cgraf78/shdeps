@@ -4823,9 +4823,12 @@ while :; do /bin/sleep 1; done
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
+    // The TERM-to-trap-to-spawn chain is the longest in this test but had
+    // the shortest budget; loaded runners starve it intermittently. Match
+    // the sibling exit wait below.
     let child_pid = wait_for_pid(
         &child_pid_path,
-        Duration::from_secs(2),
+        Duration::from_secs(4),
         "late same-group child pid",
     );
     let _child_guard = EscapedProcessGuard::new(child_pid);
