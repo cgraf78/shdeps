@@ -10159,6 +10159,11 @@ version() { printf 'saw-pkg\n'; }
             128 + libc::SIGTERM
         );
 
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+            "before-retry-run",
+        );
         let retry = run(
             &[],
             &manifest::read(&manifest_path).unwrap(),
@@ -10169,6 +10174,11 @@ version() { printf 'saw-pkg\n'; }
             },
         )
         .unwrap();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+            "after-retry-run",
+        );
 
         assert!(
             !retry.has_errors(),
@@ -12314,6 +12324,11 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
         let retry_runner = FakeRunner::default();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "before-retry-run",
+        );
         let retry = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
             &manifest::read(&manifest_path).unwrap(),
@@ -12324,12 +12339,22 @@ version() { printf 'saw-pkg\n'; }
             },
         )
         .unwrap();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "after-retry-run",
+        );
         assert!(!retry.has_errors());
         assert_eq!(
             fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
             "post\n"
         );
 
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "before-final-run",
+        );
         let final_run = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
             &manifest::read(&manifest_path).unwrap(),
@@ -12340,6 +12365,11 @@ version() { printf 'saw-pkg\n'; }
             },
         )
         .unwrap();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "after-final-run",
+        );
         assert!(!final_run.has_errors());
         assert_eq!(
             fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
