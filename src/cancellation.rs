@@ -666,7 +666,10 @@ fn teardown_diag_enabled() -> bool {
 
 /// TEMP-DIAG-131: prints scope entry/exit (see above).
 #[cfg(test)]
-struct DiagScope(&'static str);
+struct DiagScope {
+    name: &'static str,
+    started: Instant,
+}
 
 #[cfg(test)]
 impl DiagScope {
@@ -674,7 +677,10 @@ impl DiagScope {
         if teardown_diag_enabled() {
             eprintln!("DIAG131 enter {name}");
         }
-        Self(name)
+        Self {
+            name,
+            started: Instant::now(),
+        }
     }
 }
 
@@ -682,7 +688,11 @@ impl DiagScope {
 impl Drop for DiagScope {
     fn drop(&mut self) {
         if teardown_diag_enabled() {
-            eprintln!("DIAG131 exit {}", self.0);
+            eprintln!(
+                "DIAG131 exit {} elapsed_ms={}",
+                self.name,
+                self.started.elapsed().as_millis()
+            );
         }
     }
 }
@@ -2281,6 +2291,17 @@ fn stop_boundary(
         // so the boundary repolls instead of proving from one enumeration.
         retain_first_error(&mut first_error, boundary.signal_new(first_signal));
         std::thread::sleep(POLL);
+    }
+    if consecutive_empty >= 2 {
+        // Grace proved the boundary empty with two consecutive successful
+        // observations (spaced across distinct scans on cached platforms),
+        // the same proof strength the KILL branch below requires before it
+        // drops retained errors. A transient snapshot/delivery failure from
+        // an earlier poll is definitionally non-fatal to this outcome: a
+        // still-live member would have defeated the proof. Drop retained
+        // errors so a successful cleanup cannot report CLEANUP_FAILED;
+        // errors latched after this point still fail the stop.
+        first_error = None;
     }
     if consecutive_empty < 2 {
         // Freeze the attributed set before final discovery. Unlike catchable
