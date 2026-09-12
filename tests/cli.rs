@@ -5090,7 +5090,6 @@ exit 2
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-#[ignore = "TEMP-DEBUG: isolate macOS hang; do not land"]
 fn cold_sudo_authentication_and_parent_session_retry_work_through_a_real_pty() {
     use std::io::{Read as _, Write as _};
 
