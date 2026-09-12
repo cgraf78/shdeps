@@ -1650,16 +1650,14 @@ exists() { return 0; }
 version() { printf '9.9.9\n'; }
 "#,
     );
-    let head = Command::new("git")
-        .args([
-            "-C",
-            fixture.dir.join("git/tool").to_str().unwrap(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .unwrap();
+    let head = capture_output(Command::new("git").args([
+        "-C",
+        fixture.dir.join("git/tool").to_str().unwrap(),
+        "rev-parse",
+        "--short",
+        "HEAD",
+    ]))
+    .unwrap();
     assert!(head.status.success());
     let head = String::from_utf8(head.stdout).unwrap();
 
@@ -7167,8 +7165,44 @@ esac
     assert_eq!(text(&quiet.stderr), "");
 }
 
+static CAPTURE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run `command` capturing stdout/stderr through files instead of pipes.
+///
+/// `Command::output()` funnels the child through anonymous pipes and waits
+/// for EOF. On macOS `pipe()`+`fcntl(CLOEXEC)` is non-atomic, so a fork in
+/// a parallel test thread can inherit a pipe write end mid-window; when
+/// that child outlives `ps` (stopped fixtures, sleep ladders), the EOF wait
+/// hangs forever and the suite falls silent with live threads. Regular
+/// files have no EOF wait: `status()` returns when this child exits, and a
+/// leaked duplicate cannot block the read. Capture files are unique per
+/// call (pid + sequence) and removed best-effort afterward; the caller's
+/// stdin configuration is preserved exactly as `output()` would see it.
+fn capture_output(command: &mut Command) -> std::io::Result<Output> {
+    let seq = CAPTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let out_path = dir.join(format!("shdeps-capture-{pid}-{seq}.out"));
+    let err_path = dir.join(format!("shdeps-capture-{pid}-{seq}.err"));
+    let out_file = fs::File::create(&out_path)?;
+    let err_file = fs::File::create(&err_path)?;
+    command
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file));
+    let status = command.status()?;
+    let stdout = fs::read(&out_path).unwrap_or_default();
+    let stderr = fs::read(&err_path).unwrap_or_default();
+    let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&err_path);
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn run(command: &mut Command) -> Output {
-    command.output().expect("shdeps command should run")
+    capture_output(command).expect("shdeps command should run")
 }
 
 fn timed(command: &mut Command) -> (Output, Duration) {
@@ -7187,6 +7221,20 @@ fn timed_samples(mut command: impl FnMut() -> Command) -> (Output, Vec<Duration>
         samples.push(elapsed);
     }
     (output.expect("at least one timing sample"), samples)
+}
+
+#[test]
+fn file_capture_preserves_split_streams() {
+    // The file-redirect capture must observe the same bytes `output()`
+    // would: stdout and stderr stay split, exit status is preserved, and
+    // images. A temp-dir leak scan would race parallel tests sharing
+    // this process, so cleanup is best-effort by construction instead.)
+    let mut command = Command::new("echo");
+    command.arg("capture-probe");
+    let captured = capture_output(&mut command).expect("echo should run");
+    assert!(captured.status.success());
+    assert_eq!(text(&captured.stdout), "capture-probe\n");
+    assert!(captured.stderr.is_empty());
 }
 
 fn representative_duration(samples: &[Duration]) -> Duration {
@@ -7361,10 +7409,9 @@ fn process_is_running(pid: u32) -> bool {
 
     #[cfg(not(target_os = "linux"))]
     {
-        let output = Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .expect("ps should be available in non-Linux CLI tests");
+        let output =
+            capture_output(Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]))
+                .expect("ps should be available in non-Linux CLI tests");
         output.status.success() && !text(&output.stdout).trim_start().starts_with('Z')
     }
 }
@@ -7384,10 +7431,9 @@ fn process_is_stopped(pid: u32) -> bool {
 
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .expect("ps should inspect the PTY test process");
+        let output =
+            capture_output(Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]))
+                .expect("ps should inspect the PTY test process");
         output.status.success() && text(&output.stdout).trim_start().starts_with('T')
     }
 }
@@ -7559,9 +7605,7 @@ fn test_session_members(session: u32) -> Vec<u32> {
             .filter_map(|entry| entry.file_name().into_string().ok()?.parse::<u32>().ok())
             .collect::<Vec<_>>()
     } else {
-        Command::new("ps")
-            .args(["-A", "-o", "pid="])
-            .output()
+        capture_output(Command::new("ps").args(["-A", "-o", "pid="]))
             .ok()
             .filter(|output| output.status.success())
             .map(|output| {
@@ -7728,10 +7772,8 @@ fn test_process_start(pid: u32) -> Option<String> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn test_process_start(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let output =
+        capture_output(Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()])).ok()?;
     output.status.success().then(|| text(&output.stdout))
 }
 
@@ -7857,9 +7899,7 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool, descriptio
 }
 
 fn host_arch() -> String {
-    let output = Command::new("uname")
-        .arg("-m")
-        .output()
+    let output = capture_output(Command::new("uname").arg("-m"))
         .expect("uname should be available in CLI tests");
     match text(&output.stdout).trim() {
         // Release labels normalize common architecture aliases. Keep the test
@@ -8044,14 +8084,15 @@ impl Fixture {
     fn initialize_dev_checkout(&self, short_name: &str, origin: &str) {
         let root = self.dir.join("git").join(short_name);
         let run = |args: &[&str]| {
-            let output = Command::new("git")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args(["-c", "core.hooksPath=/dev/null", "-C"])
-                .arg(&root)
-                .args(args)
-                .output()
-                .unwrap();
+            let output = capture_output(
+                Command::new("git")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .args(["-c", "core.hooksPath=/dev/null", "-C"])
+                    .arg(&root)
+                    .args(args),
+            )
+            .unwrap();
             assert!(
                 output.status.success(),
                 "git -C {} {} failed: {}",
