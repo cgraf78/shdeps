@@ -3029,9 +3029,24 @@ impl Boundary {
                     if let Some(registry) = SPAWN_REGISTRATIONS.get() {
                         let _ = registry.wait_for_snapshot_registrations(deadline);
                     }
-                    match self.lifetime_has_holders()? {
-                        Some(false) | None => Ok(true),
-                        Some(true) => Err(Self::open_lease_error()),
+                    // Only supervised spawns register a window; parallel
+                    // tests fork plain children (fixture git, probes)
+                    // that inherit this writer and release it on exec
+                    // microseconds later. A single re-read races that
+                    // release under load, so poll to the caller
+                    // deadline before failing closed on a genuine leak.
+                    loop {
+                        match self.lifetime_has_holders()? {
+                            Some(false) | None => return Ok(true),
+                            Some(true) => {}
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(Self::open_lease_error());
+                        }
+                        std::thread::sleep(
+                            Duration::from_millis(10)
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
                     }
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]
