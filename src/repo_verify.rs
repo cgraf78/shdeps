@@ -1767,17 +1767,16 @@ mod tests {
                 "fixture",
             ],
         );
-        let remote = Command::new("git")
-            .args([
-                "ls-remote",
-                "--symref",
-                "--exit-code",
-                "--",
-                candidate.to_str().unwrap(),
-                "HEAD",
-            ])
-            .output()
-            .unwrap();
+        let mut remote = Command::new("git");
+        remote.args([
+            "ls-remote",
+            "--symref",
+            "--exit-code",
+            "--",
+            candidate.to_str().unwrap(),
+            "HEAD",
+        ]);
+        let remote = crate::test_support::run_subprocess(remote).unwrap();
         assert!(
             remote.status.success(),
             "stock Git rejected the isolated ls-remote argv shape: {}",
@@ -1915,21 +1914,21 @@ mod tests {
         );
         fixture_git(&source, &["branch", "-M", "main"]);
 
-        let bare = Command::new("git")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
+        let mut bare = Command::new("git");
+        bare.env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["clone", "--quiet", "--bare", "--"])
             .arg(&source)
-            .arg(&origin)
-            .output()
-            .unwrap();
+            .arg(&origin);
+        let bare = crate::test_support::run_subprocess(bare).unwrap();
         assert!(
             bare.status.success(),
             "bare origin clone failed: {}",
             String::from_utf8_lossy(&bare.stderr)
         );
         let origin_text = format!("file://{}", origin.display());
-        let checkout = Command::new("git")
+        let mut checkout = Command::new("git");
+        checkout
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args([
@@ -1942,9 +1941,8 @@ mod tests {
                 "--",
             ])
             .arg(&origin_text)
-            .arg(&candidate)
-            .output()
-            .unwrap();
+            .arg(&candidate);
+        let checkout = crate::test_support::run_subprocess(checkout).unwrap();
         assert!(
             checkout.status.success(),
             "candidate clone failed: {}",
@@ -2027,14 +2025,14 @@ mod tests {
     }
 
     fn fixture_git(root: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-c", "core.hooksPath=/dev/null", "-C"])
             .arg(root)
-            .args(args)
-            .output()
-            .unwrap();
+            .args(args);
+        let output = crate::test_support::run_subprocess(command).unwrap();
         assert!(
             output.status.success(),
             "git -C {} {} failed: {}",
@@ -2045,13 +2043,13 @@ mod tests {
     }
 
     fn fixture_git_dir(git_dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .arg(format!("--git-dir={}", git_dir.display()))
-            .args(args)
-            .output()
-            .unwrap();
+            .args(args);
+        let output = crate::test_support::run_subprocess(command).unwrap();
         assert!(
             output.status.success(),
             "git --git-dir={} {} failed: {}",
@@ -2096,12 +2094,9 @@ mod tests {
             env: &BTreeMap<OsString, OsString>,
             _timeout: Duration,
         ) -> std::io::Result<Output> {
-            let output = Command::new(program)
-                .current_dir(cwd)
-                .args(args)
-                .env_clear()
-                .envs(env)
-                .output()?;
+            let mut command = Command::new(program);
+            command.current_dir(cwd).args(args).env_clear().envs(env);
+            let output = crate::test_support::run_subprocess(command)?;
             Ok(Output {
                 success: output.status.success(),
                 timed_out: false,

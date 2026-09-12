@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -434,6 +434,80 @@ fn normalize_requested_checkout(requested_checkout: &Path) -> io::Result<PathBuf
 }
 
 // Run one mutation while holding the shared lock and report strict release errors.
+/// TEMP-DIAG-131: dump checkout-lock protocol state so one CI round shows
+/// whether a post-cancel retry wedges on a leftover owner/claim record.
+/// Walks `roots` for `*.install.lock*` paths, printing each entry's kind,
+/// symlink target, small file contents, and the classify() verdict for
+/// canonical paths. Revert with the macOS teardown telemetry once macOS
+/// is green.
+#[cfg(all(test, unix))]
+pub(crate) fn diag_dump_lock_state(test_name: &str, roots: &[&Path]) {
+    if !crate::cancellation::teardown_diag_enabled() {
+        return;
+    }
+    let child = crate::cancellation::diag_child_name();
+    let mut stack: Vec<(PathBuf, usize)> =
+        roots.iter().map(|root| (root.to_path_buf(), 0)).collect();
+    let mut found = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 8 {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains("install.lock") {
+                found += 1;
+                let kind = match fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.file_type().is_symlink() => format!(
+                        "symlink->{}",
+                        fs::read_link(&path)
+                            .map(|target| target.display().to_string())
+                            .unwrap_or_else(|_| "?".to_owned())
+                    ),
+                    Ok(meta) if meta.file_type().is_dir() => "dir".to_owned(),
+                    Ok(_) => "file".to_owned(),
+                    Err(error) => format!("meta-err:{error}"),
+                };
+                let mut extra = String::new();
+                if kind == "file" {
+                    if let Ok(bytes) = fs::read(&path) {
+                        if bytes.len() < 2048 {
+                            extra = format!(" contents={:?}", String::from_utf8_lossy(&bytes));
+                        }
+                    }
+                }
+                if name.ends_with(".install.lock") {
+                    if let Some(parent) = path.parent() {
+                        let stem = name
+                            .trim_start_matches('.')
+                            .trim_end_matches(".install.lock");
+                        match Paths::new(&parent.join(stem)) {
+                            Ok(lock_paths) => {
+                                extra.push_str(&format!(" classify={:?}", classify(&lock_paths)));
+                            }
+                            Err(error) => {
+                                extra.push_str(&format!(" classify-err:{error}"));
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "DIAG131 lockstate {test_name} #{found} {} {kind}{extra} test={child}",
+                    path.display()
+                );
+            }
+            if depth < 8 && path.is_dir() && !path.is_symlink() {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    eprintln!("DIAG131 lockstate {test_name} total={found} test={child}");
+}
+
 pub(crate) fn with_checkout_lock<T>(
     requested_checkout: &Path,
     env: &BTreeMap<String, String>,
@@ -469,12 +543,18 @@ fn with_checkout_lock_timeout<T>(
     timeout: Duration,
     operation: impl FnOnce(&Path) -> crate::Result<T>,
 ) -> crate::Result<T> {
+    crate::cancellation::check()?;
     let normalized_checkout = normalize_requested_checkout(requested_checkout)?;
     let mut lock = CheckoutLock::acquire(&normalized_checkout, timeout)?;
-    let operation_result = operation(&lock.paths.checkout);
+    let operation_result = crate::cancellation::check()
+        .map_err(crate::Error::from)
+        .and_then(|()| operation(&lock.paths.checkout));
     let release_result = lock.release();
     match (operation_result, release_result) {
-        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Ok(())) => {
+            crate::cancellation::check()?;
+            Ok(value)
+        }
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
         (Err(operation_error), Err(release_error)) => Err(io::Error::other(format!(
@@ -618,12 +698,15 @@ fn process_identity(pid: libc::pid_t) -> io::Result<(String, String, u8)> {
 
 // Run one locale-C probe with all standard streams bounded and noninteractive.
 fn command_output(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
-    let output = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
+    // No cancellation check here: release and recovery run deterministically
+    // after the operation already acknowledged its signal, and they need
+    // self-identity probes to free the lock. Refusing probes under the latch
+    // leaked a self-held live lock on platforms without procfs, wedging
+    // every cancel+retry. Callers that wait (acquire) still check at their
+    // own loop top, so a mid-iteration signal only costs one bounded probe.
+    let mut command = Command::new(program);
+    command.args(args).env("LC_ALL", "C");
+    let output = crate::cancellation::output(command, None)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "{program} exited with {}",
@@ -633,8 +716,34 @@ fn command_output(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+// The current process identity never changes, but portable probes fork
+// subprocesses that a latched signal refuses. Memoize after the first
+// successful capture so release and recovery claims keep working during
+// teardown; failures are never cached. The PID check keeps a forked
+// pre-exec child from trusting its parent's identity.
+static CURRENT_IDENTITY_CACHE: std::sync::Mutex<Option<(u32, ProcessIdentity)>> =
+    std::sync::Mutex::new(None);
+
 // Capture the complete identity written into owner and claimant records.
 fn current_identity() -> io::Result<ProcessIdentity> {
+    let pid = std::process::id();
+    let cached = CURRENT_IDENTITY_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if let Some((cached_pid, identity)) = cached {
+        if cached_pid == pid {
+            return Ok(identity);
+        }
+    }
+    let identity = current_identity_uncached()?;
+    *CURRENT_IDENTITY_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((pid, identity.clone()));
+    Ok(identity)
+}
+
+fn current_identity_uncached() -> io::Result<ProcessIdentity> {
     let pid = libc::pid_t::try_from(std::process::id())
         .map_err(|_| invalid_data("current pid does not fit the host pid type"))?;
     let (start_kind_hex, start_token_hex, state) = process_identity(pid)?;
@@ -693,12 +802,11 @@ fn record_liveness(record: &Record) -> Liveness {
         };
     }
 
-    let output = Command::new("ps")
+    let mut command = Command::new("ps");
+    command
         .args(["-o", "pid=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+        .env("LC_ALL", "C");
+    let output = crate::cancellation::output(command, None);
     match output {
         Ok(output) if output.status.success() => Liveness::Unknown,
         Ok(output)
@@ -1388,11 +1496,15 @@ fn timeout_error(paths: &Paths, timeout: Duration, state: &Classified) -> io::Er
 fn acquire(paths: &Paths, timeout: Duration) -> io::Result<CheckoutLock> {
     let started = Instant::now();
     loop {
+        crate::cancellation::check()?;
         let state = classify(paths);
         match &state {
             Classified::Missing => match cleanup_detached_claims(paths)? {
                 Cleanup::Complete => {
                     let owner = prepare_owner(paths)?;
+                    if let Err(error) = crate::cancellation::check() {
+                        return discard_unpublished_owner(&owner).and(Err(error));
+                    }
                     match symlink(&owner.target, &paths.canonical) {
                         Ok(()) => {
                             if !canonical_matches(paths, &owner.target) {
@@ -1407,10 +1519,12 @@ fn acquire(paths: &Paths, timeout: Duration) -> io::Result<CheckoutLock> {
                                 None,
                                 &paths.checkout,
                             )?;
-                            return Ok(CheckoutLock {
+                            let lock = CheckoutLock {
                                 paths: paths.clone(),
                                 owner: Some(owner),
-                            });
+                            };
+                            crate::cancellation::check()?;
+                            return Ok(lock);
                         }
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                             discard_unpublished_owner(&owner)?;
@@ -1488,6 +1602,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
@@ -1520,6 +1635,151 @@ mod tests {
             .step_by(2)
             .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).unwrap())
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_signal_interrupts_checkout_lock_contention_promptly() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CHECKOUT_LOCK_CANCEL_CHILD";
+        if let Some(checkout) = std::env::var_os(CHILD_ENV) {
+            let checkout = PathBuf::from(checkout);
+            let signals = crate::cancellation::Signals::install().unwrap();
+            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+            let _watchdog = crate::cancellation::spawn_teardown_watchdog(
+                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
+            );
+            fs::write(
+                checkout.with_extension("ready"),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+            crate::cancellation::teardown_phase(
+                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
+                "before-acquire",
+            );
+            let result = with_checkout_lock_timeout(&checkout, Duration::from_secs(30), |_| Ok(()));
+            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+            crate::cancellation::teardown_phase(
+                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
+                "after-acquire",
+            );
+            let code = signals.finish_result(result.map(|_| 0)).unwrap();
+            assert_eq!(code, 128 + libc::SIGTERM);
+            return;
+        }
+
+        let root = crate::test_support::temp_dir("checkout-lock-cancellation");
+        let checkout = root.join("tool");
+        let paths = Paths::new(&checkout).unwrap();
+        let owner = prepare_owner(&paths).unwrap();
+        symlink(&owner.target, &paths.canonical).unwrap();
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, &checkout)
+            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+            .env("SHDEPS_TEST_TEARDOWN_DIAG", "1")
+            .env(
+                "SHDEPS_INTERNAL_PROCESS_BOUNDARIES",
+                "test-harness-subprocess",
+            )
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let mut child = crate::cancellation::spawn_owned(
+            &mut command,
+            crate::cancellation::Isolation::DetachedSession,
+            true,
+        )
+        .unwrap();
+        let ready = checkout.with_extension("ready");
+        let started = Instant::now();
+        let child_pid = loop {
+            if let Ok(value) = fs::read_to_string(&ready) {
+                if let Ok(pid) = value.parse::<u32>() {
+                    if pid > 0 {
+                        break pid;
+                    }
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "child did not reach checkout-lock contention"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        // SAFETY: the retained Child handle supplies a live positive PID.
+        assert_eq!(unsafe { libc::kill(child_pid as i32, libc::SIGTERM) }, 0);
+        let signaled = Instant::now();
+        // Snapshot-probed teardown spawns `ps` plus per-PID identity probes;
+        // loaded macOS runners exceed 1s while Linux stays comfortably under.
+        let ack_budget = if cfg!(target_os = "macos") {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
+        let status = loop {
+            if child.exited().unwrap() {
+                break Some(child.wait().unwrap());
+            }
+            if signaled.elapsed() >= ack_budget {
+                let _ = child.stop(crate::cancellation::KILL_SIGNAL);
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        match status {
+            Some(status) if status.success() => {}
+            Some(status) => panic!(
+                "checkout-lock waiter exited without success instead of acknowledging cancellation: {status}"
+            ),
+            None => panic!("checkout-lock waiter did not acknowledge cancellation promptly"),
+        }
+    }
+
+    #[test]
+    fn release_succeeds_after_signal_latch() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CHECKOUT_LOCK_RELEASE_CHILD";
+        const TEST_NAME: &str = "checkout_lock::tests::release_succeeds_after_signal_latch";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let signals = crate::cancellation::Signals::install().unwrap();
+            let root = crate::test_support::temp_dir("checkout-lock-release-latch");
+            let checkout = root.join("tool");
+            let mut lock = CheckoutLock::acquire(&checkout, Duration::from_secs(5)).unwrap();
+            // Latch a real signal the way a cancelled first run does, then
+            // release: the lock must be freed even though teardown runs
+            // under the latch (macOS identity probes used to refuse, which
+            // wedged every cancel+retry on a self-held live lock).
+            // SAFETY: signaling our own PID with an installed latch handler.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+            let latched = Instant::now();
+            while crate::cancellation::received_signal().is_none() {
+                assert!(
+                    latched.elapsed() < Duration::from_secs(2),
+                    "signal latch did not fire"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            lock.release().unwrap();
+            let canonical = Paths::new(&checkout).unwrap().canonical;
+            assert_eq!(
+                fs::symlink_metadata(&canonical).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            let code = signals.finish_result(Ok::<_, crate::Error>(0)).unwrap();
+            assert_eq!(code, 128 + libc::SIGTERM);
+            return;
+        }
+
+        crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
     }
 
     #[test]
@@ -2508,7 +2768,14 @@ mod tests {
         .unwrap();
         symlink(paths.owner_target(owner_nonce), &paths.canonical).unwrap();
 
-        let mut lock = CheckoutLock::acquire(&requested, Duration::from_secs(1)).unwrap();
+        // Recovery needs several ps-probed classify rounds on macOS; loaded
+        // CI runners exceed a 1s budget while Linux stays comfortably under.
+        let timeout = if cfg!(target_os = "macos") {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
+        let mut lock = CheckoutLock::acquire(&requested, timeout).unwrap();
         let new_target = fs::read_link(&paths.canonical).unwrap();
 
         assert_ne!(

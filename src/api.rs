@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::Result;
+use crate::cancellation;
 use crate::cli;
 use crate::config;
 use crate::dep_links;
@@ -33,6 +34,18 @@ use crate::update::Options;
 use crate::update_release::{self, ReleaseRequest};
 
 const RELEASE_ARCHIVE_LAUNCHER_CAPABILITY: &str = "release-archive-launcher-preservation-v1";
+const OWNED_SUBPROCESS_CANCELLATION_CAPABILITY: &str = "owned-subprocess-cancellation-v1";
+const PROMPT_FIFO_READER_BEFORE_EVENT_CAPABILITY: &str = "prompt-fifo-reader-before-event-v1";
+const WRAPPER_ABI: u32 = 1;
+
+fn capability_available(capability: &str, unix: bool, owned_subprocesses: bool) -> bool {
+    match capability {
+        RELEASE_ARCHIVE_LAUNCHER_CAPABILITY => true,
+        PROMPT_FIFO_READER_BEFORE_EVENT_CAPABILITY => unix,
+        OWNED_SUBPROCESS_CANCELLATION_CAPABILITY => owned_subprocesses,
+        _ => false,
+    }
+}
 
 /// Runs one hidden bridge command.
 pub fn run<W, E>(
@@ -63,11 +76,17 @@ where
             // contract without coupling itself to release tags or bumping the
             // wrapper ABI. Unknown names are a clean predicate miss so old and
             // new callers can negotiate independently.
-            Ok(if capability == RELEASE_ARCHIVE_LAUNCHER_CAPABILITY {
-                0
-            } else {
-                1
-            })
+            Ok(
+                if capability_available(
+                    capability,
+                    cfg!(unix),
+                    cancellation::owned_subprocess_cancellation_available(),
+                ) {
+                    0
+                } else {
+                    1
+                },
+            )
         }
         "adopt-release-archive-launcher" => {
             let [name, cmd] = rest else {
@@ -106,7 +125,7 @@ where
             // This is wrapper-binary ABI, not the shdeps git commit version.
             // Keep it tiny and config-free so old wrappers can negotiate with
             // new binaries even on partially bootstrapped machines.
-            writeln!(stdout, "abi:1")?;
+            writeln!(stdout, "abi:{WRAPPER_ABI}")?;
             Ok(0)
         }
         "env-snapshot" => {
@@ -125,7 +144,7 @@ where
                 "reinstall={}",
                 flag(runtime::reinstall(&ProcessEnv, overrides))
             )?;
-            writeln!(stdout, "abi=1")?;
+            writeln!(stdout, "abi={WRAPPER_ABI}")?;
             Ok(0)
         }
         "completion-commands" => completion_commands(stdout),
@@ -425,20 +444,51 @@ where
     // empty prefetch object so token/freshness behavior stays identical to the
     // top-level update flow.
     let prefetch = update_release::Prefetch::default();
-    let request_context = update_release::RequestContext {
-        roots: &roots,
-        runtime_env: &runtime_env,
-        env_vars: &env_vars,
-        runner: &Process,
-        client: &Curl,
-        options,
-        prefetch: &prefetch,
-        prior_release: crate::manifest::read(&crate::manifest::path(&roots.state_dir))?
-            .get(&name)
-            .is_some_and(|installed| installed.method == method::GITHUB_RELEASE),
+    let mut mutation = crate::hooks::MutationIntent::new(&roots.state_dir, &name);
+    let outcome = {
+        let mut request_context = update_release::RequestContext {
+            roots: &roots,
+            runtime_env: &runtime_env,
+            env_vars: &env_vars,
+            runner: &Process,
+            client: &Curl,
+            options,
+            prefetch: &prefetch,
+            prior_release: crate::manifest::read(&crate::manifest::path(&roots.state_dir))?
+                .get(&name)
+                .is_some_and(|installed| installed.method == method::GITHUB_RELEASE),
+            mutation: Some(&mut mutation),
+        };
+        update_release::install_request(&request, &mut request_context)?
     };
-    let outcome = update_release::install_request(&request, &request_context)?;
+    finish_github_release_install(
+        outcome,
+        &mut mutation,
+        &roots.state_dir,
+        &name,
+        stdout,
+        stderr,
+    )
+}
 
+fn finish_github_release_install<W, E>(
+    outcome: update_release::ReleaseOutcome,
+    mutation: &mut crate::hooks::MutationIntent,
+    state_dir: &Path,
+    name: &str,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    // The installer may have completed an atomic publication while the parent
+    // signal arrived. Persist its post obligation before honoring cancellation
+    // so the next update can reconcile the committed payload without emitting
+    // success text after the signal.
+    let _ = mutation.resolve(outcome.changed)?;
+    cancellation::check()?;
     if outcome.failed {
         writeln!(
             stderr,
@@ -448,7 +498,7 @@ where
         return Ok(1);
     }
     if outcome.changed {
-        mark_changed(&roots.state_dir, &name)?;
+        mark_changed(state_dir, name)?;
         writeln!(stdout, "  {name} installed -- {}", outcome.detail)?;
     } else {
         writeln!(stdout, "  {name} -- {}", outcome.detail)?;
@@ -610,6 +660,7 @@ fn mark_changed(state_dir: &Path, name: &str) -> Result<()> {
     // relative path preserves owner/repo grouping while `valid_dep_name` above
     // prevents path traversal from a malicious hook argument.
     std::fs::write(marker, b"")?;
+    crate::hooks::mark_pending_post(state_dir, name)?;
     Ok(())
 }
 
@@ -888,13 +939,28 @@ fn load_count(conf_dir: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
     use std::io;
     use std::path::PathBuf;
     use std::time::Duration;
 
     use crate::process::Output;
 
-    use super::{Runner, pkg_install_with_runner, process};
+    use super::{Runner, finish_github_release_install, pkg_install_with_runner, process};
+
+    #[test]
+    fn prompt_fifo_capability_requires_a_unix_runtime() {
+        assert!(super::capability_available(
+            super::PROMPT_FIFO_READER_BEFORE_EVENT_CAPABILITY,
+            true,
+            true,
+        ));
+        assert!(!super::capability_available(
+            super::PROMPT_FIFO_READER_BEFORE_EVENT_CAPABILITY,
+            false,
+            true,
+        ));
+    }
 
     #[derive(Debug, Default)]
     struct FakeRunner {
@@ -1017,6 +1083,61 @@ mod tests {
             ]
         );
         assert!(stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_release_install_request_skips_changed_marker() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_RELEASE_INSTALL_REQUEST";
+        const TEST_NAME: &str =
+            "api::tests::cancellation_after_release_install_request_skips_changed_marker";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let state_dir = crate::test_support::temp_dir("shdeps-api-cancelled-release-marker");
+        let marker = state_dir.join(".changed-markers/txn/owner/tool");
+        // SAFETY: this signal test owns the process-global cancellation guard,
+        // and no other in-process test mutates this bridge-only variable.
+        unsafe { std::env::set_var("SHDEPS_UPDATE_TXN_ID", "txn") };
+        let signals = crate::cancellation::Signals::install().unwrap();
+        // SAFETY: the installed handler targets this process and latches TERM.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut mutation = crate::hooks::MutationIntent::new(&state_dir, "owner/tool");
+        mutation.begin().unwrap();
+
+        let result = finish_github_release_install(
+            crate::update_release::ReleaseOutcome {
+                changed: true,
+                failed: false,
+                detail: "v1.0.0".to_owned(),
+                stamp: true,
+            },
+            &mut mutation,
+            &state_dir,
+            "owner/tool",
+            &mut stdout,
+            &mut stderr,
+        );
+
+        unsafe { std::env::remove_var("SHDEPS_UPDATE_TXN_ID") };
+        assert!(
+            result.is_err(),
+            "latched cancellation must abort the bridge"
+        );
+        assert!(!marker.exists(), "cancelled bridge wrote a changed marker");
+        assert!(
+            state_dir.join(".pending-posts/owner/tool").is_file(),
+            "committed release must retain its prepublication post obligation"
+        );
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     fn key(program: &str, args: impl IntoIterator<Item = impl AsRef<str>>) -> String {

@@ -13,7 +13,7 @@ SHDEPS_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$(dirname "$0")/helpers.sh"
 
 _write_fake_shdeps() {
-  local path="$1" version="$2"
+  local path="$1" version="$2" abi="$3"
 
   cat >"$path" <<SH
 #!/usr/bin/env bash
@@ -24,7 +24,7 @@ case "\${1:-}" in
   __api)
     case "\${2:-}" in
       version)
-        printf '%s\n' "abi:1"
+        printf '%s\n' "abi:$abi"
         ;;
       env-snapshot)
         printf '%s\n' \\
@@ -100,7 +100,7 @@ _release_fixture() {
   local archive="shdeps-${tag}-${platform}.tar.gz"
 
   mkdir -p "$release_dir" "$payload/man/man1" "$payload/completions" "$payload/lua/shdeps"
-  _write_fake_shdeps "$payload/shdeps" "$tag"
+  _write_fake_shdeps "$payload/shdeps" "$tag" 1
   cp "$SHDEPS_DIR/shdeps.sh" "$payload/shdeps.sh"
   cp "$SHDEPS_DIR/install.sh" "$payload/install.sh"
   chmod +x "$payload/install.sh"
@@ -241,7 +241,10 @@ _lua_api_link=$(_tmpdir)/lib/shdeps
 export SHDEPS_LUA_DIR="$_lua_api_link"
 _build_bin=$(_mock_bin)
 _fake_shdeps="$_build_bin/shdeps-built"
-_write_fake_shdeps "$_fake_shdeps" "20990203-040506-abc12345"
+_source_abi=$(git -C "$_source_repo" show HEAD:shdeps.sh |
+  sed -n 's/^[[:space:]]*abi:\([0-9][0-9]*\)).*/\1/p' |
+  head -n 1)
+_write_fake_shdeps "$_fake_shdeps" "20990203-040506-abc12345" "$_source_abi"
 _write_fake_cargo_build "$_build_bin/cargo"
 
 _inst_dir=$(_tmpdir)/shdeps-fresh

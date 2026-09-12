@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::bin_link;
+use crate::cancellation;
 use crate::config::Entry;
 use crate::extras;
+use crate::hooks::MutationIntent;
 use crate::manifest::{self, ManifestEntry};
 use crate::method;
 use crate::process::Runner;
@@ -54,11 +56,13 @@ pub(crate) struct InstallPlan {
 enum InstallRoute {
     Managed,
     Fresh,
-    Development {
-        verified: repo_verify::VerifiedDevelopment,
-        replace_owned_destination: bool,
-    },
+    Development(DevelopmentPlan),
     Adopted(repo_verify::VerifiedOrdinary),
+}
+
+struct DevelopmentPlan {
+    verified: repo_verify::VerifiedDevelopment,
+    replace_owned_destination: bool,
 }
 
 /// Inspects and verifies a repo install without changing transition or live
@@ -69,6 +73,7 @@ pub(crate) fn prepare(
     install_dir: &Path,
     ownership: DestinationOwnership,
 ) -> Result<Preparation> {
+    cancellation::check()?;
     // Resolve the development source before any network work. It wins for an
     // absent or already managed destination, but it never grants permission to
     // replace an unrecorded ordinary checkout: that root must be preserved and
@@ -131,6 +136,7 @@ pub(crate) fn prepare(
         }
     };
 
+    cancellation::check()?;
     Ok(Preparation::Ready(Box::new(InstallPlan {
         source,
         local_clone,
@@ -155,10 +161,10 @@ fn development_route(
     };
     match repo_verify::verify_development(&request, context.runner) {
         Ok(repo_verify::DevelopmentVerification::Verified(verified)) => {
-            Ok(InstallRoute::Development {
+            Ok(InstallRoute::Development(DevelopmentPlan {
                 verified,
                 replace_owned_destination,
-            })
+            }))
         }
         Ok(repo_verify::DevelopmentVerification::MissingCommand) => {
             Err(missing_command_item(entry))
@@ -213,10 +219,12 @@ pub(crate) fn apply(
     entry: &Entry,
     context: &Context<'_, impl Runner>,
     options: Options,
+    mutation: &mut MutationIntent,
 ) -> Result<Item> {
+    cancellation::check()?;
     match plan.route {
         InstallRoute::Managed if plan.install_dir.join(".git").is_dir() => {
-            install_existing(entry, context, options, &plan.install_dir)
+            install_existing(entry, context, options, &plan.install_dir, mutation)
         }
         InstallRoute::Managed => install_fresh(
             entry,
@@ -225,6 +233,7 @@ pub(crate) fn apply(
             &plan.install_dir,
             &plan.source.url,
             true,
+            mutation,
         ),
         InstallRoute::Fresh => {
             require_still_absent(&plan.install_dir)?;
@@ -235,16 +244,14 @@ pub(crate) fn apply(
                 &plan.install_dir,
                 &plan.source.url,
                 false,
+                mutation,
             )
         }
-        InstallRoute::Development {
-            verified,
-            replace_owned_destination,
-        } => {
+        InstallRoute::Development(development) => {
             require_development_destination(
                 &plan.install_dir,
                 &plan.local_clone,
-                replace_owned_destination,
+                development.replace_owned_destination,
             )?;
             install_development(
                 entry,
@@ -252,13 +259,18 @@ pub(crate) fn apply(
                 options,
                 &plan.local_clone,
                 &plan.install_dir,
-                verified,
-                replace_owned_destination,
+                development,
+                mutation,
             )
         }
-        InstallRoute::Adopted(verified) => {
-            install_verified_existing(entry, context, options, &plan.install_dir, verified)
-        }
+        InstallRoute::Adopted(verified) => install_verified_existing(
+            entry,
+            context,
+            options,
+            &plan.install_dir,
+            verified,
+            mutation,
+        ),
     }
 }
 
@@ -332,9 +344,14 @@ fn install_development(
     options: Options,
     local_clone: &Path,
     install_dir: &Path,
-    verified: repo_verify::VerifiedDevelopment,
-    replace_owned_destination: bool,
+    development: DevelopmentPlan,
+    mutation: &mut MutationIntent,
 ) -> Result<Item> {
+    let DevelopmentPlan {
+        verified,
+        replace_owned_destination,
+    } = development;
+    cancellation::check()?;
     verified.authorize(local_clone)?;
 
     let previous_target = fs::read_link(install_dir).ok();
@@ -347,6 +364,7 @@ fn install_development(
 
     if !stamp::remote_fresh(&stamp_path, options.freshness()) && status.is_clean() {
         if development_has_upstream(&verified, context.runner, local_clone)? {
+            mutation.begin()?;
             if development_pull(&verified, context.runner, local_clone)? {
                 refresh_stamp = true;
             } else {
@@ -369,9 +387,11 @@ fn install_development(
     if !verified.revalidate(local_clone, context.runner)? {
         return Ok(missing_command_item(entry));
     }
+    cancellation::check()?;
     if let Some(parent) = install_dir.parent() {
         fs::create_dir_all(parent)?;
     }
+    mutation.begin()?;
     publish_development_link(local_clone, install_dir, replace_owned_destination)?;
     if let Some(revision) = &rev_after {
         stamp::revision_touch(&revision_path, revision)?;
@@ -385,6 +405,9 @@ fn install_development(
         || status.dirty
         || previous_target.as_deref() != Some(local_clone)
         || rev_before != rev_after;
+    if !pull_failed {
+        let _ = mutation.resolve(changed)?;
+    }
     let action = if previous_target.as_deref() != Some(local_clone) {
         Some("added")
     } else if rev_before != rev_after {
@@ -423,11 +446,15 @@ fn install_verified_existing(
     options: Options,
     install_dir: &Path,
     verified: repo_verify::VerifiedOrdinary,
+    mutation: &mut MutationIntent,
 ) -> Result<Item> {
+    cancellation::check()?;
     verified.authorize(install_dir)?;
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
     let was_fresh = stamp::remote_fresh(&stamp_path, options.freshness());
-    sync_ssh_push_url(context.runner, install_dir);
+    mutation.begin()?;
+    let _push_url_changed = sync_ssh_push_url(context.runner, install_dir);
+    cancellation::check()?;
     if was_fresh {
         secure_managed_clone_permissions_cached(
             &context.roots.state_dir,
@@ -445,6 +472,10 @@ fn install_verified_existing(
         stamp::remote_touch(&stamp_path, options.now)?;
     }
     record_success(entry, context, install_dir)?;
+
+    // Adoption itself commits ownership, links, and a manifest row even when
+    // the checkout contents were already current.
+    let _ = mutation.resolve(true)?;
 
     if was_fresh {
         let detail = verbose_repo_detail(None, install_dir, context, options, "fresh");
@@ -477,9 +508,13 @@ fn install_existing(
     context: &Context<'_, impl Runner>,
     options: Options,
     install_dir: &Path,
+    mutation: &mut MutationIntent,
 ) -> Result<Item> {
+    cancellation::check()?;
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
-    sync_ssh_push_url(context.runner, install_dir);
+    mutation.begin()?;
+    let push_url_changed = sync_ssh_push_url(context.runner, install_dir);
+    cancellation::check()?;
 
     if stamp::remote_fresh(&stamp_path, options.freshness()) {
         secure_managed_clone_permissions_cached(
@@ -491,6 +526,7 @@ fn install_existing(
             return Ok(item);
         }
         record_success(entry, context, install_dir)?;
+        let _ = mutation.resolve(push_url_changed)?;
         let detail = verbose_repo_detail(None, install_dir, context, options, "fresh");
         return Ok(Item::current(entry.name.clone(), ItemReason::Fresh, detail));
     }
@@ -498,6 +534,7 @@ fn install_existing(
     let head_before = git_head(context.runner, install_dir);
     let pulled = pull(context.runner, install_dir)
         || (prefer_ssh_origin(context.runner, install_dir) && pull(context.runner, install_dir));
+    cancellation::check()?;
     if !pulled {
         // Bash treats an existing clone pull failure as a warning, not an
         // install failure: the previous checkout is still usable, and hooks
@@ -514,6 +551,7 @@ fn install_existing(
         // hard build break — the more descriptive detail string is the
         // operator-visible signal.
         let post_status = git_status(context.runner, install_dir);
+        cancellation::check()?;
         // Three-way bucketing: a dirty working tree is the
         // user-recoverable case; a confirmed-clean tree with a pull
         // failure points at a network/no-fast-forward issue; an
@@ -538,6 +576,7 @@ fn install_existing(
     }
 
     let head_after = git_head(context.runner, install_dir);
+    cancellation::check()?;
     secure_managed_clone_permissions(install_dir)?;
     let _ = write_permwalk_stamp(&context.roots.state_dir, &entry.name, install_dir);
     if let Some(item) = missing_explicit_command(entry, install_dir) {
@@ -546,6 +585,7 @@ fn install_existing(
     stamp::remote_touch(&stamp_path, options.now)?;
     record_success(entry, context, install_dir)?;
     let changed = options.reinstall || head_before != head_after;
+    let _ = mutation.resolve(changed || push_url_changed)?;
     let action = if head_before != head_after {
         Some("updated")
     } else if options.reinstall {
@@ -568,7 +608,9 @@ fn install_fresh(
     install_dir: &Path,
     url: &str,
     replace_owned_destination: bool,
+    mutation: &mut MutationIntent,
 ) -> Result<Item> {
+    cancellation::check()?;
     if !context.runner.exists("git") {
         return Ok(Item::failed(
             entry.name.clone(),
@@ -587,6 +629,10 @@ fn install_fresh(
         || repo::ssh_fallback(url)
             .as_deref()
             .is_some_and(|fallback| clone_repo(context.runner, fallback, &clone_tmp));
+    if let Err(error) = cancellation::check() {
+        remove_any(&clone_tmp)?;
+        return Err(error.into());
+    }
     if !cloned || !clone_tmp.is_dir() {
         remove_any(&clone_tmp)?;
         return Ok(Item::failed(
@@ -602,12 +648,25 @@ fn install_fresh(
         return Ok(item);
     }
 
+    mutation.begin()?;
     #[cfg(unix)]
-    if let Err(error) = crate::repo_transition::publish_directory(
-        install_dir,
-        &clone_tmp,
-        replace_owned_destination,
-    ) {
+    let publication = if replace_owned_destination {
+        crate::repo_transition::publish_directory(install_dir, &clone_tmp, true)
+    } else {
+        crate::repo_transition::publish_fresh_directory(
+            install_dir,
+            &clone_tmp,
+            ManifestEntry::new(
+                &entry.name,
+                method::GITHUB_REPO,
+                &entry.cmd,
+                install_dir.display().to_string(),
+            ),
+            &context.roots.state_dir,
+        )
+    };
+    #[cfg(unix)]
+    if let Err(error) = publication {
         remove_any(&clone_tmp)?;
         return Err(error);
     }
@@ -620,9 +679,28 @@ fn install_fresh(
         fs::rename(&clone_tmp, install_dir)?;
     }
     set_ssh_push_url(context.runner, install_dir, url);
+    cancellation::check()?;
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
-    stamp::remote_touch(&stamp_path, options.now)?;
+    stamp::remote_touch_cancellable(&stamp_path, options.now)?;
+    cancellation::check()?;
     record_success(entry, context, install_dir)?;
+    #[cfg(unix)]
+    if !replace_owned_destination {
+        let ownership = ManifestEntry::new(
+            &entry.name,
+            method::GITHUB_REPO,
+            &entry.cmd,
+            install_dir.display().to_string(),
+        );
+        crate::hooks::mark_pending_post(&context.roots.state_dir, &entry.name)?;
+        crate::repo_transition::finish_fresh_recovery(
+            install_dir,
+            &ownership,
+            &context.roots.state_dir,
+        )?;
+    }
+
+    let _ = mutation.resolve(true)?;
 
     let detail = verbose_repo_detail(Some("added"), install_dir, context, options, "added");
     Ok(Item::changed(
@@ -630,6 +708,37 @@ fn install_fresh(
         ItemReason::Installed,
         detail,
     ))
+}
+
+#[cfg(unix)]
+pub(crate) fn recover_fresh_publication(
+    roots: &crate::runtime::Roots,
+    manifest_path: &Path,
+    install_dir: &Path,
+    ownership: &ManifestEntry,
+) -> Result<()> {
+    if ownership.method != method::GITHUB_REPO
+        || !crate::config::valid_dep_name(&ownership.name)
+        || !crate::config::valid_cmd_basename(&ownership.cmd)
+        || Path::new(&ownership.install_path) != install_dir
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fresh repository recovery has inconsistent durable ownership",
+        )
+        .into());
+    }
+    let entry = Entry {
+        name: ownership.name.clone(),
+        method: method::GITHUB_REPO.to_owned(),
+        cmd: ownership.cmd.clone(),
+        cmd_explicit: true,
+        aliases: String::new(),
+        filter: String::new(),
+    };
+    record_success_with_roots(&entry, roots, manifest_path, install_dir)?;
+    crate::hooks::mark_pending_post(&roots.state_dir, &ownership.name)?;
+    crate::repo_transition::finish_fresh_recovery(install_dir, ownership, &roots.state_dir)
 }
 
 fn verbose_repo_detail(
@@ -877,20 +986,28 @@ fn record_success(
     context: &Context<'_, impl Runner>,
     install_dir: &Path,
 ) -> Result<()> {
-    bin_link::from_dir(
-        &context.roots.state_dir,
-        &context.roots.bin_dir,
-        &entry.name,
-        install_dir,
-    )?;
+    record_success_with_roots(entry, context.roots, context.manifest_path, install_dir)
+}
+
+fn record_success_with_roots(
+    entry: &Entry,
+    roots: &crate::runtime::Roots,
+    manifest_path: &Path,
+    install_dir: &Path,
+) -> Result<()> {
+    cancellation::check()?;
+    // Public links, extras, and the manifest row are one publication unit.
+    // Once entered, finish it so the existing recovery metadata remains
+    // authoritative rather than interrupting between its durable writes.
+    bin_link::from_dir(&roots.state_dir, &roots.bin_dir, &entry.name, install_dir)?;
     extras::link(
-        &context.roots.state_dir,
-        &context.roots.install_dir,
+        &roots.state_dir,
+        &roots.install_dir,
         &entry.name,
         install_dir,
     )?;
     manifest::upsert(
-        context.manifest_path,
+        manifest_path,
         ManifestEntry::new(
             &entry.name,
             method::GITHUB_REPO,
@@ -1068,7 +1185,7 @@ fn prefer_ssh_origin(runner: &impl Runner, install_dir: &Path) -> bool {
     true
 }
 
-fn sync_ssh_push_url(runner: &impl Runner, install_dir: &Path) {
+fn sync_ssh_push_url(runner: &impl Runner, install_dir: &Path) -> bool {
     // System-level config is assumed at `/etc/gitconfig`: a nonstandard-prefix
     // git (e.g. Homebrew macOS, whose system config lives under the prefix)
     // with a system-level `insteadOf` would be under-collected and could skip
@@ -1082,7 +1199,7 @@ fn sync_ssh_push_url(runner: &impl Runner, install_dir: &Path) {
         Path::new("/etc/gitconfig"),
         std::env::var_os("HOME").map(PathBuf::from),
         &git_config_env_snapshot(),
-    );
+    )
 }
 
 fn sync_ssh_push_url_with_configs(
@@ -1092,7 +1209,7 @@ fn sync_ssh_push_url_with_configs(
     system_config: &Path,
     home: Option<PathBuf>,
     env: &GitConfigEnv,
-) {
+) -> bool {
     if !env.hard_override
         && push_url_sync_redundant_with_configs(
             install_dir,
@@ -1102,14 +1219,18 @@ fn sync_ssh_push_url_with_configs(
             &env.count_rewrites,
         )
     {
-        return;
+        return false;
     }
     let Some(origin) = remote_origin(runner, install_dir) else {
-        return;
+        return false;
     };
     if let Some(fallback) = expected_push_url(&origin) {
-        set_push_url(runner, install_dir, &fallback);
+        if remote_push_url(runner, install_dir).as_deref() == Some(fallback.as_str()) {
+            return false;
+        }
+        return set_push_url(runner, install_dir, &fallback);
     }
+    false
 }
 
 /// `GIT_*` environment state relevant to the push-url fast path.
@@ -1221,12 +1342,12 @@ fn expected_push_url(origin: &str) -> Option<String> {
 
 /// Returns whether the push-url sync would be a no-op, without spawning git.
 ///
-/// Every no-op update runs this per repo dependency (two git spawns each:
-/// `get-url` + `set-url --push`). A converged clone already carries the
-/// expected push URL in `.git/config`, so read that file directly and skip
-/// both spawns. Fail-closed: any ambiguity returns false and the git-based
-/// sync runs unchanged, so the worst case is today's cost, never a wrong
-/// skip.
+/// Every no-op update runs this per repo dependency (up to three git spawns
+/// each: `get-url`, a `get-url --push` pre-read, and `set-url --push` when
+/// stale). A converged clone already carries the expected push URL in
+/// `.git/config`, so read that file directly and skip all three spawns.
+/// Fail-closed: any ambiguity returns false and the git-based sync runs
+/// unchanged, so the worst case is today's cost, never a wrong skip.
 fn push_url_sync_redundant_with_configs(
     install_dir: &Path,
     user_configs: &[PathBuf],
@@ -1637,16 +1758,27 @@ fn decode_config_quoted(text: &str) -> Option<String> {
 
 fn set_ssh_push_url(runner: &impl Runner, install_dir: &Path, url: &str) {
     if let Some(fallback) = repo::ssh_fallback(url) {
-        set_push_url(runner, install_dir, &fallback);
+        let _ = set_push_url(runner, install_dir, &fallback);
     }
 }
 
-fn set_push_url(runner: &impl Runner, install_dir: &Path, url: &str) {
-    let _ = git(
+fn remote_push_url(runner: &impl Runner, install_dir: &Path) -> Option<String> {
+    git(
+        runner,
+        install_dir,
+        &["remote", "get-url", "--push", "origin"],
+    )
+    .filter(|output| output.success)
+    .map(|output| output.stdout.trim().to_owned())
+}
+
+fn set_push_url(runner: &impl Runner, install_dir: &Path, url: &str) -> bool {
+    git(
         runner,
         install_dir,
         &["remote", "set-url", "--push", "origin", url],
-    );
+    )
+    .is_some_and(|output| output.success)
 }
 
 fn clone_repo(runner: &impl Runner, url: &str, target: &Path) -> bool {
@@ -1940,6 +2072,20 @@ mod tests {
                     "-C",
                     &install_dir.display().to_string(),
                     "remote",
+                    "get-url",
+                    "--push",
+                    "origin",
+                ],
+                // No pushurl configured: real git prints the fetch URL here.
+                true,
+                "https://github.com/owner/tool.git\n",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &install_dir.display().to_string(),
+                    "remote",
                     "set-url",
                     "--push",
                     "origin",
@@ -1949,12 +2095,14 @@ mod tests {
                 "",
             );
 
-        sync_ssh_push_url(&runner, &install_dir);
+        // Stale pre-read: the set runs and reports a mutation.
+        assert!(sync_ssh_push_url(&runner, &install_dir));
 
         assert_eq!(
             runner.git_calls(),
             vec![
                 git_args(&install_dir, &["remote", "get-url", "origin"]),
+                git_args(&install_dir, &["remote", "get-url", "--push", "origin"]),
                 git_args(
                     &install_dir,
                     &[
@@ -1992,6 +2140,21 @@ mod tests {
                     "-C",
                     &install_dir.display().to_string(),
                     "remote",
+                    "get-url",
+                    "--push",
+                    "origin",
+                ],
+                // Stale https pushurl left over from before the origin
+                // moved to ssh.
+                true,
+                "https://github.com/owner/tool.git\n",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &install_dir.display().to_string(),
+                    "remote",
                     "set-url",
                     "--push",
                     "origin",
@@ -2001,11 +2164,11 @@ mod tests {
                 "",
             );
 
-        sync_ssh_push_url(&runner, &install_dir);
+        assert!(sync_ssh_push_url(&runner, &install_dir));
 
-        assert_eq!(runner.git_calls().len(), 2);
+        assert_eq!(runner.git_calls().len(), 3);
         assert_eq!(
-            runner.git_calls()[1],
+            runner.git_calls()[2],
             git_args(
                 &install_dir,
                 &[
@@ -2133,6 +2296,7 @@ mod tests {
             &context,
             Fixture::options(),
             &install_dir,
+            &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
         )
         .unwrap();
 
@@ -2261,6 +2425,20 @@ mod tests {
                     "-C",
                     &install_dir.display().to_string(),
                     "remote",
+                    "get-url",
+                    "--push",
+                    "origin",
+                ],
+                // No pushurl configured: real git prints the fetch URL here.
+                true,
+                "https://github.com/owner/tool.git\n",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &install_dir.display().to_string(),
+                    "remote",
                     "set-url",
                     "--push",
                     "origin",
@@ -2270,16 +2448,71 @@ mod tests {
                 "",
             );
 
-        sync_ssh_push_url_with_configs(
+        assert!(sync_ssh_push_url_with_configs(
             &runner,
             &install_dir,
             &[],
             &missing_path(),
             None,
             &GitConfigEnv::default(),
-        );
+        ));
 
-        assert_eq!(runner.git_calls().len(), 2);
+        assert_eq!(runner.git_calls().len(), 3);
+    }
+
+    #[test]
+    fn sync_push_url_with_configs_skips_set_when_preread_converged() {
+        // Slow-path honesty: the config file is absent so the parse fast
+        // path fails closed, but the live push URL already matches. The
+        // pre-read must skip the redundant `set-url` AND report no
+        // mutation — callers feed the return into `mutation.resolve`, so
+        // dropping the pre-read would owe post hooks on every no-op
+        // update whose config is not parse-provable.
+        let fixture = Fixture::new("push-preread-skip");
+        let install_dir = fixture.write_clone("tool");
+        let runner = FakeRunner::default()
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &install_dir.display().to_string(),
+                    "remote",
+                    "get-url",
+                    "origin",
+                ],
+                true,
+                "https://github.com/owner/tool.git\n",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &install_dir.display().to_string(),
+                    "remote",
+                    "get-url",
+                    "--push",
+                    "origin",
+                ],
+                true,
+                "git@github.com:owner/tool.git\n",
+            );
+
+        assert!(!sync_ssh_push_url_with_configs(
+            &runner,
+            &install_dir,
+            &[],
+            &missing_path(),
+            None,
+            &GitConfigEnv::default(),
+        ));
+
+        assert_eq!(
+            runner.git_calls(),
+            vec![
+                git_args(&install_dir, &["remote", "get-url", "origin"]),
+                git_args(&install_dir, &["remote", "get-url", "--push", "origin"]),
+            ]
+        );
     }
 
     #[test]
@@ -2356,6 +2589,20 @@ mod tests {
                     "-C",
                     &install_dir.display().to_string(),
                     "remote",
+                    "get-url",
+                    "--push",
+                    "origin",
+                ],
+                // The rule voids the file parse; the live answer is stale.
+                true,
+                "https://github.com/o/t.git\n",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &install_dir.display().to_string(),
+                    "remote",
                     "set-url",
                     "--push",
                     "origin",
@@ -2371,17 +2618,17 @@ mod tests {
                 "https://github.com/".to_owned(),
             )],
         };
-        sync_ssh_push_url_with_configs(
+        assert!(sync_ssh_push_url_with_configs(
             &runner,
             &install_dir,
             &[],
             &missing_path(),
             None,
             &outcome_changing,
-        );
+        ));
         assert_eq!(
             runner.git_calls().len(),
-            2,
+            3,
             "an outcome-changing env-injected rule must force the slow path"
         );
 
@@ -2404,6 +2651,20 @@ mod tests {
                     "-C",
                     &install_dir.display().to_string(),
                     "remote",
+                    "get-url",
+                    "--push",
+                    "origin",
+                ],
+                // The override voids the file parse; live is stale.
+                true,
+                "https://github.com/o/t.git\n",
+            )
+            .with_output(
+                "git",
+                [
+                    "-C",
+                    &install_dir.display().to_string(),
+                    "remote",
                     "set-url",
                     "--push",
                     "origin",
@@ -2416,17 +2677,17 @@ mod tests {
             hard_override: true,
             count_rewrites: Vec::new(),
         };
-        sync_ssh_push_url_with_configs(
+        assert!(sync_ssh_push_url_with_configs(
             &runner,
             &install_dir,
             &[],
             &missing_path(),
             None,
             &overridden,
-        );
+        ));
         assert_eq!(
             runner.git_calls().len(),
-            2,
+            3,
             "a hard env override must force the slow path"
         );
     }
@@ -2763,6 +3024,7 @@ mod tests {
             &context,
             Fixture::options(),
             &install_dir,
+            &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
         )
         .unwrap();
 
@@ -3020,6 +3282,7 @@ mod tests {
             &context,
             Fixture::options(),
             &install_dir,
+            &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
         )
         .unwrap();
         assert_eq!(first.reason, ItemReason::Fresh);
@@ -3030,6 +3293,7 @@ mod tests {
             &context,
             Fixture::options(),
             &install_dir,
+            &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
         )
         .unwrap();
 

@@ -84,6 +84,12 @@ impl Env for ProcessEnv {
     }
 
     fn command_output(&self, command: &str, args: &[&str]) -> Option<String> {
+        // Host probes (`uname`, `hostname`) are millisecond leaf commands
+        // that run on every invocation. Route them around the supervised
+        // capture path: reader threads plus supervision rendezvous cost
+        // ~11ms per probe even when no snapshot runs, which breaks the CI
+        // perf budgets. A signal mid-probe only delays handling by the
+        // probe duration; the next cancellation check still observes it.
         let output = Command::new(command).args(args).output().ok()?;
         output
             .status

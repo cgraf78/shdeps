@@ -22,6 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::config;
+use crate::manifest::{Manifest, ManifestEntry};
+use crate::method;
 
 const FORMAT: &str = "shdeps repository transition v1";
 const RECORD: &str = "record";
@@ -29,6 +32,8 @@ const PREVIOUS: &str = "previous";
 const BLOCKED: &str = "blocked";
 const BLOCKED_CONTENT: &str = "shdeps repository transition blocked v1\n";
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
+const FRESH_INDEX_DIR: &str = ".repo-publications";
+const FRESH_INDEX_FORMAT: &str = "shdeps fresh repository publication v1";
 
 /// No-follow identity for an object whose ownership the transaction records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,8 +156,27 @@ impl Desired {
 struct Record {
     format: String,
     checkout: PathBuf,
-    previous: Identity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<Identity>,
     desired: Desired,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ownership: Option<ManifestEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshIndexRecord {
+    format: String,
+    checkout: PathBuf,
+    ownership: ManifestEntry,
+}
+
+/// Durable fresh-checkout ownership that must be finalized before config
+/// interpretation or pruning can make a method decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingFreshPublication {
+    pub(crate) checkout: PathBuf,
+    pub(crate) ownership: ManifestEntry,
 }
 
 impl Record {
@@ -163,13 +187,27 @@ impl Record {
                 checkout.display()
             )));
         }
-        self.previous.validate()?;
-        self.desired.validate(checkout)
+        self.desired.validate(checkout)?;
+        match (&self.previous, &self.ownership) {
+            (Some(previous), None) => previous.validate(),
+            (None, Some(ownership))
+                if ownership.method == method::GITHUB_REPO
+                    && config::valid_dep_name(&ownership.name)
+                    && config::valid_cmd_basename(&ownership.cmd)
+                    && Path::new(&ownership.install_path) == checkout
+                    && matches!(self.desired, Desired::Directory { .. }) =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid_transition(
+                "repository transition ownership fields are inconsistent",
+            )),
+        }
     }
 }
 
 /// Recovers any Shdeps-owned transition and rejects installer-owned state.
-pub(crate) fn recover(checkout: &Path) -> Result<()> {
+pub(crate) fn recover(checkout: &Path) -> Result<Option<ManifestEntry>> {
     let actions = actions_transaction_path(checkout)?;
     if path_present(&actions)? {
         return Err(invalid_transition(format!(
@@ -186,7 +224,11 @@ pub(crate) fn publish_development(
     target: &Path,
     replace_owned_destination: bool,
 ) -> Result<()> {
-    recover(checkout)?;
+    if recover(checkout)?.is_some() {
+        return Err(invalid_transition(
+            "fresh repository ownership must be finalized before development publication",
+        ));
+    }
     match fs::symlink_metadata(checkout) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             symlink(target, checkout)?;
@@ -211,8 +253,9 @@ pub(crate) fn publish_development(
             let previous = Identity::read(checkout)?;
             publish_transaction(
                 checkout,
-                previous,
+                Some(previous),
                 Desired::Symlink(target.to_path_buf()),
+                None,
                 || symlink(target, checkout).map_err(Into::into),
             )
         }
@@ -229,7 +272,11 @@ pub(crate) fn publish_directory(
     staged: &Path,
     replace_owned_destination: bool,
 ) -> Result<()> {
-    recover(checkout)?;
+    if recover(checkout)?.is_some() {
+        return Err(invalid_transition(
+            "fresh repository ownership must be finalized before directory publication",
+        ));
+    }
     let desired_identity = Identity::read(staged)?;
     if !desired_identity.is_directory() {
         return Err(invalid_transition(format!(
@@ -259,11 +306,12 @@ pub(crate) fn publish_directory(
             let previous = Identity::read(checkout)?;
             publish_transaction(
                 checkout,
-                previous,
+                Some(previous),
                 Desired::Directory {
                     identity: desired_identity,
                     staged: staged.to_path_buf(),
                 },
+                None,
                 || rename_noreplace(staged, checkout).map_err(Into::into),
             )
         }
@@ -274,6 +322,55 @@ pub(crate) fn publish_directory(
     }
 }
 
+/// Publishes a first managed checkout while retaining exact recovery authority.
+pub(crate) fn publish_fresh_directory(
+    checkout: &Path,
+    staged: &Path,
+    ownership: ManifestEntry,
+    state_dir: &Path,
+) -> Result<()> {
+    if recover(checkout)?.is_some() {
+        return Err(invalid_transition(
+            "fresh repository ownership must be finalized before publication",
+        ));
+    }
+    let desired_identity = Identity::read(staged)?;
+    if !desired_identity.is_directory() {
+        return Err(invalid_transition(
+            "staged repository is not a real directory",
+        ));
+    }
+    let desired = Desired::Directory {
+        identity: desired_identity,
+        staged: staged.to_path_buf(),
+    };
+    let index = write_fresh_index(state_dir, checkout, &ownership)?;
+    let journal = match begin(checkout, None, desired.clone(), Some(ownership)) {
+        Ok(journal) => journal,
+        Err(error) => {
+            let _ = remove_fresh_index_path(&index);
+            return Err(error);
+        }
+    };
+    if let Err(error) = rename_noreplace(staged, checkout) {
+        let _ = recover_shdeps(checkout, false);
+        let _ = remove_fresh_index_path(&index);
+        return Err(error.into());
+    }
+    if !desired.matches(checkout) {
+        if is_real_directory(checkout) {
+            mark_blocked(&journal)?;
+        }
+        return Err(invalid_transition(
+            "published repository does not match its transition record",
+        ));
+    }
+    // The journal remains until links and manifest ownership are durable. A
+    // handled signal after this return is recovered by the next update without
+    // consulting the remote or adopting an unrecorded directory.
+    Ok(())
+}
+
 // Ordering is the crash-recovery contract: persist recovery authority before
 // vacating the stable path, park the exact previous generation, publish the
 // desired object, then use the same classifier for commit or rollback. Moving
@@ -281,20 +378,26 @@ pub(crate) fn publish_directory(
 // SIGKILL.
 fn publish_transaction(
     checkout: &Path,
-    previous: Identity,
+    previous: Option<Identity>,
     desired: Desired,
+    ownership: Option<ManifestEntry>,
     publish: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let journal = begin(checkout, previous, desired.clone())?;
+    let journal = begin(checkout, previous.clone(), desired.clone(), ownership)?;
     let previous_path = journal.join(PREVIOUS);
-    if let Err(error) = fs::rename(checkout, &previous_path) {
-        let _ = recover_shdeps(checkout, false);
-        return Err(error.into());
+    if previous.is_some() {
+        if let Err(error) = fs::rename(checkout, &previous_path) {
+            let _ = recover_shdeps(checkout, false);
+            return Err(error.into());
+        }
     }
 
     if let Err(error) = publish() {
         return match recover_shdeps(checkout, false) {
-            Ok(()) => Err(error),
+            Ok(None) => Err(error),
+            Ok(Some(_)) => Err(invalid_transition(
+                "replacement transition unexpectedly produced fresh ownership",
+            )),
             Err(recovery) => Err(invalid_transition(format!(
                 "repository publication failed ({error}); recovery also failed ({recovery})"
             ))),
@@ -308,10 +411,20 @@ fn publish_transaction(
             "published repository does not match its transition record",
         ));
     }
-    recover_shdeps(checkout, false)
+    match recover_shdeps(checkout, false)? {
+        None => Ok(()),
+        Some(_) => Err(invalid_transition(
+            "replacement transition unexpectedly produced fresh ownership",
+        )),
+    }
 }
 
-fn begin(checkout: &Path, previous: Identity, desired: Desired) -> Result<PathBuf> {
+fn begin(
+    checkout: &Path,
+    previous: Option<Identity>,
+    desired: Desired,
+    ownership: Option<ManifestEntry>,
+) -> Result<PathBuf> {
     let actions = actions_transaction_path(checkout)?;
     if path_present(&actions)? {
         return Err(invalid_transition(format!(
@@ -319,12 +432,18 @@ fn begin(checkout: &Path, previous: Identity, desired: Desired) -> Result<PathBu
             actions.display()
         )));
     }
-    if !previous.matches(checkout) {
+    if let Some(previous) = &previous {
+        if !previous.matches(checkout) {
+            return Err(invalid_transition(
+                "repository root changed before transition preparation",
+            ));
+        }
+        previous.validate()?;
+    } else if path_present(checkout)? {
         return Err(invalid_transition(
-            "repository root changed before transition preparation",
+            "repository destination appeared before fresh publication preparation",
         ));
     }
-    previous.validate()?;
     desired.validate(checkout)?;
 
     let journal = journal_path(checkout)?;
@@ -340,6 +459,7 @@ fn begin(checkout: &Path, previous: Identity, desired: Desired) -> Result<PathBu
         checkout: checkout.to_path_buf(),
         previous,
         desired,
+        ownership,
     };
     let mut encoded = serde_json::to_string_pretty(&record)?;
     encoded.push('\n');
@@ -357,10 +477,10 @@ fn begin(checkout: &Path, previous: Identity, desired: Desired) -> Result<PathBu
 /// Shdeps' crash gap. Internal recovery of a transition started by the current
 /// call passes false: a collision first observed during that transition is not
 /// retroactively granted co-owner authority and must be marked blocked instead.
-fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<()> {
+fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<Option<ManifestEntry>> {
     let journal = journal_path(checkout)?;
     let metadata = match fs::symlink_metadata(&journal) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
         Ok(metadata) => metadata,
     };
@@ -377,11 +497,10 @@ fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<()> {
         // death in that tiny window is safe to finish because no backup object
         // remains and the stable checkout was already classified beforehand.
         fs::remove_dir(&journal)?;
-        return Ok(());
+        return Ok(None);
     }
     if !entries.iter().any(|entry| entry == RECORD)
         && !entries.iter().any(|entry| entry == PREVIOUS)
-        && path_present(checkout)?
         && entries
             .iter()
             .all(|entry| entry.starts_with(".record.tmp."))
@@ -390,7 +509,7 @@ fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<()> {
         // journal. SIGKILL before the record rename cannot have moved the
         // checkout yet, so this exact shape is inert preparation debris. Do
         // not broaden the match: any symlink, hardlink, unexpected basename,
-        // missing checkout, or published backup remains a fail-closed state.
+        // or published backup remains a fail-closed state.
         for entry in &entries {
             let path = journal.join(entry);
             let metadata = fs::symlink_metadata(&path)?;
@@ -407,7 +526,7 @@ fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<()> {
             fs::remove_file(journal.join(entry))?;
         }
         fs::remove_dir(&journal)?;
-        return Ok(());
+        return Ok(None);
     }
     let blocked_temps = entries
         .iter()
@@ -453,22 +572,56 @@ fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<()> {
     let previous_present = path_present(&previous_path)?;
     let checkout_present = path_present(checkout)?;
 
+    if record.previous.is_none() {
+        if previous_present {
+            return Err(invalid_transition(
+                "fresh repository transition unexpectedly contains a previous object",
+            ));
+        }
+        let ownership = record
+            .ownership
+            .clone()
+            .expect("validated fresh transition has ownership");
+        if checkout_present {
+            if record.desired.matches(checkout) {
+                return Ok(Some(ownership));
+            }
+            if is_real_directory(checkout) {
+                mark_blocked(&journal)?;
+            }
+            return Err(invalid_transition(
+                "fresh repository transition found a foreign stable object",
+            ));
+        }
+        if let Desired::Directory { identity, staged } = &record.desired {
+            if identity.matches(staged) {
+                rename_noreplace(staged, checkout)?;
+                if record.desired.matches(checkout) {
+                    return Ok(Some(ownership));
+                }
+            }
+        }
+        return Err(invalid_transition(
+            "fresh repository transition lost both staged and stable objects",
+        ));
+    }
+    let previous = record
+        .previous
+        .as_ref()
+        .expect("validated replacement transition has previous identity");
+
     if previous_present {
-        if !record.previous.matches(&previous_path) {
+        if !previous.matches(&previous_path) {
             return Err(invalid_transition(
                 "repository transition backup identity does not match its record",
             ));
         }
         if !checkout_present {
-            return restore_parked_previous(
-                &journal,
-                checkout,
-                &record,
-                blocked,
-                allow_later_writer,
-            );
+            restore_parked_previous(&journal, checkout, &record, blocked, allow_later_writer)?;
+            return Ok(None);
         }
-        return finish_with_live_checkout(&journal, checkout, &record, blocked, allow_later_writer);
+        finish_with_live_checkout(&journal, checkout, &record, blocked, allow_later_writer)?;
+        return Ok(None);
     }
 
     if !checkout_present {
@@ -476,13 +629,14 @@ fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<()> {
             "repository transition lost both stable and backup objects",
         ));
     }
-    if record.previous.matches(checkout)
+    if previous.matches(checkout)
         || record.desired.matches(checkout)
         || (!blocked && allow_later_writer && is_real_directory(checkout))
     {
         // Preparation stopped before the move, cleanup had already removed the
         // backup, or a co-owner published a real checkout generation.
-        return remove_journal(&journal, &record);
+        remove_journal(&journal, &record)?;
+        return Ok(None);
     }
     if !allow_later_writer && is_real_directory(checkout) {
         mark_blocked(&journal)?;
@@ -490,6 +644,185 @@ fn recover_shdeps(checkout: &Path, allow_later_writer: bool) -> Result<()> {
     Err(invalid_transition(
         "repository transition stable object does not match its record",
     ))
+}
+
+/// Removes a fresh-publication journal after ownership metadata is durable.
+pub(crate) fn finish_fresh_recovery(
+    checkout: &Path,
+    ownership: &ManifestEntry,
+    state_dir: &Path,
+) -> Result<()> {
+    let journal = journal_path(checkout)?;
+    let record = read_record(&journal.join(RECORD), checkout)?;
+    if record.previous.is_some()
+        || record.ownership.as_ref() != Some(ownership)
+        || !record.desired.matches(checkout)
+    {
+        return Err(invalid_transition(
+            "fresh repository ownership changed before recovery commit",
+        ));
+    }
+    remove_journal(&journal, &record)?;
+    remove_fresh_index(state_dir, checkout, ownership)
+}
+
+/// Enumerates durable fresh-publication ownership independently of current
+/// configuration. The index is written before the checkout rename, so an
+/// interrupted first install remains discoverable even if its dependency is
+/// removed or changes method before the next invocation.
+pub(crate) fn pending_fresh_publications(
+    state_dir: &Path,
+    install_root: &Path,
+) -> Result<Vec<PendingFreshPublication>> {
+    let root = state_dir.join(FRESH_INDEX_DIR);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut pending = Vec::new();
+    for entry in entries {
+        crate::cancellation::check()?;
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(invalid_transition(format!(
+                "fresh repository publication index is not a private file: {}",
+                path.display()
+            )));
+        }
+        let bytes = crate::state::read_private_bounded(&path, MAX_RECORD_BYTES)?;
+        let record: FreshIndexRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            invalid_transition(format!(
+                "malformed fresh repository publication index {}: {error}",
+                path.display()
+            ))
+        })?;
+        validate_fresh_index(&record, install_root, &path)?;
+        pending.push(PendingFreshPublication {
+            checkout: record.checkout,
+            ownership: record.ownership,
+        });
+    }
+    pending.sort_by(|left, right| left.checkout.cmp(&right.checkout));
+    Ok(pending)
+}
+
+/// Removes an index whose sibling journal is already absent only when the
+/// durable state proves either that publication never began or that ownership
+/// was fully committed before the previous process died.
+pub(crate) fn finish_index_without_journal(
+    state_dir: &Path,
+    pending: &PendingFreshPublication,
+    manifest: &Manifest,
+) -> Result<()> {
+    if path_present(&journal_path(&pending.checkout)?)? {
+        return Err(invalid_transition(
+            "fresh repository journal still exists while finishing its index",
+        ));
+    }
+    if !path_present(&pending.checkout)? {
+        return remove_fresh_index(state_dir, &pending.checkout, &pending.ownership);
+    }
+    if manifest.get(&pending.ownership.name) == Some(&pending.ownership)
+        && Identity::read(&pending.checkout).is_ok_and(|identity| identity.is_directory())
+    {
+        return remove_fresh_index(state_dir, &pending.checkout, &pending.ownership);
+    }
+    Err(invalid_transition(
+        "fresh repository index has a live checkout without matching durable ownership",
+    ))
+}
+
+fn write_fresh_index(
+    state_dir: &Path,
+    checkout: &Path,
+    ownership: &ManifestEntry,
+) -> Result<PathBuf> {
+    let path = fresh_index_path(state_dir, &ownership.name);
+    if path_present(&path)? {
+        return Err(invalid_transition(format!(
+            "fresh repository publication index already exists: {}",
+            path.display()
+        )));
+    }
+    let record = FreshIndexRecord {
+        format: FRESH_INDEX_FORMAT.to_owned(),
+        checkout: checkout.to_path_buf(),
+        ownership: ownership.clone(),
+    };
+    let mut encoded = serde_json::to_string_pretty(&record)?;
+    encoded.push('\n');
+    crate::state::write_atomic(&path, &encoded)?;
+    Ok(path)
+}
+
+fn validate_fresh_index(record: &FreshIndexRecord, install_root: &Path, path: &Path) -> Result<()> {
+    let expected_checkout = install_root.join(&record.ownership.name);
+    if record.format != FRESH_INDEX_FORMAT
+        || record.ownership.method != method::GITHUB_REPO
+        || !config::valid_dep_name(&record.ownership.name)
+        || !config::valid_cmd_basename(&record.ownership.cmd)
+        || Path::new(&record.ownership.install_path) != record.checkout
+        || record.checkout != expected_checkout
+        || fresh_index_path(
+            path.parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| invalid_transition("fresh publication index has no state root"))?,
+            &record.ownership.name,
+        ) != path
+    {
+        return Err(invalid_transition(format!(
+            "fresh repository publication index is inconsistent: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn fresh_index_path(state_dir: &Path, name: &str) -> PathBuf {
+    let mut encoded = String::with_capacity(name.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in name.as_bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    state_dir.join(FRESH_INDEX_DIR).join(encoded)
+}
+
+fn remove_fresh_index(state_dir: &Path, checkout: &Path, ownership: &ManifestEntry) -> Result<()> {
+    let path = fresh_index_path(state_dir, &ownership.name);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let bytes = crate::state::read_private_bounded(&path, MAX_RECORD_BYTES)?;
+    let record: FreshIndexRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid_transition(format!(
+            "malformed fresh repository publication index {}: {error}",
+            path.display()
+        ))
+    })?;
+    if record.checkout != checkout || &record.ownership != ownership {
+        return Err(invalid_transition(
+            "fresh repository publication index changed before cleanup",
+        ));
+    }
+    remove_fresh_index_path(&path)
+}
+
+fn remove_fresh_index_path(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+    Ok(())
 }
 
 /// Restores a parked generation, reclassifying an atomic no-replace loss.
@@ -510,7 +843,12 @@ fn restore_parked_previous(
     let previous_path = journal.join(PREVIOUS);
     match rename_noreplace(&previous_path, checkout) {
         Ok(()) => {
-            if !record.previous.matches(checkout) {
+            if !record
+                .previous
+                .as_ref()
+                .expect("replacement transition has previous identity")
+                .matches(checkout)
+            {
                 return Err(invalid_transition(
                     "repository transition rollback identity changed",
                 ));
@@ -544,7 +882,13 @@ fn finish_with_live_checkout(
         // acquired the shared lock after our death and filled the absent stable
         // path with a new managed generation. In both cases the stable root
         // wins and only our exact backup is retired.
-        remove_identity(&previous_path, &record.previous)?;
+        remove_identity(
+            &previous_path,
+            record
+                .previous
+                .as_ref()
+                .expect("replacement transition has previous identity"),
+        )?;
         return remove_journal(journal, record);
     }
     if !allow_later_writer && is_real_directory(checkout) {
@@ -880,7 +1224,13 @@ mod tests {
         write_file(&checkout.join("old"), "managed");
         write_file(&development.join("bin/tool"), "development");
         let previous = Identity::read(&checkout).unwrap();
-        let journal = begin(&checkout, previous, Desired::Symlink(development.clone())).unwrap();
+        let journal = begin(
+            &checkout,
+            Some(previous),
+            Desired::Symlink(development.clone()),
+            None,
+        )
+        .unwrap();
         fs::rename(&checkout, journal.join("previous")).unwrap();
 
         recover(&checkout).unwrap();
@@ -897,7 +1247,13 @@ mod tests {
         write_file(&checkout.join("old"), "managed");
         write_file(&development.join("bin/tool"), "development");
         let previous = Identity::read(&checkout).unwrap();
-        let journal = begin(&checkout, previous, Desired::Symlink(development.clone())).unwrap();
+        let journal = begin(
+            &checkout,
+            Some(previous),
+            Desired::Symlink(development.clone()),
+            None,
+        )
+        .unwrap();
         fs::rename(&checkout, journal.join("previous")).unwrap();
         symlink(&development, &checkout).unwrap();
 
@@ -915,7 +1271,13 @@ mod tests {
         write_file(&checkout.join("old"), "managed");
         write_file(&development.join("bin/tool"), "development");
         let previous = Identity::read(&checkout).unwrap();
-        let journal = begin(&checkout, previous, Desired::Symlink(development)).unwrap();
+        let journal = begin(
+            &checkout,
+            Some(previous),
+            Desired::Symlink(development),
+            None,
+        )
+        .unwrap();
         fs::rename(&checkout, journal.join("previous")).unwrap();
         write_file(&checkout.join("installer"), "new generation");
 
@@ -937,10 +1299,16 @@ mod tests {
         write_file(&development.join("bin/tool"), "development");
         let previous = Identity::read(&checkout).unwrap();
 
-        let error = publish_transaction(&checkout, previous, Desired::Symlink(development), || {
-            write_file(&checkout.join("foreign"), "preserve");
-            Err(std::io::Error::other("publication collision").into())
-        })
+        let error = publish_transaction(
+            &checkout,
+            Some(previous),
+            Desired::Symlink(development),
+            None,
+            || {
+                write_file(&checkout.join("foreign"), "preserve");
+                Err(std::io::Error::other("publication collision").into())
+            },
+        )
         .unwrap_err();
 
         let journal = journal_path(&checkout).unwrap();
@@ -992,10 +1360,16 @@ mod tests {
         write_file(&development.join("bin/tool"), "development");
         let previous = Identity::read(&checkout).unwrap();
 
-        let error = publish_transaction(&checkout, previous, Desired::Symlink(development), || {
-            write_file(&checkout.join("foreign"), "preserve");
-            Ok(())
-        })
+        let error = publish_transaction(
+            &checkout,
+            Some(previous),
+            Desired::Symlink(development),
+            None,
+            || {
+                write_file(&checkout.join("foreign"), "preserve");
+                Ok(())
+            },
+        )
         .unwrap_err();
 
         let journal = journal_path(&checkout).unwrap();
@@ -1026,11 +1400,12 @@ mod tests {
         let next = Identity::read(&staged).unwrap();
         let journal = begin(
             &checkout,
-            previous,
+            Some(previous),
             Desired::Directory {
                 identity: next,
                 staged: staged.clone(),
             },
+            None,
         )
         .unwrap();
         fs::rename(&checkout, journal.join("previous")).unwrap();
@@ -1108,7 +1483,13 @@ mod tests {
         write_file(&checkout.join("old"), "managed");
         write_file(&development.join("bin/tool"), "development");
         let previous = Identity::read(&checkout).unwrap();
-        let journal = begin(&checkout, previous, Desired::Symlink(development)).unwrap();
+        let journal = begin(
+            &checkout,
+            Some(previous),
+            Desired::Symlink(development),
+            None,
+        )
+        .unwrap();
         fs::rename(&checkout, journal.join("previous")).unwrap();
         fs::create_dir_all(&checkout).unwrap();
 

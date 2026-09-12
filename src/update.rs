@@ -6,11 +6,12 @@
 //! run post hooks only for dependencies that actually changed. Keeping those
 //! rules here avoids each install method learning partial transaction policy.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::Result;
+use crate::cancellation;
 use crate::cleanup;
 use crate::config::{self, Entry};
 use crate::hooks::{BashCustomProbe, Install, Post, Txn};
@@ -599,7 +600,7 @@ where
 /// Runs update while reporting phase and item progress to `progress`.
 pub fn run_with_progress<R>(
     entries: &[Entry],
-    _manifest: &Manifest,
+    manifest: &Manifest,
     context: &Context<'_, R>,
     options: Options,
     progress: &mut dyn Progress,
@@ -607,6 +608,65 @@ pub fn run_with_progress<R>(
 where
     R: Runner + Sync,
 {
+    run_with_progress_lock(entries, manifest, context, options, progress, None)
+}
+
+/// Acquires the update state lock and finalizes crash-recoverable repository
+/// ownership before a caller resolves configuration-dependent methods.
+pub(crate) fn prepare_for_resolution(
+    roots: &crate::runtime::Roots,
+    manifest_path: &Path,
+    env_vars: &BTreeMap<String, String>,
+) -> Result<(crate::state::StateLock, Manifest)> {
+    cancellation::check()?;
+    let lock = crate::state::StateLock::acquire(&roots.state_dir)?;
+    recover_fresh_repo_publications_at(roots, manifest_path, env_vars)?;
+    cancellation::check()?;
+    Ok((lock, manifest::read(manifest_path)?))
+}
+
+/// Runs update while retaining a state lock acquired before method resolution.
+pub(crate) fn run_with_progress_locked<R>(
+    entries: &[Entry],
+    manifest: &Manifest,
+    context: &Context<'_, R>,
+    options: Options,
+    progress: &mut dyn Progress,
+    lock: crate::state::StateLock,
+) -> Result<Summary>
+where
+    R: Runner + Sync,
+{
+    run_with_progress_lock(entries, manifest, context, options, progress, Some(lock))
+}
+
+/// Runs update without terminal progress while retaining a state lock acquired
+/// before method resolution.
+pub(crate) fn run_locked<R>(
+    entries: &[Entry],
+    manifest: &Manifest,
+    context: &Context<'_, R>,
+    options: Options,
+    lock: crate::state::StateLock,
+) -> Result<Summary>
+where
+    R: Runner + Sync,
+{
+    run_with_progress_locked(entries, manifest, context, options, &mut NoProgress, lock)
+}
+
+fn run_with_progress_lock<R>(
+    entries: &[Entry],
+    _manifest: &Manifest,
+    context: &Context<'_, R>,
+    options: Options,
+    progress: &mut dyn Progress,
+    held_lock: Option<crate::state::StateLock>,
+) -> Result<Summary>
+where
+    R: Runner + Sync,
+{
+    cancellation::check()?;
     // Serialize concurrent update runs through the per-state-directory
     // advisory `flock`. Without this, two `shdeps update` processes
     // (e.g., a user-triggered run racing a periodic timer, or two
@@ -625,19 +685,77 @@ where
     //
     // The handle is bound to a local so its `Drop` releases the lock
     // when `run` returns by any path.
-    let _lock = crate::state::StateLock::acquire(&context.roots.state_dir)?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-state-lock");
+    let _lock = match held_lock {
+        Some(lock) => lock,
+        None => crate::state::StateLock::acquire(&context.roots.state_dir)?,
+    };
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-state-lock");
+    cancellation::check()?;
+    let mut summary = Summary::default();
 
     // The caller's manifest snapshot was necessarily loaded before the state
     // lock. Another updater may have committed a newer method or ownership row
     // while this invocation waited, so all transition and cleanup decisions
     // below must be rebuilt from the now-serialized on-disk state.
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-fresh-recovery");
+    recover_fresh_repo_publications(context)?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-fresh-recovery");
     let initial_manifest = manifest::read(context.manifest_path)?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-pending-publications");
     update_transition::recover_pending_publications(
         entries,
         &initial_manifest,
         context.manifest_path,
         context.roots,
     )?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-pending-publications");
+    let recovery_entries = entries
+        .iter()
+        .filter(|entry| active(entry, context.env))
+        .cloned()
+        .collect::<Vec<_>>();
+    let custom_fingerprints = recovery_entries
+        .iter()
+        .filter(|entry| entry.method == method::CUSTOM)
+        .map(|entry| {
+            context
+                .hooks
+                .install_fingerprint(&entry.name, context.roots)
+                .map(|fingerprint| (entry.name.clone(), fingerprint))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-pending-transitions");
+    for pending in update_transition::recover_pending_transitions(
+        &recovery_entries,
+        &custom_fingerprints,
+        context.manifest_path,
+        context.roots,
+        Some((context.pkg_mgr, context.env.is_android())),
+    )? {
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase("run", "pending-transition-item");
+        let old = pending.old().clone();
+        let leftover = with_old_repo_checkout_lock(Some(&old), context, |repo_root| {
+            pending.finish(context.roots, repo_root)
+        })?;
+        if let Some(detail) = leftover {
+            summary.leftovers.push(old.name.clone());
+            summary.leftover_details.insert(old.name, detail);
+        }
+    }
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-pending-transitions");
+    // Recovery is an atomic repair boundary: once entered it runs to
+    // completion, then cancellation is honored before any new work starts.
+    cancellation::check()?;
     let fresh_manifest = manifest::read(context.manifest_path)?;
     let manifest = &fresh_manifest;
 
@@ -645,10 +763,14 @@ where
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
     let package_proofs = update_pkg::required_proofs(entries, manifest, context);
 
-    let mut summary = Summary::default();
-    let mut changed = Vec::new();
     let mut queued = Vec::new();
+    let mut package_transitions = HashMap::<String, update_transition::DurableTransition>::new();
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-hook-txn");
     let hook_txn = Txn::new(&context.roots.state_dir)?;
+    let mut changed = hook_txn.pending()?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-hook-txn");
 
     let active_package_entries = entries
         .iter()
@@ -681,6 +803,7 @@ where
         } else {
             update_pkg::cache_status(entries, context, installable_package_count, options)?
         };
+        cancellation::check()?;
         if package_cache.is_hit() {
             // The package cache is stronger than a TTL: it records the package
             // DB, manifest, config, command paths, hooks, host, platform, and
@@ -700,8 +823,10 @@ where
         } else {
             let package_versions =
                 update_pkg::package_versions(entries, context, options, &package_proofs);
+            cancellation::check()?;
             let sudo =
                 update_pkg::sudo_status(entries, context, &package_versions, &package_proofs)?;
+            cancellation::check()?;
             update_pkg::prepare(
                 entries,
                 context,
@@ -710,6 +835,7 @@ where
                 sudo,
                 progress,
             )?;
+            cancellation::check()?;
 
             let mut package_clean = true;
             let mut package_done = 0usize;
@@ -719,30 +845,80 @@ where
                     continue;
                 }
 
-                let item = update_pkg::install(
+                let mut durable = update_transition::begin_durable_transition(
                     entry,
-                    context,
+                    transitions.get(&entry.name),
+                    context.roots,
+                    context.manifest_path,
+                    Some(update_transition::PkgInstallerIdentity::for_target(
+                        &entry.name,
+                        &entry.aliases,
+                        context.pkg_mgr,
+                        context.env.is_android(),
+                    )),
+                )?;
+                let retrying_ambiguous_install = durable
+                    .as_ref()
+                    .is_some_and(update_transition::DurableTransition::is_retry);
+                let staged_context = durable
+                    .as_ref()
+                    .map(|durable| context.with_manifest_path(durable.manifest_path()));
+                let install_context = staged_context.as_ref().unwrap_or(context);
+                let mut item = update_pkg::install(
+                    entry,
+                    install_context,
                     options,
                     sudo,
                     &mut queued,
                     &package_versions,
                     package_proofs.contains(&entry.name),
                 )?;
+                if item.changed {
+                    hook_txn.mark_pending(&entry.name)?;
+                }
+                cancellation::check()?;
                 if !item.failed {
                     match item.reason {
-                        ItemReason::Installed => cleanup_successful_transition(
-                            entry,
-                            transitions.get(&entry.name),
-                            context,
-                            &mut summary,
-                        )?,
-                        ItemReason::PackageUnavailable | ItemReason::PackageSudoUnavailable => {
-                            update_transition::restore_failed(
+                        ItemReason::Installed => {
+                            commit_pkg_transition(
+                                entry,
                                 transitions.get(&entry.name),
-                                context.manifest_path,
-                            )?
+                                durable.take(),
+                                context,
+                                &mut summary,
+                            )?;
                         }
-                        _ => {}
+                        ItemReason::PackageUnavailable | ItemReason::PackageSudoUnavailable => {
+                            if retrying_ambiguous_install {
+                                item = Item::failed(
+                                    entry.name.clone(),
+                                    ItemReason::InstallFailed,
+                                    "interrupted package installation is still ambiguous; retry when the package manager can verify or reinstall it",
+                                );
+                            } else if let Some(durable) = durable.take() {
+                                durable.abandon(context.roots)?;
+                            }
+                        }
+                        ItemReason::PackageQueued => {
+                            if let Some(durable) = durable.take() {
+                                package_transitions.insert(entry.name.clone(), durable);
+                            }
+                        }
+                        _ => {
+                            if retrying_ambiguous_install {
+                                item = Item::failed(
+                                    entry.name.clone(),
+                                    ItemReason::InstallFailed,
+                                    "interrupted package installation cannot be classified on this host; its recovery record was retained",
+                                );
+                            } else if let Some(durable) = durable.take() {
+                                durable.abandon(context.roots)?;
+                            }
+                        }
+                    }
+                } else if !retrying_ambiguous_install {
+                    if let Some(durable) = durable.take() {
+                        durable.abandon(context.roots)?;
                     }
                 }
                 if !matches!(
@@ -754,7 +930,7 @@ where
                     package_clean = false;
                 }
                 if item.changed {
-                    changed.push(entry.name.clone());
+                    record_changed(&mut changed, entry.name.clone());
                 }
                 if item.failed {
                     summary.failed.push(entry.name.clone());
@@ -767,7 +943,21 @@ where
 
             let pkg_changed_start = changed.len();
             let pkg_failed_start = summary.failed.len();
-            update_pkg::flush(&queued, context, sudo, &mut changed, &mut summary, progress)?;
+            for item in &queued {
+                if let Some(durable) = package_transitions.get_mut(&item.name) {
+                    durable.mark_installing(context.roots)?;
+                }
+            }
+            update_pkg::flush(
+                &queued,
+                context,
+                sudo,
+                &hook_txn,
+                &mut changed,
+                &mut summary,
+                progress,
+            )?;
+            cancellation::check()?;
             let successful_packages = changed[pkg_changed_start..]
                 .iter()
                 .cloned()
@@ -782,23 +972,13 @@ where
                     let Some(entry) = entries.iter().find(|entry| entry.name == item.name) else {
                         continue;
                     };
-                    if let Err(error) = update_pkg::record_proof(entry, context) {
-                        update_transition::restore_failed(
-                            transitions.get(&entry.name),
-                            context.manifest_path,
-                        )?;
-                        return Err(error);
-                    }
-                    cleanup_successful_transition(
+                    update_pkg::record_proof(entry, context)?;
+                    commit_pkg_transition(
                         entry,
                         transitions.get(&entry.name),
+                        package_transitions.remove(&entry.name),
                         context,
                         &mut summary,
-                    )?;
-                } else if failed_packages.contains(&item.name) {
-                    update_transition::restore_failed(
-                        transitions.get(&item.name),
-                        context.manifest_path,
                     )?;
                 }
             }
@@ -810,6 +990,7 @@ where
                 package_clean = false;
             }
             if package_clean {
+                cancellation::check()?;
                 update_pkg::write_cache(entries, context, installable_package_count, options)?;
             }
         }
@@ -839,6 +1020,7 @@ where
         }
     }
     let release_prefetch = update_release::prefetch(&release_entries, context, options, progress)?;
+    cancellation::check()?;
     if !release_entries.is_empty() {
         progress.phase(phase_for_group(
             GROUP_GITHUB_RELEASES,
@@ -864,6 +1046,8 @@ where
         .filter(|entry| active(entry, context.env))
         .collect::<Vec<_>>();
 
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-builtins");
     let builtin_outcomes = jobs::parallel_map_with_item_progress(
         &builtin_entries,
         jobs::max_jobs(context.env_vars),
@@ -875,6 +1059,7 @@ where
                 &release_prefetch,
                 transitions.get(&entry.name),
                 repo_destination_snapshot(manifest.get(&entry.name), transitions.get(&entry.name)),
+                &hook_txn,
             )
         },
         |event| {
@@ -902,6 +1087,9 @@ where
             Ok(())
         },
     )?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-builtins");
+    cancellation::check()?;
     for outcome in builtin_outcomes {
         if let Some(detail) = outcome.cleanup_error {
             summary.leftovers.push(outcome.item.name.clone());
@@ -912,13 +1100,14 @@ where
         if outcome.item.failed {
             summary.failed.push(outcome.item.name.clone());
         }
-        if outcome.item.changed {
-            changed.push(outcome.item.name.clone());
+        if outcome.item.changed || outcome.post_required {
+            record_changed(&mut changed, outcome.item.name.clone());
         }
         summary.items.push(outcome.item);
     }
 
     for entry in entries {
+        cancellation::check()?;
         if entry.method != method::CUSTOM || !active(entry, context.env) {
             continue;
         }
@@ -936,9 +1125,15 @@ where
             transitions.get(&entry.name),
             progress,
         )?;
+        cancellation::check()?;
         let item = outcome.item;
         if outcome.cleanup_leftover {
             summary.leftovers.push(entry.name.clone());
+            if let Some(detail) = outcome.cleanup_detail.as_ref() {
+                summary
+                    .leftover_details
+                    .insert(entry.name.clone(), detail.clone());
+            }
         }
         if item.failed {
             summary.failed.push(entry.name.clone());
@@ -962,7 +1157,12 @@ where
     // inline with each method. Many hooks repair shell completions, symlinks,
     // or dependent tools, so they should see the final state for the full
     // update pass instead of an intermediate per-method view.
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "before-post-hooks");
     run_post_hooks(&changed, context, &hook_txn, &mut summary, progress)?;
+    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+    crate::cancellation::teardown_phase("run", "after-post-hooks");
+    cancellation::check()?;
     Ok(summary)
 }
 
@@ -1116,12 +1316,14 @@ pub(crate) fn active(entry: &Entry, env: &RuntimeEnv) -> bool {
 struct CustomOutcome {
     item: Item,
     cleanup_leftover: bool,
+    cleanup_detail: Option<String>,
     marked: Vec<String>,
 }
 
 struct BuiltinOutcome {
     item: Item,
     cleanup_error: Option<String>,
+    post_required: bool,
 }
 
 // Return the one repo root whose ownership changes during this transition.
@@ -1140,6 +1342,72 @@ fn repo_lock_root(
     }
     let roots = cleanup_roots(context.roots);
     cleanup::safe_repo_root(old, &roots)
+}
+
+#[cfg(unix)]
+pub(crate) fn recover_fresh_repo_publications<R>(context: &Context<'_, R>) -> Result<()>
+where
+    R: Runner + Sync,
+{
+    recover_fresh_repo_publications_at(context.roots, context.manifest_path, context.env_vars)
+}
+
+#[cfg(unix)]
+fn recover_fresh_repo_publications_at(
+    roots: &crate::runtime::Roots,
+    manifest_path: &Path,
+    env_vars: &BTreeMap<String, String>,
+) -> Result<()> {
+    let pending =
+        crate::repo_transition::pending_fresh_publications(&roots.state_dir, &roots.install_dir)?;
+    for publication in pending {
+        crate::checkout_lock::with_checkout_lock(&publication.checkout, env_vars, |normalized| {
+            match crate::repo_transition::recover(normalized)? {
+                Some(ownership) => {
+                    if ownership != publication.ownership {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "fresh repository journal and durable index disagree",
+                        )
+                        .into());
+                    }
+                    update_repo::recover_fresh_publication(
+                        roots,
+                        manifest_path,
+                        normalized,
+                        &ownership,
+                    )?;
+                }
+                None => {
+                    let manifest = manifest::read(manifest_path)?;
+                    crate::repo_transition::finish_index_without_journal(
+                        &roots.state_dir,
+                        &publication,
+                        &manifest,
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn recover_fresh_repo_publications<R>(_context: &Context<'_, R>) -> Result<()>
+where
+    R: Runner + Sync,
+{
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn recover_fresh_repo_publications_at(
+    _roots: &crate::runtime::Roots,
+    _manifest_path: &Path,
+    _env_vars: &BTreeMap<String, String>,
+) -> Result<()> {
+    Ok(())
 }
 
 // Enforce state-lock then checkout-lock ordering around every repo ownership
@@ -1161,7 +1429,13 @@ fn with_repo_checkout_lock<T>(
             // The lock serializes live writers; recovery closes the separate
             // uncatchable-death window before any caller derives ownership or
             // mutates the stable checkout path.
-            crate::repo_transition::recover(normalized)?;
+            if crate::repo_transition::recover(normalized)?.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fresh repository ownership was not finalized before installation",
+                )
+                .into());
+            }
             operation(Some(normalized))
         })
     }
@@ -1189,12 +1463,19 @@ fn with_old_repo_checkout_lock<T>(
     #[cfg(unix)]
     {
         crate::checkout_lock::with_checkout_lock(&root, context.env_vars, |normalized| {
-            // Old-root recovery must happen before cleanup derives ownership.
-            // In particular, a package transition may already have written its
-            // new manifest row. In that path, the caller restores the prior row
-            // if recovery fails so the next run can retry the same cleanup
-            // coherently.
-            crate::repo_transition::recover(normalized)?;
+            // Old-root recovery must happen before the caller publishes its new
+            // manifest row or derives cleanup ownership. Every transition path
+            // holds this lock across commit and cleanup, so a recovery failure
+            // (for example an installer-owned checkout) leaves the old row and
+            // journal retryable instead of orphaning the checkout behind a
+            // committed replacement.
+            if crate::repo_transition::recover(normalized)?.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fresh repository ownership was not finalized before transition cleanup",
+                )
+                .into());
+            }
             operation(Some(normalized))
         })
     }
@@ -1247,11 +1528,25 @@ fn install_builtin<R>(
     release_prefetch: &update_release::Prefetch,
     transition: Option<&update_transition::Transition>,
     repo_destination: RepoDestinationSnapshot,
+    txn: &Txn,
 ) -> BuiltinOutcome
 where
     R: Runner + Sync,
 {
+    if let Err(error) = cancellation::check() {
+        return BuiltinOutcome {
+            item: Item::failed(
+                entry.name.clone(),
+                ItemReason::InstallFailed,
+                error.to_string(),
+            ),
+            cleanup_error: None,
+            post_required: false,
+        };
+    }
     let locked = with_repo_checkout_lock(entry, transition, context, |repo_root| {
+        cancellation::check()?;
+        let mut mutation = txn.mutation(&entry.name);
         let refreshed_transition = if entry.method == method::GITHUB_REPO {
             update_transition::revalidate_for_repo_install(
                 transition,
@@ -1291,6 +1586,7 @@ where
                         &install_context,
                         options,
                         release_prefetch,
+                        &mut mutation,
                     )
                 },
             ),
@@ -1306,7 +1602,13 @@ where
                             context.manifest_path,
                             |manifest_path| {
                                 let install_context = context.with_manifest_path(manifest_path);
-                                update_repo::apply(*plan, entry, &install_context, options)
+                                update_repo::apply(
+                                    *plan,
+                                    entry,
+                                    &install_context,
+                                    options,
+                                    &mut mutation,
+                                )
                             },
                         )
                     }
@@ -1320,7 +1622,7 @@ where
                     context.manifest_path,
                     |manifest_path| {
                         let install_context = context.with_manifest_path(manifest_path);
-                        update_external::install(entry, &install_context, options)
+                        update_external::install(entry, &install_context, options, &mut mutation)
                     },
                 )
             }
@@ -1339,15 +1641,25 @@ where
                 error.to_string(),
             ),
         };
+        // This worker may finish after the caller-side progress callback has
+        // already failed (including because a sibling latched cancellation).
+        // Persist the obligation here, alongside the committed dependency,
+        // before any callback or cancellation gate can discard the outcome.
+        if item.changed {
+            crate::hooks::mark_pending_post(&context.roots.state_dir, &item.name)?;
+        }
+        let post_required = !item.failed && txn.has_pending(&item.name)?;
         let cleanup_error = if item.failed {
             None
         } else {
+            cancellation::check()?;
             update_transition::cleanup_successful(entry, transition, context.roots, repo_root)
                 .unwrap_or_else(|error| Some(error.to_string()))
         };
         Ok(BuiltinOutcome {
             item,
             cleanup_error,
+            post_required,
         })
     });
 
@@ -1358,6 +1670,7 @@ where
             error.to_string(),
         ),
         cleanup_error: None,
+        post_required: false,
     })
 }
 
@@ -1367,45 +1680,66 @@ fn successful_custom(
     changed: bool,
     detail: String,
     transition: Option<&update_transition::Transition>,
+    durable: Option<&mut update_transition::DurableTransition>,
 ) -> Result<CustomOutcome> {
+    cancellation::check()?;
     let old = transition.map(update_transition::old);
-    with_old_repo_checkout_lock(old, context, |_repo_root| {
-        if old.is_some_and(|entry| entry.method == method::PKG) {
-            crate::package_proof::remove(&context.roots.state_dir, &entry.name)?;
+    let cleanup_detail = with_old_repo_checkout_lock(old, context, |repo_root| {
+        let new = ManifestEntry::new(&entry.name, method::CUSTOM, &entry.cmd, "");
+        if let Some(durable) = durable {
+            manifest::upsert(durable.manifest_path(), new)?;
+            durable.mark_installed(entry, context.roots)?;
+            durable.commit(entry, context.roots, context.manifest_path)?;
+            update_transition::finish_custom_transition(entry, transition, context.roots, repo_root)
+        } else {
+            manifest::upsert(context.manifest_path, new)?;
+            Ok(None)
         }
-        manifest::upsert(
-            context.manifest_path,
-            ManifestEntry::new(&entry.name, method::CUSTOM, &entry.cmd, ""),
-        )?;
-        Ok(())
     })?;
 
-    // Custom hooks can publish to any path, including the old method's public
-    // command or managed root. Once the hook succeeds there is no ownership
-    // proof that lets generic cleanup distinguish fresh custom output from old
-    // artifacts, so preserve both and report a cleanup leftover instead of
-    // risking deletion of the new install.
+    // Exact pre-install identities let transition cleanup retire unchanged old
+    // artifacts after an arbitrary hook succeeds. If the hook changed an old
+    // managed root in place, preserve it, report a retryable leftover, and keep
+    // the journal: path-only cleanup cannot distinguish new custom output from
+    // stale content in that shared generation.
     Ok(CustomOutcome {
         item: if changed {
             Item::changed(entry.name.clone(), ItemReason::Installed, detail)
         } else {
             Item::current(entry.name.clone(), ItemReason::Installed, detail)
         },
-        cleanup_leftover: old.is_some_and(|entry| entry.method != method::PKG),
+        cleanup_leftover: cleanup_detail.is_some(),
+        cleanup_detail,
         marked: Vec::new(),
     })
 }
 
-fn cleanup_successful_transition(
+/// Publishes a successful package transition and cleans the old provider.
+///
+/// Old-repository recovery runs before the new manifest row is published so an
+/// installer-owned checkout fails before commitment (matching the custom path),
+/// leaving the old row and journal retryable instead of orphaning the checkout
+/// behind a committed replacement.
+fn commit_pkg_transition(
     entry: &Entry,
     transition: Option<&update_transition::Transition>,
+    durable: Option<update_transition::DurableTransition>,
     context: &Context<'_, impl Runner>,
     summary: &mut Summary,
 ) -> Result<()> {
-    let cleanup = with_old_repo_checkout_lock(
+    with_old_repo_checkout_lock(
         transition.map(update_transition::old),
         context,
         |repo_root| {
+            if let Some(mut durable) = durable {
+                durable.mark_installed(entry, context.roots)?;
+                if let Some(warning) =
+                    durable.commit(entry, context.roots, context.manifest_path)?
+                {
+                    summary.leftovers.push(entry.name.clone());
+                    summary.leftover_details.insert(entry.name.clone(), warning);
+                }
+            }
             if let Some(detail) =
                 update_transition::cleanup_successful(entry, transition, context.roots, repo_root)?
             {
@@ -1414,21 +1748,7 @@ fn cleanup_successful_transition(
             }
             Ok(())
         },
-    );
-    if let Err(error) = cleanup {
-        // Package installation records its new method before old repo cleanup.
-        // A lock/recovery failure must not strand that new row while the old
-        // checkout and link authority remain; restoring the prior row makes
-        // the next update retry the same transition coherently.
-        if let Err(restore) = update_transition::restore_failed(transition, context.manifest_path) {
-            return Err(std::io::Error::other(format!(
-                "transition cleanup failed ({error}); restoring the old manifest also failed ({restore})"
-            ))
-            .into());
-        }
-        return Err(error);
-    }
-    Ok(())
+    )
 }
 
 fn install_custom(
@@ -1439,18 +1759,71 @@ fn install_custom(
     transition: Option<&update_transition::Transition>,
     progress: &mut dyn Progress,
 ) -> Result<CustomOutcome> {
-    let mut install =
+    cancellation::check()?;
+    let fingerprint = if transition.is_some() {
         context
             .hooks
-            .install_with_txn(&entry.name, context.roots, options.reinstall, Some(txn))?;
+            .install_fingerprint(&entry.name, context.roots)?
+    } else {
+        None
+    };
+    let mut durable = if fingerprint.is_some() {
+        update_transition::begin_custom_durable_transition(
+            entry,
+            transition,
+            context.roots,
+            context.manifest_path,
+            fingerprint.as_deref(),
+        )?
+    } else {
+        None
+    };
+    // The old provider's still-published command may satisfy an arbitrary
+    // `exists()` hook.  Every method transition must therefore enter the
+    // custom installer instead of accepting old ownership as proof of the new
+    // provider.  Retrying an ambiguous custom install has the same rule.
+    let force_custom_install = transition.is_some();
+    if let Some(durable) = durable.as_mut() {
+        durable.mark_installing(context.roots)?;
+    }
+    // Custom hook files are arbitrary code: sourcing the file, probing its
+    // functions, or running install may commit a durable side effect before
+    // the wrapper can publish its transaction-local changed marker. Persist a
+    // conservative post obligation first. Only an explicit no-change result
+    // from the initial attempt may remove a marker created here.
+    let mut mutation = txn.mutation(&entry.name);
+    mutation.begin()?;
+    let mut install = context.hooks.install_with_txn(
+        &entry.name,
+        context.roots,
+        options.reinstall || force_custom_install,
+        Some(txn),
+    )?;
+    match &install {
+        Install::Already { .. } | Install::MissingHook => {
+            mutation.resolve(false)?;
+        }
+        Install::Installed { .. } => {
+            mutation.resolve(true)?;
+        }
+        Install::MissingFunction
+        | Install::SourceFailed
+        | Install::Failed { .. }
+        | Install::SudoRequired => {}
+    }
+    cancellation::check()?;
     if install == Install::SudoRequired {
         install = if authenticate_hook_sudo(context.runner, progress)? {
-            match context.hooks.retry_install_with_txn(
+            let retried = context.hooks.retry_install_with_txn(
                 &entry.name,
                 context.roots,
-                options.reinstall,
+                options.reinstall || force_custom_install,
                 Some(txn),
-            )? {
+            )?;
+            if matches!(retried, Install::Installed { .. }) {
+                mutation.resolve(true)?;
+            }
+            match retried {
                 Install::Already { .. } => Install::Failed {
                     detail: "hook changed install state before sudo authentication".to_owned(),
                 },
@@ -1464,12 +1837,15 @@ fn install_custom(
                 detail: String::new(),
             }
         };
+        cancellation::check()?;
     }
+    cancellation::check()?;
     let marked = txn.collect()?;
     let verbose = verbose_enabled(options, context.env_vars);
     match install {
         Install::Already { detail } => {
-            let mut outcome = successful_custom(entry, context, false, detail, transition)?;
+            let mut outcome =
+                successful_custom(entry, context, false, detail, transition, durable.as_mut())?;
             outcome.marked = marked;
             Ok(outcome)
         }
@@ -1484,7 +1860,8 @@ fn install_custom(
             } else {
                 detail
             };
-            let mut outcome = successful_custom(entry, context, true, detail, transition)?;
+            let mut outcome =
+                successful_custom(entry, context, true, detail, transition, durable.as_mut())?;
             outcome.marked = marked;
             Ok(outcome)
         }
@@ -1496,6 +1873,7 @@ fn install_custom(
                     "custom hook missing or unusable",
                 ),
                 cleanup_leftover: false,
+                cleanup_detail: None,
                 marked,
             })
         }
@@ -1510,6 +1888,7 @@ fn install_custom(
                 },
             ),
             cleanup_leftover: false,
+            cleanup_detail: None,
             marked,
         }),
         Install::SudoRequired => unreachable!("sudo requests are resolved before classification"),
@@ -1517,8 +1896,12 @@ fn install_custom(
 }
 
 fn authenticate_hook_sudo(runner: &impl Runner, progress: &mut dyn Progress) -> Result<bool> {
+    cancellation::check()?;
     progress.pause_for_prompt("waiting for sudo authentication")?;
-    Ok(runner.run("sudo", &["true"], None)?.success)
+    cancellation::check()?;
+    let success = runner.run("sudo", &["true"], None)?.success;
+    cancellation::check()?;
+    Ok(success)
 }
 
 pub(crate) fn verbose_enabled(options: Options, env_vars: &BTreeMap<String, String>) -> bool {
@@ -1552,9 +1935,11 @@ fn run_post_hooks(
     progress: &mut dyn Progress,
 ) -> Result<()> {
     for name in changed {
+        cancellation::check()?;
         let mut post = context
             .hooks
             .post_with_txn(name, context.roots, Some(txn))?;
+        cancellation::check()?;
         if post == Post::SudoRequired {
             post = if authenticate_hook_sudo(context.runner, progress)? {
                 match context
@@ -1571,6 +1956,7 @@ fn run_post_hooks(
                     detail: String::new(),
                 }
             };
+            cancellation::check()?;
         }
         match post {
             Post::Ran | Post::MissingHook | Post::MissingFunction | Post::Skipped => {}
@@ -1583,6 +1969,7 @@ fn run_post_hooks(
             }
             Post::SudoRequired => unreachable!("sudo requests are resolved before classification"),
         }
+        txn.acknowledge(name)?;
     }
     Ok(())
 }
@@ -1617,16 +2004,18 @@ mod tests {
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
-    use crate::config::{parse_entry, parse_entry_for_runtime};
+    use crate::config::{Entry, parse_entry, parse_entry_for_runtime};
     use crate::github::{self, Asset, Release};
-    use crate::hooks::BashCustomProbe;
+    use crate::hooks::{BashCustomProbe, Txn};
     use crate::http::Client;
     use crate::link_state::{self, Kind};
     use crate::manifest::{self, Manifest, ManifestEntry};
+    use crate::method;
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
     use crate::runtime::Roots;
     use crate::stamp;
+    use crate::update_transition;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PhaseRecord {
@@ -1665,6 +2054,97 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct SignalOnFirstChangedItem {
+        signaled: bool,
+    }
+
+    #[cfg(unix)]
+    impl super::Progress for SignalOnFirstChangedItem {
+        fn phase(&mut self, _phase: super::Phase<'_>) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn item(&mut self, _group: &'static str, item: &Item) -> crate::Result<()> {
+            if item.changed && !self.signaled {
+                self.signaled = true;
+                // SAFETY: the isolated test process installs the production
+                // handler and deliberately targets itself at the exact
+                // post-commit/progress boundary.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct SignalOnFirstItem {
+        signaled: bool,
+    }
+
+    #[cfg(unix)]
+    impl super::Progress for SignalOnFirstItem {
+        fn phase(&mut self, _phase: super::Phase<'_>) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn item(&mut self, _group: &'static str, _item: &Item) -> crate::Result<()> {
+            if !self.signaled {
+                self.signaled = true;
+                // SAFETY: the isolated test subprocess owns the installed
+                // signal handler and deliberately targets itself.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            }
+            Ok(())
+        }
+    }
+
+    struct FailOnFirstChangedItem {
+        manifest_path: PathBuf,
+        waited_for_commits: bool,
+        failed: bool,
+    }
+
+    impl super::Progress for FailOnFirstChangedItem {
+        fn phase(&mut self, _phase: super::Phase<'_>) -> crate::Result<()> {
+            if !self.waited_for_commits {
+                self.waited_for_commits = true;
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let committed = manifest::read(&self.manifest_path)
+                        .map(|manifest| {
+                            manifest.get("alpha").is_some() && manifest.get("beta").is_some()
+                        })
+                        .unwrap_or(false);
+                    if committed {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "parallel workers did not both commit before the progress boundary"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(())
+        }
+
+        fn item(&mut self, _group: &'static str, item: &Item) -> crate::Result<()> {
+            if item.changed && !self.failed {
+                self.failed = true;
+                return Err(std::io::Error::other("stop progress after first completion").into());
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_signal_boundary_subprocess(test_name: &str, child_env: &str) {
+        crate::test_support::run_signal_boundary_subprocess(test_name, child_env);
+    }
+
     #[test]
     fn update_installs_custom_dep_records_manifest_and_runs_post() {
         let fixture = Fixture::new("custom");
@@ -1688,7 +2168,7 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
+        assert!(!summary.has_errors(), "{summary:?}");
         assert_eq!(summary.items[0].detail, "1.2.3");
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("tool"),
@@ -1697,6 +2177,239 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
         assert_eq!(
             fs::read_to_string(fixture.roots.state_dir.join("tool-post")).unwrap(),
             "post\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_custom_hook_success_skips_manifest_publication() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_CUSTOM_HOOK";
+        const TEST_NAME: &str =
+            "update::tests::cancellation_after_custom_hook_success_skips_manifest_publication";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let fixture = Fixture::new("cancel-after-custom-hook");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default();
+        let entry = parse_entry("tool|custom|tool|-|-", None);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("tool", method::PKG, "tool", ""),
+        )
+        .unwrap();
+        crate::package_proof::write(&fixture.roots.state_dir, "tool", "apt", "tool", "tool")
+            .unwrap();
+        let installed = manifest::read(&manifest_path).unwrap();
+        let transitions = crate::update_transition::by_name(
+            &installed,
+            std::slice::from_ref(&entry),
+            &fixture.roots,
+        )
+        .unwrap();
+
+        // Model an injected hook implementation that completed successfully
+        // and delivered the parent's TERM immediately before returning.
+        // SAFETY: this subprocess installed the Shdeps signal owner above.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let result = super::successful_custom(
+            &entry,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            true,
+            "installed".to_owned(),
+            transitions.get("tool"),
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "latched cancellation must reject publication"
+        );
+        assert!(
+            manifest::read(&manifest_path).unwrap().get("tool")
+                == Some(&ManifestEntry::new("tool", method::PKG, "tool", "")),
+            "successful hook result must not replace the prior manifest row after cancellation"
+        );
+        assert!(
+            crate::package_proof::current(&fixture.roots.state_dir, "tool", "apt", "tool", "tool"),
+            "cancelled custom publication must preserve the prior package proof"
+        );
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_custom_transition_retries_exact_hook_and_cleans_old_provider() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CUSTOM_TRANSITION_RETRY";
+        const TEST_NAME: &str = "update::tests::interrupted_custom_transition_retries_exact_hook_and_cleans_old_provider";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let fixture = Fixture::new("custom-transition-retry");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/custom-installed" ]]; }
+install() {
+  printf 'custom\n' >"$SHDEPS_STATE_DIR/custom-installed"
+  if [[ ! -f "$SHDEPS_STATE_DIR/signal-sent" ]]; then
+    : >"$SHDEPS_STATE_DIR/signal-sent"
+    kill -TERM "$PPID"
+  fi
+}
+post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
+"#,
+        );
+        let old_root = fixture.roots.install_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        let old_public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &old_public).unwrap();
+        crate::link_state::write(
+            &crate::link_state::path(&fixture.roots.state_dir, "tool", Kind::Bin),
+            std::slice::from_ref(&old_public),
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "tool",
+            method::CARGO,
+            "tool",
+            old_root.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let entry = parse_entry("tool|custom|tool|-|-", None);
+
+        let cancelled = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        );
+        assert!(cancelled.is_err());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        assert!(fixture.roots.state_dir.join("custom-installed").is_file());
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/tool")
+                .is_file()
+        );
+        assert_eq!(signals.finish_result(cancelled.map(|_| 0)).unwrap(), 143);
+
+        let retry = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!retry.has_errors(), "{retry:?}");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", method::CUSTOM, "tool", ""))
+        );
+        assert!(!old_root.exists());
+        assert!(!old_public.exists());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+
+        let final_run = run(
+            &[entry],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!final_run.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+    }
+
+    #[test]
+    fn custom_transition_does_not_accept_the_old_public_command_as_new_proof() {
+        let fixture = Fixture::new("custom-transition-old-command-proof");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { [[ -x "$SHDEPS_BIN_DIR/tool" ]]; }
+install() {
+  rm -f "$SHDEPS_BIN_DIR/tool"
+  printf '#!/usr/bin/env bash\nprintf new-custom\\n\n' >"$SHDEPS_BIN_DIR/tool"
+  chmod +x "$SHDEPS_BIN_DIR/tool"
+  printf 'install\n' >>"$SHDEPS_STATE_DIR/install-runs"
+}
+"#,
+        );
+        let old_root = fixture.roots.install_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        let old_public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &old_public).unwrap();
+        crate::link_state::write(
+            &crate::link_state::path(&fixture.roots.state_dir, "tool", Kind::Bin),
+            std::slice::from_ref(&old_public),
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                method::CARGO,
+                "tool",
+                old_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let entry = parse_entry("tool|custom|tool|-|-", None);
+
+        let summary = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("install-runs")).unwrap(),
+            "install\n",
+            "old-provider command existence cannot prove custom installation"
+        );
+        assert!(old_public.is_file());
+        assert!(
+            !old_public
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!old_root.exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", method::CUSTOM, "tool", ""))
         );
     }
 
@@ -1795,11 +2508,24 @@ install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
         .unwrap();
 
         assert!(!summary.has_errors());
-        assert!(install_root.exists());
-        assert_eq!(summary.leftovers, ["owner/tool"]);
+        // The hook never touched the old checkout, so its exact pre-install
+        // evidence still matches and the transition removes the safely
+        // snapshotted root instead of preserving it. Only ambiguous cleanup
+        // (hook-modified old paths) retains artifacts, a leftover, and the
+        // journal.
+        assert!(!install_root.exists());
+        assert!(summary.leftovers.is_empty());
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("owner/tool"),
             Some(&ManifestEntry::new("owner/tool", "custom", "tool", ""))
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "acknowledged cleanup must retire its transition journal"
         );
     }
 
@@ -2159,6 +2885,327 @@ install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
         assert!(fixture.roots.state_dir.join("tool-installed").exists());
     }
 
+    /// Drives an old-provider-to-custom journal to `ManifestCommitted`,
+    /// simulating a crash after the manifest swap but before old cleanup.
+    #[cfg(unix)]
+    fn commit_custom_transition_for_test(entry: &Entry, manifest_path: &Path, roots: &Roots) {
+        let manifest = manifest::read(manifest_path).unwrap();
+        let transition = update_transition::by_name(&manifest, std::slice::from_ref(entry), roots)
+            .unwrap()
+            .remove(entry.name.as_str())
+            .unwrap();
+        let mut durable = update_transition::begin_custom_durable_transition(
+            entry,
+            Some(&transition),
+            roots,
+            manifest_path,
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap()
+        .expect("starts a durable custom transition");
+        durable.mark_installing(roots).unwrap();
+        manifest::upsert(
+            durable.manifest_path(),
+            ManifestEntry::new(entry.name.clone(), method::CUSTOM, entry.cmd.clone(), ""),
+        )
+        .unwrap();
+        durable.mark_installed(entry, roots).unwrap();
+        durable.commit(entry, roots, manifest_path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cargo_to_custom_crash_recovery_cleans_old_provider() {
+        let fixture = Fixture::new("cargo-custom-crash");
+        let old_root = fixture.roots.install_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        let old_public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &old_public).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "tool", Kind::Bin),
+            std::slice::from_ref(&old_public),
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                method::CARGO,
+                "tool",
+                old_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let entry = parse_entry("tool|custom|tool|-|-", None);
+        commit_custom_transition_for_test(&entry, &manifest_path, &fixture.roots);
+
+        let summary = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(!old_root.exists(), "recovery must finish old cargo cleanup");
+        assert!(!old_public.exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", method::CUSTOM, "tool", ""))
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "acknowledged cleanup must retire its transition journal"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_to_custom_crash_recovery_cleans_old_checkout() {
+        let fixture = Fixture::new("repo-custom-crash");
+        let old_root = fixture.roots.install_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        let old_public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &old_public).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "tool", Kind::Bin),
+            std::slice::from_ref(&old_public),
+        )
+        .unwrap();
+        let dev_clone = fixture.roots.git_dev_dir.join("tool-clone");
+        fs::create_dir_all(&dev_clone).unwrap();
+        fs::write(dev_clone.join("README"), "dev\n").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                method::GITHUB_REPO,
+                "tool",
+                old_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let entry = parse_entry("tool|custom|tool|-|-", None);
+        commit_custom_transition_for_test(&entry, &manifest_path, &fixture.roots);
+
+        let summary = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(
+            !old_root.exists(),
+            "recovery must finish old checkout cleanup"
+        );
+        assert!(!old_public.exists());
+        assert!(
+            dev_clone.join("README").exists(),
+            "recovery must never touch the local dev clone"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", method::CUSTOM, "tool", ""))
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "acknowledged cleanup must retire its transition journal"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn release_to_custom_crash_recovery_cleans_proven_archive() {
+        let fixture = Fixture::new("release-custom-crash");
+        let old_root = fixture.roots.install_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        fs::write(
+            crate::github_release_install::archive_layout_path(&fixture.roots.install_dir, "tool"),
+            "v1 archive\n",
+        )
+        .unwrap();
+        let old_public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &old_public).unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "tool", Kind::Bin),
+            std::slice::from_ref(&old_public),
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                method::GITHUB_RELEASE,
+                "tool",
+                old_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let entry = parse_entry("tool|custom|tool|-|-", None);
+        commit_custom_transition_for_test(&entry, &manifest_path, &fixture.roots);
+
+        let summary = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(
+            !old_root.exists(),
+            "recovery must finish old proven-archive cleanup"
+        );
+        assert!(!old_public.exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", method::CUSTOM, "tool", ""))
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "acknowledged cleanup must retire its transition journal"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cargo_to_custom_shadow_preserves_replaced_root() {
+        let fixture = Fixture::new("cargo-custom-shadow");
+        fixture.write_lib();
+        let old_root = fixture.roots.install_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                method::CARGO,
+                "tool",
+                old_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let root = old_root.display().to_string();
+        fixture.write_hook(
+            "tool",
+            &format!(
+                "exists() {{ return 1; }}\ninstall() {{\n  rm -rf \"{root}\"\n  mkdir -p \"{root}\"\n  printf 'custom\\n' >\"{root}/custom-output\"\n}}\n"
+            ),
+        );
+
+        let summary = run(
+            &[parse_entry("tool|custom|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.leftovers, ["tool"]);
+        assert!(summary.leftover_details.get("tool").is_some_and(|detail| {
+            detail.contains("preserved an old managed root changed by custom installation")
+        }));
+        assert_eq!(
+            fs::read_to_string(old_root.join("custom-output")).unwrap(),
+            "custom\n"
+        );
+        assert!(
+            !old_root.join("bin/tool").exists(),
+            "the custom install replaced the old root wholesale"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", method::CUSTOM, "tool", ""))
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "shadowed cleanup must retain its journal for a later retry"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_to_custom_shadow_preserves_replaced_checkout() {
+        let fixture = Fixture::new("repo-custom-shadow");
+        fixture.write_lib();
+        let old_root = fixture.roots.install_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                method::GITHUB_REPO,
+                "tool",
+                old_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let root = old_root.display().to_string();
+        fixture.write_hook(
+            "tool",
+            &format!(
+                "exists() {{ return 1; }}\ninstall() {{\n  rm -rf \"{root}\"\n  mkdir -p \"{root}\"\n  printf 'custom\\n' >\"{root}/custom-output\"\n}}\n"
+            ),
+        );
+
+        let summary = run(
+            &[parse_entry("tool|custom|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.leftovers, ["tool"]);
+        assert!(summary.leftover_details.get("tool").is_some_and(|detail| {
+            detail.contains("repository root changed after transition evidence was captured")
+        }));
+        assert_eq!(
+            fs::read_to_string(old_root.join("custom-output")).unwrap(),
+            "custom\n"
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", method::CUSTOM, "tool", ""))
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists(),
+            "shadowed cleanup must retain its journal for a later retry"
+        );
+    }
+
     #[test]
     fn update_preserves_old_method_when_custom_install_fails() {
         let fixture = Fixture::new("transition-failure");
@@ -2205,6 +3252,108 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
                 "tool",
                 old_install.display().to_string(),
             ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_current_method_transition_replays_post_exactly_once() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_CURRENT_TRANSITION";
+        const TEST_NAME: &str =
+            "update::tests::cancellation_after_current_method_transition_replays_post_exactly_once";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let fixture = Fixture::new("transition-current-post-recovery");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            "post() { printf 'post\\n' >>\"$SHDEPS_STATE_DIR/post-runs\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("tool", method::PKG, "tool", ""),
+        )
+        .unwrap();
+        let install_bin = fixture.roots.install_dir.join("tool/bin/tool");
+        write_executable(&install_bin);
+        let now = 1_700_000_000;
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "tool", "cargo"),
+            now,
+        )
+        .unwrap();
+        let entry = parse_entry("tool|cargo|tool|-|-", None);
+        let mut progress = SignalOnFirstItem::default();
+
+        let cancelled = run_with_progress(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now,
+                ..Options::default()
+            },
+            &mut progress,
+        );
+
+        assert!(cancelled.is_err());
+        assert_eq!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("tool")
+                .unwrap()
+                .method,
+            method::CARGO
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/tool")
+                .is_file(),
+            "current installer still committed a provider transition"
+        );
+        assert!(!fixture.roots.state_dir.join("post-runs").exists());
+        assert_eq!(
+            signals.finish_result(cancelled.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+
+        let retry = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert!(!retry.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+
+        let final_run = run(
+            &[entry],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert!(!final_run.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
         );
     }
 
@@ -2442,6 +3591,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         let local_clone = fixture.roots.git_dev_dir.join("tool");
         write_executable(&local_clone.join("bin/tool"));
         let runner = FakeRunner::default();
+        let txn = Txn::new(&fixture.roots.state_dir).unwrap();
         let outcome = super::install_builtin(
             &entry,
             &fixture.context(&manifest_path, &runner, "apt"),
@@ -2449,6 +3599,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             &crate::update_release::Prefetch::default(),
             Some(transition),
             super::RepoDestinationSnapshot::PreviousRelease,
+            &txn,
         );
 
         assert!(outcome.item.failed);
@@ -2509,6 +3660,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         let local_clone = fixture.roots.git_dev_dir.join("tool");
         write_executable(&local_clone.join("bin/tool"));
         let runner = FakeRunner::default();
+        let txn = Txn::new(&fixture.roots.state_dir).unwrap();
         let outcome = super::install_builtin(
             &entry,
             &fixture.context(&manifest_path, &runner, "apt"),
@@ -2516,6 +3668,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             &crate::update_release::Prefetch::default(),
             Some(transition),
             super::RepoDestinationSnapshot::PreviousRelease,
+            &txn,
         );
 
         assert!(outcome.item.failed);
@@ -2573,6 +3726,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         let local_clone = fixture.roots.git_dev_dir.join("tool");
         write_executable(&local_clone.join("bin/tool"));
         let runner = FakeRunner::default();
+        let txn = Txn::new(&fixture.roots.state_dir).unwrap();
         let outcome = super::install_builtin(
             &entry,
             &fixture.context(&manifest_path, &runner, "apt"),
@@ -2580,6 +3734,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             &crate::update_release::Prefetch::default(),
             Some(transition),
             super::RepoDestinationSnapshot::PreviousRelease,
+            &txn,
         );
 
         assert!(outcome.item.failed);
@@ -3014,6 +4169,142 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         assert!(local_clone.join("bin/ds").exists());
         assert!(!fixture.roots.install_dir.join("cgraf78/ds").exists());
         assert!(runner.calls().iter().all(|call| !call.starts_with("git\0")));
+    }
+
+    #[test]
+    fn release_install_refuses_to_publish_before_post_intent_is_durable() {
+        let mut fixture = Fixture::new("release-intent-storage-failure");
+        fixture.write_lib();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                release_response(
+                    "tool",
+                    "v1.2.3",
+                    "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64",
+                ),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64",
+                b"release-binary".to_vec(),
+            );
+        fs::create_dir_all(&fixture.roots.state_dir).unwrap();
+        fs::write(
+            fixture.roots.state_dir.join(".pending-posts"),
+            "not a directory\n",
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert!(
+            !fixture.roots.bin_dir.join("tool").exists(),
+            "release payload was published before its post obligation"
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_release_publication_replays_post_exactly_once() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_RELEASE_PUBLICATION";
+        const TEST_NAME: &str =
+            "update::tests::cancellation_after_release_publication_replays_post_exactly_once";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let mut fixture = Fixture::new("release-post-recovery");
+        fixture.write_lib();
+        fixture.write_hook(
+            "owner/tool",
+            "post() { printf 'post\\n' >>\"$SHDEPS_STATE_DIR/post-runs\"; }\n",
+        );
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                release_response(
+                    "tool",
+                    "v1.2.3",
+                    "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64",
+                ),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v1/tool-linux-x86_64",
+                b"release-binary".to_vec(),
+            );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entry = parse_entry("owner/tool|github:release|tool|-|-", None);
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+        let mut progress = SignalOnFirstChangedItem::default();
+
+        let cancelled = run_with_progress(
+            std::slice::from_ref(&entry),
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &mut progress,
+        );
+
+        assert!(cancelled.is_err());
+        assert_eq!(
+            fs::read(fixture.roots.bin_dir.join("tool")).unwrap(),
+            b"release-binary"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/owner/tool")
+                .is_file()
+        );
+        assert!(!fixture.roots.state_dir.join("post-runs").exists());
+        assert_eq!(
+            signals.finish_result(cancelled.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+
+        let retry = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!retry.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+
+        let final_run = run(
+            &[entry],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!final_run.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
     }
 
     #[test]
@@ -3872,6 +5163,412 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/jq-post"; }
     }
 
     #[test]
+    fn package_install_refuses_to_mutate_before_post_intent_is_durable() {
+        let fixture = Fixture::new("pkg-intent-storage-failure");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        fs::create_dir_all(&fixture.roots.state_dir).unwrap();
+        fs::write(
+            fixture.roots.state_dir.join(".pending-posts"),
+            "not a directory\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::default()
+            .with_success("apt-cache", ["show", "jq"], "Package: jq\n")
+            .with_success("sudo", ["apt-get", "install", "-y", "jq"], "");
+
+        let result = run(
+            &[parse_entry("jq|pkg|jq|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            !runner
+                .calls()
+                .contains(&key("sudo", ["apt-get", "install", "-y", "jq"])),
+            "package manager ran before its post obligation was durable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_package_side_effect_replays_post_exactly_once() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_PACKAGE_INSTALL";
+        const TEST_NAME: &str =
+            "update::tests::cancellation_after_package_side_effect_replays_post_exactly_once";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let fixture = Fixture::new("pkg-post-recovery");
+        fixture.write_lib();
+        fixture.write_hook(
+            "jq",
+            "post() { printf 'post\\n' >>\"$SHDEPS_STATE_DIR/post-runs\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entry = parse_entry("jq|pkg|jq|-|-", None);
+        let install_args = ["apt-get", "install", "-y", "jq"];
+        let runner = FakeRunner::default()
+            .with_success("apt-cache", ["show", "jq"], "Package: jq\n")
+            .with_success("sudo", install_args, "")
+            .with_signal_after("sudo", install_args, libc::SIGTERM);
+
+        let cancelled = run(
+            std::slice::from_ref(&entry),
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        );
+
+        assert!(cancelled.is_err());
+        assert!(
+            fixture.roots.state_dir.join(".pending-posts/jq").is_file(),
+            "package mutation must leave a durable post obligation"
+        );
+        assert!(!fixture.roots.state_dir.join("post-runs").exists());
+        assert_eq!(
+            signals.finish_result(cancelled.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+
+        crate::package_proof::write(&fixture.roots.state_dir, "jq", "apt", "jq", "jq").unwrap();
+        let retry_runner = FakeRunner::default().with_command("jq");
+        let retry = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &retry_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!retry.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+
+        let final_run = run(
+            &[entry],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &retry_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!final_run.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n",
+            "acknowledged obligation must not run twice"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_package_transition_commits_then_cleans_old_provider_on_retry() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_PACKAGE_TRANSITION_RETRY";
+        const TEST_NAME: &str = "update::tests::interrupted_package_transition_commits_then_cleans_old_provider_on_retry";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let fixture = Fixture::new("package-transition-retry");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            "post() { printf 'post\\n' >>\"$SHDEPS_STATE_DIR/post-runs\"; }\n",
+        );
+        let old_root = fixture.roots.install_dir.join("tool");
+        let old_public = fixture.roots.bin_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &old_public).unwrap();
+        crate::link_state::write(
+            &crate::link_state::path(&fixture.roots.state_dir, "tool", Kind::Bin),
+            std::slice::from_ref(&old_public),
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "tool",
+            method::CARGO,
+            "tool",
+            old_root.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let entry = parse_entry("tool|pkg|tool|-|-", None);
+        let install_args = ["apt-get", "install", "-y", "tool"];
+        let runner = FakeRunner::default()
+            .with_success("apt-cache", ["show", "tool"], "Package: tool\n")
+            .with_success("sudo", install_args, "")
+            .with_signal_after("sudo", install_args, libc::SIGTERM);
+
+        let cancelled = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        );
+        assert!(cancelled.is_err());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        assert!(old_root.exists());
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/tool")
+                .is_file()
+        );
+        assert_eq!(signals.finish_result(cancelled.map(|_| 0)).unwrap(), 143);
+
+        let unavailable = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(unavailable.has_errors(), "{unavailable:?}");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .is_dir(),
+            "an ambiguous install must remain recoverable when the package manager is unavailable"
+        );
+
+        crate::package_proof::write(&fixture.roots.state_dir, "tool", "apt", "tool", "tool")
+            .unwrap();
+        let retry_runner = FakeRunner::default().with_command("tool").with_success(
+            "dpkg-query",
+            ["-W", "-f=${Status}\n", "tool"],
+            "install ok installed\n",
+        );
+        let retry = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &retry_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!retry.has_errors(), "{retry:?}");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&ManifestEntry::new("tool", method::PKG, "tool", ""))
+        );
+        assert!(!old_root.exists());
+        assert!(!old_public.exists());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+    }
+
+    /// Crafts an `Installing` method journal for a cargo-to-pkg transition.
+    ///
+    /// The journal is bound at creation to the installer that started it; the
+    /// returned manifest row and entry describe the interrupted replacement.
+    #[cfg(unix)]
+    fn craft_installing_pkg_transition(
+        fixture_name: &str,
+        entry: &Entry,
+    ) -> (Fixture, PathBuf, ManifestEntry) {
+        let fixture = Fixture::new(fixture_name);
+        fixture.write_lib();
+        let old_root = fixture.roots.install_dir.join("tool");
+        let old_public = fixture.roots.bin_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"));
+        fs::create_dir_all(old_public.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &old_public).unwrap();
+        crate::link_state::write(
+            &crate::link_state::path(&fixture.roots.state_dir, "tool", Kind::Bin),
+            std::slice::from_ref(&old_public),
+        )
+        .unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "tool",
+            method::CARGO,
+            "tool",
+            old_root.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let transitions =
+            update_transition::by_name(&manifest, std::slice::from_ref(entry), &fixture.roots)
+                .unwrap();
+        let apt_identity = update_transition::PkgInstallerIdentity::for_target(
+            &entry.name,
+            &entry.aliases,
+            "apt",
+            false,
+        );
+        let mut durable = update_transition::begin_durable_transition(
+            entry,
+            transitions.get(&entry.name),
+            &fixture.roots,
+            &manifest_path,
+            Some(apt_identity),
+        )
+        .unwrap()
+        .expect("cargo-to-pkg starts a durable transition");
+        durable.mark_installing(&fixture.roots).unwrap();
+        (fixture, manifest_path, old)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn package_transition_retry_rejects_changed_package_manager_before_any_query() {
+        let entry = parse_entry("tool|pkg|tool|-|-", None);
+        let (fixture, manifest_path, old) =
+            craft_installing_pkg_transition("pkg-identity-manager-change", &entry);
+        let runner = FakeRunner::default();
+
+        let result = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "brew"),
+            Options::default(),
+        );
+
+        let error = match result {
+            Ok(summary) => panic!(
+                "expected a fail-closed installer error, got success after queries {:?}: {summary:?}",
+                runner.calls()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("installer"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "retry under a different manager must fail before any package query: {:?}",
+            runner.calls()
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .is_dir(),
+            "the original journal must be retained for a same-installer retry"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn package_transition_retry_rejects_android_runtime_change() {
+        let entry = parse_entry("tool|pkg|tool|android:tool-droid,apt:tool-deb|-", None);
+        let (mut fixture, manifest_path, old) =
+            craft_installing_pkg_transition("pkg-identity-android-change", &entry);
+        fixture.env = RuntimeEnv::new("linux", "host").with_android(true);
+        let runner = FakeRunner::default();
+
+        let result = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        );
+
+        let error = match result {
+            Ok(summary) => panic!(
+                "expected a fail-closed installer error, got success after queries {:?}: {summary:?}",
+                runner.calls()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("installer"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "retry under a different runtime must fail before any package query: {:?}",
+            runner.calls()
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .is_dir(),
+            "the original journal must be retained for a same-installer retry"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn package_installed_only_for_changed_manager_cannot_retire_journal() {
+        let entry = parse_entry("tool|pkg|tool|-|-", None);
+        let (fixture, manifest_path, old) =
+            craft_installing_pkg_transition("pkg-identity-changed-proof", &entry);
+        let runner = FakeRunner::default()
+            .with_success("brew", ["list", "--formula", "--versions"], "tool 1.0\n")
+            .with_success("brew", ["list", "--versions", "tool"], "tool 1.0\n");
+
+        let result = run(
+            std::slice::from_ref(&entry),
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "brew"),
+            Options::default(),
+        );
+
+        let error = match result {
+            Ok(summary) => panic!(
+                "expected a fail-closed installer error, got success after queries {:?}: {summary:?}",
+                runner.calls()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("installer"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "a changed-manager proof must not be consulted: {:?}",
+            runner.calls()
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .is_dir(),
+            "a changed-manager install must not retire the original journal"
+        );
+    }
+
+    #[test]
     fn update_pauses_progress_before_sudo_package_commands() {
         let fixture = Fixture::new("pkg-sudo-prompt-pause");
         let manifest_path = manifest::path(&fixture.roots.state_dir);
@@ -4063,6 +5760,263 @@ version() { printf 'saw-pkg\n'; }
                     .to_string(),
             ))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_external_installer_skips_publication() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_EXTERNAL_INSTALL";
+        const TEST_NAME: &str =
+            "update::tests::cancellation_after_external_installer_skips_publication";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let fixture = Fixture::new("cancel-after-external-install");
+        fixture.write_lib();
+        fixture.write_hook(
+            "ripgrep",
+            "post() { printf 'post\\n' >>\"$SHDEPS_STATE_DIR/post-runs\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let bin_path = fixture.roots.install_dir.join("ripgrep/bin/rg");
+        let install_root = fixture.roots.install_dir.join("ripgrep");
+        let args = [
+            "install",
+            "--locked",
+            "--root",
+            install_root.to_str().unwrap(),
+            "ripgrep",
+        ];
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_created_binary("cargo", args, bin_path.clone())
+            .with_signal_after("cargo", args, libc::SIGTERM);
+
+        let result = run(
+            &[parse_entry("ripgrep|cargo|rg|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        );
+        assert!(result.is_err(), "latched cancellation must stop update");
+        assert!(bin_path.exists(), "fixture installer must have completed");
+        assert!(
+            !fixture.roots.bin_dir.join("rg").exists(),
+            "cancelled installer must not publish a public command"
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("ripgrep")
+                .is_none(),
+            "cancelled installer must not publish a manifest row"
+        );
+        assert!(
+            !stamp::remote_path(&fixture.roots.state_dir, "ripgrep", "cargo").exists(),
+            "cancelled installer must not publish a freshness stamp"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/ripgrep")
+                .is_file(),
+            "completed installer side effect must retain a post obligation"
+        );
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+
+        let retry_runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_success("cargo", args, "");
+        let retry = run(
+            &[parse_entry("ripgrep|cargo|rg|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &retry_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!retry.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+
+        let final_run = run(
+            &[parse_entry("ripgrep|cargo|rg|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &retry_runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(!final_run.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n",
+            "post obligation must be acknowledged after one replay"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_committed_builtin_replays_pending_post_once() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_BUILTIN_COMMIT";
+        const TEST_NAME: &str =
+            "update::tests::cancellation_after_committed_builtin_replays_pending_post_once";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let fixture = Fixture::new("cancel-after-builtin-commit");
+        fixture.write_lib();
+        fixture.write_hook(
+            "ripgrep",
+            "post() { printf 'post\\n' >>\"$SHDEPS_STATE_DIR/post-runs\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_root = fixture.roots.install_dir.join("ripgrep");
+        let bin_path = install_root.join("bin/rg");
+        let args = [
+            "install",
+            "--locked",
+            "--root",
+            install_root.to_str().unwrap(),
+            "ripgrep",
+        ];
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_created_binary("cargo", args, bin_path.clone());
+        let entry = parse_entry("ripgrep|cargo|rg|-|-", None);
+        let mut progress = SignalOnFirstChangedItem::default();
+
+        let cancelled = run_with_progress(
+            std::slice::from_ref(&entry),
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &mut progress,
+        );
+
+        assert!(cancelled.is_err());
+        assert!(
+            bin_path.exists(),
+            "installer publication must have committed"
+        );
+        assert!(
+            !fixture.roots.state_dir.join("post-runs").exists(),
+            "post must not run after cancellation is latched"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/ripgrep")
+                .is_file(),
+            "the committed install must retain a durable post obligation"
+        );
+        assert_eq!(
+            signals.finish_result(cancelled.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+
+        let retry = run(
+            &[entry],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!retry.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n",
+            "retry must run the durable post obligation exactly once without reinstalling"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/ripgrep")
+                .exists(),
+            "successful post must acknowledge its durable obligation"
+        );
+    }
+
+    #[test]
+    fn progress_failure_after_one_parallel_completion_retains_every_committed_post() {
+        let mut fixture = Fixture::new("cancel-after-parallel-commit");
+        fixture.write_lib();
+        fixture
+            .env_vars
+            .insert("SHDEPS_JOBS".to_owned(), "2".to_owned());
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let alpha_root = fixture.roots.install_dir.join("alpha");
+        let beta_root = fixture.roots.install_dir.join("beta");
+        let runner = FakeRunner::default()
+            .with_command("cargo")
+            .with_created_binary(
+                "cargo",
+                [
+                    "install",
+                    "--locked",
+                    "--root",
+                    alpha_root.to_str().unwrap(),
+                    "alpha",
+                ],
+                alpha_root.join("bin/alpha"),
+            )
+            .with_created_binary(
+                "cargo",
+                [
+                    "install",
+                    "--locked",
+                    "--root",
+                    beta_root.to_str().unwrap(),
+                    "beta",
+                ],
+                beta_root.join("bin/beta"),
+            )
+            .with_overlap_gate(2);
+        let entries = [
+            parse_entry("alpha|cargo|alpha|-|-", None),
+            parse_entry("beta|cargo|beta|-|-", None),
+        ];
+        let mut progress = FailOnFirstChangedItem {
+            manifest_path: manifest_path.clone(),
+            waited_for_commits: false,
+            failed: false,
+        };
+
+        let result = run_with_progress(
+            &entries,
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+            &mut progress,
+        );
+
+        assert!(result.is_err(), "failed progress must stop the update");
+        assert!(alpha_root.join("bin/alpha").is_file());
+        assert!(beta_root.join("bin/beta").is_file());
+        for name in ["alpha", "beta"] {
+            assert!(
+                fixture
+                    .roots
+                    .state_dir
+                    .join(".pending-posts")
+                    .join(name)
+                    .is_file(),
+                "committed sibling {name} lost its durable post obligation"
+            );
+        }
     }
 
     #[test]
@@ -7115,7 +9069,7 @@ version() { printf 'saw-pkg\n'; }
         .unwrap();
 
         let install_link = fixture.roots.install_dir.join("cgraf78/ds");
-        assert!(!summary.has_errors());
+        assert!(!summary.has_errors(), "{summary:?}");
         assert!(summary.items[0].changed);
         assert_eq!(summary.items[0].detail, "local clone");
         assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
@@ -7435,7 +9389,11 @@ version() { printf 'saw-pkg\n'; }
         .unwrap();
 
         let physical_checkout = physical_install.join("owner/tool");
-        assert!(!update.has_errors());
+        assert!(
+            !update.has_errors(),
+            "unexpected symlinked-root update result: {:?}",
+            update.items
+        );
         assert!(fs::symlink_metadata(&physical_checkout).is_ok());
         assert_eq!(
             manifest::read(&manifest_path)
@@ -7566,7 +9524,7 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
+        assert!(!summary.has_errors(), "unexpected summary: {summary:?}");
         assert_eq!(summary.items[0].detail, "added -- 1.2.3 (local clone)");
     }
 
@@ -7607,7 +9565,7 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
+        assert!(!summary.has_errors(), "unexpected summary: {summary:?}");
         assert_eq!(
             summary.items[0].detail,
             "added -- commit abc1234 (local clone)"
@@ -7637,7 +9595,7 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
+        assert!(!summary.has_errors(), "unexpected summary: {summary:?}");
         assert!(!summary.items[0].changed);
         assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
         let public = fixture.roots.bin_dir.join("ds");
@@ -7731,7 +9689,13 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
+        assert!(
+            !summary.has_errors(),
+            "failed={:?} leftovers={:?} details={:?}",
+            summary.failed,
+            summary.leftovers,
+            summary.leftover_details
+        );
         assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
         assert_eq!(
             fs::symlink_metadata(&install_link).unwrap().ino(),
@@ -7986,7 +9950,10 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
+        assert!(
+            !summary.has_errors(),
+            "repo install must succeed with a local clone: {summary:?}"
+        );
         assert!(fixture.roots.install_dir.join("cgraf78/ds").is_symlink());
         assert!(!fixture.roots.install_dir.join("cgraf78/ds.git").exists());
         assert!(
@@ -8112,6 +10079,376 @@ version() { printf 'saw-pkg\n'; }
                 "tool",
                 install_dir.display().to_string(),
             ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_repo_recovery_precedes_empty_config_and_remote_resolution() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_REPO_PUSH_URL";
+        const TEST_NAME: &str =
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let mut fixture = Fixture::new("repo-fresh-push-url-cancel");
+        fixture.write_lib();
+        fixture.env_vars.insert(
+            "SHDEPS_PRIVATE_TOOL_REPO".to_owned(),
+            "https://github.com/private/tool".to_owned(),
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("private/tool");
+        let clone_tmp = fixture
+            .roots
+            .install_dir
+            .join(format!("private/tool.tmp.{}", std::process::id()));
+        let push_args = [
+            "-C",
+            install_dir.to_str().unwrap(),
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "git@github.com:private/tool.git",
+        ];
+        let runner = FakeRunner::default()
+            .with_command("git")
+            .with_created_dir(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/private/tool",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join(".git"),
+            )
+            .with_created_binary(
+                "git",
+                [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/private/tool",
+                    clone_tmp.to_str().unwrap(),
+                ],
+                clone_tmp.join("bin/tool"),
+            )
+            .with_success("git", push_args, "")
+            .with_signal_after("git", push_args, libc::SIGTERM);
+        let signals = crate::cancellation::Signals::install().unwrap();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        let _watchdog = crate::cancellation::spawn_teardown_watchdog(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+        );
+
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+            "before-run",
+        );
+        let result = run(
+            &[parse_entry("private/tool|github:repo|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        );
+
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+            "after-run",
+        );
+        assert!(result.is_err(), "latched cancellation must abort update");
+        assert!(
+            install_dir.is_dir(),
+            "completed publication remains recoverable"
+        );
+        assert!(
+            !crate::stamp::remote_path(&fixture.roots.state_dir, "private/tool", "repo").exists(),
+            "cancelled push-url completion wrote the repo TTL"
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("private/tool")
+                .is_none(),
+            "cancelled push-url completion wrote the manifest"
+        );
+        let journal = install_dir
+            .parent()
+            .unwrap()
+            .join(".tool.shdeps-repo-transition-v1");
+        assert!(
+            journal.is_dir(),
+            "fresh publication must retain exact recovery authority until ownership is recorded"
+        );
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::checkout_lock::diag_dump_lock_state(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+            &[&fixture.roots.home],
+        );
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+            "before-retry-run",
+        );
+        let retry = run(
+            &[],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_001,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
+            "after-retry-run",
+        );
+
+        assert!(
+            !retry.has_errors(),
+            "durable ownership recovery must not depend on current config or remote access"
+        );
+        assert!(retry.items.is_empty());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("private/tool"),
+            Some(&ManifestEntry::new(
+                "private/tool",
+                method::GITHUB_REPO,
+                "tool",
+                install_dir.display().to_string(),
+            )),
+            "retry must recover exact Shdeps ownership without remote adoption"
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("tool")).unwrap(),
+            install_dir.join("bin/tool"),
+            "retry must restore local links before any unavailable remote refresh"
+        );
+        assert!(
+            !journal.exists(),
+            "completed ownership recovery removes its journal"
+        );
+
+        let head_args = ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"];
+        let advance = FakeRunner::default()
+            .with_command("git")
+            .with_failure(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "remote",
+                    "get-url",
+                    "origin",
+                ],
+            )
+            .with_success("git", head_args, "old-head\n")
+            .with_success(
+                "git",
+                [
+                    "-C",
+                    install_dir.to_str().unwrap(),
+                    "pull",
+                    "--ff-only",
+                    "--quiet",
+                ],
+                "",
+            )
+            .with_success("git", head_args, "new-head\n");
+        let advanced = run(
+            &[parse_entry("private/tool|github:repo|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &advance, "apt"),
+            Options {
+                now: 1_700_000_002,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!advanced.has_errors());
+        assert!(
+            advanced.items[0].changed,
+            "a later upstream advance must update the recovered checkout normally"
+        );
+        assert_eq!(
+            fs::read_to_string(crate::stamp::remote_path(
+                &fixture.roots.state_dir,
+                "private/tool",
+                "repo"
+            ))
+            .unwrap(),
+            "1700000002\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_repo_recovery_uses_journaled_command_before_changed_config() {
+        let fixture = Fixture::new("repo-fresh-command-change-recovery");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let checkout = fixture.roots.install_dir.join("owner/tool");
+        let staged = fixture
+            .roots
+            .install_dir
+            .join(format!("owner/tool.tmp.{}", std::process::id()));
+        write_executable(&staged.join("bin/old-tool"));
+        fs::create_dir_all(staged.join(".git")).unwrap();
+        let ownership = ManifestEntry::new(
+            "owner/tool",
+            method::GITHUB_REPO,
+            "old-tool",
+            checkout.display().to_string(),
+        );
+        crate::repo_transition::publish_fresh_directory(
+            &checkout,
+            &staged,
+            ownership.clone(),
+            &fixture.roots.state_dir,
+        )
+        .unwrap();
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|new-tool|-|-", None)],
+            &Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&ownership),
+            "recovery must finalize journaled ownership before the changed declaration is evaluated"
+        );
+        assert_eq!(
+            fs::read_link(fixture.roots.bin_dir.join("old-tool")).unwrap(),
+            checkout.join("bin/old-tool")
+        );
+        assert!(
+            crate::repo_transition::pending_fresh_publications(
+                &fixture.roots.state_dir,
+                &fixture.roots.install_dir,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_offline_repo_can_resolve_and_transition_to_online_release() {
+        let mut fixture = Fixture::new("repo-recovery-before-release-resolution");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let checkout = fixture.roots.install_dir.join("owner/tool");
+        let staged = fixture
+            .roots
+            .install_dir
+            .join(format!("owner/tool.tmp.{}", std::process::id()));
+        write_executable(&staged.join("bin/tool"));
+        fs::create_dir_all(staged.join(".git")).unwrap();
+        let ownership = ManifestEntry::new(
+            "owner/tool",
+            method::GITHUB_REPO,
+            "tool",
+            checkout.display().to_string(),
+        );
+        crate::repo_transition::publish_fresh_directory(
+            &checkout,
+            &staged,
+            ownership,
+            &fixture.roots.state_dir,
+        )
+        .unwrap();
+        fixture.client = FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                release_response(
+                    "tool",
+                    "v2.0.0",
+                    "https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64",
+                ),
+            )
+            .with(
+                "https://github.com/owner/tool/releases/download/v2/tool-linux-x86_64",
+                b"release-v2".to_vec(),
+            );
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let (lock, recovered) =
+            super::prepare_for_resolution(&fixture.roots, &manifest_path, &fixture.env_vars)
+                .unwrap();
+        assert_eq!(
+            recovered.get("owner/tool").unwrap().method,
+            method::GITHUB_REPO
+        );
+        let raw = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+        let resolved = crate::github_method::resolve_entries(
+            &raw,
+            &crate::github_method::Context {
+                roots: &fixture.roots,
+                manifest: Some(&recovered),
+                env: &fixture.env,
+                env_vars: &fixture.env_vars,
+                runner: &runner,
+                client: &fixture.client,
+            },
+            crate::github_method::Options {
+                force: true,
+                ..crate::github_method::Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved[0].method, method::GITHUB_RELEASE);
+
+        let summary = super::run_locked(
+            &resolved,
+            &recovered,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                force: true,
+                ..Options::default()
+            },
+            lock,
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert_eq!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .unwrap()
+                .method,
+            method::GITHUB_RELEASE
+        );
+        assert_eq!(
+            fs::read(fixture.roots.bin_dir.join("tool")).unwrap(),
+            b"release-v2"
+        );
+        assert!(
+            !checkout.exists(),
+            "transition must retire recovered repo ownership"
         );
     }
 
@@ -9162,8 +11499,11 @@ version() { printf 'saw-pkg\n'; }
         fs::create_dir_all(&install_dir).unwrap();
         fs::write(install_dir.join("replacement-sentinel"), "preserve\n").unwrap();
 
+        let txn = Txn::new(&fixture.roots.state_dir).unwrap();
+        let mut mutation = txn.mutation(&entry.name);
         let error =
-            crate::update_repo::apply(plan, &entry, &context, Options::default()).unwrap_err();
+            crate::update_repo::apply(plan, &entry, &context, Options::default(), &mut mutation)
+                .unwrap_err();
 
         assert!(error.to_string().contains("root changed"));
         assert_eq!(
@@ -9213,8 +11553,11 @@ version() { printf 'saw-pkg\n'; }
         fs::create_dir_all(&local_clone).unwrap();
         fs::write(local_clone.join("replacement-sentinel"), "preserve\n").unwrap();
 
+        let txn = Txn::new(&fixture.roots.state_dir).unwrap();
+        let mut mutation = txn.mutation(&entry.name);
         let error =
-            crate::update_repo::apply(plan, &entry, &context, Options::default()).unwrap_err();
+            crate::update_repo::apply(plan, &entry, &context, Options::default(), &mut mutation)
+                .unwrap_err();
 
         assert!(error.to_string().contains("development checkout changed"));
         assert_eq!(
@@ -9270,10 +11613,16 @@ version() { printf 'saw-pkg\n'; }
             ],
         );
 
+        let txn = Txn::new(&fixture.roots.state_dir).unwrap();
+        let mut mutation = txn.mutation(&entry.name);
         let error =
-            crate::update_repo::apply(plan, &entry, &context, Options::default()).unwrap_err();
+            crate::update_repo::apply(plan, &entry, &context, Options::default(), &mut mutation)
+                .unwrap_err();
 
-        assert!(error.to_string().contains("origin does not match"));
+        assert!(
+            error.to_string().contains("origin does not match"),
+            "unexpected error: {error}"
+        );
         assert!(!install_dir.exists());
         assert!(!fixture.roots.bin_dir.join("tool").exists());
         assert!(
@@ -9321,7 +11670,11 @@ version() { printf 'saw-pkg\n'; }
         fs::remove_file(local_clone.join("bin/tool")).unwrap();
         symlink(&outside, local_clone.join("bin/tool")).unwrap();
 
-        let item = crate::update_repo::apply(plan, &entry, &context, Options::default()).unwrap();
+        let txn = Txn::new(&fixture.roots.state_dir).unwrap();
+        let mut mutation = txn.mutation(&entry.name);
+        let item =
+            crate::update_repo::apply(plan, &entry, &context, Options::default(), &mut mutation)
+                .unwrap();
 
         assert_eq!(item.reason, ItemReason::MissingBinary);
         assert!(!install_dir.exists());
@@ -9374,8 +11727,11 @@ version() { printf 'saw-pkg\n'; }
             }
         };
 
+        let txn = Txn::new(&fixture.roots.state_dir).unwrap();
+        let mut mutation = txn.mutation(&entry.name);
         let error =
-            crate::update_repo::apply(plan, &entry, &context, Options::default()).unwrap_err();
+            crate::update_repo::apply(plan, &entry, &context, Options::default(), &mut mutation)
+                .unwrap_err();
 
         assert!(error.to_string().contains("destination appeared"));
         assert!(fs::symlink_metadata(&install_dir).unwrap().is_file());
@@ -9536,7 +11892,11 @@ version() { printf 'saw-pkg\n'; }
         .unwrap();
 
         assert!(summary.has_errors());
-        assert!(summary.items[0].detail.contains("status failed"));
+        assert!(
+            summary.items[0].detail.contains("status failed"),
+            "unexpected development-status failure detail: {}",
+            summary.items[0].detail
+        );
         assert!(runner.clean_calls().iter().all(|call| {
             !call
                 .args
@@ -9917,6 +12277,150 @@ version() { printf 'saw-pkg\n'; }
                 .iter()
                 .all(|call| !call.contains("\0clone\0") && !call.contains("\0pull\0")),
             "a fresh recorded checkout must not clone or pull"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_existing_repo_metadata_mutation_retains_post_intent() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_EXISTING_REPO_METADATA";
+        const TEST_NAME: &str =
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        let _watchdog = crate::cancellation::spawn_teardown_watchdog(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+        );
+        let fixture = Fixture::new("repo-existing-metadata-cancel");
+        fixture.write_lib();
+        fixture.write_hook(
+            "owner/tool",
+            "post() { printf 'post\\n' >>\"$SHDEPS_STATE_DIR/post-runs\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        write_executable(&install_dir.join("bin/tool"));
+        let installed = record_repo_manifest(&manifest_path, "owner/tool", "tool", &install_dir);
+        let install_arg = install_dir.to_string_lossy().into_owned();
+        let set_push = [
+            "-C",
+            install_arg.as_str(),
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "git@github.com:owner/tool.git",
+        ];
+        let runner = FakeRunner::default()
+            .with_command("git")
+            .with_success(
+                "git",
+                ["-C", install_arg.as_str(), "remote", "get-url", "origin"],
+                "https://github.com/owner/tool\n",
+            )
+            .with_success("git", set_push, "")
+            .with_signal_after("git", set_push, libc::SIGTERM);
+
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "before-run",
+        );
+        let cancelled = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        );
+
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "after-run",
+        );
+        assert!(cancelled.is_err());
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/owner/tool")
+                .is_file(),
+            "repo mutation must be preceded by its durable post intent"
+        );
+        assert_eq!(
+            signals.finish_result(cancelled.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+
+        let retry_now = 1_700_000_000;
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "repo"),
+            retry_now,
+        )
+        .unwrap();
+        let retry_runner = FakeRunner::default();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::checkout_lock::diag_dump_lock_state(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            &[&fixture.roots.home],
+        );
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "before-retry-run",
+        );
+        let retry = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &retry_runner, "apt"),
+            Options {
+                now: retry_now,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "after-retry-run",
+        );
+        assert!(!retry.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "before-final-run",
+        );
+        let final_run = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &retry_runner, "apt"),
+            Options {
+                now: retry_now,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
+        crate::cancellation::teardown_phase(
+            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
+            "after-final-run",
+        );
+        assert!(!final_run.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n",
+            "repo post obligation must be acknowledged after one replay"
         );
     }
 
@@ -10415,6 +12919,7 @@ version() { printf 'saw-pkg\n'; }
 
         fn write_hook(&self, name: &str, body: &str) {
             let path = self.roots.hooks_dir.join(format!("{name}.sh"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, body).unwrap();
             let mut perms = fs::metadata(&path).unwrap().permissions();
             perms.set_mode(0o755);
@@ -10604,6 +13109,7 @@ version() { printf 'saw-pkg\n'; }
         clean_outputs: QueuedOutputs,
         clean_calls: std::sync::Arc<std::sync::Mutex<Vec<CleanCall>>>,
         outputs: std::collections::BTreeMap<String, QueuedOutputs>,
+        signals_after: std::collections::BTreeMap<String, i32>,
         creates: std::collections::BTreeMap<String, Vec<PathBuf>>,
         creates_dirs: std::collections::BTreeMap<String, Vec<PathBuf>>,
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -10712,6 +13218,17 @@ version() { printf 'saw-pkg\n'; }
             self
         }
 
+        #[cfg(unix)]
+        fn with_signal_after(
+            mut self,
+            program: &str,
+            args: impl IntoIterator<Item = impl AsRef<str>>,
+            signal: i32,
+        ) -> Self {
+            self.signals_after.insert(key(program, args), signal);
+            self
+        }
+
         fn with_overlap_gate(mut self, target: usize) -> Self {
             self.overlap_gate = Some(std::sync::Arc::new(OverlapGateState::new(target)));
             self
@@ -10796,15 +13313,22 @@ version() { printf 'saw-pkg\n'; }
             for path in self.creates_dirs.get(&key).into_iter().flatten() {
                 fs::create_dir_all(path).unwrap();
             }
-            if let Some(outputs) = self.outputs.get(&key) {
-                return Ok(next_output(outputs));
+            let output = self.outputs.get(&key).map_or_else(
+                || Output {
+                    success: false,
+                    timed_out: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                next_output,
+            );
+            #[cfg(unix)]
+            if let Some(signal) = self.signals_after.get(&key) {
+                // SAFETY: the subprocess test installs Shdeps' handler before
+                // configuring this fake boundary and targets itself only.
+                unsafe { libc::raise(*signal) };
             }
-            Ok(Output {
-                success: false,
-                timed_out: false,
-                stdout: String::new(),
-                stderr: String::new(),
-            })
+            Ok(output)
         }
 
         fn run_env_clear(
@@ -11409,14 +13933,14 @@ version() { printf 'saw-pkg\n'; }
     }
 
     fn fixture_git_output(root: &Path, args: &[&str]) -> std::process::Output {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-c", "core.hooksPath=/dev/null", "-C"])
             .arg(root)
-            .args(args)
-            .output()
-            .unwrap();
+            .args(args);
+        let output = crate::test_support::run_subprocess(command).unwrap();
         assert!(
             output.status.success(),
             "git fixture command failed: git -C {} {}\n{}",
