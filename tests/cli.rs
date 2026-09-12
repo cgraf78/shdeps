@@ -5643,13 +5643,21 @@ with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
     pid_file.write(f"{os.getpid()}\n")
 while not os.path.exists(os.environ["SHDEPS_TEST_DESCENDANT_PID"]):
     time.sleep(0.001)
+# Darwin answers ESRCH for getpgid/getsid once a process has exited,
+# even while it is still a zombie, so the leader must stay alive until
+# the test has observed its topology. It still exits before the
+# descendant takes the terminal below.
+while not os.path.exists(os.environ["SHDEPS_TEST_TOPOLOGY_OBSERVED"]):
+    time.sleep(0.001)
 os._exit(0)
 "#,
     );
     let tty_owner_ready = fixture.dir.join("foreground-tty-owner-ready");
     let tty_takeover = fixture.dir.join("foreground-tty-takeover");
+    let topology_observed = fixture.dir.join("foreground-topology-observed");
     let mut command = fixture.command(["update"]);
     command
+        .env("SHDEPS_TEST_TOPOLOGY_OBSERVED", &topology_observed)
         .env(
             "SHDEPS_TEST_CHILD_PID",
             fixture.dir.join("foreground-exited.pid"),
@@ -5679,6 +5687,8 @@ os._exit(0)
         descendant_group, leader_group,
         "fixture pipe holder must own the terminal from another process group"
     );
+    // Topology observed: release the leader so it exits before take-over.
+    fs::write(&topology_observed, "observed\n").unwrap();
     wait_until(
         Duration::from_secs(2),
         || !process_is_running(leader_pid),
@@ -6505,6 +6515,12 @@ install() {
     done
   ' &
   printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/retry-hook.pid"
+  # Darwin answers ESRCH for getpgid/getsid once a process has exited,
+  # even while it is still a zombie, so the hook must stay alive until
+  # the test has observed its topology. It still exits before SIGTERM.
+  while [ ! -e "$SHDEPS_STATE_DIR/retry-topology-observed" ]; do
+    /bin/sleep 0.01
+  done
   return 0
 }
 "#,
@@ -6535,6 +6551,12 @@ install() {
         descendant_session, hook_session,
         "portable fixture must retain parent SID"
     );
+    // Topology observed: release the hook so it exits before SIGTERM.
+    fs::write(
+        fixture.dir.join("state/retry-topology-observed"),
+        "observed\n",
+    )
+    .unwrap();
     wait_until(
         Duration::from_secs(2),
         || !process_is_running(hook_pid),
