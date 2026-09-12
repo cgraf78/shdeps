@@ -7792,13 +7792,31 @@ fn process_state(pid: u32) -> String {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn describe_stall(shdeps_pid: u32, child_pid: u32, master: &fs::File) -> String {
     format!(
-        "self={} child_alive={} shdeps_state={} fg_group={:?} kids=[{}]",
+        "self={} child_alive={} shdeps_state={} threads={} fg_group={:?} kids=[{}]",
         shdeps_pid,
         process_is_running(child_pid),
         process_state(shdeps_pid),
+        thread_count(shdeps_pid),
         try_terminal_group(master),
         live_children(shdeps_pid).join(" "),
     )
+}
+
+/// Thread count for wedge classification: >1 with no children means leaked
+/// blocking threads (readers); 1 plus exiting state means pure
+/// exit-teardown (ctty/session detach).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn thread_count(pid: u32) -> String {
+    capture_output(Command::new("ps").args(["-o", "thcount=", "-p", &pid.to_string()]))
+        .map(|output| {
+            let text = text(&output.stdout).trim().to_owned();
+            if text.is_empty() {
+                "thcount-empty".to_owned()
+            } else {
+                text
+            }
+        })
+        .unwrap_or_else(|_| "thcount-unknown".to_owned())
 }
 
 /// `pid:stat:comm` for every process whose parent is `pid`.
@@ -7826,9 +7844,10 @@ fn live_children(pid: u32) -> Vec<String> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn describe_stall_self(shdeps_pid: u32, master: &fs::File) -> String {
     format!(
-        "self={} shdeps_state={} fg_group={:?} kids=[{}]",
+        "self={} shdeps_state={} threads={} fg_group={:?} kids=[{}]",
         shdeps_pid,
         process_state(shdeps_pid),
+        thread_count(shdeps_pid),
         try_terminal_group(master),
         live_children(shdeps_pid).join(" "),
     )
