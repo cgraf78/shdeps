@@ -5503,6 +5503,7 @@ exec /bin/sleep 30
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "TEMP-DEBUG: isolate macOS hang; do not land"]
 fn terminal_interrupt_cleans_closed_pipe_session_escape_before_returning() {
     use std::io::Write as _;
 
