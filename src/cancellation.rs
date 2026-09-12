@@ -5506,9 +5506,14 @@ fn session_id(pid: u32) -> Option<u32> {
     u32::try_from(unsafe { libc::getsid(pid as i32) }).ok()
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-// Reads a live process's process-group identity. Shared by the `ps`
-// fallback and the sysctl table walk below.
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+// Reads a live process's process-group identity for the `ps` fallback
+// topology lookup on Unix targets without a native snapshot. Apple builds
+// are excluded: the native `proc_listpids` walk and the `ps` enrichment
+// both read the group from `proc_pidinfo`, leaving no Apple caller.
 fn process_group(pid: u32) -> Option<u32> {
     // SAFETY: getpgid observes a positive process identity without pointers.
     u32::try_from(unsafe { libc::getpgid(pid as i32) }).ok()
