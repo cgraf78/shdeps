@@ -8458,10 +8458,10 @@ exec /bin/sleep 30
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn probe_of_leader_06_survived_block_only() {
+fn probe_of_leader_04b_survived_block_only() {
     use std::io::Write as _;
 
-    let fixture = Fixture::new("probe-of-leader-06");
+    let fixture = Fixture::new("probe-of-leader-04b");
     fixture.write("conf/deps.conf", "tool cargo\n");
     fixture.write_executable(
         "fakebin/cargo",
