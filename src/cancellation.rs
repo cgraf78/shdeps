@@ -3611,6 +3611,43 @@ impl Boundary {
         }
     }
 
+    /// Portable group redelivery for a member that exact delivery refused.
+    ///
+    /// Revalidates the member (admitted identity, fresh row, live), then
+    /// broadcasts `signal` to its current process group. Returns the covered
+    /// group ID, or `None` when the member vanished, changed identity, or
+    /// sits in the leader group without a retained leader to anchor it.
+    ///
+    /// Anchor reasoning: the group provably exists at revalidation time
+    /// because it contains the just-observed live member, so the only
+    /// residual risk is PID/group-ID reuse in the microseconds between the
+    /// revalidation reads and `killpg` — the documented cost of having no
+    /// pidfd. `ESRCH` (the group drained first) reports `Ok(None)`, not an
+    /// error: dead members need no delivery. Any other `killpg` failure
+    /// propagates so the stop fails closed.
+    fn redeliver_owned_group(
+        &self,
+        process: &ProcessInfo,
+        signal: i32,
+    ) -> std::io::Result<Option<u32>> {
+        let Some(current) = self.revalidated_process(process.pid)? else {
+            return Ok(None);
+        };
+        if !current.live || current.identity != process.identity {
+            return Ok(None);
+        }
+        if current.pgid == self.leader && !self.leader_retained {
+            // The leader group without a retained leader is unanchored: the
+            // group ID may already be recycled. Refuse rather than broadcast
+            // into a possibly-unrelated group.
+            return Ok(None);
+        }
+        match signal_group(current.pgid, signal)? {
+            true => Ok(Some(current.pgid)),
+            false => Ok(None),
+        }
+    }
+
     // A stopped child cannot run a graceful handler. Continue only identities
     // the latest process snapshot actually reports as stopped; SIGCONT is
     // otherwise observable to hooks and must not be sprayed unconditionally.
@@ -3646,17 +3683,11 @@ impl Boundary {
             group_delivered: self.phase_group_delivered,
         };
         let result = deliver_new_signal_phase(
-            self.leader_retained.then_some(self.leader),
             &pending,
             signal,
             &mut phase,
-            |process| {
-                self.revalidated_process(process.pid)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|current| current.pgid == self.leader)
-            },
             |process, signal| self.signal_exact_process(process, signal),
+            |process, signal| self.redeliver_owned_group(process, signal),
         );
         self.signaled = phase.signaled;
         self.phase_group_delivered = phase.group_delivered;
@@ -3687,6 +3718,7 @@ impl Boundary {
                     .is_some_and(|current| current.pgid == self.leader)
             },
             |process, signal| self.signal_exact_process(process, signal),
+            |process, signal| self.redeliver_owned_group(process, signal),
         );
         self.signaled = phase.signaled;
         self.phase_group_delivered = phase.group_delivered;
@@ -3768,6 +3800,7 @@ fn deliver_initial_signal_phase(
     mut signal_retained_group: impl FnMut(u32, i32) -> std::io::Result<bool>,
     mut remains_in_retained_group: impl FnMut(&ProcessInfo) -> bool,
     mut signal_exact: impl FnMut(&ProcessInfo, i32) -> std::io::Result<bool>,
+    mut redeliver_group: impl FnMut(&ProcessInfo, i32) -> std::io::Result<Option<u32>>,
 ) -> (SignalPhase, std::io::Result<()>) {
     let mut phase = SignalPhase {
         signaled: BTreeSet::new(),
@@ -3802,6 +3835,24 @@ fn deliver_initial_signal_phase(
                 phase.signaled.insert(process.identity.clone());
             }
             Ok(false) => {}
+            Err(_unsupported) if _unsupported.kind() == std::io::ErrorKind::Unsupported => {
+                // Same portable redelivery as the late-member phase: without
+                // exact authority, replay the signal to the member's owned
+                // group once and cover every pending member of that group.
+                match redeliver_group(process, signal) {
+                    Ok(Some(pgid)) => {
+                        for sibling in current
+                            .iter()
+                            .filter(|sibling| sibling.live && sibling.pgid == pgid)
+                        {
+                            phase.signaled.insert(sibling.identity.clone());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+            }
             Err(error) if first_error.is_none() => first_error = Some(error),
             Err(_) => {}
         }
@@ -3812,47 +3863,48 @@ fn deliver_initial_signal_phase(
 
 #[cfg(unix)]
 fn deliver_new_signal_phase(
-    retained_leader: Option<u32>,
     current: &[ProcessInfo],
     signal: i32,
     phase: &mut SignalPhase,
-    mut remains_in_retained_group: impl FnMut(&ProcessInfo) -> bool,
     mut signal_exact: impl FnMut(&ProcessInfo, i32) -> std::io::Result<bool>,
+    mut redeliver_group: impl FnMut(&ProcessInfo, i32) -> std::io::Result<Option<u32>>,
 ) -> std::io::Result<()> {
     let mut first_error = None;
     for process in current {
         if !process.live || phase.signaled.contains(&process.identity) {
             continue;
         }
-        if retained_leader
-            .filter(|_| remains_in_retained_group(process))
-            .is_some()
-        {
-            // Prefer exact delivery so a TERM handler can create a same-group
-            // child without re-entering unchanged handlers. A no-pidfd runtime
-            // has already delivered once to the retained group; it defers
-            // post-delivery children to the bounded group KILL phase rather
-            // than replaying a catchable signal to the initial cohort.
-            match signal_exact(process, signal) {
-                Ok(true) => {
-                    phase.signaled.insert(process.identity.clone());
-                }
-                Ok(false) => {}
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::Unsupported && phase.group_delivered => {
-                }
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+        // Prefer exact delivery so a TERM handler can create a same-group
+        // child without re-entering unchanged handlers. Without exact
+        // authority (portable runtimes, old kernels), replay the signal to
+        // the member's owned group once and cover every pending member of
+        // that group: a late same-group child must still observe the
+        // graceful phase instead of waiting for KILL. A member whose group
+        // cannot be covered (vanished or unanchored) stays unsignaled for
+        // the next observation; a sibling whose group changed since the
+        // snapshot is re-caught there with its fresh topology.
+        match signal_exact(process, signal) {
+            Ok(true) => {
+                phase.signaled.insert(process.identity.clone());
             }
-        } else {
-            match signal_exact(process, signal) {
-                Ok(true) => {
-                    phase.signaled.insert(process.identity.clone());
+            Ok(false) => {}
+            Err(_unsupported) if _unsupported.kind() == std::io::ErrorKind::Unsupported => {
+                match redeliver_group(process, signal) {
+                    Ok(Some(pgid)) => {
+                        for sibling in current
+                            .iter()
+                            .filter(|sibling| sibling.live && sibling.pgid == pgid)
+                        {
+                            phase.signaled.insert(sibling.identity.clone());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
                 }
-                Ok(false) => {}
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
             }
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
         }
     }
     first_error.map_or(Ok(()), Err)
@@ -8173,6 +8225,7 @@ sys.exit(0)
                 exact_calls.borrow_mut().push(current.pid);
                 Ok(true)
             },
+            |_, _| unreachable!("exact delivery covers the initial cohort"),
         );
         result.unwrap();
 
@@ -8182,16 +8235,15 @@ sys.exit(0)
 
         let later = vec![process(44, leader), process(45, 45)];
         super::deliver_new_signal_phase(
-            Some(leader),
             &later,
             libc::SIGTERM,
             &mut phase,
-            |process| process.pgid == leader,
             |current, signal| {
                 assert_eq!(signal, libc::SIGTERM);
                 exact_calls.borrow_mut().push(current.pid);
                 Ok(true)
             },
+            |_, _| unreachable!("exact late delivery avoids a group replay"),
         )
         .unwrap();
 
@@ -8254,33 +8306,32 @@ sys.exit(0)
                     *deliveries.borrow_mut().entry(process.pid).or_default() += 1;
                     Ok(true)
                 },
+                |_, _| unreachable!("exact delivery covers the initial cohort"),
             );
             result.unwrap();
             super::deliver_new_signal_phase(
-                Some(leader),
                 &[gap_child.clone(), handler_child.clone()],
                 signal,
                 &mut phase,
-                |process| process.pgid == leader,
                 |process, delivered_signal| {
                     assert_eq!(delivered_signal, signal);
                     *deliveries.borrow_mut().entry(process.pid).or_default() += 1;
                     Ok(true)
                 },
+                |_, _| unreachable!("exact late delivery avoids a group replay"),
             )
             .unwrap();
             // A later poll must not replay delivery to any retained identity.
             super::deliver_new_signal_phase(
-                Some(leader),
                 &[initial_leader.clone(), gap_child, handler_child],
                 signal,
                 &mut phase,
-                |process| process.pgid == leader,
                 |process, delivered_signal| {
                     assert_eq!(delivered_signal, signal);
                     *deliveries.borrow_mut().entry(process.pid).or_default() += 1;
                     Ok(true)
                 },
+                |_, _| unreachable!("exact late delivery avoids a group replay"),
             )
             .unwrap();
 
@@ -8330,18 +8381,18 @@ sys.exit(0)
                 deliveries.borrow_mut().push(process.pid);
                 Ok(true)
             },
+            |_, _| unreachable!("exact delivery covers the initial cohort"),
         );
         result.unwrap();
         super::deliver_new_signal_phase(
-            Some(leader),
             std::slice::from_ref(&gap_child),
             libc::SIGTERM,
             &mut phase,
-            |process| process.pgid == leader,
             |process, _| {
                 deliveries.borrow_mut().push(process.pid);
                 Ok(true)
             },
+            |_, _| unreachable!("exact late delivery avoids a group replay"),
         )
         .unwrap();
 
@@ -8351,7 +8402,7 @@ sys.exit(0)
 
     #[cfg(unix)]
     #[test]
-    fn no_exact_authority_defers_late_members_without_replaying_catchable_group_signal() {
+    fn no_exact_authority_redelivers_one_group_term_to_late_members() {
         let leader = 41;
         let process = |pid| super::ProcessInfo {
             pid,
@@ -8378,29 +8429,38 @@ sys.exit(0)
             },
             |process| process.pgid == leader,
             |_, _| unreachable!("the initial group covers its snapshotted members"),
+            |_, _| unreachable!("the initial cohort needs no redelivery"),
         );
         result.unwrap();
         let late = [process(42), process(43)];
+        let redeliveries = std::cell::RefCell::new(Vec::new());
         super::deliver_new_signal_phase(
-            Some(leader),
             &late,
             libc::SIGTERM,
             &mut phase,
-            |process| process.pgid == leader,
             |_, _| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "injected missing exact authority",
                 ))
             },
+            |process, signal| {
+                assert_eq!(signal, libc::SIGTERM);
+                redeliveries.borrow_mut().push(process.pid);
+                Ok(Some(leader))
+            },
         )
         .unwrap();
 
-        assert_eq!(group_calls.get(), 1, "only the initial group TERM is sent");
+        assert_eq!(
+            *redeliveries.borrow(),
+            vec![42],
+            "one group redelivery covers every same-group late member"
+        );
         assert!(
             late.iter()
-                .all(|process| !phase.signaled.contains(&process.identity)),
-            "late members remain for the bounded KILL phase"
+                .all(|process| phase.signaled.contains(&process.identity)),
+            "late members must receive the catchable phase, not only KILL"
         );
         let killed_group = Cell::new(false);
         let (_, kill_result) = super::deliver_initial_signal_phase(
@@ -8416,6 +8476,7 @@ sys.exit(0)
             },
             |process| process.pgid == leader,
             |_, _| unreachable!("the retained group covers the final cohort"),
+            |_, _| unreachable!("the KILL cohort needs no redelivery"),
         );
         kill_result.unwrap();
         assert!(
@@ -8427,6 +8488,124 @@ sys.exit(0)
             1,
             "the final KILL must not replay TERM to the leader"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_member_outside_retained_group_redelivers_its_owned_group() {
+        let leader = 41;
+        let escaped = super::ProcessInfo {
+            pid: 43,
+            ppid: leader,
+            pgid: 43,
+            sid: leader,
+            live: true,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid: 43,
+                start: Some("generation-43".to_owned()),
+            },
+        };
+        let redeliveries = std::cell::RefCell::new(Vec::new());
+        let (phase, _) = super::deliver_initial_signal_phase(
+            leader,
+            true,
+            std::slice::from_ref(&escaped),
+            libc::SIGTERM,
+            false,
+            |_, _| Ok(true),
+            |process| process.pgid == leader,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "injected missing exact authority",
+                ))
+            },
+            |process, signal| {
+                assert_eq!(signal, libc::SIGTERM);
+                redeliveries.borrow_mut().push((process.pid, process.pgid));
+                Ok(Some(process.pgid))
+            },
+        );
+
+        assert_eq!(*redeliveries.borrow(), vec![(43, 43)]);
+        assert!(phase.signaled.contains(&escaped.identity));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redelivery_skips_members_whose_group_cannot_be_covered() {
+        let leader = 41;
+        let process = |pid| super::ProcessInfo {
+            pid,
+            ppid: leader,
+            pgid: leader,
+            sid: leader,
+            live: true,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid,
+                start: Some(format!("generation-{pid}")),
+            },
+        };
+        let mut phase = super::SignalPhase {
+            signaled: std::collections::BTreeSet::new(),
+            group_delivered: true,
+        };
+        super::deliver_new_signal_phase(
+            &[process(42)],
+            libc::SIGTERM,
+            &mut phase,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "injected missing exact authority",
+                ))
+            },
+            |_, _| Ok(None),
+        )
+        .unwrap();
+
+        assert!(
+            phase.signaled.is_empty(),
+            "a vanished member stays unsignaled for the next observation instead of failing the phase"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redelivery_failure_fails_the_phase_closed() {
+        let leader = 41;
+        let process = super::ProcessInfo {
+            pid: 42,
+            ppid: leader,
+            pgid: leader,
+            sid: leader,
+            live: true,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid: 42,
+                start: Some("generation-42".to_owned()),
+            },
+        };
+        let mut phase = super::SignalPhase {
+            signaled: std::collections::BTreeSet::new(),
+            group_delivered: true,
+        };
+        let result = super::deliver_new_signal_phase(
+            &[process],
+            libc::SIGTERM,
+            &mut phase,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "injected missing exact authority",
+                ))
+            },
+            |_, _| Err(std::io::Error::other("injected redelivery failure")),
+        );
+
+        assert!(result.is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -8690,6 +8869,7 @@ sys.exit(0)
                 exact_calls.borrow_mut().push(process.pid);
                 Ok(true)
             },
+            |_, _| unreachable!("exact delivery covers the escaped member"),
         );
 
         result.unwrap();
@@ -8731,6 +8911,7 @@ sys.exit(0)
                     Ok(true)
                 }
             },
+            |_, _| unreachable!("non-Unsupported failures never redeliver"),
         );
 
         assert!(result.is_err());
@@ -8775,6 +8956,7 @@ sys.exit(0)
                     Ok(true)
                 }
             },
+            |_, _| unreachable!("non-Unsupported failures never redeliver"),
         );
 
         assert!(result.is_err());
