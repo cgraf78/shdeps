@@ -6718,9 +6718,14 @@ install() {
   : >"$SHDEPS_STATE_DIR/signal-after-marker"
 }
 version() {
+  # TEMP-DIAG-131: macOS exits 0 instead of 143, so the kill must be
+  # missing shdeps; record target identity and kill outcome. Remove
+  # once the macOS delivery gap is root-caused.
+  echo "version: ppid=$PPID ppid_comm=$(ps -o comm= -p $PPID 2>/dev/null || echo ps-failed) marker=$([ -f "$SHDEPS_STATE_DIR/signal-after-marker" ] && echo yes || echo no)" >>"$SHDEPS_STATE_DIR/kill-diag.log"
   if test -f "$SHDEPS_STATE_DIR/signal-after-marker"; then
     rm "$SHDEPS_STATE_DIR/signal-after-marker"
     kill -TERM "$PPID"
+    echo "kill_rc=$? ppid_alive=$(kill -0 "$PPID" 2>/dev/null && echo yes || echo no)" >>"$SHDEPS_STATE_DIR/kill-diag.log"
   fi
 }
 post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
@@ -6734,7 +6739,13 @@ post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
 
     let cancelled = run(fixture.command(["update"]).env("SHDEPS_LIB", &wrapper));
 
-    assert_eq!(cancelled.status.code(), Some(143));
+    assert_eq!(
+        cancelled.status.code(),
+        Some(143),
+        "kill diag: {}",
+        fs::read_to_string(fixture.dir.join("state/kill-diag.log"))
+            .unwrap_or_else(|_| "no-diag-log".to_owned())
+    );
     assert!(fixture.dir.join("state/tool-installed").is_file());
     assert!(
         fixture.dir.join("state/.pending-posts/tool").is_file(),
