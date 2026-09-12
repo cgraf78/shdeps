@@ -5114,115 +5114,60 @@ fn portable_process_info(_pid: u32, _identity: ProcessIdentity) -> Option<Proces
 
 #[cfg(target_vendor = "apple")]
 fn darwin_table_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
-    // One `KERN_PROC_ALL` sysctl for the whole table instead of spawning
-    // `/bin/ps`: a fork+exec costs ~200ms on loaded macOS runners and
-    // teardown takes several snapshots per stop. Rows carry the same
-    // identities the `proc_pidinfo` path reports, so snapshots from either
-    // source stay interchangeable. Any failure returns None and the caller
-    // falls back to `ps`.
-    let mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut fetched = false;
-    // The table can grow between the size query and the fetch as processes
-    // fork concurrently; retry boundedly, then fall back to `ps`.
+    // One `proc_listpids` for the whole table instead of spawning `/bin/ps`:
+    // a fork+exec costs ~200ms on loaded macOS runners and teardown takes
+    // several snapshots per stop. Rows come from the same `proc_pidinfo`
+    // enrichment the `ps` path uses, so snapshots from either source stay
+    // interchangeable by construction. Any failure returns None and the
+    // caller falls back to `ps`.
+    //
+    // `PROC_ALL_PIDS` is stable libproc ABI (1) but absent from libc 0.2.
+    const PROC_ALL_PIDS: u32 = 1;
+    let mut capacity: usize = 4096;
+    let mut pids: Vec<i32> = Vec::new();
+    let mut complete = false;
+    // A full buffer may mean truncation (processes fork concurrently), so
+    // grow boundedly until a fetch leaves room, then fall back to `ps`.
     for _ in 0..4 {
         if Instant::now() >= deadline {
             return None;
         }
-        let mut size: libc::size_t = 0;
-        // SAFETY: size query with a null buffer; mib is a valid static array.
-        let queried = unsafe {
-            libc::sysctl(
-                mib.as_ptr() as *mut i32,
-                mib.len() as u32,
-                std::ptr::null_mut(),
-                &mut size,
-                std::ptr::null_mut(),
+        pids.resize(capacity, 0);
+        // SAFETY: pids owns capacity pid_t slots; PROC_ALL_PIDS lists all.
+        let written = unsafe {
+            libc::proc_listpids(
+                PROC_ALL_PIDS,
                 0,
+                pids.as_mut_ptr().cast(),
+                (capacity * std::mem::size_of::<i32>()) as libc::c_int,
             )
         };
-        if queried != 0 || size == 0 {
+        if written < 0 {
             return None;
         }
-        bytes.resize(size, 0);
-        // SAFETY: bytes owns size writable bytes; mib is valid.
-        let status = unsafe {
-            libc::sysctl(
-                mib.as_ptr() as *mut i32,
-                mib.len() as u32,
-                bytes.as_mut_ptr().cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status == 0 {
-            bytes.truncate(size);
-            fetched = true;
+        let count = (written as usize) / std::mem::size_of::<i32>();
+        if count < capacity {
+            pids.truncate(count);
+            complete = true;
             break;
         }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
-            return None;
-        }
+        capacity = capacity.saturating_mul(2);
     }
-    if !fetched {
+    if !complete {
         return None;
     }
-    let stride = std::mem::size_of::<libc::kinfo_proc>();
-    if stride == 0 || bytes.len() % stride != 0 {
-        return None;
-    }
-    let mut processes = Vec::with_capacity(bytes.len() / stride);
-    let mut offset = 0;
-    while offset + stride <= bytes.len() {
+    let mut processes = Vec::with_capacity(pids.len());
+    for pid in pids {
         if Instant::now() >= deadline {
             return None;
         }
-        // SAFETY: bounds-checked slice of stride bytes copied by value;
-        // kinfo_proc is repr(C) plain data and the copy is alignment-safe.
-        let mut entry: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr().add(offset),
-                std::ptr::addr_of_mut!(entry).cast(),
-                stride,
-            );
-        }
-        offset += stride;
         // Skip rows that exited mid-walk instead of failing the snapshot.
-        let Some(pid) = u32::try_from(entry.kp_proc.p_pid)
-            .ok()
-            .filter(|pid| *pid != 0)
-        else {
+        let Ok(pid) = u32::try_from(pid) else {
             continue;
         };
-        let Some(ppid) = u32::try_from(entry.kp_proc.p_ppid).ok() else {
-            continue;
-        };
-        let (Some(pgid), Some(sid)) = (process_group(pid), session_id(pid)) else {
-            continue;
-        };
-        // Process states are small positive constants; `as` is exact.
-        // Cast the libc constants (whose int width varies) rather than
-        // assuming they match the row field.
-        let state = entry.kp_proc.p_stat as i32;
-        let zombie = libc::SZOMB as i32;
-        let stopped_state = libc::SSTOP as i32;
-        processes.push(ProcessInfo {
-            pid,
-            ppid,
-            pgid,
-            sid,
-            live: state != zombie,
-            stopped: state == stopped_state,
-            identity: ProcessIdentity {
-                pid,
-                start: Some(format!(
-                    "{}.{:06}",
-                    entry.kp_proc.p_starttime.tv_sec, entry.kp_proc.p_starttime.tv_usec
-                )),
-            },
-        });
+        if let Some(process) = darwin_process_info(pid) {
+            processes.push(process);
+        }
     }
     Some(processes)
 }
@@ -5285,7 +5230,7 @@ fn darwin_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
 #[test]
 fn darwin_table_snapshot_lists_current_process() {
     let snapshot = darwin_table_snapshot(Instant::now() + Duration::from_secs(5))
-        .expect("sysctl snapshot succeeds");
+        .expect("native snapshot succeeds");
     let me = std::process::id();
     let row = snapshot
         .iter()
@@ -5296,7 +5241,7 @@ fn darwin_table_snapshot_lists_current_process() {
         row.identity.start.is_some(),
         "start generation present: {row:?}"
     );
-    // The sysctl row must match the proc_pidinfo row for the same process
+    // The snapshot row must match the proc_pidinfo row for the same process
     // so snapshots from either source stay interchangeable.
     let enriched = darwin_process_info(me).expect("proc_pidinfo row present");
     assert_eq!(row.identity.start, enriched.identity.start);
