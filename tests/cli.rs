@@ -7818,16 +7818,39 @@ fn describe_stall(shdeps_pid: u32, child_pid: u32, master: &fs::File) -> String 
 /// exit-teardown (ctty/session detach).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn thread_count(pid: u32) -> String {
-    capture_output(Command::new("ps").args(["-o", "thcount=", "-p", &pid.to_string()]))
-        .map(|output| {
-            let text = text(&output.stdout).trim().to_owned();
-            if text.is_empty() {
-                "thcount-empty".to_owned()
-            } else {
-                text
-            }
-        })
-        .unwrap_or_else(|_| "thcount-unknown".to_owned())
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(output) =
+            capture_output(Command::new("ps").args(["-o", "thcount=", "-p", &pid.to_string()]))
+        else {
+            return "thcount-unknown".to_owned();
+        };
+        if !output.status.success() {
+            return "thcount-failed".to_owned();
+        }
+        let text = text(&output.stdout).trim().to_owned();
+        if text.is_empty() || text.parse::<u32>().is_err() {
+            return "thcount-empty".to_owned();
+        }
+        text
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `thcount` is procps-only; macOS ps rejects it and dumps its
+        // valid-keyword list to stdout. `-M` prints one line per thread.
+        let Ok(output) = capture_output(Command::new("ps").args(["-M", "-p", &pid.to_string()]))
+        else {
+            return "thcount-unknown".to_owned();
+        };
+        if !output.status.success() {
+            return "thcount-failed".to_owned();
+        }
+        text(&output.stdout)
+            .lines()
+            .count()
+            .checked_sub(1)
+            .map_or("thcount-empty".to_owned(), |n| n.to_string())
+    }
 }
 
 /// `pid:stat:comm` for every process whose parent is `pid`.
