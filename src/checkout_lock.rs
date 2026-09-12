@@ -716,8 +716,34 @@ fn command_output(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+// The current process identity never changes, but portable probes fork
+// subprocesses that a latched signal refuses. Memoize after the first
+// successful capture so release and recovery claims keep working during
+// teardown; failures are never cached. The PID check keeps a forked
+// pre-exec child from trusting its parent's identity.
+static CURRENT_IDENTITY_CACHE: std::sync::Mutex<Option<(u32, ProcessIdentity)>> =
+    std::sync::Mutex::new(None);
+
 // Capture the complete identity written into owner and claimant records.
 fn current_identity() -> io::Result<ProcessIdentity> {
+    let pid = std::process::id();
+    let cached = CURRENT_IDENTITY_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if let Some((cached_pid, identity)) = cached {
+        if cached_pid == pid {
+            return Ok(identity);
+        }
+    }
+    let identity = current_identity_uncached()?;
+    *CURRENT_IDENTITY_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((pid, identity.clone()));
+    Ok(identity)
+}
+
+fn current_identity_uncached() -> io::Result<ProcessIdentity> {
     let pid = libc::pid_t::try_from(std::process::id())
         .map_err(|_| invalid_data("current pid does not fit the host pid type"))?;
     let (start_kind_hex, start_token_hex, state) = process_identity(pid)?;
