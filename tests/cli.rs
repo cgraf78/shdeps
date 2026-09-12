@@ -11,6 +11,35 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use shdeps::cli::{HELP, PUBLIC_COMMANDS};
 
+// Every CLI case spawns subprocesses while libtest fans cases out across
+// worker threads, and fork() from a threaded process can stall inside dyld
+// locks on macOS: the whole suite hangs instead of one case failing. The
+// macOS CLI binary therefore pins the harness to a single worker with an
+// image initializer before main runs. Linux keeps parallel workers since
+// its fork path has no such stall; the lib unit-test binary also stays
+// parallel on macOS because its cases never fork.
+#[cfg(target_os = "macos")]
+extern "C" fn serialize_macos_cli_tests() {
+    // SAFETY: image initializer, runs single-threaded before main; the
+    // setenv only publishes RUST_TEST_THREADS for the libtest runner.
+    unsafe {
+        libc::setenv(c"RUST_TEST_THREADS".as_ptr(), c"1".as_ptr(), 1);
+    }
+}
+
+#[used]
+#[cfg(target_os = "macos")]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static SERIALIZE_MACOS_CLI_TESTS: extern "C" fn() = serialize_macos_cli_tests;
+
+// Regression guard for the initializer above: without it the variable is
+// absent on runners (no workflow sets it) and the suite can hang.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_cli_harness_runs_single_threaded() {
+    assert_eq!(std::env::var("RUST_TEST_THREADS").as_deref(), Ok("1"));
+}
+
 // Hosted runners can deschedule one short subprocess without indicating a
 // user-visible regression. Three samples keep the median sensitive to a
 // persistent slowdown while discarding one isolated scheduler outlier.
