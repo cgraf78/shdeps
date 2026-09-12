@@ -1768,8 +1768,11 @@ fn custom_hooks_stay_within_ci_budget() {
     assert_eq!(text(&output.stderr), "");
     // macOS process startup is materially slower, but a 50 ms polling
     // regression still adds about 1.2 seconds across these 30 serial hooks.
+    // Supervised hooks (threads, lease, exit proof) cost ~78 ms each on
+    // macOS versus ~36 ms on Linux; the budget reflects that supervised
+    // reality while still catching 50 ms-per-hook regressions (3.8 s).
     let budget = if cfg!(target_os = "macos") {
-        Duration::from_millis(2_200)
+        Duration::from_millis(3_000)
     } else {
         Duration::from_millis(1_200)
     };
@@ -1799,9 +1802,11 @@ fn custom_hooks_stay_within_ci_budget() {
     assert_eq!(text(&output.stderr), "");
     // Catch per-child whole-process discovery and exit-polling regressions; a
     // 50 ms polling delay alone adds about 1.2 seconds across these 30 serial
-    // current hooks without folding manifest I/O into the budget.
+    // current hooks without folding manifest I/O into the budget. The macOS
+    // figure reflects supervised-hook reality (~78 ms each); a 50 ms
+    // per-hook regression still trips it at ~3.8 s.
     let budget = if cfg!(target_os = "macos") {
-        Duration::from_millis(2_200)
+        Duration::from_millis(3_000)
     } else {
         Duration::from_millis(1_200)
     };
@@ -5112,7 +5117,11 @@ exit 4
 "#,
     );
 
-    let (mut shdeps, mut master) = spawn_on_pty(custom_sudo_command(&fixture, ["update"]));
+    // Undrained spawn: this test reads the sudo prompt itself, and a
+    // drainer would steal those bytes. Draining starts after the
+    // password is submitted, before the exit wait below.
+    let (mut shdeps, mut master) =
+        spawn_on_pty_undrained(custom_sudo_command(&fixture, ["update"]));
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut observed = Vec::new();
@@ -5139,6 +5148,7 @@ exit 4
     }
     master.write_all(b"secret\n").unwrap();
     master.flush().unwrap();
+    drain_pty_master(&master);
 
     let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(5));
     let stall = status
@@ -7423,7 +7433,46 @@ fn custom_sudo_command<const N: usize>(fixture: &Fixture, args: [&str; N]) -> Co
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn spawn_on_pty(mut command: Command) -> (GuardedChild, fs::File) {
+/// Discards PTY master output on a detached thread until EOF or error.
+///
+/// BSD line disciplines block the last slave close in exit teardown
+/// until pending slave output drains to the master. A test that stops
+/// reading the master (prompt consumed, now waiting for exit) wedges
+/// the child in SIGKILL-proof `E` state on macOS; Linux discards
+/// instead. Draining continuously keeps the exit path clear. The
+/// thread is detached so a wedged child can never hang the harness.
+fn drain_pty_master(master: &fs::File) {
+    let dup = master.try_clone().expect("clone PTY master for draining");
+    let _detached = std::thread::Builder::new()
+        .name("pty-master-drain".to_owned())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut master = dup;
+            let mut chunk = [0u8; 8192];
+            loop {
+                match master.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    // EIO once the final slave closes (Linux) plus HUP
+                    // and teardown races: nothing left to drain.
+                    Err(_) => break,
+                }
+            }
+        })
+        .expect("spawn PTY master drainer");
+}
+
+fn spawn_on_pty(command: Command) -> (GuardedChild, fs::File) {
+    let (child, master) = spawn_on_pty_undrained(command);
+    drain_pty_master(&master);
+    (child, master)
+}
+
+fn spawn_on_pty_undrained(mut command: Command) -> (GuardedChild, fs::File) {
     use std::os::unix::process::CommandExt as _;
 
     let mut master_fd = -1;
