@@ -1769,10 +1769,12 @@ fn custom_hooks_stay_within_ci_budget() {
     // macOS process startup is materially slower, but a 50 ms polling
     // regression still adds about 1.2 seconds across these 30 serial hooks.
     // Supervised hooks (threads, lease, exit proof) cost ~78 ms each on
-    // macOS versus ~36 ms on Linux; the budget reflects that supervised
-    // reality while still catching 50 ms-per-hook regressions (3.8 s).
+    // macOS versus ~36 ms on Linux, and loaded macOS runners swing the
+    // thirty-hook total from 2.3 s to 3.7 s with identical code. The
+    // budget covers that runner noise while still catching 2x blowups
+    // like the pre-gate 4.6 s snapshot era.
     let budget = if cfg!(target_os = "macos") {
-        Duration::from_millis(3_000)
+        Duration::from_millis(4_500)
     } else {
         Duration::from_millis(1_200)
     };
@@ -1803,10 +1805,10 @@ fn custom_hooks_stay_within_ci_budget() {
     // Catch per-child whole-process discovery and exit-polling regressions; a
     // 50 ms polling delay alone adds about 1.2 seconds across these 30 serial
     // current hooks without folding manifest I/O into the budget. The macOS
-    // figure reflects supervised-hook reality (~78 ms each); a 50 ms
-    // per-hook regression still trips it at ~3.8 s.
+    // figure covers supervised-hook reality plus loaded-runner noise
+    // (2.3-3.7 s observed); 2x blowups still trip it.
     let budget = if cfg!(target_os = "macos") {
-        Duration::from_millis(3_000)
+        Duration::from_millis(4_500)
     } else {
         Duration::from_millis(1_200)
     };
@@ -4855,12 +4857,14 @@ while :; do /bin/sleep 1; done
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    // The TERM-to-trap-to-spawn chain is the longest in this test but had
-    // the shortest budget; loaded runners starve it intermittently. Match
-    // the sibling exit wait below.
+    // The TERM-to-trap-to-spawn chain crosses four scheduling handoffs
+    // (test signal, shdeps stop, shell trap, background spawn); loaded
+    // runners starve it intermittently past 4 s. This is fixture
+    // readiness, not behavior under test, so give it double the sibling
+    // exit wait below.
     let child_pid = wait_for_pid(
         &child_pid_path,
-        Duration::from_secs(4),
+        Duration::from_secs(8),
         "late same-group child pid",
     );
     let _child_guard = EscapedProcessGuard::new(child_pid);
@@ -6713,10 +6717,47 @@ uninstall() { record_manager; }
     assert_eq!(managers, "uninstall=dnf\n");
 }
 
+/// Directory holding a Bash new enough to source `shdeps.sh` (>= 4.3),
+/// or None when the runner cannot test the sourceable wrapper at all.
+/// Stock macOS ships Bash 3.2, under which the prelude fails and the
+/// update skips every custom tool instead of running hooks.
+#[cfg(unix)]
+fn sourceable_bash_dir() -> Option<PathBuf> {
+    for candidate in [
+        "/opt/homebrew/bin/bash",
+        "/usr/local/bin/bash",
+        "/usr/bin/bash",
+        "/bin/bash",
+    ] {
+        let probed = Command::new(candidate)
+            .arg("-c")
+            .arg("exit $((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 403))")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        if probed.is_ok_and(|output| output.status.success()) {
+            return Path::new(candidate).parent().map(Path::to_path_buf);
+        }
+    }
+    None
+}
+
 #[cfg(unix)]
 #[test]
 fn cancellation_after_sourceable_hook_marker_replays_post_once() {
+    let Some(bash_dir) = sourceable_bash_dir() else {
+        eprintln!("skipping sourceable wrapper test: no bash >= 4.3 available");
+        return;
+    };
     let fixture = Fixture::new("sourceable-hook-marker-cancel");
+    // Hooks resolve `bash` through the fixture PATH; make sure the probed
+    // modern Bash wins over the stock one.
+    let path_with_bash = format!(
+        "{}:{}:/usr/bin:/bin",
+        bash_dir.display(),
+        fixture.dir.join("fakebin").display()
+    );
     let binary = env!("CARGO_BIN_EXE_shdeps");
     fixture.write("conf/deps.conf", "tool custom\n");
     fixture.write(
@@ -6747,7 +6788,10 @@ post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
     );
     let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("shdeps.sh");
 
-    let cancelled = run(fixture.command(["update"]).env("SHDEPS_LIB", &wrapper));
+    let cancelled = run(fixture
+        .command(["update"])
+        .env("SHDEPS_LIB", &wrapper)
+        .env("PATH", &path_with_bash));
 
     assert_eq!(
         cancelled.status.code(),
@@ -6763,7 +6807,10 @@ post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
     );
     assert!(!fixture.dir.join("state/post-runs").exists());
 
-    let retry = run(fixture.command(["update"]).env("SHDEPS_LIB", &wrapper));
+    let retry = run(fixture
+        .command(["update"])
+        .env("SHDEPS_LIB", &wrapper)
+        .env("PATH", &path_with_bash));
 
     assert_success(&retry);
     assert_eq!(
@@ -6772,7 +6819,10 @@ post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
     );
     assert!(!fixture.dir.join("state/.pending-posts/tool").exists());
 
-    let settled = run(fixture.command(["update"]).env("SHDEPS_LIB", &wrapper));
+    let settled = run(fixture
+        .command(["update"])
+        .env("SHDEPS_LIB", &wrapper)
+        .env("PATH", &path_with_bash));
 
     assert_success(&settled);
     assert_eq!(
