@@ -5141,11 +5141,19 @@ exit 4
     master.flush().unwrap();
 
     let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(5));
+    let stall = status
+        .is_none()
+        .then(|| describe_stall_self(shdeps.id(), &master));
     if status.is_none() {
         kill_process_group(shdeps.id());
         let _ = shdeps.wait();
     }
-    assert_eq!(status.and_then(|status| status.code()), Some(0));
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "authenticated parent-session retry must complete; stall={}",
+        stall.as_deref().unwrap_or("n/a")
+    );
     assert!(
         fixture.dir.join("state/tool-installed").is_file(),
         "authenticated parent-session retry did not finish the hook"
@@ -5188,6 +5196,9 @@ fn terminal_interrupt_of_owned_foreground_child_returns_130() {
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
     let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let stall = status
+        .is_none()
+        .then(|| describe_stall(shdeps.id(), child_pid, &master));
     if status.is_none() {
         kill_process_group(shdeps.id());
         kill_process_group(child_group);
@@ -5197,7 +5208,8 @@ fn terminal_interrupt_of_owned_foreground_child_returns_130() {
     assert_eq!(
         status.and_then(|status| status.code()),
         Some(128 + libc::SIGINT),
-        "Shdeps must propagate a terminal-delivered child interrupt conventionally"
+        "Shdeps must propagate a terminal-delivered child interrupt conventionally; stall={}",
+        stall.as_deref().unwrap_or("n/a")
     );
     assert!(!process_is_running(child_pid));
 }
@@ -5233,6 +5245,9 @@ while :; do /bin/sleep 1; done
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
     let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let stall = status
+        .is_none()
+        .then(|| describe_stall(shdeps.id(), child_pid, &master));
     if status.is_none() {
         kill_process_group(shdeps.id());
         kill_process_group(child_pid);
@@ -5242,7 +5257,8 @@ while :; do /bin/sleep 1; done
     assert_eq!(
         status.and_then(|status| status.code()),
         Some(128 + libc::SIGINT),
-        "foreground conventional 130 must preserve terminal cancellation"
+        "foreground conventional 130 must preserve terminal cancellation; stall={}",
+        stall.as_deref().unwrap_or("n/a")
     );
     assert!(!process_is_running(child_pid));
 }
@@ -5462,6 +5478,9 @@ exec /bin/sleep 30
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
     let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let stall = status
+        .is_none()
+        .then(|| describe_stall(shdeps.id(), leader_pid, &master));
     let descendant_survived = process_is_running(descendant_pid);
     let mutations = fixture.dir.join("foreground-descendant-mutations");
     let size_before = fs::metadata(&mutations)
@@ -5488,7 +5507,8 @@ exec /bin/sleep 30
     assert_eq!(
         status.and_then(|status| status.code()),
         Some(128 + libc::SIGINT),
-        "leader signal must be observed before inherited pipe EOF"
+        "leader signal must be observed before inherited pipe EOF; stall={}",
+        stall.as_deref().unwrap_or("n/a")
     );
     assert!(
         !descendant_survived,
@@ -5571,6 +5591,9 @@ os.execl("/bin/sleep", "sleep", "30")
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
     let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let stall = status
+        .is_none()
+        .then(|| describe_stall(shdeps.id(), leader_pid, &master));
     let descendant_survived = process_is_running(descendant_pid);
     let size_before = fs::metadata(&mutations)
         .map(|metadata| metadata.len())
@@ -5596,7 +5619,9 @@ os.execl("/bin/sleep", "sleep", "30")
 
     assert_eq!(
         status.and_then(|status| status.code()),
-        Some(128 + libc::SIGINT)
+        Some(128 + libc::SIGINT),
+        "closed-pipe terminal interrupt must propagate conventionally; stall={}",
+        stall.as_deref().unwrap_or("n/a")
     );
     assert!(
         !descendant_survived,
@@ -7738,6 +7763,48 @@ fn terminal_group(tty: &fs::File) -> u32 {
         std::io::Error::last_os_error()
     );
     group as u32
+}
+
+/// Non-asserting foreground query for stall diagnostics: returns None when
+/// the PTY currently has no foreground group instead of failing the test.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn try_terminal_group(tty: &fs::File) -> Option<u32> {
+    // SAFETY: tcgetpgrp only inspects this live PTY descriptor.
+    let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    (group > 0).then_some(group as u32)
+}
+
+/// Portable process state letters (R/S/T/Z/...) for stall diagnostics.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_state(pid: u32) -> String {
+    capture_output(Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]))
+        .map(|output| text(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|_| "ps-failed".to_owned())
+}
+
+/// Snapshot the stall state when a terminal test's exit bound expires.
+/// Captured BEFORE the kill fallback destroys the evidence and embedded
+/// in the assertion message so CI names whether delivery failed (child
+/// alive), observation spun (shdeps running), or teardown wedged
+/// (shdeps sleeping).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn describe_stall(shdeps_pid: u32, child_pid: u32, master: &fs::File) -> String {
+    format!(
+        "child_alive={} shdeps_state={} fg_group={:?}",
+        process_is_running(child_pid),
+        process_state(shdeps_pid),
+        try_terminal_group(master),
+    )
+}
+
+/// Stall snapshot for PTY tests that track no installer child PID.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn describe_stall_self(shdeps_pid: u32, master: &fs::File) -> String {
+    format!(
+        "shdeps_state={} fg_group={:?}",
+        process_state(shdeps_pid),
+        try_terminal_group(master),
+    )
 }
 
 #[cfg(unix)]
