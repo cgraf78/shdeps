@@ -7548,9 +7548,30 @@ impl GuardedChild {
     }
 
     fn reap(&mut self) -> std::io::Result<ExitStatus> {
-        let status = self.child.wait()?;
-        self.reaped = true;
-        Ok(status)
+        // Bounded: on macOS a child wedged in a PTY-dependent kernel wait
+        // can survive group SIGKILL plus direct SIGKILL until the test
+        // closes the PTY master, which only happens in drops *after* an
+        // explicit wait() returns. Blocking here deadlocks the test, so
+        // poll briefly and report Timeout instead; drops retry after the
+        // master closes and the pending SIGKILL lands.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match self.child.try_wait()? {
+                Some(status) => {
+                    self.reaped = true;
+                    return Ok(status);
+                }
+                None => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "child did not exit within reap grace",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     fn cleanup_and_reap(&mut self) -> std::io::Result<ExitStatus> {
