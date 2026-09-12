@@ -31,7 +31,7 @@ jobs:
       # TEMP-DEBUG: isolate the macOS CLI hang (do not land). Run only the
       # interrupt-filtered CLI cases to test whether the hang-prone tests
       # hang with minimal prior state (~11 tests, no full-suite position).
-      test-command: cargo test --locked --test cli terminal_interrupt_of_leader_stops_ignoring_pipe_holder -- --exact --nocapture
+      test-command: cargo test --locked --test cli probe_of_leader -- --nocapture
       termux-command: scripts/termux-ci.sh
       # shdeps is installed from release archives on real machines. Build and
       # unpack that exact archive on the host before transporting its binary

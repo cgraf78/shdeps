@@ -5406,6 +5406,7 @@ os._exit(130)
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[ignore = "TEMP-DEBUG: probe_of_leader_05 is the control; do not land"]
 fn terminal_interrupt_of_leader_stops_ignoring_pipe_holder() {
     use std::io::Write as _;
 
@@ -8193,4 +8194,361 @@ esac
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, format!("{now}\n")).unwrap();
     }
+}
+
+// TEMP-DEBUG hang bisection probes (do not land). Each probe executes a
+// progressively longer prefix of
+// terminal_interrupt_of_leader_stops_ignoring_pipe_holder, which hangs
+// deterministically on macOS in isolation. Alphabetical names run in
+// order; the first hanging probe pinpoints the blocking call.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn probe_of_leader_00_fixture_only() {
+    let fixture = Fixture::new("probe-of-leader-00");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exec /bin/sleep 30
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("foreground-descendant-mutations"),
+        );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn probe_of_leader_01_spawn_only() {
+    let fixture = Fixture::new("probe-of-leader-01");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exec /bin/sleep 30
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("foreground-descendant-mutations"),
+        );
+    let (_shdeps, _master) = spawn_on_pty(command);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn probe_of_leader_02_pids_guards() {
+    let fixture = Fixture::new("probe-of-leader-02");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exec /bin/sleep 30
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("foreground-descendant-mutations"),
+        );
+    let (_shdeps, _master) = spawn_on_pty(command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("foreground-leader.pid"),
+        Duration::from_secs(3),
+        "foreground installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("foreground-descendant.pid"),
+        Duration::from_secs(3),
+        "foreground pipe-holder pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (leader_group, _) = process_group_and_session(leader_pid);
+    let (descendant_group, _) = process_group_and_session(descendant_pid);
+    assert_eq!(
+        leader_group, descendant_group,
+        "fixture must share the owned PGID"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn probe_of_leader_03_ctrl_c() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("probe-of-leader-03");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exec /bin/sleep 30
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("foreground-descendant-mutations"),
+        );
+    let (_shdeps, mut master) = spawn_on_pty(command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("foreground-leader.pid"),
+        Duration::from_secs(3),
+        "foreground installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("foreground-descendant.pid"),
+        Duration::from_secs(3),
+        "foreground pipe-holder pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (leader_group, _) = process_group_and_session(leader_pid);
+    let (descendant_group, _) = process_group_and_session(descendant_pid);
+    assert_eq!(
+        leader_group, descendant_group,
+        "fixture must share the owned PGID"
+    );
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn probe_of_leader_04_bounded_wait() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("probe-of-leader-04");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exec /bin/sleep 30
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("foreground-descendant-mutations"),
+        );
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("foreground-leader.pid"),
+        Duration::from_secs(3),
+        "foreground installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("foreground-descendant.pid"),
+        Duration::from_secs(3),
+        "foreground pipe-holder pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (leader_group, _) = process_group_and_session(leader_pid);
+    let (descendant_group, _) = process_group_and_session(descendant_pid);
+    assert_eq!(
+        leader_group, descendant_group,
+        "fixture must share the owned PGID"
+    );
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let _status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let _descendant_survived = process_is_running(descendant_pid);
+    let mutations = fixture.dir.join("foreground-descendant-mutations");
+    let _size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(150));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn probe_of_leader_05_full() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("probe-of-leader-05");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exec /bin/sleep 30
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("foreground-descendant-mutations"),
+        );
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("foreground-leader.pid"),
+        Duration::from_secs(3),
+        "foreground installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("foreground-descendant.pid"),
+        Duration::from_secs(3),
+        "foreground pipe-holder pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (leader_group, _) = process_group_and_session(leader_pid);
+    let (descendant_group, _) = process_group_and_session(descendant_pid);
+    assert_eq!(
+        leader_group, descendant_group,
+        "fixture must share the owned PGID"
+    );
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let descendant_survived = process_is_running(descendant_pid);
+    let mutations = fixture.dir.join("foreground-descendant-mutations");
+    let size_before = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(150));
+    let mutation_continued = fs::metadata(&mutations)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        != size_before;
+    if descendant_survived {
+        kill_process_group(descendant_group);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(descendant_pid),
+            "foreground pipe-holder fallback cleanup",
+        );
+    }
+    if status.is_none() {
+        kill_process_group(shdeps.id());
+        let _ = shdeps.wait();
+    }
+
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(128 + libc::SIGINT),
+        "leader signal must be observed before inherited pipe EOF"
+    );
+    assert!(
+        !descendant_survived,
+        "pipe-holder survived terminal cancellation"
+    );
+    assert!(
+        !mutation_continued,
+        "pipe-holder kept mutating after Shdeps returned"
+    );
 }
