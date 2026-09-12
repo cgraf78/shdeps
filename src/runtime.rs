@@ -11,7 +11,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::cancellation;
 use crate::dep_path;
 use crate::platform::{self, RuntimeEnv};
 
@@ -85,9 +84,13 @@ impl Env for ProcessEnv {
     }
 
     fn command_output(&self, command: &str, args: &[&str]) -> Option<String> {
-        let mut child = Command::new(command);
-        child.args(args);
-        let output = cancellation::output(child, None).ok()?;
+        // Host probes (`uname`, `hostname`) are millisecond leaf commands
+        // that run on every invocation. Route them around the supervised
+        // capture path: reader threads plus supervision rendezvous cost
+        // ~11ms per probe even when no snapshot runs, which breaks the CI
+        // perf budgets. A signal mid-probe only delays handling by the
+        // probe duration; the next cancellation check still observes it.
+        let output = Command::new(command).args(args).output().ok()?;
         output
             .status
             .success()

@@ -894,8 +894,14 @@ impl PendingStdin {
                 {
                     return Ok(false);
                 }
-                join_writer(handle.take().expect("finished writer available"))?;
-                Ok(true)
+                // Mirror the Unix EPIPE rule: a child that exits before
+                // consuming stdin completes the input; collect its real
+                // output and status instead of failing the capture.
+                match join_writer(handle.take().expect("finished writer available")) {
+                    Ok(()) => Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(true),
+                    Err(error) => Err(error),
+                }
             }
         }
     }
@@ -921,6 +927,11 @@ fn write_available(
             Ok(count) => *written += count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            // The child exited or closed stdin without consuming the
+            // input. That input is complete, not failed: the child's
+            // buffered output and exit status remain collectible and
+            // authoritative, so drop the writer and keep draining.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(true),
             Err(error) => return Err(error),
         }
     }
@@ -1481,6 +1492,42 @@ impl OwnedChild {
         self.child.as_mut().and_then(|child| child.stderr.take())
     }
 
+    /// Proves a clean leader exit needs no forced attribution scan.
+    ///
+    /// Lease EOF shows every inheritor exited or deliberately closed the
+    /// private descriptor. Where the subreaper adopts orphaned
+    /// descendants, an unregistered direct child can still hide a
+    /// lease-closed escapee, so the skip also requires every direct
+    /// child to be this leader or another active leader. Anything
+    /// unprovable fails closed to the strict snapshot.
+    #[cfg(unix)]
+    fn clean_exit_needs_no_attribution_scan(&mut self) -> bool {
+        if self.boundary.lifetime_has_holders().ok() != Some(Some(false)) {
+            return false;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let deadline = Instant::now() + TRACK_SNAPSHOT_BUDGET;
+            let children = match linux_supervisor_children(deadline) {
+                Ok(Some(children)) => children,
+                _ => return false,
+            };
+            let leaders = match ACTIVE_BOUNDARY_LEADERS
+                .get_or_init(|| Mutex::new(BTreeMap::new()))
+                .try_lock()
+            {
+                Ok(leaders) => leaders,
+                Err(_) => return false,
+            };
+            for pid in children {
+                if pid != self.boundary.leader && !leaders.contains_key(&pid) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Observes leader exit without releasing its PID/session identity.
     pub(crate) fn exited(&mut self) -> std::io::Result<bool> {
         if self.leader_exited {
@@ -1521,28 +1568,50 @@ impl OwnedChild {
         }
         #[cfg(unix)]
         if leader_exited {
-            // A leader can fork and exit between periodic observations. Force
-            // a fresh snapshot at that boundary so escaped descendants retain
-            // attribution even though portable hot-path scans are shared. Do
-            // not reap and lose the leader identity if attribution timed out.
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let observed = self
-                .boundary
-                .observe_leader_exit(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET);
-            // Portable snapshots spawn `ps` plus per-PID identity probes, so
-            // they need the same leader-exit budget as the procfs path; the
-            // tighter track budget expires under CI load and fails the
-            // completion proof for a leader that already exited cleanly.
-            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-            let observed = self
-                .boundary
-                .track(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET)
-                .ok_or_else(|| {
+            // The private lifetime lease is inherited by the whole child
+            // tree, so EOF proves every inheritor already exited or
+            // deliberately closed it. A clean completion with no live
+            // inheritor and no unregistered direct child needs no
+            // attribution scan: skipping the forced snapshot keeps
+            // trivial children (host probes, leaf hooks) from paying a
+            // whole-table scan on every run. A portable `ps` snapshot
+            // costs ~200ms on loaded macOS runners, which breaks the CI
+            // perf budgets. The unregistered-child check keeps a
+            // lease-closed escapee adopted through the subreaper visible
+            // so cleanup still fails closed; on platforms without
+            // subreaper adoption such an escapee reparents to init and
+            // stays invisible to this proof, matching daemon semantics.
+            // The signal path never consults this gate.
+            if !self.clean_exit_needs_no_attribution_scan() {
+                // A leader can fork and exit between periodic observations. Force
+                // a fresh snapshot at that boundary so escaped descendants retain
+                // attribution even though portable hot-path scans are shared. Do
+                // not reap and lose the leader identity if attribution timed out.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let observed = self
+                    .boundary
+                    .observe_leader_exit(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET);
+                // Portable snapshots spawn `ps` plus per-PID identity probes, so
+                // they need the same leader-exit budget as the procfs path; the
+                // tighter track budget expires under CI load and fails the
+                // completion proof for a leader that already exited cleanly.
+                #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+                let observed = self
+                    .boundary
+                    .track(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "portable process snapshot deadline expired",
+                        )
+                    });
+                observed.map_err(|error| {
                     std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "portable process snapshot deadline expired",
+                        error.kind(),
+                        format!("could not snapshot owned subprocesses after leader exit: {error}"),
                     )
-                });
+                })?;
+            }
             // A zombie leader still reserves its PID and process group for
             // safe cleanup, but it can no longer use the terminal. A retained
             // descendant may have taken the foreground in the meantime; only
@@ -1551,12 +1620,6 @@ impl OwnedChild {
             if let Some(foreground) = &self.foreground {
                 foreground.restore_if_owned(&self.boundary)?;
             }
-            observed.map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("could not snapshot owned subprocesses after leader exit: {error}"),
-                )
-            })?;
             self.leader_exited = true;
         }
         Ok(leader_exited)
