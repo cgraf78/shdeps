@@ -8537,6 +8537,106 @@ exec /bin/sleep 30
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn probe_of_leader_04d_reap_bisect() {
+    use std::io::Write as _;
+
+    let fixture = Fixture::new("probe-of-leader-04d");
+    fixture.write("conf/deps.conf", "tool cargo\n");
+    fixture.write_executable(
+        "fakebin/cargo",
+        r#"#!/bin/sh
+/bin/sh -c '
+  trap "" HUP INT QUIT TERM
+  printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
+  while :; do
+    printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
+    /bin/sleep 0.02
+  done
+' &
+printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
+exec /bin/sleep 30
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command
+        .env(
+            "SHDEPS_TEST_CHILD_PID",
+            fixture.dir.join("foreground-leader.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_PID",
+            fixture.dir.join("foreground-descendant.pid"),
+        )
+        .env(
+            "SHDEPS_TEST_DESCENDANT_MUTATIONS",
+            fixture.dir.join("foreground-descendant-mutations"),
+        );
+    let (mut shdeps, mut master) = spawn_on_pty(command);
+    let leader_pid = wait_for_pid(
+        &fixture.dir.join("foreground-leader.pid"),
+        Duration::from_secs(3),
+        "foreground installer leader pid",
+    );
+    let descendant_pid = wait_for_pid(
+        &fixture.dir.join("foreground-descendant.pid"),
+        Duration::from_secs(3),
+        "foreground pipe-holder pid",
+    );
+    let _leader_guard = EscapedProcessGuard::new(leader_pid);
+    let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
+    let (leader_group, _) = process_group_and_session(leader_pid);
+    let (descendant_group, _) = process_group_and_session(descendant_pid);
+    assert_eq!(
+        leader_group, descendant_group,
+        "fixture must share the owned PGID"
+    );
+
+    master.write_all(&[3]).unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let descendant_survived = process_is_running(descendant_pid);
+    std::thread::sleep(Duration::from_millis(150));
+    if descendant_survived {
+        kill_process_group(descendant_group);
+        wait_until(
+            Duration::from_secs(2),
+            || !process_is_running(descendant_pid),
+            "foreground pipe-holder fallback cleanup",
+        );
+    }
+    // TEMP-DEBUG bisection: never call blocking wait(). Report whether the
+    // child is already reaped, alive-then-killable, or SIGKILL-immune.
+    // Panicking here fails fast with the answer in the log.
+    let pre = shdeps.try_wait().map(|s| s.map(|s| s.code()));
+    kill_process_group(shdeps.id());
+    std::thread::sleep(Duration::from_millis(500));
+    let postkill = shdeps.try_wait().map(|s| s.map(|s| s.code()));
+    unsafe {
+        libc::kill(shdeps.id() as i32, libc::SIGKILL);
+    }
+    let start = Instant::now();
+    let mut reaped = None;
+    while start.elapsed() < Duration::from_secs(3) {
+        match shdeps.try_wait() {
+            Ok(Some(s)) => {
+                reaped = Some(s.code());
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                panic!("TEMP-DEBUG try_wait errored: {error:?}");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "TEMP-DEBUG status={status:?} survived={descendant_survived} pre={pre:?} postkill={postkill:?} reaped={reaped:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "TEMP-DEBUG: 05 hangs; 04d reports the mechanism instead; do not land"]
 fn probe_of_leader_05_full() {
     use std::io::Write as _;
 
