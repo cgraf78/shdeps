@@ -7786,24 +7786,51 @@ fn process_state(pid: u32) -> String {
 /// Captured BEFORE the kill fallback destroys the evidence and embedded
 /// in the assertion message so CI names whether delivery failed (child
 /// alive), observation spun (shdeps running), or teardown wedged
-/// (shdeps sleeping).
+/// (shdeps sleeping). The live-children list names whom a wedged shdeps
+/// is still waiting on; the self pid lets the reader compare the
+/// foreground group against shdeps' own group.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn describe_stall(shdeps_pid: u32, child_pid: u32, master: &fs::File) -> String {
     format!(
-        "child_alive={} shdeps_state={} fg_group={:?}",
+        "self={} child_alive={} shdeps_state={} fg_group={:?} kids=[{}]",
+        shdeps_pid,
         process_is_running(child_pid),
         process_state(shdeps_pid),
         try_terminal_group(master),
+        live_children(shdeps_pid).join(" "),
     )
+}
+
+/// `pid:stat:comm` for every process whose parent is `pid`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn live_children(pid: u32) -> Vec<String> {
+    let output = capture_output(Command::new("ps").args(["-A", "-o", "pid=,ppid=,stat=,comm="]));
+    let Ok(output) = output else {
+        return vec!["ps-failed".to_owned()];
+    };
+    let wanted = pid.to_string();
+    text(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let child = fields.next()?;
+            let parent = fields.next()?;
+            let stat = fields.next()?;
+            let comm = fields.next()?;
+            (parent == wanted).then(|| format!("{child}:{stat}:{comm}"))
+        })
+        .collect()
 }
 
 /// Stall snapshot for PTY tests that track no installer child PID.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn describe_stall_self(shdeps_pid: u32, master: &fs::File) -> String {
     format!(
-        "shdeps_state={} fg_group={:?}",
+        "self={} shdeps_state={} fg_group={:?} kids=[{}]",
+        shdeps_pid,
         process_state(shdeps_pid),
         try_terminal_group(master),
+        live_children(shdeps_pid).join(" "),
     )
 }
 
