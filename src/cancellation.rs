@@ -4344,6 +4344,10 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     {
+        #[cfg(target_vendor = "apple")]
+        if let Some(processes) = darwin_table_snapshot(deadline) {
+            return Some(processes);
+        }
         #[cfg(target_os = "android")]
         let mut command = Command::new("/system/bin/ps");
         #[cfg(not(target_os = "android"))]
@@ -5109,6 +5113,121 @@ fn portable_process_info(_pid: u32, _identity: ProcessIdentity) -> Option<Proces
 }
 
 #[cfg(target_vendor = "apple")]
+fn darwin_table_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
+    // One `KERN_PROC_ALL` sysctl for the whole table instead of spawning
+    // `/bin/ps`: a fork+exec costs ~200ms on loaded macOS runners and
+    // teardown takes several snapshots per stop. Rows carry the same
+    // identities the `proc_pidinfo` path reports, so snapshots from either
+    // source stay interchangeable. Any failure returns None and the caller
+    // falls back to `ps`.
+    let mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut fetched = false;
+    // The table can grow between the size query and the fetch as processes
+    // fork concurrently; retry boundedly, then fall back to `ps`.
+    for _ in 0..4 {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let mut size: libc::size_t = 0;
+        // SAFETY: size query with a null buffer; mib is a valid static array.
+        let queried = unsafe {
+            libc::sysctl(
+                mib.as_ptr() as *mut i32,
+                mib.len() as u32,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if queried != 0 || size == 0 {
+            return None;
+        }
+        bytes.resize(size, 0);
+        // SAFETY: bytes owns size writable bytes; mib is valid.
+        let status = unsafe {
+            libc::sysctl(
+                mib.as_ptr() as *mut i32,
+                mib.len() as u32,
+                bytes.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status == 0 {
+            bytes.truncate(size);
+            fetched = true;
+            break;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
+            return None;
+        }
+    }
+    if !fetched {
+        return None;
+    }
+    let stride = std::mem::size_of::<libc::kinfo_proc>();
+    if stride == 0 || bytes.len() % stride != 0 {
+        return None;
+    }
+    let mut processes = Vec::with_capacity(bytes.len() / stride);
+    let mut offset = 0;
+    while offset + stride <= bytes.len() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        // SAFETY: bounds-checked slice of stride bytes copied by value;
+        // kinfo_proc is repr(C) plain data and the copy is alignment-safe.
+        let mut entry: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(offset),
+                std::ptr::addr_of_mut!(entry).cast(),
+                stride,
+            );
+        }
+        offset += stride;
+        // Skip rows that exited mid-walk instead of failing the snapshot.
+        let Some(pid) = u32::try_from(entry.kp_proc.p_pid)
+            .ok()
+            .filter(|pid| *pid != 0)
+        else {
+            continue;
+        };
+        let Some(ppid) = u32::try_from(entry.kp_proc.p_ppid).ok() else {
+            continue;
+        };
+        let (Some(pgid), Some(sid)) = (process_group(pid), session_id(pid)) else {
+            continue;
+        };
+        // Process states are small positive constants; `as` is exact.
+        // Cast the libc constants (whose int width varies) rather than
+        // assuming they match the row field.
+        let state = entry.kp_proc.p_stat as i32;
+        let zombie = libc::SZOMB as i32;
+        let stopped_state = libc::SSTOP as i32;
+        processes.push(ProcessInfo {
+            pid,
+            ppid,
+            pgid,
+            sid,
+            live: state != zombie,
+            stopped: state == stopped_state,
+            identity: ProcessIdentity {
+                pid,
+                start: Some(format!(
+                    "{}.{:06}",
+                    entry.kp_proc.p_starttime.tv_sec, entry.kp_proc.p_starttime.tv_usec
+                )),
+            },
+        });
+    }
+    Some(processes)
+}
+
+#[cfg(target_vendor = "apple")]
 fn darwin_process_info(pid: u32) -> Option<ProcessInfo> {
     // `proc_pidinfo` includes the process generation's start time and process
     // group, while `getsid` is a separate syscall. Bracket that second lookup
@@ -5160,6 +5279,29 @@ fn darwin_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
         return None;
     }
     Some(info)
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[test]
+fn darwin_table_snapshot_lists_current_process() {
+    let snapshot = darwin_table_snapshot(Instant::now() + Duration::from_secs(5))
+        .expect("sysctl snapshot succeeds");
+    let me = std::process::id();
+    let row = snapshot
+        .iter()
+        .find(|process| process.pid == me)
+        .expect("current process row present");
+    assert!(row.live, "current process must be live: {row:?}");
+    assert!(
+        row.identity.start.is_some(),
+        "start generation present: {row:?}"
+    );
+    // The sysctl row must match the proc_pidinfo row for the same process
+    // so snapshots from either source stay interchangeable.
+    let enriched = darwin_process_info(me).expect("proc_pidinfo row present");
+    assert_eq!(row.identity.start, enriched.identity.start);
+    assert_eq!(row.pgid, enriched.pgid);
+    assert_eq!(row.ppid, enriched.ppid);
 }
 
 #[cfg(any(test, all(unix, not(any(target_os = "linux", target_os = "android")))))]
@@ -5419,12 +5561,9 @@ fn session_id(pid: u32) -> Option<u32> {
     u32::try_from(unsafe { libc::getsid(pid as i32) }).ok()
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "android")),
-    not(target_vendor = "apple")
-))]
-// Reads a live process's process-group identity.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+// Reads a live process's process-group identity. Shared by the `ps`
+// fallback and the sysctl table walk below.
 fn process_group(pid: u32) -> Option<u32> {
     // SAFETY: getpgid observes a positive process identity without pointers.
     u32::try_from(unsafe { libc::getpgid(pid as i32) }).ok()
