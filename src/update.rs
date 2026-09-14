@@ -685,14 +685,10 @@ where
     //
     // The handle is bound to a local so its `Drop` releases the lock
     // when `run` returns by any path.
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "before-state-lock");
     let _lock = match held_lock {
         Some(lock) => lock,
         None => crate::state::StateLock::acquire(&context.roots.state_dir)?,
     };
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "after-state-lock");
     cancellation::check()?;
     let mut summary = Summary::default();
 
@@ -700,22 +696,14 @@ where
     // lock. Another updater may have committed a newer method or ownership row
     // while this invocation waited, so all transition and cleanup decisions
     // below must be rebuilt from the now-serialized on-disk state.
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "before-fresh-recovery");
     recover_fresh_repo_publications(context)?;
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "after-fresh-recovery");
     let initial_manifest = manifest::read(context.manifest_path)?;
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "before-pending-publications");
     update_transition::recover_pending_publications(
         entries,
         &initial_manifest,
         context.manifest_path,
         context.roots,
     )?;
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "after-pending-publications");
     let recovery_entries = entries
         .iter()
         .filter(|entry| active(entry, context.env))
@@ -731,8 +719,6 @@ where
                 .map(|fingerprint| (entry.name.clone(), fingerprint))
         })
         .collect::<Result<HashMap<_, _>>>()?;
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "before-pending-transitions");
     for pending in update_transition::recover_pending_transitions(
         &recovery_entries,
         &custom_fingerprints,
@@ -740,8 +726,6 @@ where
         context.roots,
         Some((context.pkg_mgr, context.env.is_android())),
     )? {
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase("run", "pending-transition-item");
         let old = pending.old().clone();
         let leftover = with_old_repo_checkout_lock(Some(&old), context, |repo_root| {
             pending.finish(context.roots, repo_root)
@@ -751,8 +735,6 @@ where
             summary.leftover_details.insert(old.name, detail);
         }
     }
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "after-pending-transitions");
     // Recovery is an atomic repair boundary: once entered it runs to
     // completion, then cancellation is honored before any new work starts.
     cancellation::check()?;
@@ -765,12 +747,8 @@ where
 
     let mut queued = Vec::new();
     let mut package_transitions = HashMap::<String, update_transition::DurableTransition>::new();
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "before-hook-txn");
     let hook_txn = Txn::new(&context.roots.state_dir)?;
     let mut changed = hook_txn.pending()?;
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "after-hook-txn");
 
     let active_package_entries = entries
         .iter()
@@ -1046,8 +1024,6 @@ where
         .filter(|entry| active(entry, context.env))
         .collect::<Vec<_>>();
 
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "before-builtins");
     let builtin_outcomes = jobs::parallel_map_with_item_progress(
         &builtin_entries,
         jobs::max_jobs(context.env_vars),
@@ -1087,8 +1063,6 @@ where
             Ok(())
         },
     )?;
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "after-builtins");
     cancellation::check()?;
     for outcome in builtin_outcomes {
         if let Some(detail) = outcome.cleanup_error {
@@ -1157,11 +1131,7 @@ where
     // inline with each method. Many hooks repair shell completions, symlinks,
     // or dependent tools, so they should see the final state for the full
     // update pass instead of an intermediate per-method view.
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "before-post-hooks");
     run_post_hooks(&changed, context, &hook_txn, &mut summary, progress)?;
-    // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-    crate::cancellation::teardown_phase("run", "after-post-hooks");
     cancellation::check()?;
     Ok(summary)
 }
@@ -10141,16 +10111,6 @@ version() { printf 'saw-pkg\n'; }
             .with_success("git", push_args, "")
             .with_signal_after("git", push_args, libc::SIGTERM);
         let signals = crate::cancellation::Signals::install().unwrap();
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        let _watchdog = crate::cancellation::spawn_teardown_watchdog(
-            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
-        );
-
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
-            "before-run",
-        );
         let result = run(
             &[parse_entry("private/tool|github:repo|tool|-|-", None)],
             &manifest::Manifest::default(),
@@ -10161,11 +10121,6 @@ version() { printf 'saw-pkg\n'; }
             },
         );
 
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
-            "after-run",
-        );
         assert!(result.is_err(), "latched cancellation must abort update");
         assert!(
             install_dir.is_dir(),
@@ -10195,16 +10150,6 @@ version() { printf 'saw-pkg\n'; }
             128 + libc::SIGTERM
         );
 
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::checkout_lock::diag_dump_lock_state(
-            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
-            &[&fixture.roots.home],
-        );
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
-            "before-retry-run",
-        );
         let retry = run(
             &[],
             &manifest::read(&manifest_path).unwrap(),
@@ -10215,11 +10160,6 @@ version() { printf 'saw-pkg\n'; }
             },
         )
         .unwrap();
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::fresh_repo_recovery_precedes_empty_config_and_remote_resolution",
-            "after-retry-run",
-        );
 
         assert!(
             !retry.has_errors(),
@@ -12292,10 +12232,6 @@ version() { printf 'saw-pkg\n'; }
         }
 
         let signals = crate::cancellation::Signals::install().unwrap();
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        let _watchdog = crate::cancellation::spawn_teardown_watchdog(
-            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
-        );
         let fixture = Fixture::new("repo-existing-metadata-cancel");
         fixture.write_lib();
         fixture.write_hook(
@@ -12327,11 +12263,6 @@ version() { printf 'saw-pkg\n'; }
             .with_success("git", set_push, "")
             .with_signal_after("git", set_push, libc::SIGTERM);
 
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
-            "before-run",
-        );
         let cancelled = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
             &installed,
@@ -12339,11 +12270,6 @@ version() { printf 'saw-pkg\n'; }
             Options::default(),
         );
 
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
-            "after-run",
-        );
         assert!(cancelled.is_err());
         assert!(
             fixture
@@ -12365,16 +12291,6 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
         let retry_runner = FakeRunner::default();
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::checkout_lock::diag_dump_lock_state(
-            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
-            &[&fixture.roots.home],
-        );
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
-            "before-retry-run",
-        );
         let retry = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
             &manifest::read(&manifest_path).unwrap(),
@@ -12385,22 +12301,12 @@ version() { printf 'saw-pkg\n'; }
             },
         )
         .unwrap();
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
-            "after-retry-run",
-        );
         assert!(!retry.has_errors());
         assert_eq!(
             fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
             "post\n"
         );
 
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
-            "before-final-run",
-        );
         let final_run = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
             &manifest::read(&manifest_path).unwrap(),
@@ -12411,11 +12317,6 @@ version() { printf 'saw-pkg\n'; }
             },
         )
         .unwrap();
-        // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-        crate::cancellation::teardown_phase(
-            "update::tests::cancellation_after_existing_repo_metadata_mutation_retains_post_intent",
-            "after-final-run",
-        );
         assert!(!final_run.has_errors());
         assert_eq!(
             fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),

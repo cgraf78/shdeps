@@ -642,135 +642,11 @@ fn runtime_cancellation_capability_with<T>(
 pub(crate) fn record_cleanup_error(error: &std::io::Error) {
     CLEANUP_FAILED.store(true, Ordering::SeqCst);
     let diagnostic = error.to_string();
-    // TEMP-DIAG-131: report every recorded cleanup error. Revert with the
-    // rest of the macOS teardown telemetry once macOS is green.
-    #[cfg(test)]
-    if teardown_diag_enabled() {
-        eprintln!(
-            "DIAG131 cleanup_error: {diagnostic} test={}",
-            diag_child_name()
-        );
-    }
     let mut diagnostics = CLEANUP_DIAGNOSTICS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if !diagnostics.contains(&diagnostic) {
         diagnostics.push(diagnostic);
-    }
-}
-
-/// TEMP-DIAG-131: teardown failure/hang telemetry for the macOS signal
-/// tests. Env-gated, stderr-unbuffered so killed subprocesses
-/// still leave their last heartbeat. Revert once macOS is green.
-#[cfg(unix)]
-pub(crate) fn teardown_diag_enabled() -> bool {
-    std::env::var_os("SHDEPS_TEST_TEARDOWN_DIAG").is_some()
-}
-
-/// TEMP-DIAG-131: attribute every marker with the owning signal-boundary
-/// child. Each child runs one `--exact TEST` behind `--test-threads=1`,
-/// so the argv filter names the test that emitted the marker; `?` marks
-/// emissions from a process without that filter. Cached: argv never
-/// changes after process start. Revert with the macOS teardown telemetry
-/// once macOS is green.
-#[cfg(any(test, unix))]
-pub(crate) fn diag_child_name() -> String {
-    static NAME: OnceLock<String> = OnceLock::new();
-    NAME.get_or_init(|| {
-        let mut args = std::env::args();
-        let mut name = String::from("?");
-        while let Some(arg) = args.next() {
-            if arg == "--exact" {
-                if let Some(exact) = args.next() {
-                    name = exact.rsplit("::").next().unwrap_or("?").to_owned();
-                }
-                break;
-            }
-        }
-        name
-    })
-    .clone()
-}
-
-/// TEMP-DIAG-131: prints scope entry/exit (see above).
-#[cfg(test)]
-struct DiagScope {
-    name: &'static str,
-    started: Instant,
-}
-
-#[cfg(test)]
-impl DiagScope {
-    fn enter(name: &'static str) -> Self {
-        if teardown_diag_enabled() {
-            eprintln!("DIAG131 enter {name} test={}", diag_child_name());
-        }
-        Self {
-            name,
-            started: Instant::now(),
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for DiagScope {
-    fn drop(&mut self) {
-        if teardown_diag_enabled() {
-            eprintln!(
-                "DIAG131 exit {} elapsed_ms={} test={}",
-                self.name,
-                self.started.elapsed().as_millis(),
-                diag_child_name()
-            );
-        }
-    }
-}
-
-/// TEMP-DIAG-131: child-side liveness watchdog for the macOS timeout
-/// victims. A detached thread prints an attributed heartbeat proving the
-/// child is alive and whether its signal latch fired; killed children
-/// leave their last tick behind. Revert with the macOS teardown
-/// telemetry once macOS is green.
-#[cfg(all(test, unix))]
-pub(crate) fn spawn_teardown_watchdog(test_name: &'static str) -> impl Drop {
-    struct Watchdog {
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    }
-    impl Drop for Watchdog {
-        fn drop(&mut self) {
-            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_thread = std::sync::Arc::clone(&stop);
-    let started = Instant::now();
-    std::thread::spawn(move || {
-        let mut tick = 0_u32;
-        while !stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            tick += 1;
-            if teardown_diag_enabled() {
-                eprintln!(
-                    "DIAG131 watchdog {test_name} tick={tick} elapsed_ms={} received={:?} active_handlers={}",
-                    started.elapsed().as_millis(),
-                    received_signal(),
-                    ACTIVE_HANDLERS.load(std::sync::atomic::Ordering::SeqCst),
-                );
-            }
-        }
-    });
-    Watchdog { stop }
-}
-
-/// TEMP-DIAG-131: attributed phase marker for the macOS timeout
-/// victims. Revert with the macOS teardown telemetry once macOS is green.
-#[cfg(unix)]
-pub(crate) fn teardown_phase(test_name: &str, phase: &str) {
-    if teardown_diag_enabled() {
-        eprintln!(
-            "DIAG131 phase {test_name} {phase} test={}",
-            diag_child_name()
-        );
     }
 }
 
@@ -942,9 +818,6 @@ fn output_with_attribution(
     stdin_bytes: Option<&[u8]>,
     attribute_descendants: bool,
 ) -> std::io::Result<std::process::Output> {
-    // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
-    #[cfg(test)]
-    let _diag = DiagScope::enter("output");
     use std::io::Read as _;
 
     command
@@ -2358,9 +2231,6 @@ fn stop_boundary(
     leader_reaped: &mut bool,
     foreground: Option<&TerminalForeground>,
 ) -> std::io::Result<ExitStatus> {
-    // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
-    #[cfg(test)]
-    let _diag = DiagScope::enter("stop_boundary");
     // Capture descendants once more before terminating the leader. Previously
     // observed identities remain owned even if PPID/PGID/SID has since changed.
     let discovery_deadline = Instant::now() + CLEANUP_SNAPSHOT_BUDGET;
@@ -2925,9 +2795,6 @@ impl Boundary {
     // a fallback when local procfs traversal cannot prove completeness. Other
     // Unix platforms use the bounded portable snapshot.
     fn track(&mut self, deadline: Instant) -> Option<()> {
-        // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
-        #[cfg(test)]
-        let _diag = DiagScope::enter("track");
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let (processes, locally_owned) = linux_local_or_full_snapshot(
@@ -2952,9 +2819,6 @@ impl Boundary {
     // Records matching topology and transitive PPID lineage. Retained
     // identities remain owned after reparenting or a process-group change.
     fn observe(&mut self, deadline: Instant) -> Option<bool> {
-        // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
-        #[cfg(test)]
-        let _diag = DiagScope::enter("observe");
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.reconcile_fresh(deadline)
@@ -3177,9 +3041,6 @@ impl Boundary {
     // not independent evidence of a stable empty set.
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     fn observe_grace_cached(&mut self, deadline: Instant) -> Option<bool> {
-        // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
-        #[cfg(test)]
-        let _diag = DiagScope::enter("observe");
         let now = Instant::now();
         let processes = PORTABLE_SNAPSHOT_CACHE
             .get_or_init(SnapshotCache::default)
@@ -5301,9 +5162,6 @@ fn parse_ps_processes(
 #[cfg(any(test, all(unix, not(any(target_os = "linux", target_os = "android")))))]
 // Captures the portable `ps` fallback without creating an unbounded helper.
 fn snapshot(mut command: Command, deadline: Instant) -> Option<Vec<u8>> {
-    // TEMP-DIAG-131: revert with the rest of the macOS teardown telemetry.
-    #[cfg(test)]
-    let _diag = DiagScope::enter("snapshot");
     use std::io::Read as _;
     use std::os::fd::OwnedFd;
 

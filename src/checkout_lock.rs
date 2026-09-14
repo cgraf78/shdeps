@@ -434,80 +434,6 @@ fn normalize_requested_checkout(requested_checkout: &Path) -> io::Result<PathBuf
 }
 
 // Run one mutation while holding the shared lock and report strict release errors.
-/// TEMP-DIAG-131: dump checkout-lock protocol state so one CI round shows
-/// whether a post-cancel retry wedges on a leftover owner/claim record.
-/// Walks `roots` for `*.install.lock*` paths, printing each entry's kind,
-/// symlink target, small file contents, and the classify() verdict for
-/// canonical paths. Revert with the macOS teardown telemetry once macOS
-/// is green.
-#[cfg(all(test, unix))]
-pub(crate) fn diag_dump_lock_state(test_name: &str, roots: &[&Path]) {
-    if !crate::cancellation::teardown_diag_enabled() {
-        return;
-    }
-    let child = crate::cancellation::diag_child_name();
-    let mut stack: Vec<(PathBuf, usize)> =
-        roots.iter().map(|root| (root.to_path_buf(), 0)).collect();
-    let mut found = 0usize;
-    while let Some((dir, depth)) = stack.pop() {
-        if depth > 8 {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.contains("install.lock") {
-                found += 1;
-                let kind = match fs::symlink_metadata(&path) {
-                    Ok(meta) if meta.file_type().is_symlink() => format!(
-                        "symlink->{}",
-                        fs::read_link(&path)
-                            .map(|target| target.display().to_string())
-                            .unwrap_or_else(|_| "?".to_owned())
-                    ),
-                    Ok(meta) if meta.file_type().is_dir() => "dir".to_owned(),
-                    Ok(_) => "file".to_owned(),
-                    Err(error) => format!("meta-err:{error}"),
-                };
-                let mut extra = String::new();
-                if kind == "file" {
-                    if let Ok(bytes) = fs::read(&path) {
-                        if bytes.len() < 2048 {
-                            extra = format!(" contents={:?}", String::from_utf8_lossy(&bytes));
-                        }
-                    }
-                }
-                if name.ends_with(".install.lock") {
-                    if let Some(parent) = path.parent() {
-                        let stem = name
-                            .trim_start_matches('.')
-                            .trim_end_matches(".install.lock");
-                        match Paths::new(&parent.join(stem)) {
-                            Ok(lock_paths) => {
-                                extra.push_str(&format!(" classify={:?}", classify(&lock_paths)));
-                            }
-                            Err(error) => {
-                                extra.push_str(&format!(" classify-err:{error}"));
-                            }
-                        }
-                    }
-                }
-                eprintln!(
-                    "DIAG131 lockstate {test_name} #{found} {} {kind}{extra} test={child}",
-                    path.display()
-                );
-            }
-            if depth < 8 && path.is_dir() && !path.is_symlink() {
-                stack.push((path, depth + 1));
-            }
-        }
-    }
-    eprintln!("DIAG131 lockstate {test_name} total={found} test={child}");
-}
-
 pub(crate) fn with_checkout_lock<T>(
     requested_checkout: &Path,
     env: &BTreeMap<String, String>,
@@ -1644,26 +1570,12 @@ mod tests {
         if let Some(checkout) = std::env::var_os(CHILD_ENV) {
             let checkout = PathBuf::from(checkout);
             let signals = crate::cancellation::Signals::install().unwrap();
-            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-            let _watchdog = crate::cancellation::spawn_teardown_watchdog(
-                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
-            );
             fs::write(
                 checkout.with_extension("ready"),
                 std::process::id().to_string(),
             )
             .unwrap();
-            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-            crate::cancellation::teardown_phase(
-                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
-                "before-acquire",
-            );
             let result = with_checkout_lock_timeout(&checkout, Duration::from_secs(30), |_| Ok(()));
-            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-            crate::cancellation::teardown_phase(
-                "checkout_lock::tests::parent_signal_interrupts_checkout_lock_contention_promptly",
-                "after-acquire",
-            );
             let code = signals.finish_result(result.map(|_| 0)).unwrap();
             assert_eq!(code, 128 + libc::SIGTERM);
             return;
@@ -1684,8 +1596,6 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(CHILD_ENV, &checkout)
-            // TEMP-DIAG-131: revert with the macOS teardown telemetry.
-            .env("SHDEPS_TEST_TEARDOWN_DIAG", "1")
             .env(
                 "SHDEPS_INTERNAL_PROCESS_BOUNDARIES",
                 "test-harness-subprocess",
