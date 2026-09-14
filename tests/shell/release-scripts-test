@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC1091
+# The quoted workflow/script fragments below must remain literal assertions.
+# shellcheck disable=SC1091,SC2016
 # shdeps-specific release coverage.
 #
 # The release scripts themselves are vendored from cgraf78/actions and covered
@@ -163,6 +164,26 @@ _assert_contains "test workflow: keeps Cargo artifacts out of transported checko
   "$_termux_host_command"
 _assert_contains "test workflow: smokes the Android x86_64 release archive" \
   "scripts/smoke-release.sh \"\$ASSET_PLATFORM\"" "$_termux_host_command"
+_assert_contains "Termux host: builds the pidfd signal helper with the NDK" \
+  'tests/termux-pidfd-signal.c' "$_termux_host_command"
+_assert_file_exists "Termux runtime: pidfd helper source exists" \
+  "$SHDEPS_DIR/tests/termux-pidfd-signal.c"
+
+_termux_ci=$(cat "$SHDEPS_DIR/scripts/termux-ci.sh")
+_assert_contains "Termux runtime: exercises parent cancellation" \
+  'signal_owned_process 15 "$shdeps_identity"' "$_termux_ci"
+_assert_contains "Termux runtime: asserts conventional TERM status" \
+  '[[ "$cancel_status" == 143 ]]' "$_termux_ci"
+_assert_contains "Termux runtime: uses a signal-resistant descendant" \
+  'trap "" HUP INT QUIT TERM' "$_termux_ci"
+_assert_contains "Termux runtime: verifies descendant teardown" \
+  'while process_identity_matches /proc "$child_identity" || process_identity_matches /proc "$descendant_identity"; do' \
+  "$_termux_ci"
+_assert_contains "Termux runtime: pins cleanup to the observed process generation" \
+  'if "$pidfd_signal" "$fixture_identity" 0; then' \
+  "$_termux_ci"
+_assert_not_contains "Termux runtime: never signals a revalidated raw PID" \
+  'kill "-$signal" "$pid"' "$_termux_ci"
 
 # Consumer workflows and vendored scripts must resolve to the same actions
 # commit. The broader verifier keeps that invariant behind the established

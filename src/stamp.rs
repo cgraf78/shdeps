@@ -77,6 +77,11 @@ pub fn remote_touch(path: &Path, now: u64) -> Result<()> {
     state::write_atomic(path, &format!("{now}\n"))
 }
 
+/// Writes a remote-check stamp only while the CLI cancellation latch is clear.
+pub(crate) fn remote_touch_cancellable(path: &Path, now: u64) -> Result<()> {
+    state::write_atomic_cancellable(path, &format!("{now}\n"))
+}
+
 /// Returns whether a remote stamp was written for this update's timestamp.
 ///
 /// This is deliberately narrower than `remote_fresh`: force/reinstall should

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::Result;
+use crate::cancellation;
 use crate::config::Entry;
 use crate::github;
 use crate::github_release;
@@ -184,18 +185,23 @@ where
     )?;
 
     for probe in remote_results {
+        cancellation::check()?;
         let entry = &entries[probe.index];
         let cache = Cache::new(&context.roots.state_dir, &entry.name);
-        let method = if probe.current_release
-            && github::remove_cached_releases(&context.roots.state_dir, &entry.name).is_ok()
-        {
+        let current_release = if probe.current_release {
+            cancellation::check()?;
+            github::remove_cached_releases(&context.roots.state_dir, &entry.name).is_ok()
+        } else {
+            false
+        };
+        let method = if current_release {
             // The installed executable already proves this host can run the
             // release method. Keep it while GitHub's public latest tag is
             // unchanged; a new tag falls through to authoritative asset
             // selection before this cache is refreshed again.
             cache.write_method(method::GITHUB_RELEASE, entry)?;
-            stamp::remote_touch(&cache.stamp, options.now)?;
-            stamp::remote_touch(
+            stamp::remote_touch_cancellable(&cache.stamp, options.now)?;
+            stamp::remote_touch_cancellable(
                 &stamp::remote_path(&context.roots.state_dir, &entry.name, "release"),
                 options.now,
             )?;
@@ -245,6 +251,7 @@ fn resolve_method<R>(
 where
     R: Runner,
 {
+    cancellation::check()?;
     if !active(entry, context.env) {
         // A filtered dependency does not own artifacts on this host, so there
         // is no useful remote fact to learn. Still return a concrete method so
@@ -262,12 +269,16 @@ where
         name: entry.name.clone(),
         cmd: entry.cmd.clone(),
     };
-    if confirmed_current_release(&candidate, context, options)
-        && github::remove_cached_releases(&context.roots.state_dir, &entry.name).is_ok()
-    {
+    let current_release = if confirmed_current_release(&candidate, context, options) {
+        cancellation::check()?;
+        github::remove_cached_releases(&context.roots.state_dir, &entry.name).is_ok()
+    } else {
+        false
+    };
+    if current_release {
         cache.write_method(method::GITHUB_RELEASE, entry)?;
-        stamp::remote_touch(&cache.stamp, options.now)?;
-        stamp::remote_touch(
+        stamp::remote_touch_cancellable(&cache.stamp, options.now)?;
+        stamp::remote_touch_cancellable(
             &stamp::remote_path(&context.roots.state_dir, &entry.name, "release"),
             options.now,
         )?;
@@ -354,6 +365,7 @@ fn resolve_remote_method<R>(
 where
     R: Runner,
 {
+    cancellation::check()?;
     let method = match releases {
         Some(releases) => {
             if github_release::select(&entry.cmd, &releases, context.env, context.runner).is_some()
@@ -363,9 +375,13 @@ where
                 // local checkout under SHDEPS_GIT_DEV_DIR must not override
                 // this decision; users who want live-checkout behavior should
                 // ask for `github:repo` explicitly.
-                github::write_cached_releases(&context.roots.state_dir, &entry.name, &releases)?;
+                github::write_cached_releases_cancellable(
+                    &context.roots.state_dir,
+                    &entry.name,
+                    &releases,
+                )?;
                 cache.write_method(method::GITHUB_RELEASE, entry)?;
-                stamp::remote_touch(&cache.stamp, options.now)?;
+                stamp::remote_touch_cancellable(&cache.stamp, options.now)?;
                 method::GITHUB_RELEASE
             } else {
                 // This is the only repo fallback worth caching: GitHub
@@ -373,9 +389,13 @@ where
                 // release asset. Cache it with an explicit reason so old
                 // "github:repo" cache files written after fetch failures are
                 // not trusted forever.
-                github::write_cached_releases(&context.roots.state_dir, &entry.name, &releases)?;
+                github::write_cached_releases_cancellable(
+                    &context.roots.state_dir,
+                    &entry.name,
+                    &releases,
+                )?;
                 cache.write_method(METHOD_REPO_NO_ASSET, entry)?;
-                stamp::remote_touch(&cache.stamp, options.now)?;
+                stamp::remote_touch_cancellable(&cache.stamp, options.now)?;
                 method::GITHUB_REPO
             }
         }
@@ -485,7 +505,7 @@ impl Cache {
     }
 
     fn write_method(&self, method: &str, entry: &Entry) -> Result<()> {
-        state::write_atomic(&self.method, &format!("{method}\ncmd={}\n", entry.cmd))
+        state::write_atomic_cancellable(&self.method, &format!("{method}\ncmd={}\n", entry.cmd))
     }
 }
 
@@ -548,8 +568,9 @@ where
     // release compatibility remotely, or the next healthy run may skip the
     // release-vs-repo decision and delay a required transition.
     if !(allow_release_seed && stored == method::GITHUB_RELEASE) {
+        cancellation::check()?;
         cache.write_method(stored, entry)?;
-        stamp::remote_touch(&cache.stamp, options.now)?;
+        stamp::remote_touch_cancellable(&cache.stamp, options.now)?;
     }
     Ok(Some(resolved))
 }
@@ -729,6 +750,65 @@ mod tests {
             "v1.0.0"
         );
         assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_remote_resolution_skips_all_cache_commits() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_GITHUB_RESOLUTION";
+        const TEST_NAME: &str =
+            "github_method::tests::cancellation_after_remote_resolution_skips_all_cache_commits";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let fixture = Fixture::new("cancel-before-cache-commit");
+        let client = FakeClient::new()
+            .with_releases(
+                "owner/tool",
+                releases_json("v1.0.0", &["tool-v1.0.0-linux-x86_64.tar.gz"]),
+            )
+            .with_signal_after(libc::SIGTERM);
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
+        let signals = crate::cancellation::Signals::install().unwrap();
+
+        let result = resolve_entries(
+            &entries,
+            &fixture.context(&runner, &client),
+            fixture.options(false),
+        );
+
+        assert!(
+            result.is_err(),
+            "latched cancellation must abort resolution"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join("owner/tool.github.method")
+                .exists(),
+            "cancelled resolution wrote the concrete-method cache"
+        );
+        assert!(
+            !github::releases_cache_path(&fixture.roots.state_dir, "owner/tool").exists(),
+            "cancelled resolution wrote the release metadata cache"
+        );
+        assert!(
+            !stamp::remote_path(
+                &fixture.roots.state_dir,
+                "owner/tool",
+                crate::method::GITHUB
+            )
+            .exists(),
+            "cancelled resolution wrote the resolver TTL"
+        );
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
     }
 
     #[test]
@@ -1619,6 +1699,7 @@ mod tests {
         delay: Option<Duration>,
         active: std::sync::atomic::AtomicUsize,
         max_active: std::sync::atomic::AtomicUsize,
+        signal_after: Option<i32>,
     }
 
     impl FakeClient {
@@ -1642,6 +1723,12 @@ mod tests {
 
         fn with_delay(mut self, delay: Duration) -> Self {
             self.delay = Some(delay);
+            self
+        }
+
+        #[cfg(unix)]
+        fn with_signal_after(mut self, signal: i32) -> Self {
+            self.signal_after = Some(signal);
             self
         }
 
@@ -1669,9 +1756,16 @@ mod tests {
                 std::thread::sleep(delay);
             }
             self.urls.lock().unwrap().push(url.to_owned());
-            self.responses.get(url).cloned().ok_or_else(|| {
+            let response = self.responses.get(url).cloned().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("missing fake URL {url}"))
-            })
+            })?;
+            #[cfg(unix)]
+            if let Some(signal) = self.signal_after {
+                // SAFETY: this test client runs only while the owning test has
+                // installed Shdeps' signal handlers and targets itself.
+                assert_eq!(unsafe { libc::raise(signal) }, 0);
+            }
+            Ok(response)
         }
 
         fn redirect_location(&self, url: &str) -> io::Result<Option<String>> {

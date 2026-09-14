@@ -20,7 +20,7 @@
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Result;
+use crate::cancellation::{self, Isolation};
 use crate::config;
 use crate::config::Entry;
 use crate::runtime::Roots;
@@ -44,8 +45,8 @@ const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 300;
 
 /// Default per-stream cap for hook stdout/stderr capture.
 ///
-/// `command.output()` buffers the full child output in memory, so a hook
-/// that emits unbounded text (e.g., `version() { cat /var/log/syslog; }`
+/// Buffering the full child output would let a hook that emits unbounded text
+/// (e.g., `version() { cat /var/log/syslog; }`
 /// — a real footgun in the wild) could OOM the parent. We continue
 /// draining the pipes after the cap so the child does not block on a
 /// full pipe buffer, but only the first `MAX` bytes are kept in memory.
@@ -59,6 +60,7 @@ const DEFAULT_HOOK_MAX_OUTPUT_BYTES: usize = 1 << 20;
 const HOOK_WAIT_POLL: Duration = Duration::from_millis(10);
 const HOOK_WARNING_PREFIX: &str = "shdeps-hook-warning: ";
 const HOOK_WARNING_MAX_BYTES: usize = 256;
+const MAX_HOOK_FINGERPRINT_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const SUDO_REQUEST_EXIT_CODE: i32 = 75;
 const SUDO_REQUEST_ENV: &str = "SHDEPS_HOOK_SUDO_REQUEST";
 const SUDO_REQUEST_DIR: &str = ".hook-sudo-requests";
@@ -146,114 +148,89 @@ fn run_hook_command(
     let timeout = hook_timeout();
     let max_bytes = hook_max_bytes();
 
-    // Put the child in its own process group on Unix so timeout-kill can reach
-    // grandchildren too. The initial attempt also starts a new session so it
-    // cannot prompt through the parent's controlling terminal. An authenticated
-    // retry must preserve that session because sudo may scope its timestamp to
-    // the terminal/session; `setpgid` keeps the retry killable without hiding
-    // the ticket the attached parent just refreshed.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` and `setpgid` are async-signal-safe and the pre-exec
-        // callback runs between fork and exec where only async-signal-safe calls
-        // are valid.
-        unsafe {
-            command.pre_exec(move || {
-                match isolation {
-                    HookIsolation::DetachedSession => {
-                        if libc::setsid() == -1 {
-                            let err = std::io::Error::last_os_error();
-                            // EPERM means the caller is already a process-group
-                            // leader, so setsid refuses — but the child inherits
-                            // that leader status, which is exactly the state we
-                            // wanted (kill(-pgid) will reach the whole group).
-                            // Any other errno genuinely blocks detachment.
-                            if err.raw_os_error() != Some(libc::EPERM) {
-                                return Err(err);
-                            }
-                        }
-                    }
-                    HookIsolation::ParentSession => {
-                        if libc::setpgid(0, 0) == -1 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                }
-                Ok(())
-            });
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = isolation;
-
-    let mut child = command
+    // The initial attempt starts a new session so it cannot prompt through the
+    // parent's controlling terminal. An authenticated retry remains in the
+    // parent session because sudo may scope its timestamp there, but receives
+    // a dedicated process group so Shdeps still owns its cleanup boundary.
+    let isolation = match isolation {
+        HookIsolation::DetachedSession => Isolation::DetachedSession,
+        HookIsolation::ParentSession => Isolation::ParentSession,
+    };
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = cancellation::spawn_owned(&mut command, isolation, true)?;
 
     // Drain the pipes concurrently in background threads so the child
     // cannot wedge on a full pipe buffer while we wait for it to exit.
     // Each reader stops storing bytes after `max_bytes` but keeps
     // reading-and-discarding until EOF; without that, a runaway hook
     // would block forever on the next pipe write.
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
-    let stdout_handle = thread::spawn(move || read_capped(stdout, max_bytes));
-    let stderr_handle = thread::spawn(move || read_capped(stderr, max_bytes));
+    let stdout = child.take_stdout().expect("stdout piped");
+    let stderr = child.take_stderr().expect("stderr piped");
+    let (stdout_handle, stderr_handle) = cancellation::spawn_output_readers(
+        &mut child,
+        Box::new(move || read_capped(stdout, max_bytes)),
+        Box::new(move || read_capped(stderr, max_bytes)),
+    )?;
 
     // The deadline covers both the hook leader and inherited output pipes.
     // A shell can exit while a background child keeps those pipes open; keep
     // polling instead of joining the readers immediately so that descendant
     // is still terminated at the configured deadline.
     let deadline = Instant::now() + timeout;
-    let mut status = None;
-    loop {
-        if status.is_none() {
-            status = child.try_wait()?;
+    let mut leader_exited = false;
+    let (status, interrupted, stopped_boundary) = loop {
+        if cancellation::received_signal().is_some() {
+            break (child.stop(cancellation::TERMINATE_SIGNAL)?, true, true);
         }
-        if status.is_some() && stdout_handle.is_finished() && stderr_handle.is_finished() {
-            break;
+        let output_drained = stdout_handle.is_finished() && stderr_handle.is_finished();
+        if output_drained {
+            if let Some(status) = child.wait_if_exited_and_output_drained()? {
+                break (status, false, false);
+            }
+        } else if !leader_exited {
+            leader_exited = child.exited()?;
         }
         if Instant::now() >= deadline {
             // Hook timed out. Signal the whole process group so any
             // grandchildren the hook backgrounded are reaped too —
             // otherwise they keep the inherited pipes open and the
             // reader threads hang past the timeout.
-            kill_hook_process_group(&mut child);
-            status = Some(child.wait()?);
-            break;
+            break (child.stop(cancellation::KILL_SIGNAL)?, false, true);
         }
         thread::sleep(HOOK_WAIT_POLL);
-    }
+    };
 
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
+    if stopped_boundary {
+        let drain_deadline = Instant::now() + Duration::from_millis(250);
+        while !(stdout_handle.is_finished() && stderr_handle.is_finished())
+            && Instant::now() < drain_deadline
+        {
+            thread::sleep(HOOK_WAIT_POLL);
+        }
+    }
+    let stdout = if stdout_handle.is_finished() {
+        cancellation::join_output_reader(stdout_handle, "hook stdout")
+    } else {
+        cancellation::unfinished_output_reader("hook stdout")
+    };
+    let stderr = if stderr_handle.is_finished() {
+        cancellation::join_output_reader(stderr_handle, "hook stderr")
+    } else {
+        cancellation::unfinished_output_reader("hook stderr")
+    };
+    let stdout = stdout?;
+    let stderr = stderr?;
+    if interrupted || cancellation::received_signal().is_some() {
+        return Err(io::Error::other("interrupted by signal"));
+    }
     Ok(std::process::Output {
-        status: status.expect("hook status set before reader completion"),
+        status,
         stdout,
         stderr,
     })
-}
-
-fn kill_hook_process_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        // Both isolation modes make the child a process-group leader, so its
-        // PID is also its PGID. This remains the group's stable identity even
-        // after the leader exits while a grandchild still holds a pipe open.
-        let pgid = -(child.id() as i32);
-        // SAFETY: negative PIDs target a POSIX process group created by this
-        // parent for this hook invocation.
-        unsafe {
-            libc::kill(pgid, libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
 }
 
 fn run_mutating_hook_command(
@@ -307,14 +284,14 @@ fn sudo_request_path() -> Option<PathBuf> {
     Some(request_path)
 }
 
-fn read_capped<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
+fn read_capped<R: Read>(mut reader: R, max_bytes: usize) -> io::Result<Vec<u8>> {
     let mut kept = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         let n = match reader.read(&mut chunk) {
-            Ok(0) => return kept,
+            Ok(0) => return Ok(kept),
             Ok(n) => n,
-            Err(_) => return kept,
+            Err(error) => return Err(error),
         };
         if kept.len() < max_bytes {
             // Append only up to the cap; subsequent bytes from this read
@@ -430,6 +407,9 @@ fi
 
 declare -f install >/dev/null 2>&1 || exit 13
 install "$name" || exit 14
+if declare -f shdeps_mark_changed >/dev/null 2>&1; then
+  shdeps_mark_changed "$name" || exit 15
+fi
 if declare -f version >/dev/null 2>&1; then
   version "$name" 2>/dev/null || true
 fi
@@ -537,15 +517,34 @@ pub struct BashCustomProbe {
 pub(crate) struct Txn {
     id: String,
     marker_dir: PathBuf,
+    state_dir: PathBuf,
+}
+
+/// Durable pre-mutation post-hook obligation.
+///
+/// `begin` must complete before the irreversible operation starts. Dropping an
+/// unresolved intent deliberately leaves the marker in place: interruption or
+/// an ambiguous installer failure may have committed a side effect. Only a
+/// caller that proved no change may remove a marker created by this attempt.
+pub(crate) struct MutationIntent {
+    state_dir: PathBuf,
+    name: String,
+    started: bool,
+    preexisting: bool,
 }
 
 impl Txn {
     /// Creates the marker directory used by hook subprocesses in one update.
     pub(crate) fn new(state_dir: &Path) -> Result<Self> {
+        promote_abandoned_markers(state_dir)?;
         let id = txn_id();
         let marker_dir = state_dir.join(".changed-markers").join(&id);
         std::fs::create_dir_all(&marker_dir)?;
-        Ok(Self { id, marker_dir })
+        Ok(Self {
+            id,
+            marker_dir,
+            state_dir: state_dir.to_path_buf(),
+        })
     }
 
     /// Returns the opaque ID exported as `SHDEPS_UPDATE_TXN_ID`.
@@ -553,22 +552,121 @@ impl Txn {
         &self.id
     }
 
-    /// Collects and removes changed markers written by hook subprocesses.
+    /// Prepares the exact parent directory needed by the shell-local marker.
+    pub(crate) fn prepare_marker(&self, name: &str) -> Result<()> {
+        if !config::valid_dep_name(name) {
+            return Ok(());
+        }
+        let marker = self.marker_dir.join(name);
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(())
+    }
+
+    /// Collects changed markers written by hook subprocesses.
     pub(crate) fn collect(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
         collect_markers(&self.marker_dir, &self.marker_dir, &mut names)?;
         names.sort();
         names.dedup();
+        for name in &names {
+            mark_pending_post(&self.state_dir, name)?;
+            // Promotion is deliberately ordered durable-first: a crash before
+            // this unlink leaves both copies and safely retries promotion,
+            // while a crash afterward still leaves the durable obligation.
+            // Consuming the ephemeral marker here prevents `Drop::drop` from
+            // recreating an obligation that a successful post already
+            // acknowledged later in this same update.
+            std::fs::remove_file(self.marker_dir.join(name))?;
+        }
         Ok(names)
+    }
+
+    /// Persists one post-hook obligation before cancellation can unwind.
+    pub(crate) fn mark_pending(&self, name: &str) -> Result<()> {
+        mark_pending_post(&self.state_dir, name)
+    }
+
+    /// Creates a lazy intent for one dependency mutation.
+    pub(crate) fn mutation(&self, name: &str) -> MutationIntent {
+        MutationIntent::new(&self.state_dir, name)
+    }
+
+    /// Returns all post-hook obligations retained from this or an earlier run.
+    pub(crate) fn pending(&self) -> Result<Vec<String>> {
+        pending_posts(&self.state_dir)
+    }
+
+    /// Reports whether one dependency still owes its post hook.
+    pub(crate) fn has_pending(&self, name: &str) -> Result<bool> {
+        Ok(self.pending()?.iter().any(|pending| pending == name))
+    }
+
+    /// Acknowledges one obligation after its post classification is complete.
+    pub(crate) fn acknowledge(&self, name: &str) -> Result<()> {
+        acknowledge_pending_post(&self.state_dir, name)
+    }
+}
+
+impl MutationIntent {
+    pub(crate) fn new(state_dir: &Path, name: &str) -> Self {
+        Self {
+            state_dir: state_dir.to_path_buf(),
+            name: name.to_owned(),
+            started: false,
+            preexisting: false,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Persists the post obligation before the associated side effect begins.
+    pub(crate) fn begin(&mut self) -> Result<()> {
+        if self.started {
+            return Ok(());
+        }
+        if !config::valid_dep_name(&self.name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid dependency name for mutation intent",
+            )
+            .into());
+        }
+        self.preexisting =
+            std::fs::symlink_metadata(self.state_dir.join(PENDING_POSTS_DIR).join(&self.name))
+                .is_ok();
+        mark_pending_post(&self.state_dir, &self.name)?;
+        self.started = true;
+        Ok(())
+    }
+
+    /// Resolves an attempted mutation and reports whether a post remains owed.
+    pub(crate) fn resolve(&mut self, changed: bool) -> Result<bool> {
+        if !self.started {
+            return Ok(self.preexisting);
+        }
+        let pending = self.preexisting || changed;
+        if !pending {
+            acknowledge_pending_post(&self.state_dir, &self.name)?;
+        }
+        self.started = false;
+        Ok(pending)
     }
 }
 
 impl Drop for Txn {
     fn drop(&mut self) {
-        // Keep the directory alive throughout the whole update because the
-        // prelude is intentionally tiny and may only `touch` marker files. A
-        // best-effort drop cleanup avoids state-dir clutter without letting
-        // cleanup failures affect the already-completed update result.
+        // A hook may finish its durable mutation and marker just before the
+        // parent observes cancellation. Promote every marker before deleting
+        // this ephemeral transaction so the next update still runs the owed
+        // post hook. If promotion fails, retain the transaction directory;
+        // `Txn::new` will retry it under the next state-lock owner.
+        if self.collect().is_err() {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.marker_dir);
         if let Some(parent) = self.marker_dir.parent() {
             let _ = std::fs::remove_dir(parent);
@@ -630,6 +728,36 @@ impl BashCustomProbe {
     #[must_use]
     pub fn shdeps_lib(&self) -> &Path {
         &self.shdeps_lib
+    }
+
+    /// Returns a stable digest of every file-backed input that selects custom
+    /// install code. Recovery uses it only to decide whether an interrupted
+    /// install may be retried; it never treats a matching digest as proof that
+    /// the earlier arbitrary side effect completed.
+    pub(crate) fn install_fingerprint(&self, name: &str, roots: &Roots) -> Result<Option<String>> {
+        let hook = roots.hooks_dir.join(format!("{name}.sh"));
+        let Some(hook_bytes) = read_regular_fingerprint_input(&hook)? else {
+            return Ok(None);
+        };
+        let library = if let Some(source) = self.inline_source {
+            source.as_bytes().to_vec()
+        } else {
+            let Some(bytes) = read_regular_fingerprint_input(&self.shdeps_lib)? else {
+                return Ok(None);
+            };
+            bytes
+        };
+        let mut input = Vec::with_capacity(hook_bytes.len() + library.len() + 128);
+        for bytes in [
+            hook_bytes.as_slice(),
+            library.as_slice(),
+            self.package_manager.as_deref().unwrap_or("").as_bytes(),
+            if self.quiet == Some(true) { b"1" } else { b"0" },
+        ] {
+            input.extend_from_slice(&bytes.len().to_le_bytes());
+            input.extend_from_slice(bytes);
+        }
+        Ok(Some(crate::checksum::sha256_hex(&input)))
     }
 
     /// Runs the optional `uninstall(name)` hook for prune and method cleanup.
@@ -713,6 +841,9 @@ impl BashCustomProbe {
         }
         if !self.available() {
             return Ok(Install::SourceFailed);
+        }
+        if let Some(txn) = txn {
+            txn.prepare_marker(name)?;
         }
 
         let mut command = self.command(INSTALL_SCRIPT, name, &hook);
@@ -821,6 +952,60 @@ impl BashCustomProbe {
     }
 }
 
+fn read_regular_fingerprint_input(path: &Path) -> Result<Option<Vec<u8>>> {
+    let canonical = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let expected = std::fs::metadata(&canonical)?;
+    if !expected.is_file() || expected.len() > MAX_HOOK_FINGERPRINT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "hook input is not a bounded regular file: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(&canonical)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != expected.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("hook input changed while opening: {}", path.display()),
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "hook input identity changed while opening: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_HOOK_FINGERPRINT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).ok() != Some(expected.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("hook input changed while reading: {}", path.display()),
+        )
+        .into());
+    }
+    Ok(Some(bytes))
+}
+
 fn failed_hook_detail(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     text.lines()
@@ -923,8 +1108,79 @@ fn collect_markers(root: &Path, dir: &Path, names: &mut Vec<String>) -> Result<(
         if config::valid_dep_name(&name) {
             names.push(name);
         }
-        let _ = std::fs::remove_file(&path);
     }
+    Ok(())
+}
+
+const PENDING_POSTS_DIR: &str = ".pending-posts";
+
+/// Serializes pending-post marker updates across parallel tool threads.
+///
+/// `mark` creates parent dirs while `acknowledge` removes them; without
+/// mutual exclusion the mkdir and the climbing rmdir interleave and the
+/// write fails with ENOENT. Cross-process updates serialize on the state
+/// lock, so a process-local mutex is complete (the atomic writer's ENOENT
+/// retry remains as a net for reentrant nested updates).
+static PENDING_POSTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn mark_pending_post(state_dir: &Path, name: &str) -> Result<()> {
+    if !config::valid_dep_name(name) {
+        return Ok(());
+    }
+    let _guard = PENDING_POSTS_LOCK.lock().unwrap();
+    crate::state::write_atomic(&state_dir.join(PENDING_POSTS_DIR).join(name), "pending\n")
+}
+
+fn pending_posts(state_dir: &Path) -> Result<Vec<String>> {
+    let root = state_dir.join(PENDING_POSTS_DIR);
+    let mut names = Vec::new();
+    collect_markers(&root, &root, &mut names)?;
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn acknowledge_pending_post(state_dir: &Path, name: &str) -> Result<()> {
+    if !config::valid_dep_name(name) {
+        return Ok(());
+    }
+    let _guard = PENDING_POSTS_LOCK.lock().unwrap();
+    let root = state_dir.join(PENDING_POSTS_DIR);
+    let marker = root.join(name);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let mut parent = marker.parent();
+    while let Some(directory) = parent.filter(|directory| *directory != root) {
+        if std::fs::remove_dir(directory).is_err() {
+            break;
+        }
+        parent = directory.parent();
+    }
+    let _ = std::fs::remove_dir(root);
+    Ok(())
+}
+
+fn promote_abandoned_markers(state_dir: &Path) -> Result<()> {
+    let root = state_dir.join(".changed-markers");
+    let Ok(transactions) = std::fs::read_dir(&root) else {
+        return Ok(());
+    };
+    for transaction in transactions {
+        let path = transaction?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let mut names = Vec::new();
+        collect_markers(&path, &path, &mut names)?;
+        for name in names {
+            mark_pending_post(state_dir, &name)?;
+        }
+        std::fs::remove_dir_all(path)?;
+    }
+    let _ = std::fs::remove_dir(root);
     Ok(())
 }
 
@@ -981,6 +1237,14 @@ mod tests {
     use crate::runtime::Roots;
     use crate::status::CustomProbe;
 
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected hook read failure"))
+        }
+    }
+
     #[test]
     fn read_capped_keeps_only_first_max_bytes_but_drains_to_eof() {
         // The cap is the in-memory storage limit, not a read limit. The
@@ -988,18 +1252,25 @@ mod tests {
         // not block on a full pipe buffer; only the first `max_bytes`
         // are retained for the caller.
         let payload = vec![b'a'; 64 * 1024];
-        let kept = read_capped(std::io::Cursor::new(payload.clone()), 16 * 1024);
+        let kept = read_capped(std::io::Cursor::new(payload.clone()), 16 * 1024).unwrap();
         assert_eq!(kept.len(), 16 * 1024);
         assert!(kept.iter().all(|byte| *byte == b'a'));
 
         // A reader whose total bytes fit under the cap is returned in full.
         let small = b"hello world".to_vec();
-        let kept = read_capped(std::io::Cursor::new(small.clone()), 16 * 1024);
+        let kept = read_capped(std::io::Cursor::new(small.clone()), 16 * 1024).unwrap();
         assert_eq!(kept, small);
 
         // A zero cap discards every byte but still returns Ok with empty.
-        let kept = read_capped(std::io::Cursor::new(payload), 0);
+        let kept = read_capped(std::io::Cursor::new(payload), 0).unwrap();
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn read_capped_preserves_reader_errors() {
+        let error = read_capped(FailingReader, 16).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("injected hook read failure"));
     }
 
     #[test]
@@ -1013,10 +1284,53 @@ mod tests {
         fs::write(marker_dir.join("bad name"), "").unwrap();
 
         assert_eq!(txn.collect().unwrap(), vec!["owner/tool".to_owned()]);
+        txn.acknowledge("owner/tool").unwrap();
+        assert!(
+            txn.collect().unwrap().is_empty(),
+            "a marker promoted to durable storage must not be promoted again"
+        );
+        assert!(txn.pending().unwrap().is_empty());
         assert!(marker_dir.exists());
 
         drop(txn);
         assert!(!marker_dir.exists());
+    }
+
+    #[test]
+    fn mutation_intent_is_durable_before_side_effect_and_clears_only_proven_no_change() {
+        let roots = roots();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let txn = Txn::new(&roots.state_dir).unwrap();
+        let mut intent = txn.mutation("owner/tool");
+
+        intent.begin().unwrap();
+        assert_eq!(txn.pending().unwrap(), vec!["owner/tool".to_owned()]);
+        assert!(!intent.resolve(false).unwrap());
+        assert!(txn.pending().unwrap().is_empty());
+
+        let mut committed = txn.mutation("owner/tool");
+        committed.begin().unwrap();
+        assert!(committed.resolve(true).unwrap());
+        assert_eq!(txn.pending().unwrap(), vec!["owner/tool".to_owned()]);
+    }
+
+    #[test]
+    fn invalid_pending_post_storage_fails_before_mutation_can_start() {
+        let roots = roots();
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        fs::write(
+            roots.state_dir.join(super::PENDING_POSTS_DIR),
+            "not a directory\n",
+        )
+        .unwrap();
+        let txn = Txn::new(&roots.state_dir).unwrap();
+        let mut intent = txn.mutation("owner/tool");
+        let mutated = std::cell::Cell::new(false);
+
+        let result = intent.begin().map(|()| mutated.set(true));
+
+        assert!(result.is_err());
+        assert!(!mutated.get(), "side effect ran before durable intent");
     }
 
     #[test]
@@ -1507,13 +1821,14 @@ post() {
     }
 
     fn compatibility_bash_supported() -> bool {
-        Command::new("bash")
-            .args([
-                "-c",
-                "((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3)))",
-            ])
-            .status()
+        let mut command = Command::new("bash");
+        command.args([
+            "-c",
+            "((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3)))",
+        ]);
+        crate::test_support::run_subprocess(command)
             .unwrap()
+            .status
             .success()
     }
 
@@ -1532,5 +1847,29 @@ post() {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_support::temp_dir(&format!("shdeps-{name}"))
+    }
+
+    #[test]
+    fn concurrent_pending_post_mark_and_acknowledge_never_loses_parent_dirs() {
+        use super::{acknowledge_pending_post, mark_pending_post};
+
+        let state_dir = temp_dir("pending-posts-race");
+        let mut handles = Vec::new();
+        for thread in 0..8 {
+            let dir = state_dir.clone();
+            handles.push(std::thread::spawn(move || {
+                for item in 0..200 {
+                    // Shared names empty the root often, forcing the
+                    // acknowledge-climbs-while-another-marks interleave that
+                    // parallel tools hit rarely with distinct names.
+                    let name = format!("tool-{}", (thread + item) % 2);
+                    mark_pending_post(&dir, &name).unwrap();
+                    acknowledge_pending_post(&dir, &name).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

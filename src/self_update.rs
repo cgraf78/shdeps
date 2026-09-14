@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::Result;
+use crate::cancellation;
 use crate::github::{self, Release};
 use crate::http::Client;
 use crate::install_metadata::{self, Metadata, Method, Read};
@@ -300,6 +301,7 @@ pub fn select_archive(
 
 /// Runs the source-checkout portion of `shdeps self-update`.
 pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
+    cancellation::check()?;
     if !dir.join(".git").is_dir() {
         return Ok(Summary {
             dir: dir.to_path_buf(),
@@ -319,6 +321,7 @@ pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
         ],
         None,
     )?;
+    cancellation::check()?;
     if !status.stdout.is_empty() {
         return Ok(Summary {
             dir: dir.to_path_buf(),
@@ -338,6 +341,7 @@ pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
         ],
         None,
     )?;
+    cancellation::check()?;
 
     if pull.success && !ensure_source_binary_current(dir, runner)? {
         return Ok(Summary {
@@ -363,6 +367,7 @@ pub fn source_checkout(dir: &Path, runner: &impl Runner) -> Result<Summary> {
 }
 
 fn ensure_source_binary_current(dir: &Path, runner: &impl Runner) -> Result<bool> {
+    cancellation::check()?;
     if !dir.join("Cargo.toml").is_file() {
         return Ok(true);
     }
@@ -377,6 +382,7 @@ fn ensure_source_binary_current(dir: &Path, runner: &impl Runner) -> Result<bool
         ("target/debug/shdeps", Some("target/debug/shdeps")),
     ] {
         if binary_matches_head(&dir.join(relative), &head, runner)? {
+            cancellation::check()?;
             if let Some(link_target) = link_target {
                 link_checkout_binary(dir, link_target)?;
             }
@@ -407,6 +413,7 @@ fn ensure_source_binary_current(dir: &Path, runner: &impl Runner) -> Result<bool
         ],
         None,
     )?;
+    cancellation::check()?;
     if !build.success {
         return Ok(false);
     }
@@ -415,6 +422,7 @@ fn ensure_source_binary_current(dir: &Path, runner: &impl Runner) -> Result<bool
         return Ok(false);
     }
 
+    cancellation::check()?;
     link_checkout_binary(dir, "target/release/shdeps")?;
     Ok(true)
 }
@@ -431,6 +439,7 @@ fn checkout_head(dir: &Path, runner: &impl Runner) -> Result<Option<String>> {
         ],
         None,
     )?;
+    cancellation::check()?;
     if !output.success {
         return Ok(None);
     }
@@ -453,6 +462,7 @@ fn binary_matches_head(binary: &Path, head: &str, runner: &impl Runner) -> Resul
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
+    cancellation::check()?;
 
     Ok(output.success && output.stdout.contains(head))
 }
@@ -482,6 +492,9 @@ pub fn release_archive(
     runner: &impl Runner,
     client: &impl Client,
 ) -> std::result::Result<ReleaseArchiveSummary, ReleaseArchiveFailure> {
+    cancellation::check()
+        .map_err(crate::Error::from)
+        .map_err(ReleaseArchiveFailure::Fetch)?;
     let repo = metadata
         .repo
         .as_deref()
@@ -490,6 +503,9 @@ pub fn release_archive(
     let token = github::token(env, runner);
     let releases_json = client
         .get(&github::releases_url(repo), token.as_deref())
+        .map_err(crate::Error::from)
+        .map_err(ReleaseArchiveFailure::Fetch)?;
+    cancellation::check()
         .map_err(crate::Error::from)
         .map_err(ReleaseArchiveFailure::Fetch)?;
     let releases = github::parse_releases(&String::from_utf8_lossy(&releases_json))
@@ -570,6 +586,16 @@ pub fn release_archive(
         .unwrap_or_else(std::env::temp_dir);
     let staged = release_stage::stage(&pair, &release.tag, &stage_parent, token.as_deref(), client)
         .map_err(ReleaseArchiveFailure::Stage)?;
+    if let Err(interrupted) = cancellation::check() {
+        let error = match fs::remove_dir_all(&staged.dir) {
+            Ok(()) => crate::Error::from(interrupted),
+            Err(cleanup) => std::io::Error::other(format!(
+                "{interrupted}; removing cancelled release staging directory also failed: {cleanup}"
+            ))
+            .into(),
+        };
+        return Err(ReleaseArchiveFailure::Fetch(error));
+    }
     let mut next_metadata = metadata.clone();
     next_metadata.method = Method::Release;
     next_metadata.version = Some(release.tag.clone());

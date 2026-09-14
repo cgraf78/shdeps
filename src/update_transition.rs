@@ -7,10 +7,10 @@
 //! learning a partial version of the same migration rules.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,9 +32,13 @@ static PUBLIC_TRANSITION_NONCE: AtomicU64 = AtomicU64::new(0);
 const PUBLIC_TRANSITION_FORMAT: &str = "shdeps public command transition v1";
 #[cfg(unix)]
 const MAX_PUBLIC_TRANSITION_RECORD_BYTES: u64 = 64 * 1024;
+const DURABLE_TRANSITION_DIR: &str = ".method-transitions-v1";
+const DURABLE_TRANSITION_FORMAT: &str = "shdeps method transition v1";
+const MAX_DURABLE_TRANSITION_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Pre-install snapshot for a configured method transition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Transition {
     old: ManifestEntry,
     bin_links: Vec<PathBuf>,
@@ -65,12 +69,1034 @@ enum PublicPublication {
     Pending(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileIdentity {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum DurableTransitionPhase {
+    Prepared,
+    Installing,
+    Installed,
+    ManifestCommitted,
+}
+
+/// Exact package-installer identity bound to a `pkg` method journal.
+///
+/// Raw `aliases` re-resolve against the current manager and runtime, so an
+/// interrupted install must record the normalized operation it started.
+/// Retrying under a different manager, Android selector, or resolved package
+/// would query, install, or verify a different package: the retry fails
+/// closed instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PkgInstallerIdentity {
+    manager: String,
+    android: bool,
+    package: String,
+}
+
+impl PkgInstallerIdentity {
+    /// Resolves the installer identity for a `pkg` target under the live environment.
+    pub(crate) fn for_target(name: &str, aliases: &str, manager: &str, android: bool) -> Self {
+        Self {
+            manager: manager.to_owned(),
+            android,
+            package: config::resolve_override_for_runtime(name, aliases, Some(manager), android),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableTransitionRecord {
+    format: String,
+    manifest: PathBuf,
+    prepared_manifest: PathBuf,
+    target_method: String,
+    target_cmd: String,
+    target_cmd_explicit: bool,
+    target_aliases: String,
+    target_filter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_pkg: Option<PkgInstallerIdentity>,
+    phase: DurableTransitionPhase,
+    transition: Transition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    new: Option<ManifestEntry>,
+}
+
+/// Durable ownership handoff retained until publication and old cleanup finish.
+#[derive(Debug)]
+pub(crate) struct DurableTransition {
+    path: PathBuf,
+    record: DurableTransitionRecord,
+}
+
+/// One committed handoff which startup recovery must finish under any old
+/// repository lock before ordinary method resolution resumes.
+#[derive(Debug)]
+pub(crate) struct PendingCleanup {
+    durable: DurableTransition,
+}
+
+impl PendingCleanup {
+    /// Returns the old ownership row whose cleanup lock must be held.
+    pub(crate) fn old(&self) -> &ManifestEntry {
+        &self.durable.record.transition.old
+    }
+
+    /// Returns the configured shape of the committed replacement.
+    pub(crate) fn entry(&self) -> Entry {
+        entry_from_record(&self.durable.record)
+    }
+
+    /// Finishes exact-evidence cleanup and retires the durable handoff.
+    pub(crate) fn finish(
+        self,
+        roots: &Roots,
+        locked_repo_root: Option<&Path>,
+    ) -> Result<Option<String>> {
+        let entry = self.entry();
+        if let Err(error) = cleanup_snapshot(
+            &entry,
+            &self.durable.record.transition,
+            roots,
+            locked_repo_root,
+        ) {
+            return Ok(Some(error.to_string()));
+        }
+        match self.durable.finish(roots) {
+            Ok(()) => Ok(None),
+            Err(error) => Ok(Some(format!(
+                "old provider cleanup completed, but retiring its transition record failed: {error}"
+            ))),
+        }
+    }
+}
+
+fn entry_from_record(record: &DurableTransitionRecord) -> Entry {
+    Entry {
+        name: record.transition.old.name.clone(),
+        method: record.target_method.clone(),
+        cmd: record.target_cmd.clone(),
+        cmd_explicit: record.target_cmd_explicit,
+        aliases: record.target_aliases.clone(),
+        filter: record.target_filter.clone(),
+    }
+}
+
+/// Builds the fail-closed error for a package retry under another installer.
+///
+/// The journal records the exact operation the interrupted install started.
+/// Re-resolving the raw aliases under a different manager, Android selector,
+/// or resolved package would operate on a different package, so the retry is
+/// refused before any package query. A legacy journal without installer
+/// binding is refused the same way: verify the package state with the
+/// original manager, remove the stale transition record, and retry.
+fn pkg_identity_error(
+    name: &str,
+    stored: Option<&PkgInstallerIdentity>,
+    current: &PkgInstallerIdentity,
+) -> crate::Error {
+    match stored {
+        Some(stored) => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "package installer identity for {name} changed since the interrupted install (was {}/{}{}, now {}/{}{}); retry with the original installer",
+                stored.manager,
+                stored.package,
+                if stored.android { " android" } else { "" },
+                current.manager,
+                current.package,
+                if current.android { " android" } else { "" },
+            ),
+        )
+        .into(),
+        None => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "package installer journal for {name} predates installer binding and cannot be resumed safely; verify the package state with the original manager, remove the stale transition record, then retry",
+            ),
+        )
+        .into(),
+    }
+}
+
+impl DurableTransition {
+    /// Returns the private manifest on which an installer may stage ownership.
+    pub(crate) fn manifest_path(&self) -> &Path {
+        &self.record.prepared_manifest
+    }
+
+    /// Persists the ambiguity boundary immediately before an installer may
+    /// perform an irreversible side effect.
+    pub(crate) fn mark_installing(&mut self, roots: &Roots) -> Result<()> {
+        if self.record.target_method == method::CUSTOM && self.record.target_fingerprint.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "custom method transition has no stable installer fingerprint",
+            )
+            .into());
+        }
+        if self.record.phase == DurableTransitionPhase::Prepared {
+            self.record.phase = DurableTransitionPhase::Installing;
+            write_durable_transition(&self.path, &self.record, roots, true)?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether this invocation is retrying an ambiguous installer.
+    pub(crate) fn is_retry(&self) -> bool {
+        self.record.phase == DurableTransitionPhase::Installing
+    }
+
+    /// Captures the exact staged ownership row after the installer succeeds.
+    pub(crate) fn mark_installed(&mut self, entry: &Entry, roots: &Roots) -> Result<()> {
+        let new = installed_entry(&self.record.prepared_manifest, entry)?;
+        self.record.new = Some(new);
+        self.record.phase = DurableTransitionPhase::Installed;
+        write_durable_transition(&self.path, &self.record, roots, true)
+    }
+
+    /// Atomically publishes the recorded ownership row and completes any
+    /// public-command exchange.  The journal deliberately remains until old
+    /// ownership cleanup is acknowledged.
+    pub(crate) fn commit(
+        &mut self,
+        entry: &Entry,
+        roots: &Roots,
+        manifest_path: &Path,
+    ) -> Result<Option<String>> {
+        let publication = self.commit_with(entry, roots, manifest_path, manifest::upsert)?;
+        finish_publication(publication, manifest_path, roots)
+    }
+
+    /// Publishes the exact recorded row, preserving recovery evidence until
+    /// old ownership has been retired.
+    fn commit_with(
+        &mut self,
+        entry: &Entry,
+        roots: &Roots,
+        manifest_path: &Path,
+        commit_manifest: impl FnOnce(&Path, ManifestEntry) -> Result<()>,
+    ) -> Result<PublicPublication> {
+        let new = self.record.new.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "method transition has no installed ownership row",
+            )
+        })?;
+        if installed_entry(&self.record.prepared_manifest, entry)? != new {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "prepared method-transition manifest changed before publication",
+            )
+            .into());
+        }
+        crate::hooks::mark_pending_post(&roots.state_dir, &entry.name)?;
+        crate::cancellation::check()?;
+        let publication = publish_replacement_public_bin(
+            entry,
+            Some(&self.record.transition),
+            roots,
+            manifest_path,
+            &self.record.prepared_manifest,
+        )?;
+        if let Err(error) = commit_manifest(manifest_path, new) {
+            #[cfg(unix)]
+            if let PublicPublication::Pending(public) = &publication {
+                if let Err(recovery) = recover_public_transition(manifest_path, public, roots) {
+                    return Err(std::io::Error::other(format!(
+                        "manifest commit failed ({error}); public command recovery also failed ({recovery})"
+                    ))
+                    .into());
+                }
+            }
+            return Err(error);
+        }
+        if let Some(parent) = manifest_path.parent() {
+            sync_directory(parent)?;
+        }
+        self.record.phase = DurableTransitionPhase::ManifestCommitted;
+        write_durable_transition(&self.path, &self.record, roots, true)?;
+        Ok(publication)
+    }
+
+    /// Removes a prepared handoff that provably never entered an installer.
+    pub(crate) fn abandon(self, roots: &Roots) -> Result<()> {
+        if self.record.phase != DurableTransitionPhase::Prepared {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot abandon a method transition after installation began",
+            )
+            .into());
+        }
+        self.finish(roots)
+    }
+
+    /// Retires the prepared manifest and journal after cleanup is acknowledged.
+    pub(crate) fn finish(self, roots: &Roots) -> Result<()> {
+        remove_durable_transition(&self.path, &self.record, roots)
+    }
+}
+
+fn durable_transition_dir(roots: &Roots) -> PathBuf {
+    roots.state_dir.join(DURABLE_TRANSITION_DIR)
+}
+
+/// Reports whether method-transition state exists without validating it.
+///
+/// Prune uses this pre-lock probe to decide whether an otherwise orphan-free
+/// run must still take the state lock and retry post-swap cleanup.  Strict
+/// validation happens under the lock inside [`recover_pending_transitions`],
+/// so malformed state fails closed there rather than here.
+pub(crate) fn has_pending_durable_transitions(roots: &Roots) -> bool {
+    match fs::read_dir(durable_transition_dir(roots)) {
+        Ok(entries) => entries.filter_map(|entry| entry.ok()).next().is_some(),
+        Err(_) => false,
+    }
+}
+
+fn durable_transition_stem(name: &str) -> String {
+    crate::checksum::sha256_hex(name.as_bytes())
+}
+
+fn durable_transition_path(roots: &Roots, name: &str) -> PathBuf {
+    durable_transition_dir(roots).join(format!("{}.json", durable_transition_stem(name)))
+}
+
+fn durable_prepared_manifest_path(roots: &Roots, name: &str) -> PathBuf {
+    durable_transition_dir(roots).join(format!("{}.manifest", durable_transition_stem(name)))
+}
+
+fn cleanup_roots(roots: &Roots) -> cleanup::Roots {
+    cleanup::Roots {
+        state_dir: roots.state_dir.clone(),
+        install_dir: roots.install_dir.clone(),
+        bin_dir: roots.bin_dir.clone(),
+    }
+}
+
+fn ensure_durable_transition_dir(roots: &Roots) -> Result<PathBuf> {
+    fs::create_dir_all(&roots.state_dir)?;
+    let path = durable_transition_dir(roots);
+    let mut builder = DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    match builder.create(&path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+            sync_directory(&roots.state_dir)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate_private_transition_dir(&path)?;
+    Ok(path)
+}
+
+fn validate_private_transition_dir(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "method transition state is not a private directory: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "method transition state has unsafe ownership or mode: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_private_transition_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "method transition state is not a regular file: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "method transition state has unsafe ownership, mode, or links: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn write_private_durable(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "method transition state has no parent directory",
+        )
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "method transition state has no UTF-8 basename",
+            )
+        })?;
+    let (temp, mut file) = loop {
+        let nonce = MANIFEST_STAGE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".{name}.tmp.{}.{}", std::process::id(), nonce));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    #[cfg(unix)]
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
+    let result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        if replace {
+            fs::rename(&temp, path)?;
+        } else {
+            crate::repo_transition::rename_noreplace(&temp, path)?;
+        }
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn write_durable_transition(
+    path: &Path,
+    record: &DurableTransitionRecord,
+    roots: &Roots,
+    replace: bool,
+) -> Result<()> {
+    validate_durable_transition(path, record, roots)?;
+    let mut encoded = serde_json::to_vec_pretty(record)?;
+    encoded.push(b'\n');
+    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_DURABLE_TRANSITION_RECORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "method transition record exceeds the supported size",
+        )
+        .into());
+    }
+    write_private_durable(path, &encoded, replace)
+}
+
+fn read_durable_transition(path: &Path, roots: &Roots) -> Result<DurableTransitionRecord> {
+    validate_private_transition_file(path)?;
+    let bytes = crate::state::read_private_bounded(path, MAX_DURABLE_TRANSITION_RECORD_BYTES)?;
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "method transition record contains a NUL byte",
+        )
+        .into());
+    }
+    let record: DurableTransitionRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed method transition record: {error}"),
+        )
+    })?;
+    validate_durable_transition(path, &record, roots)?;
+    Ok(record)
+}
+
+fn validate_durable_transition(
+    path: &Path,
+    record: &DurableTransitionRecord,
+    roots: &Roots,
+) -> Result<()> {
+    let old = &record.transition.old;
+    let expected_path = durable_transition_path(roots, &old.name);
+    let expected_prepared = durable_prepared_manifest_path(roots, &old.name);
+    let valid_phase = match record.phase {
+        DurableTransitionPhase::Prepared | DurableTransitionPhase::Installing => {
+            record.new.is_none()
+        }
+        DurableTransitionPhase::Installed | DurableTransitionPhase::ManifestCommitted => {
+            record.new.is_some()
+        }
+    };
+    let valid_new = record.new.as_ref().is_none_or(|new| {
+        new.name == old.name
+            && new.method == record.target_method
+            && new.cmd == record.target_cmd
+            && cleanup::validate_manifest_artifact_entry(new).is_ok()
+    });
+    let valid_fingerprint = match record.target_method.as_str() {
+        method::CUSTOM => record.target_fingerprint.as_deref().is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }),
+        _ => record.target_fingerprint.is_none(),
+    };
+    // Installer binding is written only for `pkg` targets. A binding on any
+    // other method is corrupt; a missing binding on a `pkg` target is a legacy
+    // record that resume and retry refuse (retirement paths still accept it so
+    // a prepared legacy handoff cannot wedge recovery).
+    let valid_pkg_binding = record.target_method == method::PKG || record.target_pkg.is_none();
+    if record.format != DURABLE_TRANSITION_FORMAT
+        || !config::valid_dep_name(&old.name)
+        || !config::valid_cmd_basename(&old.cmd)
+        || !config::valid_cmd_basename(&record.target_cmd)
+        || record.target_method.is_empty()
+        || record.target_method == old.method
+        || record.manifest != manifest::path(&roots.state_dir)
+        || record.prepared_manifest != expected_prepared
+        || path != expected_path
+        || !valid_phase
+        || !valid_new
+        || !valid_fingerprint
+        || !valid_pkg_binding
+        || record
+            .transition
+            .bin_links
+            .iter()
+            .chain(&record.transition.extra_links)
+            .any(|path| !path.is_absolute() || path.to_string_lossy().contains(['\n', '\r']))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("method transition record does not belong to {}", old.name),
+        )
+        .into());
+    }
+    record
+        .transition
+        .cleanup_evidence
+        .validate_for(old, &cleanup_roots(roots))?;
+    Ok(())
+}
+
+fn write_prepared_manifest(path: &Path, old: &ManifestEntry, replace: bool) -> Result<()> {
+    let content = format!("{}\n", old.line());
+    write_private_durable(path, content.as_bytes(), replace)
+}
+
+pub(crate) fn begin_durable_transition(
+    entry: &Entry,
+    transition: Option<&Transition>,
+    roots: &Roots,
+    manifest_path: &Path,
+    pkg_identity: Option<PkgInstallerIdentity>,
+) -> Result<Option<DurableTransition>> {
+    begin_durable_transition_with_fingerprint(
+        entry,
+        transition,
+        roots,
+        manifest_path,
+        None,
+        pkg_identity,
+    )
+}
+
+/// Starts or resumes a custom transition bound to the exact hook inputs.
+pub(crate) fn begin_custom_durable_transition(
+    entry: &Entry,
+    transition: Option<&Transition>,
+    roots: &Roots,
+    manifest_path: &Path,
+    fingerprint: Option<&str>,
+) -> Result<Option<DurableTransition>> {
+    begin_durable_transition_with_fingerprint(
+        entry,
+        transition,
+        roots,
+        manifest_path,
+        fingerprint,
+        None,
+    )
+}
+
+fn begin_durable_transition_with_fingerprint(
+    entry: &Entry,
+    transition: Option<&Transition>,
+    roots: &Roots,
+    manifest_path: &Path,
+    fingerprint: Option<&str>,
+    pkg_identity: Option<PkgInstallerIdentity>,
+) -> Result<Option<DurableTransition>> {
+    let Some(transition) = transition else {
+        return Ok(None);
+    };
+    if (entry.method == method::PKG) != pkg_identity.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "package installer identity is required exactly for pkg transitions: {}",
+                entry.name
+            ),
+        )
+        .into());
+    }
+    if transition.old.method == method::GITHUB_RELEASE
+        && transition.old.cmd == entry.cmd
+        && method::is_symlink_install_root(&entry.method)
+        && transition.archive_state == ArchiveState::Ambiguous
+    {
+        return Err(std::io::Error::other(format!(
+            "refusing to replace ambiguous legacy release command: {}",
+            roots.bin_dir.join(&entry.cmd).display()
+        ))
+        .into());
+    }
+    if manifest_path != manifest::path(&roots.state_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "method transition manifest is outside the configured state root",
+        )
+        .into());
+    }
+    let directory = ensure_durable_transition_dir(roots)?;
+    let path = durable_transition_path(roots, &entry.name);
+    let prepared_manifest = durable_prepared_manifest_path(roots, &entry.name);
+    let existing = match fs::symlink_metadata(&path) {
+        Ok(_) => Some(read_durable_transition(&path, roots)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let record = if let Some(record) = existing {
+        if entry.method == method::PKG {
+            let current = pkg_identity
+                .as_ref()
+                .expect("pkg transitions carry installer identity");
+            if record.target_pkg.as_ref() != Some(current) {
+                return Err(pkg_identity_error(
+                    &entry.name,
+                    record.target_pkg.as_ref(),
+                    current,
+                ));
+            }
+        }
+        let live = manifest::read(manifest_path)?;
+        if record.transition != *transition
+            || record.target_method != entry.method
+            || record.target_cmd != entry.cmd
+            || record.target_cmd_explicit != entry.cmd_explicit
+            || record.target_aliases != entry.aliases
+            || record.target_filter != entry.filter
+            || record.target_fingerprint.as_deref() != fingerprint
+            || live.get(&entry.name) != Some(&record.transition.old)
+            || !matches!(
+                record.phase,
+                DurableTransitionPhase::Prepared | DurableTransitionPhase::Installing
+            )
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "existing method transition for {} cannot be resumed",
+                    entry.name
+                ),
+            )
+            .into());
+        }
+        write_prepared_manifest(&prepared_manifest, &transition.old, true)?;
+        record
+    } else {
+        if fs::symlink_metadata(&prepared_manifest).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "unindexed prepared method-transition manifest exists: {}",
+                    prepared_manifest.display()
+                ),
+            )
+            .into());
+        }
+        let record = DurableTransitionRecord {
+            format: DURABLE_TRANSITION_FORMAT.to_owned(),
+            manifest: manifest_path.to_path_buf(),
+            prepared_manifest: prepared_manifest.clone(),
+            target_method: entry.method.clone(),
+            target_cmd: entry.cmd.clone(),
+            target_cmd_explicit: entry.cmd_explicit,
+            target_aliases: entry.aliases.clone(),
+            target_filter: entry.filter.clone(),
+            target_fingerprint: fingerprint.map(str::to_owned),
+            target_pkg: pkg_identity,
+            phase: DurableTransitionPhase::Prepared,
+            transition: transition.clone(),
+            new: None,
+        };
+        write_durable_transition(&path, &record, roots, false)?;
+        write_prepared_manifest(&prepared_manifest, &transition.old, false)?;
+        record
+    };
+    sync_directory(&directory)?;
+    Ok(Some(DurableTransition { path, record }))
+}
+
+fn remove_durable_transition(
+    path: &Path,
+    record: &DurableTransitionRecord,
+    roots: &Roots,
+) -> Result<()> {
+    validate_durable_transition(path, record, roots)?;
+    match fs::symlink_metadata(&record.prepared_manifest) {
+        Ok(_) => {
+            validate_private_transition_file(&record.prepared_manifest)?;
+            fs::remove_file(&record.prepared_manifest)?;
+            sync_directory(
+                record
+                    .prepared_manifest
+                    .parent()
+                    .expect("validated prepared manifest has a parent"),
+            )?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::remove_file(path) {
+        Ok(()) => sync_directory(
+            path.parent()
+                .expect("validated method transition has a parent"),
+        )?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let directory = durable_transition_dir(roots);
+    if fs::read_dir(&directory)?.next().is_none() {
+        fs::remove_dir(&directory)?;
+        sync_directory(&roots.state_dir)?;
+    }
+    Ok(())
+}
+
+fn durable_transitions(roots: &Roots) -> Result<Vec<DurableTransition>> {
+    let directory = durable_transition_dir(roots);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    validate_private_transition_dir(&directory)?;
+    let mut records = Vec::new();
+    let mut prepared = BTreeSet::new();
+    let mut removed_temp = false;
+    for path in entries {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("json") => {
+                records.push(DurableTransition {
+                    record: read_durable_transition(&path, roots)?,
+                    path,
+                });
+            }
+            Some("manifest") => {
+                validate_private_transition_file(&path)?;
+                prepared.insert(path);
+            }
+            _ if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_durable_transition_temp_name) =>
+            {
+                validate_private_transition_file(&path)?;
+                if fs::metadata(&path)?.len() > MAX_DURABLE_TRANSITION_RECORD_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "oversized method transition staging file: {}",
+                            path.display()
+                        ),
+                    )
+                    .into());
+                }
+                fs::remove_file(&path)?;
+                removed_temp = true;
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected entry in method transition state: {}",
+                        path.display()
+                    ),
+                )
+                .into());
+            }
+        }
+    }
+    if removed_temp {
+        sync_directory(&directory)?;
+    }
+    for durable in &records {
+        prepared.remove(&durable.record.prepared_manifest);
+    }
+    if let Some(path) = prepared.into_iter().next() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "unindexed prepared method-transition manifest exists: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    records.sort_by(|left, right| {
+        left.record
+            .transition
+            .old
+            .name
+            .cmp(&right.record.transition.old.name)
+    });
+    Ok(records)
+}
+
+fn is_durable_transition_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((digest, suffix)) = rest.split_once('.') else {
+        return false;
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let suffix = suffix
+        .strip_prefix("json.tmp.")
+        .or_else(|| suffix.strip_prefix("manifest.tmp."));
+    let Some((pid, nonce)) = suffix.and_then(|suffix| suffix.split_once('.')) else {
+        return false;
+    };
+    !pid.is_empty()
+        && !nonce.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && nonce.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn configured_target_matches(
+    record: &DurableTransitionRecord,
+    entries: &[Entry],
+    custom_fingerprints: &HashMap<String, Option<String>>,
+) -> bool {
+    let entry_matches = entries
+        .iter()
+        .any(|entry| entry_matches_target(record, entry));
+    entry_matches
+        && (record.target_method != method::CUSTOM
+            || record.target_fingerprint.is_some()
+                && custom_fingerprints
+                    .get(&record.transition.old.name)
+                    .is_some_and(|fingerprint| {
+                        fingerprint.as_ref() == record.target_fingerprint.as_ref()
+                    }))
+}
+
+fn entry_matches_target(record: &DurableTransitionRecord, entry: &Entry) -> bool {
+    entry.name == record.transition.old.name
+        && entry.method == record.target_method
+        && entry.cmd == record.target_cmd
+        && entry.cmd_explicit == record.target_cmd_explicit
+        && entry.aliases == record.target_aliases
+        && entry.filter == record.target_filter
+}
+
+/// Recovers committed ownership before current configuration can hide it.
+///
+/// Returned records require caller-coordinated old-repository locking before
+/// exact-evidence cleanup.  An `Installing` record is deliberately never
+/// inferred successful from current files: only the same configured target may
+/// retry its installer, while a removed or changed target fails closed.
+///
+/// `pkg` carries the live installer identity (manager, Android selector) for
+/// resume-capable callers: a `pkg` retry additionally requires the exact
+/// normalized identity (manager, Android selector, resolved package) so an
+/// interrupted apt install can never resume under brew, and a legacy journal
+/// without that binding fails closed.  Commit-only callers (prune) pass `None`
+/// and defer `Installing` records untouched: they never re-resolve aliases or
+/// run installers, so no identity check is needed to leave those journals for
+/// a same-installer update.
+pub(crate) fn recover_pending_transitions(
+    entries: &[Entry],
+    custom_fingerprints: &HashMap<String, Option<String>>,
+    manifest_path: &Path,
+    roots: &Roots,
+    pkg: Option<(&str, bool)>,
+) -> Result<Vec<PendingCleanup>> {
+    let mut pending = Vec::new();
+    for mut durable in durable_transitions(roots)? {
+        let live = manifest::read(manifest_path)?;
+        let old = &durable.record.transition.old;
+        let current = live.get(&old.name);
+        let is_old = current == Some(old);
+        let is_new = durable
+            .record
+            .new
+            .as_ref()
+            .is_some_and(|new| current == Some(new));
+
+        if is_old && durable.record.phase == DurableTransitionPhase::Prepared {
+            durable.finish(roots)?;
+            continue;
+        }
+        if is_old && durable.record.phase == DurableTransitionPhase::Installing {
+            if !configured_target_matches(&durable.record, entries, custom_fingerprints) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "ambiguous interrupted method transition for {} no longer matches configuration; restore the matching config entry and retry, or verify installed state, remove the stale transition record at {} and retry",
+                        old.name,
+                        durable.path.display()
+                    ),
+                )
+                .into());
+            }
+            if durable.record.target_method == method::PKG {
+                if let Some((pkg_manager, android)) = pkg {
+                    let current = PkgInstallerIdentity::for_target(
+                        &old.name,
+                        &durable.record.target_aliases,
+                        pkg_manager,
+                        android,
+                    );
+                    if durable.record.target_pkg.as_ref() != Some(&current) {
+                        return Err(pkg_identity_error(
+                            &old.name,
+                            durable.record.target_pkg.as_ref(),
+                            &current,
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if is_old && durable.record.phase == DurableTransitionPhase::Installed {
+            let entry = entry_from_record(&durable.record);
+            let expected = durable
+                .record
+                .new
+                .as_ref()
+                .expect("installed phase has new row");
+            if installed_entry(&durable.record.prepared_manifest, &entry)? != *expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "prepared method-transition manifest changed before recovery for {}",
+                        entry.name
+                    ),
+                )
+                .into());
+            }
+            crate::hooks::mark_pending_post(&roots.state_dir, &entry.name)?;
+            crate::cancellation::check()?;
+            let publication = publish_replacement_public_bin(
+                &entry,
+                Some(&durable.record.transition),
+                roots,
+                manifest_path,
+                &durable.record.prepared_manifest,
+            )?;
+            let new = durable
+                .record
+                .new
+                .clone()
+                .expect("installed phase has new row");
+            // Unlike commit_with, recovery does not eagerly roll back the
+            // Pending publication when the manifest upsert fails: the public
+            // journal is durable, so the next run re-reads it and converges.
+            // Eager rollback here would discard evidence a retry needs.
+            manifest::upsert(manifest_path, new)?;
+            durable.record.phase = DurableTransitionPhase::ManifestCommitted;
+            write_durable_transition(&durable.path, &durable.record, roots, true)?;
+            finish_publication(publication, manifest_path, roots)?;
+            pending.push(PendingCleanup { durable });
+            continue;
+        }
+
+        if is_new {
+            crate::hooks::mark_pending_post(&roots.state_dir, &old.name)?;
+            if durable.record.phase != DurableTransitionPhase::ManifestCommitted {
+                durable.record.phase = DurableTransitionPhase::ManifestCommitted;
+                write_durable_transition(&durable.path, &durable.record, roots, true)?;
+            }
+            recover_pending_publications(entries, &live, manifest_path, roots)?;
+            pending.push(PendingCleanup { durable });
+            continue;
+        }
+
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "method transition cannot classify manifest ownership for {}",
+                old.name
+            ),
+        )
+        .into());
+    }
+    Ok(pending)
+}
+
+fn finish_publication(
+    publication: PublicPublication,
+    manifest_path: &Path,
+    roots: &Roots,
+) -> Result<Option<String>> {
+    match publication {
+        PublicPublication::None => Ok(None),
+        PublicPublication::Warning(warning) => Ok(Some(warning)),
+        #[cfg(unix)]
+        PublicPublication::Pending(public) => {
+            recover_public_transition(manifest_path, &public, roots)?;
+            Ok(None)
+        }
+    }
 }
 
 /// Rejects an implicit dependency rename that reuses an installed command.
@@ -168,12 +1194,39 @@ pub(crate) fn by_name(
     entries: &[Entry],
     roots: &Roots,
 ) -> Result<HashMap<String, Transition>> {
+    let mut durable = durable_transitions(roots)?
+        .into_iter()
+        .map(|pending| (pending.record.transition.old.name.clone(), pending.record))
+        .collect::<HashMap<_, _>>();
     cleanup::method_transitions(manifest, entries)
         .into_iter()
         .map(|entry| {
             // A saved row is human-editable state. Validate it before its name
             // or command participates in link-state and public-bin paths.
             cleanup::validate_manifest_artifact_entry(&entry)?;
+            if let Some(record) = durable.remove(&entry.name) {
+                let target = entries
+                    .iter()
+                    .find(|candidate| candidate.name == entry.name);
+                if record.transition.old != entry
+                    || !matches!(
+                        record.phase,
+                        DurableTransitionPhase::Prepared | DurableTransitionPhase::Installing
+                    )
+                    || target.is_none_or(|target| !entry_matches_target(&record, target))
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "pending method transition for {} does not match live ownership",
+                            entry.name
+                        ),
+                    )
+                    .into());
+                }
+                return Ok((entry.name.clone(), record.transition));
+            }
+
             let bin_state = link_state::path(&roots.state_dir, &entry.name, Kind::Bin);
             // A method change may be the first operation after a killed repo
             // relink. Recover prepublication command ownership before taking
@@ -202,6 +1255,14 @@ pub(crate) fn by_name(
                 None
             };
             let cleanup_evidence = cleanup::capture_evidence(
+                &entry,
+                &cleanup::Roots {
+                    state_dir: roots.state_dir.clone(),
+                    install_dir: roots.install_dir.clone(),
+                    bin_dir: roots.bin_dir.clone(),
+                },
+            )?;
+            cleanup_evidence.validate_for(
                 &entry,
                 &cleanup::Roots {
                     state_dir: roots.state_dir.clone(),
@@ -527,6 +1588,9 @@ fn remove_public_transition_journal(journal: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    if let Some(parent) = journal.parent() {
+        sync_directory(parent)?;
+    }
     Ok(())
 }
 
@@ -606,6 +1670,9 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
             )
             .into());
         }
+        if let Some(parent) = public.parent() {
+            sync_directory(parent)?;
+        }
         remove_public_transition_journal(&journal)?;
         return Ok(());
     }
@@ -648,6 +1715,9 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
     } else if swap_is_new {
         remove_recorded_transition_symlink(&swap, &record.source)?;
     }
+    if let Some(parent) = public.parent() {
+        sync_directory(parent)?;
+    }
     remove_public_transition_journal(&journal)?;
     Ok(())
 }
@@ -689,7 +1759,8 @@ fn write_public_transition_record(journal: &Path, record: &PublicTransitionRecor
             let _ = fs::remove_file(&temp);
             return Err(error.into());
         }
-        let publish = crate::repo_transition::rename_noreplace(&temp, journal);
+        let publish = crate::repo_transition::rename_noreplace(&temp, journal)
+            .and_then(|()| File::open(parent)?.sync_all());
         let _ = fs::remove_file(&temp);
         return publish.map_err(Into::into);
     }
@@ -733,12 +1804,12 @@ fn begin_public_transition(
             std::process::id(),
             nonce
         ));
-        match std::os::unix::fs::symlink(&source, &candidate) {
-            Ok(()) => {
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 swap = Some(candidate);
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Ok(_) => continue,
             Err(error) => return Err(error.into()),
         }
     }
@@ -753,10 +1824,21 @@ fn begin_public_transition(
         new,
         expected,
     };
-    if let Err(error) = write_public_transition_record(&journal, &record) {
-        let _ = remove_recorded_transition_symlink(&swap, &source);
-        return Err(error);
+    write_public_transition_record(&journal, &record)?;
+    if let Err(error) = std::os::unix::fs::symlink(&source, &swap) {
+        return match recover_public_transition(manifest_path, &public, roots) {
+            Ok(()) => Err(error.into()),
+            Err(recovery) => Err(std::io::Error::other(format!(
+                "public command staging failed ({error}); recovery also failed ({recovery})"
+            ))
+            .into()),
+        };
     }
+    sync_directory(
+        public
+            .parent()
+            .expect("validated public command has a parent"),
+    )?;
     if let Err(error) = crate::repo_transition::rename_exchange(&public, &swap) {
         return match recover_public_transition(manifest_path, &public, roots) {
             Ok(()) => Err(error.into()),
@@ -766,6 +1848,11 @@ fn begin_public_transition(
             .into()),
         };
     }
+    sync_directory(
+        public
+            .parent()
+            .expect("validated public command has a parent"),
+    )?;
     if !cleanup::regular_file_matches_after_rename(&swap, &record.expected)? {
         let recovery = recover_public_transition(manifest_path, &public, roots);
         return Err(std::io::Error::other(match recovery {
@@ -805,91 +1892,33 @@ fn install_with_prepared_and_commit(
     install: impl FnOnce(&Path) -> Result<Item>,
     commit_manifest: impl FnOnce(&Path, ManifestEntry) -> Result<()>,
 ) -> Result<Item> {
-    let prepared_manifest = prepare_manifest(entry, transition, roots, manifest_path)?;
-    let mut item = match install(prepared_manifest.as_deref().unwrap_or(manifest_path)) {
-        Ok(item) => item,
-        Err(error) => {
-            return Err(with_prepared_cleanup(
-                error,
-                prepared_manifest.as_deref(),
-                &roots.state_dir,
-            ));
-        }
+    crate::cancellation::check()?;
+    // Built-in installers never target `pkg` (the package phase journals
+    // those directly), so no installer identity is bound here.
+    let Some(mut durable) =
+        begin_durable_transition(entry, transition, roots, manifest_path, None)?
+    else {
+        let item = install(manifest_path)?;
+        crate::cancellation::check()?;
+        return Ok(item);
     };
+    durable.mark_installing(roots)?;
+    let mut item = install(durable.manifest_path())?;
+    crate::cancellation::check()?;
     if item.failed {
-        if let Err(error) = remove_prepared_manifest(prepared_manifest.as_deref(), &roots.state_dir)
-        {
-            item.detail = format!(
-                "{}; removing the prepared manifest also failed: {error}",
-                item.detail
-            );
-        }
         return Ok(item);
     }
-
-    let install_manifest = prepared_manifest.as_deref().unwrap_or(manifest_path);
-    let committed_entry = match prepared_manifest.as_ref() {
-        Some(_) => match installed_entry(install_manifest, entry) {
-            Ok(entry) => Some(entry),
-            Err(error) => {
-                return Err(with_prepared_cleanup(
-                    error,
-                    prepared_manifest.as_deref(),
-                    &roots.state_dir,
-                ));
-            }
-        },
-        None => None,
-    };
-    let publication =
-        publish_replacement_public_bin(entry, transition, roots, manifest_path, install_manifest);
-    let mut pending_public = None;
-    match publication {
-        Ok(PublicPublication::Warning(warning)) => {
+    durable.mark_installed(entry, roots)?;
+    crate::cancellation::check()?;
+    let publication = durable.commit_with(entry, roots, manifest_path, commit_manifest)?;
+    match finish_publication(publication, manifest_path, roots) {
+        Ok(Some(warning)) => {
             item.status = crate::update::ItemStatus::Warning;
             item.reason = crate::update::ItemReason::Other;
             item.detail = format!("{}; {warning}", item.detail);
         }
-        Ok(PublicPublication::None) => {}
-        #[cfg(unix)]
-        Ok(PublicPublication::Pending(public)) => pending_public = Some(public),
+        Ok(None) => {}
         Err(error) => {
-            if prepared_manifest.is_none() {
-                restore_failed(transition, manifest_path)?;
-            }
-            return Err(with_prepared_cleanup(
-                error,
-                prepared_manifest.as_deref(),
-                &roots.state_dir,
-            ));
-        }
-    }
-
-    if let Some(committed_entry) = committed_entry {
-        if let Err(error) = commit_manifest(manifest_path, committed_entry) {
-            #[cfg(unix)]
-            if let Some(public) = pending_public.as_deref() {
-                if let Err(recovery) = recover_public_transition(manifest_path, public, roots) {
-                    return Err(with_prepared_cleanup(
-                        std::io::Error::other(format!(
-                            "manifest commit failed ({error}); public command recovery also failed ({recovery})"
-                        ))
-                        .into(),
-                        prepared_manifest.as_deref(),
-                        &roots.state_dir,
-                    ));
-                }
-            }
-            return Err(with_prepared_cleanup(
-                error,
-                prepared_manifest.as_deref(),
-                &roots.state_dir,
-            ));
-        }
-    }
-    #[cfg(unix)]
-    if let Some(public) = pending_public.as_deref() {
-        if let Err(error) = recover_public_transition(manifest_path, public, roots) {
             item.status = crate::update::ItemStatus::Warning;
             item.reason = crate::update::ItemReason::Other;
             item.detail = format!(
@@ -898,42 +1927,10 @@ fn install_with_prepared_and_commit(
             );
         }
     }
-    if let Err(error) = remove_prepared_manifest(prepared_manifest.as_deref(), &roots.state_dir) {
-        item.status = crate::update::ItemStatus::Warning;
-        item.reason = crate::update::ItemReason::Other;
-        item.detail = format!(
-            "{}; removing the prepared manifest failed: {error}",
-            item.detail
-        );
-    }
     Ok(item)
 }
 
-fn with_prepared_cleanup(
-    primary: crate::Error,
-    prepared_manifest: Option<&Path>,
-    state_dir: &Path,
-) -> crate::Error {
-    match remove_prepared_manifest(prepared_manifest, state_dir) {
-        Ok(()) => primary,
-        Err(cleanup) => std::io::Error::other(format!(
-            "{primary}; removing the prepared manifest also failed: {cleanup}"
-        ))
-        .into(),
-    }
-}
-
-fn prepare_manifest(
-    entry: &Entry,
-    transition: Option<&Transition>,
-    roots: &Roots,
-    manifest_path: &Path,
-) -> Result<Option<PathBuf>> {
-    prepare_manifest_with_nonce(entry, transition, roots, manifest_path, || {
-        MANIFEST_STAGE_NONCE.fetch_add(1, Ordering::Relaxed)
-    })
-}
-
+#[cfg(test)]
 fn prepare_manifest_with_nonce(
     entry: &Entry,
     transition: Option<&Transition>,
@@ -995,7 +1992,23 @@ fn prepare_manifest_with_nonce(
 }
 
 fn installed_entry(manifest_path: &Path, entry: &Entry) -> Result<ManifestEntry> {
-    let installed = manifest::read(manifest_path)?;
+    validate_private_transition_file(manifest_path)?;
+    let bytes =
+        crate::state::read_private_bounded(manifest_path, MAX_DURABLE_TRANSITION_RECORD_BYTES)?;
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "prepared method-transition manifest contains a NUL byte",
+        )
+        .into());
+    }
+    let content = std::str::from_utf8(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("prepared method-transition manifest is not UTF-8: {error}"),
+        )
+    })?;
+    let installed = Manifest::parse(content);
     let current = installed.get(&entry.name).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1009,29 +2022,15 @@ fn installed_entry(manifest_path: &Path, entry: &Entry) -> Result<ManifestEntry>
         )
         .into());
     }
+    if installed.entries().len() != 1 || installed.count(&entry.name) != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "successful transition recorded unexpected extra manifest rows",
+        )
+        .into());
+    }
+    cleanup::validate_manifest_artifact_entry(current)?;
     Ok(current.clone())
-}
-
-fn remove_prepared_manifest(path: Option<&Path>, state_dir: &Path) -> Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    let mut parent = path.parent();
-    while let Some(dir) = parent {
-        if dir == state_dir {
-            break;
-        }
-        if fs::remove_dir(dir).is_err() {
-            break;
-        }
-        parent = dir.parent();
-    }
-    Ok(())
 }
 
 /// Cleans old artifacts after a new method has successfully recorded itself.
@@ -1052,17 +2051,64 @@ pub(crate) fn cleanup_successful(
         .into());
     }
 
-    Ok(cleanup_snapshot(entry, transition, roots, locked_repo_root)
-        .err()
-        .map(|error| error.to_string()))
+    if let Err(error) = cleanup_snapshot(entry, transition, roots, locked_repo_root) {
+        return Ok(Some(error.to_string()));
+    }
+    if let Err(error) = finish_committed_transition(entry, transition, roots) {
+        return Ok(Some(format!(
+            "old provider cleanup completed, but retiring its transition record failed: {error}"
+        )));
+    }
+    Ok(None)
 }
 
-/// Restores the old manifest row after a transition install fails.
-pub(crate) fn restore_failed(transition: Option<&Transition>, manifest_path: &Path) -> Result<()> {
-    if let Some(transition) = transition {
-        manifest::upsert(manifest_path, transition.old.clone())?;
+fn finish_committed_transition(
+    entry: &Entry,
+    transition: &Transition,
+    roots: &Roots,
+) -> Result<()> {
+    let path = durable_transition_path(roots, &entry.name);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
     }
-    Ok(())
+    let record = read_durable_transition(&path, roots)?;
+    if record.transition != *transition
+        || record.target_method != entry.method
+        || record.target_cmd != entry.cmd
+        || record.target_cmd_explicit != entry.cmd_explicit
+        || record.target_aliases != entry.aliases
+        || record.target_filter != entry.filter
+        || record.phase != DurableTransitionPhase::ManifestCommitted
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "committed method transition for {} changed before cleanup acknowledgement",
+                entry.name
+            ),
+        )
+        .into());
+    }
+    DurableTransition { path, record }.finish(roots)
+}
+
+/// Finishes a custom transition by exact-cleaning only the old snapshot paths
+/// that still match the saved pre-install state. A custom provider's arbitrary
+/// output can collide with old built-in paths, so changed or ambiguous paths
+/// are preserved and the journal is retained for a later retry; the record is
+/// retired only once every safe snapshot path is gone.
+pub(crate) fn finish_custom_transition(
+    entry: &Entry,
+    transition: Option<&Transition>,
+    roots: &Roots,
+    locked_repo_root: Option<&Path>,
+) -> Result<Option<String>> {
+    let Some(transition) = transition else {
+        return Ok(None);
+    };
+    cleanup_successful(entry, Some(transition), roots, locked_repo_root)
 }
 
 fn publish_replacement_public_bin(
@@ -1313,6 +2359,28 @@ fn cleanup_snapshot(
         _ => {}
     }
 
+    if entry.method == method::CUSTOM {
+        if let Some(path) = transition.cleanup_evidence.unresolved_managed_root()? {
+            return Err(std::io::Error::other(format!(
+                "preserved an old managed root changed by custom installation: {}",
+                path.display()
+            ))
+            .into());
+        }
+        if transition.old.method == method::GITHUB_RELEASE
+            && transition.archive_state != ArchiveState::Proven
+        {
+            let path = roots.install_dir.join(&transition.old.name);
+            if fs::symlink_metadata(&path).is_ok() {
+                return Err(std::io::Error::other(format!(
+                    "preserved an ambiguous legacy release root after custom installation: {}",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1506,16 +2574,13 @@ fn remove_empty_install_parents(path: &Path, install_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::path::PathBuf;
-
     use super::{
-        Transition, begin_public_transition, by_name, cleanup_snapshot, install_with_prepared,
-        install_with_prepared_and_commit, points_into, prepare_manifest_with_nonce,
-        public_transition_path, recover_public_transition, reject_identity_handoffs,
-        unlink_snapshot,
+        MAX_DURABLE_TRANSITION_RECORD_BYTES, PkgInstallerIdentity, Transition,
+        begin_custom_durable_transition, begin_durable_transition, begin_public_transition,
+        by_name, cleanup_snapshot, durable_transitions, ensure_durable_transition_dir,
+        install_with_prepared, install_with_prepared_and_commit, points_into,
+        prepare_manifest_with_nonce, public_transition_path, recover_pending_transitions,
+        recover_public_transition, reject_identity_handoffs, unlink_snapshot,
     };
     use crate::config::{Entry, parse_entry};
     use crate::github_release_install::{self, ArchiveState};
@@ -1524,7 +2589,11 @@ mod tests {
     use crate::platform::RuntimeEnv;
     use crate::runtime::Roots;
     use crate::update::{Item, ItemReason};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
 
     fn cleanup_snapshot_for_test(
         entry: &Entry,
@@ -1543,6 +2612,11 @@ mod tests {
             .then(|| crate::cleanup::safe_repo_root(&transition.old, &cleanup_roots))
             .flatten();
         cleanup_snapshot(entry, &transition, roots, repo_root.as_deref())
+    }
+
+    #[cfg(unix)]
+    fn run_signal_boundary_subprocess(test_name: &str, child_env: &str) {
+        crate::test_support::run_signal_boundary_subprocess(test_name, child_env);
     }
 
     #[test]
@@ -2777,6 +3851,753 @@ mod tests {
     }
 
     #[test]
+    fn every_method_transition_stages_the_manifest_before_commit() {
+        let dir = temp_dir("all-methods-stage-manifest");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let manifest_path = crate::manifest::path(&roots.state_dir);
+        let old = ManifestEntry::new("tool", crate::method::PKG, "tool", "");
+        crate::manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let entry = parse_entry("tool|cargo|tool|-|-", Some("apt"));
+        let manifest = crate::manifest::read(&manifest_path).unwrap();
+        let transition = by_name(&manifest, std::slice::from_ref(&entry), &roots)
+            .unwrap()
+            .remove("tool")
+            .unwrap();
+
+        let error = install_with_prepared_and_commit(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            |prepared| {
+                assert_ne!(prepared, manifest_path);
+                crate::manifest::upsert(
+                    prepared,
+                    ManifestEntry::new(
+                        "tool",
+                        crate::method::CARGO,
+                        "tool",
+                        roots
+                            .install_dir
+                            .join("tool/bin/tool")
+                            .display()
+                            .to_string(),
+                    ),
+                )?;
+                Ok(Item::changed("tool", ItemReason::Installed, "installed"))
+            },
+            |path, new| {
+                crate::manifest::upsert(path, new)?;
+                Err(std::io::Error::other("injected crash after manifest commit").into())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected crash"));
+        let committed = ManifestEntry::new(
+            "tool",
+            crate::method::CARGO,
+            "tool",
+            roots
+                .install_dir
+                .join("tool/bin/tool")
+                .display()
+                .to_string(),
+        );
+        assert_eq!(
+            crate::manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&committed)
+        );
+        let pending = recover_pending_transitions(
+            &[entry],
+            &HashMap::new(),
+            &manifest_path,
+            &roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending
+                .into_iter()
+                .next()
+                .unwrap()
+                .finish(&roots, None)
+                .unwrap(),
+            None
+        );
+        assert!(durable_transitions(&roots).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prepared_manifest_replacements_fail_closed_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        for replacement in ["fifo", "symlink", "oversized", "hardlink", "mode"] {
+            let (dir, roots, manifest_path, entry, transition) =
+                simple_transition(&format!("prepared-{replacement}"), crate::method::CARGO);
+            let mut durable =
+                begin_durable_transition(&entry, Some(&transition), &roots, &manifest_path, None)
+                    .unwrap()
+                    .unwrap();
+            durable.mark_installing(&roots).unwrap();
+            let prepared = durable.manifest_path().to_path_buf();
+            fs::remove_file(&prepared).unwrap();
+            match replacement {
+                "fifo" => {
+                    let path = CString::new(prepared.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: the path points inside this test's private directory.
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                "symlink" => {
+                    let target = dir.join("replacement");
+                    fs::write(&target, "tool|cargo|tool|/tmp/tool\n").unwrap();
+                    symlink(target, &prepared).unwrap();
+                }
+                "oversized" => {
+                    let file = std::fs::File::create(&prepared).unwrap();
+                    file.set_len(MAX_DURABLE_TRANSITION_RECORD_BYTES + 1)
+                        .unwrap();
+                    fs::set_permissions(&prepared, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                "hardlink" => {
+                    let target = dir.join("replacement");
+                    fs::write(&target, "tool|cargo|tool|/tmp/tool\n").unwrap();
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::hard_link(target, &prepared).unwrap();
+                }
+                "mode" => {
+                    fs::write(&prepared, "tool|cargo|tool|/tmp/tool\n").unwrap();
+                    fs::set_permissions(&prepared, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let started = std::time::Instant::now();
+            let result = durable.mark_installed(&entry, &roots);
+            assert!(result.is_err(), "replacement={replacement}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "replacement={replacement} blocked instead of failing closed"
+            );
+            assert_eq!(
+                crate::manifest::read(&manifest_path).unwrap().get("tool"),
+                Some(&transition.old)
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_transition_requires_the_complete_normalized_intent() {
+        for changed in [
+            "tool|cargo|tool|feature|-",
+            "tool|cargo|tool|-|host:different",
+        ] {
+            let (_dir, roots, manifest_path, entry, transition) =
+                simple_transition("normalized-intent", crate::method::CARGO);
+            let mut durable =
+                begin_durable_transition(&entry, Some(&transition), &roots, &manifest_path, None)
+                    .unwrap()
+                    .unwrap();
+            durable.mark_installing(&roots).unwrap();
+
+            let changed = parse_entry(changed, Some("apt"));
+            let error = recover_pending_transitions(
+                &[changed],
+                &HashMap::new(),
+                &manifest_path,
+                &roots,
+                Some(("apt", false)),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no longer matches configuration")
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_custom_transition_requires_the_same_hook_fingerprint() {
+        let (_dir, roots, manifest_path, entry, transition) =
+            simple_transition("custom-fingerprint", crate::method::CUSTOM);
+        let first = "a".repeat(64);
+        let changed = "b".repeat(64);
+        let mut durable = begin_custom_durable_transition(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            Some(&first),
+        )
+        .unwrap()
+        .unwrap();
+        durable.mark_installing(&roots).unwrap();
+
+        let error = recover_pending_transitions(
+            std::slice::from_ref(&entry),
+            &HashMap::from([(entry.name.clone(), Some(changed))]),
+            &manifest_path,
+            &roots,
+            Some(("apt", false)),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer matches configuration")
+        );
+
+        recover_pending_transitions(
+            std::slice::from_ref(&entry),
+            &HashMap::from([(entry.name.clone(), Some(first.clone()))]),
+            &manifest_path,
+            &roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+        let retry = begin_custom_durable_transition(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            Some(&first),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(retry.is_retry());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interrupted_cleanup_is_idempotent_and_independent_of_current_config() {
+        let dir = temp_dir("cleanup-before-journal-unlink");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let old_root = roots.install_dir.join("tool");
+        let old_target = old_root.join("bin/tool");
+        let public = roots.bin_dir.join("tool");
+        write_executable(&old_target, b"old");
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        symlink(&old_target, &public).unwrap();
+        link_state::write(
+            &link_state::path(&roots.state_dir, "tool", Kind::Bin),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+        let manifest_path = crate::manifest::path(&roots.state_dir);
+        crate::manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                crate::method::CARGO,
+                "tool",
+                old_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let entry = parse_entry("tool|pkg|tool|-|-", Some("apt"));
+        let transition = by_name(
+            &crate::manifest::read(&manifest_path).unwrap(),
+            std::slice::from_ref(&entry),
+            &roots,
+        )
+        .unwrap()
+        .remove("tool")
+        .unwrap();
+        let pkg_identity =
+            PkgInstallerIdentity::for_target(&entry.name, &entry.aliases, "apt", false);
+        let mut durable = begin_durable_transition(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            Some(pkg_identity),
+        )
+        .unwrap()
+        .unwrap();
+        durable.mark_installing(&roots).unwrap();
+        crate::manifest::upsert(
+            durable.manifest_path(),
+            ManifestEntry::new("tool", crate::method::PKG, "tool", ""),
+        )
+        .unwrap();
+        durable.mark_installed(&entry, &roots).unwrap();
+        durable.commit(&entry, &roots, &manifest_path).unwrap();
+
+        cleanup_snapshot(&entry, &transition, &roots, None).unwrap();
+        assert!(!old_root.exists());
+        assert!(!public.exists());
+
+        let pending = recover_pending_transitions(
+            &[],
+            &HashMap::new(),
+            &manifest_path,
+            &roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending
+                .into_iter()
+                .next()
+                .unwrap()
+                .finish(&roots, None)
+                .unwrap(),
+            None
+        );
+        assert!(durable_transitions(&roots).unwrap().is_empty());
+        assert_eq!(
+            crate::manifest::read(&manifest_path)
+                .unwrap()
+                .get("tool")
+                .unwrap()
+                .method,
+            crate::method::PKG
+        );
+    }
+
+    /// Builds a cargo-to-pkg transition fixture with the given raw aliases.
+    #[cfg(unix)]
+    fn pkg_transition_fixture(
+        name: &str,
+        aliases: &str,
+    ) -> (PathBuf, Roots, PathBuf, Entry, Transition) {
+        let dir = temp_dir(name);
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let old_root = roots.install_dir.join("tool");
+        write_executable(&old_root.join("bin/tool"), b"old");
+        let manifest_path = crate::manifest::path(&roots.state_dir);
+        crate::manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "tool",
+                crate::method::CARGO,
+                "tool",
+                old_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let entry = parse_entry(&format!("tool|pkg|tool|{aliases}|-"), Some("apt"));
+        let transition = by_name(
+            &crate::manifest::read(&manifest_path).unwrap(),
+            std::slice::from_ref(&entry),
+            &roots,
+        )
+        .unwrap()
+        .remove("tool")
+        .unwrap();
+        (dir, roots, manifest_path, entry, transition)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pkg_journal_binds_and_rechecks_the_exact_installer_identity() {
+        let (_dir, roots, manifest_path, entry, transition) =
+            pkg_transition_fixture("pkg-identity-bind", "-");
+        let apt = PkgInstallerIdentity::for_target(&entry.name, &entry.aliases, "apt", false);
+        let mut durable =
+            begin_durable_transition(&entry, Some(&transition), &roots, &manifest_path, Some(apt))
+                .unwrap()
+                .unwrap();
+        durable.mark_installing(&roots).unwrap();
+
+        // The exact same tuple remains retryable through both gates.
+        recover_pending_transitions(
+            std::slice::from_ref(&entry),
+            &HashMap::new(),
+            &manifest_path,
+            &roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+        let retry = begin_durable_transition(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            Some(PkgInstallerIdentity::for_target(
+                &entry.name,
+                &entry.aliases,
+                "apt",
+                false,
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(retry.is_retry());
+
+        // A different manager, runtime, or resolved package fails closed.
+        for (manager, android) in [("brew", false), ("apt", true)] {
+            let changed =
+                PkgInstallerIdentity::for_target(&entry.name, &entry.aliases, manager, android);
+            let error = recover_pending_transitions(
+                std::slice::from_ref(&entry),
+                &HashMap::new(),
+                &manifest_path,
+                &roots,
+                Some((manager, android)),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("installer identity"),
+                "unexpected error: {error}"
+            );
+            let error = begin_durable_transition(
+                &entry,
+                Some(&transition),
+                &roots,
+                &manifest_path,
+                Some(changed),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("installer identity"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pkg_journal_records_the_resolved_package_not_raw_aliases() {
+        let (_dir, roots, manifest_path, entry, transition) =
+            pkg_transition_fixture("pkg-identity-resolved", "apt:tool-deb,brew:tool-brew");
+        let apt = PkgInstallerIdentity::for_target(&entry.name, &entry.aliases, "apt", false);
+        assert_eq!(apt.package, "tool-deb");
+        let mut durable =
+            begin_durable_transition(&entry, Some(&transition), &roots, &manifest_path, Some(apt))
+                .unwrap()
+                .unwrap();
+        durable.mark_installing(&roots).unwrap();
+
+        // Identical raw aliases under another manager resolve a different
+        // package and must not resume the journal.
+        let error = recover_pending_transitions(
+            std::slice::from_ref(&entry),
+            &HashMap::new(),
+            &manifest_path,
+            &roots,
+            Some(("brew", false)),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("installer identity"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("tool-deb") && error.to_string().contains("tool-brew"),
+            "the error must name both resolved packages: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn legacy_pkg_journal_without_installer_binding_fails_closed() {
+        let (_dir, roots, manifest_path, entry, transition) =
+            pkg_transition_fixture("pkg-identity-legacy", "-");
+        let apt = PkgInstallerIdentity::for_target(&entry.name, &entry.aliases, "apt", false);
+        let mut durable = begin_durable_transition(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            Some(apt.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        durable.mark_installing(&roots).unwrap();
+        // Rewrite the journal without the binding to simulate a record that
+        // predates installer identity.
+        let journal = durable_transitions(&roots)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .path;
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("target_pkg")
+            .unwrap();
+        fs::write(&journal, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let error = recover_pending_transitions(
+            std::slice::from_ref(&entry),
+            &HashMap::new(),
+            &manifest_path,
+            &roots,
+            Some(("apt", false)),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("predates installer binding"),
+            "unexpected error: {error}"
+        );
+        let error =
+            begin_durable_transition(&entry, Some(&transition), &roots, &manifest_path, Some(apt))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("predates installer binding"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn committed_pkg_cleanup_does_not_re_resolve_the_installer() {
+        let (_dir, roots, manifest_path, entry, transition) =
+            pkg_transition_fixture("pkg-identity-committed", "-");
+        let apt = PkgInstallerIdentity::for_target(&entry.name, &entry.aliases, "apt", false);
+        let mut durable =
+            begin_durable_transition(&entry, Some(&transition), &roots, &manifest_path, Some(apt))
+                .unwrap()
+                .unwrap();
+        durable.mark_installing(&roots).unwrap();
+        crate::manifest::upsert(
+            durable.manifest_path(),
+            ManifestEntry::new("tool", crate::method::PKG, "tool", ""),
+        )
+        .unwrap();
+        durable.mark_installed(&entry, &roots).unwrap();
+        durable.commit(&entry, &roots, &manifest_path).unwrap();
+
+        // Post-commit cleanup operates on recorded rows, not re-resolved
+        // aliases, so it proceeds even when the live environment changed.
+        let pending = recover_pending_transitions(
+            &[],
+            &HashMap::new(),
+            &manifest_path,
+            &roots,
+            Some(("brew", true)),
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installer_binding_is_rejected_for_non_pkg_targets() {
+        let (_dir, roots, manifest_path, entry, transition) =
+            simple_transition("pkg-identity-non-pkg", crate::method::CARGO);
+        let identity = PkgInstallerIdentity::for_target(&entry.name, &entry.aliases, "apt", false);
+        let error = begin_durable_transition(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            Some(identity),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("required exactly for pkg transitions")
+        );
+
+        let (_dir, roots, manifest_path, entry, transition) =
+            pkg_transition_fixture("pkg-identity-missing", "-");
+        let error =
+            begin_durable_transition(&entry, Some(&transition), &roots, &manifest_path, None)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("required exactly for pkg transitions")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_private_transition_temps_are_scavenged_but_unknown_entries_are_preserved() {
+        let dir = temp_dir("stale-transition-temp");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let transition_dir = ensure_durable_transition_dir(&roots).unwrap();
+        let digest = "a".repeat(64);
+        for suffix in ["json.tmp.42.1", "manifest.tmp.42.2"] {
+            let path = transition_dir.join(format!(".{digest}.{suffix}"));
+            fs::write(&path, "partial").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(durable_transitions(&roots).unwrap().is_empty());
+        assert_eq!(fs::read_dir(&transition_dir).unwrap().count(), 0);
+
+        let foreign = transition_dir.join("foreign");
+        fs::write(&foreign, "preserve").unwrap();
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = durable_transitions(&roots).unwrap_err();
+        assert!(error.to_string().contains("unexpected entry"));
+        assert_eq!(fs::read_to_string(foreign).unwrap(), "preserve");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transition_temp_crash_artifacts_scavenge_per_crash_point() {
+        // A crash at create leaves an empty temp, a crash during write or
+        // fsync leaves a partial temp, and a crash before rename leaves a
+        // complete but unrenamed temp. Recovery must scavenge every class
+        // without touching live ownership.
+        for (point, content) in [
+            ("create", Vec::new()),
+            ("write", b"{\"partial\": ".to_vec()),
+            ("fsync", b"{\"partial\": ".to_vec()),
+            (
+                "pre-rename",
+                b"{\"format\": \"shdeps method transition v1\"}".to_vec(),
+            ),
+        ] {
+            let dir = temp_dir(&format!("temp-crash-{point}"));
+            let roots = Roots {
+                conf_dir: dir.join("conf"),
+                hooks_dir: dir.join("hooks"),
+                state_dir: dir.join("state"),
+                git_dev_dir: dir.join("git-dev"),
+                install_dir: dir.join("install"),
+                bin_dir: dir.join("bin"),
+                home: dir.join("home"),
+            };
+            fs::create_dir_all(&roots.state_dir).unwrap();
+            let manifest_path = crate::manifest::path(&roots.state_dir);
+            let old = ManifestEntry::new("tool", "cargo", "tool", "tool-root");
+            crate::manifest::upsert(&manifest_path, old.clone()).unwrap();
+            let transition_dir = ensure_durable_transition_dir(&roots).unwrap();
+            let digest = "a".repeat(64);
+            let temp = transition_dir.join(format!(
+                ".{digest}.json.tmp.{}.{}",
+                std::process::id(),
+                1000 + point.len()
+            ));
+            fs::write(&temp, content).unwrap();
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let pending =
+                recover_pending_transitions(&[], &HashMap::new(), &manifest_path, &roots, None)
+                    .unwrap();
+            assert!(pending.is_empty(), "point={point}");
+            assert_eq!(
+                fs::read_dir(&transition_dir).unwrap().count(),
+                0,
+                "point={point} must not strand its crash temp"
+            );
+            assert_eq!(
+                crate::manifest::read(&manifest_path).unwrap().get("tool"),
+                Some(&old),
+                "point={point} must preserve live ownership"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        // An oversized temp fails closed instead of being scavenged: silently
+        // dropping unbounded staging state could hide disk exhaustion or
+        // tampering from the operator.
+        let dir = temp_dir("temp-crash-oversized");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        fs::create_dir_all(&roots.state_dir).unwrap();
+        let manifest_path = crate::manifest::path(&roots.state_dir);
+        let old = ManifestEntry::new("tool", "cargo", "tool", "tool-root");
+        crate::manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let transition_dir = ensure_durable_transition_dir(&roots).unwrap();
+        let digest = "b".repeat(64);
+        let temp = transition_dir.join(format!(".{digest}.manifest.tmp.{}.1", std::process::id()));
+        let file = std::fs::File::create(&temp).unwrap();
+        file.set_len(MAX_DURABLE_TRANSITION_RECORD_BYTES + 1)
+            .unwrap();
+        drop(file);
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = recover_pending_transitions(&[], &HashMap::new(), &manifest_path, &roots, None)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("oversized method transition staging file")
+        );
+        assert!(
+            temp.exists(),
+            "an oversized temp must fail closed, never silently dropped"
+        );
+        assert_eq!(
+            crate::manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_durable_write_failures_leave_no_temp_and_preserve_target() {
+        // Pre-rename failure: the destination already exists while replace is
+        // refused, so the staged temp must be removed and the target kept.
+        let dir = temp_dir("private-write-failure");
+        let target = dir.join("record.json");
+        fs::write(&target, b"original").unwrap();
+        let error = super::write_private_durable(&target, b"replacement", false).unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "a failed replace must not strand its staging temp"
+        );
+
+        // Create failure: the parent is a file, so temp creation fails before
+        // anything is staged.
+        let parent_file = dir.join("parent");
+        fs::write(&parent_file, b"not a directory").unwrap();
+        super::write_private_durable(&parent_file.join("record.json"), b"staged", false)
+            .unwrap_err();
+        assert_eq!(fs::read(&parent_file).unwrap(), b"not a directory");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     #[cfg(unix)]
     fn raw_release_transition_rolls_back_when_real_manifest_commit_fails() {
         let (roots, manifest_path, entry, transition, public, source) =
@@ -2831,6 +4652,107 @@ mod tests {
                 .unwrap()
                 .method,
             crate::method::GITHUB_RELEASE
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn method_transition_refuses_publication_when_post_intent_is_not_durable() {
+        let (roots, manifest_path, entry, transition, public, source) =
+            raw_release_transition("pending-post-storage-failure");
+        let old_bytes = fs::read(&public).unwrap();
+        fs::write(roots.state_dir.join(".pending-posts"), "not a directory\n").unwrap();
+
+        let result = install_with_prepared(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            |prepared| {
+                crate::manifest::upsert(
+                    prepared,
+                    ManifestEntry::new(
+                        &entry.name,
+                        &entry.method,
+                        &entry.cmd,
+                        source.to_string_lossy(),
+                    ),
+                )?;
+                Ok(Item::current(
+                    entry.name.clone(),
+                    ItemReason::Installed,
+                    "current",
+                ))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&public).unwrap(), old_bytes);
+        assert_eq!(
+            crate::manifest::read(&manifest_path)
+                .unwrap()
+                .get(&entry.name)
+                .unwrap()
+                .method,
+            crate::method::GITHUB_RELEASE
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellation_after_prepared_installer_preserves_old_publication() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CANCEL_AFTER_PREPARED_INSTALLER";
+        const TEST_NAME: &str = "update_transition::tests::cancellation_after_prepared_installer_preserves_old_publication";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let (roots, manifest_path, entry, transition, public, source) =
+            raw_release_transition("cancel-after-prepared-installer");
+        let old_bytes = fs::read(&public).unwrap();
+        let result = install_with_prepared_and_commit(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            |prepared| {
+                crate::manifest::upsert(
+                    prepared,
+                    ManifestEntry::new(
+                        &entry.name,
+                        &entry.method,
+                        &entry.cmd,
+                        source.to_string_lossy(),
+                    ),
+                )?;
+                // Model a successful installer that latches cancellation at
+                // the exact return boundary before public/manifest commit.
+                // SAFETY: this subprocess installed Shdeps' handler above.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                Ok(Item::changed(
+                    entry.name.clone(),
+                    ItemReason::Installed,
+                    "installed",
+                ))
+            },
+            |_, _| panic!("manifest commit ran after cancellation"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&public).unwrap(), old_bytes);
+        assert_eq!(
+            crate::manifest::read(&manifest_path)
+                .unwrap()
+                .get(&entry.name)
+                .unwrap()
+                .method,
+            crate::method::GITHUB_RELEASE
+        );
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
         );
     }
 
@@ -3234,6 +5156,38 @@ mod tests {
         let transition = transitions.remove(&entry.name).unwrap();
         write_executable(&source, b"new provider");
         (roots, manifest_path, entry, transition, public, source)
+    }
+
+    fn simple_transition(
+        name: &str,
+        target_method: &str,
+    ) -> (PathBuf, Roots, PathBuf, Entry, Transition) {
+        let dir = temp_dir(name);
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let manifest_path = crate::manifest::path(&roots.state_dir);
+        crate::manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("tool", crate::method::PKG, "tool", ""),
+        )
+        .unwrap();
+        let entry = parse_entry(&format!("tool|{target_method}|tool|-|-"), Some("apt"));
+        let transition = by_name(
+            &crate::manifest::read(&manifest_path).unwrap(),
+            std::slice::from_ref(&entry),
+            &roots,
+        )
+        .unwrap()
+        .remove("tool")
+        .unwrap();
+        (dir, roots, manifest_path, entry, transition)
     }
 
     #[cfg(unix)]

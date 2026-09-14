@@ -7,11 +7,16 @@
 //! in the wrong path.
 
 use std::fs;
+use std::io::{self, Read as _};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::method;
 use crate::platform::{self, RuntimeEnv};
+
+const MAX_CONFIG_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Parsed dependency entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,12 +334,13 @@ pub fn load_dir_for_runtime(conf_dir: &Path, env: &RuntimeEnv) -> Result<Vec<Str
 }
 
 fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<Vec<String>> {
+    crate::cancellation::check()?;
     let mut files = conf_files(conf_dir)?;
     files.sort();
 
     let mut entries = Vec::new();
     for file in files {
-        let content = fs::read_to_string(file)?;
+        let content = read_config_file(&file)?;
         entries.extend(content.lines().filter_map(parse_config_line));
     }
     // Match `parse_config_texts`: dedupe by dep name before sorting so a
@@ -363,6 +369,76 @@ fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<Vec<Str
     });
     sort_entries(&mut entries);
     Ok(entries)
+}
+
+fn read_config_file(path: &Path) -> Result<String> {
+    crate::cancellation::check()?;
+    let metadata = fs::metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("config path is not a regular file: {}", path.display()),
+        )
+        .into());
+    }
+    if metadata.len() > MAX_CONFIG_FILE_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config file exceeds {MAX_CONFIG_FILE_BYTES} bytes: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "config path changed to a non-regular file while opening: {}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        crate::cancellation::check()?;
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > MAX_CONFIG_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "config file exceeds {MAX_CONFIG_FILE_BYTES} bytes: {}",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    crate::cancellation::check()?;
+    String::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config file is not valid UTF-8: {}: {error}",
+                path.display()
+            ),
+        )
+        .into()
+    })
 }
 
 fn select_filtered_duplicates(entries: Vec<String>, env: &RuntimeEnv) -> Vec<String> {
@@ -448,12 +524,14 @@ fn entry_name(entry: &str) -> &str {
 /// rule here prevents the package warm-path cache from accidentally proving a
 /// different config surface than `load_dir()` actually reads.
 pub fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
+    crate::cancellation::check()?;
     let Ok(entries) = fs::read_dir(conf_dir) else {
         return Ok(Vec::new());
     };
 
     let mut files = Vec::new();
     for entry in entries {
+        crate::cancellation::check()?;
         let path = entry?.path();
         if path
             .extension()
@@ -487,6 +565,75 @@ mod tests {
             "owner/tool"
         );
         assert_eq!(canonical_name("tool.git", "pkg"), "tool.git");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latched_cancellation_never_blocks_on_a_config_fifo() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CONFIG_FIFO_CANCEL_CHILD";
+        const TEST_NAME: &str = "config::tests::latched_cancellation_never_blocks_on_a_config_fifo";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = crate::test_support::temp_dir("shdeps-config-fifo-cancel");
+        let fifo = dir.join("blocked.conf");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the private fixture path is represented by a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let _held_open = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let signals = crate::cancellation::Signals::install().unwrap();
+        // SAFETY: this process installed the production TERM handler above.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+
+        let result = super::load_dir(&dir);
+
+        assert!(result.is_err());
+        assert_eq!(
+            signals.finish_result(result.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_fifo_is_rejected_before_any_blocking_read() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_CONFIG_FIFO_REJECTION_CHILD";
+        const TEST_NAME: &str = "config::tests::config_fifo_is_rejected_before_any_blocking_read";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Besides isolating the fixture, the shared subprocess helper
+            // supplies a bounded failure path if a future implementation
+            // accidentally tries to read the held-open FIFO.
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = crate::test_support::temp_dir("shdeps-config-fifo-reject");
+        let fifo = dir.join("blocked.conf");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the private fixture path is represented by a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let _held_open = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+
+        let error = super::load_dir(&dir).unwrap_err();
+
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "unexpected config FIFO error: {error}"
+        );
     }
 
     #[test]

@@ -310,6 +310,17 @@ pub fn write_cached_releases(state_dir: &Path, repo: &str, releases: &[Release])
     state::write_atomic(&releases_cache_path(state_dir, repo), &content)
 }
 
+/// Writes release metadata only while the CLI cancellation latch is clear.
+pub(crate) fn write_cached_releases_cancellable(
+    state_dir: &Path,
+    repo: &str,
+    releases: &[Release],
+) -> Result<()> {
+    let mut content = serde_json::to_string(releases)?;
+    content.push('\n');
+    state::write_atomic_cancellable(&releases_cache_path(state_dir, repo), &content)
+}
+
 /// Invalidates REST metadata after a public redirect becomes the newer fact.
 ///
 /// A matching latest-release redirect proves the installed tag is current but
@@ -334,9 +345,27 @@ pub fn remove_cached_releases(state_dir: &Path, repo: &str) -> io::Result<()> {
 /// it on paths that are already doing network work and are attached to a real
 /// terminal. Headless callers that need auth should pass GH_TOKEN/GITHUB_TOKEN.
 pub fn token(env: &impl Env, runner: &impl Runner) -> Option<String> {
+    token_with_terminal(
+        env,
+        runner,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    )
+}
+
+fn token_with_terminal(
+    env: &impl Env,
+    runner: &impl Runner,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+) -> Option<String> {
     env_token(env, "GH_TOKEN")
         .or_else(|| env_token(env, "GITHUB_TOKEN"))
-        .or_else(|| gh_token_allowed(env).then(|| gh_token(runner)).flatten())
+        .or_else(|| {
+            gh_token_allowed(env, stdin_terminal, stdout_terminal)
+                .then(|| gh_token(runner))
+                .flatten()
+        })
 }
 
 fn env_token(env: &impl Env, name: &str) -> Option<String> {
@@ -362,11 +391,11 @@ fn gh_token(runner: &impl Runner) -> Option<String> {
     (!token.is_empty()).then(|| token.to_owned())
 }
 
-fn gh_token_allowed(env: &impl Env) -> bool {
+fn gh_token_allowed(env: &impl Env, stdin_terminal: bool, stdout_terminal: bool) -> bool {
     matches!(
         env_token(env, "SHDEPS_ALLOW_GH_AUTH_TOKEN").as_deref(),
         Some("1" | "true" | "yes")
-    ) || (io::stdin().is_terminal() && io::stdout().is_terminal())
+    ) || (stdin_terminal && stdout_terminal)
 }
 
 /// Classified failure for GitHub API metadata fetches.
@@ -761,7 +790,42 @@ mod tests {
 
     #[test]
     fn token_skips_gh_cli_in_headless_contexts() {
-        assert_eq!(token(&FakeEnv::new(), &PanicRunner).as_deref(), None);
+        assert_eq!(
+            super::token_with_terminal(&FakeEnv::new(), &PanicRunner, false, false).as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn gh_cli_token_requires_both_terminals_unless_explicitly_enabled() {
+        let runner = FakeRunner::new().with_gh_token("from-gh");
+        for (stdin_terminal, stdout_terminal, expected) in [
+            (false, false, None),
+            (true, false, None),
+            (false, true, None),
+            (true, true, Some("from-gh")),
+        ] {
+            assert_eq!(
+                super::token_with_terminal(
+                    &FakeEnv::new(),
+                    &runner,
+                    stdin_terminal,
+                    stdout_terminal,
+                )
+                .as_deref(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::token_with_terminal(
+                &FakeEnv::new().with_var("SHDEPS_ALLOW_GH_AUTH_TOKEN", "true"),
+                &runner,
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("from-gh")
+        );
     }
 
     #[test]

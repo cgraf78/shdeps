@@ -16,7 +16,7 @@ use crate::Result;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const LOCK_FILE: &str = ".lock";
 const LOCK_TIMEOUT_ENV: &str = "SHDEPS_STATE_LOCK_TIMEOUT_SECS";
@@ -113,6 +113,7 @@ pub struct StateLock {
 impl StateLock {
     /// Acquires the per-state-dir lock, waiting for any current holder.
     pub fn acquire(state_dir: &Path) -> Result<Self> {
+        crate::cancellation::check()?;
         if is_legitimate_reentry() {
             return Ok(StateLock { file: None });
         }
@@ -125,6 +126,7 @@ impl StateLock {
     /// should use `acquire` so concurrent invocations serialize until the
     /// configured wait budget is exhausted.
     pub fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
+        crate::cancellation::check()?;
         if is_legitimate_reentry() {
             // Same re-entry rule as `acquire`: report success without
             // actually acquiring so callers gated on `Some(_)` proceed
@@ -143,6 +145,42 @@ impl StateLock {
 
 /// Replaces a state file with `content` using a same-directory temp file.
 pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    write_atomic_impl(path, content, false)
+}
+
+/// Replaces a state file only if cancellation is still clear at publication.
+pub(crate) fn write_atomic_cancellable(path: &Path, content: &str) -> Result<()> {
+    crate::cancellation::check()?;
+    write_atomic_impl(path, content, true)
+}
+
+fn write_atomic_impl(path: &Path, content: &str, cancellable: bool) -> Result<()> {
+    // A concurrent acknowledge may remove parent dirs between our mkdir and
+    // file creation (parallel tools sharing a marker tree); recreate and
+    // retry instead of failing the write. Bounded: a genuinely broken path
+    // still surfaces after the retries.
+    let mut attempts = 0;
+    loop {
+        match write_atomic_once(path, content, cancellable) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_concurrent_removal(&error) && attempts < 2 => {
+                attempts += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Whether a write failed because a concurrent actor removed a parent dir
+/// mid-write rather than because the path itself is bad.
+fn is_concurrent_removal(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn write_atomic_once(path: &Path, content: &str, cancellable: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -152,14 +190,31 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
         // Keep the temp file beside the destination so rename stays within one
         // filesystem. Readers then observe either the old complete file or the
         // new complete file, never a partial write from a crashed update.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        let prior_mode = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_file())
+            .map(|metadata| metadata.mode() & 0o7777);
+        #[cfg(unix)]
+        options.mode(prior_mode.unwrap_or(0o666));
+        let mut file = options.open(&temp)?;
+        #[cfg(unix)]
+        if let Some(mode) = prior_mode {
+            fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
+        }
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         drop(file);
+        if cancellable {
+            crate::cancellation::check()?;
+        }
         fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
         Ok(())
     })();
 
@@ -309,34 +364,114 @@ fn temp_nonce() -> u64 {
 }
 
 fn acquire_impl(state_dir: &Path) -> Result<Option<StateLock>> {
+    const MAX_PATH_REPLACEMENT_RETRIES: usize = 8;
+
+    for _ in 0..MAX_PATH_REPLACEMENT_RETRIES {
+        let file = open_lock_file(state_dir)?;
+        match lock_file(&file)? {
+            LockResult::Acquired => {
+                if !lock_file_is_canonical(&file, state_dir)? {
+                    continue;
+                }
+                write_lock_metadata(&file, state_dir)?;
+                if !lock_file_is_canonical(&file, state_dir)? {
+                    continue;
+                }
+                return Ok(Some(StateLock { file: Some(file) }));
+            }
+            LockResult::WouldBlock => return Ok(None),
+        }
+    }
+
+    Err(std::io::Error::other("state lock path changed repeatedly during acquisition").into())
+}
+
+fn open_lock_file(state_dir: &Path) -> Result<File> {
     fs::create_dir_all(state_dir)?;
     let path = StateLock::path(state_dir);
-    let file = OpenOptions::new()
+    let mut options = OpenOptions::new();
+    options
         .read(true)
         .write(true)
         .create(true)
         // The lock file is just a stable inode for `flock`; its contents do
         // not matter, and truncating it on every acquisition would add needless
         // metadata churn to the state directory.
-        .truncate(false)
-        .open(&path)?;
-    set_close_on_exec(&file)?;
-
-    match lock_file(&file)? {
-        LockResult::Acquired => {
-            write_lock_metadata(&file, state_dir)?;
-            Ok(Some(StateLock { file: Some(file) }))
-        }
-        LockResult::WouldBlock => Ok(None),
+        .truncate(false);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    let file = options.open(&path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state lock path is not a regular file: {}", path.display()),
+        )
+        .into());
     }
+    set_close_on_exec(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn lock_file_is_canonical(file: &File, state_dir: &Path) -> Result<bool> {
+    let path = StateLock::path(state_dir);
+    let current = open_lock_file(state_dir)?;
+    let locked = file.metadata()?;
+    let opened = current.metadata()?;
+    let linked = match fs::symlink_metadata(&path) {
+        Ok(linked) => linked,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(locked.dev() == opened.dev()
+        && locked.ino() == opened.ino()
+        && opened.dev() == linked.dev()
+        && opened.ino() == linked.ino())
+}
+
+#[cfg(not(unix))]
+fn lock_file_is_canonical(_file: &File, _state_dir: &Path) -> Result<bool> {
+    Ok(true)
 }
 
 fn acquire_with_timeout(state_dir: &Path, timeout: Duration) -> Result<StateLock> {
+    acquire_with_timeout_observing(state_dir, timeout, || {})
+}
+
+fn acquire_with_timeout_observing(
+    state_dir: &Path,
+    timeout: Duration,
+    mut observe_contention: impl FnMut(),
+) -> Result<StateLock> {
     let started = Instant::now();
+    crate::cancellation::check()?;
+    // Retain one descriptor while it is contended to avoid open/close churn.
+    // Once it becomes lockable, verify that its device/inode still names the
+    // no-follow canonical path; a replacement makes us reopen and contend on
+    // the new inode instead of returning an orphaned lock.
+    let mut file = open_lock_file(state_dir)?;
     loop {
-        if let Some(lock) = acquire_impl(state_dir)? {
-            return Ok(lock);
+        crate::cancellation::check()?;
+        if lock_file(&file)? == LockResult::Acquired {
+            if !lock_file_is_canonical(&file, state_dir)? {
+                if started.elapsed() >= timeout {
+                    return Err(lock_timeout_error(state_dir, timeout).into());
+                }
+                file = open_lock_file(state_dir)?;
+                continue;
+            }
+            write_lock_metadata(&file, state_dir)?;
+            if !lock_file_is_canonical(&file, state_dir)? {
+                if started.elapsed() >= timeout {
+                    return Err(lock_timeout_error(state_dir, timeout).into());
+                }
+                file = open_lock_file(state_dir)?;
+                continue;
+            }
+            crate::cancellation::check()?;
+            return Ok(StateLock { file: Some(file) });
         }
+        observe_contention();
         if started.elapsed() >= timeout {
             return Err(lock_timeout_error(state_dir, timeout).into());
         }
@@ -360,7 +495,7 @@ fn lock_timeout_error(state_dir: &Path, timeout: Duration) -> std::io::Error {
         timeout.as_secs(),
         path.display()
     );
-    if let Ok(owner) = fs::read_to_string(&path) {
+    if let Some(owner) = read_lock_owner_metadata(&path) {
         let owner = owner.trim();
         if !owner.is_empty() {
             message.push_str("; current lock metadata: ");
@@ -368,6 +503,25 @@ fn lock_timeout_error(state_dir: &Path, timeout: Duration) -> std::io::Error {
         }
     }
     std::io::Error::new(std::io::ErrorKind::TimedOut, message)
+}
+
+fn read_lock_owner_metadata(path: &Path) -> Option<String> {
+    const MAX_LOCK_METADATA_BYTES: u64 = 4096;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_LOCK_METADATA_BYTES {
+        return None;
+    }
+    let mut owner = String::new();
+    file.take(MAX_LOCK_METADATA_BYTES.saturating_add(1))
+        .read_to_string(&mut owner)
+        .ok()?;
+    (owner.len() as u64 <= MAX_LOCK_METADATA_BYTES).then_some(owner)
 }
 
 fn write_lock_metadata(mut file: &File, state_dir: &Path) -> Result<()> {
@@ -543,8 +697,40 @@ fn lock_file(_file: &File) -> Result<LockResult> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::{StateLock, read_private_bounded_after_metadata, temp_nonce, write_atomic};
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_timeout_diagnostic_rejects_a_replaced_fifo_without_blocking() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_LOCK_TIMEOUT_FIFO_CHILD";
+        const TEST_NAME: &str =
+            "state::tests::lock_timeout_diagnostic_rejects_a_replaced_fifo_without_blocking";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let fixture = Fixture::new("lock-timeout-fifo");
+        let path = StateLock::path(&fixture.dir);
+        fs::create_dir_all(&fixture.dir).unwrap();
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the private fixture path is represented by a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let _held_open = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        let error = super::lock_timeout_error(&fixture.dir, Duration::ZERO);
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("timed out after 0s"));
+    }
 
     #[test]
     fn lock_serializes_state_dir_access() {
@@ -586,6 +772,51 @@ mod tests {
     }
 
     #[test]
+    fn waiting_lock_reopens_when_canonical_inode_is_replaced() {
+        let _env_guard = super::lock_reentry_env_for_test();
+        super::clear_reentry_env_for_test();
+        let fixture = Fixture::new("lock-replaced-while-waiting");
+        let original = StateLock::acquire(&fixture.dir).unwrap();
+        let lock_path = StateLock::path(&fixture.dir);
+        let displaced_path = fixture.dir.join(".lock.displaced");
+        let (opened_tx, opened_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+        let state_dir = fixture.dir.clone();
+
+        let waiter = std::thread::spawn(move || {
+            let mut first_contention = true;
+            super::acquire_with_timeout_observing(&state_dir, Duration::from_millis(250), || {
+                if first_contention {
+                    first_contention = false;
+                    opened_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                }
+            })
+        });
+
+        opened_rx.recv().unwrap();
+        fs::rename(&lock_path, &displaced_path).unwrap();
+        let replacement = StateLock::try_acquire(&fixture.dir)
+            .unwrap()
+            .expect("the replacement canonical inode should be independently lockable");
+        continue_tx.send(()).unwrap();
+        drop(original);
+
+        let result = waiter.join().unwrap();
+        assert!(
+            result.is_err(),
+            "a waiter must not claim an orphaned inode while the canonical lock is held"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("timed out"),
+            "the waiter should keep contending on the replacement canonical lock"
+        );
+
+        drop(replacement);
+        assert!(StateLock::try_acquire(&fixture.dir).unwrap().is_some());
+    }
+
+    #[test]
     fn acquired_lock_file_records_owner_metadata() {
         let _env_guard = super::lock_reentry_env_for_test();
         super::clear_reentry_env_for_test();
@@ -616,12 +847,9 @@ for fd in /proc/self/fd/*; do
   fi
 done
 "#;
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .env("LOCK_PATH", &lock_path)
-            .status()
-            .unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(script).env("LOCK_PATH", &lock_path);
+        let status = crate::test_support::run_subprocess(command).unwrap().status;
 
         assert!(
             status.success(),

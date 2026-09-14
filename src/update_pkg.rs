@@ -6,7 +6,9 @@
 //! the top-level update orchestrator from becoming another monolith.
 
 use crate::Result;
+use crate::cancellation;
 use crate::config::{self, Entry};
+use crate::hooks::{MutationIntent, Txn};
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::method;
 use crate::package_cache;
@@ -65,6 +67,7 @@ pub(crate) fn required_proofs(
 }
 
 pub(crate) fn record_proof(entry: &Entry, context: &Context<'_, impl Runner>) -> Result<()> {
+    cancellation::check()?;
     let package = config::resolve_override_for_runtime(
         &entry.name,
         &entry.aliases,
@@ -121,6 +124,7 @@ pub(crate) fn write_cache(
     count: usize,
     options: Options,
 ) -> Result<()> {
+    cancellation::check()?;
     if context.pkg_mgr.is_empty() {
         return Ok(());
     }
@@ -140,6 +144,7 @@ pub(crate) fn write_cache(
         force: options.force,
         reinstall: options.reinstall,
     })?;
+    cancellation::check()?;
     package_cache::write(&inputs)
 }
 
@@ -272,6 +277,7 @@ pub(crate) fn install(
     package_versions: &std::collections::BTreeMap<String, String>,
     require_proof: bool,
 ) -> Result<Item> {
+    cancellation::check()?;
     let resolved = config::resolve_override_for_runtime(
         &entry.name,
         &entry.aliases,
@@ -287,14 +293,8 @@ pub(crate) fn install(
     }
 
     let installed = installed(entry, &resolved, context, package_versions, require_proof);
+    cancellation::check()?;
     if installed {
-        if require_proof {
-            record_proof(entry, context)?;
-        }
-        manifest::upsert(
-            context.manifest_path,
-            ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
-        )?;
         let detail = if verbose_enabled(options, context.env_vars) {
             let version = process::dep_version(context.runner, &entry.cmd)
                 .or_else(|| package_versions.get(&resolved).cloned());
@@ -302,6 +302,14 @@ pub(crate) fn install(
         } else {
             "installed".to_owned()
         };
+        cancellation::check()?;
+        if require_proof {
+            record_proof(entry, context)?;
+        }
+        manifest::upsert(
+            context.manifest_path,
+            ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
+        )?;
         return Ok(if missing_command_needs_repair(entry, context) {
             Item::changed(entry.name.clone(), ItemReason::Installed, detail)
         } else {
@@ -309,12 +317,12 @@ pub(crate) fn install(
         });
     }
 
-    manifest::upsert(
-        context.manifest_path,
-        ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
-    )?;
-
     if sudo == SudoStatus::UnavailableQuiet {
+        cancellation::check()?;
+        manifest::upsert(
+            context.manifest_path,
+            ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
+        )?;
         return Ok(Item::skipped(
             entry.name.clone(),
             ItemReason::PackageSudoUnavailable,
@@ -322,7 +330,13 @@ pub(crate) fn install(
         ));
     }
 
-    if !available(context.runner, context.pkg_mgr, &resolved)? {
+    let available = available(context.runner, context.pkg_mgr, &resolved)?;
+    cancellation::check()?;
+    manifest::upsert(
+        context.manifest_path,
+        ManifestEntry::new(&entry.name, method::PKG, &entry.cmd, ""),
+    )?;
+    if !available {
         return Ok(Item::skipped(
             entry.name.clone(),
             ItemReason::PackageUnavailable,
@@ -330,6 +344,7 @@ pub(crate) fn install(
         ));
     }
 
+    cancellation::check()?;
     queued.push(Queued {
         name: entry.name.clone(),
         package: resolved,
@@ -345,6 +360,7 @@ pub(crate) fn flush(
     queued: &[Queued],
     context: &Context<'_, impl Runner>,
     sudo: SudoStatus,
+    txn: &Txn,
     changed: &mut Vec<String>,
     summary: &mut Summary,
     progress: &mut dyn Progress,
@@ -365,27 +381,72 @@ pub(crate) fn flush(
         return Ok(());
     };
 
-    if run(context.runner, &command, progress)?.success {
-        changed.extend(queued.iter().map(|item| item.name.clone()));
+    let mut intents = begin_mutations(txn, queued)?;
+    let batch = run(context.runner, &command, progress)?;
+    if batch.success {
+        for intent in &mut intents {
+            let _ = intent.resolve(true)?;
+        }
+        cancellation::check()?;
+        for item in queued {
+            if !changed.contains(&item.name) {
+                changed.push(item.name.clone());
+            }
+        }
         return Ok(());
     }
+    cancellation::check()?;
 
     // Bash retries package installs one-at-a-time after a failed batch so a
     // single bad package does not block every other queued dependency. Keep the
     // same failure isolation here even though it costs extra subprocesses only
     // on the uncommon failure path.
     for item in queued {
+        cancellation::check()?;
         let single = vec![item.package.clone()];
         let Some(command) = pkg::install(context.pkg_mgr, &single, elevation) else {
             continue;
         };
-        if run(context.runner, &command, progress)?.success {
-            changed.push(item.name.clone());
+        let output = run(context.runner, &command, progress)?;
+        if output.success {
+            if let Some(intent) = intents.iter_mut().find(|intent| intent.name() == item.name) {
+                let _ = intent.resolve(true)?;
+            }
+            cancellation::check()?;
+            if !changed.contains(&item.name) {
+                changed.push(item.name.clone());
+            }
         } else {
+            cancellation::check()?;
             summary.failed.push(item.name.clone());
         }
     }
     Ok(())
+}
+
+fn begin_mutations(txn: &Txn, queued: &[Queued]) -> Result<Vec<MutationIntent>> {
+    let mut intents: Vec<MutationIntent> = Vec::with_capacity(queued.len());
+    for item in queued {
+        let mut intent = txn.mutation(&item.name);
+        if let Err(primary) = intent.begin() {
+            let mut cleanup_errors = Vec::new();
+            for started in &mut intents {
+                if let Err(error) = started.resolve(false) {
+                    cleanup_errors.push(error.to_string());
+                }
+            }
+            if cleanup_errors.is_empty() {
+                return Err(primary);
+            }
+            return Err(io::Error::other(format!(
+                "{primary}; rolling back unused post intents also failed: {}",
+                cleanup_errors.join("; ")
+            ))
+            .into());
+        }
+        intents.push(intent);
+    }
+    Ok(intents)
 }
 
 fn missing_command_needs_repair(entry: &Entry, context: &Context<'_, impl Runner>) -> bool {
@@ -453,6 +514,7 @@ fn installed(
 
 fn user_is_root(runner: &impl Runner) -> Result<bool> {
     let output = runner.run("id", &["-u"], Some(process::VERSION_PROBE_TIMEOUT))?;
+    cancellation::check()?;
     Ok(output.success && output.stdout.trim() == "0")
 }
 
@@ -462,7 +524,10 @@ fn sudo_noninteractive(runner: &impl Runner) -> Result<bool> {
         &["-n", "true"],
         Some(process::VERSION_PROBE_TIMEOUT),
     ) {
-        Ok(output) => Ok(output.success),
+        Ok(output) => {
+            cancellation::check()?;
+            Ok(output.success)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
@@ -555,6 +620,7 @@ fn available(runner: &impl Runner, mgr: &str, package: &str) -> Result<bool> {
         &args,
         Some(process::PACKAGE_PROBE_TIMEOUT),
     )?;
+    cancellation::check()?;
     Ok(pkg::available_ok(mgr, output.success, &output.stdout))
 }
 
@@ -573,7 +639,9 @@ fn run_raw(
     args: &[&str],
     progress: &mut dyn Progress,
 ) -> Result<Output> {
+    cancellation::check()?;
     pause_for_prompt_if_needed(program, progress)?;
+    cancellation::check()?;
     runner.run(program, args, None).map_err(Into::into)
 }
 
@@ -597,8 +665,12 @@ fn best_effort_run_raw(
     // transient repo refresh error must not hide the dependency-level result.
     // Install and availability calls still use `run_raw` so real install
     // failures are not silently swallowed.
+    cancellation::check()?;
     pause_for_prompt_if_needed(program, progress)?;
-    Ok(runner.run(program, args, None).ok())
+    cancellation::check()?;
+    let output = runner.run(program, args, None).ok();
+    cancellation::check()?;
+    Ok(output)
 }
 
 fn pause_for_prompt_if_needed(program: &str, progress: &mut dyn Progress) -> Result<()> {

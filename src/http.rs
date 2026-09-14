@@ -7,8 +7,10 @@
 //! via stdin config rather than the command line that other local processes can
 //! inspect with `ps`.
 
-use std::io::{self, Write};
-use std::process::{Command, Output, Stdio};
+use std::io;
+use std::process::{Command, Output};
+
+use crate::cancellation;
 
 /// HTTP client interface used by installer and self-update workflows.
 pub trait Client: Sync {
@@ -180,20 +182,12 @@ impl Curl {
 }
 
 fn run_curl(args: &[&str], request_bounds: &[&str], config: &str) -> io::Result<Output> {
-    let mut child = Command::new("curl")
+    let mut command = Command::new("curl");
+    command
         .args(CURL_STALL_ARGS)
         .args(request_bounds)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(config.as_bytes())?;
-    }
-
-    child.wait_with_output()
+        .args(args);
+    cancellation::output(command, Some(config.as_bytes()))
 }
 
 fn response(output: Output) -> io::Result<Vec<u8>> {
