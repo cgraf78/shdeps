@@ -600,8 +600,9 @@ created. Callers MUST require the additive
 older builds can emit the event before opening the FIFO. A capable Shdeps opens
 its nonblocking read end before flushing a `prompt` event. On that event, the
 parent must suspend or clear its live display, open the FIFO
-write-only/nonblocking, write exactly `ready\n`, and close it. `ENXIO` means no
-live Shdeps reader remains. Shdeps waits up to five seconds for the
+write-only/nonblocking, and write exactly `ready\n`. The exact token alone
+completes the acknowledgement, so the writer may stay open across prompts and
+closing is optional. `ENXIO` means no live Shdeps reader remains. Shdeps waits up to five seconds for the
 acknowledgement, then writes a visible status line to `/dev/tty` and starts
 sudo. If the variable is unset, JSONL output keeps its standalone behavior and
 does not wait for an acknowledgement. The FIFO capability is advertised only

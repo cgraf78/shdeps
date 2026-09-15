@@ -173,8 +173,9 @@ JSONL progress adapters that render on the controlling terminal can set
 read end before it flushes the `prompt` event, then waits up to five seconds for
 an exact `ready\n` token before writing the visible prompt status to `/dev/tty`
 and invoking sudo. The consumer suspends its display, opens the FIFO
-write-only/nonblocking, writes the token, and closes it; `ENXIO` means there is
-no live acknowledgement reader. Without the variable, JSONL progress remains
+write-only/nonblocking, and writes the token; the exact token alone completes
+the acknowledgement, so the writer may stay open and closing is optional.
+`ENXIO` means there is no live acknowledgement reader. Without the variable, JSONL progress remains
 standalone-compatible and does not wait.
 Hooks are trusted same-user code, but the request file still requires a private,
 parent-created regular file and a no-follow open on Unix; do not weaken that

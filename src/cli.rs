@@ -1244,7 +1244,6 @@ fn wait_for_prompt_ack(ack: &PromptAck, mut input: std::fs::File) -> Result<()> 
         crate::cancellation::check()?;
         let mut bytes = [0_u8; 16];
         match input.read(&mut bytes) {
-            Ok(0) if received == PROMPT_ACK_TOKEN => return Ok(()),
             Ok(0) => {}
             Ok(count) => {
                 received.extend_from_slice(&bytes[..count]);
