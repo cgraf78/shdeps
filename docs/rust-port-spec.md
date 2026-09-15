@@ -1158,8 +1158,9 @@ When a parent terminal renderer consumes `SHDEPS_PROGRESS=jsonl`, it may set
 `SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO it creates. Shdeps MUST open and
 validate the nonblocking read end before flushing each `prompt` event. The
 consumer MUST then suspend or clear its renderer, open the FIFO
-write-only/nonblocking, write the exact token `ready\n`, and close it; `ENXIO`
-means no live acknowledgement reader remains. Shdeps waits at most five seconds
+write-only/nonblocking, and write the exact token `ready\n`; the token alone
+completes the acknowledgement, so the writer MAY stay open across prompts and
+closing is optional. `ENXIO` means no live acknowledgement reader remains. Shdeps waits at most five seconds
 before writing a visible prompt status to `/dev/tty` and invoking sudo. An
 unset variable preserves standalone JSONL behavior without an acknowledgement
 wait. Consumers MUST probe `prompt-fifo-reader-before-event-v1` before relying
