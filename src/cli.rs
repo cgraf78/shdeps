@@ -1257,6 +1257,12 @@ fn wait_for_prompt_ack(ack: &PromptAck, mut input: std::fs::File) -> Result<()> 
                     )
                     .into());
                 }
+                // The renderer holds the acknowledgement FIFO open for the
+                // whole run (one token per prompt), so EOF never arrives
+                // mid-run. Accept the complete token without waiting for it.
+                if received == PROMPT_ACK_TOKEN {
+                    return Ok(());
+                }
             }
             Err(error)
                 if matches!(
@@ -3869,6 +3875,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn jsonl_progress_accepts_ack_while_renderer_holds_fifo_open() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_PROMPT_FIFO_HELD_OPEN_CHILD";
+        const TEST_NAME: &str =
+            "cli::tests::jsonl_progress_accepts_ack_while_renderer_holds_fifo_open";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        // The dot renderer holds the acknowledgement FIFO open read/write
+        // for the whole run and writes one ready token per prompt, so EOF
+        // never arrives mid-run. The complete token alone must complete
+        // the acknowledgement; waiting for EOF times every sudo prompt out.
+        fn open_nonblocking_writer(path: &std::path::Path) -> std::io::Result<fs::File> {
+            let mut options = fs::OpenOptions::new();
+            options
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW);
+            options.open(path)
+        }
+
+        let dir = temp_dir("prompt-ack-held-open");
+        let ack_path = dir.join("prompt-ack.fifo");
+        let ack_path_c = CString::new(ack_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(ack_path_c.as_ptr(), 0o600) }, 0);
+
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut events = Vec::new();
+                let mut prompt = Vec::new();
+                let mut progress = super::JsonlProgress::with_prompt_out_and_ack(
+                    &mut events,
+                    &mut prompt,
+                    ack_path.clone(),
+                );
+                progress.prompt_ack.as_mut().unwrap().timeout = Duration::from_millis(500);
+                let result = crate::update::Progress::pause_for_prompt(
+                    &mut progress,
+                    "waiting for sudo authentication",
+                );
+                drop(progress);
+                finished_tx.send(result).unwrap();
+            });
+
+            // Wait for the prompt reader to open (it opens before emitting
+            // the prompt event), polling like a renderer that only learns
+            // about the prompt from the event stream.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let held = loop {
+                match open_nonblocking_writer(&ack_path) {
+                    Ok(writer) => break writer,
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "prompt reader never opened the acknowledgement FIFO"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("unexpected ack FIFO open error: {error}"),
+                }
+            };
+            std::io::Write::write_all(&mut &held, b"ready\n").unwrap();
+            finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("prompt acknowledgement must complete while the writer is held open")
+                .unwrap();
+            // EOF stays impossible until here: the writer outlives the ack,
+            // matching a renderer that never closes mid-run.
+            drop(held);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn jsonl_progress_fails_before_prompt_when_renderer_does_not_ack() {
         const CHILD_ENV: &str = "SHDEPS_TEST_PROMPT_FIFO_TIMEOUT_CHILD";
         const TEST_NAME: &str =
@@ -4005,6 +4086,9 @@ mod tests {
                 .contains("invalid progress prompt acknowledgement")
         );
 
+        // The renderer holds the acknowledgement FIFO open for the whole
+        // run, so EOF never arrives mid-run: the complete token alone must
+        // complete the acknowledgement.
         let (ack, path) = fifo("prompt-ack-writer-held-open");
         let input = super::open_prompt_ack(&ack).unwrap();
         let mut writer = fs::OpenOptions::new()
@@ -4013,8 +4097,7 @@ mod tests {
             .open(&path)
             .unwrap();
         writer.write_all(b"ready\n").unwrap();
-        let error = super::wait_for_prompt_ack(&ack, input).unwrap_err();
-        assert!(error.to_string().contains("timed out waiting"));
+        super::wait_for_prompt_ack(&ack, input).unwrap();
         drop(writer);
         let after = fs::OpenOptions::new()
             .write(true)
