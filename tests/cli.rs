@@ -6153,8 +6153,10 @@ fn background_terminal_read_stops_and_resumes_the_shdeps_job() {
 cat >/dev/null
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
 printf 'background prompt: ' >/dev/tty
-IFS= read -r answer </dev/tty
-printf '%s\n' "$answer" >"$SHDEPS_TEST_CHILD_RESUMED"
+# busybox ash implements `read` over poll(), which never raises SIGTTIN, so a
+# background terminal stop needs a genuine blocking read. python3 is already a
+# hard dependency of this test through background-harness.
+python3 -c 'import sys; sys.stdout.write(sys.stdin.readline())' </dev/tty >"$SHDEPS_TEST_CHILD_RESUMED"
 printf '[]\n'
 "#,
     );
