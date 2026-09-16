@@ -1753,11 +1753,19 @@ fn custom_hooks_stay_within_ci_budget() {
     }
     fixture.write("conf/deps.conf", &config);
 
-    let mut command = fixture.command(["list"]);
-    command.env("SHDEPS_JOBS", "1");
-    let (output, elapsed) = timed(&mut command);
+    // Warm once so the samples measure hook supervision rather than
+    // one-time loader or filesystem-cache noise. `list` is read-only, so
+    // every sample repeats identical work.
+    let mut warm = fixture.command(["list"]);
+    warm.env("SHDEPS_JOBS", "1");
+    assert_success(&run(&mut warm));
 
-    assert_success(&output);
+    let (output, samples) = timed_samples(|| {
+        let mut command = fixture.command(["list"]);
+        command.env("SHDEPS_JOBS", "1");
+        command
+    });
+
     assert_eq!(
         text(&output.stdout)
             .lines()
@@ -1772,28 +1780,29 @@ fn custom_hooks_stay_within_ci_budget() {
     // macOS versus ~36 ms on Linux, and loaded macOS runners swing the
     // thirty-hook total from 2.3 s to 3.7 s with identical code. The
     // budget covers that runner noise while still catching 2x blowups
-    // like the pre-gate 4.6 s snapshot era.
+    // like the pre-gate 4.6 s snapshot era. The median over three samples
+    // absorbs one scheduler outlier (loaded Linux runners spike to ~1.4 s
+    // with identical code) while a persistent slowdown still trips it.
     let budget = if cfg!(target_os = "macos") {
         Duration::from_millis(4_500)
     } else {
         Duration::from_millis(1_200)
     };
-    assert!(
-        elapsed <= budget,
-        "thirty short custom status hooks should stay under the CI budget; elapsed={elapsed:?}, budget={budget:?}, stdout={:?}, stderr={:?}",
-        text(&output.stdout),
-        text(&output.stderr)
-    );
+    assert_ci_budget("thirty-hook list", budget, &output, &samples);
 
     // Seed the manifest outside the timed window. The performance contract is
     // for a warm current update, not thirty serial atomic manifest fsyncs.
     assert_success(&run(&mut fixture.command(["update"])));
 
-    let mut command = fixture.command(["-v", "update"]);
-    command.env("SHDEPS_JOBS", "1");
-    let (output, elapsed) = timed(&mut command);
+    // The seed above doubles as the warm run: every sample below repeats
+    // the same warm-current update, so each one evaluates all thirty hooks
+    // instead of measuring one-time loader or cache noise.
+    let (output, samples) = timed_samples(|| {
+        let mut command = fixture.command(["-v", "update"]);
+        command.env("SHDEPS_JOBS", "1");
+        command
+    });
 
-    assert_success(&output);
     assert_eq!(
         text(&output.stdout)
             .lines()
@@ -1806,18 +1815,15 @@ fn custom_hooks_stay_within_ci_budget() {
     // 50 ms polling delay alone adds about 1.2 seconds across these 30 serial
     // current hooks without folding manifest I/O into the budget. The macOS
     // figure covers supervised-hook reality plus loaded-runner noise
-    // (2.3-3.7 s observed); 2x blowups still trip it.
+    // (2.3-3.7 s observed); 2x blowups still trip it. The median over three
+    // samples absorbs one scheduler outlier (loaded Linux runners spike to
+    // ~1.4 s with identical code) while a persistent slowdown still trips it.
     let budget = if cfg!(target_os = "macos") {
         Duration::from_millis(4_500)
     } else {
         Duration::from_millis(1_200)
     };
-    assert!(
-        elapsed <= budget,
-        "thirty current custom hooks should stay under the CI budget; elapsed={elapsed:?}, budget={budget:?}, stdout={:?}, stderr={:?}",
-        text(&output.stdout),
-        text(&output.stderr)
-    );
+    assert_ci_budget("thirty-hook warm update", budget, &output, &samples);
 }
 
 #[test]
