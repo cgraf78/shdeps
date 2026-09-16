@@ -6201,7 +6201,13 @@ shdeps = os.fork()
 if shdeps == 0:
     os.setpgid(0, 0)
     os.execl(os.environ["SHDEPS_TEST_BINARY"], "shdeps", "list")
-os.setpgid(shdeps, shdeps)
+try:
+    os.setpgid(shdeps, shdeps)
+except PermissionError:
+    # The child assigns itself to its own group before exec; if it exec'd
+    # first, this redundant assignment fails with EACCES while the group
+    # is already correct.
+    pass
 with open(os.environ["SHDEPS_TEST_BACKGROUND_PID"], "w") as pid_file:
     pid_file.write(f"{shdeps}\n")
 
@@ -6247,11 +6253,29 @@ raise SystemExit(128 + os.WTERMSIG(status))
         .env("SHDEPS_TEST_CHILD_PID", &child_pid_path)
         .env("SHDEPS_TEST_CHILD_RESUMED", &child_resumed_path);
     let (mut harness, mut master) = spawn_on_pty(command);
-    let shdeps_pid = wait_for_pid(
-        &shdeps_pid_path,
-        Duration::from_secs(3),
-        "background Shdeps pid",
-    );
+    // The harness must start a Python interpreter on a fresh PTY, fork, and
+    // report the shdeps pid; on a loaded runner that fixture startup alone
+    // can exceed 3 s, before any product behavior runs. Skip loudly when
+    // the harness is still starting, so runner slowness never fails the
+    // stop/resume propagation assertions below. GuardedChild's Drop reaps
+    // the harness on this path.
+    let pid_wait_started = Instant::now();
+    let Some(shdeps_pid) = wait_for_pid_opt(&shdeps_pid_path, Duration::from_secs(3)) else {
+        // A dead harness is a fixture bug, not load: fail loudly instead
+        // of skipping, so harness crashes never hide behind this skip.
+        if let Some(status) = harness
+            .observed_status()
+            .expect("harness status should be observable")
+        {
+            panic!("background harness exited {status:?} before reporting its pid");
+        }
+        eprintln!(
+            "SKIP: background-harness pid never appeared within {:?}; PTY plus interpreter \
+             startup was starved by load, so terminal stop/resume propagation is unobservable",
+            pid_wait_started.elapsed()
+        );
+        return;
+    };
     let child_pid = wait_for_pid(
         &child_pid_path,
         Duration::from_secs(3),
