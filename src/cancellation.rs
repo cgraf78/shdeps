@@ -6192,6 +6192,39 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    static TEST_TERM_RECORD_FD: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+
+    // Records each delivery synchronously inside the handler: the exact-grace
+    // child may be frozen and reaped before it wakes to record, so the count
+    // file must observe delivery itself rather than post-signal survival.
+    // Only async-signal-safe operations here: one atomic bump plus one
+    // write(2) of the running total, keeping the outer last-line count
+    // meaning "deliveries" so duplicates still fail exactly-once loudly.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    extern "C" fn record_test_term(_signal: i32) {
+        let delivered = TEST_TERM_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let fd = TEST_TERM_RECORD_FD.load(std::sync::atomic::Ordering::SeqCst);
+        if fd >= 0 {
+            let mut digits = [0u8; 32];
+            let mut length = 0;
+            let mut remaining = delivered;
+            while remaining > 0 {
+                digits[length] = b'0' + (remaining % 10) as u8;
+                length += 1;
+                remaining /= 10;
+            }
+            digits[..length].reverse();
+            digits[length] = b'\n';
+            // SAFETY: fd is a live O_APPEND descriptor opened before this
+            // handler was installed; only this handler writes to it.
+            unsafe {
+                libc::write(fd, digits.as_ptr() as *const libc::c_void, length + 1);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn install_test_term_counter() {
         TEST_TERM_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: the handler has C ABI, touches only a lock-free atomic, and
@@ -6203,6 +6236,76 @@ mod tests {
             action.sa_flags = 0;
             assert_eq!(
                 libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    // Installs the recording handler and opens the count file it appends to.
+    // The caller must unblock SIGTERM after this returns: the leader spawns
+    // the child with TERM blocked (the mask is inherited across fork+exec),
+    // so a delivery racing handler installation pends instead of killing
+    // with the default disposition; unblocking then runs the pending
+    // delivery through this handler, which observes it even if SIGKILL
+    // follows before the child wakes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn install_test_term_recorder(count_path: &std::path::Path) {
+        use std::os::unix::io::IntoRawFd as _;
+
+        TEST_TERM_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(count_path)
+            .unwrap();
+        // The descriptor outlives this scope: the handler needs it until the
+        // role process exits or is reaped when the test finishes.
+        let fd = file.into_raw_fd();
+        TEST_TERM_RECORD_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: the handler has C ABI and touches only a lock-free atomic
+        // plus one write(2) to the pre-opened descriptor above.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_test_term as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = 0;
+            assert_eq!(
+                libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    // Blocks SIGTERM in the calling thread. The exact-grace leader holds
+    // this across its spawn so the child inherits a blocked mask; the
+    // leader's own mask is unblocked before the block, so unblocking after
+    // the spawn restores it exactly.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn block_test_term() {
+        // SAFETY: sigemptyset/sigaddset/pthread_sigmask only touch the local
+        // set and the calling thread's mask.
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTERM);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &block, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    // Unblocks SIGTERM in the calling thread. Any delivery that pended while
+    // blocked runs through the installed handler on return.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn unblock_test_term() {
+        // SAFETY: only clears SIGTERM in the calling thread's mask.
+        unsafe {
+            let mut unblock: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut unblock);
+            libc::sigaddset(&mut unblock, libc::SIGTERM);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut()),
                 0
             );
         }
@@ -8648,31 +8751,35 @@ sys.exit(0)
             let leader_count = std::path::PathBuf::from(std::env::var(LEADER_COUNT_ENV).unwrap());
             let child_ready = std::path::PathBuf::from(std::env::var(CHILD_READY_ENV).unwrap());
             let child_count = std::path::PathBuf::from(std::env::var(CHILD_COUNT_ENV).unwrap());
-            install_test_term_counter();
             if role == "child" {
+                // The handler records each delivery synchronously, so the
+                // count file observes the TERM even when the grace freeze
+                // reaps this child before it wakes. Install before
+                // unblocking: the inherited blocked mask pends any delivery
+                // racing installation, and unblocking runs it through the
+                // handler above.
+                install_test_term_recorder(&child_count);
                 std::fs::write(&child_ready, std::process::id().to_string()).unwrap();
-                while TEST_TERM_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                unblock_test_term();
+                // Linger until reaped so a duplicate delivery still lands in
+                // the count file; the outer stop() always escalates to KILL.
+                loop {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                let mut recorded = 0;
-                let deadline = Instant::now() + Duration::from_millis(100);
-                while Instant::now() < deadline {
-                    let count = TEST_TERM_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-                    if count != recorded {
-                        record_count(&child_count, count);
-                        recorded = count;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                return;
             }
 
+            install_test_term_counter();
             std::fs::write(&ready, std::process::id().to_string()).unwrap();
             while TEST_TERM_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let mut recorded = TEST_TERM_COUNT.load(std::sync::atomic::Ordering::SeqCst);
             record_count(&leader_count, recorded);
+            // Block SIGTERM across the spawn so the child inherits the mask:
+            // a delivery racing its handler installation pends instead of
+            // killing with the default disposition. Unblock right after so
+            // this leader keeps observing duplicate deliveries below.
+            block_test_term();
             let mut descendant = Command::new(std::env::current_exe().unwrap());
             descendant
                 .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
@@ -8685,6 +8792,7 @@ sys.exit(0)
                 reason = "the outer owned boundary reaps this intentionally inherited descendant"
             )]
             let _descendant = descendant.spawn().unwrap();
+            unblock_test_term();
             let child_deadline = Instant::now() + Duration::from_secs(2);
             while !child_ready.is_file() {
                 assert!(Instant::now() < child_deadline);
@@ -8735,6 +8843,11 @@ sys.exit(0)
         }
 
         child.stop(libc::SIGTERM).unwrap();
+        // No settle wait belongs here: stop() reaps the whole boundary
+        // before it returns, so both roles are already dead and their count
+        // files are final. The child records each delivery synchronously
+        // inside its TERM handler, which is what makes a late-grace
+        // delivery observable even when the freeze reaps it before it wakes.
         let count = |path: &std::path::Path| {
             std::fs::read_to_string(path)
                 .unwrap_or_default()
@@ -8748,7 +8861,8 @@ sys.exit(0)
         assert_eq!(
             count(&child_terms),
             1,
-            "handler-created child did not receive exactly one TERM"
+            "handler-created child did not receive exactly one TERM (child ready: {})",
+            child_ready.is_file()
         );
     }
 
