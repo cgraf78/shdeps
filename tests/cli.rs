@@ -1775,18 +1775,20 @@ fn custom_hooks_stay_within_ci_budget() {
     );
     assert_eq!(text(&output.stderr), "");
     // macOS process startup is materially slower, but a 50 ms polling
-    // regression still adds about 1.2 seconds across these 30 serial hooks.
+    // regression still adds about 1.5 seconds across these 30 serial hooks.
     // Supervised hooks (threads, lease, exit proof) cost ~78 ms each on
     // macOS versus ~36 ms on Linux, and loaded macOS runners swing the
     // thirty-hook total from 2.3 s to 3.7 s with identical code. The
     // budget covers that runner noise while still catching 2x blowups
     // like the pre-gate 4.6 s snapshot era. The median over three samples
-    // absorbs one scheduler outlier (loaded Linux runners spike to ~1.4 s
-    // with identical code) while a persistent slowdown still trips it.
+    // absorbs one scheduler outlier, but sustained load windows (Debian
+    // samples of 1.42 s and 1.90 s with identical code) defeat the median,
+    // so the Linux budget sits at 2.0 s: above observed load yet still
+    // below a 2x blowup (2.16 s) or a 50 ms per-hook regression (2.58 s).
     let budget = if cfg!(target_os = "macos") {
         Duration::from_millis(4_500)
     } else {
-        Duration::from_millis(1_200)
+        Duration::from_millis(2_000)
     };
     assert_ci_budget("thirty-hook list", budget, &output, &samples);
 
@@ -1812,16 +1814,18 @@ fn custom_hooks_stay_within_ci_budget() {
     );
     assert_eq!(text(&output.stderr), "");
     // Catch per-child whole-process discovery and exit-polling regressions; a
-    // 50 ms polling delay alone adds about 1.2 seconds across these 30 serial
+    // 50 ms polling delay alone adds about 1.5 seconds across these 30 serial
     // current hooks without folding manifest I/O into the budget. The macOS
     // figure covers supervised-hook reality plus loaded-runner noise
     // (2.3-3.7 s observed); 2x blowups still trip it. The median over three
-    // samples absorbs one scheduler outlier (loaded Linux runners spike to
-    // ~1.4 s with identical code) while a persistent slowdown still trips it.
+    // samples absorbs one scheduler outlier, but sustained load windows
+    // (Debian samples of 1.42 s and 1.90 s with identical code) defeat the
+    // median, so the Linux budget sits at 2.0 s: above observed load yet
+    // still below a 2x blowup (2.16 s) or a 50 ms per-hook delay (2.58 s).
     let budget = if cfg!(target_os = "macos") {
         Duration::from_millis(4_500)
     } else {
-        Duration::from_millis(1_200)
+        Duration::from_millis(2_000)
     };
     assert_ci_budget("thirty-hook warm update", budget, &output, &samples);
 }
