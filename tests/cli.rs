@@ -4825,12 +4825,20 @@ fn parent_signal_delivers_term_to_late_same_group_descendant() {
     // The late child survives TERM so the topology assertion below observes
     // a live process; teardown's KILL escalation (already required for the
     // TERM-ignoring leader) still reaps it before the final assertion.
+    //
+    // The child idles in the `wait` builtin rather than a foreground sleep.
+    // Shdeps signals each discovered PID, so the child's TERM need not reach
+    // its current sleep, and a shell defers a trap until the foreground
+    // command exits: a foreground sleep then needs three scheduling handoffs
+    // (sleep exit, shell reap, trap) before the TERM is recorded, which a
+    // loaded runner can push past the 250 ms grace. POSIX requires a trapped
+    // signal to interrupt `wait` immediately, leaving one handoff.
     fixture.write_executable(
         "fakebin/late-same-group-child",
         r#"#!/bin/sh
 trap 'printf term >"$SHDEPS_TEST_LATE_CHILD_TERM"' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_LATE_CHILD_PID"
-while :; do /bin/sleep 0.02; done
+while :; do /bin/sleep 1 & wait $!; done
 "#,
     );
     fixture.write_executable(
