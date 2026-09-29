@@ -863,9 +863,11 @@ mod tests {
     fn checked_in_dependency_example_uses_the_production_grammar() {
         let entries = parse_config_texts([include_str!("../examples/deps.conf")]);
 
-        assert_eq!(entries.len(), 20, "every active example name should parse");
+        assert_eq!(entries.len(), 22, "every active example name should parse");
         assert!(entries.contains(&"fd|pkg|apt:fdfind|apt:fd-find,dnf:fd-find".to_owned()));
         assert!(entries.contains(&"neovim/neovim|github:release|nvim".to_owned()));
+        assert!(entries.contains(&"cgraf78/ds|github".to_owned()));
+        assert!(entries.contains(&"prettier|npm".to_owned()));
         assert!(entries.contains(&"nerd-fonts|custom".to_owned()));
         assert!(entries.contains(&"openai/codex|github:release|-|-|host:nas".to_owned()));
         assert!(entries.contains(&"ast-grep|cargo|-|-|mgr:!brew,mgr:!pacman".to_owned()));

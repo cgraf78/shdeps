@@ -119,7 +119,9 @@ Commands:
   help                   Show this help message
 
 Options:
-  -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
+  -c, --config <path>   Config directory or file (default: $SHDEPS_CONF_DIR
+                        or ${XDG_CONFIG_HOME:-~/.config}/shdeps/); a path that
+                        is not a directory selects its parent
   -f, --force           Bypass TTL cache (check for updates now)
   -R, --reinstall       Force reinstall all dependencies (implies --force)
   -q, --quiet           Suppress non-result output and interactive prompts

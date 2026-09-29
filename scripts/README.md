@@ -12,6 +12,10 @@ in this directory.
 - `smoke-release.sh` checks an unpacked release archive.
 - `smoke-install-bash32.sh` verifies compatibility with older Bash installs.
 - `release.sh` composes the release helpers for local release preparation.
+- `release-lib.sh` is the shared release library sourced by the release
+  entry-point scripts.
+- `termux-ci.sh` runs the NDK-built Android binary inside Termux in CI and
+  verifies Android package policy.
 
 ## Expectations
 
