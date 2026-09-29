@@ -49,7 +49,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 
 | Variable             | Default                                            | Description                                                                                                |
 | -------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `SHDEPS_CONF_DIR`    | `~/.config/shdeps/` (CLI) or `./shdeps/` (library) | Config directory (all `*.conf` files loaded)                                                               |
+| `SHDEPS_CONF_DIR`    | `${XDG_CONFIG_HOME:-~/.config}/shdeps/`            | Config directory (all `*.conf` files loaded)                                                               |
 | `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                               | Post-install hooks                                                                                         |
 | `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`     | Cache/state dir                                                                                            |
 | `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache                                                                                           |
@@ -63,7 +63,7 @@ All behavior is controlled via environment variables (no hardcoded paths):
 | `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                                              |
 | `SHDEPS_LUA_DIR`     | `~/.local/lib/shdeps`                              | Installer-owned stable link to the active Shdeps Lua API tree                                              |
 | `SHDEPS_LOG_LEVEL`   | `1`                                                | Logging: 0=quiet, 1=normal, 2=verbose                                                                      |
-| `SHDEPS_JOBS`        | auto (`nproc`)                                     | Max concurrent read-only probes. Explicit values win; `1` = sequential.                                    |
+| `SHDEPS_JOBS`        | auto (`nproc`)                                     | Max concurrent probes and parallel non-package installs (`github*`, `cargo`, `go`, `uv`, `npm`). Explicit values win; `1` = sequential. |
 | `SHDEPS_STATE_LOCK_TIMEOUT_SECS` | `1800`                                | Max seconds a mutating command waits for another live `update`/`prune` holder before failing with metadata. |
 | `SHDEPS_CHECKOUT_LOCK_TIMEOUT_SECS` | `1800`                             | Max seconds a `github:repo` mutation waits for the shared installer/Shdeps checkout lock; strict nonnegative decimal, at most 9 digits. |
 
@@ -200,9 +200,14 @@ Run the test suite:
 
 ```bash
 cargo test --locked
+tests/shell/helpers-test
 tests/shell/install-sh-test
 tests/shell/install-interruption-test
+tests/shell/completion-test
+tests/shell/examples-test
 tests/shell/installer-flow-test
+tests/shell/lua-api-test
+tests/shell/lua-bootstrap-test
 tests/shell/release-scripts-test
 SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
 ```

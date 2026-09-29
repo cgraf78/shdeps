@@ -7,6 +7,7 @@
 #   version()  — print version string to stdout. Optional.
 #   install()  — perform the install unconditionally. Return 0 on success.
 #   post()     — optional post-install setup (runs if dep changed).
+#   uninstall() — optional cleanup called by `shdeps prune`.
 #
 # shdeps calls exists() to decide whether to run install(), and uses
 # version() for the status line. Hook authors don't need to check
@@ -18,11 +19,12 @@
 # Public API available to hooks:
 #   $1                    Dependency name (passed to all hook functions)
 #   shdeps_log            Normal log line
-#   shdeps_warn           Warning (always shown unless quiet)
-#   shdeps_log_ok         Success highlight
-#   shdeps_log_dim        Dimmed / low-importance line
-#   shdeps_log_header     Section header
-#   shdeps_pkg_mgr        Detected package manager (brew/apt/dnf/pacman/"")
+#   shdeps_warn           Warning line on stderr
+#   shdeps_log_ok         Alias of shdeps_log (no extra styling)
+#   shdeps_log_dim        Alias of shdeps_log (no extra styling)
+#   shdeps_log_header     Alias of shdeps_log (no extra styling)
+#   shdeps_pkg_mgr        Detected package manager
+#                         (brew/apt/dnf/pacman/zypper/apk/"")
 #   shdeps_force          Returns 0 if force mode is active (TTL bypass)
 #   shdeps_reinstall      Returns 0 if reinstall mode is active
 #   shdeps_platform       Normalized platform name (linux, macos, wsl)

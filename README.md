@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-%3E%3D1.85-orange.svg)](https://www.rust-lang.org/)
 [![Bash API](https://img.shields.io/badge/bash%20API-%3E%3D4.3-blue.svg)](https://www.gnu.org/software/bash/)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20Android-lightgrey.svg)](#)
 
 Declare your shell tools in one config file. shdeps installs and updates them everywhere — brew, apt, dnf, pacman, zypper, apk, GitHub repos, or GitHub release binaries. One manifest, any machine.
 
@@ -16,7 +16,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 
 - **Declarative config** — one line per dependency in `*.conf` files
 - **Multiple install methods** — system packages (brew/apt/dnf/pacman/zypper/apk), automatic GitHub release/repo selection, explicit GitHub repos, explicit GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), Node.js CLI tools (`npm install -g`), or fully custom hooks
-- **Cross-platform** — Linux, macOS, WSL with `os:`, `host:`, and `mgr:` filtering per dep
+- **Cross-platform** — Linux, macOS, WSL, and Android (Termux) with `os:`, `host:`, and `mgr:` filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
 - **TTL-based caching** — avoids redundant network calls
@@ -47,7 +47,7 @@ shdeps and one of the established tools below, this section should help.
 - You want **one config file** that says "install `jq`, `fzf`, `ripgrep`, `neovim` everywhere" and shdeps figures out whether that means `brew`, `apt`, a GitHub release archive, or a Cargo crate on each host.
 - You write Bash dotfiles or hooks and want `source shdeps.sh` to give you `shdeps_update`, `shdeps_dep_source`, `shdeps_platform`, `shdeps_pkg_mgr`, etc. — so your `.bashrc` can both *install* and *use* tools without forking shells.
 - You're comfortable with "latest stable" semantics. shdeps does not pin tool versions, and that is a deliberate design choice — pinning would conflict with `pkg`-installed tools whose version is the distro's call.
-- You want custom escape hatches: any tool that doesn't fit `pkg`/`github*`/`cargo`/`go`/`uv`/`npm` gets a `custom` method with a 4-function Bash hook (`exists`/`version`/`install`/`uninstall`) and shdeps treats it as a first-class entry.
+- You want custom escape hatches: any tool that doesn't fit `pkg`/`github*`/`cargo`/`go`/`uv`/`npm` gets a `custom` method with a 5-function Bash hook (`exists`/`version`/`install`/`post`/`uninstall`) and shdeps treats it as a first-class entry.
 
 ### Pick something else when
 
@@ -85,7 +85,7 @@ EOF
 shdeps update
 ```
 
-The CLI loads all `*.conf` files from `~/.config/shdeps/` (sorted alphabetically). Split deps across multiple files for organization (e.g., `00-core.conf`, `50-tools.conf`, `99-local.conf`). The Bash API (`source shdeps.sh`) defaults to `./shdeps/`.
+The CLI and the Bash API (`source shdeps.sh`) load all `*.conf` files (sorted alphabetically) from `$SHDEPS_CONF_DIR`, defaulting to `${XDG_CONFIG_HOME:-~/.config}/shdeps/`. Split deps across multiple files for organization (e.g., `00-core.conf`, `50-tools.conf`, `99-local.conf`).
 
 ### Updating shdeps
 
@@ -148,7 +148,7 @@ that recorded owner and same-name updates refresh stale rows.
 
 | Variable             | Default                                                 | Description                                                                                                                                                                           |
 | -------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SHDEPS_CONF_DIR`    | `~/.config/shdeps/` (CLI) or `./shdeps/` (Bash API)     | Config directory (all `*.conf` files loaded)                                                                                                                                          |
+| `SHDEPS_CONF_DIR`    | `${XDG_CONFIG_HOME:-~/.config}/shdeps/`                 | Config directory (all `*.conf` files loaded)                                                                                                                                          |
 | `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                                    | Post-install hooks directory                                                                                                                                                          |
 | `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`          | Cache/state directory                                                                                                                                                                 |
 | `SHDEPS_FORCE`       | `0`                                                     | Bypass TTL cache (check for updates now)                                                                                                                                              |
@@ -162,7 +162,7 @@ that recorded owner and same-name updates refresh stale rows.
 | `SHDEPS_BIN_DIR`     | `~/.local/bin`                                          | Directory for binary symlinks and raw `github:release` binaries                                                                                                                       |
 | `SHDEPS_LUA_DIR`     | `~/.local/lib/shdeps`                                   | Installer-owned stable link to the active Shdeps Lua API tree                                                                                                                         |
 | `SHDEPS_LOG_LEVEL`   | `1`                                                     | 0=quiet, 1=normal, 2=verbose                                                                                                                                                          |
-| `SHDEPS_JOBS`        | auto (`nproc`)                                          | Max concurrent read-only probes. Explicit values win; `1` = sequential.                                                                                                               |
+| `SHDEPS_JOBS`        | auto (`nproc`)                                          | Max concurrent probes and parallel non-package installs (`github*`, `cargo`, `go`, `uv`, `npm`). Explicit values win; `1` = sequential.                                               |
 | `SHDEPS_STATE_LOCK_TIMEOUT_SECS` | `1800`                                      | Max seconds a mutating command waits for another live `shdeps update`/`prune` holder before failing with lock metadata.                                                               |
 | `SHDEPS_CHECKOUT_LOCK_TIMEOUT_SECS` | `1800`                                   | Max seconds a `github:repo` mutation waits for the shared installer/Shdeps checkout lock. Values use the strict v1 grammar: a nonnegative decimal integer of at most 9 digits.          |
 
@@ -334,7 +334,7 @@ tokei     cargo
 
 The `name` field is the crate name. Override `cmd` when the crate installs a binary with a different name (e.g., the `ripgrep` crate installs `rg`). `--reinstall` passes `--force` to cargo.
 
-Requires `cargo` on `$PATH`. If absent, shdeps warns once at startup and skips all cargo deps.
+Requires `cargo` on `$PATH`. If it is absent and no active `pkg` dep has `cargo` as its command, `shdeps update` exits with status 1 before installing any dependency (the TTL-gated shdeps self-update check may already have run).
 
 ### `go` — Go Modules
 
@@ -348,7 +348,7 @@ github.com/charmbracelet/gum        go    gum
 
 The `name` field is the full Go module path (including any `cmd/...` subpath). `cmd` defaults to the basename of the module path.
 
-Requires `go` on `$PATH`. If absent, shdeps warns once at startup and skips all go deps.
+Requires `go` on `$PATH`. If it is absent and no active `pkg` dep has `go` as its command, `shdeps update` exits with status 1 before installing any dependency (the TTL-gated shdeps self-update check may already have run).
 
 ### `uv` — Python CLI Tools
 
@@ -363,7 +363,7 @@ poetry    uv
 
 The `name` field is the PyPI package name. Override `cmd` when the package's executable name differs from the package name. `--reinstall` passes `--force` to `uv tool install`.
 
-Requires `uv` on `$PATH` (install via `pipx install uv`, `brew install uv`, or [Astral's installer](https://docs.astral.sh/uv/getting-started/installation/)). If absent, shdeps warns once at startup and skips all uv deps.
+Requires `uv` on `$PATH` (install via `pipx install uv`, `brew install uv`, or [Astral's installer](https://docs.astral.sh/uv/getting-started/installation/)). If it is absent and no active `pkg` dep has `uv` as its command, `shdeps update` exits with status 1 before installing any dependency (the TTL-gated shdeps self-update check may already have run).
 
 ### `npm` — Node CLI Packages
 
@@ -376,7 +376,7 @@ typescript   npm   tsc
 
 The `name` field is the npm package name. Override `cmd` when the package's executable name differs from the package name.
 
-Requires `npm` on `$PATH`. If absent, shdeps warns once at startup and skips all npm deps.
+Requires `npm` on `$PATH`. If it is absent and no active `pkg` dep has `npm` as its command, `shdeps update` exits with status 1 before installing any dependency (the TTL-gated shdeps self-update check may already have run).
 
 ### `custom` — Hook-Only
 
@@ -443,7 +443,7 @@ Usage: shdeps [options] <command> [args]
 
 Commands:
   update                 Install/update all dependencies
-  self-update            Update shdeps itself (git pull, skips dirty trees)
+  self-update            Update shdeps itself
   list                   List all configured dependencies with status
   check <name>           Check if a specific dependency is installed
   dep-root <name>        Print a configured dependency root directory
@@ -455,7 +455,9 @@ Commands:
   help                   Show this help message
 
 Options:
-  -c, --config <path>   Config directory or file (default: ~/.config/shdeps/)
+  -c, --config <path>   Config directory or file (default: $SHDEPS_CONF_DIR
+                        or ${XDG_CONFIG_HOME:-~/.config}/shdeps/); a path that
+                        is not a directory selects its parent
   -f, --force           Bypass TTL cache (check for updates now)
   -R, --reinstall       Force reinstall all dependencies (implies --force)
   -q, --quiet           Suppress non-result output and interactive prompts
@@ -471,7 +473,6 @@ Examples:
   shdeps --force update
   shdeps list
   shdeps check jq
-  shdeps dep-links cgraf78/sley
   shdeps prune --dry-run
   shdeps prune -y
 
@@ -550,7 +551,7 @@ exists; this Bash section documents the shell-facing contract specifically.
 | Function                          | Description                                                                                 |
 | --------------------------------- | ------------------------------------------------------------------------------------------- |
 | `shdeps_update`                   | Install/update all dependencies                                                             |
-| `shdeps_self_update [dir]`        | Update shdeps itself (git pull, skips dirty trees)                                          |
+| `shdeps_self_update`              | Update shdeps itself (latest release archive, or `git pull --ff-only` for source checkouts, skipping dirty trees); takes no arguments |
 | `shdeps_prune [-y] [--dry-run]`   | Remove orphaned deps no longer in config                                                    |
 | `shdeps_load`                     | Parse config and return dep count                                                           |
 | `shdeps_version`                  | Print version string                                                                        |
@@ -573,13 +574,22 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_dep_source <name> <rel>`  | Source an existing dependency asset into the current Bash process                           |
 | `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir                          |
 | `shdeps_unlink_extras <name>`     | Remove all extras symlinks tracked for a dep                                                |
+| `shdeps_github_release_install <name> <cmd> [repo] [bin-path]` | Install one GitHub release binary for `<name>` (default repo `<name>`, default path `$SHDEPS_BIN_DIR/<cmd>`) |
+| `shdeps_mark_changed <name>`      | Mark a dep as changed during the current `shdeps update` so its `post()` hook runs; no-op outside an update |
+| `shdeps_skip <dep> [reason]`      | Record a `.skipped` marker (with optional reason) under the dep's install dir               |
+| `shdeps_skipped <dep>`            | Return 0 if the dep is marked skipped                                                       |
+| `shdeps_skip_reason <dep>`        | Print the recorded skip reason; returns 1 if not skipped                                    |
+| `shdeps_unskip <dep>`             | Remove the skip marker                                                                      |
+| `shdeps_find_runtime [--path DIR]... [--reject SUBSTR] [--verify] <name>...` | For each name in order, print the first qualifying executable in the `--path` dirs, then `$PATH`; returns 1 if none |
+| `shdeps_write_wrapper [--env VAR=value]... <name> <interp> [args...] -- <payload>` | Write an executable `$SHDEPS_BIN_DIR/<name>` that execs `<interp> <args...> <payload> "$@"`; prints its path |
 | `shdeps_require_sudo`             | Acquire sudo; returns 0 if root or sudo obtained                                            |
 | `shdeps_curl <curl-args...>`       | Run curl with bounded connect/stall handling and transient retries                          |
 | `shdeps_log`                      | Normal log line                                                                             |
-| `shdeps_warn`                     | Warning (always shown unless quiet)                                                         |
-| `shdeps_log_ok`                   | Success highlight                                                                           |
-| `shdeps_log_dim`                  | Dimmed / low-importance line                                                                |
-| `shdeps_log_header`               | Section header                                                                              |
+| `shdeps_warn`                     | Warning line on stderr                                                                      |
+| `shdeps_log_warn`                 | Alias of `shdeps_warn`                                                                      |
+| `shdeps_log_ok`                   | Alias of `shdeps_log` (no extra styling)                                                    |
+| `shdeps_log_dim`                  | Alias of `shdeps_log` (no extra styling)                                                    |
+| `shdeps_log_header`               | Alias of `shdeps_log` (no extra styling)                                                    |
 
 `shdeps_require_sudo` first checks root or cached credentials with
 `sudo -n`. The initial mutating hook attempt runs in a detached session with a
@@ -727,9 +737,14 @@ static archive.
 
 ```bash
 cargo test --locked
+tests/shell/helpers-test
 tests/shell/install-sh-test
 tests/shell/install-interruption-test
+tests/shell/completion-test
+tests/shell/examples-test
 tests/shell/installer-flow-test
+tests/shell/lua-api-test
+tests/shell/lua-bootstrap-test
 tests/shell/release-scripts-test
 SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
 ```

@@ -8,6 +8,10 @@ around the Rust `shdeps` core.
 - `helpers.sh` owns shared fixture setup and assertions.
 - `helpers-test` verifies shared temporary fixtures are reclaimed at exit.
 - `install-sh-test` covers `install.sh`, including sourceable bootstrap mode.
+- `install-interruption-test` covers interruption-safe release activation in
+  `install.sh`.
+- `completion-test` covers the shell completion scripts.
+- `examples-test` exercises the checked-in `examples/` hook and Lua resolver.
 - `installer-flow-test` exercises end-to-end install/update flows.
 - `lua-api-test` and `lua-bootstrap-test` cover the Lua API and install
   discovery behavior.
@@ -29,7 +33,9 @@ The full shell suite used by CI is:
 ```sh
 tests/shell/helpers-test
 tests/shell/install-sh-test
+tests/shell/install-interruption-test
 tests/shell/completion-test
+tests/shell/examples-test
 tests/shell/installer-flow-test
 tests/shell/lua-api-test
 tests/shell/lua-bootstrap-test

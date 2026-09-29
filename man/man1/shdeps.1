@@ -1,4 +1,4 @@
-.TH SHDEPS 1 "2026-04-16" "shdeps 0.5.0" "User Commands"
+.TH SHDEPS 1 "2026-09-29" "shdeps" "User Commands"
 .SH NAME
 shdeps \- declarative shell dependency manager
 .SH SYNOPSIS
@@ -11,11 +11,12 @@ shdeps \- declarative shell dependency manager
 reads declarative config files and installs or updates shell tools via
 system package managers, GitHub repos, GitHub release binaries,
 Rust crates (\fBcargo install\fR), Go modules (\fBgo install\fR),
-Python CLI tools (\fBuv tool install\fR), or fully custom hooks.
+Python CLI tools (\fBuv tool install\fR), Node.js CLI packages
+(\fBnpm install \-g\fR), or fully custom hooks.
 Dependencies are declared in
 .B *.conf
 files within a config directory (default:
-.IR ~/.config/shdeps/ ).
+.IR \%${XDG_CONFIG_HOME:\-~/.config}/shdeps/ ).
 .SH COMMANDS
 .TP
 .B update
@@ -71,9 +72,11 @@ Show the built-in help message.
 .TP
 .BR \-c ", " \-\-config " " \fIpath\fR
 Config directory or file.
-If a file is given, its parent directory is used.
+A path that is not an existing directory selects its parent directory.
 Default:
-.IR ~/.config/shdeps/ .
+.B $SHDEPS_CONF_DIR
+or
+.IR \%${XDG_CONFIG_HOME:\-~/.config}/shdeps/ .
 .TP
 .BR \-f ", " \-\-force
 Bypass the TTL cache and check for updates immediately.
@@ -113,11 +116,13 @@ are comments.
 jq                pkg
 bat               pkg              apt:batcat
 fd                pkg              apt:fdfind       apt:fd-find,dnf:fd-find
+cgraf78/sley      github
 cgraf78/ds        github:repo
 neovim/neovim     github:release   nvim
 ripgrep           cargo            rg
 github.com/junegunn/fzf             go
 ruff              uv
+prettier          npm
 dust              pkg              \-               \-                       os:macos
 htop              pkg              \-               \-                       host:nas
 nerd-fonts        custom
@@ -129,7 +134,8 @@ nerd-fonts        custom
 Required.
 Identifier for the dependency.
 For
-.B github:repo
+.BR github ,
+.BR github:repo ,
 and
 .B github:release
 methods, this is the GitHub
@@ -146,11 +152,14 @@ this is the crate name.
 For
 .BR uv ,
 this is the PyPI package name.
+For
+.BR npm ,
+this is the npm package name.
 .TP
 .B method
 Required.
 One of
-.BR pkg ", " github:repo ", " github:release ", " cargo ", " go ", " uv ", or " custom .
+.BR pkg ", " github ", " github:repo ", " github:release ", " cargo ", " go ", " uv ", " npm ", or " custom .
 .TP
 .B cmd
 Command name to check for.
@@ -215,6 +224,16 @@ On first adoption, and whenever the manager, package alias, or command changes,
 Shdeps verifies package-manager ownership even if the command already exists.
 A durable proof preserves the command-only fast path on later healthy updates.
 .TP
+.B github
+Resolves to
+.B github:release
+when the latest stable release has a compatible asset for the current host and
+command; otherwise falls back to
+.BR github:repo .
+The manifest and
+.B shdeps list
+record only the resolved concrete method.
+.TP
 .B github:repo
 Clones from GitHub (the
 .B name
@@ -273,6 +292,16 @@ Requires
 on
 .BR $PATH .
 .TP
+.B npm
+Installs Node.js CLI packages via
+.BR "npm install \-g \-\-prefix $SHDEPS_INSTALL_DIR/<name> <pkg>" .
+The binary is symlinked into
+.BR $SHDEPS_BIN_DIR .
+Requires
+.B npm
+on
+.BR $PATH .
+.TP
 .B custom
 Hook-only.
 Requires
@@ -280,6 +309,19 @@ Requires
 and
 .B install()
 functions in the hook file.
+.PP
+For
+.BR cargo ,
+.BR go ,
+.BR uv ,
+and
+.BR npm ,
+if the required tool is absent and no active
+.B pkg
+dependency has that tool as its command,
+.B shdeps update
+exits with status 1 before installing any dependency
+(the TTL-gated shdeps self-update check may already have run).
 .SH HOOKS
 Hook files are sourced from
 .IB $SHDEPS_HOOKS_DIR / name .sh
@@ -307,7 +349,7 @@ Runs after any method if the dependency changed.
 Cleanup during
 .BR "shdeps prune" .
 For custom deps this is the only cleanup path.
-For github:repo/github:release deps it runs before built-in cleanup.
+For other methods it runs before built-in cleanup.
 .SH EXTRAS LINKING
 For
 .B github:repo
@@ -331,12 +373,13 @@ Tracked per-dep in
 shdeps ships a Lua module at
 .I lua/shdeps.lua
 inside the shdeps root.
-In a source checkout this is commonly
-.IR ~/git/shdeps/lua/shdeps.lua ;
-in a release install it is
-.IR $SHDEPS_DIR/lua/shdeps.lua
-(default:
-.IR ~/.local/share/shdeps/lua/shdeps.lua ).
+Installer activation publishes that
+.I lua/
+tree through the stable
+.B $SHDEPS_LUA_DIR
+link (default:
+.IR ~/.local/lib/shdeps ),
+which points at the active source, developer, or release tree.
 The sibling
 .I lua/shdeps/
 modules are part of the same public release artifact.
@@ -347,7 +390,7 @@ configuration itself.
 .PP
 .RS
 .nf
-local shdeps = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps.lua")
+local shdeps = dofile(os.getenv("HOME") .. "/.local/lib/shdeps/shdeps.lua")
 local api = shdeps.new({ home = os.getenv("HOME") })
 local setup = api.dep_file("cgraf78/termnav", "lib/termnav/nvim/setup.lua")
 local env = api.env()
@@ -357,12 +400,14 @@ local env = api.env()
 Lua hosts that start before shell init has normalized
 .B PATH
 can load
-.I lua/shdeps/bootstrap.lua
-from any known shdeps root:
+.I shdeps/bootstrap.lua
+from the stable
+.B $SHDEPS_LUA_DIR
+tree:
 .PP
 .RS
 .nf
-local bootstrap = dofile(os.getenv("HOME") .. "/.local/share/shdeps/lua/shdeps/bootstrap.lua")
+local bootstrap = dofile(os.getenv("HOME") .. "/.local/lib/shdeps/shdeps/bootstrap.lua")
 local shdeps = bootstrap.load({ home = os.getenv("HOME") })
 local api = shdeps.new({ home = os.getenv("HOME") })
 .fi
@@ -418,10 +463,7 @@ environment variables, and the bootstrap file's own root.
 .B SHDEPS_CONF_DIR
 Config directory.
 Default:
-.I ~/.config/shdeps/
-(CLI) or
-.I ./shdeps/
-(library mode).
+.IR \%${XDG_CONFIG_HOME:\-~/.config}/shdeps/ .
 .TP
 .B SHDEPS_HOOKS_DIR
 Hooks directory.
@@ -431,7 +473,7 @@ Default:
 .B SHDEPS_STATE_DIR
 State and cache directory.
 Default:
-.IR $XDG_STATE_HOME/shdeps .
+.IR \%${XDG_STATE_HOME:\-~/.local/state}/shdeps .
 .TP
 .B SHDEPS_FORCE
 Set to
@@ -479,8 +521,21 @@ Directory for symlinks to installed binaries.
 Default:
 .IR ~/.local/bin .
 .TP
+.B SHDEPS_LUA_DIR
+Installer-owned stable link to the active shdeps Lua API tree.
+Default:
+.IR ~/.local/lib/shdeps .
+.TP
 .B SHDEPS_LOG_LEVEL
 Logging verbosity: 0=quiet, 1=normal, 2=verbose.
+.TP
+.B SHDEPS_JOBS
+Maximum concurrent jobs for read-only probes and parallel non-package installs
+.RB ( github* ", " cargo ", " go ", " uv ", " npm ).
+Explicit positive values win;
+.B 1
+runs sequentially.
+Default: host CPU parallelism (GitHub API reads cap the automatic value at 4).
 .TP
 .B SHDEPS_STATE_LOCK_TIMEOUT_SECS
 Maximum seconds a mutating command waits for another live
@@ -488,6 +543,13 @@ Maximum seconds a mutating command waits for another live
 or
 .B shdeps prune
 state lock holder before failing with lock metadata.
+Default: 1800.
+.TP
+.B SHDEPS_CHECKOUT_LOCK_TIMEOUT_SECS
+Maximum seconds a
+.B github:repo
+mutation or prune waits for the shared installer/shdeps checkout lock.
+Values must be nonnegative decimal integers of at most 9 digits.
 Default: 1800.
 .SH EXIT STATUS
 .TP
@@ -499,13 +561,18 @@ Error (dependency not found, install failure, etc.).
 .TP
 .B 2
 Usage error (unknown command or missing argument).
+.TP
+.BI 128+ N
+Interrupted by signal
+.I N
+after owned subprocess cleanup.
 .SH FILES
 .TP
-.I ~/.config/shdeps/*.conf
+.I \%${XDG_CONFIG_HOME:\-~/.config}/shdeps/*.conf
 Default config files.
 .TP
-.I ~/.config/shdeps/hooks.d/*.sh
-Hook scripts.
+.I \%${XDG_CONFIG_HOME:\-~/.config}/shdeps/hooks.d/*.sh
+Default hook scripts.
 .TP
 .I $SHDEPS_STATE_DIR/manifest
 Installed dependency manifest.
