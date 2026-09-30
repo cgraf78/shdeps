@@ -658,6 +658,9 @@ where
         };
         progress.finish(&summary, &entries, footer.as_deref())?;
         drop(progress);
+        // A live terminal view always shows the warning; only the record is
+        // kept current here.
+        record_deferred_posts(&roots.state_dir, &summary);
         write_update_terminal_summary(
             &summary,
             &entries,
@@ -732,9 +735,12 @@ where
                 update_lock.take().expect("update lock is consumed once"),
             )?;
             crate::cancellation::check()?;
+            // Keep the record current (so a later text-mode run announces a
+            // recurrence) but always emit the event: the consumer decides.
+            record_deferred_posts(&roots.state_dir, &summary);
             summary
         } else {
-            let summary = update::run_locked(
+            let mut summary = update::run_locked(
                 &entries,
                 &manifest,
                 &context,
@@ -742,6 +748,8 @@ where
                 update_lock.take().expect("update lock is consumed once"),
             )?;
             crate::cancellation::check()?;
+            summary.deferred_posts_already_announced =
+                !record_deferred_posts(&roots.state_dir, &summary);
             write_update_summary(
                 &summary,
                 &entries,
@@ -1718,6 +1726,14 @@ where
         return Ok(1);
     }
     if detected.orphans.is_empty() {
+        // Nothing is deferred any more (for example the dep was re-added to
+        // config), so a later recurrence must be announced again.
+        crate::deferral_notice::record(
+            &roots.state_dir,
+            crate::deferral_notice::Kind::Uninstalls,
+            &[],
+            false,
+        );
         if !prune_options.quiet {
             writeln!(stdout, "No orphaned deps found.")?;
         }
@@ -1729,6 +1745,27 @@ where
 
     write_prune_orphans(&detected.orphans, false, stdout)?;
     if prune_options.dry_run {
+        // Unattended runs announce a deferral once; show it here every time
+        // so the state stays discoverable.
+        let deferred = crate::deferral_notice::recorded(
+            &roots.state_dir,
+            crate::deferral_notice::Kind::Uninstalls,
+        );
+        for orphan in detected
+            .orphans
+            .iter()
+            .filter(|orphan| deferred.contains(&orphan.name))
+        {
+            write_row(
+                stdout,
+                "detail",
+                &format!(
+                    "{}: uninstall deferred -- {}; run `shdeps prune` from a terminal",
+                    orphan.name,
+                    update::SUDO_NO_TERMINAL
+                ),
+            )?;
+        }
         writeln!(stdout, "Dry run — nothing removed.")?;
         return Ok(0);
     }
@@ -1757,7 +1794,21 @@ where
     )?;
     crate::cancellation::check()?;
     write_prune_results(&summary.removed, stdout, stderr)?;
-    if let Some(warning) = summary.deferred_warning() {
+    let deferred = summary
+        .removed
+        .iter()
+        .filter(|item| item.hook_deferred())
+        .map(|item| item.entry.name.clone())
+        .collect::<Vec<_>>();
+    // Without a terminal (cron) repeat the warning only when the deferred set
+    // gains an entry; `prune --dry-run` keeps showing it on demand.
+    let announce = crate::deferral_notice::record(
+        &roots.state_dir,
+        crate::deferral_notice::Kind::Uninstalls,
+        &deferred,
+        process::controlling_terminal(),
+    );
+    if let Some(warning) = summary.deferred_warning().filter(|_| announce) {
         writeln!(stderr, "  warning: {warning}")?;
     }
     Ok(if summary.has_errors() { 1 } else { 0 })
@@ -2300,11 +2351,25 @@ where
     Ok(())
 }
 
+/// Records this run's deferred posts and reports whether a text renderer
+/// should announce them (see `deferral_notice`).
+fn record_deferred_posts(state_dir: &Path, summary: &update::Summary) -> bool {
+    crate::deferral_notice::record(
+        state_dir,
+        crate::deferral_notice::Kind::Posts,
+        &summary.deferred_posts,
+        process::controlling_terminal(),
+    )
+}
+
 /// Writes the one-line warning for post hooks deferred until sudo can prompt.
 fn write_deferred_posts_warning<E>(summary: &update::Summary, stderr: &mut E) -> Result<()>
 where
     E: Write,
 {
+    if summary.deferred_posts_already_announced {
+        return Ok(());
+    }
     if let Some(warning) = summary.deferred_posts_warning() {
         write_row(stderr, "warning", &warning)?;
     }

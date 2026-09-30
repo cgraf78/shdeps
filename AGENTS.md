@@ -143,7 +143,9 @@ and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
   hook keeps the manifest row and built-in payload for the next prune to
   retry, and prune exits 1; a hook that succeeded is recorded and not rerun.
   A hook that needs sudo when prune has no terminal is deferred instead: no
-  `sudo` runs, the row is kept, one warning is printed, and prune exits 0.
+  `sudo` runs, the row is kept, one warning is printed (without a terminal,
+  only when the deferred set changes; `prune --dry-run` always shows it), and
+  prune exits 0.
 
 ### Hook helper toolkit
 

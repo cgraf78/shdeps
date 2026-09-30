@@ -275,6 +275,11 @@ pub struct Summary {
     /// fallback may have failed instead); keeping the hook's own detail in
     /// the warning stops the deferral from hiding a different failure.
     pub deferred_details: BTreeMap<String, String>,
+    /// Set by the CLI when a run without a terminal finds a deferred set an
+    /// earlier run already announced; text renderers then omit the warning
+    /// line so cron is not mailed about unchanged state. Counts and JSONL
+    /// events are unaffected.
+    pub deferred_posts_already_announced: bool,
     /// Dependencies whose old-method cleanup needs a later retry.
     ///
     /// Method-transition cleanup runs after the new method has been recorded.

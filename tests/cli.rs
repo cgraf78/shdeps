@@ -3650,6 +3650,45 @@ fn update_defers_retained_sudo_posts_without_a_terminal() {
 }
 
 #[test]
+fn unattended_update_announces_a_deferred_post_once_per_state() {
+    let fixture = custom_sudo_fixture("post-sudo-deferred-once", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+    let deferred_lines = |output: &Output| {
+        text(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count()
+    };
+
+    let first = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+    let second = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&first);
+    assert_success(&second);
+    assert_eq!(deferred_lines(&first), 1, "{first:?}");
+    assert_eq!(
+        deferred_lines(&second),
+        0,
+        "unchanged state must stay quiet: {second:?}"
+    );
+    // The non-quiet summary still counts it, so the state stays visible.
+    assert!(text(&second.stdout).contains("1 warning"), "{second:?}");
+    // Machine-readable consumers always get the event and decide for
+    // themselves (dot suppresses notes in quiet mode).
+    let machine = run_without_terminal(
+        custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"),
+    );
+    assert_eq!(
+        jsonl(&machine.stdout)
+            .iter()
+            .filter(|event| event["event"] == "warning")
+            .count(),
+        1,
+        "{machine:?}"
+    );
+}
+
+#[test]
 fn update_reports_deferred_sudo_post_as_a_jsonl_warning_then_recovers_on_a_terminal() {
     let fixture = custom_sudo_fixture("post-sudo-no-terminal-jsonl", &["tool"]);
     write_retained_sudo_post(&fixture, &["tool"]);
@@ -3825,6 +3864,62 @@ fn prune_defers_sudo_uninstall_without_a_terminal() {
     let output = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
 
     assert_prune_deferred(&fixture, &output);
+}
+
+#[test]
+fn unattended_prune_announces_a_deferred_uninstall_once_per_state() {
+    // Cron prunes every 30 minutes; repeating the same warning on stderr
+    // mails the owner ~48 times a day about unchanged, expected state.
+    let fixture = custom_sudo_fixture("custom-uninstall-deferred-once", &["tool"]);
+    write_sudo_uninstall_orphan(&fixture);
+    let deferred_lines = |output: &Output| {
+        text(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count()
+    };
+
+    let first = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+    let second = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+
+    assert_success(&first);
+    assert_success(&second);
+    assert_eq!(deferred_lines(&first), 1, "{first:?}");
+    assert_eq!(
+        deferred_lines(&second),
+        0,
+        "unchanged state must stay quiet: {second:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+
+    // The state stays discoverable on demand.
+    let dry_run = run_without_terminal(&mut custom_sudo_command(
+        &fixture,
+        ["prune", "--dry-run", "-y"],
+    ));
+    assert_success(&dry_run);
+    assert!(
+        text(&dry_run.stdout)
+            .lines()
+            .any(|line| line.contains("tool") && line.contains("deferred")),
+        "{dry_run:?}"
+    );
+
+    // An interactive prune removes the orphan and clears the record ...
+    let interactive = run_on_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+    assert_success(&interactive);
+    assert!(fixture.dir.join("state/tool-uninstalled").is_file());
+
+    // ... so a later recurrence is announced again.
+    fs::remove_file(fixture.dir.join("state/tool-uninstalled")).unwrap();
+    fs::remove_file(fixture.dir.join("sudo-cache")).unwrap();
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+    let recurred = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+    assert_success(&recurred);
+    assert_eq!(deferred_lines(&recurred), 1, "{recurred:?}");
 }
 
 #[test]

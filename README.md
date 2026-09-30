@@ -609,7 +609,10 @@ a hook can fall back to a sudo-free path; if the hook fails instead, a run
 without a terminal defers that `post()` the same way (the warning keeps any
 `shdeps_warn` detail, since the fallback may have been what failed). `shdeps prune` treats a
 sudo-needing `uninstall()` alike: without a terminal it runs no `sudo`, keeps
-the row for a later prune, and reports one warning without failing. Because the
+the row for a later prune, and reports one warning without failing. Without a
+terminal that warning (and `update`'s) is printed only when the set of deferred
+deps gains an entry, so cron is not mailed every run about the same state;
+`shdeps prune --dry-run` always lists deferred uninstalls. Because the
 retry restarts the hook function, hooks must call `shdeps_require_sudo` before
 making filesystem changes or starting other side effects.
 
