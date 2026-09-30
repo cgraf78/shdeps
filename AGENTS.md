@@ -134,13 +134,18 @@ and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
 - `exists(name)` — **required for `custom`**. Returns 0 if the dep is installed.
 - `install(name)` — **required for `custom`**. Called when `exists` returns 1.
 - `version(name)` — return version string.
-- `post(name)` — post-install setup. Runs after any change.
+- `post(name)` — post-install setup. Runs after any change; a failed post
+  stays pending and is retried on the next update.
 - `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
   an orphaned dep (any method). For custom deps, this is the only cleanup.
   For other methods, runs before the built-in cleanup — use it to reverse
   what `post()` created (symlinks, config files). A failed or unsourceable
   hook keeps the manifest row and built-in payload for the next prune to
   retry, and prune exits 1; a hook that succeeded is recorded and not rerun.
+  A hook that needs sudo when prune has no terminal is deferred instead: no
+  `sudo` runs, the row is kept, one warning is printed (without a terminal,
+  only when the deferred set changes; `prune --dry-run` always shows it), and
+  prune exits 0.
 
 ### Hook helper toolkit
 
@@ -166,7 +171,12 @@ Initial mutating hook subprocesses are deliberately detached with closed stdin
 so cancellation and timeouts can kill their complete session.
 `shdeps_require_sudo` must not prompt from that detached child: after a failed
 `sudo -n` probe it requests authentication from the attached parent, which
-pauses progress, runs the prompt, and retries the hook once. The authenticated
+pauses progress, runs the prompt, and retries the hook once. Without a
+controlling terminal `update` runs no sudo for the request and does not retry:
+it defers a post (kept pending, one warning, not a failure) or fails an
+install. Quiet hooks still get `1` from `shdeps_require_sudo` (fallbacks keep
+working) but leave a note, so a quiet post or uninstall that then fails without
+a terminal is deferred the same way. The authenticated
 retry must keep closed
 stdin and its own killable process group but remain in the parent's session so
 terminal-scoped sudo timestamps and subsequent direct `sudo` commands work.

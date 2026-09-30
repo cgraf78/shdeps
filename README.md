@@ -395,12 +395,12 @@ Place hook files in `<hooks_dir>/<name>.sh`. For methods whose `name` contains p
 - **`exists(name)`** — return 0 if installed (or not applicable), 1 if missing. Required for `custom` deps.
 - **`version(name)`** — print version string to stdout. Optional.
 - **`install(name)`** — perform the install unconditionally. shdeps only calls this when `exists()` returns 1 or `--reinstall` is used.
-- **`uninstall(name)`** — reverse what `install()` or `post()` created. Optional. Called by `shdeps prune` when removing an orphaned dep (any method). For custom deps, this is the only cleanup. For other methods, runs before the built-in cleanup. If it fails, prune keeps the dep tracked (and its files in place), exits 1, and retries on the next run.
-- **`post(name)`** — optional post-install setup.
+- **`uninstall(name)`** — reverse what `install()` or `post()` created. Optional. Called by `shdeps prune` when removing an orphaned dep (any method). For custom deps, this is the only cleanup. For other methods, runs before the built-in cleanup. If it fails, prune keeps the dep tracked (and its files in place), exits 1, and retries on the next run. A hook that needs sudo while prune has no terminal is deferred instead: the dep stays tracked, prune prints one warning, and exits 0.
+- **`post(name)`** — optional post-install setup. A failed `post()` is retried on the next `shdeps update`.
 
 **Non-custom dep hooks** (`pkg`, `github`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, `npm`):
 
-- **`post(name)`** — runs after shdeps installs/updates the dep (symlinking, config, etc.).
+- **`post(name)`** — runs after shdeps installs/updates the dep (symlinking, config, etc.). A failed `post()` is retried on the next `shdeps update`.
 
 All [public API functions](#public-api) are available to hook authors. See [examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh).
 
@@ -575,7 +575,7 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir                          |
 | `shdeps_unlink_extras <name>`     | Remove all extras symlinks tracked for a dep                                                |
 | `shdeps_github_release_install <name> <cmd> [repo] [bin-path]` | Install one GitHub release binary for `<name>` (default repo `<name>`, default path `$SHDEPS_BIN_DIR/<cmd>`) |
-| `shdeps_mark_changed <name>`      | Mark a dep as changed during the current `shdeps update` so its `post()` hook runs; no-op outside an update |
+| `shdeps_mark_changed <name>`      | Mark a dep as changed during the current `shdeps update` so its `post()` hook runs (held while the dep is inactive on this host, dropped if it is also not installed or no config entry owns it); no-op outside an update |
 | `shdeps_skip <dep> [reason]`      | Record a `.skipped` marker (with optional reason) under the dep's install dir               |
 | `shdeps_skipped <dep>`            | Return 0 if the dep is marked skipped                                                       |
 | `shdeps_skip_reason <dep>`        | Print the recorded skip reason; returns 1 if not skipped                                    |
@@ -599,7 +599,20 @@ new process group while preserving the parent's session and controlling
 terminal. That lets sudo policies with terminal-scoped timestamps recognize
 the freshly cached credential without weakening timeout cleanup; hook stdin
 remains closed in both attempts. Quiet mode never prompts or retries, and an
-already current custom dependency never reaches the sudo helper. Because the
+already current custom dependency never reaches the sudo helper. Without a
+controlling terminal (cron, systemd timers, CI, agent shells) `shdeps update`
+does not answer a hook's sudo request with `sudo` at all, since it could not
+read a password: a `post()` stays pending for the next update that can
+authenticate and is reported once as a warning, not a failure, while a custom
+`install()` fails. In quiet mode `shdeps_require_sudo` still just returns 1, so
+a hook can fall back to a sudo-free path; if the hook fails instead, a run
+without a terminal defers that `post()` the same way (the warning keeps any
+`shdeps_warn` detail, since the fallback may have been what failed). `shdeps prune` treats a
+sudo-needing `uninstall()` alike: without a terminal it runs no `sudo`, keeps
+the row for a later prune, and reports one warning without failing. Without a
+terminal that warning (and `update`'s) is printed only when the set of deferred
+deps gains an entry, so cron is not mailed every run about the same state;
+`shdeps prune --dry-run` always lists deferred uninstalls. Because the
 retry restarts the hook function, hooks must call `shdeps_require_sudo` before
 making filesystem changes or starting other side effects.
 

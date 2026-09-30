@@ -141,6 +141,20 @@ impl StateLock {
     pub fn path(state_dir: &Path) -> PathBuf {
         state_dir.join(LOCK_FILE)
     }
+
+    /// Reports whether this is a re-entry guard inside a live outer holder.
+    ///
+    /// A re-entrant update runs from a hook of an outer update that still
+    /// owns its in-flight post obligations and changed-marker directory.
+    pub(crate) fn is_reentry(&self) -> bool {
+        self.file.is_none()
+    }
+
+    /// Builds a re-entry guard without mutating process-global env.
+    #[cfg(test)]
+    pub(crate) fn reentry_for_test() -> Self {
+        StateLock { file: None }
+    }
 }
 
 /// Replaces a state file with `content` using a same-directory temp file.

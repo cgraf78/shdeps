@@ -576,6 +576,14 @@ where
         update::prepare_for_resolution(&roots, &manifest_path, &env_vars)?;
     let mut update_lock = Some(update_lock);
     if entries.is_empty() {
+        // No posts run, so nothing is deferred now; forget earlier notices so
+        // a deferral that recurs once deps are configured again is announced.
+        crate::deferral_notice::record(
+            &roots.state_dir,
+            crate::deferral_notice::Kind::Posts,
+            &[],
+            announce_mode(),
+        );
         if options.quiet {
             return Ok(0);
         }
@@ -658,6 +666,9 @@ where
         };
         progress.finish(&summary, &entries, footer.as_deref())?;
         drop(progress);
+        // A live terminal view always shows the warning; only the record is
+        // kept current here.
+        record_deferred_posts(&roots.state_dir, &summary, announce_mode());
         write_update_terminal_summary(
             &summary,
             &entries,
@@ -732,9 +743,17 @@ where
                 update_lock.take().expect("update lock is consumed once"),
             )?;
             crate::cancellation::check()?;
+            // Always emit the event: the consumer decides whether anyone sees
+            // it, so this run only retires entries and never marks new ones
+            // as announced.
+            record_deferred_posts(
+                &roots.state_dir,
+                &summary,
+                crate::deferral_notice::Mode::ShrinkOnly,
+            );
             summary
         } else {
-            let summary = update::run_locked(
+            let mut summary = update::run_locked(
                 &entries,
                 &manifest,
                 &context,
@@ -742,6 +761,8 @@ where
                 update_lock.take().expect("update lock is consumed once"),
             )?;
             crate::cancellation::check()?;
+            summary.deferred_posts_already_announced =
+                !record_deferred_posts(&roots.state_dir, &summary, announce_mode());
             write_update_summary(
                 &summary,
                 &entries,
@@ -1718,6 +1739,17 @@ where
         return Ok(1);
     }
     if detected.orphans.is_empty() {
+        // Nothing is deferred any more (for example the dep was re-added to
+        // config), so a later recurrence must be announced again. A dry run
+        // leaves state alone.
+        if !prune_options.dry_run {
+            crate::deferral_notice::record(
+                &roots.state_dir,
+                crate::deferral_notice::Kind::Uninstalls,
+                &[],
+                announce_mode(),
+            );
+        }
         if !prune_options.quiet {
             writeln!(stdout, "No orphaned deps found.")?;
         }
@@ -1729,6 +1761,27 @@ where
 
     write_prune_orphans(&detected.orphans, false, stdout)?;
     if prune_options.dry_run {
+        // Unattended runs announce a deferral once; show it here every time
+        // so the state stays discoverable.
+        let deferred = crate::deferral_notice::recorded(
+            &roots.state_dir,
+            crate::deferral_notice::Kind::Uninstalls,
+        );
+        for orphan in detected
+            .orphans
+            .iter()
+            .filter(|orphan| deferred.contains(&orphan.name))
+        {
+            write_row(
+                stdout,
+                "detail",
+                &format!(
+                    "{}: last unattended prune deferred its uninstall -- {}",
+                    orphan.name,
+                    update::SUDO_NO_TERMINAL
+                ),
+            )?;
+        }
         writeln!(stdout, "Dry run — nothing removed.")?;
         return Ok(0);
     }
@@ -1757,6 +1810,23 @@ where
     )?;
     crate::cancellation::check()?;
     write_prune_results(&summary.removed, stdout, stderr)?;
+    let deferred = summary
+        .removed
+        .iter()
+        .filter(|item| item.hook_deferred())
+        .map(|item| (item.entry.name.as_str(), ""))
+        .collect::<Vec<_>>();
+    // Without a terminal (cron) repeat the warning only when the deferred set
+    // gains an entry; `prune --dry-run` keeps showing it on demand.
+    let announce = crate::deferral_notice::record(
+        &roots.state_dir,
+        crate::deferral_notice::Kind::Uninstalls,
+        &deferred,
+        announce_mode(),
+    );
+    if let Some(warning) = summary.deferred_warning().filter(|_| announce) {
+        writeln!(stderr, "  warning: {warning}")?;
+    }
     Ok(if summary.has_errors() { 1 } else { 0 })
 }
 
@@ -2185,6 +2255,7 @@ where
     for name in &summary.leftovers {
         write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
+    write_deferred_posts_warning(summary, stderr)?;
 
     if !quiet {
         write_normal_group_summaries(summary, entries, stdout)?;
@@ -2242,6 +2313,7 @@ where
     for name in &summary.leftovers {
         write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
+    write_deferred_posts_warning(summary, stderr)?;
 
     Ok(())
 }
@@ -2290,7 +2362,55 @@ where
     for name in &summary.leftovers {
         write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
+    write_deferred_posts_warning(summary, stderr)?;
 
+    Ok(())
+}
+
+/// Records this run's deferred posts and reports whether a text renderer
+/// should announce them (see `deferral_notice`).
+fn record_deferred_posts(
+    state_dir: &Path,
+    summary: &update::Summary,
+    mode: crate::deferral_notice::Mode,
+) -> bool {
+    let entries = summary
+        .deferred_posts
+        .iter()
+        .map(|name| {
+            let detail = summary
+                .deferred_details
+                .get(name)
+                .map_or("", String::as_str);
+            (name.as_str(), detail)
+        })
+        .collect::<Vec<_>>();
+    crate::deferral_notice::record(
+        state_dir,
+        crate::deferral_notice::Kind::Posts,
+        &entries,
+        mode,
+    )
+}
+
+/// Record mode for a run that prints the deferral warning itself.
+fn announce_mode() -> crate::deferral_notice::Mode {
+    crate::deferral_notice::Mode::Announce {
+        terminal: process::controlling_terminal(),
+    }
+}
+
+/// Writes the one-line warning for post hooks deferred until sudo can prompt.
+fn write_deferred_posts_warning<E>(summary: &update::Summary, stderr: &mut E) -> Result<()>
+where
+    E: Write,
+{
+    if summary.deferred_posts_already_announced {
+        return Ok(());
+    }
+    if let Some(warning) = summary.deferred_posts_warning() {
+        write_row(stderr, "warning", &warning)?;
+    }
     Ok(())
 }
 
@@ -2429,6 +2549,7 @@ where
     for name in &summary.leftovers {
         write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
+    write_deferred_posts_warning(summary, stderr)?;
 
     let counts = update_counts(summary, active_count);
     if counts.failed == 0 {
@@ -2487,6 +2608,15 @@ where
                 "detail": format!("{}: {}", item.name, item.detail),
             }))?;
         }
+    }
+    // A parent renderer (dot) shows this as a note and the summary status
+    // below as a warning, so a deferred post never looks like a failure.
+    if let Some(warning) = summary.deferred_posts_warning() {
+        progress.event(json!({
+            "event": "warning",
+            "status": "warning",
+            "detail": warning,
+        }))?;
     }
     write_group_summaries_jsonl(summary, entries, progress)?;
     let counts = update_counts(summary, active_count);
@@ -2556,11 +2686,14 @@ fn update_counts(summary: &update::Summary, active_count: usize) -> UpdateCounts
         .iter()
         .filter(|item| item.status == update::ItemStatus::Changed)
         .count();
+    // Deferred posts count as warnings so the overall status is "warning",
+    // not "ok", while they stay pending; they are never failures.
     let warnings = summary
         .items
         .iter()
         .filter(|item| item.status == update::ItemStatus::Warning)
-        .count();
+        .count()
+        + summary.deferred_posts.len();
     let skipped = summary
         .items
         .iter()
@@ -2954,7 +3087,11 @@ where
                     item.entry.name
                 )?;
             }
-            Uninstall::MissingHook | Uninstall::MissingFunction | Uninstall::Removed => {}
+            // Reported once for every deferred item after this loop.
+            Uninstall::MissingHook
+            | Uninstall::MissingFunction
+            | Uninstall::Removed
+            | Uninstall::SudoUnavailable => {}
             Uninstall::SudoRequired => {
                 unreachable!("sudo requests are resolved before prune rendering")
             }
@@ -3655,6 +3792,63 @@ mod tests {
 
         assert!(String::from_utf8(stdout).unwrap().is_empty());
         assert!(String::from_utf8(stderr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_text_summary_reports_deferred_posts_as_one_warning() {
+        // The live TTY view and the verbose views render through separate
+        // writers; each must show the deferral once and never as a failure.
+        let summary = Summary {
+            items: vec![Item::current("jq", ItemReason::Installed, "current")],
+            deferred_posts: vec!["first".to_owned(), "second".to_owned()],
+            ..Summary::default()
+        };
+        let entries = vec![Entry {
+            name: "jq".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "jq".to_owned(),
+            cmd_explicit: false,
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        for verbose in [false, true] {
+            for terminal in [false, true] {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if terminal {
+                    super::write_update_terminal_summary(
+                        &summary,
+                        &entries,
+                        false,
+                        verbose,
+                        &mut stdout,
+                        &mut stderr,
+                    )
+                    .unwrap();
+                } else {
+                    super::write_update_summary(
+                        &summary,
+                        &entries,
+                        1,
+                        false,
+                        verbose,
+                        &mut stdout,
+                        &mut stderr,
+                    )
+                    .unwrap();
+                }
+                let stderr = String::from_utf8(stderr).unwrap();
+                let stdout = String::from_utf8(stdout).unwrap();
+                let context = format!("verbose={verbose} terminal={terminal}");
+                assert_eq!(
+                    stderr.matches("first, second: post hook deferred").count(),
+                    1,
+                    "{context}: {stderr}"
+                );
+                assert!(!stderr.contains("failed"), "{context}: {stderr}");
+                assert!(!stdout.contains("failed"), "{context}: {stdout}");
+            }
+        }
     }
 
     #[test]

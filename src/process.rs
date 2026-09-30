@@ -136,6 +136,25 @@ impl Runner for Process {
     }
 }
 
+/// Reports whether this process has a controlling terminal.
+///
+/// `sudo` reads passwords from `/dev/tty`, so without one an interactive
+/// `sudo` cannot prompt at all: it fails and, on audited hosts, still logs a
+/// failed authentication. Cron, systemd timers, CI, and agent tool shells run
+/// without one even when stdin or stdout is redirected to something else.
+///
+/// This is a conservative test: sudo reads a typed password through
+/// `/dev/tty`, so without one it cannot prompt on Linux or macOS. It can
+/// still authenticate without a terminal through an askpass helper or a
+/// non-typing PAM module (for example Touch ID); those runs defer instead.
+pub(crate) fn controlling_terminal() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
+}
+
 /// Detects the active package manager using the Bash reference order.
 #[must_use]
 pub fn detect_package_manager(runner: &impl Runner) -> String {

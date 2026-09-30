@@ -17,6 +17,7 @@
 //! `<install_dir>/<name>` layout the install path uses for the same
 //! deps, keeping hooks parallel to their dep's install root.
 
+use std::collections::BTreeSet;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -65,11 +66,16 @@ pub(crate) const SUDO_REQUEST_EXIT_CODE: i32 = 75;
 const SUDO_REQUEST_ENV: &str = "SHDEPS_HOOK_SUDO_REQUEST";
 const SUDO_REQUEST_DIR: &str = ".hook-sudo-requests";
 const SUDO_REQUEST_TOKEN: &[u8] = b"shdeps-hook-sudo-v1\n";
+/// Written by a quiet hook whose `sudo -n` probe failed. Unlike the request
+/// token it does not end the hook (a fallback path may still succeed); it only
+/// tells the parent why a hook that then fails could not do its work.
+const SUDO_UNAVAILABLE_TOKEN: &[u8] = b"shdeps-hook-sudo-unavailable-v1\n";
 static SUDO_REQUEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
 struct HookOutput {
     output: std::process::Output,
     sudo_requested: bool,
+    sudo_unavailable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -122,11 +128,20 @@ impl SudoRequest {
     }
 
     fn requested(&mut self) -> bool {
-        if self.file.seek(SeekFrom::Start(0)).is_err() {
-            return false;
-        }
+        self.token()
+            .is_some_and(|token| token == SUDO_REQUEST_TOKEN)
+    }
+
+    fn unavailable(&mut self) -> bool {
+        self.token()
+            .is_some_and(|token| token == SUDO_UNAVAILABLE_TOKEN)
+    }
+
+    fn token(&mut self) -> Option<Vec<u8>> {
+        self.file.seek(SeekFrom::Start(0)).ok()?;
         let mut bytes = Vec::new();
-        self.file.read_to_end(&mut bytes).is_ok() && bytes == SUDO_REQUEST_TOKEN
+        self.file.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
     }
 }
 
@@ -264,14 +279,29 @@ fn run_mutating_hook_command(
     let output = run_hook_command_with(command, isolation, signal_policy)?;
     let sudo_requested =
         output.status.code() == Some(SUDO_REQUEST_EXIT_CODE) && request.requested();
+    let sudo_unavailable = !output.status.success() && request.unavailable();
     Ok(HookOutput {
         output,
         sudo_requested,
+        sudo_unavailable,
     })
 }
 
 /// Signals that a detached mutating hook needs its parent to authenticate sudo.
 pub(crate) fn signal_parent_sudo_request() -> Result<bool> {
+    write_parent_sudo_token(SUDO_REQUEST_TOKEN)
+}
+
+/// Tells the parent that this quiet hook found no usable sudo credentials.
+///
+/// The hook keeps running (its caller may fall back to a sudo-free path); the
+/// note only matters if the hook then fails, so the parent can tell "could not
+/// get sudo" apart from an ordinary failure.
+pub(crate) fn note_parent_sudo_unavailable() -> Result<bool> {
+    write_parent_sudo_token(SUDO_UNAVAILABLE_TOKEN)
+}
+
+fn write_parent_sudo_token(token: &[u8]) -> Result<bool> {
     let Some(request_path) = sudo_request_path() else {
         return Ok(false);
     };
@@ -283,7 +313,9 @@ pub(crate) fn signal_parent_sudo_request() -> Result<bool> {
     if !request.metadata()?.file_type().is_file() {
         return Ok(false);
     }
-    request.write_all(SUDO_REQUEST_TOKEN)?;
+    // Replace rather than append: the parent compares the whole file.
+    request.set_len(0)?;
+    request.write_all(token)?;
     Ok(true)
 }
 
@@ -466,6 +498,10 @@ pub enum Uninstall {
     SourceFailed,
     /// The detached hook needs its attached parent to authenticate sudo.
     SudoRequired,
+    /// `uninstall(name)` failed after sudo proved unobtainable without a
+    /// prompt (a quiet hook's `sudo -n` probe failed). Prune turns this into
+    /// a deferral without a terminal and into `Failed` with one.
+    SudoUnavailable,
     /// `uninstall(name)` exists but returned non-zero.
     Failed,
     /// `uninstall(name)` ran successfully.
@@ -511,6 +547,13 @@ pub enum Post {
     SourceFailed,
     /// The detached hook needs its attached parent to authenticate sudo.
     SudoRequired,
+    /// `post(name)` failed after sudo proved unobtainable without a prompt
+    /// (a quiet hook's `sudo -n` probe failed). Update defers it without a
+    /// terminal and treats it as `Failed` with one.
+    SudoUnavailable {
+        /// Safe phase context emitted through `shdeps_warn`.
+        detail: String,
+    },
     /// `post(name)` declined with exit code 2 (hook-declined/mismatch
     /// convention). The hook chose not to run, so this is not a failure.
     Skipped,
@@ -539,6 +582,10 @@ pub(crate) struct Txn {
     id: String,
     marker_dir: PathBuf,
     state_dir: PathBuf,
+    /// Post obligations owned by a live outer update when this transaction
+    /// started re-entrantly. They stay invisible to this transaction and are
+    /// never acknowledged by it; empty for a top-level update.
+    inherited: BTreeSet<String>,
 }
 
 /// Durable pre-mutation post-hook obligation.
@@ -556,8 +603,28 @@ pub(crate) struct MutationIntent {
 
 impl Txn {
     /// Creates the marker directory used by hook subprocesses in one update.
+    ///
+    /// Only the top-level state-lock holder may call this: it adopts every
+    /// abandoned transaction directory and pending obligation as its own.
     pub(crate) fn new(state_dir: &Path) -> Result<Self> {
         promote_abandoned_markers(state_dir)?;
+        Self::create(state_dir, BTreeSet::new())
+    }
+
+    /// Creates a transaction for an update re-entered from a hook.
+    ///
+    /// The outer update still owns its live `.changed-markers/<txn>` directory
+    /// and every pending obligation that exists now, including the post hook
+    /// that may have started this nested run. Promoting or adopting them here
+    /// would delete the outer run's markers and re-run its hooks (the running
+    /// one recursively). Leave both alone: the outer run, or the next
+    /// top-level run after a crash, remains responsible for them.
+    pub(crate) fn nested(state_dir: &Path) -> Result<Self> {
+        let inherited = pending_posts(state_dir)?.into_iter().collect();
+        Self::create(state_dir, inherited)
+    }
+
+    fn create(state_dir: &Path, inherited: BTreeSet<String>) -> Result<Self> {
         let id = txn_id();
         let marker_dir = state_dir.join(".changed-markers").join(&id);
         std::fs::create_dir_all(&marker_dir)?;
@@ -565,6 +632,7 @@ impl Txn {
             id,
             marker_dir,
             state_dir: state_dir.to_path_buf(),
+            inherited,
         })
     }
 
@@ -614,9 +682,18 @@ impl Txn {
         MutationIntent::new(&self.state_dir, name)
     }
 
-    /// Returns all post-hook obligations retained from this or an earlier run.
+    /// Returns post-hook obligations this transaction owns: everything
+    /// retained from this or an earlier run, minus a live outer run's.
     pub(crate) fn pending(&self) -> Result<Vec<String>> {
-        pending_posts(&self.state_dir)
+        let mut pending = pending_posts(&self.state_dir)?;
+        pending.retain(|name| self.owns(name));
+        Ok(pending)
+    }
+
+    /// Reports whether this transaction owns (may run and acknowledge) the
+    /// post obligation for `name`; false only for a live outer run's.
+    pub(crate) fn owns(&self, name: &str) -> bool {
+        !self.inherited.contains(name)
     }
 
     /// Reports whether one dependency still owes its post hook.
@@ -625,7 +702,14 @@ impl Txn {
     }
 
     /// Acknowledges one obligation after its post classification is complete.
+    ///
+    /// An inherited obligation belongs to the outer run, which acknowledges
+    /// it after its own post; a nested acknowledgement would erase it if the
+    /// outer run is interrupted before that post completes.
     pub(crate) fn acknowledge(&self, name: &str) -> Result<()> {
+        if !self.owns(name) {
+            return Ok(());
+        }
         acknowledge_pending_post(&self.state_dir, name)
     }
 }
@@ -656,9 +740,7 @@ impl MutationIntent {
             )
             .into());
         }
-        self.preexisting =
-            std::fs::symlink_metadata(self.state_dir.join(PENDING_POSTS_DIR).join(&self.name))
-                .is_ok();
+        self.preexisting = pending_post_exists(&self.state_dir, &self.name);
         mark_pending_post(&self.state_dir, &self.name)?;
         self.started = true;
         Ok(())
@@ -825,6 +907,9 @@ impl BashCustomProbe {
             Some(0) => Uninstall::Removed,
             Some(10) => Uninstall::MissingFunction,
             Some(11 | 12) => Uninstall::SourceFailed,
+            // Only a hook that exited on its own gave up for lack of sudo;
+            // one killed by its deadline or a signal did not.
+            Some(_) if output.sudo_unavailable => Uninstall::SudoUnavailable,
             _ => Uninstall::Failed,
         })
     }
@@ -953,6 +1038,11 @@ impl BashCustomProbe {
             Some(2) => Post::Skipped,
             Some(10) => Post::MissingFunction,
             Some(11 | 12) => Post::SourceFailed,
+            // Only a hook that exited on its own gave up for lack of sudo;
+            // one killed by its deadline or a signal did not.
+            Some(_) if output.sudo_unavailable => Post::SudoUnavailable {
+                detail: failed_hook_detail(&output.output.stderr),
+            },
             _ => Post::Failed {
                 detail: failed_hook_detail(&output.output.stderr),
             },
@@ -1136,6 +1226,14 @@ fn collect_markers(root: &Path, dir: &Path, names: &mut Vec<String>) -> Result<(
             continue;
         };
         let name = relative.to_string_lossy().replace('\\', "/");
+        // Decode the two collision forms written by `mark_pending_post`.
+        let name = match name.rsplit_once('/') {
+            Some((parent, PENDING_SELF_MARKER)) => parent.to_owned(),
+            None if name == PENDING_SELF_MARKER => continue,
+            _ => name
+                .strip_suffix(PENDING_MOVING_SUFFIX)
+                .map_or(name.clone(), str::to_owned),
+        };
         if config::valid_dep_name(&name) {
             names.push(name);
         }
@@ -1144,6 +1242,17 @@ fn collect_markers(root: &Path, dir: &Path, names: &mut Vec<String>) -> Result<(
 }
 
 const PENDING_POSTS_DIR: &str = ".pending-posts";
+
+// Markers mirror dependency names as paths, so a name that is a path prefix
+// of another (`neovim` and `neovim/neovim`) would need `.pending-posts/neovim`
+// to be both a file and a directory. The prefix's marker then lives inside
+// the directory as `PENDING_SELF_MARKER`; while it is being moved there it is
+// briefly a sibling with `PENDING_MOVING_SUFFIX`. Both contain `|`, which no
+// dependency name may contain, so they can never be mistaken for another
+// dependency's marker (older Shdeps simply ignores them). Uncollided names
+// keep the plain path layout.
+const PENDING_SELF_MARKER: &str = "|pending";
+const PENDING_MOVING_SUFFIX: &str = "|moving";
 
 /// Serializes pending-post marker updates across parallel tool threads.
 ///
@@ -1159,7 +1268,55 @@ pub(crate) fn mark_pending_post(state_dir: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
     let _guard = PENDING_POSTS_LOCK.lock().unwrap();
-    crate::state::write_atomic(&state_dir.join(PENDING_POSTS_DIR).join(name), "pending\n")
+    let root = state_dir.join(PENDING_POSTS_DIR);
+    // A pending shorter name blocks the directory this name needs: move its
+    // marker inside that directory first (see `PENDING_SELF_MARKER`).
+    let mut ancestor = root.clone();
+    let components = name.split('/').collect::<Vec<_>>();
+    for component in &components[..components.len() - 1] {
+        ancestor.push(component);
+        if std::fs::symlink_metadata(&ancestor).is_ok_and(|metadata| metadata.is_file()) {
+            relocate_into_directory(&ancestor)?;
+        }
+    }
+    let marker = root.join(name);
+    let marker = if std::fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.is_dir()) {
+        marker.join(PENDING_SELF_MARKER)
+    } else {
+        marker
+    };
+    crate::state::write_atomic(&marker, "pending\n")
+}
+
+/// Turns the plain marker file at `path` into `path/PENDING_SELF_MARKER`.
+///
+/// Every intermediate state still decodes to the same pending name: the file
+/// is renamed aside (`PENDING_MOVING_SUFFIX`), the directory is created, and
+/// the file is renamed into it.
+fn relocate_into_directory(path: &Path) -> Result<()> {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(PENDING_MOVING_SUFFIX);
+    let aside = PathBuf::from(aside);
+    std::fs::rename(path, &aside)?;
+    std::fs::create_dir(path)?;
+    std::fs::rename(&aside, path.join(PENDING_SELF_MARKER))?;
+    Ok(())
+}
+
+/// Returns the existing marker files that record `name` as pending.
+fn pending_post_markers(state_dir: &Path, name: &str) -> Vec<PathBuf> {
+    let plain = state_dir.join(PENDING_POSTS_DIR).join(name);
+    let mut aside = plain.as_os_str().to_owned();
+    aside.push(PENDING_MOVING_SUFFIX);
+    [plain.join(PENDING_SELF_MARKER), PathBuf::from(aside), plain]
+        .into_iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_dir()))
+        .collect()
+}
+
+/// Reports whether any marker records `name` as pending.
+fn pending_post_exists(state_dir: &Path, name: &str) -> bool {
+    config::valid_dep_name(name) && !pending_post_markers(state_dir, name).is_empty()
 }
 
 fn pending_posts(state_dir: &Path) -> Result<Vec<String>> {
@@ -1171,24 +1328,31 @@ fn pending_posts(state_dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn acknowledge_pending_post(state_dir: &Path, name: &str) -> Result<()> {
+/// Removes one durable pending-post marker (and any now-empty parents).
+///
+/// Absent markers and names that could never have been marked are a no-op.
+pub(crate) fn acknowledge_pending_post(state_dir: &Path, name: &str) -> Result<()> {
     if !config::valid_dep_name(name) {
         return Ok(());
     }
     let _guard = PENDING_POSTS_LOCK.lock().unwrap();
     let root = state_dir.join(PENDING_POSTS_DIR);
-    let marker = root.join(name);
-    match std::fs::remove_file(&marker) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    let mut parent = marker.parent();
-    while let Some(directory) = parent.filter(|directory| *directory != root) {
-        if std::fs::remove_dir(directory).is_err() {
-            break;
+    // A directory at the plain path holds other dependencies' markers (see
+    // `PENDING_SELF_MARKER`), so only this name's own marker files are
+    // removed; the directory itself goes only once it is empty.
+    for marker in pending_post_markers(state_dir, name) {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         }
-        parent = directory.parent();
+        let mut parent = marker.parent();
+        while let Some(directory) = parent.filter(|directory| *directory != root) {
+            if std::fs::remove_dir(directory).is_err() {
+                break;
+            }
+            parent = directory.parent();
+        }
     }
     let _ = std::fs::remove_dir(root);
     Ok(())
@@ -1878,6 +2042,54 @@ post() {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_support::temp_dir(&format!("shdeps-{name}"))
+    }
+
+    #[test]
+    fn pending_post_for_a_name_prefix_coexists_with_nested_names() {
+        // `neovim` and `neovim/neovim` share `.pending-posts/neovim`. Marking
+        // either while the other is pending must not fail (which aborts the
+        // mutation) or drop the other's obligation, in either order.
+        use super::{acknowledge_pending_post, mark_pending_post, pending_posts};
+
+        for (first, second) in [("neovim", "neovim/neovim"), ("neovim/neovim", "neovim")] {
+            let state_dir = temp_dir("pending-posts-prefix");
+            mark_pending_post(&state_dir, first).unwrap();
+            mark_pending_post(&state_dir, second).unwrap();
+            assert_eq!(
+                pending_posts(&state_dir).unwrap(),
+                ["neovim", "neovim/neovim"],
+                "{first} then {second}"
+            );
+
+            acknowledge_pending_post(&state_dir, "neovim").unwrap();
+            assert_eq!(pending_posts(&state_dir).unwrap(), ["neovim/neovim"]);
+            mark_pending_post(&state_dir, "neovim").unwrap();
+            acknowledge_pending_post(&state_dir, "neovim/neovim").unwrap();
+            assert_eq!(pending_posts(&state_dir).unwrap(), ["neovim"]);
+            acknowledge_pending_post(&state_dir, "neovim").unwrap();
+            assert!(pending_posts(&state_dir).unwrap().is_empty());
+            assert!(!state_dir.join(super::PENDING_POSTS_DIR).exists());
+        }
+    }
+
+    #[test]
+    fn pending_post_moved_aside_by_an_interrupted_relocation_is_still_pending() {
+        // Relocating `neovim` under a new `neovim/` directory renames it aside
+        // first; a crash at that point must not lose the obligation.
+        use super::{acknowledge_pending_post, pending_posts};
+
+        let state_dir = temp_dir("pending-posts-moving");
+        let root = state_dir.join(super::PENDING_POSTS_DIR);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(format!("neovim{}", super::PENDING_MOVING_SUFFIX)),
+            "pending\n",
+        )
+        .unwrap();
+
+        assert_eq!(pending_posts(&state_dir).unwrap(), ["neovim"]);
+        acknowledge_pending_post(&state_dir, "neovim").unwrap();
+        assert!(pending_posts(&state_dir).unwrap().is_empty());
     }
 
     #[test]

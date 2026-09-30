@@ -1376,6 +1376,99 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
 }
 
 #[test]
+fn update_identity_handoff_fails_one_dependency_and_updates_the_rest() {
+    // A handoff must not abort the entire run before unrelated dependencies
+    // update; the blocked dependency still fails the exit status.
+    let fixture = Fixture::new("update-identity-handoff-isolated");
+    fixture.write(
+        "conf/deps.conf",
+        "replacement custom tool\nother custom other\n",
+    );
+    fixture.write(
+        "conf/hooks.d/replacement.sh",
+        "exists() { return 1; }\ninstall() { : >\"$SHDEPS_STATE_DIR/replacement-installed\"; }\n",
+    );
+    fixture.write(
+        "conf/hooks.d/other.sh",
+        "exists() { [[ -f \"$SHDEPS_STATE_DIR/other-installed\" ]]; }\ninstall() { : >\"$SHDEPS_STATE_DIR/other-installed\"; }\n",
+    );
+    fixture.write(
+        "state/manifest",
+        "owner/old|github:release|tool|/nonexistent/old\n",
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={:?} stderr={:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("replacement") && stderr.contains("shdeps prune"),
+        "blocked dependency must name the prune remedy: {stderr}"
+    );
+    assert!(!fixture.dir.join("state/replacement-installed").exists());
+    assert!(
+        fixture.dir.join("state/other-installed").is_file(),
+        "unrelated dependency must still update: stdout={:?} stderr={stderr}",
+        text(&output.stdout)
+    );
+}
+
+#[test]
+fn nested_update_from_post_hook_does_not_rerun_outer_posts() {
+    // A post() hook that runs `shdeps update` re-enters under the outer
+    // run's lock while its own obligation is still pending. The nested run
+    // must not adopt that obligation, or it re-runs the same hook, which
+    // starts another nested update, and so on. The dependency reports a
+    // change on every run (as under `SHDEPS_REINSTALL`) so the nested run
+    // changes it again too. The depth cap only bounds a regression; a
+    // correct run posts exactly once.
+    let fixture = Fixture::new("update-nested-post");
+    fixture.write("conf/deps.conf", "tool custom tool\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"exists() { return 1; }
+install() { :; }
+post() {
+    printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"
+    depth=${NESTED_TEST_DEPTH:-0}
+    if (( depth < 3 )); then
+        NESTED_TEST_DEPTH=$((depth + 1)) "$NESTED_TEST_SHDEPS" update
+    fi
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("NESTED_TEST_SHDEPS", env!("CARGO_BIN_EXE_shdeps"))
+        .env("SHDEPS_STATE_LOCK_TIMEOUT_SECS", "10");
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/post-runs")).unwrap(),
+        "post\n",
+        "stdout={:?} stderr={:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    assert!(
+        !fixture.dir.join("state/.pending-posts").exists(),
+        "the outer run must still acknowledge its obligation"
+    );
+    assert!(
+        !fixture.dir.join("state/.changed-markers").exists(),
+        "no transaction directory may outlive the update"
+    );
+}
+
+#[test]
 fn update_allows_real_provider_to_share_command_with_none_package_override() {
     let fixture = Fixture::new("update-none-package-command-claim");
     fixture.write(
@@ -3345,7 +3438,8 @@ fn update_custom_hook_with_cached_sudo_does_not_prompt_parent() {
 fn update_custom_hook_prompts_parent_and_retries_once_when_sudo_cache_is_cold() {
     let fixture = custom_sudo_fixture("custom-sudo-cold", &["tool"]);
 
-    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+    let output =
+        run_on_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
 
     assert_success(&output);
     assert_eq!(
@@ -3415,7 +3509,7 @@ exec "$@"
         &format!("#!/bin/sh\nexec {binary} \"$@\"\n"),
     );
 
-    let output = run(&mut custom_sudo_command(&fixture, ["update"]));
+    let output = run_on_terminal(&mut custom_sudo_command(&fixture, ["update"]));
 
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
     assert_eq!(
@@ -3447,7 +3541,8 @@ exec "$@"
 fn update_multiple_custom_hooks_share_one_parent_sudo_prompt() {
     let fixture = custom_sudo_fixture("custom-sudo-multiple", &["first", "second"]);
 
-    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+    let output =
+        run_on_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
 
     assert_success(&output);
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -3483,7 +3578,8 @@ post() {
 "#,
     );
 
-    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+    let output =
+        run_on_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
 
     assert_success(&output);
     assert_eq!(
@@ -3492,6 +3588,224 @@ post() {
          tool post\npost sudo -n true\n"
     );
     assert!(fixture.dir.join("state/tool-posted").is_file());
+}
+
+/// Writes an already-installed custom dep whose failed `post()` is retained
+/// and needs sudo before any side effect.
+fn write_retained_sudo_post(fixture: &Fixture, deps: &[&str]) {
+    let mut manifest = String::new();
+    for dep in deps {
+        fixture.write(
+            format!("conf/hooks.d/{dep}.sh"),
+            r#"
+exists() { return 0; }
+post() {
+  printf '%s post\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  printf 'post\n' >"$SHDEPS_STATE_DIR/$1-posted"
+}
+"#,
+        );
+        fixture.write(format!("state/.pending-posts/{dep}"), "pending\n");
+        manifest.push_str(&format!("{dep}|custom|{dep}|\n"));
+    }
+    fixture.write("state/manifest", &manifest);
+}
+
+#[test]
+fn update_defers_retained_sudo_posts_without_a_terminal() {
+    // Cron, systemd, and agent shells have no terminal. Running `sudo true`
+    // there cannot read a password; it only records a failed authentication
+    // (audited on managed hosts) and failed the run every time.
+    let fixture = custom_sudo_fixture("post-sudo-no-terminal", &["first", "second"]);
+    write_retained_sudo_post(&fixture, &["first", "second"]);
+
+    let output = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "first post\npost sudo -n true\nsecond post\npost sudo -n true\n",
+        "without a terminal the parent must neither prompt nor repeat the \
+         hook's failed `sudo -n` probe (each probe is another audit entry)"
+    );
+    for dep in ["first", "second"] {
+        assert!(
+            fixture
+                .dir
+                .join(format!("state/.pending-posts/{dep}"))
+                .is_file(),
+            "deferred post must stay pending"
+        );
+        assert!(!fixture.dir.join(format!("state/{dep}-posted")).exists());
+    }
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("failed"), "{stderr}");
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("deferred"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("first, second"), "{stderr}");
+}
+
+#[test]
+fn unattended_update_announces_a_deferred_post_once_per_state() {
+    let fixture = custom_sudo_fixture("post-sudo-deferred-once", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+    let deferred_lines = |output: &Output| {
+        text(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count()
+    };
+
+    let first = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+    let second = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&first);
+    assert_success(&second);
+    assert_eq!(deferred_lines(&first), 1, "{first:?}");
+    assert_eq!(
+        deferred_lines(&second),
+        0,
+        "unchanged state must stay quiet: {second:?}"
+    );
+    // The non-quiet summary still counts it, so the state stays visible.
+    assert!(text(&second.stdout).contains("1 warning"), "{second:?}");
+    // Machine-readable consumers always get the event and decide for
+    // themselves (dot suppresses notes in quiet mode).
+    let machine = run_without_terminal(
+        custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"),
+    );
+    assert_eq!(
+        jsonl(&machine.stdout)
+            .iter()
+            .filter(|event| event["event"] == "warning")
+            .count(),
+        1,
+        "{machine:?}"
+    );
+}
+
+#[test]
+fn unattended_update_reannounces_a_deferred_post_whose_failure_detail_changed() {
+    // The quiet note cannot prove sudo caused the failure, so a new hook
+    // detail is new state and must be printed even for the same dep.
+    let fixture = custom_sudo_fixture("post-sudo-deferred-detail-change", &["tool"]);
+    let deferred_lines = |output: &Output| {
+        text(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count()
+    };
+    write_retained_quiet_sudo_post(
+        &fixture,
+        "  shdeps_require_sudo || { shdeps_warn 'mirror unreachable'; return 1; }",
+    );
+    let first =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+    write_retained_quiet_sudo_post(
+        &fixture,
+        "  shdeps_require_sudo || { shdeps_warn 'checksum mismatch'; return 1; }",
+    );
+    let second =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_eq!(deferred_lines(&first), 1, "{first:?}");
+    assert_eq!(deferred_lines(&second), 1, "{second:?}");
+    assert!(
+        text(&second.stderr).contains("checksum mismatch"),
+        "{second:?}"
+    );
+}
+
+#[test]
+fn jsonl_update_does_not_mark_a_deferred_post_as_announced() {
+    // A JSONL consumer may suppress the event (dot does in quiet mode), so
+    // a later text-mode run must still print the deferral once.
+    let fixture = custom_sudo_fixture("post-sudo-deferred-jsonl-first", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+
+    let machine = run_without_terminal(
+        custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"),
+    );
+    let human = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&machine);
+    assert_eq!(
+        text(&human.stderr)
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count(),
+        1,
+        "{human:?}"
+    );
+}
+
+#[test]
+fn update_reports_deferred_sudo_post_as_a_jsonl_warning_then_recovers_on_a_terminal() {
+    let fixture = custom_sudo_fixture("post-sudo-no-terminal-jsonl", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+
+    let deferred = run_without_terminal(
+        custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"),
+    );
+
+    assert_success(&deferred);
+    let events = jsonl(&deferred.stdout);
+    assert!(
+        !events.iter().any(|event| event["event"] == "prompt"),
+        "no terminal, so no prompt pause: {events:#?}"
+    );
+    let warnings = events
+        .iter()
+        .filter(|event| event["event"] == "warning")
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{events:#?}");
+    assert!(
+        warnings[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("tool: post hook deferred")),
+        "{events:#?}"
+    );
+    let summary = events.last().unwrap();
+    assert_eq!(summary["event"], "summary", "{events:#?}");
+    assert_eq!(summary["status"], "warning", "{summary}");
+    assert_eq!(summary["failed"], 0, "{summary}");
+    assert!(fixture.dir.join("state/.pending-posts/tool").is_file());
+
+    // An interactive run still prompts, runs the post, and retires it.
+    fs::write(fixture.dir.join("sudo.log"), "").unwrap();
+    let interactive = run_on_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&interactive);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool post\npost sudo -n true\nparent sudo true\n\
+         tool post\npost sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/tool-posted").is_file());
+    assert!(!fixture.dir.join("state/.pending-posts/tool").exists());
+}
+
+#[test]
+fn update_custom_install_needing_sudo_fails_without_prompting_when_no_terminal() {
+    let fixture = custom_sudo_fixture("custom-sudo-no-terminal", &["tool"]);
+
+    let output = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool install\ninstall sudo -n true\n"
+    );
+    assert!(
+        text(&output.stderr).contains("no terminal"),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(!fixture.dir.join("state/tool-installed").exists());
 }
 
 #[test]
@@ -3510,7 +3824,7 @@ uninstall() {
 "#,
     );
 
-    let output = run(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+    let output = run_on_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
 
     assert_success(&output);
     assert_eq!(
@@ -3536,13 +3850,14 @@ uninstall() {
 "#,
     );
 
-    let output = run(&mut custom_sudo_command(
+    let output = run_on_terminal(&mut custom_sudo_command(
         &fixture,
         ["--quiet", "prune", "-y"],
     ));
 
-    // This is the cron shape: the hook cannot get sudo, so its cleanup never
-    // ran. Prune must fail and keep the row for a later interactive retry.
+    // Quiet on a terminal: nothing prompts, the hook's cleanup never ran, so
+    // prune fails and keeps the row for a later interactive retry. (Without a
+    // terminal the same hook is deferred instead; see the tests below.)
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
@@ -3554,12 +3869,252 @@ uninstall() {
     );
 }
 
+/// Writes an orphaned custom dep whose `uninstall()` needs sudo before any
+/// side effect.
+fn write_sudo_uninstall_orphan(fixture: &Fixture) {
+    fixture.write("conf/deps.conf", "");
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+uninstall() {
+  printf '%s uninstall\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  printf 'uninstalled\n' >"$SHDEPS_STATE_DIR/tool-uninstalled"
+}
+"#,
+    );
+}
+
+/// Asserts the prune deferral shape: exit 0, no sudo beyond the hook's own
+/// probe, the row kept for a later run, and exactly one deferral warning.
+fn assert_prune_deferred(fixture: &Fixture, output: &Output) {
+    assert_success(output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool uninstall\nuninstall sudo -n true\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+    assert!(!fixture.dir.join("state/tool-uninstalled").exists());
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("failed"), "{stderr}");
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("deferred"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("tool"), "{stderr}");
+}
+
+#[test]
+fn prune_defers_sudo_uninstall_without_a_terminal() {
+    // Cron now prunes every 30 minutes. Running `sudo true` there cannot
+    // read a password and would log a failed authentication on every run.
+    let fixture = custom_sudo_fixture("custom-uninstall-sudo-no-terminal", &["tool"]);
+    write_sudo_uninstall_orphan(&fixture);
+
+    let output = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+
+    assert_prune_deferred(&fixture, &output);
+}
+
+#[test]
+fn unattended_prune_announces_a_deferred_uninstall_once_per_state() {
+    // Cron prunes every 30 minutes; repeating the same warning on stderr
+    // mails the owner ~48 times a day about unchanged, expected state.
+    let fixture = custom_sudo_fixture("custom-uninstall-deferred-once", &["tool"]);
+    write_sudo_uninstall_orphan(&fixture);
+    let deferred_lines = |output: &Output| {
+        text(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count()
+    };
+
+    let first = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+    let second = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+
+    assert_success(&first);
+    assert_success(&second);
+    assert_eq!(deferred_lines(&first), 1, "{first:?}");
+    assert_eq!(
+        deferred_lines(&second),
+        0,
+        "unchanged state must stay quiet: {second:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+
+    // The state stays discoverable on demand.
+    let dry_run = run_without_terminal(&mut custom_sudo_command(
+        &fixture,
+        ["prune", "--dry-run", "-y"],
+    ));
+    assert_success(&dry_run);
+    assert!(
+        text(&dry_run.stdout)
+            .lines()
+            .any(|line| line.contains("tool") && line.contains("deferred")),
+        "{dry_run:?}"
+    );
+
+    // An interactive prune removes the orphan and clears the record ...
+    let interactive = run_on_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+    assert_success(&interactive);
+    assert!(fixture.dir.join("state/tool-uninstalled").is_file());
+
+    // ... so a later recurrence is announced again.
+    fs::remove_file(fixture.dir.join("state/tool-uninstalled")).unwrap();
+    fs::remove_file(fixture.dir.join("sudo-cache")).unwrap();
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+    let recurred = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+    assert_success(&recurred);
+    assert_eq!(deferred_lines(&recurred), 1, "{recurred:?}");
+}
+
+#[test]
+fn quiet_prune_defers_sudo_uninstall_without_a_terminal() {
+    // The cron shape: `SHDEPS_QUIET=1` makes the hook's own
+    // `shdeps_require_sudo` return 1 instead of asking the parent.
+    let fixture = custom_sudo_fixture("custom-uninstall-sudo-quiet-no-terminal", &["tool"]);
+    write_sudo_uninstall_orphan(&fixture);
+
+    let output = run_without_terminal(
+        custom_sudo_command(&fixture, ["prune", "-y"]).env("SHDEPS_QUIET", "1"),
+    );
+
+    assert_prune_deferred(&fixture, &output);
+}
+
+#[test]
+fn quiet_update_defers_retained_sudo_post_without_a_terminal() {
+    // `dot update --cron` exports `SHDEPS_QUIET=1`; the hook's probe fails
+    // and it returns 1 without asking the parent. That must defer too.
+    let fixture = custom_sudo_fixture("post-sudo-quiet-no-terminal", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+
+    let output =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool post\npost sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/.pending-posts/tool").is_file());
+    assert!(!fixture.dir.join("state/tool-posted").exists());
+    assert_eq!(text(&output.stdout), "", "quiet stays quiet");
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("failed"), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+}
+
+/// Writes one retained post whose hook body runs after a failed quiet
+/// `shdeps_require_sudo`, for classification edge cases.
+fn write_retained_quiet_sudo_post(fixture: &Fixture, body: &str) {
+    write_retained_sudo_post(fixture, &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        &format!(
+            "exists() {{ return 0; }}\npost() {{\n  printf '%s post\\n' \"$1\" >>\"$SHDEPS_TEST_SUDO_LOG\"\n{body}\n}}\n"
+        ),
+    );
+}
+
+#[test]
+fn quiet_post_whose_sudo_free_fallback_succeeds_is_not_deferred() {
+    let fixture = custom_sudo_fixture("post-sudo-quiet-fallback-ok", &["tool"]);
+    write_retained_quiet_sudo_post(
+        &fixture,
+        "  shdeps_require_sudo || printf 'fallback\\n' >\"$SHDEPS_STATE_DIR/tool-posted\"",
+    );
+
+    let output =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_success(&output);
+    assert!(fixture.dir.join("state/tool-posted").is_file());
+    assert!(!fixture.dir.join("state/.pending-posts/tool").exists());
+    assert!(!text(&output.stderr).contains("deferred"), "{output:?}");
+}
+
+#[test]
+fn quiet_deferred_post_keeps_the_hooks_own_failure_detail() {
+    // The note only says sudo was unavailable at some point; if the hook
+    // then reports why it failed, the deferral warning must not hide it.
+    let fixture = custom_sudo_fixture("post-sudo-quiet-detail", &["tool"]);
+    write_retained_quiet_sudo_post(
+        &fixture,
+        "  shdeps_require_sudo || { shdeps_warn 'fallback download failed'; return 1; }",
+    );
+
+    let output =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_success(&output);
+    let stderr = text(&output.stderr);
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("deferred"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("fallback download failed"), "{stderr}");
+}
+
+#[test]
+fn quiet_post_killed_by_its_timeout_after_a_sudo_probe_still_fails() {
+    // A hook stopped by its deadline did not give up for lack of sudo.
+    let fixture = custom_sudo_fixture("post-sudo-quiet-timeout", &["tool"]);
+    write_retained_quiet_sudo_post(&fixture, "  shdeps_require_sudo\n  /bin/sleep 5");
+
+    let output = run_without_terminal(
+        custom_sudo_command(&fixture, ["update"])
+            .env("SHDEPS_QUIET", "1")
+            .env("SHDEPS_HOOK_TIMEOUT_SECS", "1"),
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!text(&output.stderr).contains("deferred"), "{output:?}");
+    assert!(fixture.dir.join("state/.pending-posts/tool").is_file());
+}
+
+#[test]
+fn quiet_update_on_a_terminal_still_fails_a_post_that_needs_sudo() {
+    // Quiet mode never prompts; with a terminal available the user can rerun
+    // without `--quiet`, so the failure is reported as before.
+    let fixture = custom_sudo_fixture("post-sudo-quiet-terminal", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+
+    let output =
+        run_on_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool post\npost sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/.pending-posts/tool").is_file());
+}
+
 #[test]
 fn update_custom_hook_retries_only_once_when_sudo_cache_stays_cold() {
     let fixture = custom_sudo_fixture("custom-sudo-one-retry", &["tool"]);
 
-    let output =
-        run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_TEST_SUDO_STICKY_FAIL", "1"));
+    let output = run_on_terminal(
+        custom_sudo_command(&fixture, ["update"]).env("SHDEPS_TEST_SUDO_STICKY_FAIL", "1"),
+    );
 
     assert_eq!(output.status.code(), Some(1));
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -3573,9 +4128,11 @@ fn update_custom_hook_retries_only_once_when_sudo_cache_stays_cold() {
 fn update_custom_hook_does_not_retry_when_parent_sudo_fails() {
     let fixture = custom_sudo_fixture("custom-sudo-parent-fails", &["tool"]);
 
-    let output = run(custom_sudo_command(&fixture, ["update"])
-        .env("SHDEPS_TEST_SUDO_PARENT_FAIL", "1")
-        .env("SHDEPS_PROGRESS", "jsonl"));
+    let output = run_on_terminal(
+        custom_sudo_command(&fixture, ["update"])
+            .env("SHDEPS_TEST_SUDO_PARENT_FAIL", "1")
+            .env("SHDEPS_PROGRESS", "jsonl"),
+    );
 
     assert_eq!(output.status.code(), Some(1));
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -3610,7 +4167,7 @@ install() {
 "#,
     );
 
-    let output = run(&mut custom_sudo_command(&fixture, ["update"]));
+    let output = run_on_terminal(&mut custom_sudo_command(&fixture, ["update"]));
 
     assert_eq!(output.status.code(), Some(1));
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -3641,7 +4198,7 @@ install() {
     let mut command = custom_sudo_command(&fixture, ["update"]);
     command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
 
-    let (output, elapsed) = timed(&mut command);
+    let (output, elapsed) = timed_on_terminal(&mut command);
 
     assert_success(&output);
     assert!(
@@ -3679,7 +4236,7 @@ install() {
     let mut command = custom_sudo_command(&fixture, ["update"]);
     command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
 
-    let (output, elapsed) = timed(&mut command);
+    let (output, elapsed) = timed_on_terminal(&mut command);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -5162,7 +5719,7 @@ exit 2
         .env("SHDEPS_TEST_SUDO_TERM", fixture.dir.join("sudo-term"))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut shdeps = spawn_test_session(&mut command);
+    let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let sudo_pid = wait_for_pid(
         &fixture.dir.join("sudo.pid"),
         Duration::from_secs(3),
@@ -6593,7 +7150,7 @@ install() {
 
     let mut command = custom_sudo_command(&fixture, ["update"]);
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut shdeps = spawn_test_session(&mut command);
+    let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/retry-hook.pid"),
         Duration::from_secs(3),
@@ -6702,7 +7259,7 @@ install() {
 
     let mut command = custom_sudo_command(&fixture, ["update"]);
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut shdeps = spawn_test_session(&mut command);
+    let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/retry-hook.pid"),
         Duration::from_secs(3),
@@ -7856,6 +8413,101 @@ fn drain_pty_master(master: &fs::File) {
         .expect("spawn PTY master drainer");
 }
 
+/// Runs `command` in a new session without a controlling terminal: the
+/// shape of cron, systemd timers, CI, and agent tool shells, independent of
+/// whatever terminal the test harness itself was started from.
+fn run_without_terminal(command: &mut Command) -> Output {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: setsid is async-signal-safe and touches only the forked child.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    run(command)
+}
+
+/// Runs `command` with a fresh PTY as its controlling terminal while its
+/// stdout and stderr stay captured: the shape of an interactive
+/// `shdeps update`, independent of the harness's own terminal (CI has none).
+fn run_on_terminal(command: &mut Command) -> Output {
+    let (slave, master) = controlling_terminal_for(command);
+    drain_pty_master(&master);
+    let output = run(command);
+    drop(slave);
+    drop(master);
+    output
+}
+
+fn timed_on_terminal(command: &mut Command) -> (Output, Duration) {
+    let started = Instant::now();
+    let output = run_on_terminal(command);
+    (output, started.elapsed())
+}
+
+/// Opens a PTY and makes `command` start in a private session with its
+/// slave as the controlling terminal. Returns `(slave, master)`; keep both
+/// open until the command has exited (see [`TestTerminal`] for why the
+/// slave matters on macOS).
+fn controlling_terminal_for(command: &mut Command) -> (fs::File, fs::File) {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    #[cfg(target_vendor = "apple")]
+    let (termp, winp) = (std::ptr::null_mut(), std::ptr::null_mut());
+    #[cfg(not(target_vendor = "apple"))]
+    let (termp, winp) = (std::ptr::null(), std::ptr::null());
+    // SAFETY: openpty initializes both descriptors; terminal attributes and
+    // window size are intentionally left at platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                termp,
+                winp,
+            )
+        },
+        0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: openpty returned two newly owned descriptors above.
+    let master = unsafe { fs::File::from_raw_fd(master_fd) };
+    // SAFETY: same ownership transfer for the slave descriptor.
+    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+    // Keep both ends out of the command's descendants: the controlling
+    // terminal survives exec without an open descriptor, and a leaked master
+    // would keep the drainer from ever seeing EOF.
+    for fd in [master_fd, slave_fd] {
+        // SAFETY: F_SETFD on a descriptor owned above.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    // SAFETY: after fork and before exec, create a private session and make
+    // the (still open, close-on-exec) PTY slave its controlling terminal.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    (slave, master)
+}
+
 fn spawn_on_pty(command: Command) -> (GuardedChild, fs::File) {
     let (child, master) = spawn_on_pty_undrained(command);
     drain_pty_master(&master);
@@ -8125,6 +8777,34 @@ impl Drop for GuardedChild {
     fn drop(&mut self) {
         let _ = self.cleanup_and_reap();
     }
+}
+
+/// Both PTY ends backing a spawned session's controlling terminal.
+///
+/// The slave must stay open for the child's whole life: it is close-on-exec,
+/// so this is the only open descriptor, and on macOS the last slave close
+/// detaches the terminal from its session (the child's `open("/dev/tty")`
+/// then fails with ENXIO, so Shdeps sees no terminal). Linux keeps the
+/// association while the master is open, which hid the difference there.
+struct TestTerminal {
+    _master: fs::File,
+    _slave: fs::File,
+}
+
+/// Like [`spawn_test_session`], but with a fresh PTY as the session's
+/// controlling terminal so Shdeps may prompt for sudo in its own session.
+/// Keep the returned terminal alive until the child has exited.
+fn spawn_test_session_on_terminal(command: &mut Command) -> (GuardedChild, TestTerminal) {
+    let (slave, master) = controlling_terminal_for(command);
+    let child = GuardedChild::new(command.spawn().expect("guarded test process should start"));
+    drain_pty_master(&master);
+    (
+        child,
+        TestTerminal {
+            _master: master,
+            _slave: slave,
+        },
+    )
 }
 
 #[cfg(unix)]

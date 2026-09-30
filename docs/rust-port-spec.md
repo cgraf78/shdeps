@@ -374,7 +374,8 @@ Exit codes:
   skipped prompt/action.
 - `1`: guarded all-orphans condition, cleanup runtime error, a failed
   (or unsourceable) `uninstall()` hook, or a missing or unreadable config
-  directory.
+  directory. An `uninstall()` deferred because it needs sudo and no terminal
+  is available keeps its row but is not a failure.
 - `2`: unknown prune option.
 
 Safety:
@@ -1076,7 +1077,9 @@ remove anything outside the orphan list the preview showed (and the prompt or
 exits 1 so the next run re-previews.
 Prune MUST remove manifest rows after cleanup attempts, except when an
 existing `uninstall()` hook fails or cannot be sourced: prune then keeps the
-row and skips built-in cleanup so a later prune retries the hook, and exits 1.
+row and skips built-in cleanup so a later prune retries the hook, and exits 1
+(or, for a hook deferred because it needs sudo without a terminal, exits 0
+with one warning).
 To release such a row, fix the hook, run `shdeps prune` interactively when the
 hook needs sudo, or delete the hook file (its cleanup is then skipped).
 
@@ -1137,8 +1140,10 @@ Isolation:
   `list` and `check` currently suppress hook source errors and treat the custom
   dep as missing unless `exists(name)` is successfully loaded and returns
   success.
-- `post(name)` failures do not currently fail update; this behavior MUST remain
-  unless a future spec revision changes it.
+- `post(name)` failures MUST NOT abort update: remaining dependencies and post
+  hooks still run and the dependency is reported as failed. The failed post's
+  pending obligation MUST be retained so the next update retries it (at most
+  once per run); see the hook coordination rules below.
 
 Bash compatibility:
 
@@ -1196,7 +1201,31 @@ with stdin closed. If `shdeps_require_sudo` cannot authenticate with `sudo -n`
 inside `install`, `post`, or `uninstall`, it MUST signal the attached parent.
 The parent pauses live progress, performs the interactive sudo authentication,
 and retries that hook exactly once. `SHDEPS_QUIET=1` MUST suppress both the
-prompt and retry. Calls outside this hook handshake retain the direct helper's
+prompt and retry. Without a controlling terminal, `update` MUST NOT run sudo
+for a hook's request (it cannot read a password there and would only log
+another failed authentication after the hook's own `sudo -n` probe) and MUST
+NOT retry the hook: a `post` obligation is deferred (it stays pending, is
+reported as one warning per run, counts as a warning rather than a failure,
+and does not affect the exit status) and a custom `install` fails. In quiet
+mode `shdeps_require_sudo` MUST still return 1 without ending the hook, so
+fallback paths keep working, but it records a "sudo unavailable" note on the
+same request channel; when such a `post` then exits nonzero on its own (not by
+timeout or signal) in an `update` without a controlling terminal, it MUST be
+deferred the same way, keeping any hook-authored failure detail in the warning
+because the note cannot prove sudo caused the failure (with a terminal it
+remains a failure). `prune` applies the same rules to `uninstall`: without a
+controlling terminal it MUST NOT run sudo for a hook's request, and an
+`uninstall` that requested sudo or failed after the quiet note keeps its row
+and prune journal for a later prune, is reported as one warning per run, and
+does not make prune exit nonzero. Without a terminal, the text warning for
+deferred posts (`update`) or uninstalls (`prune`) MUST be printed only when
+the deferred set gains an entry since the last run (an entry is the name plus
+the hook's failure detail, so a changed detail counts as new), tracked in
+`$SHDEPS_STATE_DIR/.deferred-posts` and `.deferred-uninstalls` (cleared when
+nothing is deferred, so a recurrence is announced again); terminal runs always
+print it, JSONL `warning` events are always emitted but never mark an entry as
+announced, and `prune --dry-run` lists recorded deferred uninstalls every
+time. Calls outside this hook handshake retain the direct helper's
 normal prompt behavior. Since retry restarts the hook function, hook authors
 MUST call `shdeps_require_sudo` before any side effect. If the first install
 attempt changes `exists()` before requesting sudo, the retry MUST fail closed
@@ -1489,9 +1518,33 @@ Design (deliberately simple):
   pending-post marker. The parent promotes any sentinel before deleting its
   transaction directory, including during cancellation; the next update also
   promotes abandoned transaction directories after an uncatchable exit.
-  Pending markers are acknowledged only after the matching post hook is
-  classified. `<txn_id>` is a unique identifier the parent generates per
+  For a dependency with a configured entry whose filter matches this host,
+  the pending marker is acknowledged only after the matching post hook ran,
+  declined (exit 2), or was absent. A post that fails or cannot be sourced
+  keeps its marker so the next update retries it; each update attempts a
+  pending post at most once. Any other dependency follows prune's ownership
+  rule: with no manifest row (never installed here, or prune already removed
+  it) the marker is acknowledged without running `post(name)`, which would
+  recreate what `uninstall` removed; with a row and an entry that still owns
+  it (its filter does not provably exclude this host, e.g. an unproven
+  `host:` mismatch) the marker is kept without running `post(name)` or
+  reporting failure; with a row but no owning entry (removed from config or
+  provably excluded, not yet pruned) the marker is acknowledged without
+  running `post(name)`: prune owns that install's cleanup, and a post could
+  recreate what prune removes or run on an excluded platform. Prune itself
+  removes a dependency's pending marker immediately before it removes that
+  manifest row, so a marker never outlives its row there; the no-row rule
+  above still covers markers left by older versions.
+  `<txn_id>` is a unique identifier the parent generates per
   `shdeps update` and exports through `SHDEPS_UPDATE_TXN_ID`.
+- Only the top-level state-lock holder recovers abandoned transaction
+  directories and pending obligations. An update that re-enters under another
+  Shdeps command's state lock (for example from a hook) MUST NOT promote or
+  delete other `.changed-markers/<txn_id>` directories, and MUST NOT run or
+  acknowledge obligations that were already pending when it started, even for
+  a dependency it changes again; they belong to the outer command (or, after a
+  crash, to the next top-level update). The nested run posts only the
+  obligations it created.
 - Logging helpers (`shdeps_log`, `shdeps_warn`, `shdeps_log_*`) write
   directly to stdout/stderr from the subprocess; the parent does not
   reformat. The wrapper one-liner discipline (see Code Quality requirements)

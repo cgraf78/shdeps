@@ -6,7 +6,8 @@
 #   exists()   — return 0 if installed, 1 if missing. Required.
 #   version()  — print version string to stdout. Optional.
 #   install()  — perform the install unconditionally. Return 0 on success.
-#   post()     — optional post-install setup (runs if dep changed).
+#   post()     — optional post-install setup (runs if dep changed; a
+#                failed post is retried on the next update).
 #   uninstall() — optional cleanup called by `shdeps prune`.
 #
 # shdeps calls exists() to decide whether to run install(), and uses

@@ -21,6 +21,7 @@ pub mod checksum;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
+mod deferral_notice;
 pub mod dep_links;
 pub mod dep_path;
 pub mod errors;

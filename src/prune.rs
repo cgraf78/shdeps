@@ -68,6 +68,30 @@ impl Summary {
             .iter()
             .any(|item| item.cleanup_error.is_some() || item.hook_failed())
     }
+
+    /// Returns the single warning line for uninstall hooks deferred until
+    /// sudo can prompt, or `None` when nothing was deferred.
+    ///
+    /// Deferral is not an error: the row stays for the next prune, and an
+    /// unattended prune (cron) that can never prompt must not fail, or log a
+    /// failed sudo attempt, on every run. One line per run keeps it quiet.
+    #[must_use]
+    pub fn deferred_warning(&self) -> Option<String> {
+        let names = self
+            .removed
+            .iter()
+            .filter(|item| item.hook_deferred())
+            .map(|item| item.entry.name.as_str())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{}: uninstall hook deferred -- {}; kept for a `shdeps prune` run from a terminal",
+            names.join(", "),
+            crate::update::SUDO_NO_TERMINAL
+        ))
+    }
 }
 
 /// Runs prune against one already-loaded config snapshot.
@@ -404,7 +428,7 @@ pub fn run_with_config_loader(
             cleanup: None,
             cleanup_error: None,
         };
-        if item.hook_failed() {
+        if item.hook_failed() || item.hook_deferred() {
             // The hook's own cleanup did not happen (cron sudo without a TTY,
             // a broken hook, ...). Retiring the row now would orphan whatever
             // the hook was supposed to remove with nothing left to retry it,
@@ -455,10 +479,23 @@ fn uninstall(
     hooks: &BashCustomProbe,
 ) -> Result<Uninstall> {
     let hook = hooks.uninstall(&entry.name, roots)?;
-    if hook != Uninstall::SudoRequired {
-        return Ok(hook);
+    match hook {
+        Uninstall::SudoRequired => {}
+        // A quiet hook's own `sudo -n` probe failed and it gave up. Without a
+        // terminal no prune started this way can do better, so defer; with
+        // one the user can rerun without quiet, so it stays a failure.
+        Uninstall::SudoUnavailable if crate::process::controlling_terminal() => {
+            return Ok(Uninstall::Failed);
+        }
+        other => return Ok(other),
     }
     cancellation::check()?;
+    // Without a terminal `sudo` cannot read a password: it would only fail
+    // and log a failed authentication on every cron run. The hook already
+    // probed `sudo -n`, so defer without running `sudo` at all.
+    if !crate::process::controlling_terminal() {
+        return Ok(Uninstall::SudoUnavailable);
+    }
     if !Process.run("sudo", &["true"], None)?.success {
         return Ok(Uninstall::Failed);
     }
@@ -573,6 +610,14 @@ fn cleanup_orphan(
         // a partially missing filesystem state does not strand the manifest
         // forever. Lock-acquisition failures return before this point because
         // no checkout cleanup decision was safely made.
+        //
+        // Retire a retained failed `post()` first, inside the same commit
+        // boundary: once the row is gone nothing may run that post (an older
+        // Shdeps after a rollback would, recreating what `uninstall()` just
+        // removed). Clearing it before the row means a crash in between
+        // leaves a row without a marker, which the retried prune removes,
+        // never a marker without its row.
+        crate::hooks::acknowledge_pending_post(&cleanup_roots.state_dir, &entry.name)?;
         manifest::remove(manifest_path, &entry.name)?;
         Ok(result)
     };
@@ -684,6 +729,14 @@ impl Item {
     #[must_use]
     pub fn hook_failed(&self) -> bool {
         matches!(self.hook, Uninstall::Failed | Uninstall::SourceFailed)
+    }
+
+    /// Returns whether the hook needed sudo that this run could not obtain
+    /// without a terminal; its row is kept like a failure's, but it is not
+    /// reported as an error.
+    #[must_use]
+    pub fn hook_deferred(&self) -> bool {
+        self.hook == Uninstall::SudoUnavailable
     }
 }
 
@@ -2638,6 +2691,135 @@ mod tests {
         );
         assert!(archive_bin.exists(), "failed hook must keep the payload");
         assert!(fs::symlink_metadata(&public).is_ok());
+    }
+
+    #[test]
+    fn prune_retires_pending_post_with_the_manifest_row() {
+        // A failed post leaves `.pending-posts/<name>`. Once prune removes
+        // the row, nothing may run that post: an older Shdeps (rollback)
+        // would otherwise recreate what `uninstall()` just removed.
+        let fixture = Fixture::new("pending-post-retired");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("owner/tool", "custom", "tool", ""),
+        )
+        .unwrap();
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "owner/tool").unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/owner/tool")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn prune_keeps_the_pending_post_of_a_dep_nested_under_the_orphan_name() {
+        // Replacing `neovim` (pkg) with `neovim/neovim` orphans the old row
+        // while the new dep's pending marker makes `.pending-posts/neovim` a
+        // directory. That directory is not the orphan's marker: prune must
+        // neither fail on it nor touch the other dep's obligation.
+        let fixture = Fixture::new("pending-post-nested-name");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("neovim", "custom", "nvim", ""),
+        )
+        .unwrap();
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "neovim/neovim").unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/neovim/neovim")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn prune_keeps_pending_post_while_it_keeps_the_row() {
+        // A failed uninstall keeps the row for the next prune; the pending
+        // post stays with it so the state is unchanged for that retry.
+        let fixture = Fixture::new("pending-post-kept");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("custom.sh"),
+            "uninstall() { return 1; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("custom", "custom", "custom", ""),
+        )
+        .unwrap();
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "custom").unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors(), "{summary:?}");
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("custom")
+                .is_some()
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/custom")
+                .is_file()
+        );
     }
 
     #[test]
