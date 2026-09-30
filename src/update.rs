@@ -259,6 +259,15 @@ pub struct Summary {
     /// failures have no item, so their sanitized hook-authored warning is
     /// recorded here instead of collapsing into a generic failure.
     pub failed_details: BTreeMap<String, String>,
+    /// Dependencies whose pending post hook needs sudo that this run could
+    /// not obtain without a terminal.
+    ///
+    /// These are deliberately not failures: the post stays pending and runs
+    /// on the next update that can authenticate, and an unattended run that
+    /// can never prompt must not fail (or log a failed sudo attempt) every
+    /// time. Renderers report them as one warning via
+    /// [`Summary::deferred_posts_warning`].
+    pub deferred_posts: Vec<String>,
     /// Dependencies whose old-method cleanup needs a later retry.
     ///
     /// Method-transition cleanup runs after the new method has been recorded.
@@ -544,6 +553,21 @@ where
 }
 
 impl Summary {
+    /// Returns the single warning line for posts deferred until sudo can
+    /// prompt, or `None` when nothing was deferred.
+    ///
+    /// One line per run (not per dependency) keeps an unattended run that
+    /// defers several hooks from flooding cron mail or a parent's display.
+    pub fn deferred_posts_warning(&self) -> Option<String> {
+        if self.deferred_posts.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{}: post hook deferred -- {SUDO_NO_TERMINAL}; rerun `shdeps update` from a terminal",
+            self.deferred_posts.join(", ")
+        ))
+    }
+
     /// Returns whether the update had any failure.
     ///
     /// Install failures always gate the exit code. Cleanup-step
@@ -1863,29 +1887,35 @@ fn install_custom(
     }
     cancellation::check()?;
     if install == Install::SudoRequired {
-        install = if authenticate_hook_sudo(context.runner, progress)? {
-            let retried = context.hooks.retry_install_with_txn(
-                &entry.name,
-                context.roots,
-                options.reinstall || force_custom_install,
-                Some(txn),
-            )?;
-            if matches!(retried, Install::Installed { .. }) {
-                mutation.resolve(true)?;
+        install = match authenticate_hook_sudo(context.runner, progress)? {
+            HookSudo::Authenticated => {
+                let retried = context.hooks.retry_install_with_txn(
+                    &entry.name,
+                    context.roots,
+                    options.reinstall || force_custom_install,
+                    Some(txn),
+                )?;
+                if matches!(retried, Install::Installed { .. }) {
+                    mutation.resolve(true)?;
+                }
+                match retried {
+                    Install::Already { .. } => Install::Failed {
+                        detail: "hook changed install state before sudo authentication".to_owned(),
+                    },
+                    Install::SudoRequired => Install::Failed {
+                        detail: String::new(),
+                    },
+                    retried => retried,
+                }
             }
-            match retried {
-                Install::Already { .. } => Install::Failed {
-                    detail: "hook changed install state before sudo authentication".to_owned(),
-                },
-                Install::SudoRequired => Install::Failed {
-                    detail: String::new(),
-                },
-                retried => retried,
-            }
-        } else {
-            Install::Failed {
+            HookSudo::Denied => Install::Failed {
                 detail: String::new(),
-            }
+            },
+            // The dependency is still missing, so this stays a failure; the
+            // detail says why instead of a bare "custom install failed".
+            HookSudo::NoTerminal => Install::Failed {
+                detail: SUDO_NO_TERMINAL.to_owned(),
+            },
         };
         cancellation::check()?;
     }
@@ -1945,13 +1975,47 @@ fn install_custom(
     }
 }
 
-fn authenticate_hook_sudo(runner: &impl Runner, progress: &mut dyn Progress) -> Result<bool> {
+/// Why a hook's sudo request could not be satisfied without a terminal.
+pub(crate) const SUDO_NO_TERMINAL: &str = "sudo needs a password but no terminal is available";
+
+/// Parent-side answer to a hook's request for sudo authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookSudo {
+    /// Credentials are usable; retry the hook once.
+    Authenticated,
+    /// The interactive prompt ran and did not authenticate.
+    Denied,
+    /// A password is needed but there is no terminal to ask on.
+    NoTerminal,
+}
+
+/// Obtains sudo credentials in the attached parent for a hook that asked.
+///
+/// With a controlling terminal this prompts exactly as before. Without one
+/// (cron, systemd timers, CI, agent tool shells) an interactive `sudo` cannot
+/// read a password and only records a failed authentication, so the parent
+/// accepts credentials that need no prompt and otherwise reports
+/// `NoTerminal` without ever running an interactive `sudo`.
+fn authenticate_hook_sudo(runner: &impl Runner, progress: &mut dyn Progress) -> Result<HookSudo> {
     cancellation::check()?;
+    if !crate::process::controlling_terminal() {
+        let cached = update_pkg::sudo_noninteractive(runner)?;
+        cancellation::check()?;
+        return Ok(if cached {
+            HookSudo::Authenticated
+        } else {
+            HookSudo::NoTerminal
+        });
+    }
     progress.pause_for_prompt("waiting for sudo authentication")?;
     cancellation::check()?;
     let success = runner.run("sudo", &["true"], None)?.success;
     cancellation::check()?;
-    Ok(success)
+    Ok(if success {
+        HookSudo::Authenticated
+    } else {
+        HookSudo::Denied
+    })
 }
 
 pub(crate) fn verbose_enabled(options: Options, env_vars: &BTreeMap<String, String>) -> bool {
@@ -1988,6 +2052,9 @@ fn run_post_hooks(
 ) -> Result<()> {
     // Rows as they stand after every install decision in this run.
     let installed = manifest::read(context.manifest_path)?;
+    // Latched once sudo proved unavailable without a terminal: nothing in
+    // this run can change that, so later hooks skip the repeated probe.
+    let mut sudo_needs_terminal = false;
     for name in changed {
         cancellation::check()?;
         if !managed.contains(name) {
@@ -2011,19 +2078,36 @@ fn run_post_hooks(
             .post_with_txn(name, context.roots, Some(txn))?;
         cancellation::check()?;
         if post == Post::SudoRequired {
-            post = if authenticate_hook_sudo(context.runner, progress)? {
-                match context
-                    .hooks
-                    .retry_post_with_txn(name, context.roots, Some(txn))?
-                {
-                    Post::SudoRequired => Post::Failed {
-                        detail: String::new(),
-                    },
-                    retried => retried,
-                }
+            let sudo = if sudo_needs_terminal {
+                HookSudo::NoTerminal
             } else {
-                Post::Failed {
+                authenticate_hook_sudo(context.runner, progress)?
+            };
+            post = match sudo {
+                HookSudo::Authenticated => {
+                    match context
+                        .hooks
+                        .retry_post_with_txn(name, context.roots, Some(txn))?
+                    {
+                        Post::SudoRequired => Post::Failed {
+                            detail: String::new(),
+                        },
+                        retried => retried,
+                    }
+                }
+                HookSudo::Denied => Post::Failed {
                     detail: String::new(),
+                },
+                HookSudo::NoTerminal => {
+                    // Defer rather than fail: by the hook contract a
+                    // `SudoRequired` post made no changes yet, so keeping its
+                    // obligation lets the next update that can authenticate
+                    // run it. Failing here would fail every unattended run
+                    // forever for something only an interactive run can fix.
+                    sudo_needs_terminal = true;
+                    summary.deferred_posts.push(name.clone());
+                    cancellation::check()?;
+                    continue;
                 }
             };
             cancellation::check()?;

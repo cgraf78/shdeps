@@ -599,7 +599,12 @@ new process group while preserving the parent's session and controlling
 terminal. That lets sudo policies with terminal-scoped timestamps recognize
 the freshly cached credential without weakening timeout cleanup; hook stdin
 remains closed in both attempts. Quiet mode never prompts or retries, and an
-already current custom dependency never reaches the sudo helper. Because the
+already current custom dependency never reaches the sudo helper. Without a
+controlling terminal (cron, systemd timers, CI, agent shells) `shdeps update`
+never runs an interactive `sudo`: it retries the hook only when `sudo -n`
+succeeds in the parent. Otherwise a `post()` stays pending for the next update
+that can authenticate and is reported once as a warning, not a failure, while
+a custom `install()` fails. Because the
 retry restarts the hook function, hooks must call `shdeps_require_sudo` before
 making filesystem changes or starting other side effects.
 

@@ -3438,7 +3438,8 @@ fn update_custom_hook_with_cached_sudo_does_not_prompt_parent() {
 fn update_custom_hook_prompts_parent_and_retries_once_when_sudo_cache_is_cold() {
     let fixture = custom_sudo_fixture("custom-sudo-cold", &["tool"]);
 
-    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+    let output =
+        run_on_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
 
     assert_success(&output);
     assert_eq!(
@@ -3508,7 +3509,7 @@ exec "$@"
         &format!("#!/bin/sh\nexec {binary} \"$@\"\n"),
     );
 
-    let output = run(&mut custom_sudo_command(&fixture, ["update"]));
+    let output = run_on_terminal(&mut custom_sudo_command(&fixture, ["update"]));
 
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
     assert_eq!(
@@ -3540,7 +3541,8 @@ exec "$@"
 fn update_multiple_custom_hooks_share_one_parent_sudo_prompt() {
     let fixture = custom_sudo_fixture("custom-sudo-multiple", &["first", "second"]);
 
-    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+    let output =
+        run_on_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
 
     assert_success(&output);
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -3576,7 +3578,8 @@ post() {
 "#,
     );
 
-    let output = run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
+    let output =
+        run_on_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"));
 
     assert_success(&output);
     assert_eq!(
@@ -3585,6 +3588,130 @@ post() {
          tool post\npost sudo -n true\n"
     );
     assert!(fixture.dir.join("state/tool-posted").is_file());
+}
+
+/// Writes an already-installed custom dep whose failed `post()` is retained
+/// and needs sudo before any side effect.
+fn write_retained_sudo_post(fixture: &Fixture, deps: &[&str]) {
+    let mut manifest = String::new();
+    for dep in deps {
+        fixture.write(
+            format!("conf/hooks.d/{dep}.sh"),
+            r#"
+exists() { return 0; }
+post() {
+  printf '%s post\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  printf 'post\n' >"$SHDEPS_STATE_DIR/$1-posted"
+}
+"#,
+        );
+        fixture.write(format!("state/.pending-posts/{dep}"), "pending\n");
+        manifest.push_str(&format!("{dep}|custom|{dep}|\n"));
+    }
+    fixture.write("state/manifest", &manifest);
+}
+
+#[test]
+fn update_defers_retained_sudo_posts_without_a_terminal() {
+    // Cron, systemd, and agent shells have no terminal. Running `sudo true`
+    // there cannot read a password; it only records a failed authentication
+    // (audited on managed hosts) and failed the run every time.
+    let fixture = custom_sudo_fixture("post-sudo-no-terminal", &["first", "second"]);
+    write_retained_sudo_post(&fixture, &["first", "second"]);
+
+    let output = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "first post\npost sudo -n true\nparent sudo -n true\n\
+         second post\npost sudo -n true\n",
+        "never prompt without a terminal, and probe the parent only once"
+    );
+    for dep in ["first", "second"] {
+        assert!(
+            fixture
+                .dir
+                .join(format!("state/.pending-posts/{dep}"))
+                .is_file(),
+            "deferred post must stay pending"
+        );
+        assert!(!fixture.dir.join(format!("state/{dep}-posted")).exists());
+    }
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("failed"), "{stderr}");
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("deferred"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("first, second"), "{stderr}");
+}
+
+#[test]
+fn update_reports_deferred_sudo_post_as_a_jsonl_warning_then_recovers_on_a_terminal() {
+    let fixture = custom_sudo_fixture("post-sudo-no-terminal-jsonl", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+
+    let deferred = run_without_terminal(
+        custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"),
+    );
+
+    assert_success(&deferred);
+    let events = jsonl(&deferred.stdout);
+    assert!(
+        !events.iter().any(|event| event["event"] == "prompt"),
+        "no terminal, so no prompt pause: {events:#?}"
+    );
+    let warnings = events
+        .iter()
+        .filter(|event| event["event"] == "warning")
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{events:#?}");
+    assert!(
+        warnings[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("tool: post hook deferred")),
+        "{events:#?}"
+    );
+    let summary = events.last().unwrap();
+    assert_eq!(summary["event"], "summary", "{events:#?}");
+    assert_eq!(summary["status"], "warning", "{summary}");
+    assert_eq!(summary["failed"], 0, "{summary}");
+    assert!(fixture.dir.join("state/.pending-posts/tool").is_file());
+
+    // An interactive run still prompts, runs the post, and retires it.
+    fs::write(fixture.dir.join("sudo.log"), "").unwrap();
+    let interactive = run_on_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&interactive);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool post\npost sudo -n true\nparent sudo true\n\
+         tool post\npost sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/tool-posted").is_file());
+    assert!(!fixture.dir.join("state/.pending-posts/tool").exists());
+}
+
+#[test]
+fn update_custom_install_needing_sudo_fails_without_prompting_when_no_terminal() {
+    let fixture = custom_sudo_fixture("custom-sudo-no-terminal", &["tool"]);
+
+    let output = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool install\ninstall sudo -n true\nparent sudo -n true\n"
+    );
+    assert!(
+        text(&output.stderr).contains("no terminal"),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(!fixture.dir.join("state/tool-installed").exists());
 }
 
 #[test]
@@ -3651,8 +3778,9 @@ uninstall() {
 fn update_custom_hook_retries_only_once_when_sudo_cache_stays_cold() {
     let fixture = custom_sudo_fixture("custom-sudo-one-retry", &["tool"]);
 
-    let output =
-        run(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_TEST_SUDO_STICKY_FAIL", "1"));
+    let output = run_on_terminal(
+        custom_sudo_command(&fixture, ["update"]).env("SHDEPS_TEST_SUDO_STICKY_FAIL", "1"),
+    );
 
     assert_eq!(output.status.code(), Some(1));
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -3666,9 +3794,11 @@ fn update_custom_hook_retries_only_once_when_sudo_cache_stays_cold() {
 fn update_custom_hook_does_not_retry_when_parent_sudo_fails() {
     let fixture = custom_sudo_fixture("custom-sudo-parent-fails", &["tool"]);
 
-    let output = run(custom_sudo_command(&fixture, ["update"])
-        .env("SHDEPS_TEST_SUDO_PARENT_FAIL", "1")
-        .env("SHDEPS_PROGRESS", "jsonl"));
+    let output = run_on_terminal(
+        custom_sudo_command(&fixture, ["update"])
+            .env("SHDEPS_TEST_SUDO_PARENT_FAIL", "1")
+            .env("SHDEPS_PROGRESS", "jsonl"),
+    );
 
     assert_eq!(output.status.code(), Some(1));
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -3703,7 +3833,7 @@ install() {
 "#,
     );
 
-    let output = run(&mut custom_sudo_command(&fixture, ["update"]));
+    let output = run_on_terminal(&mut custom_sudo_command(&fixture, ["update"]));
 
     assert_eq!(output.status.code(), Some(1));
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -3734,7 +3864,7 @@ install() {
     let mut command = custom_sudo_command(&fixture, ["update"]);
     command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
 
-    let (output, elapsed) = timed(&mut command);
+    let (output, elapsed) = timed_on_terminal(&mut command);
 
     assert_success(&output);
     assert!(
@@ -3772,7 +3902,7 @@ install() {
     let mut command = custom_sudo_command(&fixture, ["update"]);
     command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
 
-    let (output, elapsed) = timed(&mut command);
+    let (output, elapsed) = timed_on_terminal(&mut command);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -5255,7 +5385,7 @@ exit 2
         .env("SHDEPS_TEST_SUDO_TERM", fixture.dir.join("sudo-term"))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut shdeps = spawn_test_session(&mut command);
+    let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let sudo_pid = wait_for_pid(
         &fixture.dir.join("sudo.pid"),
         Duration::from_secs(3),
@@ -6686,7 +6816,7 @@ install() {
 
     let mut command = custom_sudo_command(&fixture, ["update"]);
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut shdeps = spawn_test_session(&mut command);
+    let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/retry-hook.pid"),
         Duration::from_secs(3),
@@ -6795,7 +6925,7 @@ install() {
 
     let mut command = custom_sudo_command(&fixture, ["update"]);
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut shdeps = spawn_test_session(&mut command);
+    let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/retry-hook.pid"),
         Duration::from_secs(3),
@@ -7949,6 +8079,100 @@ fn drain_pty_master(master: &fs::File) {
         .expect("spawn PTY master drainer");
 }
 
+/// Runs `command` in a new session without a controlling terminal: the
+/// shape of cron, systemd timers, CI, and agent tool shells, independent of
+/// whatever terminal the test harness itself was started from.
+fn run_without_terminal(command: &mut Command) -> Output {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: setsid is async-signal-safe and touches only the forked child.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    run(command)
+}
+
+/// Runs `command` with a fresh PTY as its controlling terminal while its
+/// stdout and stderr stay captured: the shape of an interactive
+/// `shdeps update`, independent of the harness's own terminal (CI has none).
+fn run_on_terminal(command: &mut Command) -> Output {
+    let (slave, master) = controlling_terminal_for(command);
+    drain_pty_master(&master);
+    let output = run(command);
+    drop(slave);
+    drop(master);
+    output
+}
+
+fn timed_on_terminal(command: &mut Command) -> (Output, Duration) {
+    let started = Instant::now();
+    let output = run_on_terminal(command);
+    (output, started.elapsed())
+}
+
+/// Opens a PTY and makes `command` start in a private session with its
+/// slave as the controlling terminal. Returns `(slave, master)`; keep both
+/// open until the command is spawned and the master until it has exited.
+fn controlling_terminal_for(command: &mut Command) -> (fs::File, fs::File) {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    #[cfg(target_vendor = "apple")]
+    let (termp, winp) = (std::ptr::null_mut(), std::ptr::null_mut());
+    #[cfg(not(target_vendor = "apple"))]
+    let (termp, winp) = (std::ptr::null(), std::ptr::null());
+    // SAFETY: openpty initializes both descriptors; terminal attributes and
+    // window size are intentionally left at platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                termp,
+                winp,
+            )
+        },
+        0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: openpty returned two newly owned descriptors above.
+    let master = unsafe { fs::File::from_raw_fd(master_fd) };
+    // SAFETY: same ownership transfer for the slave descriptor.
+    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+    // Keep both ends out of the command's descendants: the controlling
+    // terminal survives exec without an open descriptor, and a leaked master
+    // would keep the drainer from ever seeing EOF.
+    for fd in [master_fd, slave_fd] {
+        // SAFETY: F_SETFD on a descriptor owned above.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    // SAFETY: after fork and before exec, create a private session and make
+    // the (still open, close-on-exec) PTY slave its controlling terminal.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    (slave, master)
+}
+
 fn spawn_on_pty(command: Command) -> (GuardedChild, fs::File) {
     let (child, master) = spawn_on_pty_undrained(command);
     drain_pty_master(&master);
@@ -8221,6 +8445,17 @@ impl Drop for GuardedChild {
 }
 
 #[cfg(unix)]
+/// Like [`spawn_test_session`], but with a fresh PTY as the session's
+/// controlling terminal so Shdeps may prompt for sudo in its own session.
+/// Keep the returned master alive until the child has exited.
+fn spawn_test_session_on_terminal(command: &mut Command) -> (GuardedChild, fs::File) {
+    let (slave, master) = controlling_terminal_for(command);
+    let child = GuardedChild::new(command.spawn().expect("guarded test process should start"));
+    drop(slave);
+    drain_pty_master(&master);
+    (child, master)
+}
+
 fn spawn_test_session(command: &mut Command) -> GuardedChild {
     use std::os::unix::process::CommandExt as _;
 

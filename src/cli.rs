@@ -2185,6 +2185,7 @@ where
     for name in &summary.leftovers {
         write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
+    write_deferred_posts_warning(summary, stderr)?;
 
     if !quiet {
         write_normal_group_summaries(summary, entries, stdout)?;
@@ -2242,6 +2243,7 @@ where
     for name in &summary.leftovers {
         write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
+    write_deferred_posts_warning(summary, stderr)?;
 
     Ok(())
 }
@@ -2290,7 +2292,19 @@ where
     for name in &summary.leftovers {
         write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
+    write_deferred_posts_warning(summary, stderr)?;
 
+    Ok(())
+}
+
+/// Writes the one-line warning for post hooks deferred until sudo can prompt.
+fn write_deferred_posts_warning<E>(summary: &update::Summary, stderr: &mut E) -> Result<()>
+where
+    E: Write,
+{
+    if let Some(warning) = summary.deferred_posts_warning() {
+        write_row(stderr, "warning", &warning)?;
+    }
     Ok(())
 }
 
@@ -2429,6 +2443,7 @@ where
     for name in &summary.leftovers {
         write_row(stderr, "warning", &cleanup_leftover_message(summary, name))?;
     }
+    write_deferred_posts_warning(summary, stderr)?;
 
     let counts = update_counts(summary, active_count);
     if counts.failed == 0 {
@@ -2487,6 +2502,15 @@ where
                 "detail": format!("{}: {}", item.name, item.detail),
             }))?;
         }
+    }
+    // A parent renderer (dot) shows this as a note and the summary status
+    // below as a warning, so a deferred post never looks like a failure.
+    if let Some(warning) = summary.deferred_posts_warning() {
+        progress.event(json!({
+            "event": "warning",
+            "status": "warning",
+            "detail": warning,
+        }))?;
     }
     write_group_summaries_jsonl(summary, entries, progress)?;
     let counts = update_counts(summary, active_count);
@@ -2556,11 +2580,14 @@ fn update_counts(summary: &update::Summary, active_count: usize) -> UpdateCounts
         .iter()
         .filter(|item| item.status == update::ItemStatus::Changed)
         .count();
+    // Deferred posts count as warnings so the overall status is "warning",
+    // not "ok", while they stay pending; they are never failures.
     let warnings = summary
         .items
         .iter()
         .filter(|item| item.status == update::ItemStatus::Warning)
-        .count();
+        .count()
+        + summary.deferred_posts.len();
     let skipped = summary
         .items
         .iter()
