@@ -143,10 +143,10 @@ impl Runner for Process {
 /// failed authentication. Cron, systemd timers, CI, and agent tool shells run
 /// without one even when stdin or stdout is redirected to something else.
 ///
-/// Opening `/dev/tty` read-write is exactly what sudo does to prompt, so the
-/// answer matches sudo's own on every platform, including where Linux and
-/// macOS differ (macOS detaches a terminal whose slave side no process holds
-/// open, while Linux keeps it while the master is open).
+/// This is a conservative test: sudo reads a typed password through
+/// `/dev/tty`, so without one it cannot prompt on Linux or macOS. It can
+/// still authenticate without a terminal through an askpass helper or a
+/// non-typing PAM module (for example Touch ID); those runs defer instead.
 pub(crate) fn controlling_terminal() -> bool {
     std::fs::OpenOptions::new()
         .read(true)
