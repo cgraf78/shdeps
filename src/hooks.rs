@@ -17,6 +17,7 @@
 //! `<install_dir>/<name>` layout the install path uses for the same
 //! deps, keeping hooks parallel to their dep's install root.
 
+use std::collections::BTreeSet;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -539,6 +540,10 @@ pub(crate) struct Txn {
     id: String,
     marker_dir: PathBuf,
     state_dir: PathBuf,
+    /// Post obligations owned by a live outer update when this transaction
+    /// started re-entrantly. They stay invisible to this transaction and are
+    /// never acknowledged by it; empty for a top-level update.
+    inherited: BTreeSet<String>,
 }
 
 /// Durable pre-mutation post-hook obligation.
@@ -556,8 +561,28 @@ pub(crate) struct MutationIntent {
 
 impl Txn {
     /// Creates the marker directory used by hook subprocesses in one update.
+    ///
+    /// Only the top-level state-lock holder may call this: it adopts every
+    /// abandoned transaction directory and pending obligation as its own.
     pub(crate) fn new(state_dir: &Path) -> Result<Self> {
         promote_abandoned_markers(state_dir)?;
+        Self::create(state_dir, BTreeSet::new())
+    }
+
+    /// Creates a transaction for an update re-entered from a hook.
+    ///
+    /// The outer update still owns its live `.changed-markers/<txn>` directory
+    /// and every pending obligation that exists now, including the post hook
+    /// that may have started this nested run. Promoting or adopting them here
+    /// would delete the outer run's markers and re-run its hooks (the running
+    /// one recursively). Leave both alone: the outer run, or the next
+    /// top-level run after a crash, remains responsible for them.
+    pub(crate) fn nested(state_dir: &Path) -> Result<Self> {
+        let inherited = pending_posts(state_dir)?.into_iter().collect();
+        Self::create(state_dir, inherited)
+    }
+
+    fn create(state_dir: &Path, inherited: BTreeSet<String>) -> Result<Self> {
         let id = txn_id();
         let marker_dir = state_dir.join(".changed-markers").join(&id);
         std::fs::create_dir_all(&marker_dir)?;
@@ -565,6 +590,7 @@ impl Txn {
             id,
             marker_dir,
             state_dir: state_dir.to_path_buf(),
+            inherited,
         })
     }
 
@@ -614,9 +640,18 @@ impl Txn {
         MutationIntent::new(&self.state_dir, name)
     }
 
-    /// Returns all post-hook obligations retained from this or an earlier run.
+    /// Returns post-hook obligations this transaction owns: everything
+    /// retained from this or an earlier run, minus a live outer run's.
     pub(crate) fn pending(&self) -> Result<Vec<String>> {
-        pending_posts(&self.state_dir)
+        let mut pending = pending_posts(&self.state_dir)?;
+        pending.retain(|name| self.owns(name));
+        Ok(pending)
+    }
+
+    /// Reports whether this transaction owns (may run and acknowledge) the
+    /// post obligation for `name`; false only for a live outer run's.
+    pub(crate) fn owns(&self, name: &str) -> bool {
+        !self.inherited.contains(name)
     }
 
     /// Reports whether one dependency still owes its post hook.
@@ -625,7 +660,14 @@ impl Txn {
     }
 
     /// Acknowledges one obligation after its post classification is complete.
+    ///
+    /// An inherited obligation belongs to the outer run, which acknowledges
+    /// it after its own post; a nested acknowledgement would erase it if the
+    /// outer run is interrupted before that post completes.
     pub(crate) fn acknowledge(&self, name: &str) -> Result<()> {
+        if !self.owns(name) {
+            return Ok(());
+        }
         acknowledge_pending_post(&self.state_dir, name)
     }
 }

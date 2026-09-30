@@ -1507,6 +1507,14 @@ Design (deliberately simple):
   it.
   `<txn_id>` is a unique identifier the parent generates per
   `shdeps update` and exports through `SHDEPS_UPDATE_TXN_ID`.
+- Only the top-level state-lock holder recovers abandoned transaction
+  directories and pending obligations. An update that re-enters under another
+  Shdeps command's state lock (for example from a hook) MUST NOT promote or
+  delete other `.changed-markers/<txn_id>` directories, and MUST NOT run or
+  acknowledge obligations that were already pending when it started, even for
+  a dependency it changes again; they belong to the outer command (or, after a
+  crash, to the next top-level update). The nested run posts only the
+  obligations it created.
 - Logging helpers (`shdeps_log`, `shdeps_warn`, `shdeps_log_*`) write
   directly to stdout/stderr from the subprocess; the parent does not
   reformat. The wrapper one-liner discipline (see Code Quality requirements)

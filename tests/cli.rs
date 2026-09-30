@@ -1420,6 +1420,55 @@ fn update_identity_handoff_fails_one_dependency_and_updates_the_rest() {
 }
 
 #[test]
+fn nested_update_from_post_hook_does_not_rerun_outer_posts() {
+    // A post() hook that runs `shdeps update` re-enters under the outer
+    // run's lock while its own obligation is still pending. The nested run
+    // must not adopt that obligation, or it re-runs the same hook, which
+    // starts another nested update, and so on. The dependency reports a
+    // change on every run (as under `SHDEPS_REINSTALL`) so the nested run
+    // changes it again too. The depth cap only bounds a regression; a
+    // correct run posts exactly once.
+    let fixture = Fixture::new("update-nested-post");
+    fixture.write("conf/deps.conf", "tool custom tool\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"exists() { return 1; }
+install() { :; }
+post() {
+    printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"
+    depth=${NESTED_TEST_DEPTH:-0}
+    if (( depth < 3 )); then
+        NESTED_TEST_DEPTH=$((depth + 1)) "$NESTED_TEST_SHDEPS" update
+    fi
+}
+"#,
+    );
+
+    let mut command = fixture.command(["update"]);
+    command
+        .env("NESTED_TEST_SHDEPS", env!("CARGO_BIN_EXE_shdeps"))
+        .env("SHDEPS_STATE_LOCK_TIMEOUT_SECS", "10");
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/post-runs")).unwrap(),
+        "post\n",
+        "stdout={:?} stderr={:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    assert!(
+        !fixture.dir.join("state/.pending-posts").exists(),
+        "the outer run must still acknowledge its obligation"
+    );
+    assert!(
+        !fixture.dir.join("state/.changed-markers").exists(),
+        "no transaction directory may outlive the update"
+    );
+}
+
+#[test]
 fn update_allows_real_provider_to_share_command_with_none_package_override() {
     let fixture = Fixture::new("update-none-package-command-claim");
     fixture.write(

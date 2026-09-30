@@ -685,7 +685,7 @@ where
     //
     // The handle is bound to a local so its `Drop` releases the lock
     // when `run` returns by any path.
-    let _lock = match held_lock {
+    let state_lock = match held_lock {
         Some(lock) => lock,
         None => crate::state::StateLock::acquire(&context.roots.state_dir)?,
     };
@@ -802,7 +802,13 @@ where
 
     let mut queued = Vec::new();
     let mut package_transitions = HashMap::<String, update_transition::DurableTransition>::new();
-    let hook_txn = Txn::new(&context.roots.state_dir)?;
+    // A re-entrant update (started from an outer run's hook) must not adopt
+    // the outer run's pending posts or live markers; see `Txn::nested`.
+    let hook_txn = if state_lock.is_reentry() {
+        Txn::nested(&context.roots.state_dir)?
+    } else {
+        Txn::new(&context.roots.state_dir)?
+    };
     let mut changed = hook_txn.pending()?;
 
     let active_package_entries = entries
@@ -1186,6 +1192,12 @@ where
     // conflict is resolved: running its post now would configure an identity
     // this run refused to update, and a failure would repeat every run.
     changed.retain(|name| !blocked.contains_key(name));
+    // A nested update never posts an obligation its outer run owns, even for
+    // a dependency it changed again itself (for example under
+    // `SHDEPS_REINSTALL`): the outer run posts it after this nested run
+    // returns, and posting here would re-run the hook that started this
+    // nested update, recursively.
+    changed.retain(|name| hook_txn.owns(name));
 
     // Post hooks deliberately run after every install decision rather than
     // inline with each method. Many hooks repair shell completions, symlinks,
@@ -2431,6 +2443,148 @@ post() {
 
         assert_eq!(summary.failed, ["gone"]);
         assert!(!fixture.roots.state_dir.join(".pending-posts/gone").exists());
+    }
+
+    #[test]
+    fn nested_update_leaves_outer_post_obligations_and_markers_alone() {
+        // A post() hook that runs `shdeps update` re-enters under the outer
+        // run's state lock. The nested run must not adopt the outer run's
+        // pending posts (that re-runs the very hook that started it,
+        // recursively) or delete the outer run's live changed-marker dir.
+        let fixture = Fixture::new("nested-update-scope");
+        fixture.write_lib();
+        fixture.write_hook(
+            "outer-dep",
+            r#"
+exists() { return 0; }
+post() { printf 'outer-dep\n' >> "$SHDEPS_STATE_DIR/post-runs"; }
+"#,
+        );
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "outer-dep").unwrap();
+        let outer_marker = fixture
+            .roots
+            .state_dir
+            .join(".changed-markers/outer-txn/marked-dep");
+        fs::create_dir_all(outer_marker.parent().unwrap()).unwrap();
+        fs::write(&outer_marker, "").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = super::run_locked(
+            &[parse_entry("outer-dep|custom|outer-dep|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+            crate::state::StateLock::reentry_for_test(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(
+            !fixture.roots.state_dir.join("post-runs").exists(),
+            "nested run executed a post owned by the outer run"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/outer-dep")
+                .is_file(),
+            "nested run consumed the outer run's pending post"
+        );
+        assert!(
+            outer_marker.is_file(),
+            "nested run deleted the outer run's live changed marker"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/marked-dep")
+                .exists(),
+            "nested run promoted the outer run's live marker"
+        );
+    }
+
+    #[test]
+    fn nested_update_does_not_post_an_outer_obligation_it_changed_again() {
+        // `SHDEPS_REINSTALL` (inherited by hooks) or a hook that always
+        // reports a change makes the nested run change the outer run's
+        // dependency again; posting it would recurse through the same hook.
+        let fixture = Fixture::new("nested-update-rechanged");
+        fixture.write_lib();
+        fixture.write_hook(
+            "outer-dep",
+            r#"
+exists() { return 1; }
+install() { printf 'install\n' >> "$SHDEPS_STATE_DIR/install-runs"; }
+post() { printf 'outer-dep\n' >> "$SHDEPS_STATE_DIR/post-runs"; }
+"#,
+        );
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "outer-dep").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = super::run_locked(
+            &[parse_entry("outer-dep|custom|outer-dep|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+            crate::state::StateLock::reentry_for_test(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(
+            fixture.roots.state_dir.join("install-runs").is_file(),
+            "the nested run should still update the dependency"
+        );
+        assert!(
+            !fixture.roots.state_dir.join("post-runs").exists(),
+            "nested run posted an obligation owned by the outer run"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/outer-dep")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn nested_update_still_posts_dependencies_it_changed() {
+        let fixture = Fixture::new("nested-update-own-post");
+        fixture.write_lib();
+        fixture.write_hook(
+            "inner-dep",
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/inner-installed" ]]; }
+install() { : > "$SHDEPS_STATE_DIR/inner-installed"; }
+post() { printf 'inner-dep\n' >> "$SHDEPS_STATE_DIR/post-runs"; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = super::run_locked(
+            &[parse_entry("inner-dep|custom|inner-dep|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+            crate::state::StateLock::reentry_for_test(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "inner-dep\n"
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/inner-dep")
+                .exists()
+        );
     }
 
     #[test]
