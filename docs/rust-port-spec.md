@@ -1209,8 +1209,10 @@ reported as one warning per run, counts as a warning rather than a failure,
 and does not affect the exit status) and a custom `install` fails. In quiet
 mode `shdeps_require_sudo` MUST still return 1 without ending the hook, so
 fallback paths keep working, but it records a "sudo unavailable" note on the
-same request channel; when such a `post` then fails in an `update` without a
-controlling terminal, it MUST be deferred the same way (with a terminal it
+same request channel; when such a `post` then exits nonzero on its own (not by
+timeout or signal) in an `update` without a controlling terminal, it MUST be
+deferred the same way, keeping any hook-authored failure detail in the warning
+because the note cannot prove sudo caused the failure (with a terminal it
 remains a failure). `prune` applies the same rules to `uninstall`: without a
 controlling terminal it MUST NOT run sudo for a hook's request, and an
 `uninstall` that requested sudo or failed after the quiet note keeps its row

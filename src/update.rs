@@ -268,6 +268,13 @@ pub struct Summary {
     /// time. Renderers report them as one warning via
     /// [`Summary::deferred_posts_warning`].
     pub deferred_posts: Vec<String>,
+    /// Hook-authored failure details for deferred posts, keyed by name.
+    ///
+    /// A quiet hook is deferred because it failed after sudo proved
+    /// unavailable, but the note cannot prove sudo was the cause (a sudo-free
+    /// fallback may have failed instead); keeping the hook's own detail in
+    /// the warning stops the deferral from hiding a different failure.
+    pub deferred_details: BTreeMap<String, String>,
     /// Dependencies whose old-method cleanup needs a later retry.
     ///
     /// Method-transition cleanup runs after the new method has been recorded.
@@ -562,10 +569,14 @@ impl Summary {
         if self.deferred_posts.is_empty() {
             return None;
         }
-        Some(format!(
+        let mut warning = format!(
             "{}: post hook deferred -- {SUDO_NO_TERMINAL}; rerun `shdeps update` from a terminal",
             self.deferred_posts.join(", ")
-        ))
+        );
+        for (name, detail) in &self.deferred_details {
+            warning.push_str(&format!("; {name}: {detail}"));
+        }
+        Some(warning)
     }
 
     /// Returns whether the update had any failure.
@@ -2108,6 +2119,11 @@ fn run_post_hooks(
             // that gave up is retried whole) lets that run do the work,
             // while failing here would fail every unattended run (cron,
             // quiet or not) for something only an interactive run can fix.
+            if let Post::SudoUnavailable { detail } = post {
+                if !detail.is_empty() {
+                    summary.deferred_details.insert(name.clone(), detail);
+                }
+            }
             summary.deferred_posts.push(name.clone());
             continue;
         }

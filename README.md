@@ -606,7 +606,8 @@ read a password: a `post()` stays pending for the next update that can
 authenticate and is reported once as a warning, not a failure, while a custom
 `install()` fails. In quiet mode `shdeps_require_sudo` still just returns 1, so
 a hook can fall back to a sudo-free path; if the hook fails instead, a run
-without a terminal defers that `post()` the same way. `shdeps prune` treats a
+without a terminal defers that `post()` the same way (the warning keeps any
+`shdeps_warn` detail, since the fallback may have been what failed). `shdeps prune` treats a
 sudo-needing `uninstall()` alike: without a terminal it runs no `sudo`, keeps
 the row for a later prune, and reports one warning without failing. Because the
 retry restarts the hook function, hooks must call `shdeps_require_sudo` before

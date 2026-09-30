@@ -907,7 +907,9 @@ impl BashCustomProbe {
             Some(0) => Uninstall::Removed,
             Some(10) => Uninstall::MissingFunction,
             Some(11 | 12) => Uninstall::SourceFailed,
-            _ if output.sudo_unavailable => Uninstall::SudoUnavailable,
+            // Only a hook that exited on its own gave up for lack of sudo;
+            // one killed by its deadline or a signal did not.
+            Some(_) if output.sudo_unavailable => Uninstall::SudoUnavailable,
             _ => Uninstall::Failed,
         })
     }
@@ -1036,7 +1038,9 @@ impl BashCustomProbe {
             Some(2) => Post::Skipped,
             Some(10) => Post::MissingFunction,
             Some(11 | 12) => Post::SourceFailed,
-            _ if output.sudo_unavailable => Post::SudoUnavailable {
+            // Only a hook that exited on its own gave up for lack of sudo;
+            // one killed by its deadline or a signal did not.
+            Some(_) if output.sudo_unavailable => Post::SudoUnavailable {
                 detail: failed_hook_detail(&output.output.stderr),
             },
             _ => Post::Failed {

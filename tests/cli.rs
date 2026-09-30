@@ -3871,6 +3871,75 @@ fn quiet_update_defers_retained_sudo_post_without_a_terminal() {
     );
 }
 
+/// Writes one retained post whose hook body runs after a failed quiet
+/// `shdeps_require_sudo`, for classification edge cases.
+fn write_retained_quiet_sudo_post(fixture: &Fixture, body: &str) {
+    write_retained_sudo_post(fixture, &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        &format!(
+            "exists() {{ return 0; }}\npost() {{\n  printf '%s post\\n' \"$1\" >>\"$SHDEPS_TEST_SUDO_LOG\"\n{body}\n}}\n"
+        ),
+    );
+}
+
+#[test]
+fn quiet_post_whose_sudo_free_fallback_succeeds_is_not_deferred() {
+    let fixture = custom_sudo_fixture("post-sudo-quiet-fallback-ok", &["tool"]);
+    write_retained_quiet_sudo_post(
+        &fixture,
+        "  shdeps_require_sudo || printf 'fallback\\n' >\"$SHDEPS_STATE_DIR/tool-posted\"",
+    );
+
+    let output =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_success(&output);
+    assert!(fixture.dir.join("state/tool-posted").is_file());
+    assert!(!fixture.dir.join("state/.pending-posts/tool").exists());
+    assert!(!text(&output.stderr).contains("deferred"), "{output:?}");
+}
+
+#[test]
+fn quiet_deferred_post_keeps_the_hooks_own_failure_detail() {
+    // The note only says sudo was unavailable at some point; if the hook
+    // then reports why it failed, the deferral warning must not hide it.
+    let fixture = custom_sudo_fixture("post-sudo-quiet-detail", &["tool"]);
+    write_retained_quiet_sudo_post(
+        &fixture,
+        "  shdeps_require_sudo || { shdeps_warn 'fallback download failed'; return 1; }",
+    );
+
+    let output =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_success(&output);
+    let stderr = text(&output.stderr);
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("deferred"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("fallback download failed"), "{stderr}");
+}
+
+#[test]
+fn quiet_post_killed_by_its_timeout_after_a_sudo_probe_still_fails() {
+    // A hook stopped by its deadline did not give up for lack of sudo.
+    let fixture = custom_sudo_fixture("post-sudo-quiet-timeout", &["tool"]);
+    write_retained_quiet_sudo_post(&fixture, "  shdeps_require_sudo\n  /bin/sleep 5");
+
+    let output = run_without_terminal(
+        custom_sudo_command(&fixture, ["update"])
+            .env("SHDEPS_QUIET", "1")
+            .env("SHDEPS_HOOK_TIMEOUT_SECS", "1"),
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!text(&output.stderr).contains("deferred"), "{output:?}");
+    assert!(fixture.dir.join("state/.pending-posts/tool").is_file());
+}
+
 #[test]
 fn quiet_update_on_a_terminal_still_fails_a_post_that_needs_sudo() {
     // Quiet mode never prompts; with a terminal available the user can rerun
