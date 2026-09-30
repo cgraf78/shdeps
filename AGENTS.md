@@ -168,9 +168,9 @@ so cancellation and timeouts can kill their complete session.
 `shdeps_require_sudo` must not prompt from that detached child: after a failed
 `sudo -n` probe it requests authentication from the attached parent, which
 pauses progress, runs the prompt, and retries the hook once. Without a
-controlling terminal `update` never prompts: it retries only if a parent
-`sudo -n` succeeds, otherwise it defers a post (kept pending, one warning, not
-a failure) or fails an install. The authenticated
+controlling terminal `update` runs no sudo for the request and does not retry:
+it defers a post (kept pending, one warning, not a failure) or fails an
+install. The authenticated
 retry must keep closed
 stdin and its own killable process group but remain in the parent's session so
 terminal-scoped sudo timestamps and subsequent direct `sudo` commands work.

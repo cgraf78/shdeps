@@ -3685,6 +3685,63 @@ mod tests {
     }
 
     #[test]
+    fn every_text_summary_reports_deferred_posts_as_one_warning() {
+        // The live TTY view and the verbose views render through separate
+        // writers; each must show the deferral once and never as a failure.
+        let summary = Summary {
+            items: vec![Item::current("jq", ItemReason::Installed, "current")],
+            deferred_posts: vec!["first".to_owned(), "second".to_owned()],
+            ..Summary::default()
+        };
+        let entries = vec![Entry {
+            name: "jq".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "jq".to_owned(),
+            cmd_explicit: false,
+            aliases: String::new(),
+            filter: String::new(),
+        }];
+        for verbose in [false, true] {
+            for terminal in [false, true] {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if terminal {
+                    super::write_update_terminal_summary(
+                        &summary,
+                        &entries,
+                        false,
+                        verbose,
+                        &mut stdout,
+                        &mut stderr,
+                    )
+                    .unwrap();
+                } else {
+                    super::write_update_summary(
+                        &summary,
+                        &entries,
+                        1,
+                        false,
+                        verbose,
+                        &mut stdout,
+                        &mut stderr,
+                    )
+                    .unwrap();
+                }
+                let stderr = String::from_utf8(stderr).unwrap();
+                let stdout = String::from_utf8(stdout).unwrap();
+                let context = format!("verbose={verbose} terminal={terminal}");
+                assert_eq!(
+                    stderr.matches("first, second: post hook deferred").count(),
+                    1,
+                    "{context}: {stderr}"
+                );
+                assert!(!stderr.contains("failed"), "{context}: {stderr}");
+                assert!(!stdout.contains("failed"), "{context}: {stdout}");
+            }
+        }
+    }
+
+    #[test]
     fn cleanup_leftover_message_surfaces_recovery_detail() {
         let mut summary = Summary::default();
         summary.leftovers.push("tool".to_owned());

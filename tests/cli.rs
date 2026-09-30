@@ -3625,9 +3625,9 @@ fn update_defers_retained_sudo_posts_without_a_terminal() {
     assert_success(&output);
     assert_eq!(
         fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
-        "first post\npost sudo -n true\nparent sudo -n true\n\
-         second post\npost sudo -n true\n",
-        "never prompt without a terminal, and probe the parent only once"
+        "first post\npost sudo -n true\nsecond post\npost sudo -n true\n",
+        "without a terminal the parent must neither prompt nor repeat the \
+         hook's failed `sudo -n` probe (each probe is another audit entry)"
     );
     for dep in ["first", "second"] {
         assert!(
@@ -3704,7 +3704,7 @@ fn update_custom_install_needing_sudo_fails_without_prompting_when_no_terminal()
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
-        "tool install\ninstall sudo -n true\nparent sudo -n true\n"
+        "tool install\ninstall sudo -n true\n"
     );
     assert!(
         text(&output.stderr).contains("no terminal"),
@@ -8444,7 +8444,6 @@ impl Drop for GuardedChild {
     }
 }
 
-#[cfg(unix)]
 /// Like [`spawn_test_session`], but with a fresh PTY as the session's
 /// controlling terminal so Shdeps may prompt for sudo in its own session.
 /// Keep the returned master alive until the child has exited.
@@ -8456,6 +8455,7 @@ fn spawn_test_session_on_terminal(command: &mut Command) -> (GuardedChild, fs::F
     (child, master)
 }
 
+#[cfg(unix)]
 fn spawn_test_session(command: &mut Command) -> GuardedChild {
     use std::os::unix::process::CommandExt as _;
 

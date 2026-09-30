@@ -518,9 +518,7 @@ fn user_is_root(runner: &impl Runner) -> Result<bool> {
     Ok(output.success && output.stdout.trim() == "0")
 }
 
-/// Reports whether `sudo` works without prompting (cached credentials or
-/// `NOPASSWD`); a missing `sudo` counts as unavailable.
-pub(crate) fn sudo_noninteractive(runner: &impl Runner) -> Result<bool> {
+fn sudo_noninteractive(runner: &impl Runner) -> Result<bool> {
     match runner.run(
         "sudo",
         &["-n", "true"],

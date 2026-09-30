@@ -1994,18 +1994,14 @@ enum HookSudo {
 /// With a controlling terminal this prompts exactly as before. Without one
 /// (cron, systemd timers, CI, agent tool shells) an interactive `sudo` cannot
 /// read a password and only records a failed authentication, so the parent
-/// accepts credentials that need no prompt and otherwise reports
-/// `NoTerminal` without ever running an interactive `sudo`.
+/// reports `NoTerminal` without running `sudo` at all. It does not re-probe
+/// `sudo -n` either: the hook only asks after its own `shdeps_require_sudo`
+/// probe failed, a terminal-less parent has no credential scope the hook
+/// lacks, and every failed probe is one more audit-log entry.
 fn authenticate_hook_sudo(runner: &impl Runner, progress: &mut dyn Progress) -> Result<HookSudo> {
     cancellation::check()?;
     if !crate::process::controlling_terminal() {
-        let cached = update_pkg::sudo_noninteractive(runner)?;
-        cancellation::check()?;
-        return Ok(if cached {
-            HookSudo::Authenticated
-        } else {
-            HookSudo::NoTerminal
-        });
+        return Ok(HookSudo::NoTerminal);
     }
     progress.pause_for_prompt("waiting for sudo authentication")?;
     cancellation::check()?;
@@ -2052,9 +2048,6 @@ fn run_post_hooks(
 ) -> Result<()> {
     // Rows as they stand after every install decision in this run.
     let installed = manifest::read(context.manifest_path)?;
-    // Latched once sudo proved unavailable without a terminal: nothing in
-    // this run can change that, so later hooks skip the repeated probe.
-    let mut sudo_needs_terminal = false;
     for name in changed {
         cancellation::check()?;
         if !managed.contains(name) {
@@ -2078,12 +2071,7 @@ fn run_post_hooks(
             .post_with_txn(name, context.roots, Some(txn))?;
         cancellation::check()?;
         if post == Post::SudoRequired {
-            let sudo = if sudo_needs_terminal {
-                HookSudo::NoTerminal
-            } else {
-                authenticate_hook_sudo(context.runner, progress)?
-            };
-            post = match sudo {
+            post = match authenticate_hook_sudo(context.runner, progress)? {
                 HookSudo::Authenticated => {
                     match context
                         .hooks
@@ -2102,9 +2090,10 @@ fn run_post_hooks(
                     // Defer rather than fail: by the hook contract a
                     // `SudoRequired` post made no changes yet, so keeping its
                     // obligation lets the next update that can authenticate
-                    // run it. Failing here would fail every unattended run
-                    // forever for something only an interactive run can fix.
-                    sudo_needs_terminal = true;
+                    // run it. Failing here would fail every non-quiet
+                    // unattended run for something only an interactive run
+                    // can fix. (Quiet runs never ask: the hook's own
+                    // `shdeps_require_sudo` returns 1 and the hook decides.)
                     summary.deferred_posts.push(name.clone());
                     cancellation::check()?;
                     continue;

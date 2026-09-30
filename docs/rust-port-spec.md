@@ -1198,13 +1198,12 @@ with stdin closed. If `shdeps_require_sudo` cannot authenticate with `sudo -n`
 inside `install`, `post`, or `uninstall`, it MUST signal the attached parent.
 The parent pauses live progress, performs the interactive sudo authentication,
 and retries that hook exactly once. `SHDEPS_QUIET=1` MUST suppress both the
-prompt and retry. Without a controlling terminal, `update` MUST NOT run an
-interactive sudo, which cannot read a password there and would only log a
-failed authentication: it retries the hook only when a parent `sudo -n` probe
-succeeds (probing at most once per run for post hooks). Otherwise a `post`
-obligation is deferred: it stays pending, is reported as one warning per run,
-counts as a warning rather than a failure, and does not affect the exit
-status; a custom `install` fails. Calls outside this hook handshake retain the direct helper's
+prompt and retry. Without a controlling terminal, `update` MUST NOT run sudo
+for a hook's request (it cannot read a password there and would only log
+another failed authentication after the hook's own `sudo -n` probe) and MUST
+NOT retry the hook: a `post` obligation is deferred (it stays pending, is
+reported as one warning per run, counts as a warning rather than a failure,
+and does not affect the exit status) and a custom `install` fails. Calls outside this hook handshake retain the direct helper's
 normal prompt behavior. Since retry restarts the hook function, hook authors
 MUST call `shdeps_require_sudo` before any side effect. If the first install
 attempt changes `exists()` before requesting sudo, the retry MUST fail closed
