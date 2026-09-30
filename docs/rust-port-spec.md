@@ -1219,11 +1219,13 @@ controlling terminal it MUST NOT run sudo for a hook's request, and an
 and prune journal for a later prune, is reported as one warning per run, and
 does not make prune exit nonzero. Without a terminal, the text warning for
 deferred posts (`update`) or uninstalls (`prune`) MUST be printed only when
-the deferred set gains an entry since the last run, tracked in
+the deferred set gains an entry since the last run (an entry is the name plus
+the hook's failure detail, so a changed detail counts as new), tracked in
 `$SHDEPS_STATE_DIR/.deferred-posts` and `.deferred-uninstalls` (cleared when
 nothing is deferred, so a recurrence is announced again); terminal runs always
-print it, JSONL `warning` events are always emitted, and `prune --dry-run`
-lists recorded deferred uninstalls every time. Calls outside this hook handshake retain the direct helper's
+print it, JSONL `warning` events are always emitted but never mark an entry as
+announced, and `prune --dry-run` lists recorded deferred uninstalls every
+time. Calls outside this hook handshake retain the direct helper's
 normal prompt behavior. Since retry restarts the hook function, hook authors
 MUST call `shdeps_require_sudo` before any side effect. If the first install
 attempt changes `exists()` before requesting sudo, the retry MUST fail closed

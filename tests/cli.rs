@@ -3689,6 +3689,61 @@ fn unattended_update_announces_a_deferred_post_once_per_state() {
 }
 
 #[test]
+fn unattended_update_reannounces_a_deferred_post_whose_failure_detail_changed() {
+    // The quiet note cannot prove sudo caused the failure, so a new hook
+    // detail is new state and must be printed even for the same dep.
+    let fixture = custom_sudo_fixture("post-sudo-deferred-detail-change", &["tool"]);
+    let deferred_lines = |output: &Output| {
+        text(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count()
+    };
+    write_retained_quiet_sudo_post(
+        &fixture,
+        "  shdeps_require_sudo || { shdeps_warn 'mirror unreachable'; return 1; }",
+    );
+    let first =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+    write_retained_quiet_sudo_post(
+        &fixture,
+        "  shdeps_require_sudo || { shdeps_warn 'checksum mismatch'; return 1; }",
+    );
+    let second =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_eq!(deferred_lines(&first), 1, "{first:?}");
+    assert_eq!(deferred_lines(&second), 1, "{second:?}");
+    assert!(
+        text(&second.stderr).contains("checksum mismatch"),
+        "{second:?}"
+    );
+}
+
+#[test]
+fn jsonl_update_does_not_mark_a_deferred_post_as_announced() {
+    // A JSONL consumer may suppress the event (dot does in quiet mode), so
+    // a later text-mode run must still print the deferral once.
+    let fixture = custom_sudo_fixture("post-sudo-deferred-jsonl-first", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+
+    let machine = run_without_terminal(
+        custom_sudo_command(&fixture, ["update"]).env("SHDEPS_PROGRESS", "jsonl"),
+    );
+    let human = run_without_terminal(&mut custom_sudo_command(&fixture, ["update"]));
+
+    assert_success(&machine);
+    assert_eq!(
+        text(&human.stderr)
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count(),
+        1,
+        "{human:?}"
+    );
+}
+
+#[test]
 fn update_reports_deferred_sudo_post_as_a_jsonl_warning_then_recovers_on_a_terminal() {
     let fixture = custom_sudo_fixture("post-sudo-no-terminal-jsonl", &["tool"]);
     write_retained_sudo_post(&fixture, &["tool"]);

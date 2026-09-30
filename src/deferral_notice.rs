@@ -37,34 +37,58 @@ fn read_lines(path: &Path) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// How a run may change the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// The run prints the warning itself; `terminal` means it always does.
+    Announce {
+        /// Whether a controlling terminal (an attentive user) is present.
+        terminal: bool,
+    },
+    /// A consumer (JSONL) decides whether anyone sees the warning, so this
+    /// run may retire entries that are no longer deferred but must not mark
+    /// new ones as announced.
+    ShrinkOnly,
+}
+
 /// Records this run's deferred set and reports whether to announce it.
 ///
-/// An empty set clears the record, so a deferral that clears and later recurs
-/// is announced again. With a terminal the answer is always "announce". The
-/// record is advisory: if it cannot be read or written, announce rather than
-/// risk hiding a new deferral.
-pub(crate) fn record(state_dir: &Path, kind: Kind, names: &[String], terminal: bool) -> bool {
+/// Each entry is a dependency name plus the hook's own failure detail (empty
+/// when none); a changed detail is new state, because a deferral cannot prove
+/// sudo caused the failure and must not hide a different one. An empty set
+/// clears the record, so a deferral that clears and later recurs is announced
+/// again. The record is advisory and written after the state lock is
+/// released, so racing runs may cost one extra or one missed repeat until the
+/// next run rewrites it; unreadable or unwritable records err toward
+/// announcing.
+pub(crate) fn record(state_dir: &Path, kind: Kind, entries: &[(&str, &str)], mode: Mode) -> bool {
     let path = path(state_dir, kind);
-    let current = names
+    let current = entries
         .iter()
-        .map(|name| format!("{name}|{REASON_SUDO_NO_TERMINAL}"))
+        .map(|(name, detail)| format!("{name}|{REASON_SUDO_NO_TERMINAL}|{detail}"))
         .collect::<BTreeSet<_>>();
-    if current.is_empty() {
-        // Best effort: a record that cannot be removed only delays the next
-        // announcement of the same set, and there is nothing to announce now.
-        let _ = std::fs::remove_file(&path);
-        return false;
-    }
     let previous = read_lines(&path);
-    let new_entry = !current.is_subset(&previous);
-    if current != previous {
-        let mut content = current.iter().cloned().collect::<Vec<_>>().join("\n");
+    let next = match mode {
+        Mode::Announce { .. } => current.clone(),
+        Mode::ShrinkOnly => current.intersection(&previous).cloned().collect(),
+    };
+    if next.is_empty() {
+        // Best effort: a record that cannot be removed only delays the next
+        // announcement of the same set.
+        let _ = std::fs::remove_file(&path);
+    } else if next != previous {
+        let mut content = next.iter().cloned().collect::<Vec<_>>().join("\n");
         content.push('\n');
         if crate::state::write_atomic(&path, &content).is_err() {
             return true;
         }
     }
-    terminal || new_entry
+    match mode {
+        Mode::Announce { terminal } => {
+            !current.is_empty() && (terminal || !current.is_subset(&previous))
+        }
+        Mode::ShrinkOnly => true,
+    }
 }
 
 /// Returns the recorded deferred names, for on-demand reporting.
@@ -77,29 +101,63 @@ pub(crate) fn recorded(state_dir: &Path, kind: Kind) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, record, recorded};
+    use super::{Kind, Mode, record, recorded};
 
-    fn names(list: &[&str]) -> Vec<String> {
-        list.iter().map(|name| (*name).to_owned()).collect()
+    fn names<'a>(list: &[&'a str]) -> Vec<(&'a str, &'a str)> {
+        list.iter().map(|name| (*name, "")).collect()
     }
+
+    const UNATTENDED: Mode = Mode::Announce { terminal: false };
 
     #[test]
     fn announces_new_entries_only_and_again_after_clearing() {
         let state = crate::test_support::temp_dir("shdeps-deferral-notice");
         std::fs::create_dir_all(&state).unwrap();
 
-        assert!(record(&state, Kind::Uninstalls, &names(&["a"]), false));
-        assert!(!record(&state, Kind::Uninstalls, &names(&["a"]), false));
-        assert!(record(&state, Kind::Uninstalls, &names(&["a", "b"]), false));
-        assert!(!record(&state, Kind::Uninstalls, &names(&["b"]), false));
+        assert!(record(&state, Kind::Uninstalls, &names(&["a"]), UNATTENDED));
+        assert!(!record(
+            &state,
+            Kind::Uninstalls,
+            &names(&["a"]),
+            UNATTENDED
+        ));
+        assert!(record(
+            &state,
+            Kind::Uninstalls,
+            &names(&["a", "b"]),
+            UNATTENDED
+        ));
+        assert!(!record(
+            &state,
+            Kind::Uninstalls,
+            &names(&["b"]),
+            UNATTENDED
+        ));
         assert_eq!(recorded(&state, Kind::Uninstalls), ["b".to_owned()].into());
-        assert!(record(&state, Kind::Uninstalls, &names(&["b"]), true));
-        assert!(!record(&state, Kind::Uninstalls, &[], false));
+        assert!(record(
+            &state,
+            Kind::Uninstalls,
+            &names(&["b"]),
+            Mode::Announce { terminal: true }
+        ));
+        assert!(!record(&state, Kind::Uninstalls, &[], UNATTENDED));
         assert!(recorded(&state, Kind::Uninstalls).is_empty());
-        assert!(record(&state, Kind::Uninstalls, &names(&["b"]), false));
+        assert!(record(&state, Kind::Uninstalls, &names(&["b"]), UNATTENDED));
         assert!(
             recorded(&state, Kind::Posts).is_empty(),
             "kinds are independent"
         );
+        assert!(record(
+            &state,
+            Kind::Uninstalls,
+            &[("b", "other")],
+            UNATTENDED
+        ));
+
+        // A consumer-rendered run never marks entries as announced.
+        record(&state, Kind::Posts, &names(&["c"]), Mode::ShrinkOnly);
+        assert!(record(&state, Kind::Posts, &names(&["c"]), UNATTENDED));
+        record(&state, Kind::Posts, &[], Mode::ShrinkOnly);
+        assert!(recorded(&state, Kind::Posts).is_empty());
     }
 }
