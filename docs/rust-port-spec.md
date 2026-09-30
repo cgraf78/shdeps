@@ -382,7 +382,10 @@ Safety:
 - If config has zero deps and manifest has entries, prune MUST require `-y`
   before treating every manifest entry as orphaned.
 - A config directory that exists but cannot be read (EACCES, EIO, ENOTDIR)
-  MUST be an error for every command, never an empty config.
+  MUST be an error for mutating commands (`prune`, `update`), never an empty
+  config. Read-only and startup callers (`list`, `check`, `dep-path`,
+  `shdeps_load`, completion) keep treating it as no config; `list` and
+  `check` print one warning line, the startup paths stay silent.
 - Prune MUST refuse (exit 1), even with `-y`, when the config directory does
   not exist and the manifest tracks deps: absence (unmounted home, dangling
   symlink, half-applied dotfiles) is not evidence that every dep should go.

@@ -7302,6 +7302,59 @@ fn prune_preserves_packages_and_guards_empty_config() {
 }
 
 #[test]
+fn unreadable_config_directory_fails_mutating_update() {
+    let fixture = Fixture::new("update-unreadable-conf");
+    fixture.write("conf", "not a directory\n");
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("cannot read config directory"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn unreadable_config_directory_keeps_read_only_commands_unchanged() {
+    // Read-only and startup callers keep treating an unreadable config dir as
+    // no config. Only interactive `list`/`check` add one warning line;
+    // `dep-path`, `shdeps_load` counts, and completion stay silent.
+    let unreadable = Fixture::new("read-only-unreadable-conf");
+    unreadable.write("conf", "not a directory\n");
+    let missing = Fixture::new("read-only-missing-conf");
+
+    let list = run(&mut unreadable.command(["list"]));
+    assert_success(&list);
+    assert_eq!(text(&list.stdout), "No dependencies configured.\n");
+    let list_stderr = text(&list.stderr);
+    assert_eq!(list_stderr.lines().count(), 1, "{list:?}");
+    assert!(list_stderr.starts_with("warning: cannot read config directory"));
+
+    let check = run(&mut unreadable.command(["check", "tool"]));
+    let check_missing = run(&mut missing.command(["check", "tool"]));
+    assert_eq!(check.status.code(), check_missing.status.code());
+    assert_eq!(check.stdout, check_missing.stdout);
+    assert!(text(&check.stderr).starts_with("warning: cannot read config directory"));
+
+    for args in [
+        vec!["dep-path", "tool"],
+        vec!["__api", "dep-path", "tool"],
+        vec!["__api", "load-count"],
+        vec!["__api", "completion-dep-names"],
+    ] {
+        let mut on_unreadable = unreadable.command([""; 0]);
+        on_unreadable.args(&args);
+        let mut on_missing = missing.command([""; 0]);
+        on_missing.args(&args);
+        let (got, want) = (run(&mut on_unreadable), run(&mut on_missing));
+        assert_eq!(got.status.code(), want.status.code(), "{args:?}: {got:?}");
+        assert_eq!(got.stdout, want.stdout, "{args:?}");
+        assert_eq!(got.stderr, want.stderr, "{args:?}");
+    }
+}
+
+#[test]
 fn prune_refuses_when_config_directory_is_unreadable() {
     // An unreadable config path used to load as an empty config, and
     // `prune -y` then removed every tracked dep.

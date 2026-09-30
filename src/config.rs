@@ -318,8 +318,13 @@ fn dedupe_last_wins(entries: Vec<String>) -> Vec<String> {
 /// registry is sorted by dependency name. Keeping directory loading here means
 /// `update`, `list`, `dep-file`, and bridge APIs cannot accidentally disagree
 /// about `.git` canonicalization or comment handling.
+///
+/// This read-only loader (completion names, `shdeps_load` counts during shell
+/// startup) treats a missing or unreadable config directory as no config, so
+/// startup stays silent and fast. Mutating callers use
+/// `load_dir_for_runtime`, which fails closed on an unreadable directory.
 pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
-    Ok(load_dir_entries(conf_dir, None)?.unwrap_or_default())
+    Ok(load_dir_entries(conf_dir, None)?.or_empty())
 }
 
 /// Loads config while selecting one active declaration from filtered duplicates.
@@ -329,8 +334,17 @@ pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
 /// last matching declaration wins. This lets one manifest identity move
 /// safely between platform or package-manager providers, so the normal method
 /// transition cleanup removes the previous provider's managed artifacts.
+///
+/// This is the loader for mutating commands (`update`): a missing directory
+/// is an empty config (a fresh machine before dotfiles land), but a directory
+/// that exists and cannot be read (EACCES, EIO, ENOTDIR) is an error, never an
+/// empty config that would make state-changing work act on nothing.
 pub fn load_dir_for_runtime(conf_dir: &Path, env: &RuntimeEnv) -> Result<Vec<String>> {
-    Ok(load_dir_entries(conf_dir, Some(env))?.unwrap_or_default())
+    match load_dir_entries(conf_dir, Some(env))? {
+        DirState::Missing => Ok(Vec::new()),
+        DirState::Unreadable(error) => Err(unreadable(conf_dir, error)),
+        DirState::Present(entries) => Ok(entries),
+    }
 }
 
 /// Like `load_dir_for_runtime`, but returns `None` when the config directory
@@ -343,13 +357,78 @@ pub fn load_dir_for_runtime_if_present(
     conf_dir: &Path,
     env: &RuntimeEnv,
 ) -> Result<Option<Vec<String>>> {
-    load_dir_entries(conf_dir, Some(env))
+    match load_dir_entries(conf_dir, Some(env))? {
+        DirState::Missing => Ok(None),
+        DirState::Unreadable(error) => Err(unreadable(conf_dir, error)),
+        DirState::Present(entries) => Ok(Some(entries)),
+    }
 }
 
-fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<Option<Vec<String>>> {
+/// Config loaded for a read-only command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlyConfig {
+    /// Loaded entries; empty when the directory is missing or unreadable.
+    pub entries: Vec<String>,
+    /// Why an existing config directory could not be read, if it could not.
+    pub unreadable: Option<String>,
+}
+
+/// Loads config for read-only commands (`list`, `check`, `dep-path`).
+///
+/// These keep treating an unreadable config directory as no config: they
+/// change nothing, and `dep-path` runs during editor startup where an error
+/// would be louder than the problem. The reason is returned so interactive
+/// commands can warn once; startup paths ignore it.
+pub fn load_dir_for_runtime_read_only(conf_dir: &Path, env: &RuntimeEnv) -> Result<ReadOnlyConfig> {
+    Ok(match load_dir_entries(conf_dir, Some(env))? {
+        DirState::Missing => ReadOnlyConfig {
+            entries: Vec::new(),
+            unreadable: None,
+        },
+        DirState::Unreadable(error) => ReadOnlyConfig {
+            entries: Vec::new(),
+            unreadable: Some(unreadable(conf_dir, error).to_string()),
+        },
+        DirState::Present(entries) => ReadOnlyConfig {
+            entries,
+            unreadable: None,
+        },
+    })
+}
+
+/// Result of listing the config directory itself.
+enum DirState<T> {
+    Missing,
+    Unreadable(io::Error),
+    Present(T),
+}
+
+impl<T: Default> DirState<T> {
+    fn or_empty(self) -> T {
+        match self {
+            Self::Present(value) => value,
+            Self::Missing | Self::Unreadable(_) => T::default(),
+        }
+    }
+}
+
+fn unreadable(conf_dir: &Path, error: io::Error) -> crate::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "cannot read config directory {}: {error}",
+            conf_dir.display()
+        ),
+    )
+    .into()
+}
+
+fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<DirState<Vec<String>>> {
     crate::cancellation::check()?;
-    let Some(mut files) = conf_files_if_present(conf_dir)? else {
-        return Ok(None);
+    let mut files = match conf_files_state(conf_dir)? {
+        DirState::Present(files) => files,
+        DirState::Missing => return Ok(DirState::Missing),
+        DirState::Unreadable(error) => return Ok(DirState::Unreadable(error)),
     };
     files.sort();
 
@@ -383,7 +462,7 @@ fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<Option<
         }
     });
     sort_entries(&mut entries);
-    Ok(Some(entries))
+    Ok(DirState::Present(entries))
 }
 
 fn read_config_file(path: &Path) -> Result<String> {
@@ -548,33 +627,31 @@ fn entry_name(entry: &str) -> &str {
 ///
 /// Loading and cache validation both need the same file set. Keeping the glob
 /// rule here prevents the package warm-path cache from accidentally proving a
-/// different config surface than `load_dir()` actually reads.
+/// different config surface than `load_dir_for_runtime()` actually reads.
+///
+/// Used by the `update` package warm-path cache, so an unreadable directory
+/// is an error here, matching `load_dir_for_runtime`.
 pub fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
-    Ok(conf_files_if_present(conf_dir)?.unwrap_or_default())
+    match conf_files_state(conf_dir)? {
+        DirState::Missing => Ok(Vec::new()),
+        DirState::Unreadable(error) => Err(unreadable(conf_dir, error)),
+        DirState::Present(files) => Ok(files),
+    }
 }
 
-fn conf_files_if_present(conf_dir: &Path) -> Result<Option<Vec<PathBuf>>> {
+fn conf_files_state(conf_dir: &Path) -> Result<DirState<Vec<PathBuf>>> {
     crate::cancellation::check()?;
     let entries = match fs::read_dir(conf_dir) {
         Ok(entries) => entries,
-        // A missing directory is an empty config for read-only and install
-        // callers (a fresh machine before dotfiles land). Destructive callers
-        // must not infer intent from absence, so absence is reported
-        // distinctly (`load_dir_for_runtime_if_present`).
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // Absence is reported distinctly: callers decide whether it means
+        // "nothing configured" (read-only, install) or must be refused
+        // (`load_dir_for_runtime_if_present` for prune).
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DirState::Missing),
         // Anything else (EACCES, EIO, ENOTDIR) means the config could not be
-        // read, not that it is empty. Reporting it as empty made `prune -y`
-        // treat every tracked dep as orphaned.
-        Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot read config directory {}: {error}",
-                    conf_dir.display()
-                ),
-            )
-            .into());
-        }
+        // read, not that it is empty. Mutating callers turn this into an
+        // error: reporting it as empty made `prune -y` treat every tracked
+        // dep as orphaned. Read-only callers may still treat it as empty.
+        Err(error) => return Ok(DirState::Unreadable(error)),
     };
 
     let mut files = Vec::new();
@@ -588,7 +665,7 @@ fn conf_files_if_present(conf_dir: &Path) -> Result<Option<Vec<PathBuf>>> {
             files.push(path);
         }
     }
-    Ok(Some(files))
+    Ok(DirState::Present(files))
 }
 
 #[cfg(test)]
@@ -1042,28 +1119,31 @@ tool pkg - - os:macos
     }
 
     #[test]
-    fn load_dir_rejects_a_config_path_that_is_not_a_directory() {
+    fn mutating_loader_rejects_a_config_path_that_is_not_a_directory() {
         // ENOTDIR (and EACCES/EIO) used to read as an empty config, which
         // `prune -y` then treated as "remove every tracked dep".
         let dir = temp_dir("not-a-dir");
         let conf = dir.join("shdeps");
         write(&conf, "tool pkg\n");
 
-        let error = load_dir(&conf).unwrap_err().to_string();
+        let error = load_dir_for_runtime(&conf, &linux())
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("cannot read config directory"), "{error}");
+        assert!(super::conf_files(&conf).is_err());
     }
 
     #[test]
     #[cfg(unix)]
-    fn load_dir_rejects_an_unreadable_config_directory() {
+    fn mutating_loader_rejects_an_unreadable_config_directory() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_dir("unreadable-dir");
         write(&dir.join("deps.conf"), "tool pkg\n");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
         let readable = fs::read_dir(&dir).is_ok();
-        let result = load_dir(&dir);
+        let result = load_dir_for_runtime(&dir, &linux());
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         if readable {
             // Running as root: permissions cannot make the directory
@@ -1072,6 +1152,36 @@ tool pkg - - os:macos
         }
 
         assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
+    fn read_only_loaders_treat_an_unreadable_config_directory_as_no_config() {
+        // Startup and read-only callers (completion, `shdeps_load`,
+        // `dep-path`, `list`, `check`) keep the historical behavior.
+        let dir = temp_dir("read-only-not-a-dir");
+        let conf = dir.join("shdeps");
+        write(&conf, "tool pkg\n");
+
+        assert!(load_dir(&conf).unwrap().is_empty());
+        let loaded = super::load_dir_for_runtime_read_only(&conf, &linux()).unwrap();
+        assert!(loaded.entries.is_empty());
+        assert!(
+            loaded
+                .unreadable
+                .is_some_and(|reason| reason.contains("cannot read config directory"))
+        );
+        let missing = super::load_dir_for_runtime_read_only(&dir.join("missing"), &linux());
+        assert_eq!(
+            missing.unwrap(),
+            super::ReadOnlyConfig {
+                entries: Vec::new(),
+                unreadable: None,
+            }
+        );
+    }
+
+    fn linux() -> RuntimeEnv {
+        RuntimeEnv::new("linux", "host").with_package_manager("apt")
     }
 
     #[test]

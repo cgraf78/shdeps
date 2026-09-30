@@ -414,7 +414,7 @@ fn list_cmd<W, E>(
     _args: &[String],
     options: &ParsedOptions,
     stdout: &mut W,
-    _stderr: &mut E,
+    stderr: &mut E,
 ) -> Result<i32>
 where
     W: Write,
@@ -423,7 +423,7 @@ where
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     let pkg_mgr = process::detect_package_manager(&Process);
     let env = runtime_env_for_manager(&pkg_mgr);
-    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
+    let raw_entries = read_only_config(&roots.conf_dir, &env, stderr)?;
     let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     if entries.is_empty() {
         writeln!(stdout, "No dependencies configured.")?;
@@ -474,7 +474,7 @@ where
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     let pkg_mgr = process::detect_package_manager(&Process);
     let env = runtime_env_for_manager(&pkg_mgr);
-    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
+    let raw_entries = read_only_config(&roots.conf_dir, &env, stderr)?;
     let Some(raw_entry) = raw_entries.iter().find(|raw| {
         let entry = config::parse_entry(raw, None);
         entry.name == *target
@@ -1837,6 +1837,27 @@ where
         dep_path::file(target, rel, &roots.dep_path_roots(), &env),
         stdout,
     )
+}
+
+/// Loads config for an interactive read-only command (`list`, `check`).
+///
+/// An unreadable config directory stays "no config" here, as it always was,
+/// because these commands change nothing; one warning line makes the cause
+/// visible. Startup paths (`dep-path`, `shdeps_load`, completion) use the
+/// silent loaders instead.
+fn read_only_config<E>(
+    conf_dir: &Path,
+    env: &crate::platform::RuntimeEnv,
+    stderr: &mut E,
+) -> Result<Vec<String>>
+where
+    E: Write,
+{
+    let loaded = config::load_dir_for_runtime_read_only(conf_dir, env)?;
+    if let Some(reason) = loaded.unreadable {
+        writeln!(stderr, "warning: {reason}; treating as no config")?;
+    }
+    Ok(loaded.entries)
 }
 
 /// Builds one runtime identity from an already-detected package manager.
