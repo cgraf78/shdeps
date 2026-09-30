@@ -573,6 +573,14 @@ fn cleanup_orphan(
         // a partially missing filesystem state does not strand the manifest
         // forever. Lock-acquisition failures return before this point because
         // no checkout cleanup decision was safely made.
+        //
+        // Retire a retained failed `post()` first, inside the same commit
+        // boundary: once the row is gone nothing may run that post (an older
+        // Shdeps after a rollback would, recreating what `uninstall()` just
+        // removed). Clearing it before the row means a crash in between
+        // leaves a row without a marker, which the retried prune removes,
+        // never a marker without its row.
+        crate::hooks::acknowledge_pending_post(&cleanup_roots.state_dir, &entry.name)?;
         manifest::remove(manifest_path, &entry.name)?;
         Ok(result)
     };
@@ -2638,6 +2646,94 @@ mod tests {
         );
         assert!(archive_bin.exists(), "failed hook must keep the payload");
         assert!(fs::symlink_metadata(&public).is_ok());
+    }
+
+    #[test]
+    fn prune_retires_pending_post_with_the_manifest_row() {
+        // A failed post leaves `.pending-posts/<name>`. Once prune removes
+        // the row, nothing may run that post: an older Shdeps (rollback)
+        // would otherwise recreate what `uninstall()` just removed.
+        let fixture = Fixture::new("pending-post-retired");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("owner/tool", "custom", "tool", ""),
+        )
+        .unwrap();
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "owner/tool").unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/owner/tool")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn prune_keeps_pending_post_while_it_keeps_the_row() {
+        // A failed uninstall keeps the row for the next prune; the pending
+        // post stays with it so the state is unchanged for that retry.
+        let fixture = Fixture::new("pending-post-kept");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("custom.sh"),
+            "uninstall() { return 1; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("custom", "custom", "custom", ""),
+        )
+        .unwrap();
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "custom").unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors(), "{summary:?}");
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("custom")
+                .is_some()
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/custom")
+                .is_file()
+        );
     }
 
     #[test]

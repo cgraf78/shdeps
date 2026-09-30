@@ -1213,7 +1213,10 @@ fn pending_posts(state_dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn acknowledge_pending_post(state_dir: &Path, name: &str) -> Result<()> {
+/// Removes one durable pending-post marker (and any now-empty parents).
+///
+/// Absent markers and names that could never have been marked are a no-op.
+pub(crate) fn acknowledge_pending_post(state_dir: &Path, name: &str) -> Result<()> {
     if !config::valid_dep_name(name) {
         return Ok(());
     }

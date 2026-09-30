@@ -1504,7 +1504,10 @@ Design (deliberately simple):
   reporting failure; with a row but no owning entry (removed from config or
   provably excluded, not yet pruned) the marker is acknowledged without
   running `post(name)`: prune owns that install's cleanup, and a post could
-  recreate what prune removes or run on an excluded platform.
+  recreate what prune removes or run on an excluded platform. Prune itself
+  removes a dependency's pending marker immediately before it removes that
+  manifest row, so a marker never outlives its row there; the no-row rule
+  above still covers markers left by older versions.
   `<txn_id>` is a unique identifier the parent generates per
   `shdeps update` and exports through `SHDEPS_UPDATE_TXN_ID`.
 - Only the top-level state-lock holder recovers abandoned transaction
