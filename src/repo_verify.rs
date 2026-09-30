@@ -1819,8 +1819,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn isolated_git_can_resolve_a_separate_trusted_bash_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = super::create_unique_private_dir(&std::env::temp_dir()).unwrap();
         let source = root.join("source");
         let origin = root.join("origin.git");
@@ -1833,29 +1831,29 @@ mod tests {
         fs::create_dir_all(&shell_bin).unwrap();
 
         let real_bash = crate::process::Process.path("bash").unwrap();
-        fs::write(
+        // Both fixtures are exec'd by `CleanEnvRunner` while sibling tests in
+        // this binary fork, so they go through `write_executable` to avoid the
+        // fork-inherited write fd that makes exec fail with ETXTBSY.
+        crate::test_support::write_executable(
             &git_wrapper,
             format!(
                 "#!/usr/bin/env bash\nprintf 'ref: refs/heads/main\\tHEAD\\n{}\\tHEAD\\n'\n",
                 OID
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&git_wrapper, fs::Permissions::from_mode(0o755)).unwrap();
-        // Do not copy the ELF and execute it immediately: Debian's overlay
-        // filesystem can report ETXTBSY while the freshly written binary is
-        // still settling. An absolute-interpreter shim exercises the same
-        // separate trusted PATH entry without that filesystem race.
-        fs::write(
-            shell_bin.join("bash"),
+        );
+        // An absolute-interpreter shim exercises the same separate trusted
+        // PATH entry as a copied bash binary without duplicating the ELF. The
+        // ETXTBSY once blamed on overlay filesystems "settling" was the
+        // in-process write fd leaking into concurrently forked children,
+        // a race `write_executable` avoids for either approach.
+        crate::test_support::write_executable(
+            &shell_bin.join("bash"),
             format!(
                 "#!{}\nexec \"{}\" \"$@\"\n",
                 real_bash.display(),
                 real_bash.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(shell_bin.join("bash"), fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let quarantine = Quarantine::create(&root.join("state")).unwrap();
         let runner = CleanEnvRunner {

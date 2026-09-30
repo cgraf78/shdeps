@@ -126,12 +126,11 @@ mod tests {
     /// PATH. Returns `(combined_output, stub_call_log)`.
     #[cfg(unix)]
     fn run_prelude_driver(driver_bash: &str, extra_env: &[(&str, &str)]) -> (String, String) {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = crate::test_support::temp_dir("shdeps-prelude-driver");
-        let stub = dir.join("shdeps");
-        std::fs::write(
-            &stub,
+        // Bash execs this stub while sibling tests fork; see
+        // `write_executable` for the ETXTBSY race an in-process write hits.
+        crate::test_support::write_executable(
+            &dir.join("shdeps"),
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SHDEPS_STUB_LOG"
 case "$1 $2" in
@@ -150,9 +149,7 @@ case "$1 $2" in
   *) printf 'stub-unexpected: %s\n' "$*" >&2; exit 99 ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let log = dir.join("calls.log");
         let driver = dir.join("driver.sh");
         std::fs::write(
