@@ -68,6 +68,30 @@ impl Summary {
             .iter()
             .any(|item| item.cleanup_error.is_some() || item.hook_failed())
     }
+
+    /// Returns the single warning line for uninstall hooks deferred until
+    /// sudo can prompt, or `None` when nothing was deferred.
+    ///
+    /// Deferral is not an error: the row stays for the next prune, and an
+    /// unattended prune (cron) that can never prompt must not fail, or log a
+    /// failed sudo attempt, on every run. One line per run keeps it quiet.
+    #[must_use]
+    pub fn deferred_warning(&self) -> Option<String> {
+        let names = self
+            .removed
+            .iter()
+            .filter(|item| item.hook_deferred())
+            .map(|item| item.entry.name.as_str())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{}: uninstall hook deferred -- {}; kept for a `shdeps prune` run from a terminal",
+            names.join(", "),
+            crate::update::SUDO_NO_TERMINAL
+        ))
+    }
 }
 
 /// Runs prune against one already-loaded config snapshot.
@@ -404,7 +428,7 @@ pub fn run_with_config_loader(
             cleanup: None,
             cleanup_error: None,
         };
-        if item.hook_failed() {
+        if item.hook_failed() || item.hook_deferred() {
             // The hook's own cleanup did not happen (cron sudo without a TTY,
             // a broken hook, ...). Retiring the row now would orphan whatever
             // the hook was supposed to remove with nothing left to retry it,
@@ -455,10 +479,23 @@ fn uninstall(
     hooks: &BashCustomProbe,
 ) -> Result<Uninstall> {
     let hook = hooks.uninstall(&entry.name, roots)?;
-    if hook != Uninstall::SudoRequired {
-        return Ok(hook);
+    match hook {
+        Uninstall::SudoRequired => {}
+        // A quiet hook's own `sudo -n` probe failed and it gave up. Without a
+        // terminal no prune started this way can do better, so defer; with
+        // one the user can rerun without quiet, so it stays a failure.
+        Uninstall::SudoUnavailable if crate::process::controlling_terminal() => {
+            return Ok(Uninstall::Failed);
+        }
+        other => return Ok(other),
     }
     cancellation::check()?;
+    // Without a terminal `sudo` cannot read a password: it would only fail
+    // and log a failed authentication on every cron run. The hook already
+    // probed `sudo -n`, so defer without running `sudo` at all.
+    if !crate::process::controlling_terminal() {
+        return Ok(Uninstall::SudoUnavailable);
+    }
     if !Process.run("sudo", &["true"], None)?.success {
         return Ok(Uninstall::Failed);
     }
@@ -692,6 +729,14 @@ impl Item {
     #[must_use]
     pub fn hook_failed(&self) -> bool {
         matches!(self.hook, Uninstall::Failed | Uninstall::SourceFailed)
+    }
+
+    /// Returns whether the hook needed sudo that this run could not obtain
+    /// without a terminal; its row is kept like a failure's, but it is not
+    /// reported as an error.
+    #[must_use]
+    pub fn hook_deferred(&self) -> bool {
+        self.hook == Uninstall::SudoUnavailable
     }
 }
 

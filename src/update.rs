@@ -2070,41 +2070,51 @@ fn run_post_hooks(
             .hooks
             .post_with_txn(name, context.roots, Some(txn))?;
         cancellation::check()?;
-        if post == Post::SudoRequired {
-            post = match authenticate_hook_sudo(context.runner, progress)? {
+        let deferred = match post {
+            Post::SudoRequired => match authenticate_hook_sudo(context.runner, progress)? {
                 HookSudo::Authenticated => {
-                    match context
-                        .hooks
-                        .retry_post_with_txn(name, context.roots, Some(txn))?
-                    {
-                        Post::SudoRequired => Post::Failed {
-                            detail: String::new(),
-                        },
-                        retried => retried,
-                    }
+                    post =
+                        match context
+                            .hooks
+                            .retry_post_with_txn(name, context.roots, Some(txn))?
+                        {
+                            Post::SudoRequired => Post::Failed {
+                                detail: String::new(),
+                            },
+                            retried => retried,
+                        };
+                    false
                 }
-                HookSudo::Denied => Post::Failed {
-                    detail: String::new(),
-                },
-                HookSudo::NoTerminal => {
-                    // Defer rather than fail: by the hook contract a
-                    // `SudoRequired` post made no changes yet, so keeping its
-                    // obligation lets the next update that can authenticate
-                    // run it. Failing here would fail every non-quiet
-                    // unattended run for something only an interactive run
-                    // can fix. (Quiet runs never ask: the hook's own
-                    // `shdeps_require_sudo` returns 1 and the hook decides.)
-                    summary.deferred_posts.push(name.clone());
-                    cancellation::check()?;
-                    continue;
+                HookSudo::Denied => {
+                    post = Post::Failed {
+                        detail: String::new(),
+                    };
+                    false
                 }
-            };
-            cancellation::check()?;
+                HookSudo::NoTerminal => true,
+            },
+            // A quiet hook never asks the parent: its own `sudo -n` probe
+            // failed and it gave up. Without a terminal no run started this
+            // way can ever do better, so treat it like `NoTerminal`; with one
+            // the user can rerun without quiet, so it stays a failure.
+            Post::SudoUnavailable { .. } => !crate::process::controlling_terminal(),
+            _ => false,
+        };
+        cancellation::check()?;
+        if deferred {
+            // Defer rather than fail: the hook could not get sudo, and only
+            // an update that can authenticate will run it. Keeping the
+            // obligation (a `SudoRequired` hook made no changes yet; a hook
+            // that gave up is retried whole) lets that run do the work,
+            // while failing here would fail every unattended run (cron,
+            // quiet or not) for something only an interactive run can fix.
+            summary.deferred_posts.push(name.clone());
+            continue;
         }
         let failed = match post {
             Post::Ran | Post::MissingHook | Post::MissingFunction | Post::Skipped => false,
             Post::SourceFailed => true,
-            Post::Failed { detail } => {
+            Post::Failed { detail } | Post::SudoUnavailable { detail } => {
                 if !detail.is_empty() {
                     summary.failed_details.insert(name.clone(), detail);
                 }

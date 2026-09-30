@@ -66,11 +66,16 @@ pub(crate) const SUDO_REQUEST_EXIT_CODE: i32 = 75;
 const SUDO_REQUEST_ENV: &str = "SHDEPS_HOOK_SUDO_REQUEST";
 const SUDO_REQUEST_DIR: &str = ".hook-sudo-requests";
 const SUDO_REQUEST_TOKEN: &[u8] = b"shdeps-hook-sudo-v1\n";
+/// Written by a quiet hook whose `sudo -n` probe failed. Unlike the request
+/// token it does not end the hook (a fallback path may still succeed); it only
+/// tells the parent why a hook that then fails could not do its work.
+const SUDO_UNAVAILABLE_TOKEN: &[u8] = b"shdeps-hook-sudo-unavailable-v1\n";
 static SUDO_REQUEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
 struct HookOutput {
     output: std::process::Output,
     sudo_requested: bool,
+    sudo_unavailable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -123,11 +128,20 @@ impl SudoRequest {
     }
 
     fn requested(&mut self) -> bool {
-        if self.file.seek(SeekFrom::Start(0)).is_err() {
-            return false;
-        }
+        self.token()
+            .is_some_and(|token| token == SUDO_REQUEST_TOKEN)
+    }
+
+    fn unavailable(&mut self) -> bool {
+        self.token()
+            .is_some_and(|token| token == SUDO_UNAVAILABLE_TOKEN)
+    }
+
+    fn token(&mut self) -> Option<Vec<u8>> {
+        self.file.seek(SeekFrom::Start(0)).ok()?;
         let mut bytes = Vec::new();
-        self.file.read_to_end(&mut bytes).is_ok() && bytes == SUDO_REQUEST_TOKEN
+        self.file.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
     }
 }
 
@@ -265,14 +279,29 @@ fn run_mutating_hook_command(
     let output = run_hook_command_with(command, isolation, signal_policy)?;
     let sudo_requested =
         output.status.code() == Some(SUDO_REQUEST_EXIT_CODE) && request.requested();
+    let sudo_unavailable = !output.status.success() && request.unavailable();
     Ok(HookOutput {
         output,
         sudo_requested,
+        sudo_unavailable,
     })
 }
 
 /// Signals that a detached mutating hook needs its parent to authenticate sudo.
 pub(crate) fn signal_parent_sudo_request() -> Result<bool> {
+    write_parent_sudo_token(SUDO_REQUEST_TOKEN)
+}
+
+/// Tells the parent that this quiet hook found no usable sudo credentials.
+///
+/// The hook keeps running (its caller may fall back to a sudo-free path); the
+/// note only matters if the hook then fails, so the parent can tell "could not
+/// get sudo" apart from an ordinary failure.
+pub(crate) fn note_parent_sudo_unavailable() -> Result<bool> {
+    write_parent_sudo_token(SUDO_UNAVAILABLE_TOKEN)
+}
+
+fn write_parent_sudo_token(token: &[u8]) -> Result<bool> {
     let Some(request_path) = sudo_request_path() else {
         return Ok(false);
     };
@@ -284,7 +313,9 @@ pub(crate) fn signal_parent_sudo_request() -> Result<bool> {
     if !request.metadata()?.file_type().is_file() {
         return Ok(false);
     }
-    request.write_all(SUDO_REQUEST_TOKEN)?;
+    // Replace rather than append: the parent compares the whole file.
+    request.set_len(0)?;
+    request.write_all(token)?;
     Ok(true)
 }
 
@@ -467,6 +498,10 @@ pub enum Uninstall {
     SourceFailed,
     /// The detached hook needs its attached parent to authenticate sudo.
     SudoRequired,
+    /// `uninstall(name)` failed after sudo proved unobtainable without a
+    /// prompt (a quiet hook's `sudo -n` probe failed). Prune turns this into
+    /// a deferral without a terminal and into `Failed` with one.
+    SudoUnavailable,
     /// `uninstall(name)` exists but returned non-zero.
     Failed,
     /// `uninstall(name)` ran successfully.
@@ -512,6 +547,13 @@ pub enum Post {
     SourceFailed,
     /// The detached hook needs its attached parent to authenticate sudo.
     SudoRequired,
+    /// `post(name)` failed after sudo proved unobtainable without a prompt
+    /// (a quiet hook's `sudo -n` probe failed). Update defers it without a
+    /// terminal and treats it as `Failed` with one.
+    SudoUnavailable {
+        /// Safe phase context emitted through `shdeps_warn`.
+        detail: String,
+    },
     /// `post(name)` declined with exit code 2 (hook-declined/mismatch
     /// convention). The hook chose not to run, so this is not a failure.
     Skipped,
@@ -867,6 +909,7 @@ impl BashCustomProbe {
             Some(0) => Uninstall::Removed,
             Some(10) => Uninstall::MissingFunction,
             Some(11 | 12) => Uninstall::SourceFailed,
+            _ if output.sudo_unavailable => Uninstall::SudoUnavailable,
             _ => Uninstall::Failed,
         })
     }
@@ -995,6 +1038,9 @@ impl BashCustomProbe {
             Some(2) => Post::Skipped,
             Some(10) => Post::MissingFunction,
             Some(11 | 12) => Post::SourceFailed,
+            _ if output.sudo_unavailable => Post::SudoUnavailable {
+                detail: failed_hook_detail(&output.output.stderr),
+            },
             _ => Post::Failed {
                 detail: failed_hook_detail(&output.output.stderr),
             },

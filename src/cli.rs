@@ -1757,6 +1757,9 @@ where
     )?;
     crate::cancellation::check()?;
     write_prune_results(&summary.removed, stdout, stderr)?;
+    if let Some(warning) = summary.deferred_warning() {
+        writeln!(stderr, "  warning: {warning}")?;
+    }
     Ok(if summary.has_errors() { 1 } else { 0 })
 }
 
@@ -2981,7 +2984,11 @@ where
                     item.entry.name
                 )?;
             }
-            Uninstall::MissingHook | Uninstall::MissingFunction | Uninstall::Removed => {}
+            // Reported once for every deferred item after this loop.
+            Uninstall::MissingHook
+            | Uninstall::MissingFunction
+            | Uninstall::Removed
+            | Uninstall::SudoUnavailable => {}
             Uninstall::SudoRequired => {
                 unreachable!("sudo requests are resolved before prune rendering")
             }

@@ -877,6 +877,11 @@ fn require_sudo() -> Result<i32> {
     }
 
     if std::env::var("SHDEPS_QUIET").as_deref() == Ok("1") {
+        // Quiet mode never prompts or ends the hook: callers may fall back to
+        // a sudo-free path. Leave the parent a note so a hook that then fails
+        // can be deferred rather than failed when no run could prompt. The
+        // note is advisory; losing it only means an ordinary failure.
+        let _ = hooks::note_parent_sudo_unavailable();
         return Ok(1);
     }
 

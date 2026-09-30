@@ -3730,7 +3730,7 @@ uninstall() {
 "#,
     );
 
-    let output = run(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+    let output = run_on_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
 
     assert_success(&output);
     assert_eq!(
@@ -3756,13 +3756,14 @@ uninstall() {
 "#,
     );
 
-    let output = run(&mut custom_sudo_command(
+    let output = run_on_terminal(&mut custom_sudo_command(
         &fixture,
         ["--quiet", "prune", "-y"],
     ));
 
-    // This is the cron shape: the hook cannot get sudo, so its cleanup never
-    // ran. Prune must fail and keep the row for a later interactive retry.
+    // Quiet on a terminal: nothing prompts, the hook's cleanup never ran, so
+    // prune fails and keeps the row for a later interactive retry. (Without a
+    // terminal the same hook is deferred instead; see the tests below.)
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
@@ -3772,6 +3773,120 @@ uninstall() {
         fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
         "tool|custom|tool|\n"
     );
+}
+
+/// Writes an orphaned custom dep whose `uninstall()` needs sudo before any
+/// side effect.
+fn write_sudo_uninstall_orphan(fixture: &Fixture) {
+    fixture.write("conf/deps.conf", "");
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+uninstall() {
+  printf '%s uninstall\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
+  shdeps_require_sudo || return $?
+  printf 'uninstalled\n' >"$SHDEPS_STATE_DIR/tool-uninstalled"
+}
+"#,
+    );
+}
+
+/// Asserts the prune deferral shape: exit 0, no sudo beyond the hook's own
+/// probe, the row kept for a later run, and exactly one deferral warning.
+fn assert_prune_deferred(fixture: &Fixture, output: &Output) {
+    assert_success(output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool uninstall\nuninstall sudo -n true\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+    assert!(!fixture.dir.join("state/tool-uninstalled").exists());
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("failed"), "{stderr}");
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("deferred"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("tool"), "{stderr}");
+}
+
+#[test]
+fn prune_defers_sudo_uninstall_without_a_terminal() {
+    // Cron now prunes every 30 minutes. Running `sudo true` there cannot
+    // read a password and would log a failed authentication on every run.
+    let fixture = custom_sudo_fixture("custom-uninstall-sudo-no-terminal", &["tool"]);
+    write_sudo_uninstall_orphan(&fixture);
+
+    let output = run_without_terminal(&mut custom_sudo_command(&fixture, ["prune", "-y"]));
+
+    assert_prune_deferred(&fixture, &output);
+}
+
+#[test]
+fn quiet_prune_defers_sudo_uninstall_without_a_terminal() {
+    // The cron shape: `SHDEPS_QUIET=1` makes the hook's own
+    // `shdeps_require_sudo` return 1 instead of asking the parent.
+    let fixture = custom_sudo_fixture("custom-uninstall-sudo-quiet-no-terminal", &["tool"]);
+    write_sudo_uninstall_orphan(&fixture);
+
+    let output = run_without_terminal(
+        custom_sudo_command(&fixture, ["prune", "-y"]).env("SHDEPS_QUIET", "1"),
+    );
+
+    assert_prune_deferred(&fixture, &output);
+}
+
+#[test]
+fn quiet_update_defers_retained_sudo_post_without_a_terminal() {
+    // `dot update --cron` exports `SHDEPS_QUIET=1`; the hook's probe fails
+    // and it returns 1 without asking the parent. That must defer too.
+    let fixture = custom_sudo_fixture("post-sudo-quiet-no-terminal", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+
+    let output =
+        run_without_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool post\npost sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/.pending-posts/tool").is_file());
+    assert!(!fixture.dir.join("state/tool-posted").exists());
+    assert_eq!(text(&output.stdout), "", "quiet stays quiet");
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("failed"), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("deferred"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+}
+
+#[test]
+fn quiet_update_on_a_terminal_still_fails_a_post_that_needs_sudo() {
+    // Quiet mode never prompts; with a terminal available the user can rerun
+    // without `--quiet`, so the failure is reported as before.
+    let fixture = custom_sudo_fixture("post-sudo-quiet-terminal", &["tool"]);
+    write_retained_sudo_post(&fixture, &["tool"]);
+
+    let output =
+        run_on_terminal(custom_sudo_command(&fixture, ["update"]).env("SHDEPS_QUIET", "1"));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
+        "tool post\npost sudo -n true\n"
+    );
+    assert!(fixture.dir.join("state/.pending-posts/tool").is_file());
 }
 
 #[test]

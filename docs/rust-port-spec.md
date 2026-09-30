@@ -374,7 +374,8 @@ Exit codes:
   skipped prompt/action.
 - `1`: guarded all-orphans condition, cleanup runtime error, a failed
   (or unsourceable) `uninstall()` hook, or a missing or unreadable config
-  directory.
+  directory. An `uninstall()` deferred because it needs sudo and no terminal
+  is available keeps its row but is not a failure.
 - `2`: unknown prune option.
 
 Safety:
@@ -1076,7 +1077,9 @@ remove anything outside the orphan list the preview showed (and the prompt or
 exits 1 so the next run re-previews.
 Prune MUST remove manifest rows after cleanup attempts, except when an
 existing `uninstall()` hook fails or cannot be sourced: prune then keeps the
-row and skips built-in cleanup so a later prune retries the hook, and exits 1.
+row and skips built-in cleanup so a later prune retries the hook, and exits 1
+(or, for a hook deferred because it needs sudo without a terminal, exits 0
+with one warning).
 To release such a row, fix the hook, run `shdeps prune` interactively when the
 hook needs sudo, or delete the hook file (its cleanup is then skipped).
 
@@ -1203,7 +1206,16 @@ for a hook's request (it cannot read a password there and would only log
 another failed authentication after the hook's own `sudo -n` probe) and MUST
 NOT retry the hook: a `post` obligation is deferred (it stays pending, is
 reported as one warning per run, counts as a warning rather than a failure,
-and does not affect the exit status) and a custom `install` fails. Calls outside this hook handshake retain the direct helper's
+and does not affect the exit status) and a custom `install` fails. In quiet
+mode `shdeps_require_sudo` MUST still return 1 without ending the hook, so
+fallback paths keep working, but it records a "sudo unavailable" note on the
+same request channel; when such a `post` then fails in an `update` without a
+controlling terminal, it MUST be deferred the same way (with a terminal it
+remains a failure). `prune` applies the same rules to `uninstall`: without a
+controlling terminal it MUST NOT run sudo for a hook's request, and an
+`uninstall` that requested sudo or failed after the quiet note keeps its row
+and prune journal for a later prune, is reported as one warning per run, and
+does not make prune exit nonzero. Calls outside this hook handshake retain the direct helper's
 normal prompt behavior. Since retry restarts the hook function, hook authors
 MUST call `shdeps_require_sudo` before any side effect. If the first install
 attempt changes `exists()` before requesting sudo, the retry MUST fail closed
