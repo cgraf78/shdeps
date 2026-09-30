@@ -38,6 +38,40 @@ pub(crate) fn short_temp_dir() -> PathBuf {
     create_temp_dir(&std::env::temp_dir(), "s")
 }
 
+/// Writes an executable fixture at `path` that a subprocess will exec.
+///
+/// Linux refuses to exec a file while any process holds it open for writing
+/// (ETXTBSY). An in-process `fs::write` opens such an fd, and a sibling test
+/// thread that forks during that window hands its child a copy. Rust's
+/// `O_CLOEXEC` does not help: it closes the fd only when that child execs,
+/// which a loaded scheduler or a `pre_exec` hook can delay past our own exec
+/// of the fixture, so bash intermittently reports "Text file busy" (exit
+/// 126). The content therefore goes to a sibling `.src` file that is never
+/// exec'd, and a `cp` child creates the executable: `cp` holds the only
+/// write fd and exits before we continue. `set_permissions` chmods by path
+/// without opening an fd.
+#[cfg(unix)]
+pub(crate) fn write_executable(path: &std::path::Path, content: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut source = path.as_os_str().to_owned();
+    source.push(".src");
+    let source = PathBuf::from(source);
+    fs::write(&source, content).unwrap();
+    let copied = std::process::Command::new("cp")
+        .arg(&source)
+        .arg(path)
+        .status()
+        .expect("cp must run to materialize an executable fixture");
+    assert!(
+        copied.success(),
+        "cp failed to materialize {}: {copied}",
+        path.display()
+    );
+    fs::remove_file(&source).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// Runs a test-fixture subprocess through the production ownership boundary.
 ///
 /// An environment marker is not visible until exec. Registration before fork
@@ -169,5 +203,22 @@ mod tests {
         let dir = temp_dir("shdeps-test-support-physical");
 
         assert_eq!(dir, std::fs::canonicalize(&dir).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_executable_leaves_only_a_runnable_0755_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("shdeps-test-support-executable");
+        let path = dir.join("tool");
+        super::write_executable(&path, "#!/bin/sh\nprintf 'ran\\n'\n");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert!(!dir.join("tool.src").exists(), "staging source leaked");
+        let output = std::process::Command::new(&path).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"ran\n");
     }
 }
