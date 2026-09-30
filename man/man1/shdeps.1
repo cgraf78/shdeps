@@ -349,6 +349,7 @@ Print a version string.
 .BI post( name )
 Post-install setup.
 Runs after any method if the dependency changed.
+A failed post is retried on the next update.
 .TP
 .BI uninstall( name )
 Cleanup during

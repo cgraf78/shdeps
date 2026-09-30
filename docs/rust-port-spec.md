@@ -1137,8 +1137,10 @@ Isolation:
   `list` and `check` currently suppress hook source errors and treat the custom
   dep as missing unless `exists(name)` is successfully loaded and returns
   success.
-- `post(name)` failures do not currently fail update; this behavior MUST remain
-  unless a future spec revision changes it.
+- `post(name)` failures MUST NOT abort update: remaining dependencies and post
+  hooks still run and the dependency is reported as failed. The failed post's
+  pending obligation MUST be retained so the next update retries it (at most
+  once per run); see the hook coordination rules below.
 
 Bash compatibility:
 
@@ -1489,8 +1491,21 @@ Design (deliberately simple):
   pending-post marker. The parent promotes any sentinel before deleting its
   transaction directory, including during cancellation; the next update also
   promotes abandoned transaction directories after an uncatchable exit.
-  Pending markers are acknowledged only after the matching post hook is
-  classified. `<txn_id>` is a unique identifier the parent generates per
+  For a dependency with a configured entry whose filter matches this host,
+  the pending marker is acknowledged only after the matching post hook ran,
+  declined (exit 2), or was absent. A post that fails or cannot be sourced
+  keeps its marker so the next update retries it; each update attempts a
+  pending post at most once. Any other dependency follows prune's ownership
+  rule: with no manifest row (never installed here, or prune already removed
+  it) the marker is acknowledged without running `post(name)`, which would
+  recreate what `uninstall` removed; with a row and an entry that still owns
+  it (its filter does not provably exclude this host, e.g. an unproven
+  `host:` mismatch) the marker is kept without running `post(name)` or
+  reporting failure; with a row but no owning entry (removed from config or
+  provably excluded, not yet pruned) the post runs and its marker is
+  acknowledged after classification because nothing would otherwise retire
+  it.
+  `<txn_id>` is a unique identifier the parent generates per
   `shdeps update` and exports through `SHDEPS_UPDATE_TXN_ID`.
 - Logging helpers (`shdeps_log`, `shdeps_warn`, `shdeps_log_*`) write
   directly to stdout/stderr from the subprocess; the parent does not

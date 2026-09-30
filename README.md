@@ -396,11 +396,11 @@ Place hook files in `<hooks_dir>/<name>.sh`. For methods whose `name` contains p
 - **`version(name)`** — print version string to stdout. Optional.
 - **`install(name)`** — perform the install unconditionally. shdeps only calls this when `exists()` returns 1 or `--reinstall` is used.
 - **`uninstall(name)`** — reverse what `install()` or `post()` created. Optional. Called by `shdeps prune` when removing an orphaned dep (any method). For custom deps, this is the only cleanup. For other methods, runs before the built-in cleanup. If it fails, prune keeps the dep tracked (and its files in place), exits 1, and retries on the next run.
-- **`post(name)`** — optional post-install setup.
+- **`post(name)`** — optional post-install setup. A failed `post()` is retried on the next `shdeps update`.
 
 **Non-custom dep hooks** (`pkg`, `github`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, `npm`):
 
-- **`post(name)`** — runs after shdeps installs/updates the dep (symlinking, config, etc.).
+- **`post(name)`** — runs after shdeps installs/updates the dep (symlinking, config, etc.). A failed `post()` is retried on the next `shdeps update`.
 
 All [public API functions](#public-api) are available to hook authors. See [examples/hooks.d/example-hook.sh](examples/hooks.d/example-hook.sh).
 
@@ -575,7 +575,7 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir                          |
 | `shdeps_unlink_extras <name>`     | Remove all extras symlinks tracked for a dep                                                |
 | `shdeps_github_release_install <name> <cmd> [repo] [bin-path]` | Install one GitHub release binary for `<name>` (default repo `<name>`, default path `$SHDEPS_BIN_DIR/<cmd>`) |
-| `shdeps_mark_changed <name>`      | Mark a dep as changed during the current `shdeps update` so its `post()` hook runs; no-op outside an update |
+| `shdeps_mark_changed <name>`      | Mark a dep as changed during the current `shdeps update` so its `post()` hook runs (held while the dep is inactive on this host, dropped if it is also not installed); no-op outside an update |
 | `shdeps_skip <dep> [reason]`      | Record a `.skipped` marker (with optional reason) under the dep's install dir               |
 | `shdeps_skipped <dep>`            | Return 0 if the dep is marked skipped                                                       |
 | `shdeps_skip_reason <dep>`        | Print the recorded skip reason; returns 1 if not skipped                                    |

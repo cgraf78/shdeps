@@ -741,6 +741,24 @@ where
     let fresh_manifest = manifest::read(context.manifest_path)?;
     let manifest = &fresh_manifest;
 
+    // Dependencies this host still manages, captured before blocked entries
+    // are dropped: a failed post obligation is retained for retry only while
+    // its dependency is managed, so an unconfigured dep cannot fail forever.
+    let managed = entries
+        .iter()
+        .filter(|entry| active(entry, context.env))
+        .map(|entry| entry.name.clone())
+        .collect::<BTreeSet<_>>();
+    // Names prune would still keep installed on this host (the shared
+    // ownership rule). A dependency owned but not active here (an unproven
+    // `host:` mismatch, an undetected package manager) must neither run nor
+    // drop its pending post: prune keeps the install, so the obligation
+    // waits until update manages the dependency again.
+    let owned = manifest::owner_names(entries, context.env)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
     // An unsupported identity handoff fails only the dependencies involved.
     // Aborting the whole run would freeze every unrelated dependency on
     // unattended (cron) hosts until an operator prunes the old identity by
@@ -1173,7 +1191,15 @@ where
     // inline with each method. Many hooks repair shell completions, symlinks,
     // or dependent tools, so they should see the final state for the full
     // update pass instead of an intermediate per-method view.
-    run_post_hooks(&changed, context, &hook_txn, &mut summary, progress)?;
+    run_post_hooks(
+        &changed,
+        &managed,
+        &owned,
+        context,
+        &hook_txn,
+        &mut summary,
+        progress,
+    )?;
     cancellation::check()?;
     Ok(summary)
 }
@@ -1941,13 +1967,33 @@ fn record_changed(changed: &mut Vec<String>, name: String) {
 
 fn run_post_hooks(
     changed: &[String],
+    managed: &BTreeSet<String>,
+    owned: &BTreeSet<String>,
     context: &Context<'_, impl Runner>,
     txn: &Txn,
     summary: &mut Summary,
     progress: &mut dyn Progress,
 ) -> Result<()> {
+    // Rows as they stand after every install decision in this run.
+    let installed = manifest::read(context.manifest_path)?;
     for name in changed {
         cancellation::check()?;
+        if !managed.contains(name) {
+            // Nothing is installed under this name here. That includes an
+            // obligation retained from a failed post after prune removed the
+            // row (running `uninstall()`) but not the pending marker: running
+            // `post()` now would recreate what the uninstall just undid, and
+            // holding it would keep a marker that nothing ever consumes.
+            if installed.get(name).is_none() {
+                txn.acknowledge(name)?;
+                continue;
+            }
+            // Prune keeps this install; hold the obligation untouched (no
+            // run, no failure) until update manages the dependency again.
+            if owned.contains(name) {
+                continue;
+            }
+        }
         let mut post = context
             .hooks
             .post_with_txn(name, context.roots, Some(txn))?;
@@ -1970,18 +2016,32 @@ fn run_post_hooks(
             };
             cancellation::check()?;
         }
-        match post {
-            Post::Ran | Post::MissingHook | Post::MissingFunction | Post::Skipped => {}
-            Post::SourceFailed => summary.failed.push(name.clone()),
+        let failed = match post {
+            Post::Ran | Post::MissingHook | Post::MissingFunction | Post::Skipped => false,
+            Post::SourceFailed => true,
             Post::Failed { detail } => {
                 if !detail.is_empty() {
                     summary.failed_details.insert(name.clone(), detail);
                 }
-                summary.failed.push(name.clone());
+                true
             }
             Post::SudoRequired => unreachable!("sudo requests are resolved before classification"),
+        };
+        if failed {
+            summary.failed.push(name.clone());
         }
-        txn.acknowledge(name)?;
+        // A failed post keeps its durable obligation so the next update
+        // retries it; acknowledging it would leave the dependency changed but
+        // never configured (for example, a cron run that cannot use sudo).
+        // Each update visits `changed` once, so a permanently failing hook
+        // costs one attempt per run rather than spinning. Obligations for
+        // installed dependencies that no config entry owns on this host
+        // (removed from config, or provably excluded by `os:`/`mgr:`, and
+        // not yet pruned) are dropped instead: nothing would ever clear them,
+        // and prune owns that cleanup.
+        if !failed || !managed.contains(name) {
+            txn.acknowledge(name)?;
+        }
     }
     Ok(())
 }
@@ -2190,6 +2250,187 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
             fs::read_to_string(fixture.roots.state_dir.join("tool-post")).unwrap(),
             "post\n"
         );
+    }
+
+    #[test]
+    fn retained_post_for_a_pruned_dep_is_retired_without_running() {
+        // Prune removes the row but not a retained failed-post marker; the
+        // next update must not run `post()` and recreate what `uninstall()`
+        // just removed.
+        let fixture = Fixture::new("post-retained-after-prune");
+        fixture.write_lib();
+        fixture.write_hook(
+            "pruned",
+            "post() { printf 'post\\n' >> \"$SHDEPS_STATE_DIR/post-runs\"; }\n",
+        );
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "pruned").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(!fixture.roots.state_dir.join("post-runs").exists());
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/pruned")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn retained_post_for_a_host_filtered_dep_is_held_without_running() {
+        // A `host:` mismatch never proves exclusion, so prune keeps the
+        // install; the retained obligation must survive untouched rather than
+        // run on the wrong host or be dropped.
+        let fixture = Fixture::new("post-retained-host-filtered");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            "post() { printf 'post\\n' >> \"$SHDEPS_STATE_DIR/post-runs\"; return 1; }\n",
+        );
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "tool").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("tool", method::CUSTOM, "tool", ""),
+        )
+        .unwrap();
+
+        let summary = run(
+            &[parse_entry("tool|custom|tool|-|host:elsewhere", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(!fixture.roots.state_dir.join("post-runs").exists());
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/tool")
+                .is_file()
+        );
+
+        // Once update manages the dependency here again, the held post runs
+        // (and, still failing, stays pending for the next run).
+        let active = run(
+            &[parse_entry("tool|custom|tool|-|host:host", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(active.failed, ["tool"]);
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\n"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/tool")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn failed_post_hook_is_retried_on_the_next_update() {
+        // A failed `post()` (e.g. a cron run without sudo) must keep its
+        // durable obligation so the next run retries it instead of silently
+        // leaving the dependency half-configured forever.
+        let fixture = Fixture::new("post-failure-retry");
+        fixture.write_lib();
+        fixture.write_hook(
+            "tool",
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/tool-installed" ]]; }
+install() { : > "$SHDEPS_STATE_DIR/tool-installed"; }
+post() {
+    printf 'post\n' >> "$SHDEPS_STATE_DIR/post-runs"
+    [[ -f "$SHDEPS_STATE_DIR/post-may-succeed" ]]
+}
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entry = parse_entry("tool|custom|tool|-|-", None);
+        let pending = fixture.roots.state_dir.join(".pending-posts/tool");
+        let update = || {
+            run(
+                std::slice::from_ref(&entry),
+                &manifest::read(&manifest_path).unwrap(),
+                &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+                Options::default(),
+            )
+            .unwrap()
+        };
+
+        let first = update();
+        assert_eq!(first.failed, ["tool"]);
+        assert!(pending.is_file(), "failed post must stay pending");
+
+        let second = update();
+        assert_eq!(second.failed, ["tool"]);
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\npost\n",
+            "a pending failed post runs exactly once per update"
+        );
+
+        fs::write(fixture.roots.state_dir.join("post-may-succeed"), "").unwrap();
+        let third = update();
+        assert!(!third.has_errors(), "{third:?}");
+        assert!(!pending.exists(), "successful retry must acknowledge");
+
+        let fourth = update();
+        assert!(!fourth.has_errors(), "{fourth:?}");
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("post-runs")).unwrap(),
+            "post\npost\npost\n",
+            "an acknowledged post must not run again"
+        );
+    }
+
+    #[test]
+    fn failed_post_for_an_unconfigured_dep_is_not_retained() {
+        // Retrying only makes sense while Shdeps still manages the dependency;
+        // an obligation for a removed (not yet pruned) dep would otherwise
+        // fail forever.
+        let fixture = Fixture::new("post-failure-unconfigured");
+        fixture.write_lib();
+        fixture.write_hook(
+            "gone",
+            "post() { printf 'post\\n' >> \"$SHDEPS_STATE_DIR/post-runs\"; return 1; }\n",
+        );
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "gone").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("gone", method::CUSTOM, "gone", ""),
+        )
+        .unwrap();
+
+        let summary = run(
+            &[],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.failed, ["gone"]);
+        assert!(!fixture.roots.state_dir.join(".pending-posts/gone").exists());
     }
 
     #[test]

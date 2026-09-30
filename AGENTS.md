@@ -134,7 +134,8 @@ and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
 - `exists(name)` — **required for `custom`**. Returns 0 if the dep is installed.
 - `install(name)` — **required for `custom`**. Called when `exists` returns 1.
 - `version(name)` — return version string.
-- `post(name)` — post-install setup. Runs after any change.
+- `post(name)` — post-install setup. Runs after any change; a failed post
+  stays pending and is retried on the next update.
 - `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
   an orphaned dep (any method). For custom deps, this is the only cleanup.
   For other methods, runs before the built-in cleanup — use it to reverse
