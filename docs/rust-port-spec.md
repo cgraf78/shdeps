@@ -1502,9 +1502,9 @@ Design (deliberately simple):
   it (its filter does not provably exclude this host, e.g. an unproven
   `host:` mismatch) the marker is kept without running `post(name)` or
   reporting failure; with a row but no owning entry (removed from config or
-  provably excluded, not yet pruned) the post runs and its marker is
-  acknowledged after classification because nothing would otherwise retire
-  it.
+  provably excluded, not yet pruned) the marker is acknowledged without
+  running `post(name)`: prune owns that install's cleanup, and a post could
+  recreate what prune removes or run on an excluded platform.
   `<txn_id>` is a unique identifier the parent generates per
   `shdeps update` and exports through `SHDEPS_UPDATE_TXN_ID`.
 - Only the top-level state-lock holder recovers abandoned transaction

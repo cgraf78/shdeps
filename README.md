@@ -575,7 +575,7 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_link_extras <name> <dir>` | Discover and symlink man pages and completions from an install dir                          |
 | `shdeps_unlink_extras <name>`     | Remove all extras symlinks tracked for a dep                                                |
 | `shdeps_github_release_install <name> <cmd> [repo] [bin-path]` | Install one GitHub release binary for `<name>` (default repo `<name>`, default path `$SHDEPS_BIN_DIR/<cmd>`) |
-| `shdeps_mark_changed <name>`      | Mark a dep as changed during the current `shdeps update` so its `post()` hook runs (held while the dep is inactive on this host, dropped if it is also not installed); no-op outside an update |
+| `shdeps_mark_changed <name>`      | Mark a dep as changed during the current `shdeps update` so its `post()` hook runs (held while the dep is inactive on this host, dropped if it is also not installed or no config entry owns it); no-op outside an update |
 | `shdeps_skip <dep> [reason]`      | Record a `.skipped` marker (with optional reason) under the dep's install dir               |
 | `shdeps_skipped <dep>`            | Return 0 if the dep is marked skipped                                                       |
 | `shdeps_skip_reason <dep>`        | Print the recorded skip reason; returns 1 if not skipped                                    |
