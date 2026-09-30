@@ -40,9 +40,11 @@ fn macos_cli_harness_runs_single_threaded() {
     assert_eq!(std::env::var("RUST_TEST_THREADS").as_deref(), Ok("1"));
 }
 
-// Hosted runners can deschedule one short subprocess without indicating a
-// user-visible regression. Three samples keep the median sensitive to a
-// persistent slowdown while discarding one isolated scheduler outlier.
+// Wall-clock budgets run separately from the parallel functional suite:
+// `cargo test --locked --test cli -- --ignored --test-threads=1`.
+// SHDEPS_JOBS only bounds one CLI's workers; it cannot prevent sibling tests
+// from competing for process startup and filesystem I/O. Three samples still
+// discard one isolated hosted-runner scheduler outlier in the serial pass.
 const CI_PERFORMANCE_SAMPLES: usize = 3;
 
 fn shdeps() -> Command {
@@ -1084,6 +1086,7 @@ fn system_bash() -> PathBuf {
 }
 
 #[test]
+#[ignore = "run wall-clock budgets separately with --ignored --test-threads=1"]
 fn dep_file_stays_fast_with_many_configured_dependencies() {
     let fixture = Fixture::new("dep-file-perf");
     let mut config = String::new();
@@ -1136,6 +1139,7 @@ fn representative_duration_preserves_persistent_slowdown() {
 }
 
 #[test]
+#[ignore = "run wall-clock budgets separately with --ignored --test-threads=1"]
 fn cheap_path_and_status_commands_stay_within_ci_budget() {
     let fixture = Fixture::new("cheap-path-status-perf");
     let mut config = String::new();
@@ -1199,6 +1203,7 @@ fn cheap_path_and_status_commands_stay_within_ci_budget() {
 }
 
 #[test]
+#[ignore = "run wall-clock budgets separately with --ignored --test-threads=1"]
 fn no_op_manifest_backed_update_stays_fast_and_skips_network_and_tools() {
     let fixture = Fixture::new("noop-update-perf");
     fixture.write(
@@ -1833,6 +1838,7 @@ fn list_reports_configured_dependency_statuses() {
 }
 
 #[test]
+#[ignore = "run wall-clock budgets separately with --ignored --test-threads=1"]
 fn custom_hooks_stay_within_ci_budget() {
     let fixture = Fixture::new("custom-hook-perf");
     let mut config = String::new();
