@@ -319,7 +319,7 @@ fn dedupe_last_wins(entries: Vec<String>) -> Vec<String> {
 /// `update`, `list`, `dep-file`, and bridge APIs cannot accidentally disagree
 /// about `.git` canonicalization or comment handling.
 pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
-    load_dir_entries(conf_dir, None)
+    Ok(load_dir_entries(conf_dir, None)?.unwrap_or_default())
 }
 
 /// Loads config while selecting one active declaration from filtered duplicates.
@@ -330,12 +330,27 @@ pub fn load_dir(conf_dir: &Path) -> Result<Vec<String>> {
 /// safely between platform or package-manager providers, so the normal method
 /// transition cleanup removes the previous provider's managed artifacts.
 pub fn load_dir_for_runtime(conf_dir: &Path, env: &RuntimeEnv) -> Result<Vec<String>> {
+    Ok(load_dir_entries(conf_dir, Some(env))?.unwrap_or_default())
+}
+
+/// Like `load_dir_for_runtime`, but returns `None` when the config directory
+/// does not exist instead of an empty config.
+///
+/// Destructive callers need to tell "nothing configured" from "no config at
+/// all". Deciding from the same `read_dir` call avoids a stat-then-read race
+/// where a directory swapped out in between reads as an empty config.
+pub fn load_dir_for_runtime_if_present(
+    conf_dir: &Path,
+    env: &RuntimeEnv,
+) -> Result<Option<Vec<String>>> {
     load_dir_entries(conf_dir, Some(env))
 }
 
-fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<Vec<String>> {
+fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<Option<Vec<String>>> {
     crate::cancellation::check()?;
-    let mut files = conf_files(conf_dir)?;
+    let Some(mut files) = conf_files_if_present(conf_dir)? else {
+        return Ok(None);
+    };
     files.sort();
 
     let mut entries = Vec::new();
@@ -368,7 +383,7 @@ fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<Vec<Str
         }
     });
     sort_entries(&mut entries);
-    Ok(entries)
+    Ok(Some(entries))
 }
 
 fn read_config_file(path: &Path) -> Result<String> {
@@ -535,14 +550,18 @@ fn entry_name(entry: &str) -> &str {
 /// rule here prevents the package warm-path cache from accidentally proving a
 /// different config surface than `load_dir()` actually reads.
 pub fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(conf_files_if_present(conf_dir)?.unwrap_or_default())
+}
+
+fn conf_files_if_present(conf_dir: &Path) -> Result<Option<Vec<PathBuf>>> {
     crate::cancellation::check()?;
     let entries = match fs::read_dir(conf_dir) {
         Ok(entries) => entries,
         // A missing directory is an empty config for read-only and install
         // callers (a fresh machine before dotfiles land). Destructive callers
-        // must not infer intent from absence; `shdeps prune` checks presence
-        // itself before trusting an empty result.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // must not infer intent from absence, so absence is reported
+        // distinctly (`load_dir_for_runtime_if_present`).
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         // Anything else (EACCES, EIO, ENOTDIR) means the config could not be
         // read, not that it is empty. Reporting it as empty made `prune -y`
         // treat every tracked dep as orphaned.
@@ -569,7 +588,7 @@ pub fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
             files.push(path);
         }
     }
-    Ok(files)
+    Ok(Some(files))
 }
 
 #[cfg(test)]

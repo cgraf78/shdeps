@@ -1660,21 +1660,41 @@ where
     }
 
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
-    if let Some(message) = missing_prune_config_dir(&roots.conf_dir)? {
-        writeln!(stderr, "error: {message}")?;
-        return Ok(1);
-    }
     let (pkg_mgr, env) = detected_runtime_env();
-    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
-    let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     let env_vars = env_vars(options);
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
-    let entries =
-        resolve_github_entries(&entries, &roots, Some(&manifest), &env, &env_vars, options)?;
+    // Prune loads config once for the lock-free preview and again under the
+    // state lock; both loads apply the same presence rule and resolution.
+    let load_config = |manifest: &Manifest| -> Result<Vec<Entry>> {
+        let Some(raw_entries) = config::load_dir_for_runtime_if_present(&roots.conf_dir, &env)?
+        else {
+            // Other commands read a missing config directory as "nothing
+            // configured". For prune that orphans every tracked dep, and
+            // `-y` (cron, dot) skips the all-orphans guard, so an unmounted
+            // home, a dangling symlink, or half-applied dotfiles would wipe
+            // every install. Refuse unless there is nothing to remove (a
+            // fresh or config-less host must not fail every run). An
+            // existing empty directory stays the explicit empty config.
+            if manifest.effective_entries().is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "config directory does not exist: {}; refusing to prune \
+                     (create it, even empty, to confirm the config)",
+                    roots.conf_dir.display()
+                ),
+            )
+            .into());
+        };
+        let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
+        resolve_github_entries(&entries, &roots, Some(manifest), &env, &env_vars, options)
+    };
     let hooks = custom_probe(&pkg_mgr, options.quiet, env.platform());
-    let detected = prune::run(
-        &entries,
+    let detected = prune::run_with_config_loader(
+        &load_config,
         &manifest,
         &manifest_path,
         &roots,
@@ -1684,6 +1704,7 @@ where
             dry_run: true,
             ..prune_options
         },
+        None,
     )?;
     crate::cancellation::check()?;
 
@@ -1720,8 +1741,8 @@ where
     crate::cancellation::check()?;
 
     let manifest = manifest::read(&manifest_path)?;
-    let summary = prune::run(
-        &entries,
+    let summary = prune::run_with_config_loader(
+        &load_config,
         &manifest,
         &manifest_path,
         &roots,
@@ -1732,29 +1753,11 @@ where
             dry_run: false,
             quiet: false,
         },
+        Some(&detected.orphans),
     )?;
     crate::cancellation::check()?;
     write_prune_results(&summary.removed, stdout, stderr)?;
     Ok(if summary.has_errors() { 1 } else { 0 })
-}
-
-/// Returns a refusal message when prune's config directory does not exist.
-///
-/// Other commands read a missing config directory as "nothing configured".
-/// For prune that turns every tracked dep into an orphan, and `-y` (cron,
-/// dot) skips the all-orphans guard, so an unmounted home, a dangling
-/// symlink, or half-applied dotfiles would wipe every install. An existing
-/// but empty directory remains the explicit way to declare an empty config.
-fn missing_prune_config_dir(conf_dir: &Path) -> Result<Option<String>> {
-    match std::fs::metadata(conf_dir) {
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(format!(
-            "config directory does not exist: {}; refusing to prune (create it, \
-             even empty, to confirm the config)",
-            conf_dir.display()
-        ))),
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn self_update_cmd<W, E>(

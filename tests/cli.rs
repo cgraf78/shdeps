@@ -7330,6 +7330,19 @@ fn prune_refuses_when_config_directory_is_unreadable() {
 }
 
 #[test]
+fn prune_without_config_or_tracked_deps_is_a_clean_no_op() {
+    // A fresh or config-less host has nothing to protect; refusing there
+    // would make every cron/dot prune run fail.
+    let fixture = Fixture::new("prune-no-conf-no-manifest");
+
+    let output = run(&mut fixture.command(["prune", "-y"]));
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "No orphaned deps found.\n");
+}
+
+#[test]
+#[cfg(unix)]
 fn prune_refuses_when_config_directory_is_missing() {
     // A missing config dir (unmounted home, half-applied dotfiles) is not
     // evidence that the user wants every tracked dep removed, even with -y.
@@ -7347,6 +7360,16 @@ fn prune_refuses_when_config_directory_is_missing() {
         fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
         "tool|custom|tool|\n"
     );
+
+    // A dangling symlink is just as absent.
+    std::os::unix::fs::symlink(fixture.dir.join("gone"), fixture.dir.join("conf")).unwrap();
+    let dangling = run(&mut fixture.command(["prune", "-y"]));
+    assert_eq!(dangling.status.code(), Some(1), "{dangling:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+    fs::remove_file(fixture.dir.join("conf")).unwrap();
 
     // An existing but empty config dir is the explicit way to say "nothing
     // is configured"; the all-orphans guard and -y then apply as before.

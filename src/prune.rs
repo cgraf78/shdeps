@@ -70,10 +70,12 @@ impl Summary {
     }
 }
 
-/// Runs prune using already-loaded config and manifest paths.
+/// Runs prune against one already-loaded config snapshot.
 ///
 /// `env` is the runtime identity used to decide which config entries still
-/// own their manifest rows on this host (see `Manifest::orphans`).
+/// own their manifest rows on this host (see `Manifest::orphans`). Callers
+/// that can reload config should use `run_with_config_loader` so the
+/// mutating phase sees config as of state-lock acquisition.
 pub fn run(
     config: &[Entry],
     manifest: &Manifest,
@@ -82,6 +84,40 @@ pub fn run(
     hooks: &BashCustomProbe,
     env: &RuntimeEnv,
     options: Options,
+) -> Result<Summary> {
+    run_with_config_loader(
+        &|_: &Manifest| Ok(config.to_vec()),
+        manifest,
+        manifest_path,
+        roots,
+        hooks,
+        env,
+        options,
+        None,
+    )
+}
+
+/// Runs prune, loading config through `load_config`.
+///
+/// The loader receives the manifest snapshot it should resolve against
+/// (`github` method resolution consults existing rows). It runs once for the
+/// lock-free preview and again after the state lock is held, so the mutating
+/// phase never acts on a config snapshot taken before a long lock wait.
+///
+/// `confirmed` is the orphan list an earlier preview showed (and the user or
+/// `-y` accepted). When given, the locked run refuses to remove anything
+/// outside it: a config or manifest change during the lock wait must not
+/// widen the removal set past what was accepted, up to every tracked dep.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_config_loader(
+    load_config: &dyn Fn(&Manifest) -> Result<Vec<Entry>>,
+    manifest: &Manifest,
+    manifest_path: &Path,
+    roots: &runtime::Roots,
+    hooks: &BashCustomProbe,
+    env: &RuntimeEnv,
+    options: Options,
+    confirmed: Option<&[ManifestEntry]>,
 ) -> Result<Summary> {
     cancellation::check()?;
     // A fresh checkout can be durably published before its manifest row and
@@ -110,6 +146,8 @@ pub fn run(
         .map(|_| manifest::read(manifest_path))
         .transpose()?;
     let manifest = recovered_manifest.as_ref().unwrap_or(manifest);
+    let preview_config = load_config(manifest)?;
+    let config = preview_config.as_slice();
     let orphans = manifest.orphans(config, env);
     // The "all orphans" guard prevents a silent bulk-delete of every
     // shdeps-tracked dep without explicit `--yes`. The pre-fix gate
@@ -191,14 +229,18 @@ pub fn run(
     // since then, which would invalidate the orphan list. Recomputing
     // inside the lock guarantees we mutate against the current state.
     //
-    // The `config` is intentionally NOT re-read: shdeps does not write
-    // to user config files, so a concurrent shdeps invocation cannot
-    // mutate it. Only an operator-side edit (text editor, git pull)
-    // would change it, and racing against that is out of scope —
-    // the operator is expected to re-run prune if they edit config
-    // mid-run.
+    // Config is re-read here too. shdeps never writes it, but the lock
+    // wait can span a whole update, during which a dotfiles pull or an
+    // edit may add or remove deps; the preview snapshot could then name
+    // a dep that is configured again. Lock order matches update (config
+    // read takes no lock; state lock, then per-checkout locks), so this
+    // adds no deadlock. A config edit racing this read is still possible;
+    // it can only reflect a state the operator actually wrote.
     recover_fresh_repo_publications(roots, manifest_path)?;
     let initial_manifest = manifest::read(manifest_path)?;
+    let locked_config = load_config(&initial_manifest)?;
+    let config = locked_config.as_slice();
+    cancellation::check()?;
     crate::update_transition::recover_pending_publications(
         config,
         &initial_manifest,
@@ -255,6 +297,16 @@ pub fn run(
     // Retire pre-hook records whose exact row is gone before any record can
     // be reused below.
     prune_journal::retain(&cleanup_roots(roots), &fresh_manifest)?;
+    if let Some(confirmed) = confirmed {
+        if let Some(extra) = orphans.iter().find(|orphan| !confirmed.contains(orphan)) {
+            return Err(std::io::Error::other(format!(
+                "orphaned deps changed while waiting for the state lock ({} was not \
+                 in the confirmed list); no orphans removed, re-run prune",
+                extra.name
+            ))
+            .into());
+        }
+    }
     if orphans.is_empty() && recovered_items.is_empty() {
         return Ok(Summary {
             orphans,
@@ -2700,6 +2752,104 @@ mod tests {
         assert_eq!(after.entries(), &[release, keep]);
         assert!(archive_bin.exists());
         assert!(fs::symlink_metadata(&public).is_ok());
+    }
+
+    #[test]
+    fn prune_rereads_config_under_the_state_lock() {
+        // The caller's config snapshot can predate a long wait for the state
+        // lock (a running update, a dotfiles pull re-adding a dep). Prune must
+        // act on the config as of lock acquisition, not the stale snapshot.
+        let fixture = Fixture::new("reread-config");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            "uninstall() { : > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let tool = ManifestEntry::new("tool", "custom", "tool", "");
+        manifest::upsert(&manifest_path, tool.clone()).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("keep", "custom", "keep", ""),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let loads = std::cell::Cell::new(0);
+        let load_config = |_: &manifest::Manifest| {
+            loads.set(loads.get() + 1);
+            // First (pre-lock) load: `tool` was removed from config. Every
+            // later load: the edit was reverted before prune got the lock.
+            let mut config = vec![parse_entry("keep|custom", None)];
+            if loads.get() > 1 {
+                config.push(parse_entry("tool|custom", None));
+            }
+            Ok(config)
+        };
+
+        let summary = super::run_with_config_loader(
+            &load_config,
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(loads.get() >= 2, "config was not re-read under the lock");
+        assert!(summary.removed.is_empty(), "{summary:?}");
+        assert!(!fixture.roots.state_dir.join("hook-ran").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&tool)
+        );
+    }
+
+    #[test]
+    fn prune_refuses_orphans_outside_the_confirmed_list() {
+        // The CLI confirms a preview, then runs the mutating phase with
+        // `yes`. A config change during the lock wait must not widen the
+        // removal set beyond what was confirmed.
+        let fixture = Fixture::new("confirmed-orphans");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let a = ManifestEntry::new("a", "custom", "a", "");
+        let b = ManifestEntry::new("b", "custom", "b", "");
+        let keep = ManifestEntry::new("keep", "custom", "keep", "");
+        for entry in [&a, &b, &keep] {
+            manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        }
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let loads = std::cell::Cell::new(0);
+        let load_config = |_: &manifest::Manifest| {
+            loads.set(loads.get() + 1);
+            let mut config = vec![parse_entry("keep|custom", None)];
+            if loads.get() == 1 {
+                config.push(parse_entry("b|custom", None));
+            }
+            Ok(config)
+        };
+
+        let error = super::run_with_config_loader(
+            &load_config,
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+            Some(std::slice::from_ref(&a)),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("re-run prune"), "{error}");
+        assert_eq!(manifest::read(&manifest_path).unwrap(), manifest);
     }
 
     #[test]

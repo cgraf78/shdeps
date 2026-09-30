@@ -384,8 +384,10 @@ Safety:
 - A config directory that exists but cannot be read (EACCES, EIO, ENOTDIR)
   MUST be an error for every command, never an empty config.
 - Prune MUST refuse (exit 1), even with `-y`, when the config directory does
-  not exist: absence (unmounted home, dangling symlink, half-applied
-  dotfiles) is not evidence that every dep should go. An existing empty
+  not exist and the manifest tracks deps: absence (unmounted home, dangling
+  symlink, half-applied dotfiles) is not evidence that every dep should go.
+  Presence is decided by the same `read_dir` that loads config. With nothing
+  tracked, a missing directory is a clean no-op (exit 0). An existing empty
   directory is the explicit way to declare an empty config. Other commands
   keep treating a missing directory as an empty config.
 - `--dry-run` MUST NOT remove files or change manifest.
@@ -1062,6 +1064,13 @@ rows.
 - `pkg` orphans still only drop shdeps tracking and never uninstall packages.
 
 Prune MUST list orphans before removal unless quiet behavior skips action.
+Prune MUST re-read config (with the same presence rule and `github`
+resolution) after it acquires the state lock and before recovery or removal,
+so the mutating phase never acts on a config snapshot taken before a long
+lock wait. The re-read takes no additional lock. The mutating phase MUST NOT
+remove anything outside the orphan list the preview showed (and the prompt or
+`-y` accepted); if the locked orphan set grew, prune removes no orphans and
+exits 1 so the next run re-previews.
 Prune MUST remove manifest rows after cleanup attempts, except when an
 existing `uninstall()` hook fails or cannot be sourced: prune then keeps the
 row and skips built-in cleanup so a later prune retries the hook, and exits 1.
