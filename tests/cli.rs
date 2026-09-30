@@ -3541,10 +3541,16 @@ uninstall() {
         ["--quiet", "prune", "-y"],
     ));
 
-    assert_success(&output);
+    // This is the cron shape: the hook cannot get sudo, so its cleanup never
+    // ran. Prune must fail and keep the row for a later interactive retry.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
         "tool uninstall\nuninstall sudo -n true\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
     );
 }
 
@@ -7289,6 +7295,44 @@ fn prune_preserves_packages_and_guards_empty_config() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn prune_fails_and_retries_when_uninstall_hook_fails() {
+    // Cron runs `shdeps prune -y`; a hook that cannot finish (e.g. sudo
+    // without a TTY) must surface as a failure and leave the row for the
+    // next run instead of printing "removed" and exiting 0.
+    let fixture = Fixture::new("prune-hook-fails");
+    fixture.write("conf/deps.conf", "keep custom\n");
+    fixture.write("state/manifest", "keep|custom|keep|\nold|custom|old|\n");
+    fixture.write("conf/hooks.d/old.sh", "uninstall() { return 1; }\n");
+
+    let failed = run(&mut fixture.command(["prune", "-y"]));
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert!(!text(&failed.stdout).contains("old removed"), "{failed:?}");
+    assert!(
+        text(&failed.stderr).contains("old uninstall hook failed"),
+        "{failed:?}"
+    );
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("old|custom|old|")
+    );
+
+    fixture.write(
+        "conf/hooks.d/old.sh",
+        "uninstall() { printf '%s\\n' \"$1\" > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+    );
+    let retried = run(&mut fixture.command(["prune", "-y"]));
+    assert_success(&retried);
+    assert!(text(&retried.stdout).contains("old removed"), "{retried:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/hook-ran")).unwrap(),
+        "old\n"
+    );
+    let manifest = fs::read_to_string(fixture.dir.join("state/manifest")).unwrap();
+    assert_eq!(manifest, "keep|custom|keep|\n");
 }
 
 #[test]

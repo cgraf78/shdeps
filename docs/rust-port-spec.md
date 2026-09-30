@@ -372,7 +372,8 @@ Exit codes:
 
 - `0`: success, no orphans, dry run success, user aborted prompt, or quiet mode
   skipped prompt/action.
-- `1`: guarded all-orphans condition or cleanup runtime error.
+- `1`: guarded all-orphans condition, cleanup runtime error, or a failed
+  (or unsourceable) `uninstall()` hook.
 - `2`: unknown prune option.
 
 Safety:
@@ -1039,7 +1040,11 @@ config set, regardless of platform or host filters.
 Platform-filtered configured deps are not orphans.
 
 Prune MUST list orphans before removal unless quiet behavior skips action.
-Prune MUST remove manifest rows after cleanup attempts.
+Prune MUST remove manifest rows after cleanup attempts, except when an
+existing `uninstall()` hook fails or cannot be sourced: prune then keeps the
+row and skips built-in cleanup so a later prune retries the hook, and exits 1.
+To release such a row, fix the hook, run `shdeps prune` interactively when the
+hook needs sudo, or delete the hook file (its cleanup is then skipped).
 
 ## Hook ABI
 

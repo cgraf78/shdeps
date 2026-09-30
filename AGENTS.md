@@ -135,7 +135,9 @@ and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
 - `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
   an orphaned dep (any method). For custom deps, this is the only cleanup.
   For other methods, runs before the built-in cleanup — use it to reverse
-  what `post()` created (symlinks, config files).
+  what `post()` created (symlinks, config files). A failed or unsourceable
+  hook keeps the manifest row and built-in payload for the next prune to
+  retry, and prune exits 1.
 
 ### Hook helper toolkit
 

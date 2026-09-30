@@ -2895,13 +2895,13 @@ where
             )?,
             Uninstall::SourceFailed => writeln!(
                 stderr,
-                "  warning: failed to source hook for {}",
+                "  warning: failed to source hook for {} — kept for the next prune",
                 item.entry.name
             )?,
             Uninstall::Failed => {
                 writeln!(
                     stderr,
-                    "  warning: {} uninstall hook failed",
+                    "  warning: {} uninstall hook failed — kept for the next prune",
                     item.entry.name
                 )?;
             }

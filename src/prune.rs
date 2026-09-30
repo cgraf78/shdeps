@@ -37,7 +37,8 @@ pub struct Item {
     pub entry: ManifestEntry,
     /// Optional hook cleanup result.
     pub hook: Uninstall,
-    /// Built-in cleanup decisions.
+    /// Built-in cleanup decisions; `None` when cleanup failed or a failed
+    /// hook deferred it (the manifest row is then kept for a retry).
     pub cleanup: Option<cleanup::Summary>,
     /// Built-in cleanup failed after the hook attempt.
     pub cleanup_error: Option<String>,
@@ -58,10 +59,12 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// Returns whether any built-in cleanup attempt failed.
+    /// Returns whether any uninstall hook or built-in cleanup attempt failed.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.removed.iter().any(|item| item.cleanup_error.is_some())
+        self.removed
+            .iter()
+            .any(|item| item.cleanup_error.is_some() || item.hook_failed())
     }
 }
 
@@ -300,6 +303,21 @@ pub fn run(
             };
             cancellation::check()?;
         }
+        let item = Item {
+            entry: entry.clone(),
+            hook,
+            cleanup: None,
+            cleanup_error: None,
+        };
+        if item.hook_failed() {
+            // The hook's own cleanup did not happen (cron sudo without a TTY,
+            // a broken hook, ...). Retiring the row now would orphan whatever
+            // the hook was supposed to remove with nothing left to retry it,
+            // so keep both the row and the built-in payload and let the
+            // caller report failure; the next prune retries the hook.
+            removed.push(item);
+            continue;
+        }
         let preserve_regular_public =
             regular_public_claimed_by_survivor(entry, &fresh_manifest, config);
         // Cleanup plus manifest removal is one commit boundary. Honor a
@@ -314,10 +332,9 @@ pub fn run(
             cleanup_evidence,
         )?;
         removed.push(Item {
-            entry: entry.clone(),
-            hook,
             cleanup,
             cleanup_error,
+            ..item
         });
     }
 
@@ -535,6 +552,18 @@ fn cleanup_roots(roots: &runtime::Roots) -> cleanup::Roots {
         state_dir: roots.state_dir.clone(),
         install_dir: roots.install_dir.clone(),
         bin_dir: roots.bin_dir.clone(),
+    }
+}
+
+impl Item {
+    /// Returns whether an existing uninstall hook did not complete its cleanup.
+    ///
+    /// A missing hook file or `uninstall()` function means there is nothing
+    /// for the hook to undo; a hook that failed or could not be sourced left
+    /// its own cleanup undone.
+    #[must_use]
+    pub fn hook_failed(&self) -> bool {
+        matches!(self.hook, Uninstall::Failed | Uninstall::SourceFailed)
     }
 }
 
@@ -2213,6 +2242,96 @@ mod tests {
             "custom\n"
         );
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_keeps_row_and_artifacts_when_uninstall_hook_fails() {
+        use std::os::unix::fs::symlink;
+
+        // A failed hook (for example a cron run whose sudo cannot prompt)
+        // left its own cleanup undone. Dropping the row would orphan those
+        // files forever, so the row and built-in payload must survive for a
+        // later prune to retry.
+        let fixture = Fixture::new("hook-fails");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/tool.sh"),
+            "uninstall() { return 1; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let archive_bin = fixture.roots.install_dir.join("owner/tool/bin/tool");
+        fixture.write(&archive_bin, "#!/bin/sh\n");
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&archive_bin, &public).unwrap();
+        let entry = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            public.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.removed.len(), 1);
+        assert_eq!(summary.removed[0].hook, Uninstall::Failed);
+        assert!(summary.removed[0].hook_failed());
+        assert_eq!(summary.removed[0].cleanup, None);
+        assert!(summary.has_errors(), "a failed hook must fail the prune");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&entry)
+        );
+        assert!(archive_bin.exists(), "failed hook must keep the payload");
+        assert!(fs::symlink_metadata(&public).is_ok());
+    }
+
+    #[test]
+    fn prune_keeps_row_when_uninstall_hook_cannot_be_sourced() {
+        // An unsourceable hook never ran its cleanup either; treat it like a
+        // failed hook instead of silently retiring the row.
+        let fixture = Fixture::new("hook-source-fails");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("custom.sh"),
+            "uninstall() { :; }\nreturn 1\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entry = ManifestEntry::new("custom", "custom", "custom", "");
+        manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.removed[0].hook, Uninstall::SourceFailed);
+        assert!(summary.has_errors());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("custom"),
+            Some(&entry)
+        );
     }
 
     /// Starts a cargo-to-pkg method journal bound to the apt installer.
