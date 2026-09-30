@@ -2689,6 +2689,47 @@ mod tests {
     }
 
     #[test]
+    fn prune_keeps_the_pending_post_of_a_dep_nested_under_the_orphan_name() {
+        // Replacing `neovim` (pkg) with `neovim/neovim` orphans the old row
+        // while the new dep's pending marker makes `.pending-posts/neovim` a
+        // directory. That directory is not the orphan's marker: prune must
+        // neither fail on it nor touch the other dep's obligation.
+        let fixture = Fixture::new("pending-post-nested-name");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("neovim", "custom", "nvim", ""),
+        )
+        .unwrap();
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "neovim/neovim").unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/neovim/neovim")
+                .is_file()
+        );
+    }
+
+    #[test]
     fn prune_keeps_pending_post_while_it_keeps_the_row() {
         // A failed uninstall keeps the row for the next prune; the pending
         // post stays with it so the state is unchanged for that retry.

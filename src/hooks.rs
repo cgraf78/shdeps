@@ -1223,6 +1223,13 @@ pub(crate) fn acknowledge_pending_post(state_dir: &Path, name: &str) -> Result<(
     let _guard = PENDING_POSTS_LOCK.lock().unwrap();
     let root = state_dir.join(PENDING_POSTS_DIR);
     let marker = root.join(name);
+    // Markers mirror dependency names as paths, so `neovim` and
+    // `neovim/neovim` share `.pending-posts/neovim`. A directory there holds
+    // other dependencies' markers, never this one's: nothing is pending for
+    // this exact name, and removing (or failing on) it would be wrong.
+    if std::fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(());
+    }
     match std::fs::remove_file(&marker) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
