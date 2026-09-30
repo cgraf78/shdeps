@@ -6,7 +6,7 @@
 //! Keeping the transaction-sensitive code here prevents each installer from
 //! learning a partial version of the same migration rules.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -1099,7 +1099,7 @@ fn finish_publication(
     }
 }
 
-/// Rejects an implicit dependency rename that reuses an installed command.
+/// Finds configured dependencies blocked by an unsupported command handoff.
 ///
 /// Method transitions are transactional only when the logical dependency name
 /// stays stable. A differently named config entry can otherwise mistake the
@@ -1107,12 +1107,16 @@ fn finish_publication(
 /// treats the old manifest row as unrelated. Require the operator to prune the
 /// old identity first instead of guessing replacement intent from a command
 /// collision alone.
-pub(crate) fn reject_identity_handoffs(
+///
+/// Returns the blocked dependency names mapped to an operator-facing reason.
+/// The caller fails only those dependencies so one unresolved rename does not
+/// block every unrelated update on the host.
+pub(crate) fn identity_handoff_conflicts(
     manifest: &Manifest,
     entries: &[Entry],
     env: &RuntimeEnv,
     pkg_mgr: &str,
-) -> Result<()> {
+) -> BTreeMap<String, String> {
     let active_entries = entries
         .iter()
         .filter(|entry| {
@@ -1128,6 +1132,7 @@ pub(crate) fn reject_identity_handoffs(
                 ) == "NONE")
         })
         .collect::<Vec<_>>();
+    let mut conflicts = BTreeMap::new();
     let mut command_claims = HashMap::<&str, &str>::new();
     for entry in &active_entries {
         if entry.cmd.is_empty() {
@@ -1135,14 +1140,16 @@ pub(crate) fn reject_identity_handoffs(
         }
         if let Some(previous) = command_claims.insert(&entry.cmd, &entry.name) {
             if previous != entry.name {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "duplicate active command claim for `{}`: configured `{previous}` conflicts with `{}`; give each dependency a distinct command",
-                        entry.cmd, entry.name
-                    ),
-                )
-                .into());
+                // Neither claimant can be installed safely: parallel installers
+                // define no winner for a shared public command.
+                let reason = format!(
+                    "duplicate active command claim for `{}`: configured `{previous}` conflicts with `{}`; give each dependency a distinct command",
+                    entry.cmd, entry.name
+                );
+                conflicts
+                    .entry(previous.to_owned())
+                    .or_insert_with(|| reason.clone());
+                conflicts.entry(entry.name.clone()).or_insert(reason);
             }
         }
     }
@@ -1174,18 +1181,16 @@ pub(crate) fn reject_identity_handoffs(
             {
                 continue;
             }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            conflicts.entry(new.name.clone()).or_insert_with(|| {
                 format!(
                     "unsupported dependency identity handoff for command `{}`: manifest `{}` conflicts with configured `{}`; remove the old declaration, run `shdeps prune`, then retry the replacement",
                     old.cmd, old.name, new.name
-                ),
-            )
-            .into());
+                )
+            });
         }
     }
 
-    Ok(())
+    conflicts
 }
 
 /// Builds a transition map keyed by dependency name.
@@ -2578,9 +2583,9 @@ mod tests {
         MAX_DURABLE_TRANSITION_RECORD_BYTES, PkgInstallerIdentity, Transition,
         begin_custom_durable_transition, begin_durable_transition, begin_public_transition,
         by_name, cleanup_snapshot, durable_transitions, ensure_durable_transition_dir,
-        install_with_prepared, install_with_prepared_and_commit, points_into,
-        prepare_manifest_with_nonce, public_transition_path, recover_pending_transitions,
-        recover_public_transition, reject_identity_handoffs, unlink_snapshot,
+        identity_handoff_conflicts, install_with_prepared, install_with_prepared_and_commit,
+        points_into, prepare_manifest_with_nonce, public_transition_path,
+        recover_pending_transitions, recover_public_transition, unlink_snapshot,
     };
     use crate::config::{Entry, parse_entry};
     use crate::github_release_install::{self, ArchiveState};
@@ -2617,6 +2622,51 @@ mod tests {
     #[cfg(unix)]
     fn run_signal_boundary_subprocess(test_name: &str, child_env: &str) {
         crate::test_support::run_signal_boundary_subprocess(test_name, child_env);
+    }
+
+    // Collapses the per-dependency conflict map into the historical
+    // accept/reject shape so guard cases stay compact.
+    fn reject_identity_handoffs(
+        manifest: &Manifest,
+        entries: &[Entry],
+        env: &RuntimeEnv,
+        pkg_mgr: &str,
+    ) -> Result<(), String> {
+        let conflicts = identity_handoff_conflicts(manifest, entries, env, pkg_mgr);
+        if conflicts.is_empty() {
+            return Ok(());
+        }
+        Err(conflicts
+            .iter()
+            .map(|(name, reason)| format!("{name}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    #[test]
+    fn identity_handoff_conflicts_name_only_the_blocked_dependencies() {
+        let manifest = Manifest::parse("owner/old|github:release|tool|/tmp/old\n");
+        let entries = [
+            parse_entry("replacement|pkg|tool|-|-", Some("apt")),
+            parse_entry("first|custom|shared|-|-", Some("apt")),
+            parse_entry("second|custom|shared|-|-", Some("apt")),
+            parse_entry("unrelated|custom|other|-|-", Some("apt")),
+        ];
+
+        let conflicts = identity_handoff_conflicts(
+            &manifest,
+            &entries,
+            &RuntimeEnv::new("linux", "host"),
+            "apt",
+        );
+
+        assert_eq!(
+            conflicts.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["first", "replacement", "second"]
+        );
+        assert!(conflicts["replacement"].contains("shdeps prune"));
+        assert!(conflicts["first"].contains("duplicate active command claim"));
+        assert!(conflicts["second"].contains("duplicate active command claim"));
     }
 
     #[test]

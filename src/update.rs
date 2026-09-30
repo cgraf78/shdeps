@@ -741,7 +741,44 @@ where
     let fresh_manifest = manifest::read(context.manifest_path)?;
     let manifest = &fresh_manifest;
 
-    update_transition::reject_identity_handoffs(manifest, entries, context.env, context.pkg_mgr)?;
+    // An unsupported identity handoff fails only the dependencies involved.
+    // Aborting the whole run would freeze every unrelated dependency on
+    // unattended (cron) hosts until an operator prunes the old identity by
+    // hand. The blocked entries are removed from this run entirely so no
+    // installer, transition, or post hook can treat the old command as their
+    // own proof; the failure still makes the run exit nonzero.
+    let blocked = update_transition::identity_handoff_conflicts(
+        manifest,
+        entries,
+        context.env,
+        context.pkg_mgr,
+    );
+    let unblocked_entries;
+    let entries = if blocked.is_empty() {
+        entries
+    } else {
+        // Report each conflict once, under the active entry's group; an
+        // inactive same-name platform variant is not part of this run.
+        for entry in entries
+            .iter()
+            .filter(|entry| blocked.contains_key(&entry.name) && active(entry, context.env))
+        {
+            let item = Item::failed(
+                entry.name.clone(),
+                ItemReason::Other,
+                blocked[&entry.name].clone(),
+            );
+            progress.item(group_for_method(&entry.method), &item)?;
+            summary.failed.push(entry.name.clone());
+            summary.items.push(item);
+        }
+        unblocked_entries = entries
+            .iter()
+            .filter(|entry| !blocked.contains_key(&entry.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        unblocked_entries.as_slice()
+    };
     let transitions = update_transition::by_name(manifest, entries, context.roots)?;
     let package_proofs = update_pkg::required_proofs(entries, manifest, context);
 
@@ -1126,6 +1163,11 @@ where
         }
         summary.items.push(item);
     }
+
+    // A blocked dependency keeps any pending obligation untouched until its
+    // conflict is resolved: running its post now would configure an identity
+    // this run refused to update, and a failure would repeat every run.
+    changed.retain(|name| !blocked.contains_key(name));
 
     // Post hooks deliberately run after every install decision rather than
     // inline with each method. Many hooks repair shell completions, symlinks,
@@ -2148,6 +2190,114 @@ post() { printf 'post\n' > "$SHDEPS_STATE_DIR/tool-post"; }
             fs::read_to_string(fixture.roots.state_dir.join("tool-post")).unwrap(),
             "post\n"
         );
+    }
+
+    #[test]
+    fn blocked_dependency_keeps_its_pending_post_without_running_it() {
+        let fixture = Fixture::new("identity-conflict-pending-post");
+        fixture.write_lib();
+        for name in ["first", "second"] {
+            fixture.write_hook(
+                name,
+                r#"
+exists() { return 0; }
+post() { printf '%s\n' "$1" >> "$SHDEPS_STATE_DIR/post-runs"; }
+"#,
+            );
+        }
+        crate::hooks::mark_pending_post(&fixture.roots.state_dir, "first").unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+
+        let summary = run(
+            &[
+                parse_entry("first|custom|shared|-|-", None),
+                parse_entry("second|custom|shared|-|-", None),
+            ],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.failed, ["first", "second"]);
+        assert!(
+            !fixture.roots.state_dir.join("post-runs").exists(),
+            "a blocked dependency's post must not run"
+        );
+        assert!(
+            fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/first")
+                .is_file(),
+            "the obligation must survive until the conflict is resolved"
+        );
+    }
+
+    #[test]
+    fn identity_handoff_fails_only_the_replacement_and_updates_the_rest() {
+        // A rename/provider switch that reuses an installed command must not
+        // abort the whole run and freeze every unrelated dependency.
+        let fixture = Fixture::new("identity-handoff-isolated");
+        fixture.write_lib();
+        fixture.write_hook(
+            "replacement",
+            r#"
+exists() { return 1; }
+install() { printf 'yes\n' > "$SHDEPS_STATE_DIR/replacement-installed"; }
+"#,
+        );
+        fixture.write_hook(
+            "other",
+            r#"
+exists() { [[ -f "$SHDEPS_STATE_DIR/other-installed" ]]; }
+install() { printf 'yes\n' > "$SHDEPS_STATE_DIR/other-installed"; }
+"#,
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new("owner/old", method::GITHUB_RELEASE, "tool", "/tmp/old");
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+
+        let summary = run(
+            &[
+                parse_entry("replacement|custom|tool|-|-", None),
+                parse_entry("other|custom|other|-|-", None),
+            ],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .expect("an identity handoff must fail only the affected dependency");
+
+        assert_eq!(summary.failed, vec!["replacement".to_owned()]);
+        let blocked = summary
+            .items
+            .iter()
+            .find(|item| item.name == "replacement")
+            .expect("blocked dependency must still be reported");
+        assert!(blocked.failed);
+        assert!(blocked.detail.contains("owner/old"), "{}", blocked.detail);
+        assert!(
+            blocked.detail.contains("shdeps prune"),
+            "{}",
+            blocked.detail
+        );
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join("replacement-installed")
+                .exists(),
+            "a blocked replacement must not install"
+        );
+        assert!(
+            fixture.roots.state_dir.join("other-installed").is_file(),
+            "unrelated dependencies must still update"
+        );
+        let recorded = manifest::read(&manifest_path).unwrap();
+        assert_eq!(recorded.get("owner/old"), Some(&old));
+        assert!(recorded.get("replacement").is_none());
+        assert!(recorded.get("other").is_some());
     }
 
     #[cfg(unix)]
@@ -3721,7 +3871,7 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
 
     #[test]
     #[cfg(unix)]
-    fn update_rejects_stale_command_handoff_before_package_detection() {
+    fn update_fails_stale_command_handoff_before_package_detection() {
         use std::os::unix::fs::symlink;
 
         let fixture = Fixture::new("cross-identity-pkg");
@@ -3751,7 +3901,11 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             )
             .with_success("sudo", ["apt-get", "install", "-y", "replacement"], "");
 
-        let error = run(
+        // The old identity stays configured under a new command. Only the
+        // replacement is blocked; the old dependency's own update is not this
+        // guard's concern (here its release download fails, so its row and
+        // public command must survive untouched).
+        let summary = run(
             &[
                 parse_entry("owner/old-tool|github:release|other|-|-", None),
                 parse_entry("replacement|pkg|tool|-|-", None),
@@ -3760,11 +3914,18 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
             &fixture.context(&manifest_path, &runner, "apt"),
             Options::default(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("owner/old-tool"));
-        assert!(error.to_string().contains("replacement"));
-        assert!(error.to_string().contains("tool"));
+        assert!(summary.failed.contains(&"replacement".to_owned()));
+        let detail = &summary
+            .items
+            .iter()
+            .find(|item| item.name == "replacement")
+            .unwrap()
+            .detail;
+        assert!(detail.contains("owner/old-tool"), "{detail}");
+        assert!(detail.contains("replacement"), "{detail}");
+        assert!(detail.contains("`tool`"), "{detail}");
         assert!(
             runner.calls().is_empty(),
             "package detection ran before the unsupported handoff was rejected"

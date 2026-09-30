@@ -1376,6 +1376,50 @@ fn update_jsonl_package_progress_includes_manager_override_skips() {
 }
 
 #[test]
+fn update_identity_handoff_fails_one_dependency_and_updates_the_rest() {
+    // A handoff must not abort the entire run before unrelated dependencies
+    // update; the blocked dependency still fails the exit status.
+    let fixture = Fixture::new("update-identity-handoff-isolated");
+    fixture.write(
+        "conf/deps.conf",
+        "replacement custom tool\nother custom other\n",
+    );
+    fixture.write(
+        "conf/hooks.d/replacement.sh",
+        "exists() { return 1; }\ninstall() { : >\"$SHDEPS_STATE_DIR/replacement-installed\"; }\n",
+    );
+    fixture.write(
+        "conf/hooks.d/other.sh",
+        "exists() { [[ -f \"$SHDEPS_STATE_DIR/other-installed\" ]]; }\ninstall() { : >\"$SHDEPS_STATE_DIR/other-installed\"; }\n",
+    );
+    fixture.write(
+        "state/manifest",
+        "owner/old|github:release|tool|/nonexistent/old\n",
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={:?} stderr={:?}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("replacement") && stderr.contains("shdeps prune"),
+        "blocked dependency must name the prune remedy: {stderr}"
+    );
+    assert!(!fixture.dir.join("state/replacement-installed").exists());
+    assert!(
+        fixture.dir.join("state/other-installed").is_file(),
+        "unrelated dependency must still update: stdout={:?} stderr={stderr}",
+        text(&output.stdout)
+    );
+}
+
+#[test]
 fn update_allows_real_provider_to_share_command_with_none_package_override() {
     let fixture = Fixture::new("update-none-package-command-claim");
     fixture.write(
