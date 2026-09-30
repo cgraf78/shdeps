@@ -151,35 +151,79 @@ pub fn manager_match(spec: &str, env: &RuntimeEnv) -> bool {
 /// Returns whether a combined `os:`/`host:`/`mgr:` filter matches the runtime.
 #[must_use]
 pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
-    if spec.is_empty() {
-        return FilterMatch::Match;
-    }
-
-    let mut platform_spec = String::new();
-    let mut host_spec = String::new();
-    let mut manager_spec = String::new();
-
-    for token in spec.split(',').filter(|token| !token.is_empty()) {
-        if let Some(value) = token.strip_prefix("os:") {
-            append_spec(&mut platform_spec, value);
-        } else if let Some(value) = token.strip_prefix("host:") {
-            append_spec(&mut host_spec, value);
-        } else if let Some(value) = token.strip_prefix("mgr:") {
-            append_spec(&mut manager_spec, value);
-        }
-    }
-
-    if !platform_spec.is_empty() && !platform_match(&platform_spec, env) {
+    let specs = FilterSpecs::parse(spec);
+    if specs.platform_rejects(env) {
         return FilterMatch::PlatformMismatch;
     }
-    if !host_spec.is_empty() && !host_match(&host_spec, env) {
+    if specs.host_rejects(env) {
         return FilterMatch::HostMismatch;
     }
-    if !manager_spec.is_empty() && !manager_match(&manager_spec, env) {
+    if specs.manager_rejects(env) {
         return FilterMatch::ManagerMismatch;
     }
 
     FilterMatch::Match
+}
+
+/// Returns whether `spec` rejects this runtime on a stable, known identity.
+///
+/// Destructive callers (prune, run unattended by cron) must not act on
+/// `filter_match` alone, because some identities are probes that can be
+/// wrong transiently:
+///
+/// - `host:` never proves exclusion. `hostname` yields an empty value when
+///   the probe fails, and on macOS without a fixed `HostName` it follows the
+///   network (DHCP or reverse DNS), so a non-empty value can still be a
+///   transient misidentification.
+/// - `mgr:` proves exclusion only once a package manager was detected; an
+///   empty value means detection failed (for example a cron PATH without
+///   brew), not that this machine uses no manager. Detection is otherwise a
+///   deterministic PATH lookup.
+/// - `os:` always proves exclusion: the platform always resolves (`uname`
+///   falls back to the compile-time OS).
+///
+/// Unlike `filter_match`, every dimension is checked so an unproven host
+/// mismatch cannot mask a known package-manager mismatch.
+#[must_use]
+pub fn provably_excludes(spec: &str, env: &RuntimeEnv) -> bool {
+    let specs = FilterSpecs::parse(spec);
+    specs.platform_rejects(env) || (!env.package_manager().is_empty() && specs.manager_rejects(env))
+}
+
+/// Per-dimension specs split out of one combined `os:`/`host:`/`mgr:` filter.
+#[derive(Default)]
+struct FilterSpecs {
+    platform: String,
+    host: String,
+    manager: String,
+}
+
+impl FilterSpecs {
+    fn parse(spec: &str) -> Self {
+        let mut specs = Self::default();
+        for token in spec.split(',').filter(|token| !token.is_empty()) {
+            if let Some(value) = token.strip_prefix("os:") {
+                append_spec(&mut specs.platform, value);
+            } else if let Some(value) = token.strip_prefix("host:") {
+                append_spec(&mut specs.host, value);
+            } else if let Some(value) = token.strip_prefix("mgr:") {
+                append_spec(&mut specs.manager, value);
+            }
+        }
+        specs
+    }
+
+    fn platform_rejects(&self, env: &RuntimeEnv) -> bool {
+        !self.platform.is_empty() && !platform_match(&self.platform, env)
+    }
+
+    fn host_rejects(&self, env: &RuntimeEnv) -> bool {
+        !self.host.is_empty() && !host_match(&self.host, env)
+    }
+
+    fn manager_rejects(&self, env: &RuntimeEnv) -> bool {
+        !self.manager.is_empty() && !manager_match(&self.manager, env)
+    }
 }
 
 fn append_spec(spec: &mut String, value: &str) {
@@ -237,6 +281,7 @@ fn normalize_item(item: &str, case_mode: CaseMode) -> String {
 mod tests {
     use super::{
         FilterMatch, RuntimeEnv, filter_match, host_match, normalize_platform, platform_match,
+        provably_excludes,
     };
 
     #[test]
@@ -464,5 +509,45 @@ mod tests {
         assert_eq!(FilterMatch::PlatformMismatch.exit_code(), 1);
         assert_eq!(FilterMatch::HostMismatch.exit_code(), 2);
         assert_eq!(FilterMatch::ManagerMismatch.exit_code(), 3);
+    }
+
+    #[test]
+    fn provably_excludes_only_on_a_known_identity_mismatch() {
+        let env = RuntimeEnv::new("linux", "desk").with_package_manager("apt");
+
+        assert!(!provably_excludes("", &env));
+        assert!(!provably_excludes("os:linux,host:desk,mgr:apt", &env));
+        assert!(provably_excludes("os:macos", &env));
+        assert!(provably_excludes("mgr:brew", &env));
+    }
+
+    #[test]
+    fn provably_excludes_never_trusts_the_host() {
+        // Hostnames can be empty (failed probe) or transiently wrong (macOS
+        // DHCP names), so a host mismatch alone never proves exclusion.
+        let known = RuntimeEnv::new("linux", "desk").with_package_manager("apt");
+        let unknown = RuntimeEnv::new("linux", "").with_package_manager("apt");
+
+        assert!(!provably_excludes("host:nas", &known));
+        assert!(!provably_excludes("host:!desk", &known));
+        assert!(!provably_excludes("host:nas", &unknown));
+        assert!(provably_excludes("os:macos,host:nas", &unknown));
+    }
+
+    #[test]
+    fn provably_excludes_ignores_an_unknown_package_manager() {
+        let unknown = RuntimeEnv::new("linux", "desk");
+
+        assert!(!provably_excludes("mgr:brew", &unknown));
+        assert!(!provably_excludes("mgr:brew,mgr:pacman", &unknown));
+    }
+
+    #[test]
+    fn provably_excludes_checks_every_dimension() {
+        // `filter_match` reports only the first mismatch; an unproven host
+        // mismatch must not hide a known package-manager mismatch.
+        let env = RuntimeEnv::new("linux", "").with_package_manager("apt");
+
+        assert!(provably_excludes("host:nas,mgr:pacman", &env));
     }
 }

@@ -464,6 +464,17 @@ fn select_filtered_duplicates(entries: Vec<String>, env: &RuntimeEnv) -> Vec<Str
                 .find(|(_, raw)| {
                     platform::filter_match(entry_filter(raw), env) == platform::FilterMatch::Match
                 })
+                // With no match, keep a declaration whose exclusion is not
+                // proven (e.g. `host:` or an undetected `mgr:`). Prune treats
+                // a row as orphaned when the kept declaration provably
+                // excludes this host, so dropping the unproven one here would
+                // let a transient identity error orphan a live row.
+                .or_else(|| {
+                    group
+                        .iter()
+                        .rev()
+                        .find(|(_, raw)| !platform::provably_excludes(entry_filter(raw), env))
+                })
                 .cloned()
                 .or_else(|| group.into_iter().last())
         })
@@ -930,6 +941,26 @@ mod tests {
         assert_eq!(
             load_dir_for_runtime(&dir, &apt).unwrap(),
             vec!["ast-grep|cargo|-|-|mgr:!pacman"]
+        );
+    }
+
+    #[test]
+    fn runtime_loader_prefers_unproven_exclusion_when_nothing_matches() {
+        // Neither declaration matches, but only `os:macos` provably excludes
+        // this Linux host. Keeping it would let prune orphan a row that the
+        // host-scoped declaration may still own.
+        let dir = temp_dir("unproven-exclusion");
+        write(
+            &dir.join("deps.conf"),
+            "tool custom - - host:nas
+tool pkg - - os:macos
+",
+        );
+        let env = RuntimeEnv::new("linux", "desk").with_package_manager("apt");
+
+        assert_eq!(
+            load_dir_for_runtime(&dir, &env).unwrap(),
+            vec!["tool|custom|-|-|host:nas"]
         );
     }
 

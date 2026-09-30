@@ -759,7 +759,7 @@ where
 
     crate::cancellation::check()?;
     let manifest = manifest::read(&manifest_path)?;
-    let orphans = manifest.orphans(&entries);
+    let orphans = manifest.orphans(&entries, &env);
     if !orphans.is_empty() && !options.quiet {
         if progress_jsonl {
             let mut progress = JsonlProgress::new(stdout);
@@ -1675,6 +1675,7 @@ where
         &manifest_path,
         &roots,
         &hooks,
+        &env,
         PruneOptions {
             dry_run: true,
             ..prune_options
@@ -1721,6 +1722,7 @@ where
         &manifest_path,
         &roots,
         &hooks,
+        &env,
         PruneOptions {
             yes: true,
             dry_run: false,

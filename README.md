@@ -485,7 +485,7 @@ Exit codes:
 
 ### Removing Dependencies
 
-When you remove a dep from your config, `shdeps update` will notify you that it's orphaned. Run `shdeps prune` to clean up the artifacts:
+When you remove a dep from your config (or exclude it from the current host with an `os:` filter, or with an `mgr:` filter once the package manager is detected), `shdeps update` will notify you that it's orphaned. Run `shdeps prune` to clean up the artifacts:
 
 ```bash
 # Remove a dep from config, then update

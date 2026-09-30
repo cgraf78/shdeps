@@ -96,8 +96,11 @@ shdeps tracks installed deps in a manifest file at
 `$SHDEPS_STATE_DIR/manifest`. Each line is pipe-delimited:
 `name|method|cmd|install_path`. Written automatically during `shdeps update`.
 
-When a dep is removed from config but still in the manifest, `shdeps update`
-prints an orphan notice. Run `shdeps prune` to remove orphaned artifacts.
+When a dep is removed from config (or every config entry for its name is
+filtered out on this host) but still in the manifest, `shdeps update` prints
+an orphan notice. Run `shdeps prune` to remove orphaned artifacts. Only
+stable identities count (`os:`, and `mgr:` once a manager was detected);
+`host:` filters never make a dep orphaned.
 
 ## Extras Linking
 

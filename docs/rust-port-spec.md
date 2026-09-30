@@ -360,8 +360,8 @@ Exit codes:
 
 ### `prune`
 
-`shdeps prune` removes orphaned dependencies: manifest entries whose names are
-not present in the current config set.
+`shdeps prune` removes orphaned dependencies: manifest entries that no config
+entry active on this host owns (see Orphans And Prune).
 
 Options:
 
@@ -977,7 +977,8 @@ binary at `$SHDEPS_BIN_DIR/<cmd>`.
 
 If a configured dependency's method differs from its manifest method:
 
-- It is not an orphan.
+- It is not an orphan, unless every same-name entry provably excludes this
+  host (see Orphans And Prune).
 - shdeps MUST record a durable method-transition journal before installing
   new method artifacts: the old manifest row, the configured target (method,
   cmd, aliases, filter, custom hook fingerprint), and the phase. The journal
@@ -1034,10 +1035,23 @@ corruption.
 
 ## Orphans And Prune
 
-A manifest entry is orphaned when its dependency name is absent from the current
-config set, regardless of platform or host filters.
+A manifest entry is orphaned when no config entry with its dependency name
+can be active on this runtime: the name is absent from the current config set,
+or every same-name entry's filter provably rejects this host. Update and
+status skip filtered entries, so prune is the only path that retires such
+rows.
 
-Platform-filtered configured deps are not orphans.
+- Ownership is by name, not method. A same-name entry that may be active
+  under another method is a method transition owned by update, not an orphan.
+- Only stable identities prove exclusion, because cron runs `prune -y`
+  unattended: an `os:` mismatch always does, an `mgr:` mismatch only once a
+  package manager was detected (an empty value, e.g. a cron PATH without brew,
+  proves nothing), and a `host:` mismatch never does (hostnames can be empty
+  or drift, e.g. macOS DHCP names). Remove host-scoped leftovers by removing
+  the config entry.
+- While a method-transition journal is pending, rows orphaned only by filters
+  are kept so the journal keeps its old row.
+- `pkg` orphans still only drop shdeps tracking and never uninstall packages.
 
 Prune MUST list orphans before removal unless quiet behavior skips action.
 Prune MUST remove manifest rows after cleanup attempts, except when an

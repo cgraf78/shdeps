@@ -7298,6 +7298,46 @@ fn prune_preserves_packages_and_guards_empty_config() {
 }
 
 #[test]
+fn prune_removes_rows_filtered_out_on_this_host() {
+    // Update skips entries whose filter rejects this host, so a row whose
+    // config entry moved to another platform is never refreshed or cleaned
+    // unless prune treats it as orphaned here.
+    let fixture = Fixture::new("prune-filtered-out");
+    fixture.write(
+        "conf/deps.conf",
+        "keep custom\nold pkg - - os:macos\nlinux-only custom - - os:linux\n",
+    );
+    fixture.write(
+        "state/manifest",
+        "keep|custom|keep|\nold|custom|old|\nlinux-only|custom|linux-only|\n",
+    );
+    fixture.write(
+        "conf/hooks.d/old.sh",
+        "uninstall() { printf '%s\\n' \"$1\" > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+    );
+
+    let dry = run(&mut fixture.command(["prune", "--dry-run"]));
+    assert_success(&dry);
+    assert!(
+        text(&dry.stdout).contains("detail   old (custom)\n"),
+        "{dry:?}"
+    );
+    assert!(!text(&dry.stdout).contains("linux-only"), "{dry:?}");
+
+    let removed = run(&mut fixture.command(["prune", "-y"]));
+    assert_success(&removed);
+    assert!(text(&removed.stdout).contains("old removed"), "{removed:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/hook-ran")).unwrap(),
+        "old\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "keep|custom|keep|\nlinux-only|custom|linux-only|\n"
+    );
+}
+
+#[test]
 fn prune_fails_and_retries_when_uninstall_hook_fails() {
     // Cron runs `shdeps prune -y`; a hook that cannot finish (e.g. sudo
     // without a TTY) must surface as a failure and leave the row for the
