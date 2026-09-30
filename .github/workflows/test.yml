@@ -28,6 +28,13 @@ jobs:
       # publishers, the published-pid watchdog). Minimal Rust images do not
       # otherwise install its interpreter.
       profiles: python
+      # Keep functional coverage parallel, then measure wall-clock budgets
+      # without sibling process/PTY/fsync tests competing on the same runner.
+      # Both commands are required by the shared Rust platform gate.
+      test-command: |
+        set -e
+        cargo test --locked
+        cargo test --locked --test cli -- --ignored --test-threads=1
       termux-command: scripts/termux-ci.sh
       # shdeps is installed from release archives on real machines. Build and
       # unpack that exact archive on the host before transporting its binary

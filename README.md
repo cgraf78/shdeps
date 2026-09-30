@@ -750,6 +750,7 @@ static archive.
 
 ```bash
 cargo test --locked
+cargo test --locked --test cli -- --ignored --test-threads=1
 tests/shell/helpers-test
 tests/shell/install-sh-test
 tests/shell/install-interruption-test
@@ -761,6 +762,11 @@ tests/shell/lua-bootstrap-test
 tests/shell/release-scripts-test
 SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
 ```
+
+The second Cargo command runs the four wall-clock performance budgets serially.
+They are ignored by the first command to avoid contention with parallel
+functional tests; CI requires both commands on every standard Rust matrix
+platform.
 
 The standalone CLI is a Rust binary. The sourceable Bash API and hook prelude
 require Bash 4.3+; `install.sh` itself is kept compatible with the stock macOS

@@ -215,6 +215,7 @@ Run the test suite:
 
 ```bash
 cargo test --locked
+cargo test --locked --test cli -- --ignored --test-threads=1
 tests/shell/helpers-test
 tests/shell/install-sh-test
 tests/shell/install-interruption-test
@@ -226,3 +227,8 @@ tests/shell/lua-bootstrap-test
 tests/shell/release-scripts-test
 SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
 ```
+
+The second Cargo command runs the four wall-clock performance budgets serially.
+They are ignored by the first command so concurrent functional tests cannot
+distort their timings; CI requires both commands on every standard Rust matrix
+platform.
