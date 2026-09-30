@@ -16,7 +16,9 @@ use crate::cleanup;
 use crate::config::Entry;
 use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::manifest::{self, Manifest, ManifestEntry};
+use crate::platform::RuntimeEnv;
 use crate::process::{Process, Runner};
+use crate::prune_journal;
 use crate::runtime;
 
 /// User options for `shdeps prune`.
@@ -37,7 +39,8 @@ pub struct Item {
     pub entry: ManifestEntry,
     /// Optional hook cleanup result.
     pub hook: Uninstall,
-    /// Built-in cleanup decisions.
+    /// Built-in cleanup decisions; `None` when cleanup failed or a failed
+    /// hook deferred it (the manifest row is then kept for a retry).
     pub cleanup: Option<cleanup::Summary>,
     /// Built-in cleanup failed after the hook attempt.
     pub cleanup_error: Option<String>,
@@ -58,21 +61,63 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// Returns whether any built-in cleanup attempt failed.
+    /// Returns whether any uninstall hook or built-in cleanup attempt failed.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.removed.iter().any(|item| item.cleanup_error.is_some())
+        self.removed
+            .iter()
+            .any(|item| item.cleanup_error.is_some() || item.hook_failed())
     }
 }
 
-/// Runs prune using already-loaded config and manifest paths.
+/// Runs prune against one already-loaded config snapshot.
+///
+/// `env` is the runtime identity used to decide which config entries still
+/// own their manifest rows on this host (see `Manifest::orphans`). Callers
+/// that can reload config should use `run_with_config_loader` so the
+/// mutating phase sees config as of state-lock acquisition.
 pub fn run(
     config: &[Entry],
     manifest: &Manifest,
     manifest_path: &Path,
     roots: &runtime::Roots,
     hooks: &BashCustomProbe,
+    env: &RuntimeEnv,
     options: Options,
+) -> Result<Summary> {
+    run_with_config_loader(
+        &|_: &Manifest| Ok(config.to_vec()),
+        manifest,
+        manifest_path,
+        roots,
+        hooks,
+        env,
+        options,
+        None,
+    )
+}
+
+/// Runs prune, loading config through `load_config`.
+///
+/// The loader receives the manifest snapshot it should resolve against
+/// (`github` method resolution consults existing rows). It runs once for the
+/// lock-free preview and again after the state lock is held, so the mutating
+/// phase never acts on a config snapshot taken before a long lock wait.
+///
+/// `confirmed` is the orphan list an earlier preview showed (and the user or
+/// `-y` accepted). When given, the locked run refuses to remove anything
+/// outside it: a config or manifest change during the lock wait must not
+/// widen the removal set past what was accepted, up to every tracked dep.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_config_loader(
+    load_config: &dyn Fn(&Manifest) -> Result<Vec<Entry>>,
+    manifest: &Manifest,
+    manifest_path: &Path,
+    roots: &runtime::Roots,
+    hooks: &BashCustomProbe,
+    env: &RuntimeEnv,
+    options: Options,
+    confirmed: Option<&[ManifestEntry]>,
 ) -> Result<Summary> {
     cancellation::check()?;
     // A fresh checkout can be durably published before its manifest row and
@@ -101,7 +146,9 @@ pub fn run(
         .map(|_| manifest::read(manifest_path))
         .transpose()?;
     let manifest = recovered_manifest.as_ref().unwrap_or(manifest);
-    let orphans = orphans(manifest, config);
+    let preview_config = load_config(manifest)?;
+    let config = preview_config.as_slice();
+    let orphans = manifest.orphans(config, env);
     // The "all orphans" guard prevents a silent bulk-delete of every
     // shdeps-tracked dep without explicit `--yes`. The pre-fix gate
     // (`config.is_empty()`) only caught the literal empty-config case;
@@ -182,14 +229,18 @@ pub fn run(
     // since then, which would invalidate the orphan list. Recomputing
     // inside the lock guarantees we mutate against the current state.
     //
-    // The `config` is intentionally NOT re-read: shdeps does not write
-    // to user config files, so a concurrent shdeps invocation cannot
-    // mutate it. Only an operator-side edit (text editor, git pull)
-    // would change it, and racing against that is out of scope —
-    // the operator is expected to re-run prune if they edit config
-    // mid-run.
+    // Config is re-read here too. shdeps never writes it, but the lock
+    // wait can span a whole update, during which a dotfiles pull or an
+    // edit may add or remove deps; the preview snapshot could then name
+    // a dep that is configured again. Lock order matches update (config
+    // read takes no lock; state lock, then per-checkout locks), so this
+    // adds no deadlock. A config edit racing this read is still possible;
+    // it can only reflect a state the operator actually wrote.
     recover_fresh_repo_publications(roots, manifest_path)?;
     let initial_manifest = manifest::read(manifest_path)?;
+    let locked_config = load_config(&initial_manifest)?;
+    let config = locked_config.as_slice();
+    cancellation::check()?;
     crate::update_transition::recover_pending_publications(
         config,
         &initial_manifest,
@@ -203,8 +254,9 @@ pub fn run(
     // same-installer update, while a removed or changed target and malformed
     // state fail closed before any hook, artifact cleanup, or manifest
     // mutation below.
-    // Prune evaluates the full config (it does not platform-filter orphans),
-    // matching the publications recovery above.
+    // Recovery evaluates the full config, including entries filtered out on
+    // this host, matching the publications recovery above; a deferred
+    // journal's target may be such an entry (see the orphan loop below).
     let recovery_entries: Vec<Entry> = config.to_vec();
     let custom_fingerprints = recovery_entries
         .iter()
@@ -241,7 +293,20 @@ pub fn run(
     }
     cancellation::check()?;
     let fresh_manifest = manifest::read(manifest_path)?;
-    let orphans = self::orphans(&fresh_manifest, config);
+    let orphans = fresh_manifest.orphans(config, env);
+    // Retire pre-hook records whose exact row is gone before any record can
+    // be reused below.
+    prune_journal::retain(&cleanup_roots(roots), &fresh_manifest)?;
+    if let Some(confirmed) = confirmed {
+        if let Some(extra) = orphans.iter().find(|orphan| !confirmed.contains(orphan)) {
+            return Err(std::io::Error::other(format!(
+                "orphaned deps changed while waiting for the state lock ({} was not \
+                 in the confirmed list); no orphans removed, re-run prune",
+                extra.name
+            ))
+            .into());
+        }
+    }
     if orphans.is_empty() && recovered_items.is_empty() {
         return Ok(Summary {
             orphans,
@@ -276,6 +341,20 @@ pub fn run(
         });
     }
 
+    // A method-transition journal deferred by recovery (an `Installing`
+    // record waiting for its same-installer update) still claims its old
+    // row. When that row is an orphan only because its configured entries
+    // are filtered out here, pruning it would strand the journal and wedge
+    // every later update and prune. The probe is coarse (any journal) but
+    // journals are rare and short-lived; rows whose name left config
+    // entirely keep their existing handling.
+    if crate::update_transition::has_pending_durable_transitions(roots) {
+        for orphan in &orphans {
+            if config.iter().any(|entry| entry.name == orphan.name) {
+                blocked.insert(orphan.name.clone());
+            }
+        }
+    }
     let cleanup_roots = cleanup_roots(roots);
     let mut removed = recovered_items;
     for entry in &orphans {
@@ -284,24 +363,58 @@ pub fn run(
             continue;
         }
         cleanup::validate_manifest_artifact_entry(entry)?;
-        let cleanup_evidence = capture_cleanup_evidence(entry, &cleanup_roots)?;
+        // The pre-hook evidence is the only proof of which artifacts the
+        // orphan owned before its hook could replace them. Reuse the record
+        // from an interrupted or failed earlier prune of this exact row;
+        // otherwise capture and persist it before the hook runs, so a crash
+        // or signal anywhere after this point cannot lose it.
+        let mut record = match prune_journal::load(&cleanup_roots, entry)? {
+            Some(record) => record,
+            None => {
+                let record = prune_journal::Record {
+                    entry: entry.clone(),
+                    evidence: capture_cleanup_evidence(entry, &cleanup_roots)?,
+                    hook_completed: false,
+                };
+                prune_journal::save(&cleanup_roots, &record)?;
+                record
+            }
+        };
         cancellation::check()?;
-        let mut hook = hooks.uninstall(&entry.name, roots)?;
+        let hook = if record.hook_completed {
+            // A previous prune's hook already succeeded. One-shot hooks may
+            // fail or act on replacement state if rerun, so go straight to
+            // built-in cleanup with the recorded evidence.
+            Uninstall::Removed
+        } else {
+            let hook = uninstall(entry, roots, hooks)?;
+            if hook == Uninstall::Removed {
+                // Record completion before honoring any signal latched while
+                // the hook ran; the next prune then skips the hook and keeps
+                // judging ownership by the pre-hook snapshot.
+                record.hook_completed = true;
+                prune_journal::save(&cleanup_roots, &record)?;
+            }
+            hook
+        };
         cancellation::check()?;
-        if hook == Uninstall::SudoRequired {
-            hook = if Process.run("sudo", &["true"], None)?.success {
-                cancellation::check()?;
-                match hooks.retry_uninstall(&entry.name, roots)? {
-                    Uninstall::SudoRequired => Uninstall::Failed,
-                    retried => retried,
-                }
-            } else {
-                Uninstall::Failed
-            };
-            cancellation::check()?;
+        let item = Item {
+            entry: entry.clone(),
+            hook,
+            cleanup: None,
+            cleanup_error: None,
+        };
+        if item.hook_failed() {
+            // The hook's own cleanup did not happen (cron sudo without a TTY,
+            // a broken hook, ...). Retiring the row now would orphan whatever
+            // the hook was supposed to remove with nothing left to retry it,
+            // so keep both the row and the built-in payload and let the
+            // caller report failure; the next prune retries the hook.
+            removed.push(item);
+            continue;
         }
         let preserve_regular_public =
-            regular_public_claimed_by_survivor(entry, &fresh_manifest, config);
+            regular_public_claimed_by_survivor(entry, &fresh_manifest, config, env);
         // Cleanup plus manifest removal is one commit boundary. Honor a
         // latched signal before entering it, then let recovery invariants
         // complete rather than interrupting halfway through filesystem state.
@@ -311,13 +424,15 @@ pub fn run(
             manifest_path,
             &cleanup_roots,
             preserve_regular_public,
-            cleanup_evidence,
+            record.evidence,
         )?;
+        // The manifest row is gone, so the record's authority has lapsed. A
+        // crash before this line leaves a stale record that `retain` clears.
+        prune_journal::remove(&cleanup_roots, &entry.name)?;
         removed.push(Item {
-            entry: entry.clone(),
-            hook,
             cleanup,
             cleanup_error,
+            ..item
         });
     }
 
@@ -326,6 +441,31 @@ pub fn run(
         removed,
         guarded_all_orphans: false,
         quiet_skipped: false,
+    })
+}
+
+// Runs the orphan's `uninstall()` hook, authenticating sudo in the attached
+// parent and retrying once when the detached hook asks for it. By the hook
+// contract a `SudoRequired` hook has made no changes yet, so cancellation may
+// be honored before the prompt and the retry; after a hook that may have
+// succeeded the caller must persist completion first.
+fn uninstall(
+    entry: &ManifestEntry,
+    roots: &runtime::Roots,
+    hooks: &BashCustomProbe,
+) -> Result<Uninstall> {
+    let hook = hooks.uninstall(&entry.name, roots)?;
+    if hook != Uninstall::SudoRequired {
+        return Ok(hook);
+    }
+    cancellation::check()?;
+    if !Process.run("sudo", &["true"], None)?.success {
+        return Ok(Uninstall::Failed);
+    }
+    cancellation::check()?;
+    Ok(match hooks.retry_uninstall(&entry.name, roots)? {
+        Uninstall::SudoRequired => Uninstall::Failed,
+        retried => retried,
     })
 }
 
@@ -463,14 +603,15 @@ fn regular_public_claimed_by_survivor(
     orphan: &ManifestEntry,
     manifest: &Manifest,
     config: &[Entry],
+    env: &RuntimeEnv,
 ) -> bool {
     if orphan.method != crate::method::GITHUB_RELEASE {
         return false;
     }
-    let configured = config
-        .iter()
-        .map(|entry| entry.name.as_str())
-        .collect::<BTreeSet<_>>();
+    // Survivors use the same ownership rule as orphan detection; otherwise
+    // two filtered-out releases sharing a command would each protect it for
+    // the other and it would never be removed.
+    let configured = manifest::owner_names(config, env);
     manifest.effective_entries().into_iter().any(|installed| {
         installed.name != orphan.name
             && configured.contains(installed.name.as_str())
@@ -479,10 +620,6 @@ fn regular_public_claimed_by_survivor(
                 || installed.method == crate::method::CUSTOM
                 || crate::method::is_symlink_install_root(&installed.method))
     })
-}
-
-fn orphans(manifest: &Manifest, config: &[Entry]) -> Vec<ManifestEntry> {
-    manifest.orphans(config)
 }
 
 #[cfg(unix)]
@@ -538,6 +675,18 @@ fn cleanup_roots(roots: &runtime::Roots) -> cleanup::Roots {
     }
 }
 
+impl Item {
+    /// Returns whether an existing uninstall hook did not complete its cleanup.
+    ///
+    /// A missing hook file or `uninstall()` function means there is nothing
+    /// for the hook to undo; a hook that failed or could not be sourced left
+    /// its own cleanup undone.
+    #[must_use]
+    pub fn hook_failed(&self) -> bool {
+        matches!(self.hook, Uninstall::Failed | Uninstall::SourceFailed)
+    }
+}
+
 impl fmt::Display for Item {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{} ({})", self.entry.name, self.entry.method)
@@ -550,6 +699,7 @@ mod tests {
     use crate::config::{Entry, parse_entry};
     use crate::hooks::{BashCustomProbe, Uninstall};
     use crate::manifest::{self, ManifestEntry};
+    use crate::platform::RuntimeEnv;
     use crate::runtime::Roots;
     use crate::update_transition;
     use std::fs;
@@ -594,6 +744,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -639,6 +790,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -756,6 +908,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -798,6 +951,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -850,6 +1004,7 @@ mod tests {
                 &manifest_path,
                 &fixture.roots,
                 &fixture.hooks,
+                &fixture.env,
                 Options {
                     yes: true,
                     ..Options::default()
@@ -884,6 +1039,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -926,6 +1082,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -968,6 +1125,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -979,6 +1137,190 @@ mod tests {
         assert_eq!(
             fs::read_to_string(public).unwrap(),
             "replacement from hook\n"
+        );
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    /// Writes a raw-release orphan whose public command is a regular file
+    /// and returns (manifest path, public command path).
+    fn raw_release_orphan(fixture: &Fixture) -> (PathBuf, PathBuf) {
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "old raw release\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        (manifest_path, public)
+    }
+
+    fn prune_all(fixture: &Fixture, manifest_path: &Path) -> crate::Result<super::Summary> {
+        let manifest = manifest::read(manifest_path).unwrap();
+        run(
+            &[],
+            &manifest,
+            manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+    }
+
+    #[test]
+    fn prune_retry_uses_evidence_captured_before_the_failed_hook() {
+        // The first hook swaps in a replacement command and then fails, so
+        // prune keeps the row. The retry must judge ownership against the
+        // original pre-hook snapshot; re-capturing would adopt the
+        // replacement as orphan-owned and delete it.
+        let fixture = Fixture::new("retry-keeps-pre-hook-evidence");
+        let (manifest_path, public) = raw_release_orphan(&fixture);
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            r#"uninstall() {
+  [ -e "$SHDEPS_STATE_DIR/hook-ran" ] && return 0
+  : > "$SHDEPS_STATE_DIR/hook-ran"
+  printf 'replacement from hook\n' > "$SHDEPS_BIN_DIR/.tool.new"
+  mv -f "$SHDEPS_BIN_DIR/.tool.new" "$SHDEPS_BIN_DIR/tool"
+  return 1
+}
+"#,
+        );
+
+        let failed = prune_all(&fixture, &manifest_path).unwrap();
+        assert!(failed.has_errors());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/old")
+                .is_some()
+        );
+
+        let retried = prune_all(&fixture, &manifest_path).unwrap();
+
+        assert!(!retried.has_errors(), "{retried:?}");
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "replacement from hook\n"
+        );
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(
+            fs::read_dir(fixture.roots.state_dir.join(".prune-hooks-v1"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "the record must be retired with the manifest row"
+        );
+    }
+
+    #[test]
+    fn prune_does_not_rerun_a_hook_that_already_completed() {
+        // Model a prune killed after a successful one-shot hook: the durable
+        // record says the hook completed. Rerunning it here would fail (and
+        // keep the row forever); cleanup must instead finish with the
+        // recorded pre-hook evidence.
+        let fixture = Fixture::new("hook-already-completed");
+        let (manifest_path, public) = raw_release_orphan(&fixture);
+        let entry = manifest::read(&manifest_path)
+            .unwrap()
+            .get("owner/old")
+            .unwrap()
+            .clone();
+        let cleanup_roots = super::cleanup_roots(&fixture.roots);
+        let evidence = super::capture_cleanup_evidence(&entry, &cleanup_roots).unwrap();
+        crate::prune_journal::save(
+            &cleanup_roots,
+            &crate::prune_journal::Record {
+                entry,
+                evidence,
+                hook_completed: true,
+            },
+        )
+        .unwrap();
+        fixture.write(&public, "replacement from hook\n");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            "uninstall() { : > \"$SHDEPS_STATE_DIR/hook-reran\"; return 1; }\n",
+        );
+
+        let summary = prune_all(&fixture, &manifest_path).unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(!fixture.roots.state_dir.join("hook-reran").exists());
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "replacement from hook\n"
+        );
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_after_uninstall_hook_keeps_pre_hook_evidence_for_next_prune() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_SIGNAL_AFTER_PRUNE_HOOK";
+        const TEST_NAME: &str =
+            "prune::tests::signal_after_uninstall_hook_keeps_pre_hook_evidence_for_next_prune";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let fixture = Fixture::new("signal-after-prune-hook");
+        let (manifest_path, public) = raw_release_orphan(&fixture);
+        // One-shot hook: replace the command, TERM this prune process, and
+        // still exit 0 (it ignores the group TERM the supervisor forwards),
+        // so the signal is latched while the hook succeeds. A rerun fails,
+        // so the resumed prune only passes if hook completion was recorded
+        // and the recorded pre-hook evidence was reused.
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            &format!(
+                r#"uninstall() {{
+  [ -e "$SHDEPS_STATE_DIR/hook-ran" ] && return 1
+  trap '' TERM
+  : > "$SHDEPS_STATE_DIR/hook-ran"
+  printf 'replacement from hook\n' > "$SHDEPS_BIN_DIR/.tool.new"
+  mv -f "$SHDEPS_BIN_DIR/.tool.new" "$SHDEPS_BIN_DIR/tool"
+  kill -TERM {}
+}}
+"#,
+                std::process::id()
+            ),
+        );
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let interrupted = prune_all(&fixture, &manifest_path);
+        assert!(interrupted.is_err(), "{interrupted:?}");
+        assert_eq!(
+            signals.finish_result(interrupted.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/old")
+                .is_some()
+        );
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let resumed = prune_all(&fixture, &manifest_path);
+        drop(signals);
+
+        let resumed = resumed.unwrap();
+        assert!(!resumed.has_errors(), "{resumed:?}");
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "replacement from hook\n",
+            "the next prune deleted the hook's replacement command"
         );
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
     }
@@ -1022,6 +1364,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1060,6 +1403,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1100,6 +1444,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1138,6 +1483,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1175,6 +1521,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1212,6 +1559,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1258,6 +1606,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1317,6 +1666,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1369,6 +1719,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1419,6 +1770,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1463,6 +1815,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1519,6 +1872,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1580,6 +1934,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1641,6 +1996,7 @@ mod tests {
                 &manifest_path,
                 &fixture.roots,
                 &fixture.hooks,
+                &fixture.env,
                 Options {
                     yes: true,
                     ..Options::default()
@@ -1699,6 +2055,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1732,6 +2089,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1771,6 +2129,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1839,6 +2198,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1883,6 +2243,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1940,6 +2301,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -1978,6 +2340,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2023,6 +2386,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2058,6 +2422,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options::default(),
         )
         .unwrap();
@@ -2097,6 +2462,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 dry_run: true,
@@ -2110,6 +2476,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 quiet: true,
                 ..Options::default()
@@ -2159,6 +2526,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options::default(),
         )
         .unwrap();
@@ -2200,6 +2568,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2213,6 +2582,311 @@ mod tests {
             "custom\n"
         );
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_keeps_row_and_artifacts_when_uninstall_hook_fails() {
+        use std::os::unix::fs::symlink;
+
+        // A failed hook (for example a cron run whose sudo cannot prompt)
+        // left its own cleanup undone. Dropping the row would orphan those
+        // files forever, so the row and built-in payload must survive for a
+        // later prune to retry.
+        let fixture = Fixture::new("hook-fails");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/tool.sh"),
+            "uninstall() { return 1; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let archive_bin = fixture.roots.install_dir.join("owner/tool/bin/tool");
+        fixture.write(&archive_bin, "#!/bin/sh\n");
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&archive_bin, &public).unwrap();
+        let entry = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            public.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.removed.len(), 1);
+        assert_eq!(summary.removed[0].hook, Uninstall::Failed);
+        assert!(summary.removed[0].hook_failed());
+        assert_eq!(summary.removed[0].cleanup, None);
+        assert!(summary.has_errors(), "a failed hook must fail the prune");
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&entry)
+        );
+        assert!(archive_bin.exists(), "failed hook must keep the payload");
+        assert!(fs::symlink_metadata(&public).is_ok());
+    }
+
+    #[test]
+    fn prune_keeps_row_when_uninstall_hook_cannot_be_sourced() {
+        // An unsourceable hook never ran its cleanup either; treat it like a
+        // failed hook instead of silently retiring the row.
+        let fixture = Fixture::new("hook-source-fails");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("custom.sh"),
+            "uninstall() { :; }\nreturn 1\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entry = ManifestEntry::new("custom", "custom", "custom", "");
+        manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.removed[0].hook, Uninstall::SourceFailed);
+        assert!(summary.has_errors());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("custom"),
+            Some(&entry)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_removes_rows_whose_config_entry_is_filtered_out_on_this_host() {
+        use std::os::unix::fs::symlink;
+
+        // Live shape: config moved `editorconfig-checker` to `pkg os:macos`
+        // while Linux now uses the `owner/repo` release. Update skips the
+        // filtered entry, so only prune can retire the stale custom row.
+        let fixture = Fixture::new("filtered-out");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("editorconfig-checker.sh"),
+            "uninstall() { printf '%s\\n' \"$1\" > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("editorconfig-checker");
+        let archive_bin = fixture
+            .roots
+            .install_dir
+            .join("editorconfig-checker/editorconfig-checker/bin/editorconfig-checker");
+        fixture.write(&archive_bin, "#!/bin/sh\n");
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&archive_bin, &public).unwrap();
+        let stale_custom = ManifestEntry::new("editorconfig-checker", "custom", "ec", "");
+        let stale_pkg = ManifestEntry::new("bat", "pkg", "bat", "");
+        let release = ManifestEntry::new(
+            "editorconfig-checker/editorconfig-checker",
+            "github:release",
+            "editorconfig-checker",
+            public.display().to_string(),
+        );
+        let keep = ManifestEntry::new("keep", "custom", "keep", "");
+        for entry in [&stale_custom, &stale_pkg, &release, &keep] {
+            manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        }
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let config = [
+            parse_entry("editorconfig-checker|pkg|-|-|os:macos", None),
+            parse_entry("bat|pkg|-|-|os:macos", None),
+            parse_entry(
+                "editorconfig-checker/editorconfig-checker|github:release|editorconfig-checker|-|os:!macos",
+                None,
+            ),
+            parse_entry("keep|custom", None),
+        ];
+
+        let summary = run(
+            &config,
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.orphans, vec![stale_custom, stale_pkg]);
+        assert!(!summary.has_errors());
+        assert_eq!(
+            fs::read_to_string(fixture.roots.state_dir.join("hook-ran")).unwrap(),
+            "editorconfig-checker\n"
+        );
+        // `pkg` rows only lose shdeps tracking; the OS package stays.
+        assert!(
+            summary.removed[1]
+                .cleanup
+                .as_ref()
+                .is_some_and(|cleanup| cleanup.preserved_package)
+        );
+        let after = manifest::read(&manifest_path).unwrap();
+        assert_eq!(after.entries(), &[release, keep]);
+        assert!(archive_bin.exists());
+        assert!(fs::symlink_metadata(&public).is_ok());
+    }
+
+    #[test]
+    fn prune_rereads_config_under_the_state_lock() {
+        // The caller's config snapshot can predate a long wait for the state
+        // lock (a running update, a dotfiles pull re-adding a dep). Prune must
+        // act on the config as of lock acquisition, not the stale snapshot.
+        let fixture = Fixture::new("reread-config");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            "uninstall() { : > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let tool = ManifestEntry::new("tool", "custom", "tool", "");
+        manifest::upsert(&manifest_path, tool.clone()).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new("keep", "custom", "keep", ""),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let loads = std::cell::Cell::new(0);
+        let load_config = |_: &manifest::Manifest| {
+            loads.set(loads.get() + 1);
+            // First (pre-lock) load: `tool` was removed from config. Every
+            // later load: the edit was reverted before prune got the lock.
+            let mut config = vec![parse_entry("keep|custom", None)];
+            if loads.get() > 1 {
+                config.push(parse_entry("tool|custom", None));
+            }
+            Ok(config)
+        };
+
+        let summary = super::run_with_config_loader(
+            &load_config,
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(loads.get() >= 2, "config was not re-read under the lock");
+        assert!(summary.removed.is_empty(), "{summary:?}");
+        assert!(!fixture.roots.state_dir.join("hook-ran").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&tool)
+        );
+    }
+
+    #[test]
+    fn prune_refuses_orphans_outside_the_confirmed_list() {
+        // The CLI confirms a preview, then runs the mutating phase with
+        // `yes`. A config change during the lock wait must not widen the
+        // removal set beyond what was confirmed.
+        let fixture = Fixture::new("confirmed-orphans");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let a = ManifestEntry::new("a", "custom", "a", "");
+        let b = ManifestEntry::new("b", "custom", "b", "");
+        let keep = ManifestEntry::new("keep", "custom", "keep", "");
+        for entry in [&a, &b, &keep] {
+            manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        }
+        let manifest = manifest::read(&manifest_path).unwrap();
+        let loads = std::cell::Cell::new(0);
+        let load_config = |_: &manifest::Manifest| {
+            loads.set(loads.get() + 1);
+            let mut config = vec![parse_entry("keep|custom", None)];
+            if loads.get() == 1 {
+                config.push(parse_entry("b|custom", None));
+            }
+            Ok(config)
+        };
+
+        let error = super::run_with_config_loader(
+            &load_config,
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+            Some(std::slice::from_ref(&a)),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("re-run prune"), "{error}");
+        assert_eq!(manifest::read(&manifest_path).unwrap(), manifest);
+    }
+
+    #[test]
+    fn prune_keeps_host_filtered_rows() {
+        // A failed or drifting hostname probe must not look like "this is no
+        // longer the nas" and prune every host-scoped dep from a `-y` cron
+        // run, so host filters never orphan a row.
+        let fixture = Fixture::new("filtered-unknown-host");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            "uninstall() { : > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+        );
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let tool = ManifestEntry::new("tool", "custom", "tool", "");
+        manifest::upsert(&manifest_path, tool.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[parse_entry("tool|custom|-|-|host:nas", None)],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &RuntimeEnv::new("linux", "desk").with_package_manager("apt"),
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.orphans.is_empty());
+        assert!(!fixture.roots.state_dir.join("hook-ran").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&tool)
+        );
     }
 
     /// Starts a cargo-to-pkg method journal bound to the apt installer.
@@ -2358,13 +3032,18 @@ mod tests {
         drop(durable);
 
         let manifest = manifest::read(&manifest_path).unwrap();
-        assert!(manifest.orphans(std::slice::from_ref(&entry)).is_empty());
+        assert!(
+            manifest
+                .orphans(std::slice::from_ref(&entry), &fixture.env)
+                .is_empty()
+        );
         let summary = run(
             std::slice::from_ref(&entry),
             &manifest,
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2457,6 +3136,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2515,6 +3195,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2556,6 +3237,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2597,6 +3279,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2638,6 +3321,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2685,6 +3369,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2724,6 +3409,49 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn prune_keeps_filtered_row_while_its_method_transition_is_pending() {
+        // An interrupted cargo-to-pkg transition whose target is now filtered
+        // out of this host still owns the old row through its journal.
+        // Pruning the row would strand the journal and wedge every later run.
+        let fixture = Fixture::new("filtered-pending-transition");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("tool.sh"),
+            "uninstall() { : > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+        );
+        let (manifest_path, old) = write_old_cargo_provider(&fixture);
+        let target = parse_entry("tool|pkg|tool|-|os:macos", Some("apt"));
+        let mut durable = begin_pkg_journal(&fixture, &manifest_path, &target);
+        durable.mark_installing(&fixture.roots).unwrap();
+        drop(durable);
+        let keep = ManifestEntry::new("keep", "custom", "keep", "");
+        manifest::upsert(&manifest_path, keep.clone()).unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        let summary = run(
+            &[target, parse_entry("keep|custom", None)],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.removed.is_empty(), "{summary:?}");
+        assert!(!fixture.roots.state_dir.join("hook-ran").exists());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("tool"),
+            Some(&old)
+        );
+        assert!(fixture.roots.install_dir.join("tool/bin/tool").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn prune_rejects_malformed_transition_state_before_mutating() {
         let fixture = Fixture::new("transition-malformed");
         let (manifest_path, old) = write_old_cargo_provider(&fixture);
@@ -2742,6 +3470,7 @@ mod tests {
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             Options {
                 yes: true,
                 ..Options::default()
@@ -2765,6 +3494,7 @@ mod tests {
     struct Fixture {
         roots: Roots,
         hooks: BashCustomProbe,
+        env: RuntimeEnv,
     }
 
     impl Fixture {
@@ -2786,6 +3516,7 @@ mod tests {
             Self {
                 roots,
                 hooks: BashCustomProbe::new(lib),
+                env: RuntimeEnv::new("linux", "test-host").with_package_manager("apt"),
             }
         }
 

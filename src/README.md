@@ -18,8 +18,9 @@ over this implementation.
   config interpretation. Consumers should not duplicate this vocabulary.
 - `update*.rs`, `github*.rs`, `pkg.rs`, and `repo.rs` own method-specific
   update/install behavior.
-- `state.rs`, `stamp.rs`, `install_metadata.rs`, `link_state.rs`, and
-  `dep_links.rs` own durable files written under shdeps-managed directories.
+- `state.rs`, `stamp.rs`, `install_metadata.rs`, `link_state.rs`,
+  `dep_links.rs`, and `prune_journal.rs` own durable files written under
+  shdeps-managed directories.
 
 ## Design Notes
 

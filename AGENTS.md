@@ -96,8 +96,11 @@ shdeps tracks installed deps in a manifest file at
 `$SHDEPS_STATE_DIR/manifest`. Each line is pipe-delimited:
 `name|method|cmd|install_path`. Written automatically during `shdeps update`.
 
-When a dep is removed from config but still in the manifest, `shdeps update`
-prints an orphan notice. Run `shdeps prune` to remove orphaned artifacts.
+When a dep is removed from config (or every config entry for its name is
+filtered out on this host) but still in the manifest, `shdeps update` prints
+an orphan notice. Run `shdeps prune` to remove orphaned artifacts. Only
+stable identities count (`os:`, and `mgr:` once a manager was detected);
+`host:` filters never make a dep orphaned.
 
 ## Extras Linking
 
@@ -135,7 +138,9 @@ and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
 - `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
   an orphaned dep (any method). For custom deps, this is the only cleanup.
   For other methods, runs before the built-in cleanup — use it to reverse
-  what `post()` created (symlinks, config files).
+  what `post()` created (symlinks, config files). A failed or unsourceable
+  hook keeps the manifest row and built-in payload for the next prune to
+  retry, and prune exits 1; a hook that succeeded is recorded and not rerun.
 
 ### Hook helper toolkit
 

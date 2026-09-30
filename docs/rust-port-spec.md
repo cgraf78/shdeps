@@ -360,8 +360,8 @@ Exit codes:
 
 ### `prune`
 
-`shdeps prune` removes orphaned dependencies: manifest entries whose names are
-not present in the current config set.
+`shdeps prune` removes orphaned dependencies: manifest entries that no config
+entry active on this host owns (see Orphans And Prune).
 
 Options:
 
@@ -372,13 +372,27 @@ Exit codes:
 
 - `0`: success, no orphans, dry run success, user aborted prompt, or quiet mode
   skipped prompt/action.
-- `1`: guarded all-orphans condition or cleanup runtime error.
+- `1`: guarded all-orphans condition, cleanup runtime error, a failed
+  (or unsourceable) `uninstall()` hook, or a missing or unreadable config
+  directory.
 - `2`: unknown prune option.
 
 Safety:
 
 - If config has zero deps and manifest has entries, prune MUST require `-y`
   before treating every manifest entry as orphaned.
+- A config directory that exists but cannot be read (EACCES, EIO, ENOTDIR)
+  MUST be an error for mutating commands (`prune`, `update`), never an empty
+  config. Read-only and startup callers (`list`, `check`, `dep-path`,
+  `shdeps_load`, completion) keep treating it as no config; `list` and
+  `check` print one warning line, the startup paths stay silent.
+- Prune MUST refuse (exit 1), even with `-y`, when the config directory does
+  not exist and the manifest tracks deps: absence (unmounted home, dangling
+  symlink, half-applied dotfiles) is not evidence that every dep should go.
+  Presence is decided by the same `read_dir` that loads config. With nothing
+  tracked, a missing directory is a clean no-op (exit 0). An existing empty
+  directory is the explicit way to declare an empty config. Other commands
+  keep treating a missing directory as an empty config.
 - `--dry-run` MUST NOT remove files or change manifest.
 - Quiet mode without `-y` MUST skip prompt and action.
 - `pkg` deps MUST NOT uninstall system packages.
@@ -976,7 +990,8 @@ binary at `$SHDEPS_BIN_DIR/<cmd>`.
 
 If a configured dependency's method differs from its manifest method:
 
-- It is not an orphan.
+- It is not an orphan, unless every same-name entry provably excludes this
+  host (see Orphans And Prune).
 - shdeps MUST record a durable method-transition journal before installing
   new method artifacts: the old manifest row, the configured target (method,
   cmd, aliases, filter, custom hook fingerprint), and the phase. The journal
@@ -1033,13 +1048,45 @@ corruption.
 
 ## Orphans And Prune
 
-A manifest entry is orphaned when its dependency name is absent from the current
-config set, regardless of platform or host filters.
+A manifest entry is orphaned when no config entry with its dependency name
+can be active on this runtime: the name is absent from the current config set,
+or every same-name entry's filter provably rejects this host. Update and
+status skip filtered entries, so prune is the only path that retires such
+rows.
 
-Platform-filtered configured deps are not orphans.
+- Ownership is by name, not method. A same-name entry that may be active
+  under another method is a method transition owned by update, not an orphan.
+- Only stable identities prove exclusion, because cron runs `prune -y`
+  unattended: an `os:` mismatch always does, an `mgr:` mismatch only once a
+  package manager was detected (an empty value, e.g. a cron PATH without brew,
+  proves nothing), and a `host:` mismatch never does (hostnames can be empty
+  or drift, e.g. macOS DHCP names). Remove host-scoped leftovers by removing
+  the config entry.
+- While a method-transition journal is pending, rows orphaned only by filters
+  are kept so the journal keeps its old row.
+- `pkg` orphans still only drop shdeps tracking and never uninstall packages.
 
 Prune MUST list orphans before removal unless quiet behavior skips action.
-Prune MUST remove manifest rows after cleanup attempts.
+Prune MUST re-read config (with the same presence rule and `github`
+resolution) after it acquires the state lock and before recovery or removal,
+so the mutating phase never acts on a config snapshot taken before a long
+lock wait. The re-read takes no additional lock. The mutating phase MUST NOT
+remove anything outside the orphan list the preview showed (and the prompt or
+`-y` accepted); if the locked orphan set grew, prune removes no orphans and
+exits 1 so the next run re-previews.
+Prune MUST remove manifest rows after cleanup attempts, except when an
+existing `uninstall()` hook fails or cannot be sourced: prune then keeps the
+row and skips built-in cleanup so a later prune retries the hook, and exits 1.
+To release such a row, fix the hook, run `shdeps prune` interactively when the
+hook needs sudo, or delete the hook file (its cleanup is then skipped).
+
+Before running an orphan's hook, prune durably records the pre-hook cleanup
+evidence under `$SHDEPS_STATE_DIR/.prune-hooks-v1/` and marks the record once
+the hook succeeds. A later prune of the same row (after a failed hook, crash,
+or signal) reuses that evidence and does not rerun a completed hook, so files
+the hook installed are never adopted as orphan-owned. The record is retired
+with the manifest row; a record whose exact row is gone or was rewritten is
+discarded.
 
 ## Hook ABI
 

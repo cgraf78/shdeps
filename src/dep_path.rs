@@ -95,7 +95,8 @@ pub fn file(target: &str, rel: &str, roots: &Roots, env: &RuntimeEnv) -> Result<
 /// is often used during shell/editor startup where compatibility bugs are more
 /// painful than the small cost of sorting a few config lines.
 pub fn find_entry(target: &str, conf_dir: &Path, env: &RuntimeEnv) -> Result<Option<Entry>> {
-    for raw in config::load_dir_for_runtime(conf_dir, env)? {
+    // Startup path: an unreadable config dir stays silent "no config".
+    for raw in config::load_dir_for_runtime_read_only(conf_dir, env)?.entries {
         let entry = config::parse_entry_for_runtime(&raw, None, env.is_android());
         if entry.name != target {
             continue;

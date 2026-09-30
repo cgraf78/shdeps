@@ -414,7 +414,7 @@ fn list_cmd<W, E>(
     _args: &[String],
     options: &ParsedOptions,
     stdout: &mut W,
-    _stderr: &mut E,
+    stderr: &mut E,
 ) -> Result<i32>
 where
     W: Write,
@@ -423,7 +423,7 @@ where
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     let pkg_mgr = process::detect_package_manager(&Process);
     let env = runtime_env_for_manager(&pkg_mgr);
-    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
+    let raw_entries = read_only_config(&roots.conf_dir, &env, stderr)?;
     let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     if entries.is_empty() {
         writeln!(stdout, "No dependencies configured.")?;
@@ -474,7 +474,7 @@ where
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     let pkg_mgr = process::detect_package_manager(&Process);
     let env = runtime_env_for_manager(&pkg_mgr);
-    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
+    let raw_entries = read_only_config(&roots.conf_dir, &env, stderr)?;
     let Some(raw_entry) = raw_entries.iter().find(|raw| {
         let entry = config::parse_entry(raw, None);
         entry.name == *target
@@ -759,7 +759,7 @@ where
 
     crate::cancellation::check()?;
     let manifest = manifest::read(&manifest_path)?;
-    let orphans = manifest.orphans(&entries);
+    let orphans = manifest.orphans(&entries, &env);
     if !orphans.is_empty() && !options.quiet {
         if progress_jsonl {
             let mut progress = JsonlProgress::new(stdout);
@@ -1661,24 +1661,50 @@ where
 
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
     let (pkg_mgr, env) = detected_runtime_env();
-    let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
-    let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
     let env_vars = env_vars(options);
     let manifest_path = manifest::path(&roots.state_dir);
     let manifest = manifest::read(&manifest_path)?;
-    let entries =
-        resolve_github_entries(&entries, &roots, Some(&manifest), &env, &env_vars, options)?;
+    // Prune loads config once for the lock-free preview and again under the
+    // state lock; both loads apply the same presence rule and resolution.
+    let load_config = |manifest: &Manifest| -> Result<Vec<Entry>> {
+        let Some(raw_entries) = config::load_dir_for_runtime_if_present(&roots.conf_dir, &env)?
+        else {
+            // Other commands read a missing config directory as "nothing
+            // configured". For prune that orphans every tracked dep, and
+            // `-y` (cron, dot) skips the all-orphans guard, so an unmounted
+            // home, a dangling symlink, or half-applied dotfiles would wipe
+            // every install. Refuse unless there is nothing to remove (a
+            // fresh or config-less host must not fail every run). An
+            // existing empty directory stays the explicit empty config.
+            if manifest.effective_entries().is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "config directory does not exist: {}; refusing to prune \
+                     (create it, even empty, to confirm the config)",
+                    roots.conf_dir.display()
+                ),
+            )
+            .into());
+        };
+        let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
+        resolve_github_entries(&entries, &roots, Some(manifest), &env, &env_vars, options)
+    };
     let hooks = custom_probe(&pkg_mgr, options.quiet, env.platform());
-    let detected = prune::run(
-        &entries,
+    let detected = prune::run_with_config_loader(
+        &load_config,
         &manifest,
         &manifest_path,
         &roots,
         &hooks,
+        &env,
         PruneOptions {
             dry_run: true,
             ..prune_options
         },
+        None,
     )?;
     crate::cancellation::check()?;
 
@@ -1715,17 +1741,19 @@ where
     crate::cancellation::check()?;
 
     let manifest = manifest::read(&manifest_path)?;
-    let summary = prune::run(
-        &entries,
+    let summary = prune::run_with_config_loader(
+        &load_config,
         &manifest,
         &manifest_path,
         &roots,
         &hooks,
+        &env,
         PruneOptions {
             yes: true,
             dry_run: false,
             quiet: false,
         },
+        Some(&detected.orphans),
     )?;
     crate::cancellation::check()?;
     write_prune_results(&summary.removed, stdout, stderr)?;
@@ -1809,6 +1837,27 @@ where
         dep_path::file(target, rel, &roots.dep_path_roots(), &env),
         stdout,
     )
+}
+
+/// Loads config for an interactive read-only command (`list`, `check`).
+///
+/// An unreadable config directory stays "no config" here, as it always was,
+/// because these commands change nothing; one warning line makes the cause
+/// visible. Startup paths (`dep-path`, `shdeps_load`, completion) use the
+/// silent loaders instead.
+fn read_only_config<E>(
+    conf_dir: &Path,
+    env: &crate::platform::RuntimeEnv,
+    stderr: &mut E,
+) -> Result<Vec<String>>
+where
+    E: Write,
+{
+    let loaded = config::load_dir_for_runtime_read_only(conf_dir, env)?;
+    if let Some(reason) = loaded.unreadable {
+        writeln!(stderr, "warning: {reason}; treating as no config")?;
+    }
+    Ok(loaded.entries)
 }
 
 /// Builds one runtime identity from an already-detected package manager.
@@ -2895,13 +2944,13 @@ where
             )?,
             Uninstall::SourceFailed => writeln!(
                 stderr,
-                "  warning: failed to source hook for {}",
+                "  warning: failed to source hook for {} — kept for the next prune",
                 item.entry.name
             )?,
             Uninstall::Failed => {
                 writeln!(
                     stderr,
-                    "  warning: {} uninstall hook failed",
+                    "  warning: {} uninstall hook failed — kept for the next prune",
                     item.entry.name
                 )?;
             }

@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use crate::Result;
 use crate::config::Entry;
+use crate::platform::{self, RuntimeEnv};
 use crate::state;
 
 // Built-in install methods can complete in parallel, but manifest updates are
@@ -180,13 +181,21 @@ impl Manifest {
         self.entries.retain(|entry| entry.name != name);
     }
 
-    /// Returns entries present in the manifest but absent from loaded config.
+    /// Returns effective rows that no config entry for this runtime owns.
+    ///
+    /// A row is owned while any same-name config entry may be active here.
+    /// Update and status skip entries whose filter rejects this runtime, so
+    /// a row whose only entries are filtered out would otherwise never be
+    /// cleaned (for example a Linux custom row after config moved the name
+    /// to `pkg os:macos`). Ownership is decided by name, not method: an
+    /// active entry under a different method is a method transition that
+    /// update performs with its own cleanup journal, and a transiently
+    /// misdetected package manager must not turn such rows into orphans.
+    /// Filters count only through `platform::provably_excludes`, so `host:`
+    /// filters and an unknown package manager never orphan anything.
     #[must_use]
-    pub fn orphans(&self, config: &[Entry]) -> Vec<ManifestEntry> {
-        let configured = config
-            .iter()
-            .map(|entry| entry.name.as_str())
-            .collect::<BTreeSet<_>>();
+    pub fn orphans(&self, config: &[Entry], env: &RuntimeEnv) -> Vec<ManifestEntry> {
+        let configured = owner_names(config, env);
 
         self.effective_entries()
             .into_iter()
@@ -209,6 +218,20 @@ impl Manifest {
             content
         }
     }
+}
+
+/// Returns the config names that may own a manifest row on this runtime.
+///
+/// This is the single ownership rule for orphan detection and prune's
+/// survivor checks: an entry owns its name unless its filter provably
+/// excludes this runtime (see `Manifest::orphans`).
+#[must_use]
+pub fn owner_names<'a>(config: &'a [Entry], env: &RuntimeEnv) -> BTreeSet<&'a str> {
+    config
+        .iter()
+        .filter(|entry| !platform::provably_excludes(&entry.filter, env))
+        .map(|entry| entry.name.as_str())
+        .collect()
 }
 
 /// Returns the manifest path for a state directory.
@@ -261,6 +284,7 @@ mod tests {
 
     use super::{Manifest, ManifestEntry, path, read, remove, upsert};
     use crate::config::parse_entry;
+    use crate::platform::RuntimeEnv;
 
     #[test]
     fn parse_strips_utf8_bom_at_file_start() {
@@ -452,28 +476,77 @@ mod tests {
     }
 
     #[test]
-    fn orphan_detection_uses_config_names_regardless_of_platform_filter() {
+    fn orphan_detection_treats_rows_filtered_out_on_this_host_as_orphans() {
+        // Update and status skip entries whose filter rejects this runtime,
+        // so nothing on this host owns such a row anymore. Name-only matching
+        // kept rows like `editorconfig-checker|custom` (config now says
+        // `pkg os:macos`) on Linux forever.
         let manifest = Manifest::parse(
             "dep-a|pkg|dep-a|\n\
              owner/dep-b|github:release|dep-b|.local/bin/dep-b\n\
-             owner/dep-c|github:repo|dep-c|.local/share/dep-c\n",
+             owner/dep-c|github:repo|dep-c|.local/share/dep-c\n\
+             dep-d|custom|dep-d|\n",
         );
         let config = [
             parse_entry("dep-a|pkg", None),
             parse_entry("owner/dep-b|github:release|dep-b|-|os:never", None),
+            parse_entry("dep-d|pkg|-|-|os:linux", None),
         ];
 
-        let orphans = manifest.orphans(&config);
+        let orphans = manifest.orphans(&config, &linux());
 
         assert_eq!(
             orphans,
-            vec![ManifestEntry::new(
-                "owner/dep-c",
-                "github:repo",
-                "dep-c",
-                ".local/share/dep-c"
-            )]
+            vec![
+                ManifestEntry::new("owner/dep-b", "github:release", "dep-b", ".local/bin/dep-b"),
+                ManifestEntry::new("owner/dep-c", "github:repo", "dep-c", ".local/share/dep-c"),
+            ],
+            "an active entry under another method (dep-d) is a pending method \
+             transition owned by update, not an orphan"
         );
+    }
+
+    #[test]
+    fn orphan_detection_keeps_row_while_any_same_name_entry_is_active() {
+        let manifest = Manifest::parse("eza|custom|eza|\n");
+        let config = [
+            parse_entry("eza|pkg|eza|-|mgr:!dnf", None),
+            parse_entry("eza|custom|eza|-|mgr:dnf", None),
+        ];
+
+        assert!(
+            manifest
+                .orphans(&config, &linux().with_package_manager("dnf"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn orphan_detection_never_trusts_a_host_or_unknown_package_manager() {
+        // A failed or drifting `hostname` probe or an empty package-manager
+        // detection (cron PATH without brew) is a transient identity error,
+        // not proof that a host- or manager-filtered dep left this machine.
+        let manifest = Manifest::parse(
+            "step-ca|github:release|step-ca|.local/bin/step-ca\n\
+             ast-grep|custom|ast-grep|\n",
+        );
+        let config = [
+            parse_entry("step-ca|github:release|-|-|host:nas", None),
+            parse_entry("ast-grep|custom|-|-|mgr:brew", None),
+        ];
+
+        let unknown = RuntimeEnv::new("linux", "");
+        assert!(manifest.orphans(&config, &unknown).is_empty());
+
+        let known = RuntimeEnv::new("linux", "desk").with_package_manager("apt");
+        assert_eq!(
+            manifest.orphans(&config, &known),
+            vec![ManifestEntry::new("ast-grep", "custom", "ast-grep", "")]
+        );
+    }
+
+    fn linux() -> RuntimeEnv {
+        RuntimeEnv::new("linux", "test-host").with_package_manager("apt")
     }
 
     fn temp_dir(name: &str) -> PathBuf {

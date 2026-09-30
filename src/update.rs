@@ -9381,6 +9381,7 @@ version() { printf 'saw-pkg\n'; }
             &manifest_path,
             &fixture.roots,
             &fixture.hooks,
+            &fixture.env,
             crate::prune::Options {
                 yes: true,
                 ..crate::prune::Options::default()

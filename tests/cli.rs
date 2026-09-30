@@ -3541,10 +3541,16 @@ uninstall() {
         ["--quiet", "prune", "-y"],
     ));
 
-    assert_success(&output);
+    // This is the cron shape: the hook cannot get sudo, so its cleanup never
+    // ran. Prune must fail and keep the row for a later interactive retry.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         fs::read_to_string(fixture.dir.join("sudo.log")).unwrap(),
         "tool uninstall\nuninstall sudo -n true\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
     );
 }
 
@@ -7259,6 +7265,10 @@ fn prune_lists_dry_runs_and_removes_orphans() {
 #[test]
 fn prune_preserves_packages_and_guards_empty_config() {
     let fixture = Fixture::new("prune-pkg");
+    // An existing but empty config dir declares "nothing configured"; a
+    // missing one is refused outright (see
+    // `prune_refuses_when_config_directory_is_missing`).
+    fs::create_dir_all(fixture.dir.join("conf")).unwrap();
     fixture.write("state/manifest", "pkg-tool|pkg|pkg-tool|\n");
 
     let guarded = run(&mut fixture.command(["prune"]));
@@ -7289,6 +7299,218 @@ fn prune_preserves_packages_and_guards_empty_config() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn unreadable_config_directory_fails_mutating_update() {
+    let fixture = Fixture::new("update-unreadable-conf");
+    fixture.write("conf", "not a directory\n");
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("cannot read config directory"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn unreadable_config_directory_keeps_read_only_commands_unchanged() {
+    // Read-only and startup callers keep treating an unreadable config dir as
+    // no config. Only interactive `list`/`check` add one warning line;
+    // `dep-path`, `shdeps_load` counts, and completion stay silent.
+    let unreadable = Fixture::new("read-only-unreadable-conf");
+    unreadable.write("conf", "not a directory\n");
+    let missing = Fixture::new("read-only-missing-conf");
+
+    let list = run(&mut unreadable.command(["list"]));
+    assert_success(&list);
+    assert_eq!(text(&list.stdout), "No dependencies configured.\n");
+    let list_stderr = text(&list.stderr);
+    assert_eq!(list_stderr.lines().count(), 1, "{list:?}");
+    assert!(list_stderr.starts_with("warning: cannot read config directory"));
+
+    let check = run(&mut unreadable.command(["check", "tool"]));
+    let check_missing = run(&mut missing.command(["check", "tool"]));
+    assert_eq!(check.status.code(), check_missing.status.code());
+    assert_eq!(check.stdout, check_missing.stdout);
+    assert!(text(&check.stderr).starts_with("warning: cannot read config directory"));
+
+    for args in [
+        vec!["dep-path", "tool"],
+        vec!["__api", "dep-path", "tool"],
+        vec!["__api", "load-count"],
+        vec!["__api", "completion-dep-names"],
+    ] {
+        let mut on_unreadable = unreadable.command([""; 0]);
+        on_unreadable.args(&args);
+        let mut on_missing = missing.command([""; 0]);
+        on_missing.args(&args);
+        let (got, want) = (run(&mut on_unreadable), run(&mut on_missing));
+        assert_eq!(got.status.code(), want.status.code(), "{args:?}: {got:?}");
+        assert_eq!(got.stdout, want.stdout, "{args:?}");
+        assert_eq!(got.stderr, want.stderr, "{args:?}");
+    }
+}
+
+#[test]
+fn prune_refuses_when_config_directory_is_unreadable() {
+    // An unreadable config path used to load as an empty config, and
+    // `prune -y` then removed every tracked dep.
+    let fixture = Fixture::new("prune-unreadable-conf");
+    fixture.write("conf", "not a directory\n");
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+    fixture.write(
+        "conf-hooks/tool.sh",
+        "uninstall() { : > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+    );
+
+    let output = run(fixture
+        .command(["prune", "-y"])
+        .env("SHDEPS_HOOKS_DIR", fixture.dir.join("conf-hooks")));
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("cannot read config directory"),
+        "{output:?}"
+    );
+    assert!(!fixture.dir.join("state/hook-ran").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+}
+
+#[test]
+fn prune_without_config_or_tracked_deps_is_a_clean_no_op() {
+    // A fresh or config-less host has nothing to protect; refusing there
+    // would make every cron/dot prune run fail.
+    let fixture = Fixture::new("prune-no-conf-no-manifest");
+
+    let output = run(&mut fixture.command(["prune", "-y"]));
+
+    assert_success(&output);
+    assert_eq!(text(&output.stdout), "No orphaned deps found.\n");
+}
+
+#[test]
+#[cfg(unix)]
+fn prune_refuses_when_config_directory_is_missing() {
+    // A missing config dir (unmounted home, half-applied dotfiles) is not
+    // evidence that the user wants every tracked dep removed, even with -y.
+    let fixture = Fixture::new("prune-missing-conf");
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+
+    let output = run(&mut fixture.command(["prune", "-y"]));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("config directory does not exist"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+
+    // A dangling symlink is just as absent.
+    std::os::unix::fs::symlink(fixture.dir.join("gone"), fixture.dir.join("conf")).unwrap();
+    let dangling = run(&mut fixture.command(["prune", "-y"]));
+    assert_eq!(dangling.status.code(), Some(1), "{dangling:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+    fs::remove_file(fixture.dir.join("conf")).unwrap();
+
+    // An existing but empty config dir is the explicit way to say "nothing
+    // is configured"; the all-orphans guard and -y then apply as before.
+    fs::create_dir_all(fixture.dir.join("conf")).unwrap();
+    let removed = run(&mut fixture.command(["prune", "-y"]));
+    assert_success(&removed);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        ""
+    );
+}
+
+#[test]
+fn prune_removes_rows_filtered_out_on_this_host() {
+    // Update skips entries whose filter rejects this host, so a row whose
+    // config entry moved to another platform is never refreshed or cleaned
+    // unless prune treats it as orphaned here.
+    let fixture = Fixture::new("prune-filtered-out");
+    fixture.write(
+        "conf/deps.conf",
+        "keep custom\nold pkg - - os:macos\nlinux-only custom - - os:linux\n",
+    );
+    fixture.write(
+        "state/manifest",
+        "keep|custom|keep|\nold|custom|old|\nlinux-only|custom|linux-only|\n",
+    );
+    fixture.write(
+        "conf/hooks.d/old.sh",
+        "uninstall() { printf '%s\\n' \"$1\" > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+    );
+
+    let dry = run(&mut fixture.command(["prune", "--dry-run"]));
+    assert_success(&dry);
+    assert!(
+        text(&dry.stdout).contains("detail   old (custom)\n"),
+        "{dry:?}"
+    );
+    assert!(!text(&dry.stdout).contains("linux-only"), "{dry:?}");
+
+    let removed = run(&mut fixture.command(["prune", "-y"]));
+    assert_success(&removed);
+    assert!(text(&removed.stdout).contains("old removed"), "{removed:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/hook-ran")).unwrap(),
+        "old\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "keep|custom|keep|\nlinux-only|custom|linux-only|\n"
+    );
+}
+
+#[test]
+fn prune_fails_and_retries_when_uninstall_hook_fails() {
+    // Cron runs `shdeps prune -y`; a hook that cannot finish (e.g. sudo
+    // without a TTY) must surface as a failure and leave the row for the
+    // next run instead of printing "removed" and exiting 0.
+    let fixture = Fixture::new("prune-hook-fails");
+    fixture.write("conf/deps.conf", "keep custom\n");
+    fixture.write("state/manifest", "keep|custom|keep|\nold|custom|old|\n");
+    fixture.write("conf/hooks.d/old.sh", "uninstall() { return 1; }\n");
+
+    let failed = run(&mut fixture.command(["prune", "-y"]));
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert!(!text(&failed.stdout).contains("old removed"), "{failed:?}");
+    assert!(
+        text(&failed.stderr).contains("old uninstall hook failed"),
+        "{failed:?}"
+    );
+    assert!(
+        fs::read_to_string(fixture.dir.join("state/manifest"))
+            .unwrap()
+            .contains("old|custom|old|")
+    );
+
+    fixture.write(
+        "conf/hooks.d/old.sh",
+        "uninstall() { printf '%s\\n' \"$1\" > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+    );
+    let retried = run(&mut fixture.command(["prune", "-y"]));
+    assert_success(&retried);
+    assert!(text(&retried.stdout).contains("old removed"), "{retried:?}");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/hook-ran")).unwrap(),
+        "old\n"
+    );
+    let manifest = fs::read_to_string(fixture.dir.join("state/manifest")).unwrap();
+    assert_eq!(manifest, "keep|custom|keep|\n");
 }
 
 #[test]

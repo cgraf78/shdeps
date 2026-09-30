@@ -56,7 +56,12 @@ rows. The lookup is local and does not run hooks, package-manager probes,
 network requests, or version commands.
 .TP
 .B prune
-Remove orphaned dependencies that are no longer present in any config file.
+Remove orphaned dependencies that are no longer present in any config file,
+or whose config entries are all excluded on this host by
+.B os:
+(or by a detected
+.BR mgr: )
+filters.
 Accepts
 .B \-y
 to skip the confirmation prompt and
