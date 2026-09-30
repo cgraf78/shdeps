@@ -142,6 +142,11 @@ impl Runner for Process {
 /// `sudo` cannot prompt at all: it fails and, on audited hosts, still logs a
 /// failed authentication. Cron, systemd timers, CI, and agent tool shells run
 /// without one even when stdin or stdout is redirected to something else.
+///
+/// Opening `/dev/tty` read-write is exactly what sudo does to prompt, so the
+/// answer matches sudo's own on every platform, including where Linux and
+/// macOS differ (macOS detaches a terminal whose slave side no process holds
+/// open, while Linux keeps it while the master is open).
 pub(crate) fn controlling_terminal() -> bool {
     std::fs::OpenOptions::new()
         .read(true)

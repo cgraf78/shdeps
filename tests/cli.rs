@@ -8451,7 +8451,8 @@ fn timed_on_terminal(command: &mut Command) -> (Output, Duration) {
 
 /// Opens a PTY and makes `command` start in a private session with its
 /// slave as the controlling terminal. Returns `(slave, master)`; keep both
-/// open until the command is spawned and the master until it has exited.
+/// open until the command has exited (see [`TestTerminal`] for why the
+/// slave matters on macOS).
 fn controlling_terminal_for(command: &mut Command) -> (fs::File, fs::File) {
     use std::os::unix::process::CommandExt as _;
 
@@ -8778,15 +8779,32 @@ impl Drop for GuardedChild {
     }
 }
 
+/// Both PTY ends backing a spawned session's controlling terminal.
+///
+/// The slave must stay open for the child's whole life: it is close-on-exec,
+/// so this is the only open descriptor, and on macOS the last slave close
+/// detaches the terminal from its session (the child's `open("/dev/tty")`
+/// then fails with ENXIO, so Shdeps sees no terminal). Linux keeps the
+/// association while the master is open, which hid the difference there.
+struct TestTerminal {
+    _master: fs::File,
+    _slave: fs::File,
+}
+
 /// Like [`spawn_test_session`], but with a fresh PTY as the session's
 /// controlling terminal so Shdeps may prompt for sudo in its own session.
-/// Keep the returned master alive until the child has exited.
-fn spawn_test_session_on_terminal(command: &mut Command) -> (GuardedChild, fs::File) {
+/// Keep the returned terminal alive until the child has exited.
+fn spawn_test_session_on_terminal(command: &mut Command) -> (GuardedChild, TestTerminal) {
     let (slave, master) = controlling_terminal_for(command);
     let child = GuardedChild::new(command.spawn().expect("guarded test process should start"));
-    drop(slave);
     drain_pty_master(&master);
-    (child, master)
+    (
+        child,
+        TestTerminal {
+            _master: master,
+            _slave: slave,
+        },
+    )
 }
 
 #[cfg(unix)]
