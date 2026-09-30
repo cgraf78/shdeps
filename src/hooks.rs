@@ -740,9 +740,7 @@ impl MutationIntent {
             )
             .into());
         }
-        self.preexisting =
-            std::fs::symlink_metadata(self.state_dir.join(PENDING_POSTS_DIR).join(&self.name))
-                .is_ok();
+        self.preexisting = pending_post_exists(&self.state_dir, &self.name);
         mark_pending_post(&self.state_dir, &self.name)?;
         self.started = true;
         Ok(())
@@ -1224,6 +1222,14 @@ fn collect_markers(root: &Path, dir: &Path, names: &mut Vec<String>) -> Result<(
             continue;
         };
         let name = relative.to_string_lossy().replace('\\', "/");
+        // Decode the two collision forms written by `mark_pending_post`.
+        let name = match name.rsplit_once('/') {
+            Some((parent, PENDING_SELF_MARKER)) => parent.to_owned(),
+            None if name == PENDING_SELF_MARKER => continue,
+            _ => name
+                .strip_suffix(PENDING_MOVING_SUFFIX)
+                .map_or(name.clone(), str::to_owned),
+        };
         if config::valid_dep_name(&name) {
             names.push(name);
         }
@@ -1232,6 +1238,17 @@ fn collect_markers(root: &Path, dir: &Path, names: &mut Vec<String>) -> Result<(
 }
 
 const PENDING_POSTS_DIR: &str = ".pending-posts";
+
+// Markers mirror dependency names as paths, so a name that is a path prefix
+// of another (`neovim` and `neovim/neovim`) would need `.pending-posts/neovim`
+// to be both a file and a directory. The prefix's marker then lives inside
+// the directory as `PENDING_SELF_MARKER`; while it is being moved there it is
+// briefly a sibling with `PENDING_MOVING_SUFFIX`. Both contain `|`, which no
+// dependency name may contain, so they can never be mistaken for another
+// dependency's marker (older Shdeps simply ignores them). Uncollided names
+// keep the plain path layout.
+const PENDING_SELF_MARKER: &str = "|pending";
+const PENDING_MOVING_SUFFIX: &str = "|moving";
 
 /// Serializes pending-post marker updates across parallel tool threads.
 ///
@@ -1247,7 +1264,55 @@ pub(crate) fn mark_pending_post(state_dir: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
     let _guard = PENDING_POSTS_LOCK.lock().unwrap();
-    crate::state::write_atomic(&state_dir.join(PENDING_POSTS_DIR).join(name), "pending\n")
+    let root = state_dir.join(PENDING_POSTS_DIR);
+    // A pending shorter name blocks the directory this name needs: move its
+    // marker inside that directory first (see `PENDING_SELF_MARKER`).
+    let mut ancestor = root.clone();
+    let components = name.split('/').collect::<Vec<_>>();
+    for component in &components[..components.len() - 1] {
+        ancestor.push(component);
+        if std::fs::symlink_metadata(&ancestor).is_ok_and(|metadata| metadata.is_file()) {
+            relocate_into_directory(&ancestor)?;
+        }
+    }
+    let marker = root.join(name);
+    let marker = if std::fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.is_dir()) {
+        marker.join(PENDING_SELF_MARKER)
+    } else {
+        marker
+    };
+    crate::state::write_atomic(&marker, "pending\n")
+}
+
+/// Turns the plain marker file at `path` into `path/PENDING_SELF_MARKER`.
+///
+/// Every intermediate state still decodes to the same pending name: the file
+/// is renamed aside (`PENDING_MOVING_SUFFIX`), the directory is created, and
+/// the file is renamed into it.
+fn relocate_into_directory(path: &Path) -> Result<()> {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(PENDING_MOVING_SUFFIX);
+    let aside = PathBuf::from(aside);
+    std::fs::rename(path, &aside)?;
+    std::fs::create_dir(path)?;
+    std::fs::rename(&aside, path.join(PENDING_SELF_MARKER))?;
+    Ok(())
+}
+
+/// Returns the existing marker files that record `name` as pending.
+fn pending_post_markers(state_dir: &Path, name: &str) -> Vec<PathBuf> {
+    let plain = state_dir.join(PENDING_POSTS_DIR).join(name);
+    let mut aside = plain.as_os_str().to_owned();
+    aside.push(PENDING_MOVING_SUFFIX);
+    [plain.join(PENDING_SELF_MARKER), PathBuf::from(aside), plain]
+        .into_iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_dir()))
+        .collect()
+}
+
+/// Reports whether any marker records `name` as pending.
+fn pending_post_exists(state_dir: &Path, name: &str) -> bool {
+    config::valid_dep_name(name) && !pending_post_markers(state_dir, name).is_empty()
 }
 
 fn pending_posts(state_dir: &Path) -> Result<Vec<String>> {
@@ -1268,25 +1333,22 @@ pub(crate) fn acknowledge_pending_post(state_dir: &Path, name: &str) -> Result<(
     }
     let _guard = PENDING_POSTS_LOCK.lock().unwrap();
     let root = state_dir.join(PENDING_POSTS_DIR);
-    let marker = root.join(name);
-    // Markers mirror dependency names as paths, so `neovim` and
-    // `neovim/neovim` share `.pending-posts/neovim`. A directory there holds
-    // other dependencies' markers, never this one's: nothing is pending for
-    // this exact name, and removing (or failing on) it would be wrong.
-    if std::fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.is_dir()) {
-        return Ok(());
-    }
-    match std::fs::remove_file(&marker) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    let mut parent = marker.parent();
-    while let Some(directory) = parent.filter(|directory| *directory != root) {
-        if std::fs::remove_dir(directory).is_err() {
-            break;
+    // A directory at the plain path holds other dependencies' markers (see
+    // `PENDING_SELF_MARKER`), so only this name's own marker files are
+    // removed; the directory itself goes only once it is empty.
+    for marker in pending_post_markers(state_dir, name) {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         }
-        parent = directory.parent();
+        let mut parent = marker.parent();
+        while let Some(directory) = parent.filter(|directory| *directory != root) {
+            if std::fs::remove_dir(directory).is_err() {
+                break;
+            }
+            parent = directory.parent();
+        }
     }
     let _ = std::fs::remove_dir(root);
     Ok(())
@@ -1976,6 +2038,54 @@ post() {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_support::temp_dir(&format!("shdeps-{name}"))
+    }
+
+    #[test]
+    fn pending_post_for_a_name_prefix_coexists_with_nested_names() {
+        // `neovim` and `neovim/neovim` share `.pending-posts/neovim`. Marking
+        // either while the other is pending must not fail (which aborts the
+        // mutation) or drop the other's obligation, in either order.
+        use super::{acknowledge_pending_post, mark_pending_post, pending_posts};
+
+        for (first, second) in [("neovim", "neovim/neovim"), ("neovim/neovim", "neovim")] {
+            let state_dir = temp_dir("pending-posts-prefix");
+            mark_pending_post(&state_dir, first).unwrap();
+            mark_pending_post(&state_dir, second).unwrap();
+            assert_eq!(
+                pending_posts(&state_dir).unwrap(),
+                ["neovim", "neovim/neovim"],
+                "{first} then {second}"
+            );
+
+            acknowledge_pending_post(&state_dir, "neovim").unwrap();
+            assert_eq!(pending_posts(&state_dir).unwrap(), ["neovim/neovim"]);
+            mark_pending_post(&state_dir, "neovim").unwrap();
+            acknowledge_pending_post(&state_dir, "neovim/neovim").unwrap();
+            assert_eq!(pending_posts(&state_dir).unwrap(), ["neovim"]);
+            acknowledge_pending_post(&state_dir, "neovim").unwrap();
+            assert!(pending_posts(&state_dir).unwrap().is_empty());
+            assert!(!state_dir.join(super::PENDING_POSTS_DIR).exists());
+        }
+    }
+
+    #[test]
+    fn pending_post_moved_aside_by_an_interrupted_relocation_is_still_pending() {
+        // Relocating `neovim` under a new `neovim/` directory renames it aside
+        // first; a crash at that point must not lose the obligation.
+        use super::{acknowledge_pending_post, pending_posts};
+
+        let state_dir = temp_dir("pending-posts-moving");
+        let root = state_dir.join(super::PENDING_POSTS_DIR);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(format!("neovim{}", super::PENDING_MOVING_SUFFIX)),
+            "pending\n",
+        )
+        .unwrap();
+
+        assert_eq!(pending_posts(&state_dir).unwrap(), ["neovim"]);
+        acknowledge_pending_post(&state_dir, "neovim").unwrap();
+        assert!(pending_posts(&state_dir).unwrap().is_empty());
     }
 
     #[test]
