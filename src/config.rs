@@ -536,8 +536,26 @@ fn entry_name(entry: &str) -> &str {
 /// different config surface than `load_dir()` actually reads.
 pub fn conf_files(conf_dir: &Path) -> Result<Vec<PathBuf>> {
     crate::cancellation::check()?;
-    let Ok(entries) = fs::read_dir(conf_dir) else {
-        return Ok(Vec::new());
+    let entries = match fs::read_dir(conf_dir) {
+        Ok(entries) => entries,
+        // A missing directory is an empty config for read-only and install
+        // callers (a fresh machine before dotfiles land). Destructive callers
+        // must not infer intent from absence; `shdeps prune` checks presence
+        // itself before trusting an empty result.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // Anything else (EACCES, EIO, ENOTDIR) means the config could not be
+        // read, not that it is empty. Reporting it as empty made `prune -y`
+        // treat every tracked dep as orphaned.
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read config directory {}: {error}",
+                    conf_dir.display()
+                ),
+            )
+            .into());
+        }
     };
 
     let mut files = Vec::new();
@@ -1002,6 +1020,39 @@ tool pkg - - os:macos
         let dir = temp_dir("missing-dir");
 
         assert!(load_dir(&dir.join("missing")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_dir_rejects_a_config_path_that_is_not_a_directory() {
+        // ENOTDIR (and EACCES/EIO) used to read as an empty config, which
+        // `prune -y` then treated as "remove every tracked dep".
+        let dir = temp_dir("not-a-dir");
+        let conf = dir.join("shdeps");
+        write(&conf, "tool pkg\n");
+
+        let error = load_dir(&conf).unwrap_err().to_string();
+
+        assert!(error.contains("cannot read config directory"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_dir_rejects_an_unreadable_config_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("unreadable-dir");
+        write(&dir.join("deps.conf"), "tool pkg\n");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&dir).is_ok();
+        let result = load_dir(&dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            // Running as root: permissions cannot make the directory
+            // unreadable, so there is nothing to assert.
+            return;
+        }
+
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]

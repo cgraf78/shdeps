@@ -372,14 +372,22 @@ Exit codes:
 
 - `0`: success, no orphans, dry run success, user aborted prompt, or quiet mode
   skipped prompt/action.
-- `1`: guarded all-orphans condition, cleanup runtime error, or a failed
-  (or unsourceable) `uninstall()` hook.
+- `1`: guarded all-orphans condition, cleanup runtime error, a failed
+  (or unsourceable) `uninstall()` hook, or a missing or unreadable config
+  directory.
 - `2`: unknown prune option.
 
 Safety:
 
 - If config has zero deps and manifest has entries, prune MUST require `-y`
   before treating every manifest entry as orphaned.
+- A config directory that exists but cannot be read (EACCES, EIO, ENOTDIR)
+  MUST be an error for every command, never an empty config.
+- Prune MUST refuse (exit 1), even with `-y`, when the config directory does
+  not exist: absence (unmounted home, dangling symlink, half-applied
+  dotfiles) is not evidence that every dep should go. An existing empty
+  directory is the explicit way to declare an empty config. Other commands
+  keep treating a missing directory as an empty config.
 - `--dry-run` MUST NOT remove files or change manifest.
 - Quiet mode without `-y` MUST skip prompt and action.
 - `pkg` deps MUST NOT uninstall system packages.

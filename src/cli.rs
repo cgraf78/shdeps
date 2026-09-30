@@ -1660,6 +1660,10 @@ where
     }
 
     let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    if let Some(message) = missing_prune_config_dir(&roots.conf_dir)? {
+        writeln!(stderr, "error: {message}")?;
+        return Ok(1);
+    }
     let (pkg_mgr, env) = detected_runtime_env();
     let raw_entries = config::load_dir_for_runtime(&roots.conf_dir, &env)?;
     let entries = parse_entries(&raw_entries, &pkg_mgr, &env);
@@ -1732,6 +1736,25 @@ where
     crate::cancellation::check()?;
     write_prune_results(&summary.removed, stdout, stderr)?;
     Ok(if summary.has_errors() { 1 } else { 0 })
+}
+
+/// Returns a refusal message when prune's config directory does not exist.
+///
+/// Other commands read a missing config directory as "nothing configured".
+/// For prune that turns every tracked dep into an orphan, and `-y` (cron,
+/// dot) skips the all-orphans guard, so an unmounted home, a dangling
+/// symlink, or half-applied dotfiles would wipe every install. An existing
+/// but empty directory remains the explicit way to declare an empty config.
+fn missing_prune_config_dir(conf_dir: &Path) -> Result<Option<String>> {
+    match std::fs::metadata(conf_dir) {
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(format!(
+            "config directory does not exist: {}; refusing to prune (create it, \
+             even empty, to confirm the config)",
+            conf_dir.display()
+        ))),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn self_update_cmd<W, E>(

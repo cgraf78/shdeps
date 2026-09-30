@@ -7265,6 +7265,10 @@ fn prune_lists_dry_runs_and_removes_orphans() {
 #[test]
 fn prune_preserves_packages_and_guards_empty_config() {
     let fixture = Fixture::new("prune-pkg");
+    // An existing but empty config dir declares "nothing configured"; a
+    // missing one is refused outright (see
+    // `prune_refuses_when_config_directory_is_missing`).
+    fs::create_dir_all(fixture.dir.join("conf")).unwrap();
     fixture.write("state/manifest", "pkg-tool|pkg|pkg-tool|\n");
 
     let guarded = run(&mut fixture.command(["prune"]));
@@ -7294,6 +7298,64 @@ fn prune_preserves_packages_and_guards_empty_config() {
         fs::read_to_string(fixture.dir.join("state/manifest"))
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn prune_refuses_when_config_directory_is_unreadable() {
+    // An unreadable config path used to load as an empty config, and
+    // `prune -y` then removed every tracked dep.
+    let fixture = Fixture::new("prune-unreadable-conf");
+    fixture.write("conf", "not a directory\n");
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+    fixture.write(
+        "conf-hooks/tool.sh",
+        "uninstall() { : > \"$SHDEPS_STATE_DIR/hook-ran\"; }\n",
+    );
+
+    let output = run(fixture
+        .command(["prune", "-y"])
+        .env("SHDEPS_HOOKS_DIR", fixture.dir.join("conf-hooks")));
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("cannot read config directory"),
+        "{output:?}"
+    );
+    assert!(!fixture.dir.join("state/hook-ran").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+}
+
+#[test]
+fn prune_refuses_when_config_directory_is_missing() {
+    // A missing config dir (unmounted home, half-applied dotfiles) is not
+    // evidence that the user wants every tracked dep removed, even with -y.
+    let fixture = Fixture::new("prune-missing-conf");
+    fixture.write("state/manifest", "tool|custom|tool|\n");
+
+    let output = run(&mut fixture.command(["prune", "-y"]));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("config directory does not exist"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        "tool|custom|tool|\n"
+    );
+
+    // An existing but empty config dir is the explicit way to say "nothing
+    // is configured"; the all-orphans guard and -y then apply as before.
+    fs::create_dir_all(fixture.dir.join("conf")).unwrap();
+    let removed = run(&mut fixture.command(["prune", "-y"]));
+    assert_success(&removed);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        ""
     );
 }
 
