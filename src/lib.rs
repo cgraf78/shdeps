@@ -45,6 +45,7 @@ pub mod pkg;
 pub mod platform;
 pub mod process;
 pub mod prune;
+mod prune_journal;
 pub mod release_activate;
 pub mod release_artifact;
 pub mod release_asset;

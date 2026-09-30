@@ -18,6 +18,7 @@ use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::platform::RuntimeEnv;
 use crate::process::{Process, Runner};
+use crate::prune_journal;
 use crate::runtime;
 
 /// User options for `shdeps prune`.
@@ -251,6 +252,9 @@ pub fn run(
     cancellation::check()?;
     let fresh_manifest = manifest::read(manifest_path)?;
     let orphans = fresh_manifest.orphans(config, env);
+    // Retire pre-hook records whose exact row is gone before any record can
+    // be reused below.
+    prune_journal::retain(&cleanup_roots(roots), &fresh_manifest)?;
     if orphans.is_empty() && recovered_items.is_empty() {
         return Ok(Summary {
             orphans,
@@ -307,22 +311,41 @@ pub fn run(
             continue;
         }
         cleanup::validate_manifest_artifact_entry(entry)?;
-        let cleanup_evidence = capture_cleanup_evidence(entry, &cleanup_roots)?;
+        // The pre-hook evidence is the only proof of which artifacts the
+        // orphan owned before its hook could replace them. Reuse the record
+        // from an interrupted or failed earlier prune of this exact row;
+        // otherwise capture and persist it before the hook runs, so a crash
+        // or signal anywhere after this point cannot lose it.
+        let mut record = match prune_journal::load(&cleanup_roots, entry)? {
+            Some(record) => record,
+            None => {
+                let record = prune_journal::Record {
+                    entry: entry.clone(),
+                    evidence: capture_cleanup_evidence(entry, &cleanup_roots)?,
+                    hook_completed: false,
+                };
+                prune_journal::save(&cleanup_roots, &record)?;
+                record
+            }
+        };
         cancellation::check()?;
-        let mut hook = hooks.uninstall(&entry.name, roots)?;
+        let hook = if record.hook_completed {
+            // A previous prune's hook already succeeded. One-shot hooks may
+            // fail or act on replacement state if rerun, so go straight to
+            // built-in cleanup with the recorded evidence.
+            Uninstall::Removed
+        } else {
+            let hook = uninstall(entry, roots, hooks)?;
+            if hook == Uninstall::Removed {
+                // Record completion before honoring any signal latched while
+                // the hook ran; the next prune then skips the hook and keeps
+                // judging ownership by the pre-hook snapshot.
+                record.hook_completed = true;
+                prune_journal::save(&cleanup_roots, &record)?;
+            }
+            hook
+        };
         cancellation::check()?;
-        if hook == Uninstall::SudoRequired {
-            hook = if Process.run("sudo", &["true"], None)?.success {
-                cancellation::check()?;
-                match hooks.retry_uninstall(&entry.name, roots)? {
-                    Uninstall::SudoRequired => Uninstall::Failed,
-                    retried => retried,
-                }
-            } else {
-                Uninstall::Failed
-            };
-            cancellation::check()?;
-        }
         let item = Item {
             entry: entry.clone(),
             hook,
@@ -349,8 +372,11 @@ pub fn run(
             manifest_path,
             &cleanup_roots,
             preserve_regular_public,
-            cleanup_evidence,
+            record.evidence,
         )?;
+        // The manifest row is gone, so the record's authority has lapsed. A
+        // crash before this line leaves a stale record that `retain` clears.
+        prune_journal::remove(&cleanup_roots, &entry.name)?;
         removed.push(Item {
             cleanup,
             cleanup_error,
@@ -363,6 +389,31 @@ pub fn run(
         removed,
         guarded_all_orphans: false,
         quiet_skipped: false,
+    })
+}
+
+// Runs the orphan's `uninstall()` hook, authenticating sudo in the attached
+// parent and retrying once when the detached hook asks for it. By the hook
+// contract a `SudoRequired` hook has made no changes yet, so cancellation may
+// be honored before the prompt and the retry; after a hook that may have
+// succeeded the caller must persist completion first.
+fn uninstall(
+    entry: &ManifestEntry,
+    roots: &runtime::Roots,
+    hooks: &BashCustomProbe,
+) -> Result<Uninstall> {
+    let hook = hooks.uninstall(&entry.name, roots)?;
+    if hook != Uninstall::SudoRequired {
+        return Ok(hook);
+    }
+    cancellation::check()?;
+    if !Process.run("sudo", &["true"], None)?.success {
+        return Ok(Uninstall::Failed);
+    }
+    cancellation::check()?;
+    Ok(match hooks.retry_uninstall(&entry.name, roots)? {
+        Uninstall::SudoRequired => Uninstall::Failed,
+        retried => retried,
     })
 }
 
@@ -1034,6 +1085,190 @@ mod tests {
         assert_eq!(
             fs::read_to_string(public).unwrap(),
             "replacement from hook\n"
+        );
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    /// Writes a raw-release orphan whose public command is a regular file
+    /// and returns (manifest path, public command path).
+    fn raw_release_orphan(fixture: &Fixture) -> (PathBuf, PathBuf) {
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        fixture.write(&public, "old raw release\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/old",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        (manifest_path, public)
+    }
+
+    fn prune_all(fixture: &Fixture, manifest_path: &Path) -> crate::Result<super::Summary> {
+        let manifest = manifest::read(manifest_path).unwrap();
+        run(
+            &[],
+            &manifest,
+            manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+    }
+
+    #[test]
+    fn prune_retry_uses_evidence_captured_before_the_failed_hook() {
+        // The first hook swaps in a replacement command and then fails, so
+        // prune keeps the row. The retry must judge ownership against the
+        // original pre-hook snapshot; re-capturing would adopt the
+        // replacement as orphan-owned and delete it.
+        let fixture = Fixture::new("retry-keeps-pre-hook-evidence");
+        let (manifest_path, public) = raw_release_orphan(&fixture);
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            r#"uninstall() {
+  [ -e "$SHDEPS_STATE_DIR/hook-ran" ] && return 0
+  : > "$SHDEPS_STATE_DIR/hook-ran"
+  printf 'replacement from hook\n' > "$SHDEPS_BIN_DIR/.tool.new"
+  mv -f "$SHDEPS_BIN_DIR/.tool.new" "$SHDEPS_BIN_DIR/tool"
+  return 1
+}
+"#,
+        );
+
+        let failed = prune_all(&fixture, &manifest_path).unwrap();
+        assert!(failed.has_errors());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/old")
+                .is_some()
+        );
+
+        let retried = prune_all(&fixture, &manifest_path).unwrap();
+
+        assert!(!retried.has_errors(), "{retried:?}");
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "replacement from hook\n"
+        );
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+        assert!(
+            fs::read_dir(fixture.roots.state_dir.join(".prune-hooks-v1"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "the record must be retired with the manifest row"
+        );
+    }
+
+    #[test]
+    fn prune_does_not_rerun_a_hook_that_already_completed() {
+        // Model a prune killed after a successful one-shot hook: the durable
+        // record says the hook completed. Rerunning it here would fail (and
+        // keep the row forever); cleanup must instead finish with the
+        // recorded pre-hook evidence.
+        let fixture = Fixture::new("hook-already-completed");
+        let (manifest_path, public) = raw_release_orphan(&fixture);
+        let entry = manifest::read(&manifest_path)
+            .unwrap()
+            .get("owner/old")
+            .unwrap()
+            .clone();
+        let cleanup_roots = super::cleanup_roots(&fixture.roots);
+        let evidence = super::capture_cleanup_evidence(&entry, &cleanup_roots).unwrap();
+        crate::prune_journal::save(
+            &cleanup_roots,
+            &crate::prune_journal::Record {
+                entry,
+                evidence,
+                hook_completed: true,
+            },
+        )
+        .unwrap();
+        fixture.write(&public, "replacement from hook\n");
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            "uninstall() { : > \"$SHDEPS_STATE_DIR/hook-reran\"; return 1; }\n",
+        );
+
+        let summary = prune_all(&fixture, &manifest_path).unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(!fixture.roots.state_dir.join("hook-reran").exists());
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "replacement from hook\n"
+        );
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_after_uninstall_hook_keeps_pre_hook_evidence_for_next_prune() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_SIGNAL_AFTER_PRUNE_HOOK";
+        const TEST_NAME: &str =
+            "prune::tests::signal_after_uninstall_hook_keeps_pre_hook_evidence_for_next_prune";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let fixture = Fixture::new("signal-after-prune-hook");
+        let (manifest_path, public) = raw_release_orphan(&fixture);
+        // One-shot hook: replace the command, TERM this prune process, and
+        // still exit 0 (it ignores the group TERM the supervisor forwards),
+        // so the signal is latched while the hook succeeds. A rerun fails,
+        // so the resumed prune only passes if hook completion was recorded
+        // and the recorded pre-hook evidence was reused.
+        fixture.write(
+            &fixture.roots.hooks_dir.join("owner/old.sh"),
+            &format!(
+                r#"uninstall() {{
+  [ -e "$SHDEPS_STATE_DIR/hook-ran" ] && return 1
+  trap '' TERM
+  : > "$SHDEPS_STATE_DIR/hook-ran"
+  printf 'replacement from hook\n' > "$SHDEPS_BIN_DIR/.tool.new"
+  mv -f "$SHDEPS_BIN_DIR/.tool.new" "$SHDEPS_BIN_DIR/tool"
+  kill -TERM {}
+}}
+"#,
+                std::process::id()
+            ),
+        );
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let interrupted = prune_all(&fixture, &manifest_path);
+        assert!(interrupted.is_err(), "{interrupted:?}");
+        assert_eq!(
+            signals.finish_result(interrupted.map(|_| 0)).unwrap(),
+            128 + libc::SIGTERM
+        );
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/old")
+                .is_some()
+        );
+
+        let signals = crate::cancellation::Signals::install().unwrap();
+        let resumed = prune_all(&fixture, &manifest_path);
+        drop(signals);
+
+        let resumed = resumed.unwrap();
+        assert!(!resumed.has_errors(), "{resumed:?}");
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "replacement from hook\n",
+            "the next prune deleted the hook's replacement command"
         );
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
     }

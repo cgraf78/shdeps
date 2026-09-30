@@ -139,11 +139,30 @@ impl Drop for SudoRequest {
     }
 }
 
+/// How a hook run reports a signal that was latched while the hook ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalPolicy {
+    /// Any latched signal fails the run, even when the hook exited 0.
+    Fail,
+    /// A hook that still exited 0 reports its status so the caller can
+    /// durably record the completed side effect before honoring the signal
+    /// itself. A hook stopped by the signal has no exit code and still fails.
+    ReportSuccess,
+}
+
 /// Runs a configured hook command with a wall-clock timeout and a
 /// per-stream output cap.
 fn run_hook_command(
+    command: Command,
+    isolation: HookIsolation,
+) -> io::Result<std::process::Output> {
+    run_hook_command_with(command, isolation, SignalPolicy::Fail)
+}
+
+fn run_hook_command_with(
     mut command: Command,
     isolation: HookIsolation,
+    signal_policy: SignalPolicy,
 ) -> io::Result<std::process::Output> {
     let timeout = hook_timeout();
     let max_bytes = hook_max_bytes();
@@ -223,7 +242,8 @@ fn run_hook_command(
     };
     let stdout = stdout?;
     let stderr = stderr?;
-    if interrupted || cancellation::received_signal().is_some() {
+    let completed = signal_policy == SignalPolicy::ReportSuccess && status.success();
+    if !completed && (interrupted || cancellation::received_signal().is_some()) {
         return Err(io::Error::other("interrupted by signal"));
     }
     Ok(std::process::Output {
@@ -237,10 +257,11 @@ fn run_mutating_hook_command(
     mut command: Command,
     state_dir: &Path,
     isolation: HookIsolation,
+    signal_policy: SignalPolicy,
 ) -> io::Result<HookOutput> {
     let mut request = SudoRequest::new(state_dir)?;
     request.apply(&mut command);
-    let output = run_hook_command(command, isolation)?;
+    let output = run_hook_command_with(command, isolation, signal_policy)?;
     let sudo_requested =
         output.status.code() == Some(SUDO_REQUEST_EXIT_CODE) && request.requested();
     Ok(HookOutput {
@@ -786,7 +807,15 @@ impl BashCustomProbe {
 
         let mut command = self.command(UNINSTALL_SCRIPT, name, &hook);
         apply_hook_env(&mut command, roots, name, "uninstall", self, None);
-        let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
+        // Prune records a successful uninstall durably before it honors a
+        // signal; losing that fact would make the next prune rerun a
+        // one-shot hook (see `prune_journal`).
+        let output = run_mutating_hook_command(
+            command,
+            &roots.state_dir,
+            isolation,
+            SignalPolicy::ReportSuccess,
+        )?;
 
         if output.sudo_requested {
             return Ok(Uninstall::SudoRequired);
@@ -849,7 +878,8 @@ impl BashCustomProbe {
         let mut command = self.command(INSTALL_SCRIPT, name, &hook);
         command.arg(if reinstall { "1" } else { "0" });
         apply_hook_env(&mut command, roots, name, "install", self, txn);
-        let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
+        let output =
+            run_mutating_hook_command(command, &roots.state_dir, isolation, SignalPolicy::Fail)?;
 
         if output.sudo_requested {
             return Ok(Install::SudoRequired);
@@ -911,7 +941,8 @@ impl BashCustomProbe {
 
         let mut command = self.command(POST_SCRIPT, name, &hook);
         apply_hook_env(&mut command, roots, name, "post", self, txn);
-        let output = run_mutating_hook_command(command, &roots.state_dir, isolation)?;
+        let output =
+            run_mutating_hook_command(command, &roots.state_dir, isolation, SignalPolicy::Fail)?;
 
         if output.sudo_requested {
             return Ok(Post::SudoRequired);

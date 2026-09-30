@@ -1060,6 +1060,14 @@ row and skips built-in cleanup so a later prune retries the hook, and exits 1.
 To release such a row, fix the hook, run `shdeps prune` interactively when the
 hook needs sudo, or delete the hook file (its cleanup is then skipped).
 
+Before running an orphan's hook, prune durably records the pre-hook cleanup
+evidence under `$SHDEPS_STATE_DIR/.prune-hooks-v1/` and marks the record once
+the hook succeeds. A later prune of the same row (after a failed hook, crash,
+or signal) reuses that evidence and does not rerun a completed hook, so files
+the hook installed are never adopted as orphan-owned. The record is retired
+with the manifest row; a record whose exact row is gone or was rewritten is
+discarded.
+
 ## Hook ABI
 
 Hook path:
