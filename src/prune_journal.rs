@@ -129,7 +129,12 @@ fn read(path: &Path) -> Result<Record> {
 }
 
 fn dir(roots: &cleanup::Roots) -> PathBuf {
-    roots.state_dir.join(DIR)
+    dir_path(&roots.state_dir)
+}
+
+/// Returns the record directory; a non-empty one means a prune is unfinished.
+pub(crate) fn dir_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(DIR)
 }
 
 // Dependency names contain `/`; hashing keeps one flat file per name.

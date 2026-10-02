@@ -68,7 +68,7 @@ pub fn path(state_dir: &Path, name: &str, kind: Kind) -> PathBuf {
 
 /// Reads tracked links. Missing link-state files are empty state.
 pub fn read(path: &Path) -> Result<Vec<PathBuf>> {
-    match fs::read_to_string(path) {
+    match state::read_regular_to_string(path) {
         Ok(content) => Ok(content
             .lines()
             .filter(|line| !line.is_empty())
@@ -257,7 +257,8 @@ pub(crate) fn unlink_tracked_matching(
     }
 }
 
-fn reconcile_path(path: &Path) -> PathBuf {
+/// Returns the reconciliation journal path beside a link-state file.
+pub(crate) fn reconcile_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())

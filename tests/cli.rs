@@ -241,6 +241,178 @@ fn dep_links_usage_and_missing_dependency_exit_codes_are_machine_clean() {
     assert_eq!(text(&missing.stderr), "");
 }
 
+/// Root shapes the release update gate must classify identically in
+/// `health` and `update`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum InstallerRoot {
+    /// The cgraf78/actions installer's exact layout: adopted by update.
+    Adoptable,
+    /// The same layout while the installer's publication lock exists.
+    Locked,
+    /// Locked, before shdeps ever recorded the release (no manifest row).
+    LockedFresh,
+    /// The installer's root behind a regular launcher at the public path.
+    AdoptableLauncher,
+    /// An adoption interrupted after parking the root link: finished by update.
+    Parked,
+    /// The same symlinked root without the installer's ownership marker.
+    Unmanaged,
+    /// A root shdeps already adopted (marked), with the installer's inert
+    /// control directory left beside it holding a stale lock.
+    AdoptedStaleLock,
+    /// The installer's layout whose release is already the latest: update
+    /// adopts it anyway.
+    AdoptableCurrent,
+}
+
+/// Builds `owner/tool` as published by the standalone release installer,
+/// shaped as `shape`, plus a newer archive release for update to fetch.
+#[cfg(unix)]
+fn installer_root_fixture(name: &str, shape: InstallerRoot) -> Fixture {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new(name);
+    let release = "v0-linux";
+    let control = fixture.dir.join("share/owner/.tool-standalone");
+    if !matches!(shape, InstallerRoot::Unmanaged) {
+        fixture.write(
+            "share/owner/.tool-standalone/owner",
+            "cgraf78/actions release-installer v1\n",
+        );
+    }
+    if matches!(
+        shape,
+        InstallerRoot::Locked | InstallerRoot::LockedFresh | InstallerRoot::AdoptedStaleLock
+    ) {
+        fixture.write("share/owner/.tool-standalone/lock", "");
+    }
+    let installed = if matches!(shape, InstallerRoot::AdoptableCurrent) {
+        "#!/bin/sh\necho v1.0.0\n"
+    } else {
+        "#!/bin/sh\necho v0.9.0\n"
+    };
+    fixture.write_executable(
+        format!("share/owner/.tool-standalone/releases/{release}/tool"),
+        installed,
+    );
+    fixture.write(
+        format!("share/owner/.tool-standalone/releases/{release}/.tool-install.json"),
+        r#"{"schema":1,"method":"release","repo":"owner/tool"}"#,
+    );
+    symlink(format!("releases/{release}"), control.join("current")).unwrap();
+    let root = fixture.dir.join("share/owner/tool");
+    let public = fixture.dir.join("bin/tool");
+    fs::create_dir_all(public.parent().unwrap()).unwrap();
+    if matches!(shape, InstallerRoot::Parked) {
+        // An interrupted fallback switch pinned the command at the active
+        // release and parked the root link under its fixed name.
+        symlink(
+            ".tool-standalone/current",
+            fixture.dir.join("share/owner/tool.shdeps-parked-root"),
+        )
+        .unwrap();
+        symlink(control.join(format!("releases/{release}/tool")), &public).unwrap();
+    } else if matches!(shape, InstallerRoot::AdoptedStaleLock) {
+        fixture.write_executable("share/owner/tool/bin/tool", "#!/bin/sh\necho v0.9.0\n");
+        fixture.write("share/owner/tool/.shdeps-release-layout", "v1 archive\n");
+        symlink(root.join("bin/tool"), &public).unwrap();
+    } else if matches!(shape, InstallerRoot::AdoptableLauncher) {
+        symlink(".tool-standalone/current", &root).unwrap();
+        fixture.write_executable("bin/tool", "#!/bin/sh\nexec launcher\n");
+    } else {
+        symlink(".tool-standalone/current", &root).unwrap();
+        symlink(root.join("tool"), &public).unwrap();
+    }
+    fixture.write("conf/deps.conf", "owner/tool github:release tool\n");
+    if !matches!(shape, InstallerRoot::LockedFresh) {
+        fixture.write(
+            "state/manifest",
+            &format!("owner/tool|github:release|tool|{}\n", public.display()),
+        );
+    }
+    let asset = format!("{}.tar.gz", host_linux_asset("tool", "v1.0.0"));
+    fixture.write_fake_curl(&release_json("v1.0.0", &[asset.as_str()]), "");
+    write_tar_gz(
+        &fixture.dir.join("fake/asset"),
+        &[("tool-v1.0.0/bin/tool", "#!/bin/sh\necho v1.0.0\n", 0o755)],
+    );
+    fixture
+}
+
+#[test]
+#[cfg(unix)]
+fn health_agrees_with_update_on_every_release_root() {
+    // `health` and `update` must agree on every root shape: health flags the
+    // root exactly when update refuses to upgrade it, and an installer-owned
+    // root (whole, parked mid-adoption, or already current) is adopted, never
+    // flagged; a lock left beside an adopted root blocks nothing.
+    for (shape, refused) in [
+        (InstallerRoot::Adoptable, false),
+        (InstallerRoot::Locked, true),
+        (InstallerRoot::LockedFresh, true),
+        (InstallerRoot::AdoptableLauncher, false),
+        (InstallerRoot::Parked, false),
+        (InstallerRoot::Unmanaged, true),
+        (InstallerRoot::AdoptedStaleLock, false),
+        (InstallerRoot::AdoptableCurrent, false),
+    ] {
+        let fixture = installer_root_fixture(&format!("health-parity-{shape:?}"), shape);
+        let root = fixture.dir.join("share/owner/tool");
+
+        let health = run(&mut fixture.command(["health"]));
+        let rows = text(&health.stdout);
+        let flagged_rows = rows
+            .lines()
+            .filter(|row| row.split('\t').nth(2) == Some("install-root-unmanaged"))
+            .collect::<Vec<_>>();
+        let update = run(&mut fixture.command(["update"]));
+        let update_out = format!("{}{}", text(&update.stdout), text(&update.stderr));
+        let update_refused = update.status.code() != Some(0);
+
+        assert_eq!(
+            !flagged_rows.is_empty(),
+            update_refused,
+            "{shape:?}: health and update disagree\nhealth:\n{rows}\nupdate:\n{update_out}"
+        );
+        assert_eq!(update_refused, refused, "{shape:?}: {update_out}");
+        match shape {
+            InstallerRoot::Adoptable
+            | InstallerRoot::AdoptableLauncher
+            | InstallerRoot::Parked
+            | InstallerRoot::AdoptableCurrent
+            | InstallerRoot::AdoptedStaleLock => {
+                assert_eq!(health.status.code(), Some(0), "{shape:?}: {rows}");
+                let adopted = fs::symlink_metadata(&root).unwrap();
+                assert!(adopted.is_dir(), "{shape:?}: update adopts the root");
+                let healthy = run(&mut fixture.command(["health"]));
+                assert_eq!(text(&healthy.stdout), "", "{shape:?} after adoption");
+            }
+            InstallerRoot::Locked | InstallerRoot::LockedFresh => {
+                assert!(update_out.contains("standalone installer lock present"));
+                let lock = fixture.dir.join("share/owner/.tool-standalone/lock");
+                assert!(flagged_rows[0].contains(&format!("lock {}", lock.display())));
+                assert!(
+                    !flagged_rows[0].contains("aside"),
+                    "never advise moving an installer-owned root aside"
+                );
+            }
+            InstallerRoot::Unmanaged => {
+                assert!(update_out.contains("release asset format changed"));
+                assert_eq!(
+                    flagged_rows[0].split('\t').nth(3),
+                    Some(root.to_str().unwrap())
+                );
+                // The remediation health prints makes update succeed.
+                fs::remove_file(&root).unwrap();
+                fs::remove_file(fixture.dir.join("bin/tool")).unwrap();
+                assert_success(&run(&mut fixture.command(["update"])));
+                assert_success(&run(&mut fixture.command(["health"])));
+            }
+        }
+    }
+}
+
 #[test]
 fn read_only_api_outputs_machine_clean_lines() {
     let fixture = Fixture::new("api");

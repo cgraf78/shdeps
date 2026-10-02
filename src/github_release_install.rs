@@ -22,7 +22,8 @@ use crate::method;
 use crate::process;
 use crate::state;
 
-const ARCHIVE_LAYOUT_FILE: &str = ".shdeps-release-layout";
+pub(crate) const ARCHIVE_LAYOUT_FILE: &str = ".shdeps-release-layout";
+const ARCHIVE_BACKUP_EXTENSION: &str = "shdeps-archive-backup-";
 const ARCHIVE_LAYOUT_CONTENT: &str = "v1 archive\n";
 
 struct RemoveOnDrop(PathBuf);
@@ -152,6 +153,149 @@ pub(crate) fn archive_state(
     }
 
     Ok(ArchiveState::None)
+}
+
+/// Why `shdeps update` would refuse to upgrade a `github:release` root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpgradeBlocker {
+    /// The stable root is a symlink. Ownership checks never follow it, so it
+    /// cannot be proven to be a Shdeps archive (e.g. another installer's
+    /// `current` link).
+    SymlinkedRoot {
+        /// Raw link target, for the report.
+        target: PathBuf,
+    },
+    /// Something other than a directory occupies the stable root.
+    NonDirectoryRoot,
+    /// A real directory without the archive marker or legacy proof.
+    UnprovenRoot {
+        /// The legacy evidence is contradictory (`ArchiveState::Ambiguous`),
+        /// which blocks raw and archive releases alike.
+        ambiguous: bool,
+    },
+    /// The root is gone while the public command is still a link, the shape
+    /// only an archive install leaves; an archive upgrade cannot prove the
+    /// link is not someone else's and refuses to replace it.
+    MissingRoot,
+    /// The marker exists but is not a regular file with the known content;
+    /// every update fails closed on it.
+    InvalidMarker(String),
+    /// The standalone release installer's publication lock exists (an
+    /// `install.sh` is running, or one was killed and left it), so the update
+    /// refuses to interpret the installer's tree. Only Unix hosts run the
+    /// installer.
+    #[cfg(unix)]
+    InstallerLocked {
+        /// The lock path to remove once no installer runs.
+        lock: PathBuf,
+    },
+}
+
+/// Read-only twin of the release update's layout gate.
+///
+/// For a dependency whose manifest row is already `github:release`,
+/// `update_release::install_request` refuses a download as a "release asset
+/// format changed" migration when, from the same `archive_state` snapshot, a
+/// raw asset meets any state other than `None`, or an archive asset meets a
+/// root that is not `Proven` while the public command path exists. Without
+/// network the asset kind is unknown, so this assumes the next asset keeps
+/// the root's current layout: a proven or installer-owned archive root and a
+/// rootless regular public file (a raw release) are healthy, and every other
+/// root that blocks either kind is reported. (A symlinked or
+/// unmarked root beside a regular launcher still blocks archive upgrades and
+/// is reported; that is the legacy-launcher shape of a standalone install.)
+/// Before the first recorded release only the explicit marker is read, and
+/// only a corrupt one blocks. It writes nothing (no marker backfill) and
+/// takes no lock, so diagnostics may run beside an update; a root a
+/// concurrent update is swapping can classify either way for that instant.
+///
+/// A root the cgraf78/actions standalone installer provably owns
+/// (`standalone_layout::classify`) is adopted by the archive switch, so it is
+/// not blocked, including an adoption interrupted with the root link parked;
+/// while that installer's lock exists the update refuses, so that is
+/// reported. Like the update, the layout is consulted only for a root that
+/// is not already `Proven`, so a lock left beside an adopted root is inert. The installer only publishes archives, so a raw asset over its
+/// root is an unknowable format change like any other.
+///
+/// The predicate is restated here rather than shared with `install_request`;
+/// the CLI parity test `health_agrees_with_update_on_every_release_root`
+/// runs both against each root shape and pins agreement.
+pub(crate) fn upgrade_blocker(
+    state_dir: &Path,
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+    prior_release: bool,
+) -> Result<Option<UpgradeBlocker>> {
+    // Validate the marker on its own first so a corrupt marker is reported
+    // as such, while any other read failure (a corrupt link ledger) stays an
+    // error for the caller instead of masquerading as a marker problem.
+    if let Some(install_dir) = managed_install_dir(install_base, name)? {
+        match marker_state(&install_dir) {
+            Ok(_) => {}
+            Err(crate::Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                return Ok(Some(UpgradeBlocker::InvalidMarker(error.to_string())));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // The same snapshot the update gate starts from: full legacy proof once a
+    // release is recorded, otherwise only the explicit marker.
+    let archive = if prior_release {
+        archive_state(state_dir, install_base, public, name)?
+    } else {
+        explicit_archive_state(install_base, name)?
+    };
+    // Like the update, consult the installer layout only for a root Shdeps
+    // has not proven: a marked root is its own, so a stale installer lock
+    // left in the inert control directory beside it blocks nothing.
+    if archive != ArchiveState::Proven {
+        match crate::standalone_layout::classify(install_base, name, public) {
+            crate::standalone_layout::Standalone::Adoptable => return Ok(None),
+            #[cfg(unix)]
+            crate::standalone_layout::Standalone::Locked(lock) => {
+                return Ok(Some(UpgradeBlocker::InstallerLocked { lock }));
+            }
+            crate::standalone_layout::Standalone::None => {}
+        }
+    }
+    if !prior_release {
+        // Before the first recorded release install the update consults only
+        // the explicit marker, which was just found valid or absent.
+        return Ok(None);
+    }
+    match archive {
+        ArchiveState::Proven => Ok(None),
+        ArchiveState::Ambiguous => Ok(Some(UpgradeBlocker::UnprovenRoot { ambiguous: true })),
+        ArchiveState::None => {
+            let public_type = match fs::symlink_metadata(public) {
+                Ok(metadata) => metadata.file_type(),
+                // The archive switch replaces an unowned root only when no
+                // public command could be stranded.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let root = install_base.join(name);
+            let root_type = match fs::symlink_metadata(&root) {
+                Ok(metadata) => metadata.file_type(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(public_type
+                        .is_symlink()
+                        .then_some(UpgradeBlocker::MissingRoot));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            Ok(Some(if root_type.is_symlink() {
+                UpgradeBlocker::SymlinkedRoot {
+                    target: fs::read_link(&root).unwrap_or_default(),
+                }
+            } else if root_type.is_dir() {
+                UpgradeBlocker::UnprovenRoot { ambiguous: false }
+            } else {
+                UpgradeBlocker::NonDirectoryRoot
+            }))
+        }
+    }
 }
 
 /// Backfills the marker for a proven legacy archive during a mutating update.
@@ -987,9 +1131,45 @@ fn install_backup_path(install_dir: &Path) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     install_dir.with_extension(format!(
-        "shdeps-archive-backup-{}-{nanos}",
+        "{ARCHIVE_BACKUP_EXTENSION}{}-{nanos}",
         std::process::id()
     ))
+}
+
+/// Lists backups that an interrupted archive swap left beside a release root.
+///
+/// The swap renames the live root to [`install_backup_path`] and removes it
+/// after the new root is in place, so a survivor means a crash in between
+/// (or a swap still deleting the old tree). Matching uses the same
+/// `with_extension` derivation, so a repo name that already contains a dot is
+/// found too; that derivation also means `owner/foo` and `owner/foo.nvim`
+/// share backup names, so such a backup is listed for both. One `read_dir` of
+/// the owner directory; an unreadable directory reports nothing.
+pub(crate) fn archive_backups(install_base: &Path, name: &str) -> Vec<PathBuf> {
+    let prefix_path = install_base
+        .join(name)
+        .with_extension(ARCHIVE_BACKUP_EXTENSION);
+    let (Some(parent), Some(prefix)) = (
+        prefix_path.parent(),
+        prefix_path.file_name().and_then(|prefix| prefix.to_str()),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut backups = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|file| file.starts_with(prefix) && file.len() > prefix.len())
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups
 }
 
 fn content_root(extract_dir: &Path) -> Result<PathBuf> {
@@ -2582,5 +2762,184 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_support::temp_dir(&format!("shdeps-release-install-{name}"))
+    }
+
+    /// Layout fixture for `upgrade_blocker`: (state, install base, public).
+    fn blocker_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        let install_base = dir.join("share");
+        fs::create_dir_all(install_base.join("owner")).unwrap();
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        (dir.join("state"), install_base, dir.join("bin/tool"))
+    }
+
+    fn blocker(
+        state: &std::path::Path,
+        base: &std::path::Path,
+        public: &std::path::Path,
+        prior_release: bool,
+    ) -> Option<super::UpgradeBlocker> {
+        super::upgrade_blocker(state, base, public, "owner/tool", prior_release).unwrap()
+    }
+
+    #[test]
+    fn upgrade_blocker_allows_absent_marked_and_legacy_proven_roots() {
+        let (state, base, public) = blocker_fixture("blocker-allowed");
+        fs::write(&public, "raw").unwrap();
+        assert_eq!(blocker(&state, &base, &public, true), None, "raw release");
+
+        fs::remove_file(&public).unwrap();
+        let root = base.join("owner/tool");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/tool"), "bin").unwrap();
+        symlink(root.join("bin/tool"), &public).unwrap();
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            None,
+            "a live public link into the root proves a pre-marker archive"
+        );
+
+        fs::write(root.join(super::ARCHIVE_LAYOUT_FILE), "v1 archive\n").unwrap();
+        assert_eq!(blocker(&state, &base, &public, true), None, "marked root");
+    }
+
+    #[test]
+    fn upgrade_blocker_reports_symlinked_root_only_when_update_would_refuse() {
+        let (state, base, public) = blocker_fixture("blocker-symlink");
+        fs::create_dir_all(base.join("owner/.tool-standalone/current")).unwrap();
+        symlink(".tool-standalone/current", base.join("owner/tool")).unwrap();
+
+        // Without a public command or a prior release the archive switch
+        // replaces the unowned link, so nothing blocks.
+        assert_eq!(blocker(&state, &base, &public, true), None);
+        symlink(base.join("owner/tool/tool"), &public).unwrap();
+        assert_eq!(blocker(&state, &base, &public, false), None);
+
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::SymlinkedRoot {
+                target: PathBuf::from(".tool-standalone/current")
+            })
+        );
+    }
+
+    #[test]
+    fn upgrade_blocker_reports_unproven_and_ambiguous_directories() {
+        let (state, base, public) = blocker_fixture("blocker-unproven");
+        fs::create_dir_all(base.join("owner/tool")).unwrap();
+        let elsewhere = public.with_file_name("elsewhere");
+        fs::write(&elsewhere, "bin").unwrap();
+        symlink(&elsewhere, &public).unwrap();
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::UnprovenRoot { ambiguous: false })
+        );
+
+        fs::remove_file(&public).unwrap();
+        fs::write(&public, "launcher").unwrap();
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::UnprovenRoot { ambiguous: true })
+        );
+    }
+
+    #[test]
+    fn upgrade_blocker_reports_non_directory_root_and_corrupt_marker() {
+        let (state, base, public) = blocker_fixture("blocker-invalid");
+        fs::write(base.join("owner/tool"), "file").unwrap();
+        fs::write(&public, "bin").unwrap();
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::NonDirectoryRoot)
+        );
+
+        fs::remove_file(base.join("owner/tool")).unwrap();
+        fs::create_dir_all(base.join("owner/tool")).unwrap();
+        fs::write(
+            base.join("owner/tool").join(super::ARCHIVE_LAYOUT_FILE),
+            "v2\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::InvalidMarker(reason)) if reason.contains("unknown release archive marker")
+        ));
+    }
+
+    #[test]
+    fn upgrade_blocker_reports_missing_root_behind_a_public_link() {
+        let (state, base, public) = blocker_fixture("blocker-missing-root");
+        symlink(base.join("owner/tool/bin/tool"), &public).unwrap();
+
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::MissingRoot)
+        );
+        assert_eq!(
+            blocker(&state, &base, &public, false),
+            None,
+            "before the first release install only the marker is consulted"
+        );
+    }
+
+    #[test]
+    fn upgrade_blocker_reads_only_a_corrupt_marker_before_the_first_release() {
+        let (state, base, public) = blocker_fixture("blocker-first-release");
+        fs::create_dir_all(base.join("owner/tool")).unwrap();
+        fs::write(&public, "bin").unwrap();
+        assert_eq!(blocker(&state, &base, &public, false), None);
+
+        fs::write(
+            base.join("owner/tool").join(super::ARCHIVE_LAYOUT_FILE),
+            "v2\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            blocker(&state, &base, &public, false),
+            Some(super::UpgradeBlocker::InvalidMarker(_))
+        ));
+    }
+
+    #[test]
+    fn upgrade_blocker_never_writes_the_marker() {
+        let (state, base, public) = blocker_fixture("blocker-read-only");
+        let root = base.join("owner/tool");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/tool"), "bin").unwrap();
+        symlink(root.join("bin/tool"), &public).unwrap();
+
+        assert_eq!(blocker(&state, &base, &public, true), None);
+        assert!(!root.join(super::ARCHIVE_LAYOUT_FILE).exists());
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn archive_backups_match_only_this_roots_swap_leftovers() {
+        let dir = temp_dir("archive-backups");
+        let base = dir.join("share");
+        for name in [
+            "owner/tool.shdeps-archive-backup-1-2",
+            "owner/tool.shdeps-archive-backup-3-4",
+            "owner/toolkit.shdeps-archive-backup-1-2",
+            "owner/tool",
+            "owner/foo.shdeps-archive-backup-5-6",
+        ] {
+            fs::create_dir_all(base.join(name)).unwrap();
+        }
+
+        assert_eq!(
+            super::archive_backups(&base, "owner/tool"),
+            [
+                base.join("owner/tool.shdeps-archive-backup-1-2"),
+                base.join("owner/tool.shdeps-archive-backup-3-4"),
+            ]
+        );
+        // `with_extension` replaces a dotted repo suffix, exactly as the swap
+        // names its backup, so `foo.nvim` backs up to `foo.shdeps-…`.
+        assert_eq!(
+            super::archive_backups(&base, "owner/foo.nvim"),
+            [base.join("owner/foo.shdeps-archive-backup-5-6")]
+        );
+        assert!(super::archive_backups(&base, "missing/tool").is_empty());
     }
 }

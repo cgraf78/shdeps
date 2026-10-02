@@ -1319,7 +1319,19 @@ fn pending_post_exists(state_dir: &Path, name: &str) -> bool {
     config::valid_dep_name(name) && !pending_post_markers(state_dir, name).is_empty()
 }
 
-fn pending_posts(state_dir: &Path) -> Result<Vec<String>> {
+/// Returns the directory holding durable pending-post markers.
+pub(crate) fn pending_posts_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(PENDING_POSTS_DIR)
+}
+
+/// Returns the plain marker path recording `name` as pending (collision
+/// forms live beneath or beside it; see `PENDING_SELF_MARKER`).
+pub(crate) fn pending_post_path(state_dir: &Path, name: &str) -> PathBuf {
+    pending_posts_dir(state_dir).join(name)
+}
+
+/// Lists every dependency whose durable post-hook obligation is still open.
+pub(crate) fn pending_posts(state_dir: &Path) -> Result<Vec<String>> {
     let root = state_dir.join(PENDING_POSTS_DIR);
     let mut names = Vec::new();
     collect_markers(&root, &root, &mut names)?;

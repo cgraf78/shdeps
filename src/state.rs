@@ -519,6 +519,111 @@ fn lock_timeout_error(state_dir: &Path, timeout: Duration) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, message)
 }
 
+/// Reports whether the process last recorded as the state-lock owner is alive.
+///
+/// Read-only diagnostics must never take the lock (that would stall a
+/// concurrent `update`), so they cannot ask `flock` who holds it. The owner
+/// metadata stays behind after release, so a live PID is only a strong hint
+/// that an update or prune is in flight. Callers must treat it as "suppress
+/// transient state" at most. PID reuse is narrowed two ways: the owner always
+/// runs as this user, so `EPERM` (another user's process) means reuse, and on
+/// Linux a process that started after the recorded acquisition cannot be the
+/// one that acquired it.
+pub(crate) fn recorded_lock_owner_alive(state_dir: &Path) -> bool {
+    let Some(owner) = read_lock_owner_metadata(&StateLock::path(state_dir)) else {
+        return false;
+    };
+    let field = |key: &str| {
+        owner
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+    let Some(pid) = field("pid=").and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
+        return false;
+    };
+    process_alive(pid) && !started_after(pid, field("acquired_unix="))
+}
+
+#[cfg(unix)]
+fn process_alive(pid: libc::pid_t) -> bool {
+    // Signal 0 probes existence without delivering anything. Pid 0 or a
+    // negative value would address process groups, never a lock owner.
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: i32) -> bool {
+    false
+}
+
+/// Whether `pid` provably started after `acquired_unix` (so it reused the
+/// PID). Unknown inputs prove nothing and return false.
+#[cfg(target_os = "linux")]
+fn started_after(pid: libc::pid_t, acquired_unix: Option<u64>) -> bool {
+    let Some(acquired_unix) = acquired_unix else {
+        return false;
+    };
+    // Field 22 of /proc/<pid>/stat is the start time in clock ticks since
+    // boot. The command name (field 2) may contain spaces or parentheses, so
+    // count fields after its closing parenthesis (field 3 is index 0).
+    let Some(start_ticks) = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, rest) = stat.rsplit_once(')')?;
+            rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+        })
+    else {
+        return false;
+    };
+    let Some(boot_unix) = fs::read_to_string("/proc/stat").ok().and_then(|stat| {
+        stat.lines()
+            .find_map(|line| line.strip_prefix("btime "))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    }) else {
+        return false;
+    };
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let Ok(ticks) = u64::try_from(ticks) else {
+        return false;
+    };
+    if ticks == 0 {
+        return false;
+    }
+    // `btime` is whole seconds and drifts slightly with clock adjustments;
+    // the slack keeps a genuine owner from looking newer than its lock.
+    boot_unix + start_ticks / ticks > acquired_unix + 2
+}
+
+#[cfg(not(target_os = "linux"))]
+fn started_after(_pid: i32, _acquired_unix: Option<u64>) -> bool {
+    false
+}
+
+/// Reads a small state file, refusing anything but a regular file and never
+/// blocking.
+///
+/// Read-only commands such as `health` and `dep-links` open many ledgers on
+/// every run; a FIFO left where a ledger or the manifest belongs would block
+/// a plain `read` forever, uninterruptibly. Opening nonblocking and checking
+/// the opened descriptor turns that into an `InvalidData` error.
+pub(crate) fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state is not a regular file: {}", path.display()),
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
 fn read_lock_owner_metadata(path: &Path) -> Option<String> {
     const MAX_LOCK_METADATA_BYTES: u64 = 4096;
 
@@ -713,7 +818,57 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{StateLock, read_private_bounded_after_metadata, temp_nonce, write_atomic};
+    use super::{
+        StateLock, read_private_bounded_after_metadata, recorded_lock_owner_alive, temp_nonce,
+        write_atomic,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_lock_owner_liveness_follows_the_recorded_pid() {
+        let dir = crate::test_support::temp_dir("shdeps-lock-owner-alive");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!recorded_lock_owner_alive(&dir), "no lock file");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let write_owner = |pid: u32, acquired: u64| {
+            fs::write(
+                StateLock::path(&dir),
+                format!("pid={pid}\nstate_dir=x\nacquired_unix={acquired}\n"),
+            )
+            .unwrap();
+        };
+        write_owner(child.id(), now);
+        assert!(recorded_lock_owner_alive(&dir));
+        if cfg!(target_os = "linux") {
+            // A process that started after the recorded acquisition reused
+            // the PID and is not the owner.
+            write_owner(child.id(), 1000);
+            assert!(!recorded_lock_owner_alive(&dir), "reused pid");
+            write_owner(child.id(), now);
+        }
+        // Another user's process (here init) can never be this user's owner.
+        if unsafe { libc::geteuid() } != 0 {
+            write_owner(1, now);
+            assert!(!recorded_lock_owner_alive(&dir), "foreign pid");
+            write_owner(child.id(), now);
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!recorded_lock_owner_alive(&dir), "reaped owner");
+
+        for bogus in ["pid=0\n", "pid=-1\n", "pid=abc\n", "state_dir=x\n"] {
+            fs::write(StateLock::path(&dir), bogus).unwrap();
+            assert!(!recorded_lock_owner_alive(&dir), "{bogus:?}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

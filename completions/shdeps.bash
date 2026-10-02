@@ -6,7 +6,7 @@ _shdeps_completion_commands() {
 }
 
 _shdeps_completion_commands_fallback() {
-  printf '%s\n' update self-update list check dep-root dep-path dep-file dep-links prune version help
+  printf '%s\n' update self-update list check dep-root dep-path dep-file dep-links health prune version help
 }
 
 _shdeps_dep_names() {
