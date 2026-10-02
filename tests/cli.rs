@@ -2264,6 +2264,46 @@ fn update_explicit_github_release_fetches_without_bare_github_cache() {
 }
 
 #[test]
+#[cfg(unix)]
+fn update_retires_extras_left_dangling_by_a_vanished_release_root() {
+    use std::os::unix::fs::symlink;
+
+    // An archive release that became a single binary leaves its old root's
+    // man/completion links behind; the fresh-stamp fast path must retire
+    // them without touching the network or anything it does not own.
+    let fixture = Fixture::new("update-retire-stale-extras");
+    fixture.write("conf/deps.conf", "owner/tool github:release tool\n");
+    fixture.write_executable("bin/tool", "#!/bin/sh\necho v1.0.0\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.dir.join("bin/tool").display()
+        ),
+    );
+    fixture.write_fresh_stamp("owner/tool", "release");
+    let stale = fixture.dir.join("share/man/man1/tool.1");
+    fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    symlink(fixture.dir.join("share/owner/tool/man/man1/tool.1"), &stale).unwrap();
+    let foreign = fixture.dir.join("share/man/man1/foreign.1");
+    symlink(fixture.dir.join("elsewhere/foreign.1"), &foreign).unwrap();
+    fixture.write(
+        "state/owner/tool.links",
+        &format!("{}\n{}\n", stale.display(), foreign.display()),
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_success(&output);
+    assert!(fs::symlink_metadata(&stale).is_err(), "stale extra retired");
+    assert!(fs::symlink_metadata(&foreign).is_ok(), "foreign link kept");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/owner/tool.links")).unwrap(),
+        format!("{}\n", foreign.display())
+    );
+}
+
+#[test]
 fn update_explicit_github_repo_does_not_fetch_release_metadata() {
     let fixture = Fixture::new("update-explicit-github-repo");
     fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");
@@ -9557,13 +9597,34 @@ impl Fixture {
         fs::write(path, content).unwrap();
     }
 
+    /// Writes an executable fixture without ever holding a write fd to it.
+    ///
+    /// Same ETXTBSY race as `test_support::write_executable` in the crate
+    /// (which this integration-test binary cannot import): a sibling test
+    /// thread that forks while `fs::write` holds the file open hands its child
+    /// a copy of that fd, and exec of the fixture then fails with "Text file
+    /// busy" until that child execs. The content goes to a `.src` sibling, a
+    /// `cp` child creates the executable and exits before we continue, and the
+    /// mode is set by path.
     fn write_executable(&self, rel: impl AsRef<Path>, content: &str) {
         let path = self.dir.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, content).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        let mut source = path.as_os_str().to_owned();
+        source.push(".src");
+        let source = PathBuf::from(source);
+        fs::write(&source, content).unwrap();
+        let copied = Command::new("cp")
+            .arg(&source)
+            .arg(&path)
+            .status()
+            .expect("cp must run to materialize an executable fixture");
+        assert!(
+            copied.success(),
+            "cp failed to materialize {}: {copied}",
+            path.display()
+        );
+        fs::remove_file(&source).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn initialize_dev_checkout(&self, short_name: &str, origin: &str) {

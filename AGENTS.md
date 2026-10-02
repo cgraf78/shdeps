@@ -122,7 +122,9 @@ test.
 
 State tracking: each dep's linked symlinks are recorded in
 `$SHDEPS_STATE_DIR/<name>.links`. On re-link (update), stale symlinks are
-cleaned before new ones are created. On prune, the hidden
+cleaned before new ones are created. When the install root is gone, update
+removes only tracked symlinks that dangle into that root and keeps anything
+re-pointed elsewhere. On prune, the hidden
 `shdeps __api unlink-extras` bridge removes all tracked symlinks.
 
 ## Hook Contract

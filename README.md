@@ -436,7 +436,7 @@ export MANPATH="$HOME/.local/share/man:$MANPATH"
 fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
 ```
 
-Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdeps prune` removes symlinks along with the dep. Updates clean stale symlinks before re-linking.
+Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdeps prune` removes symlinks along with the dep. Updates clean stale symlinks before re-linking, and retire tracked links left dangling by an install root that no longer exists.
 
 ## CLI Usage
 
