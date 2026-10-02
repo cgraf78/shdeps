@@ -350,7 +350,25 @@ pub(crate) fn install_request(
         github_release_install::explicit_archive_state(&context.roots.install_dir, request.name)?
     };
     cancellation::check()?;
-    if process::executable_path(request.public_bin)
+    // Only an unproven root can be the standalone installer's. A marked root
+    // is Shdeps' own, and the inert control directory left beside it must not
+    // influence it again: a stale `lock` there would otherwise block every
+    // later update of a correctly adopted install.
+    let standalone = if archive == github_release_install::ArchiveState::Proven {
+        standalone_layout::Standalone::None
+    } else {
+        standalone_layout::classify(&context.roots.install_dir, request.name, request.public_bin)
+    };
+    // Adopt as soon as the layout is recognized, even when the installed
+    // release is current. The installer never publishes the companions a
+    // dependency hook adds (dot's `~/.local/lib/dot`), so waiting for the next
+    // upstream release would leave a freshly bootstrapped host half-working.
+    // Adoption therefore bypasses every "already current" shortcut below and
+    // reinstalls the selected release into the Shdeps root; once the root is
+    // marked this is false and the shortcuts apply again.
+    let adopting = standalone == standalone_layout::Standalone::Adoptable;
+    if !adopting
+        && process::executable_path(request.public_bin)
         && (stamp::remote_fresh(&stamp_path, context.options.freshness())
             || checked_this_run(&stamp_path, context.options))
     {
@@ -404,13 +422,14 @@ pub(crate) fn install_request(
         });
     cancellation::check()?;
 
-    let redirect_confirms_current = context.prefetch.is_current(request.name)
-        || (!context.options.reinstall
-            && !context.prefetch.releases.contains_key(request.repo)
-            && current_version.as_deref().is_some_and(|current| {
-                github::latest_release_matches(request.repo, current, context.client)
-                    .unwrap_or(false)
-            }));
+    let redirect_confirms_current = !adopting
+        && (context.prefetch.is_current(request.name)
+            || (!context.options.reinstall
+                && !context.prefetch.releases.contains_key(request.repo)
+                && current_version.as_deref().is_some_and(|current| {
+                    github::latest_release_matches(request.repo, current, context.client)
+                        .unwrap_or(false)
+                })));
     cancellation::check()?;
     if redirect_confirms_current {
         if let Some(mutation) = context.mutation.as_deref_mut() {
@@ -507,6 +526,7 @@ pub(crate) fn install_request(
     };
     if let Some(latest) = github_release::latest_stable(releases) {
         if !context.options.reinstall
+            && !adopting
             && current_version
                 .as_deref()
                 .is_some_and(|current| github::installed_matches_tag(current, &latest.tag))
@@ -553,8 +573,6 @@ pub(crate) fn install_request(
     // Shdeps archive, but it is provably that installer's and holds the same
     // archive payload. Recognizing it lets the archive switch below adopt the
     // root instead of failing closed on every host bootstrapped that way.
-    let standalone =
-        standalone_layout::classify(&context.roots.install_dir, request.name, request.public_bin);
     #[cfg(unix)]
     if let standalone_layout::Standalone::Locked(lock) = &standalone {
         // Never race an installer publication, and never guess whether a lock
@@ -564,13 +582,12 @@ pub(crate) fn install_request(
             lock.display()
         )));
     }
-    let adoptable = standalone == standalone_layout::Standalone::Adoptable;
     let format_changed = (!is_archive(asset_kind)
-        && (archive != github_release_install::ArchiveState::None || adoptable))
+        && (archive != github_release_install::ArchiveState::None || adopting))
         || (is_archive(asset_kind)
             && context.prior_release
             && archive != github_release_install::ArchiveState::Proven
-            && !adoptable
+            && !adopting
             && github_release_install::path_entry_exists(request.public_bin)?);
     if format_changed {
         // Switching between archive and single-file releases is not a normal
@@ -593,6 +610,31 @@ pub(crate) fn install_request(
         asset_token.as_deref(),
     ) {
         Ok(bytes) => bytes,
+        Err(_)
+            if adopting
+                && !context.options.reinstall
+                && github_release_install::path_entry_exists(
+                    &context.roots.install_dir.join(request.name),
+                )?
+                && current_version.as_deref().is_some_and(|current| {
+                    github::installed_matches_tag(current, &selection.tag)
+                }) =>
+        {
+            // Adopting a current, intact standalone install is a layout
+            // repair, not a missing tool. A download failure keeps the working
+            // command and retries on the next run (no stamp refresh) instead
+            // of turning a healthy host's update red. A real upgrade, an
+            // explicit reinstall, or a root left missing by an interrupted
+            // switch still fail visibly below.
+            return Ok(ReleaseOutcome {
+                changed: false,
+                failed: false,
+                detail: current_version
+                    .map(|version| format!("{version} (standalone adoption pending)"))
+                    .unwrap_or_else(|| "standalone adoption pending".to_owned()),
+                stamp: false,
+            });
+        }
         Err(_) => return Ok(failed("release asset download failed")),
     };
     cancellation::check()?;

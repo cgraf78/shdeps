@@ -117,32 +117,6 @@ fn probe(install_base: &Path, name: &str, public: &Path) -> std::io::Result<Stan
     {
         return Ok(Standalone::None);
     }
-    // The installer holds `lock` for its whole publication. While it exists
-    // the `current` link may be mid-switch, so never interpret the tree. A
-    // killed installer leaves it behind too; report that distinctly so the
-    // owner sees what blocks the update.
-    let lock = control.join("lock");
-    if entry_exists(&lock)? {
-        return Ok(Standalone::Locked(lock));
-    }
-
-    let current = control.join("current");
-    if !fs::symlink_metadata(&current)?.file_type().is_symlink() {
-        return Ok(Standalone::None);
-    }
-    let current_target = fs::read_link(&current)?;
-    let Some(release) = single_child(&current_target, "releases") else {
-        return Ok(Standalone::None);
-    };
-    let releases = control.join("releases");
-    let release_dir = releases.join(release);
-    if !owned_entry(&releases, EntryKind::Dir)? || !owned_entry(&release_dir, EntryKind::Dir)? {
-        return Ok(Standalone::None);
-    }
-    if !metadata_names_release(&release_dir.join(format!(".{repo}-install.json")), name)? {
-        return Ok(Standalone::None);
-    }
-
     // The stable root is either the installer's exact relative link or, after
     // an interrupted fallback switch, moved aside. A parked link proves the
     // latter only when it still carries the installer's exact target. Any
@@ -164,6 +138,35 @@ fn probe(install_base: &Path, name: &str, public: &Path) -> std::io::Result<Stan
         }
         Err(error) => return Err(error),
     };
+
+    // The installer holds `lock` for its whole publication. While it exists
+    // the `current` link may be mid-switch, so never interpret the tree. A
+    // killed installer leaves it behind too; report that distinctly so the
+    // owner sees what blocks the update. This runs only after the root is
+    // known not to be someone else's (a real directory or a foreign link
+    // returned `None` above), so a lock in a leftover control directory
+    // beside an adopted root never blocks anything.
+    let lock = control.join("lock");
+    if entry_exists(&lock)? {
+        return Ok(Standalone::Locked(lock));
+    }
+
+    let current = control.join("current");
+    if !fs::symlink_metadata(&current)?.file_type().is_symlink() {
+        return Ok(Standalone::None);
+    }
+    let current_target = fs::read_link(&current)?;
+    let Some(release) = single_child(&current_target, "releases") else {
+        return Ok(Standalone::None);
+    };
+    let releases = control.join("releases");
+    let release_dir = releases.join(release);
+    if !owned_entry(&releases, EntryKind::Dir)? || !owned_entry(&release_dir, EntryKind::Dir)? {
+        return Ok(Standalone::None);
+    }
+    if !metadata_names_release(&release_dir.join(format!(".{repo}-install.json")), name)? {
+        return Ok(Standalone::None);
+    }
 
     let adoptable = match fs::symlink_metadata(public) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -442,6 +445,19 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_beside_a_root_that_is_not_the_installer_link_is_ignored() {
+        // After adoption the root is a real directory; a stale lock in the
+        // leftover control directory must not turn that into `Locked`.
+        let root = temp_dir("standalone-lock-real-root");
+        let (base, public) = standalone(&root);
+        fs::create_dir(base.join("cgraf78/.dot-standalone/lock")).unwrap();
+        fs::remove_file(base.join("cgraf78/dot")).unwrap();
+        fs::create_dir(base.join("cgraf78/dot")).unwrap();
+
+        assert_none(&base, &public, "a real root ignores the leftover lock");
+    }
+
+    #[test]
     fn rejects_a_missing_root_without_a_command_into_the_release() {
         let root = temp_dir("standalone-nothing-to-adopt");
         let (base, public) = standalone(&root);
@@ -520,7 +536,13 @@ mod tests {
         let root = temp_dir("standalone-escaping-current");
         let (base, public) = standalone(&root);
         let current = base.join("cgraf78/.dot-standalone/current");
-        for target in ["releases/../owner", "../dot-standalone-copy", "releases"] {
+        for target in [
+            "releases/../owner",
+            "../dot-standalone-copy",
+            "releases",
+            "releases/../releases/20260929-074025-4fd04934-linux-x86_64-musl",
+            "./releases/20260929-074025-4fd04934-linux-x86_64-musl",
+        ] {
             fs::remove_file(&current).unwrap();
             symlink(target, &current).unwrap();
             assert_none(&base, &public, &format!("current -> {target}"));

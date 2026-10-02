@@ -698,7 +698,10 @@ fn install_archive(
 /// command is first pointed straight at the binary it currently runs and the
 /// link is parked under a fixed name ([`parked_root_link`]), so a crash
 /// between the two renames is recognizable and the next update finishes the
-/// switch and removes the parked link.
+/// switch and removes the parked link. A regular launcher (dot's
+/// `client-launcher.sh`) cannot be re-pointed, so on that fallback path a
+/// crash exactly between the renames leaves it failing until Shdeps runs
+/// again; the exchange path has no such window.
 fn switch_root(
     content_root: &Path,
     install_dir: &Path,
@@ -774,43 +777,69 @@ pub(crate) fn parked_root_link(install_dir: &Path) -> PathBuf {
     install_dir.with_file_name(name)
 }
 
+/// Whether this build may attempt an atomic path exchange at all.
+///
+/// Android is excluded by owner policy: before Android 11 the app seccomp
+/// policy may kill the process with SIGSYS on `renameat2`, and a signal is not
+/// an error the fallback could catch, so the standalone adoption switch never
+/// risks it and Termux always takes the park-and-resume path. (Other
+/// `repo_transition` callers predate this policy and are not changed here.)
+/// Non-Unix platforms have no exchange primitive.
+pub(crate) const ATOMIC_EXCHANGE_ALLOWED: bool = cfg!(all(unix, not(target_os = "android")));
+
 /// Atomically swaps two existing paths on the same filesystem, or fails without
-/// changing either. Callers must treat every error as "not swapped": kernels
-/// before 3.15, filesystems without exchange support, and HFS+ all decline.
-#[cfg(unix)]
+/// changing either.
+///
+/// Callers must treat every error as "not swapped" and fall back: kernels
+/// before 3.15 report ENOSYS, and filesystems without exchange support (WSL1
+/// drvfs, NFS, older ZFS, overlay stacks, HFS+) report EINVAL, EOPNOTSUPP, or
+/// EXDEV. A failed `renameat2`/`renamex_np` never changes either path.
 fn exchange_paths(left: &Path, right: &Path) -> io::Result<()> {
     #[cfg(test)]
     {
-        if EXCHANGE_DISABLED.with(std::cell::Cell::get) {
-            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        if let Some(errno) = EXCHANGE_FAULT.with(std::cell::Cell::get) {
+            return Err(io::Error::from_raw_os_error(errno));
         }
     }
-    crate::repo_transition::rename_exchange(left, right)
-}
-
-#[cfg(not(unix))]
-fn exchange_paths(_left: &Path, _right: &Path) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
+    if !ATOMIC_EXCHANGE_ALLOWED {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    }
+    #[cfg(unix)]
+    {
+        crate::repo_transition::rename_exchange(left, right)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Lets tests exercise the fallback switch on platforms that can exchange.
-    static EXCHANGE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Errno a test injects in place of the exchange syscall's result.
+    static EXCHANGE_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
-/// Runs `body` with atomic exchange disabled on this thread (tests only).
+/// Runs `body` with every exchange on this thread failing with `errno`, the
+/// way a kernel or filesystem without support would (tests only).
 #[cfg(test)]
-pub(crate) fn without_exchange<T>(body: impl FnOnce() -> T) -> T {
+pub(crate) fn with_exchange_errno<T>(errno: i32, body: impl FnOnce() -> T) -> T {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
-            EXCHANGE_DISABLED.with(|disabled| disabled.set(false));
+            EXCHANGE_FAULT.with(|fault| fault.set(None));
         }
     }
-    EXCHANGE_DISABLED.with(|disabled| disabled.set(true));
+    EXCHANGE_FAULT.with(|fault| fault.set(Some(errno)));
     let _restore = Restore;
     body()
+}
+
+/// Runs `body` as if this platform could not exchange paths (tests only).
+#[cfg(test)]
+pub(crate) fn without_exchange<T>(body: impl FnOnce() -> T) -> T {
+    with_exchange_errno(libc::ENOSYS, body)
 }
 
 /// Before a symlinked root is renamed away, points a public command symlink
@@ -2005,17 +2034,19 @@ mod tests {
         let parked =
             super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap();
 
-        // Linux CI temp filesystems (ext4/tmpfs/btrfs) all exchange: the old
-        // link is parked at the staged path and the public command was never
-        // re-pointed. APFS may decline a directory/symlink swap, which takes
-        // the (separately tested) fallback with the same end state.
-        if cfg!(target_os = "linux") || parked.as_deref() == Some(staged.as_path()) {
+        // Whether the exchange path ran depends on the test filesystem, not on
+        // the code: tmpfs/ext4/btrfs/APFS exchange, while NFS, WSL1 drvfs, or
+        // older ZFS decline. Assert whichever switch this filesystem selects.
+        if exchange_supported(root.parent().unwrap()) {
             assert_eq!(parked.as_deref(), Some(staged.as_path()));
             assert_eq!(
                 fs::read_link(&staged).unwrap(),
                 std::path::Path::new(".tool-standalone/releases/old")
             );
             assert_eq!(fs::read_link(&public).unwrap(), root.join("tool"));
+        } else {
+            assert_eq!(parked, Some(super::parked_root_link(&root)));
+            assert_eq!(fs::read_link(&public).unwrap(), old_binary);
         }
         assert!(
             !fs::symlink_metadata(&root)
@@ -2028,6 +2059,69 @@ mod tests {
             "#!/bin/sh\necho new\n"
         );
         assert!(old_binary.is_file(), "the old release is never touched");
+    }
+
+    /// Probes whether this build and filesystem can exchange a directory with
+    /// a symlink, the exact shape `switch_root` swaps.
+    #[cfg(unix)]
+    fn exchange_supported(dir: &std::path::Path) -> bool {
+        let probe_dir = dir.join(".exchange-probe-dir");
+        let probe_link = dir.join(".exchange-probe-link");
+        fs::create_dir_all(&probe_dir).unwrap();
+        let _ = fs::remove_file(&probe_link);
+        symlink("target", &probe_link).unwrap();
+        let supported = super::exchange_paths(&probe_dir, &probe_link).is_ok();
+        let _ = fs::remove_file(&probe_dir);
+        let _ = fs::remove_dir(&probe_dir);
+        let _ = fs::remove_file(&probe_link);
+        let _ = fs::remove_dir(&probe_link);
+        supported
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_root_switch_falls_back_for_every_unsupported_exchange_errno() {
+        // Kernels without renameat2 (ENOSYS) and filesystems without exchange
+        // support (EINVAL on NFS/WSL1 drvfs, EOPNOTSUPP on older ZFS, EXDEV on
+        // overlay stacks) must select the park-and-resume switch, never fail.
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP, libc::EXDEV] {
+            let (staged, root, old_binary, public) =
+                symlinked_root_fixture(&format!("switch-errno-{errno}"));
+
+            let parked = super::with_exchange_errno(errno, || {
+                super::switch_root(&staged, &root, &public, std::path::Path::new("tool"))
+            })
+            .unwrap_or_else(|error| panic!("errno {errno} must fall back: {error}"));
+
+            assert_eq!(
+                parked,
+                Some(super::parked_root_link(&root)),
+                "errno {errno}"
+            );
+            assert_eq!(fs::read_link(&public).unwrap(), old_binary, "errno {errno}");
+            assert!(
+                !fs::symlink_metadata(&root)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "errno {errno}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "android")]
+    fn symlinked_root_switch_never_attempts_exchange_on_android() {
+        // Termux CI: the exchange syscall may be fatal under older app seccomp
+        // policies, so the build must select the fallback without trying it.
+        assert!(!super::ATOMIC_EXCHANGE_ALLOWED);
+        let (staged, root, old_binary, public) = symlinked_root_fixture("switch-android");
+
+        let parked =
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap();
+
+        assert_eq!(parked, Some(super::parked_root_link(&root)));
+        assert_eq!(fs::read_link(&public).unwrap(), old_binary);
     }
 
     #[test]
@@ -2096,6 +2190,22 @@ mod tests {
             super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap()
         });
         assert_eq!(fs::read_link(&public).unwrap(), foreign);
+
+        // A non-canonical spelling of a foreign target would be rewritten to
+        // its canonical form if the "resolves into the root" filter were lost,
+        // so this also pins that filter, not just the final target.
+        let (staged, root, _old_binary, public) =
+            symlinked_root_fixture("switch-fallback-foreign-noncanonical");
+        let foreign = public.with_file_name("elsewhere");
+        crate::test_support::write_executable(&foreign, "#!/bin/sh\n");
+        let spelled = public.parent().unwrap().join("../bin/elsewhere");
+        fs::remove_file(&public).unwrap();
+        symlink(&spelled, &public).unwrap();
+
+        super::without_exchange(|| {
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap()
+        });
+        assert_eq!(fs::read_link(&public).unwrap(), spelled);
     }
 
     #[test]

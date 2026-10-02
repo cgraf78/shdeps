@@ -9608,9 +9608,71 @@ version() { printf 'saw-pkg\n'; }
     #[test]
     #[cfg(unix)]
     fn update_github_release_standalone_download_failure_leaves_layout_untouched() {
-        let mut fixture = Fixture::new("release-standalone-download-failure");
+        // Adopting a current, intact install repairs a working layout, so a
+        // download failure keeps the command, reports the pending adoption
+        // without failing the run, and leaves the stamp stale for a retry.
+        // The same failure during a real upgrade still fails visibly.
+        for (installed, should_fail) in [(STANDALONE_NEW, false), (STANDALONE_OLD, true)] {
+            let mut fixture = Fixture::new(&format!("release-standalone-download-{installed}"));
+            fixture.write_lib();
+            let (_control, _old_release, public) = write_standalone_dot(&fixture);
+            let manifest_path = manifest::path(&fixture.roots.state_dir);
+            record_dot_release(&fixture, &manifest_path);
+            let asset = format!("dot-{STANDALONE_NEW}-linux-x86_64-musl.tar.gz");
+            let url = format!(
+                "https://github.com/cgraf78/dot/releases/download/{STANDALONE_NEW}/{asset}"
+            );
+            fixture.client = FakeClient::default().with(
+                "https://api.github.com/repos/cgraf78/dot/releases?per_page=100",
+                release_asset_response(&asset, STANDALONE_NEW, &url),
+            );
+
+            let summary = run_dot_update(
+                &fixture,
+                &manifest_path,
+                &standalone_dot_runner_reporting(installed),
+            );
+
+            assert_eq!(summary.has_errors(), should_fail, "{summary:#?}");
+            assert!(!summary.items[0].changed);
+            if !should_fail {
+                assert!(
+                    summary.items[0]
+                        .detail
+                        .contains("standalone adoption pending"),
+                    "{summary:#?}"
+                );
+            }
+            assert!(
+                !stamp::remote_path(&fixture.roots.state_dir, "cgraf78/dot", "release").exists(),
+                "a pending adoption must be retried, not cached as current"
+            );
+            let root = fixture.roots.install_dir.join("cgraf78/dot");
+            assert_eq!(
+                fs::read_link(&root).unwrap(),
+                Path::new(".dot-standalone/current")
+            );
+            assert_eq!(fs::read_link(&public).unwrap(), root.join("dot"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_standalone_download_failure_with_a_parked_root_fails() {
+        // An interrupted fallback switch left only the parked link, so a
+        // regular launcher in front of the root no longer runs even though it
+        // is an executable file. A download failure there must stay visible.
+        let mut fixture = Fixture::new("release-standalone-download-parked");
         fixture.write_lib();
         let (_control, _old_release, public) = write_standalone_dot(&fixture);
+        let root = fixture.roots.install_dir.join("cgraf78/dot");
+        fs::rename(
+            &root,
+            crate::github_release_install::parked_root_link(&root),
+        )
+        .unwrap();
+        fs::remove_file(&public).unwrap();
+        crate::test_support::write_executable(&public, "#!/bin/sh\nexec launcher\n");
         let manifest_path = manifest::path(&fixture.roots.state_dir);
         record_dot_release(&fixture, &manifest_path);
         let asset = format!("dot-{STANDALONE_NEW}-linux-x86_64-musl.tar.gz");
@@ -9621,15 +9683,113 @@ version() { printf 'saw-pkg\n'; }
             release_asset_response(&asset, STANDALONE_NEW, &url),
         );
 
-        let summary = run_dot_update(&fixture, &manifest_path, &standalone_dot_runner());
-
-        assert!(summary.has_errors());
-        let root = fixture.roots.install_dir.join("cgraf78/dot");
-        assert_eq!(
-            fs::read_link(&root).unwrap(),
-            Path::new(".dot-standalone/current")
+        let summary = run_dot_update(
+            &fixture,
+            &manifest_path,
+            &standalone_dot_runner_reporting(STANDALONE_NEW),
         );
-        assert_eq!(fs::read_link(&public).unwrap(), root.join("dot"));
+
+        assert!(summary.has_errors(), "{summary:#?}");
+    }
+
+    fn standalone_dot_runner_reporting(version: &str) -> FakeRunner {
+        FakeRunner::default()
+            .with_success("dot", ["--version"], &format!("dot {version}\n"))
+            .with_success("uname", ["-m"], "x86_64\n")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_adopts_standalone_layout_when_already_current() {
+        // A freshly bootstrapped host runs the latest release already. It must
+        // still be adopted now (reinstalling that release into the Shdeps
+        // root so post hooks run), not at some future upstream release.
+        let mut fixture = Fixture::new("release-standalone-current");
+        fixture.write_lib();
+        let (control, old_release, public) = write_standalone_dot(&fixture);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        record_dot_release(&fixture, &manifest_path);
+        fixture.client =
+            standalone_dot_client(STANDALONE_NEW, standalone_dot_archive(STANDALONE_NEW));
+        let runner = standalone_dot_runner_reporting(STANDALONE_NEW);
+
+        let summary = run_dot_update(&fixture, &manifest_path, &runner);
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert!(summary.items[0].changed, "adoption must run post hooks");
+        assert_adopted(&fixture, &control, &old_release, &public);
+
+        // Converged: the marked root takes the ordinary "current" path.
+        let again = run_dot_update(&fixture, &manifest_path, &runner);
+        assert!(!again.has_errors(), "{again:#?}");
+        assert!(!again.items[0].changed);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_adopts_standalone_layout_despite_a_fresh_stamp() {
+        let mut fixture = Fixture::new("release-standalone-fresh-stamp");
+        fixture.write_lib();
+        let (control, old_release, public) = write_standalone_dot(&fixture);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        record_dot_release(&fixture, &manifest_path);
+        stamp::remote_touch(
+            &stamp::remote_path(&fixture.roots.state_dir, "cgraf78/dot", "release"),
+            Options::default().now,
+        )
+        .unwrap();
+        fixture.client =
+            standalone_dot_client(STANDALONE_NEW, standalone_dot_archive(STANDALONE_NEW));
+
+        let summary = run_dot_update(
+            &fixture,
+            &manifest_path,
+            &standalone_dot_runner_reporting(STANDALONE_NEW),
+        );
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert_adopted(&fixture, &control, &old_release, &public);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_ignores_a_stale_lock_beside_an_adopted_root() {
+        // The leftover control directory is inert after adoption. A lock left
+        // there by a killed installer must not block later upgrades of the
+        // marked Shdeps root.
+        let mut fixture = Fixture::new("release-standalone-stale-lock");
+        fixture.write_lib();
+        let (control, old_release, public) = write_standalone_dot(&fixture);
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        record_dot_release(&fixture, &manifest_path);
+        fixture.client =
+            standalone_dot_client(STANDALONE_NEW, standalone_dot_archive(STANDALONE_NEW));
+        let adopted = run_dot_update(&fixture, &manifest_path, &standalone_dot_runner());
+        assert!(!adopted.has_errors(), "{adopted:#?}");
+        assert_adopted(&fixture, &control, &old_release, &public);
+        fs::create_dir(control.join("lock")).unwrap();
+        // Expire the adoption's freshness stamp so the next run really checks
+        // upstream instead of taking the TTL shortcut.
+        let _ = fs::remove_file(stamp::remote_path(
+            &fixture.roots.state_dir,
+            "cgraf78/dot",
+            "release",
+        ));
+        let newer = "20261003-000000-0badc0de";
+        fixture.client = standalone_dot_client(newer, standalone_dot_archive(newer));
+
+        let summary = run_dot_update(
+            &fixture,
+            &manifest_path,
+            &standalone_dot_runner_reporting(STANDALONE_NEW),
+        );
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert!(summary.items[0].changed);
+        assert_eq!(
+            fs::read_to_string(fixture.roots.install_dir.join("cgraf78/dot/dot")).unwrap(),
+            format!("#!/bin/sh\necho dot {newer}\n")
+        );
     }
 
     #[test]
