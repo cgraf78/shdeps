@@ -24,6 +24,7 @@ use crate::dep_links;
 use crate::dep_path;
 use crate::errors::Error;
 use crate::github_method;
+use crate::health;
 use crate::hooks::{BashCustomProbe, Uninstall};
 use crate::http::Curl;
 use crate::jobs;
@@ -85,6 +86,10 @@ pub const PUBLIC_COMMANDS: &[PublicCommand] = &[
         description: "Print public command links owned by a dependency",
     },
     PublicCommand {
+        name: "health",
+        description: "Report problems with installed dependencies",
+    },
+    PublicCommand {
         name: "prune",
         description: "Remove orphaned deps no longer in config",
     },
@@ -114,6 +119,7 @@ Commands:
   dep-path <name> <rel>  Print a path below a configured dependency root
   dep-file <name> <rel>  Print a readable regular file below a dependency root
   dep-links <name>       Print public command links owned by a dependency
+  health                 Report problems with installed dependencies
   prune                  Remove orphaned deps no longer in config
   version                Print shdeps version
   help                   Show this help message
@@ -139,11 +145,19 @@ Examples:
   shdeps check jq
   shdeps prune --dry-run
   shdeps prune -y
+  shdeps health
+
+Health output (stable): one problem per line, exactly five tab-separated
+fields: <severity> <package> <kind> <path> <detail>
+  severity is fail or warn; package and path are - when not applicable.
+  New kinds may be added; ignore unknown kinds. Healthy prints nothing.
+  Local reads only: no network, hooks, writes, or locks.
 
 Exit codes:
-  0  Success
-  1  Error
+  0  Success (health: no problems)
+  1  Error (health: problems reported)
   2  Usage error
+  3  health: report incomplete (state unreadable, or output not written)
   128+N  Interrupted by signal N after owned subprocess cleanup
 ";
 
@@ -217,6 +231,7 @@ where
         "dep-links" => dep_links_cmd(rest, &parsed, stdout, stderr),
         "list" => list_cmd(rest, &parsed, stdout, stderr),
         "check" => check_cmd(rest, &parsed, stdout, stderr),
+        "health" => health_cmd(rest, &parsed, stdout, stderr),
         "__api" => api::run(rest, &parsed.overrides, stdout, stderr),
         "migrate" => {
             writeln!(
@@ -531,6 +546,43 @@ where
 
     write_check(&dependency, stdout)?;
     Ok(check_exit_code(&dependency.state))
+}
+
+fn health_cmd<W, E>(
+    args: &[String],
+    options: &ParsedOptions,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<i32>
+where
+    W: Write,
+    E: Write,
+{
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("-h" | "--help") => {
+            write!(stdout, "{HELP}")?;
+            return Ok(0);
+        }
+        Some(extra) => {
+            // Global options belong before the command (`shdeps -c DIR health`).
+            writeln!(stderr, "error: health takes no arguments (got '{extra}')")?;
+            writeln!(stderr, "Usage: shdeps [options] health")?;
+            return Ok(2);
+        }
+    }
+
+    let roots = runtime::roots(&ProcessEnv, &options.overrides);
+    let (pkg_mgr, env) = detected_runtime_env();
+    let report = health::check(&roots, &env, &pkg_mgr);
+    // A report that could not be written is incomplete, the same contract as
+    // unreadable state; exit 1 would let a caller read "no fail rows" as an
+    // apparently healthy host.
+    if let Err(error) = health::write_tsv(&report, stdout).and_then(|()| Ok(stdout.flush()?)) {
+        let _ = writeln!(stderr, "error: cannot write health report: {error}");
+        return Ok(health::EXIT_UNREADABLE);
+    }
+    Ok(report.exit_code())
 }
 
 fn update_cmd<W, E>(
