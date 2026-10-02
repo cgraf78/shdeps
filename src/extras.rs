@@ -584,6 +584,28 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn cleanup_failure_never_fails_the_link_call() {
+        // A missing root was always `Ok`; an unreadable ledger must not turn
+        // a raw release's every update into an install failure.
+        let dir = temp_dir("advisory-cleanup");
+        let state = dir.join("state");
+        let ledger = link_state::path(&state, "owner/tool", Kind::Extras);
+        fs::create_dir_all(&ledger).unwrap();
+
+        let created = super::link(
+            &state,
+            &dir.join("xdg"),
+            "owner/tool",
+            &dir.join("share/owner/tool"),
+        )
+        .unwrap();
+
+        assert!(created.is_empty());
+        assert!(ledger.is_dir(), "the unreadable ledger is left alone");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn uninspectable_entries_keep_their_ownership() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
