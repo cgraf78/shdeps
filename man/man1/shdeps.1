@@ -1,4 +1,4 @@
-.TH SHDEPS 1 "2026-09-29" "shdeps" "User Commands"
+.TH SHDEPS 1 "2026-10-02" "shdeps" "User Commands"
 .SH NAME
 shdeps \- declarative shell dependency manager
 .SH SYNOPSIS
@@ -54,6 +54,54 @@ and
 .I target-path
 rows. The lookup is local and does not run hooks, package-manager probes,
 network requests, or version commands.
+.TP
+.B health
+Report problems with installed dependencies.
+Reads only local config and state: no network, hooks, package-manager
+queries, writes, or locks.
+A healthy host prints nothing; otherwise each problem is one line of exactly
+five tab-separated fields:
+.IR severity ,
+.IR package ,
+.IR kind ,
+.IR path ,
+and
+.IR detail .
+.I severity
+is
+.B fail
+or
+.BR warn ;
+.I package
+and
+.I path
+are
+.B \-
+when not applicable; tabs and newlines inside a field become spaces.
+Stable
+.I kind
+tokens:
+.BR not-executable ,
+.BR install-root-unmanaged ,
+and
+.B unreadable-state
+(fail);
+.BR missing-binlink ,
+.BR dangling-binlink ,
+.BR wrong-target ,
+.BR dangling-link ,
+.BR not-installed ,
+.BR archive-backup ,
+.BR deferred-post ,
+.BR deferred-uninstall ,
+.BR pending-post ,
+and
+.B recovery-state
+(warn).
+Later releases may add kinds, never columns; ignore unknown kinds.
+Exits 0 when healthy, 1 when problems are reported, and 3 when the report is
+incomplete because some state could not be read or the report could not be
+written.
 .TP
 .B prune
 Remove orphaned dependencies that are no longer present in any config file,
@@ -564,9 +612,18 @@ Success.
 .TP
 .B 1
 Error (dependency not found, install failure, etc.).
+For
+.BR health :
+problems were reported.
 .TP
 .B 2
 Usage error (unknown command or missing argument).
+.TP
+.B 3
+.B health
+report is incomplete: some config or state could not be read (an
+.B unreadable-state
+row is printed) or the report could not be written.
 .TP
 .BI 128+ N
 Interrupted by signal

@@ -7,7 +7,6 @@
 //! mistaken for valid install state.
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -242,7 +241,7 @@ pub fn path(state_dir: &Path) -> PathBuf {
 
 /// Reads a manifest file. Missing files are empty manifests.
 pub fn read(path: &Path) -> Result<Manifest> {
-    match fs::read_to_string(path) {
+    match state::read_regular_to_string(path) {
         Ok(content) => Ok(Manifest::parse(&content)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
         Err(error) => Err(error.into()),

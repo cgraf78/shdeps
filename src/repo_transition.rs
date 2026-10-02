@@ -666,6 +666,11 @@ pub(crate) fn finish_fresh_recovery(
     remove_fresh_index(state_dir, checkout, ownership)
 }
 
+/// Returns the fresh-publication index directory under a state directory.
+pub(crate) fn fresh_index_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(FRESH_INDEX_DIR)
+}
+
 /// Enumerates durable fresh-publication ownership independently of current
 /// configuration. The index is written before the checkout rename, so an
 /// interrupted first install remains discoverable even if its dependency is

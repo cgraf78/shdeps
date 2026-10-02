@@ -350,7 +350,12 @@ impl DurableTransition {
 }
 
 fn durable_transition_dir(roots: &Roots) -> PathBuf {
-    roots.state_dir.join(DURABLE_TRANSITION_DIR)
+    transition_dir(&roots.state_dir)
+}
+
+/// Returns the durable method-transition directory under a state directory.
+pub(crate) fn transition_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(DURABLE_TRANSITION_DIR)
 }
 
 /// Reports whether method-transition state exists without validating it.

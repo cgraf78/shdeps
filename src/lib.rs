@@ -32,6 +32,7 @@ pub mod github_gate;
 pub mod github_method;
 pub mod github_release;
 pub mod github_release_install;
+pub mod health;
 pub mod hook_toolkit;
 pub mod hooks;
 pub mod http;

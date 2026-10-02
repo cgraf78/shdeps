@@ -68,19 +68,33 @@ pub fn links(target: &str, roots: &Roots, env: &RuntimeEnv) -> Result<Vec<Depend
     };
 
     let manifest = manifest::read(&manifest::path(&roots.state_dir))?;
-    let concrete_method = concrete_method(&entry.method, &entry.name, &manifest);
+    links_for_entry(&entry, roots, &manifest)
+}
+
+/// Resolves public command links for an already-loaded active config entry.
+///
+/// `shdeps health` walks every configured dependency; taking the entry and
+/// manifest from the caller keeps that one config load and one manifest read
+/// instead of one per dependency, while `dep-links` and health share a single
+/// definition of the expected links.
+pub(crate) fn links_for_entry(
+    entry: &config::Entry,
+    roots: &Roots,
+    manifest: &manifest::Manifest,
+) -> Result<Vec<DependencyLink>> {
+    let concrete_method = concrete_method(&entry.method, &entry.name, manifest);
 
     if concrete_method == method::GITHUB_REPO {
-        return repo_links(target, roots, env);
+        return repo_links(entry, roots);
     }
 
     if method::is_binary_install_root(&concrete_method) {
-        let tracked = tracked_bin_links(&entry, roots)?;
+        let tracked = tracked_bin_links(entry, roots)?;
         if !tracked.is_empty() {
             return Ok(tracked);
         }
 
-        let Some(target_path) = binary_target(&entry, roots, &manifest) else {
+        let Some(target_path) = binary_target(entry, roots, manifest) else {
             return Err(ResolveError::NotFound.into());
         };
         return Ok(vec![DependencyLink {
@@ -93,7 +107,13 @@ pub fn links(target: &str, roots: &Roots, env: &RuntimeEnv) -> Result<Vec<Depend
     Ok(Vec::new())
 }
 
-fn concrete_method(configured_method: &str, name: &str, manifest: &manifest::Manifest) -> String {
+/// Translates a bare `github` config method to the method the last update
+/// installed, defaulting to a repo checkout when nothing is recorded.
+pub(crate) fn concrete_method(
+    configured_method: &str,
+    name: &str,
+    manifest: &manifest::Manifest,
+) -> String {
     if configured_method == method::GITHUB {
         manifest
             .get(name)
@@ -104,8 +124,8 @@ fn concrete_method(configured_method: &str, name: &str, manifest: &manifest::Man
     }
 }
 
-fn repo_links(target: &str, roots: &Roots, env: &RuntimeEnv) -> Result<Vec<DependencyLink>> {
-    let root = dep_path::root(target, &roots.dep_path_roots(), env)?;
+fn repo_links(entry: &config::Entry, roots: &Roots) -> Result<Vec<DependencyLink>> {
+    let root = dep_path::repo_root(entry, &roots.dep_path_roots()).ok_or(ResolveError::NotFound)?;
     let source_dir = root.join("bin");
     let Ok(entries) = fs::read_dir(&source_dir) else {
         return Ok(Vec::new());

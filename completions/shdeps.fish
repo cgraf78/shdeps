@@ -14,6 +14,7 @@ function __shdeps_commands
         dep-path 'Print a path below a configured dependency root' \
         dep-file 'Print a readable regular file below a dependency root' \
         dep-links 'Print public command links owned by a dependency' \
+        health 'Report problems with installed dependencies' \
         prune 'Remove orphaned deps no longer in config' \
         version 'Print shdeps version' \
         help 'Show this help message'

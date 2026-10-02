@@ -242,6 +242,75 @@ fn dep_links_usage_and_missing_dependency_exit_codes_are_machine_clean() {
 }
 
 #[test]
+#[cfg(unix)]
+fn health_flags_exactly_the_release_root_update_refuses() {
+    use std::os::unix::fs::symlink;
+
+    // `health` and `update` must agree: the root health reports is the one
+    // update refuses, and the remediation health prints makes update succeed.
+    let fixture = Fixture::new("health-update-agreement");
+    let asset = format!("{}.tar.gz", host_linux_asset("tool", "v1.0.0"));
+    fixture.write("conf/deps.conf", "owner/tool github:release tool\n");
+    fixture.write_fake_curl(&release_json("v1.0.0", &[asset.as_str()]), "");
+    write_tar_gz(
+        &fixture.dir.join("fake/asset"),
+        &[("tool-v1.0.0/bin/tool", "#!/bin/sh\necho v1.0.0\n", 0o755)],
+    );
+    // Another installer's layout: the stable root links to its own release.
+    fixture.write_executable(
+        "share/owner/.tool-standalone/releases/v0/tool",
+        "#!/bin/sh\necho v0.9.0\n",
+    );
+    symlink(
+        "releases/v0",
+        fixture.dir.join("share/owner/.tool-standalone/current"),
+    )
+    .unwrap();
+    let root = fixture.dir.join("share/owner/tool");
+    symlink(".tool-standalone/current", &root).unwrap();
+    let public = fixture.dir.join("bin/tool");
+    fs::create_dir_all(public.parent().unwrap()).unwrap();
+    symlink(root.join("tool"), &public).unwrap();
+    fixture.write(
+        "state/manifest",
+        &format!("owner/tool|github:release|tool|{}\n", public.display()),
+    );
+
+    let health = run(&mut fixture.command(["health"]));
+    assert_eq!(health.status.code(), Some(1), "{}", text(&health.stdout));
+    let row = text(&health.stdout);
+    let fields = row.trim_end().split('\t').collect::<Vec<_>>();
+    assert_eq!(
+        fields[..4],
+        [
+            "fail",
+            "owner/tool",
+            "install-root-unmanaged",
+            root.to_str().unwrap()
+        ]
+    );
+
+    let refused = run(&mut fixture.command(["update"]));
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        format!("{}{}", text(&refused.stdout), text(&refused.stderr))
+            .contains("release asset format changed"),
+        "stdout={} stderr={}",
+        text(&refused.stdout),
+        text(&refused.stderr)
+    );
+
+    // The remediation the row prints: move the root and public command aside.
+    fs::remove_file(&root).unwrap();
+    fs::remove_file(&public).unwrap();
+    let updated = run(&mut fixture.command(["update"]));
+    assert_success(&updated);
+    let healthy = run(&mut fixture.command(["health"]));
+    assert_success(&healthy);
+    assert_eq!(text(&healthy.stdout), "");
+}
+
+#[test]
 fn read_only_api_outputs_machine_clean_lines() {
     let fixture = Fixture::new("api");
     fixture.write("conf/deps.conf", "owner/tool.git github:repo\njq pkg\n");
