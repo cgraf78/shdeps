@@ -180,6 +180,15 @@ pub(crate) enum UpgradeBlocker {
     /// The marker exists but is not a regular file with the known content;
     /// every update fails closed on it.
     InvalidMarker(String),
+    /// The standalone release installer's publication lock exists (an
+    /// `install.sh` is running, or one was killed and left it), so the update
+    /// refuses to interpret the installer's tree. Only Unix hosts run the
+    /// installer.
+    #[cfg(unix)]
+    InstallerLocked {
+        /// The lock path to remove once no installer runs.
+        lock: PathBuf,
+    },
 }
 
 /// Read-only twin of the release update's layout gate.
@@ -189,9 +198,10 @@ pub(crate) enum UpgradeBlocker {
 /// format changed" migration when, from the same `archive_state` snapshot, a
 /// raw asset meets any state other than `None`, or an archive asset meets a
 /// root that is not `Proven` while the public command path exists. Without
-/// network the asset kind is unknown, so this reports roots that block at
-/// least one kind, except the one shape that is normal for the other: no root
-/// beside a regular public file is a healthy raw release. (A symlinked or
+/// network the asset kind is unknown, so this assumes the next asset keeps
+/// the root's current layout: a proven or installer-owned archive root and a
+/// rootless regular public file (a raw release) are healthy, and every other
+/// root that blocks either kind is reported. (A symlinked or
 /// unmarked root beside a regular launcher still blocks archive upgrades and
 /// is reported; that is the legacy-launcher shape of a standalone install.)
 /// Before the first recorded release only the explicit marker is read, and
@@ -199,10 +209,16 @@ pub(crate) enum UpgradeBlocker {
 /// takes no lock, so diagnostics may run beside an update; a root a
 /// concurrent update is swapping can classify either way for that instant.
 ///
-/// The predicate is restated here rather than shared with `install_request`
-/// because that gate is being extended to adopt standalone-installer roots;
-/// once that lands both should call one pure gate. The CLI parity test
-/// `health_flags_exactly_the_release_root_update_refuses` pins agreement.
+/// A root the cgraf78/actions standalone installer provably owns
+/// (`standalone_layout::classify`) is adopted by the archive switch, so it is
+/// not blocked, including an adoption interrupted with the root link parked;
+/// while that installer's lock exists the update refuses, so that is
+/// reported. The installer only publishes archives, so a raw asset over its
+/// root is an unknowable format change like any other.
+///
+/// The predicate is restated here rather than shared with `install_request`;
+/// the CLI parity test `health_agrees_with_update_on_every_release_root`
+/// runs both against each root shape and pins agreement.
 pub(crate) fn upgrade_blocker(
     state_dir: &Path,
     install_base: &Path,
@@ -221,6 +237,16 @@ pub(crate) fn upgrade_blocker(
             }
             Err(error) => return Err(error),
         }
+    }
+    // The update consults the installer layout on every release request,
+    // before and after the first recorded install.
+    match crate::standalone_layout::classify(install_base, name, public) {
+        crate::standalone_layout::Standalone::Adoptable => return Ok(None),
+        #[cfg(unix)]
+        crate::standalone_layout::Standalone::Locked(lock) => {
+            return Ok(Some(UpgradeBlocker::InstallerLocked { lock }));
+        }
+        crate::standalone_layout::Standalone::None => {}
     }
     if !prior_release {
         // Before the first recorded release install the update consults only

@@ -649,6 +649,8 @@ fn transient_records_are_suppressed_while_an_update_holds_the_lock() {
     fixture.healthy_release("owner/tool", "tool");
     fixture.write("state/.pending-posts/owner/tool", "pending\n");
     fixture.write("state/.method-transitions-v1/abc.json", "{}\n");
+    // A swap still deleting the old tree keeps its backup until it finishes.
+    fixture.write("share/owner/tool.shdeps-archive-backup-1-2/bin/tool", "");
     let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
     fixture.write(
         "state/.lock",
@@ -666,7 +668,11 @@ fn transient_records_are_suppressed_while_an_update_holds_the_lock() {
 
     assert_exit(&running, 0);
     assert_exit(&finished, 1);
-    assert_eq!(rows(&finished).len(), 2);
+    let kinds = rows(&finished)
+        .into_iter()
+        .map(|row| row[2].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["recovery-state", "archive-backup", "pending-post"]);
 }
 
 #[test]

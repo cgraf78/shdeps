@@ -618,6 +618,13 @@ impl<'a> Scan<'a> {
                     UpgradeBlocker::InvalidMarker(reason) => {
                         format!("{reason}, so updates fail; {aside}")
                     }
+                    // Never advise moving an installer-owned root aside: the
+                    // update adopts it once the lock is gone.
+                    #[cfg(unix)]
+                    UpgradeBlocker::InstallerLocked { lock } => format!(
+                        "standalone installer lock {} blocks updates; remove it if no install.sh is running, then run 'shdeps update'",
+                        lock.display()
+                    ),
                 };
                 self.push(
                     ProblemKind::InstallRootUnmanaged,
@@ -785,5 +792,52 @@ fn non_empty_dir(dir: &Path) -> io::Result<bool> {
         Ok(mut entries) => Ok(entries.next().is_some()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{Problem, ProblemKind, Report, write_tsv};
+
+    #[test]
+    fn rows_always_have_five_fields_whatever_the_values_contain() {
+        // dot doctor splits on tabs and reads one row per line, so embedded
+        // separators must never shift columns or split a row.
+        let report = Report {
+            problems: vec![
+                Problem {
+                    kind: ProblemKind::WrongTarget,
+                    package: Some("own\ter/to\nol".to_owned()),
+                    path: Some(PathBuf::from("/tmp/a\tb\r\nc")),
+                    detail: "line one\nline\ttwo\r".to_owned(),
+                },
+                Problem {
+                    kind: ProblemKind::RecoveryState,
+                    package: None,
+                    path: None,
+                    detail: String::new(),
+                },
+                Problem {
+                    kind: ProblemKind::DeferredPost,
+                    package: Some(String::new()),
+                    path: Some(PathBuf::new()),
+                    detail: "hint".to_owned(),
+                },
+            ],
+        };
+        let mut out = Vec::new();
+
+        write_tsv(&report, &mut out).unwrap();
+
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out,
+            "warn\town er/to ol\twrong-target\t/tmp/a b  c\tline one line two \n\
+             warn\t-\trecovery-state\t-\t-\n\
+             warn\t-\tdeferred-post\t-\thint\n"
+        );
+        assert!(out.lines().all(|row| row.split('\t').count() == 5));
     }
 }
