@@ -9452,13 +9452,34 @@ impl Fixture {
         fs::write(path, content).unwrap();
     }
 
+    /// Writes an executable fixture without ever holding a write fd to it.
+    ///
+    /// Same ETXTBSY race as `test_support::write_executable` in the crate
+    /// (which this integration-test binary cannot import): a sibling test
+    /// thread that forks while `fs::write` holds the file open hands its child
+    /// a copy of that fd, and exec of the fixture then fails with "Text file
+    /// busy" until that child execs. The content goes to a `.src` sibling, a
+    /// `cp` child creates the executable and exits before we continue, and the
+    /// mode is set by path.
     fn write_executable(&self, rel: impl AsRef<Path>, content: &str) {
         let path = self.dir.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, content).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        let mut source = path.as_os_str().to_owned();
+        source.push(".src");
+        let source = PathBuf::from(source);
+        fs::write(&source, content).unwrap();
+        let copied = Command::new("cp")
+            .arg(&source)
+            .arg(&path)
+            .status()
+            .expect("cp must run to materialize an executable fixture");
+        assert!(
+            copied.success(),
+            "cp failed to materialize {}: {copied}",
+            path.display()
+        );
+        fs::remove_file(&source).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn initialize_dev_checkout(&self, short_name: &str, origin: &str) {
