@@ -1652,6 +1652,111 @@ fn update_development_verification_ignores_ambient_git_dir() {
 }
 
 #[test]
+fn update_adopts_a_standalone_installer_layout_end_to_end() {
+    // A host bootstrapped by the cgraf78/actions standalone installer, whose
+    // first Shdeps run recorded the release as current, must converge to the
+    // normal Shdeps-owned layout once a newer release ships instead of failing
+    // with "release asset format changed" on every run.
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("update-standalone-adoption");
+    let (old, new) = ("20260929-074025-4fd04934", "20261002-011600-52e1dc13");
+    let platform = format!("linux-{}-musl", host_arch());
+    let control = fixture.dir.join("share/cgraf78/.dot-standalone");
+    let release = format!("{old}-{platform}");
+    fixture.write(
+        "share/cgraf78/.dot-standalone/owner",
+        "cgraf78/actions release-installer v1\n",
+    );
+    fixture.write_executable(
+        format!("share/cgraf78/.dot-standalone/releases/{release}/dot"),
+        &format!("#!/bin/sh\necho dot {old}\n"),
+    );
+    fixture.write(
+        format!("share/cgraf78/.dot-standalone/releases/{release}/.dot-install.json"),
+        &format!(r#"{{"schema":1,"method":"release","repo":"cgraf78/dot","tag":"{old}"}}"#),
+    );
+    symlink(format!("releases/{release}"), control.join("current")).unwrap();
+    let root = fixture.dir.join("share/cgraf78/dot");
+    symlink(".dot-standalone/current", &root).unwrap();
+    fs::create_dir_all(fixture.dir.join("bin")).unwrap();
+    let public = fixture.dir.join("bin/dot");
+    symlink(root.join("dot"), &public).unwrap();
+    fixture.write("conf/deps.conf", "cgraf78/dot github:release dot\n");
+    fixture.write(
+        "state/manifest",
+        &format!("cgraf78/dot|github:release|dot|{}\n", public.display()),
+    );
+
+    let asset = format!("dot-{new}-{platform}.tar.gz");
+    let archive = fixture.dir.join("fake/asset");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let binary = format!("#!/bin/sh\necho dot {new}\n");
+    let metadata =
+        format!(r#"{{"schema":1,"method":"release","repo":"cgraf78/dot","tag":"{new}"}}"#);
+    write_tar_gz(
+        &archive,
+        &[
+            ("dot", binary.as_str(), 0o755),
+            (".dot-install.json", metadata.as_str(), 0o644),
+        ],
+    );
+    fixture.write(
+        "fake/asset.sha256",
+        &format!(
+            "{}  {asset}\n",
+            shdeps::checksum::sha256_hex(&fs::read(&archive).unwrap())
+        ),
+    );
+    let url = format!("https://github.com/cgraf78/dot/releases/download/{new}/{asset}");
+    fixture.write(
+        "fake/release.json",
+        &format!(
+            r#"[{{"tag_name":"{new}","draft":false,"prerelease":false,"assets":[{{"name":"{asset}","browser_download_url":"{url}"}},{{"name":"{asset}.sha256","browser_download_url":"{url}.sha256"}}]}}]"#
+        ),
+    );
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+config=$(cat)
+case "$config" in
+  *'url = "https://api.github.com/repos/cgraf78/dot/releases?per_page=100"'*)
+    cat "$SHDEPS_TEST_RELEASE_JSON" ;;
+  *'url = "https://github.com/cgraf78/dot/releases/download/'*'.sha256"'*)
+    cat "$SHDEPS_TEST_RELEASE_ASSET.sha256" ;;
+  *'url = "https://github.com/cgraf78/dot/releases/download/'*)
+    cat "$SHDEPS_TEST_RELEASE_ASSET" ;;
+  *) exit 22 ;;
+esac
+"#,
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_success(&output);
+    let metadata = fs::symlink_metadata(&root).unwrap();
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    assert_eq!(
+        fs::read_to_string(root.join(".shdeps-release-layout")).unwrap(),
+        "v1 archive\n"
+    );
+    assert_eq!(fs::read_link(&public).unwrap(), root.join("dot"));
+    let version = run(&mut Command::new(&public));
+    assert_success(&version);
+    assert_eq!(text(&version.stdout), format!("dot {new}\n"));
+    assert!(
+        control.join(format!("releases/{release}/dot")).is_file(),
+        "the standalone tree stays for a still-running old binary"
+    );
+
+    // Converged: the next run is an ordinary current check on a marked root.
+    let again = run(&mut fixture.command(["--force", "update"]));
+    assert_success(&again);
+    assert_eq!(fs::read_link(&public).unwrap(), root.join("dot"));
+}
+
+#[test]
 fn update_jsonl_reports_bare_github_method_resolution() {
     let fixture = Fixture::new("update-jsonl-github-method-progress");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
