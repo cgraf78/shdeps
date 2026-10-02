@@ -213,7 +213,8 @@ pub(crate) enum UpgradeBlocker {
 /// (`standalone_layout::classify`) is adopted by the archive switch, so it is
 /// not blocked, including an adoption interrupted with the root link parked;
 /// while that installer's lock exists the update refuses, so that is
-/// reported. The installer only publishes archives, so a raw asset over its
+/// reported. Like the update, the layout is consulted only for a root that
+/// is not already `Proven`, so a lock left beside an adopted root is inert. The installer only publishes archives, so a raw asset over its
 /// root is an unknowable format change like any other.
 ///
 /// The predicate is restated here rather than shared with `install_request`;
@@ -238,22 +239,31 @@ pub(crate) fn upgrade_blocker(
             Err(error) => return Err(error),
         }
     }
-    // The update consults the installer layout on every release request,
-    // before and after the first recorded install.
-    match crate::standalone_layout::classify(install_base, name, public) {
-        crate::standalone_layout::Standalone::Adoptable => return Ok(None),
-        #[cfg(unix)]
-        crate::standalone_layout::Standalone::Locked(lock) => {
-            return Ok(Some(UpgradeBlocker::InstallerLocked { lock }));
+    // The same snapshot the update gate starts from: full legacy proof once a
+    // release is recorded, otherwise only the explicit marker.
+    let archive = if prior_release {
+        archive_state(state_dir, install_base, public, name)?
+    } else {
+        explicit_archive_state(install_base, name)?
+    };
+    // Like the update, consult the installer layout only for a root Shdeps
+    // has not proven: a marked root is its own, so a stale installer lock
+    // left in the inert control directory beside it blocks nothing.
+    if archive != ArchiveState::Proven {
+        match crate::standalone_layout::classify(install_base, name, public) {
+            crate::standalone_layout::Standalone::Adoptable => return Ok(None),
+            #[cfg(unix)]
+            crate::standalone_layout::Standalone::Locked(lock) => {
+                return Ok(Some(UpgradeBlocker::InstallerLocked { lock }));
+            }
+            crate::standalone_layout::Standalone::None => {}
         }
-        crate::standalone_layout::Standalone::None => {}
     }
     if !prior_release {
         // Before the first recorded release install the update consults only
         // the explicit marker, which was just found valid or absent.
         return Ok(None);
     }
-    let archive = archive_state(state_dir, install_base, public, name)?;
     match archive {
         ArchiveState::Proven => Ok(None),
         ArchiveState::Ambiguous => Ok(Some(UpgradeBlocker::UnprovenRoot { ambiguous: true })),
