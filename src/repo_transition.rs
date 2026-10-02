@@ -1026,14 +1026,109 @@ fn replace_owned_symlink(checkout: &Path, target: &Path) -> Result<()> {
     result.map_err(Into::into)
 }
 
-/// Atomically publishes `source` only when `destination` is still absent.
+/// Whether this build may call `renameat2` at all.
+///
+/// Android is excluded by owner policy: before Android 11 the app seccomp
+/// filter may kill the process with SIGSYS on `renameat2`, and a signal is not
+/// an error any caller could recover from. Every helper below therefore takes
+/// its documented Android path without attempting the syscall.
+pub(crate) const RENAMEAT2_ALLOWED: bool = !cfg!(target_os = "android");
+
+/// Runtime view of [`RENAMEAT2_ALLOWED`]. Tests can simulate the Android
+/// policy on any host with [`with_android_rename_policy`]; production builds
+/// reduce this to the constant.
+pub(crate) fn renameat2_allowed() -> bool {
+    #[cfg(test)]
+    {
+        if ANDROID_POLICY.with(std::cell::Cell::get) {
+            return false;
+        }
+    }
+    RENAMEAT2_ALLOWED
+}
+
+/// Publishes `source` at `destination` only when `destination` is absent.
 ///
 /// Plain POSIX `rename` may replace a late empty directory, which would defeat
 /// the unrecorded-root no-clobber guarantee and can also discard a co-owner
-/// generation during transaction rollback. The supported fleet platforms all
-/// expose an atomic exclusive rename; unknown Unix targets fail closed rather
-/// than silently falling back to clobbering semantics.
+/// generation during transaction rollback. Linux and macOS use the kernel's
+/// atomic exclusive rename, so the absence check and the publication are one
+/// step. Unknown Unix targets fail closed rather than silently falling back to
+/// clobbering semantics.
+///
+/// Two cases take [`rename_noreplace_checked`] instead, with a narrowed
+/// guarantee: Android (the syscall is never attempted, see
+/// [`RENAMEAT2_ALLOWED`]) and kernels or filesystems that decline the atomic
+/// form (ENOSYS, EINVAL, EOPNOTSUPP/ENOTSUP, EXDEV). There the source object
+/// still moves atomically and anything present at check time is preserved,
+/// but an unrelated entry (a file, symlink, or empty directory) created in the
+/// instant between the check and the rename can be replaced and lost; a
+/// directory source can never replace a non-empty directory. Cooperating
+/// writers (Shdeps and the checkout installer) are excluded by the shared
+/// checkout and state locks, so the residual race is with unrelated processes.
 pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if !renameat2_allowed() {
+        return rename_noreplace_checked(source, destination);
+    }
+    match rename_noreplace_atomic(source, destination) {
+        Err(error) if atomic_rename_declined(&error) => {
+            rename_noreplace_checked(source, destination)
+        }
+        result => result,
+    }
+}
+
+/// Returns whether an atomic rename error means "this kernel or filesystem
+/// cannot do it" (nothing changed), as opposed to a real failure. A genuine
+/// EINVAL (a directory into its own subtree) or EXDEV (a cross-device move) is
+/// simply reproduced by the plain rename in the fallback, so listing them
+/// costs nothing and keeps one rule for every filesystem that declines.
+fn atomic_rename_declined(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|errno| {
+        [
+            libc::ENOSYS,
+            libc::EINVAL,
+            libc::EOPNOTSUPP,
+            libc::ENOTSUP,
+            libc::EXDEV,
+        ]
+        .contains(&errno)
+    })
+}
+
+/// Non-atomic exclusive rename: refuse an existing destination entry (without
+/// following symlinks), then move the source with plain `rename`.
+fn rename_noreplace_checked(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    CHECKED_FALLBACKS.with(|count| count.set(count.get() + 1));
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return Err(std::io::Error::from_raw_os_error(libc::EEXIST)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match fs::rename(source, destination) {
+        // A destination that appeared after the check makes `rename` fail
+        // with a type-specific errno instead of EEXIST. Callers branch on
+        // `AlreadyExists` to classify a late writer (checkout rollback,
+        // cleanup quarantine retries), so report the collision as such.
+        Err(error)
+            if error.raw_os_error().is_some_and(|errno| {
+                [libc::ENOTEMPTY, libc::EEXIST, libc::ENOTDIR, libc::EISDIR].contains(&errno)
+            }) && fs::symlink_metadata(destination).is_ok() =>
+        {
+            Err(std::io::Error::from_raw_os_error(libc::EEXIST))
+        }
+        result => result,
+    }
+}
+
+fn rename_noreplace_atomic(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if let Some(errno) = ATOMIC_RENAME_FAULT.with(std::cell::Cell::get) {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+    }
     let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1047,7 +1142,7 @@ pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Re
         )
     })?;
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     let status = unsafe {
         // SAFETY: both C strings are live and NUL-terminated for the syscall;
         // AT_FDCWD makes both absolute/path-relative arguments use cwd exactly
@@ -1069,7 +1164,7 @@ pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Re
         libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL)
     };
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if status == 0 {
             Ok(())
@@ -1078,8 +1173,9 @@ pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Re
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        let _ = (source, destination);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "atomic no-replace repository publication is unsupported on this Unix platform",
@@ -1087,8 +1183,23 @@ pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Re
     }
 }
 
-/// Atomically exchanges two existing filesystem entries without an absent path window.
+/// Atomically exchanges two existing filesystem entries without an absent path
+/// window.
+///
+/// There is no generic non-atomic emulation: every caller (the public-command
+/// transition and its recovery in `update_transition`) relies on both paths
+/// staying present for its crash journal, so an emulated swap would create
+/// states that recovery cannot classify. On Android the syscall is never
+/// attempted (see [`RENAMEAT2_ALLOWED`]) and this fails with `Unsupported`,
+/// and declined kernels or filesystems return their error unchanged; callers
+/// fail closed exactly as they do on platforms without the primitive.
 pub(crate) fn rename_exchange(left: &Path, right: &Path) -> std::io::Result<()> {
+    if !renameat2_allowed() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic filesystem exchange is disabled on Android",
+        ));
+    }
     let left = CString::new(left.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1102,7 +1213,7 @@ pub(crate) fn rename_exchange(left: &Path, right: &Path) -> std::io::Result<()> 
         )
     })?;
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     let status = unsafe {
         // SAFETY: both paths are valid live C strings and RENAME_EXCHANGE is
         // the kernel's atomic two-entry swap contract.
@@ -1123,7 +1234,7 @@ pub(crate) fn rename_exchange(left: &Path, right: &Path) -> std::io::Result<()> 
         libc::renamex_np(left.as_ptr(), right.as_ptr(), libc::RENAME_SWAP)
     };
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if status == 0 {
             Ok(())
@@ -1132,13 +1243,61 @@ pub(crate) fn rename_exchange(left: &Path, right: &Path) -> std::io::Result<()> 
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        let _ = (left, right);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "atomic filesystem exchange is unsupported on this Unix platform",
         ))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Errno a test injects in place of the atomic no-replace syscall result.
+    static ATOMIC_RENAME_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// Number of times this thread took the checked (non-atomic) fallback.
+    static CHECKED_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Simulates the Android rename policy on this thread.
+    static ANDROID_POLICY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `body` as if this build were Android: no `renameat2` at all (tests).
+#[cfg(test)]
+pub(crate) fn with_android_rename_policy<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ANDROID_POLICY.with(|policy| policy.set(false));
+        }
+    }
+    ANDROID_POLICY.with(|policy| policy.set(true));
+    let _restore = Restore;
+    body()
+}
+
+/// Runs `body` with the atomic no-replace syscall failing with `errno` on this
+/// thread, returning the result and how many checked fallbacks ran (tests).
+#[cfg(test)]
+pub(crate) fn with_atomic_rename_errno<T>(
+    errno: Option<i32>,
+    body: impl FnOnce() -> T,
+) -> (T, usize) {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ATOMIC_RENAME_FAULT.with(|fault| fault.set(None));
+        }
+    }
+    ATOMIC_RENAME_FAULT.with(|fault| fault.set(errno));
+    let before = CHECKED_FALLBACKS.with(std::cell::Cell::get);
+    let _restore = Restore;
+    let result = body();
+    (
+        result,
+        CHECKED_FALLBACKS.with(std::cell::Cell::get) - before,
+    )
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -1185,7 +1344,7 @@ mod tests {
     use super::{
         Desired, Identity, actions_transaction_path, begin, journal_path, publish_development,
         publish_directory, publish_transaction, recover, rename_exchange, rename_noreplace,
-        restore_parked_previous,
+        restore_parked_previous, with_atomic_rename_errno,
     };
 
     #[test]
@@ -1203,6 +1362,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn atomic_exchange_swaps_two_existing_entries() {
         let dir = temp_dir("atomic-exchange");
         let left = dir.join("left");
@@ -1214,6 +1374,148 @@ mod tests {
 
         assert_eq!(fs::read_to_string(left).unwrap(), "right");
         assert_eq!(fs::read_to_string(right).unwrap(), "left");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn exclusive_rename_uses_the_atomic_syscall_off_android() {
+        // Non-Android behavior is unchanged: a supporting kernel/filesystem
+        // publishes through the atomic syscall, never the checked fallback.
+        let dir = temp_dir("exclusive-rename-atomic");
+        let source = dir.join("source");
+        write_file(&source, "candidate");
+
+        let (result, fallbacks) =
+            with_atomic_rename_errno(None, || rename_noreplace(&source, &dir.join("published")));
+
+        result.unwrap();
+        assert_eq!(fallbacks, 0);
+        assert_eq!(
+            fs::read_to_string(dir.join("published")).unwrap(),
+            "candidate"
+        );
+    }
+
+    #[test]
+    fn exclusive_rename_falls_back_for_every_declined_errno() {
+        for errno in [
+            libc::ENOSYS,
+            libc::EINVAL,
+            libc::EOPNOTSUPP,
+            libc::ENOTSUP,
+            libc::EXDEV,
+        ] {
+            let dir = temp_dir(&format!("exclusive-rename-fallback-{errno}"));
+            let source = dir.join("source");
+            write_file(&source.join("candidate"), "moved");
+
+            let (result, fallbacks) = with_atomic_rename_errno(Some(errno), || {
+                rename_noreplace(&source, &dir.join("published"))
+            });
+
+            result.unwrap_or_else(|error| panic!("errno {errno} must fall back: {error}"));
+            assert_eq!(fallbacks, 1, "errno {errno}");
+            assert!(!source.exists(), "errno {errno}");
+            assert_eq!(
+                fs::read_to_string(dir.join("published/candidate")).unwrap(),
+                "moved"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_fallback_still_refuses_every_existing_destination() {
+        // The fallback keeps the no-clobber contract for every destination
+        // that exists when it looks, including an empty directory and a
+        // dangling symlink, and leaves the source untouched.
+        for (label, make) in [
+            (
+                "file",
+                Box::new(|path: &Path| write_file(path, "keep")) as Box<dyn Fn(&Path)>,
+            ),
+            (
+                "empty-dir",
+                Box::new(|path: &Path| fs::create_dir_all(path).unwrap()),
+            ),
+            (
+                "dangling-symlink",
+                Box::new(|path: &Path| symlink("missing-target", path).unwrap()),
+            ),
+        ] {
+            let dir = temp_dir(&format!("exclusive-rename-checked-{label}"));
+            let source = dir.join("source");
+            let destination = dir.join("destination");
+            write_file(&source.join("candidate"), "preserve");
+            make(&destination);
+
+            let (result, fallbacks) = with_atomic_rename_errno(Some(libc::ENOSYS), || {
+                rename_noreplace(&source, &destination)
+            });
+
+            let error = result.unwrap_err();
+            assert_eq!(fallbacks, 1, "{label}");
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{label}");
+            assert!(fs::symlink_metadata(&destination).is_ok(), "{label}");
+            assert_eq!(
+                fs::read_to_string(source.join("candidate")).unwrap(),
+                "preserve",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn exclusive_rename_propagates_real_errors_without_fallback() {
+        let dir = temp_dir("exclusive-rename-real-error");
+        let source = dir.join("source");
+        write_file(&source, "candidate");
+
+        let (result, fallbacks) = with_atomic_rename_errno(Some(libc::EACCES), || {
+            rename_noreplace(&source, &dir.join("published"))
+        });
+
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EACCES));
+        assert_eq!(fallbacks, 0);
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn android_policy_never_calls_renameat2() {
+        // Simulated on every host (and real on Android builds, where the
+        // constant is false): the exclusive rename takes the checked path even
+        // with the syscall "available", and the exchange fails closed without
+        // touching either entry.
+        let dir = temp_dir("android-no-renameat2");
+        let source = dir.join("source");
+        write_file(&source, "candidate");
+        write_file(&dir.join("left"), "left");
+        write_file(&dir.join("right"), "right");
+
+        let ((renamed, exchanged), fallbacks) = with_atomic_rename_errno(None, || {
+            super::with_android_rename_policy(|| {
+                (
+                    rename_noreplace(&source, &dir.join("published")),
+                    rename_exchange(&dir.join("left"), &dir.join("right")),
+                )
+            })
+        });
+
+        renamed.unwrap();
+        assert_eq!(fallbacks, 1);
+        assert_eq!(
+            exchanged.unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(fs::read_to_string(dir.join("left")).unwrap(), "left");
+        assert_eq!(fs::read_to_string(dir.join("right")).unwrap(), "right");
+    }
+
+    #[test]
+    #[cfg(target_os = "android")]
+    fn android_builds_disable_renameat2() {
+        assert!(!super::RENAMEAT2_ALLOWED);
+        assert!(!super::renameat2_allowed());
     }
 
     #[test]

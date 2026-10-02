@@ -682,6 +682,26 @@ fn begin_durable_transition_with_fingerprint(
         )
         .into());
     }
+    if !crate::repo_transition::renameat2_allowed()
+        && transition
+            .cleanup_evidence
+            .public_regular_identity()
+            .is_some()
+    {
+        // Replacing a raw release command with a symlink-based install needs
+        // the atomic public-command exchange, which Android never attempts.
+        // Refuse before any installer runs or durable record exists: failing
+        // later would leave an `Installed` record that every subsequent
+        // update and prune retries and aborts on.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "raw-command method transition needs an atomic exchange, which is disabled on Android; remove {} and rerun",
+                roots.bin_dir.join(&entry.cmd).display()
+            ),
+        )
+        .into());
+    }
     if transition.old.method == method::GITHUB_RELEASE
         && transition.old.cmd == entry.cmd
         && method::is_symlink_install_root(&entry.method)
@@ -1615,6 +1635,26 @@ fn ensure_transitioned_binlink(record: &PublicTransitionRecord, roots: &Roots) -
     Ok(())
 }
 
+/// Moves the journal-validated generation at `swap` onto `public` during
+/// recovery.
+///
+/// Both recovery branches keep only the generation at `swap` and then discard
+/// whatever ends up at `swap`, so where the atomic exchange is unavailable
+/// (Android never calls `renameat2`, see `repo_transition::RENAMEAT2_ALLOWED`)
+/// one plain rename reaches the same end state atomically: it replaces the
+/// displaced generation that recovery would delete anyway and leaves `swap`
+/// absent, a state the same recovery already accepts on a rerun. This lets a
+/// journal written by an older Shdeps that could still exchange be finished.
+#[cfg(unix)]
+fn settle_public_swap(public: &Path, swap: &Path) -> Result<()> {
+    if crate::repo_transition::renameat2_allowed() {
+        crate::repo_transition::rename_exchange(public, swap)?;
+    } else {
+        fs::rename(swap, public)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots) -> Result<()> {
     let Some((journal, record)) = read_public_transition(public)? else {
@@ -1644,7 +1684,7 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
 
     if manifest_is_old {
         if public_is_new && swap_is_old {
-            crate::repo_transition::rename_exchange(public, &swap)?;
+            settle_public_swap(public, &swap)?;
             if !cleanup::regular_file_matches_after_rename(public, &record.expected)? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1683,7 +1723,7 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
     }
 
     if public_is_old && swap_is_new {
-        crate::repo_transition::rename_exchange(public, &swap)?;
+        settle_public_swap(public, &swap)?;
     } else if !public_is_new {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2584,7 +2624,7 @@ mod tests {
         begin_custom_durable_transition, begin_durable_transition, begin_public_transition,
         by_name, cleanup_snapshot, durable_transitions, ensure_durable_transition_dir,
         identity_handoff_conflicts, install_with_prepared, install_with_prepared_and_commit,
-        points_into, prepare_manifest_with_nonce, public_transition_path,
+        points_into, prepare_manifest_with_nonce, public_transition_path, read_public_transition,
         recover_pending_transitions, recover_public_transition, unlink_snapshot,
     };
     use crate::config::{Entry, parse_entry};
@@ -5091,6 +5131,95 @@ mod tests {
                 .method,
             crate::method::GITHUB_RELEASE
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn raw_release_transition_is_refused_before_install_under_android_policy() {
+        // Without an atomic exchange the public command cannot be published
+        // safely, so the transition must stop before the installer runs or a
+        // durable record exists that later runs would keep retrying.
+        let (roots, manifest_path, entry, transition, public, _source) =
+            raw_release_transition("android-raw-transition-refused");
+        let mut installer_ran = false;
+
+        let error = crate::repo_transition::with_android_rename_policy(|| {
+            install_with_prepared(&entry, Some(&transition), &roots, &manifest_path, |_| {
+                installer_ran = true;
+                Ok(Item::changed(
+                    entry.name.clone(),
+                    ItemReason::Installed,
+                    "installed",
+                ))
+            })
+        })
+        .unwrap_err();
+
+        assert!(!installer_ran);
+        assert!(error.to_string().contains("disabled on Android"), "{error}");
+        assert_eq!(fs::read(&public).unwrap(), b"old release");
+        assert_eq!(
+            crate::manifest::read(&manifest_path)
+                .unwrap()
+                .get(&entry.name)
+                .unwrap()
+                .method,
+            crate::method::GITHUB_RELEASE
+        );
+        let leftovers: Vec<_> = fs::read_dir(&roots.state_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "manifest")
+            .collect();
+        assert!(leftovers.is_empty(), "no durable record: {leftovers:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn android_policy_finishes_journals_written_with_an_exchange() {
+        // An older Shdeps that could still exchange died right after
+        // publishing (public = new symlink, swap = old file, manifest old).
+        // Recovery under the Android policy must roll back with one rename,
+        // and the committed-side journal must also finish.
+        for committed in [false, true] {
+            let (roots, manifest_path, entry, transition, public, source) =
+                raw_release_transition(&format!("android-journal-recovery-{committed}"));
+            let new = ManifestEntry::new(
+                &entry.name,
+                &entry.method,
+                &entry.cmd,
+                source.to_string_lossy(),
+            );
+            begin_public_transition(&transition, new.clone(), &roots, &manifest_path).unwrap();
+            assert_eq!(fs::read_link(&public).unwrap(), source);
+            if committed {
+                crate::manifest::upsert(&manifest_path, new).unwrap();
+                // Committed-side recovery expects the old file back at public
+                // and the new link parked at swap, its own crash state.
+                let journal = public_transition_path(&public).unwrap();
+                let (_, record) = read_public_transition(&public).unwrap().unwrap();
+                crate::repo_transition::rename_exchange(&public, &record.swap).unwrap();
+                assert!(journal.exists());
+            }
+
+            crate::repo_transition::with_android_rename_policy(|| {
+                recover_public_transition(&manifest_path, &public, &roots)
+            })
+            .unwrap();
+
+            if committed {
+                assert_eq!(fs::read_link(&public).unwrap(), source, "committed");
+            } else {
+                assert_eq!(fs::read(&public).unwrap(), b"old release", "rolled back");
+            }
+            let mut names: Vec<_> = fs::read_dir(&roots.bin_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["tool"], "committed={committed}");
+            assert!(read_public_transition(&public).unwrap().is_none());
+        }
     }
 
     #[test]
