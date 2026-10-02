@@ -60,11 +60,15 @@ pub fn link(
     name: &str,
     install_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
+    let state_path = link_state::path(state_dir, name, Kind::Extras);
     if !install_dir.is_dir() {
+        // Advisory cleanup: before this existed a missing root was always
+        // `Ok`, and a raw release must not start failing every update over an
+        // unreadable ledger. Leftovers stay visible to `shdeps health`.
+        let _ = retire_dangling(&state_path, install_dir);
         return Ok(Vec::new());
     }
 
-    let state_path = link_state::path(state_dir, name, Kind::Extras);
     link_state::unlink_tracked(&state_path)?;
 
     let mut linker = Linker {
@@ -79,6 +83,77 @@ pub fn link(
 
     link_state::write(&state_path, &linker.created)?;
     Ok(linker.created)
+}
+
+/// Retires tracked extras left dangling by an install root that is gone.
+///
+/// A root disappears for good when a release switches from an archive to a
+/// single binary (or a checkout is removed); relinking needs the root, so
+/// without this the ledger and its dangling man/completion links would
+/// survive every update. Only a symlink the ledger tracks, that dangles, and
+/// whose own target lies under the missing root is removed: a link someone
+/// re-pointed elsewhere, a regular file, or a link that still resolves stays
+/// on disk and stays tracked (prune keeps its ownership rules). Entries whose
+/// path no longer exists are dropped from the ledger; an entry that cannot be
+/// inspected (an unsearchable parent) is kept, so ownership is never lost.
+fn retire_dangling(state_path: &Path, install_dir: &Path) -> Result<()> {
+    link_state::recover_reconcile(state_path)?;
+    let tracked = link_state::read(state_path)?;
+    if tracked.is_empty() {
+        return Ok(());
+    }
+    let mut kept = Vec::new();
+    for link in &tracked {
+        let metadata = match fs::symlink_metadata(link) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                kept.push(link.clone());
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() && dangles_into(link, install_dir) {
+            remove_link(link)?;
+            continue;
+        }
+        kept.push(link.clone());
+    }
+    if kept.len() != tracked.len() {
+        link_state::write(state_path, &kept)?;
+    }
+    Ok(())
+}
+
+/// Whether symlink `link` is dangling and its own target names a path under
+/// `root`. The comparison is lexical because the root no longer exists to be
+/// canonicalized. Shdeps always links extras to the absolute
+/// `root.join(...)`, so a relative target was made by someone else and is
+/// never claimed.
+fn dangles_into(link: &Path, root: &Path) -> bool {
+    let Ok(target) = fs::read_link(link) else {
+        return false;
+    };
+    // A root replaced by a regular file makes the walk fail with ENOTDIR
+    // rather than ENOENT; either way the target cannot exist.
+    target.is_absolute()
+        && target.starts_with(root)
+        && fs::metadata(link).is_err_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            )
+        })
+}
+
+/// Removes a link the caller just verified (lstat) is a tracked, dangling
+/// symlink; already gone counts as done. Like the existing relink cleanup,
+/// this runs under the update's state lock.
+fn remove_link(link: &Path) -> Result<()> {
+    match fs::remove_file(link) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 struct Linker<'a> {
@@ -426,6 +501,136 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::link_state::{self, Kind};
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_root_retires_only_its_own_dangling_links() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("missing-root");
+        let state = dir.join("state");
+        let gone = dir.join("share/owner/tool");
+        let xdg = dir.join("xdg");
+        fs::create_dir_all(&xdg).unwrap();
+        let elsewhere = dir.join("elsewhere.1");
+        fs::write(&elsewhere, "live\n").unwrap();
+
+        let own = xdg.join("own.1");
+        symlink(gone.join("man/own.1"), &own).unwrap();
+        let relative = xdg.join("relative.1");
+        symlink("../share/owner/tool/man/relative.1", &relative).unwrap();
+        let foreign_dangling = xdg.join("foreign.1");
+        symlink(dir.join("other/foreign.1"), &foreign_dangling).unwrap();
+        let repointed = xdg.join("repointed.1");
+        symlink(&elsewhere, &repointed).unwrap();
+        let regular = xdg.join("regular.1");
+        fs::write(&regular, "user\n").unwrap();
+        let absent = xdg.join("absent.1");
+        let ledger = link_state::path(&state, "owner/tool", Kind::Extras);
+        link_state::write(
+            &ledger,
+            &[
+                own.clone(),
+                relative.clone(),
+                foreign_dangling.clone(),
+                repointed.clone(),
+                regular.clone(),
+                absent,
+            ],
+        )
+        .unwrap();
+
+        let created = super::link(&state, &xdg, "owner/tool", &gone).unwrap();
+
+        assert!(created.is_empty());
+        assert!(
+            fs::symlink_metadata(&own).is_err(),
+            "own dangling link removed"
+        );
+        assert!(
+            fs::symlink_metadata(&relative).is_ok(),
+            "relative links are never shdeps-made"
+        );
+        assert!(fs::symlink_metadata(&foreign_dangling).is_ok());
+        assert_eq!(fs::read_link(&repointed).unwrap(), elsewhere);
+        assert_eq!(fs::read_to_string(&regular).unwrap(), "user\n");
+        assert_eq!(
+            link_state::read(&ledger).unwrap(),
+            [relative, foreign_dangling, repointed, regular]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn root_replaced_by_a_file_retires_links_through_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("file-root");
+        let state = dir.join("state");
+        let root = dir.join("share/owner/tool");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::write(&root, "not a directory\n").unwrap();
+        let link = dir.join("xdg/man/man1/tool.1");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(root.join("man/man1/tool.1"), &link).unwrap();
+        let ledger = link_state::path(&state, "owner/tool", Kind::Extras);
+        link_state::write(&ledger, std::slice::from_ref(&link)).unwrap();
+
+        super::link(&state, &dir.join("xdg"), "owner/tool", &root).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(!ledger.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn uninspectable_entries_keep_their_ownership() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores directory permissions
+        }
+        let dir = temp_dir("uninspectable");
+        let state = dir.join("state");
+        let gone = dir.join("share/owner/tool");
+        let locked = dir.join("xdg/locked");
+        fs::create_dir_all(&locked).unwrap();
+        let link = locked.join("tool.1");
+        symlink(gone.join("man/tool.1"), &link).unwrap();
+        let ledger = link_state::path(&state, "owner/tool", Kind::Extras);
+        link_state::write(&ledger, std::slice::from_ref(&link)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = super::link(&state, &dir.join("xdg"), "owner/tool", &gone);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.unwrap();
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert_eq!(link_state::read(&ledger).unwrap(), [link]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_root_with_only_own_links_removes_the_ledger() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("missing-root-ledger");
+        let state = dir.join("state");
+        let gone = dir.join("share/owner/tool");
+        let link = dir.join("xdg/man/man1/tool.1");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(gone.join("man/man1/tool.1"), &link).unwrap();
+        let ledger = link_state::path(&state, "owner/tool", Kind::Extras);
+        link_state::write(&ledger, std::slice::from_ref(&link)).unwrap();
+
+        super::link(&state, &dir.join("xdg"), "owner/tool", &gone).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(!ledger.exists());
+        // Idempotent and quiet without a ledger.
+        super::link(&state, &dir.join("xdg"), "owner/tool", &gone).unwrap();
+        assert!(!ledger.exists());
+    }
 
     #[test]
     #[cfg(unix)]
