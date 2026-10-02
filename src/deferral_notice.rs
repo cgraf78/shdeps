@@ -24,7 +24,8 @@ pub(crate) enum Kind {
 /// future reason is a new state (and announced) rather than a silent repeat.
 const REASON_SUDO_NO_TERMINAL: &str = "sudo-no-terminal";
 
-fn path(state_dir: &Path, kind: Kind) -> PathBuf {
+/// Returns the record file for one deferral kind.
+pub(crate) fn path(state_dir: &Path, kind: Kind) -> PathBuf {
     state_dir.join(match kind {
         Kind::Posts => ".deferred-posts",
         Kind::Uninstalls => ".deferred-uninstalls",
@@ -32,7 +33,7 @@ fn path(state_dir: &Path, kind: Kind) -> PathBuf {
 }
 
 fn read_lines(path: &Path) -> BTreeSet<String> {
-    std::fs::read_to_string(path)
+    crate::state::read_regular_to_string(path)
         .map(|content| content.lines().map(str::to_owned).collect())
         .unwrap_or_default()
 }

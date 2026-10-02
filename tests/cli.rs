@@ -241,6 +241,178 @@ fn dep_links_usage_and_missing_dependency_exit_codes_are_machine_clean() {
     assert_eq!(text(&missing.stderr), "");
 }
 
+/// Root shapes the release update gate must classify identically in
+/// `health` and `update`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum InstallerRoot {
+    /// The cgraf78/actions installer's exact layout: adopted by update.
+    Adoptable,
+    /// The same layout while the installer's publication lock exists.
+    Locked,
+    /// Locked, before shdeps ever recorded the release (no manifest row).
+    LockedFresh,
+    /// The installer's root behind a regular launcher at the public path.
+    AdoptableLauncher,
+    /// An adoption interrupted after parking the root link: finished by update.
+    Parked,
+    /// The same symlinked root without the installer's ownership marker.
+    Unmanaged,
+    /// A root shdeps already adopted (marked), with the installer's inert
+    /// control directory left beside it holding a stale lock.
+    AdoptedStaleLock,
+    /// The installer's layout whose release is already the latest: update
+    /// adopts it anyway.
+    AdoptableCurrent,
+}
+
+/// Builds `owner/tool` as published by the standalone release installer,
+/// shaped as `shape`, plus a newer archive release for update to fetch.
+#[cfg(unix)]
+fn installer_root_fixture(name: &str, shape: InstallerRoot) -> Fixture {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new(name);
+    let release = "v0-linux";
+    let control = fixture.dir.join("share/owner/.tool-standalone");
+    if !matches!(shape, InstallerRoot::Unmanaged) {
+        fixture.write(
+            "share/owner/.tool-standalone/owner",
+            "cgraf78/actions release-installer v1\n",
+        );
+    }
+    if matches!(
+        shape,
+        InstallerRoot::Locked | InstallerRoot::LockedFresh | InstallerRoot::AdoptedStaleLock
+    ) {
+        fixture.write("share/owner/.tool-standalone/lock", "");
+    }
+    let installed = if matches!(shape, InstallerRoot::AdoptableCurrent) {
+        "#!/bin/sh\necho v1.0.0\n"
+    } else {
+        "#!/bin/sh\necho v0.9.0\n"
+    };
+    fixture.write_executable(
+        format!("share/owner/.tool-standalone/releases/{release}/tool"),
+        installed,
+    );
+    fixture.write(
+        format!("share/owner/.tool-standalone/releases/{release}/.tool-install.json"),
+        r#"{"schema":1,"method":"release","repo":"owner/tool"}"#,
+    );
+    symlink(format!("releases/{release}"), control.join("current")).unwrap();
+    let root = fixture.dir.join("share/owner/tool");
+    let public = fixture.dir.join("bin/tool");
+    fs::create_dir_all(public.parent().unwrap()).unwrap();
+    if matches!(shape, InstallerRoot::Parked) {
+        // An interrupted fallback switch pinned the command at the active
+        // release and parked the root link under its fixed name.
+        symlink(
+            ".tool-standalone/current",
+            fixture.dir.join("share/owner/tool.shdeps-parked-root"),
+        )
+        .unwrap();
+        symlink(control.join(format!("releases/{release}/tool")), &public).unwrap();
+    } else if matches!(shape, InstallerRoot::AdoptedStaleLock) {
+        fixture.write_executable("share/owner/tool/bin/tool", "#!/bin/sh\necho v0.9.0\n");
+        fixture.write("share/owner/tool/.shdeps-release-layout", "v1 archive\n");
+        symlink(root.join("bin/tool"), &public).unwrap();
+    } else if matches!(shape, InstallerRoot::AdoptableLauncher) {
+        symlink(".tool-standalone/current", &root).unwrap();
+        fixture.write_executable("bin/tool", "#!/bin/sh\nexec launcher\n");
+    } else {
+        symlink(".tool-standalone/current", &root).unwrap();
+        symlink(root.join("tool"), &public).unwrap();
+    }
+    fixture.write("conf/deps.conf", "owner/tool github:release tool\n");
+    if !matches!(shape, InstallerRoot::LockedFresh) {
+        fixture.write(
+            "state/manifest",
+            &format!("owner/tool|github:release|tool|{}\n", public.display()),
+        );
+    }
+    let asset = format!("{}.tar.gz", host_linux_asset("tool", "v1.0.0"));
+    fixture.write_fake_curl(&release_json("v1.0.0", &[asset.as_str()]), "");
+    write_tar_gz(
+        &fixture.dir.join("fake/asset"),
+        &[("tool-v1.0.0/bin/tool", "#!/bin/sh\necho v1.0.0\n", 0o755)],
+    );
+    fixture
+}
+
+#[test]
+#[cfg(unix)]
+fn health_agrees_with_update_on_every_release_root() {
+    // `health` and `update` must agree on every root shape: health flags the
+    // root exactly when update refuses to upgrade it, and an installer-owned
+    // root (whole, parked mid-adoption, or already current) is adopted, never
+    // flagged; a lock left beside an adopted root blocks nothing.
+    for (shape, refused) in [
+        (InstallerRoot::Adoptable, false),
+        (InstallerRoot::Locked, true),
+        (InstallerRoot::LockedFresh, true),
+        (InstallerRoot::AdoptableLauncher, false),
+        (InstallerRoot::Parked, false),
+        (InstallerRoot::Unmanaged, true),
+        (InstallerRoot::AdoptedStaleLock, false),
+        (InstallerRoot::AdoptableCurrent, false),
+    ] {
+        let fixture = installer_root_fixture(&format!("health-parity-{shape:?}"), shape);
+        let root = fixture.dir.join("share/owner/tool");
+
+        let health = run(&mut fixture.command(["health"]));
+        let rows = text(&health.stdout);
+        let flagged_rows = rows
+            .lines()
+            .filter(|row| row.split('\t').nth(2) == Some("install-root-unmanaged"))
+            .collect::<Vec<_>>();
+        let update = run(&mut fixture.command(["update"]));
+        let update_out = format!("{}{}", text(&update.stdout), text(&update.stderr));
+        let update_refused = update.status.code() != Some(0);
+
+        assert_eq!(
+            !flagged_rows.is_empty(),
+            update_refused,
+            "{shape:?}: health and update disagree\nhealth:\n{rows}\nupdate:\n{update_out}"
+        );
+        assert_eq!(update_refused, refused, "{shape:?}: {update_out}");
+        match shape {
+            InstallerRoot::Adoptable
+            | InstallerRoot::AdoptableLauncher
+            | InstallerRoot::Parked
+            | InstallerRoot::AdoptableCurrent
+            | InstallerRoot::AdoptedStaleLock => {
+                assert_eq!(health.status.code(), Some(0), "{shape:?}: {rows}");
+                let adopted = fs::symlink_metadata(&root).unwrap();
+                assert!(adopted.is_dir(), "{shape:?}: update adopts the root");
+                let healthy = run(&mut fixture.command(["health"]));
+                assert_eq!(text(&healthy.stdout), "", "{shape:?} after adoption");
+            }
+            InstallerRoot::Locked | InstallerRoot::LockedFresh => {
+                assert!(update_out.contains("standalone installer lock present"));
+                let lock = fixture.dir.join("share/owner/.tool-standalone/lock");
+                assert!(flagged_rows[0].contains(&format!("lock {}", lock.display())));
+                assert!(
+                    !flagged_rows[0].contains("aside"),
+                    "never advise moving an installer-owned root aside"
+                );
+            }
+            InstallerRoot::Unmanaged => {
+                assert!(update_out.contains("release asset format changed"));
+                assert_eq!(
+                    flagged_rows[0].split('\t').nth(3),
+                    Some(root.to_str().unwrap())
+                );
+                // The remediation health prints makes update succeed.
+                fs::remove_file(&root).unwrap();
+                fs::remove_file(fixture.dir.join("bin/tool")).unwrap();
+                assert_success(&run(&mut fixture.command(["update"])));
+                assert_success(&run(&mut fixture.command(["health"])));
+            }
+        }
+    }
+}
+
 #[test]
 fn read_only_api_outputs_machine_clean_lines() {
     let fixture = Fixture::new("api");
@@ -1652,6 +1824,111 @@ fn update_development_verification_ignores_ambient_git_dir() {
 }
 
 #[test]
+fn update_adopts_a_standalone_installer_layout_end_to_end() {
+    // A host bootstrapped by the cgraf78/actions standalone installer, whose
+    // first Shdeps run recorded the release as current, must converge to the
+    // normal Shdeps-owned layout once a newer release ships instead of failing
+    // with "release asset format changed" on every run.
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("update-standalone-adoption");
+    let (old, new) = ("20260929-074025-4fd04934", "20261002-011600-52e1dc13");
+    let platform = format!("linux-{}-musl", host_arch());
+    let control = fixture.dir.join("share/cgraf78/.dot-standalone");
+    let release = format!("{old}-{platform}");
+    fixture.write(
+        "share/cgraf78/.dot-standalone/owner",
+        "cgraf78/actions release-installer v1\n",
+    );
+    fixture.write_executable(
+        format!("share/cgraf78/.dot-standalone/releases/{release}/dot"),
+        &format!("#!/bin/sh\necho dot {old}\n"),
+    );
+    fixture.write(
+        format!("share/cgraf78/.dot-standalone/releases/{release}/.dot-install.json"),
+        &format!(r#"{{"schema":1,"method":"release","repo":"cgraf78/dot","tag":"{old}"}}"#),
+    );
+    symlink(format!("releases/{release}"), control.join("current")).unwrap();
+    let root = fixture.dir.join("share/cgraf78/dot");
+    symlink(".dot-standalone/current", &root).unwrap();
+    fs::create_dir_all(fixture.dir.join("bin")).unwrap();
+    let public = fixture.dir.join("bin/dot");
+    symlink(root.join("dot"), &public).unwrap();
+    fixture.write("conf/deps.conf", "cgraf78/dot github:release dot\n");
+    fixture.write(
+        "state/manifest",
+        &format!("cgraf78/dot|github:release|dot|{}\n", public.display()),
+    );
+
+    let asset = format!("dot-{new}-{platform}.tar.gz");
+    let archive = fixture.dir.join("fake/asset");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let binary = format!("#!/bin/sh\necho dot {new}\n");
+    let metadata =
+        format!(r#"{{"schema":1,"method":"release","repo":"cgraf78/dot","tag":"{new}"}}"#);
+    write_tar_gz(
+        &archive,
+        &[
+            ("dot", binary.as_str(), 0o755),
+            (".dot-install.json", metadata.as_str(), 0o644),
+        ],
+    );
+    fixture.write(
+        "fake/asset.sha256",
+        &format!(
+            "{}  {asset}\n",
+            shdeps::checksum::sha256_hex(&fs::read(&archive).unwrap())
+        ),
+    );
+    let url = format!("https://github.com/cgraf78/dot/releases/download/{new}/{asset}");
+    fixture.write(
+        "fake/release.json",
+        &format!(
+            r#"[{{"tag_name":"{new}","draft":false,"prerelease":false,"assets":[{{"name":"{asset}","browser_download_url":"{url}"}},{{"name":"{asset}.sha256","browser_download_url":"{url}.sha256"}}]}}]"#
+        ),
+    );
+    fixture.write_executable(
+        "fakebin/curl",
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+config=$(cat)
+case "$config" in
+  *'url = "https://api.github.com/repos/cgraf78/dot/releases?per_page=100"'*)
+    cat "$SHDEPS_TEST_RELEASE_JSON" ;;
+  *'url = "https://github.com/cgraf78/dot/releases/download/'*'.sha256"'*)
+    cat "$SHDEPS_TEST_RELEASE_ASSET.sha256" ;;
+  *'url = "https://github.com/cgraf78/dot/releases/download/'*)
+    cat "$SHDEPS_TEST_RELEASE_ASSET" ;;
+  *) exit 22 ;;
+esac
+"#,
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_success(&output);
+    let metadata = fs::symlink_metadata(&root).unwrap();
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    assert_eq!(
+        fs::read_to_string(root.join(".shdeps-release-layout")).unwrap(),
+        "v1 archive\n"
+    );
+    assert_eq!(fs::read_link(&public).unwrap(), root.join("dot"));
+    let version = run(&mut Command::new(&public));
+    assert_success(&version);
+    assert_eq!(text(&version.stdout), format!("dot {new}\n"));
+    assert!(
+        control.join(format!("releases/{release}/dot")).is_file(),
+        "the standalone tree stays for a still-running old binary"
+    );
+
+    // Converged: the next run is an ordinary current check on a marked root.
+    let again = run(&mut fixture.command(["--force", "update"]));
+    assert_success(&again);
+    assert_eq!(fs::read_link(&public).unwrap(), root.join("dot"));
+}
+
+#[test]
 fn update_jsonl_reports_bare_github_method_resolution() {
     let fixture = Fixture::new("update-jsonl-github-method-progress");
     fixture.write("conf/deps.conf", "owner/tool github tool\n");
@@ -2155,6 +2432,46 @@ fn update_explicit_github_release_fetches_without_bare_github_cache() {
         fs::read_to_string(fixture.dir.join("fake/curl.log")).unwrap(),
         "api\nasset\n",
         "explicit github:release should fetch normally when no resolver cache exists"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn update_retires_extras_left_dangling_by_a_vanished_release_root() {
+    use std::os::unix::fs::symlink;
+
+    // An archive release that became a single binary leaves its old root's
+    // man/completion links behind; the fresh-stamp fast path must retire
+    // them without touching the network or anything it does not own.
+    let fixture = Fixture::new("update-retire-stale-extras");
+    fixture.write("conf/deps.conf", "owner/tool github:release tool\n");
+    fixture.write_executable("bin/tool", "#!/bin/sh\necho v1.0.0\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.dir.join("bin/tool").display()
+        ),
+    );
+    fixture.write_fresh_stamp("owner/tool", "release");
+    let stale = fixture.dir.join("share/man/man1/tool.1");
+    fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    symlink(fixture.dir.join("share/owner/tool/man/man1/tool.1"), &stale).unwrap();
+    let foreign = fixture.dir.join("share/man/man1/foreign.1");
+    symlink(fixture.dir.join("elsewhere/foreign.1"), &foreign).unwrap();
+    fixture.write(
+        "state/owner/tool.links",
+        &format!("{}\n{}\n", stale.display(), foreign.display()),
+    );
+
+    let output = run(&mut fixture.command(["update"]));
+
+    assert_success(&output);
+    assert!(fs::symlink_metadata(&stale).is_err(), "stale extra retired");
+    assert!(fs::symlink_metadata(&foreign).is_ok(), "foreign link kept");
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/owner/tool.links")).unwrap(),
+        format!("{}\n", foreign.display())
     );
 }
 
@@ -9452,13 +9769,34 @@ impl Fixture {
         fs::write(path, content).unwrap();
     }
 
+    /// Writes an executable fixture without ever holding a write fd to it.
+    ///
+    /// Same ETXTBSY race as `test_support::write_executable` in the crate
+    /// (which this integration-test binary cannot import): a sibling test
+    /// thread that forks while `fs::write` holds the file open hands its child
+    /// a copy of that fd, and exec of the fixture then fails with "Text file
+    /// busy" until that child execs. The content goes to a `.src` sibling, a
+    /// `cp` child creates the executable and exits before we continue, and the
+    /// mode is set by path.
     fn write_executable(&self, rel: impl AsRef<Path>, content: &str) {
         let path = self.dir.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, content).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        let mut source = path.as_os_str().to_owned();
+        source.push(".src");
+        let source = PathBuf::from(source);
+        fs::write(&source, content).unwrap();
+        let copied = Command::new("cp")
+            .arg(&source)
+            .arg(&path)
+            .status()
+            .expect("cp must run to materialize an executable fixture");
+        assert!(
+            copied.success(),
+            "cp failed to materialize {}: {copied}",
+            path.display()
+        );
+        fs::remove_file(&source).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn initialize_dev_checkout(&self, short_name: &str, origin: &str) {

@@ -904,6 +904,25 @@ Behavior:
   archive and single-binary layouts MUST fail closed: the layouts own different
   paths, and safe conversion would require a durable multi-path transaction.
   Compatibility tests MUST keep both sides explicit.
+- A root published by the cgraf78/actions standalone release installer
+  (`<owner>/<repo>` linking exactly to `.<repo>-standalone/current`, with the
+  installer's owner marker, a `current` link to one `releases/<name>` entry,
+  matching `.<repo>-install.json` metadata, current-user ownership of its
+  directories and files, and no installer lock) is an archive layout owned by
+  a known installer, not an unknown one. Updates MUST adopt it through the
+  normal staged switch even when the installed release is current, and MUST
+  NOT classify a root that is already a marked Shdeps archive. Replacing a
+  symlinked root MUST NOT expose a missing root where the filesystem can
+  exchange two paths atomically, and MUST NOT attempt the exchange on Android,
+  where older seccomp policies kill the process. Otherwise a public command
+  symlink resolving through the root (or an absent one) MUST first point at
+  the binary it currently runs, and the root link MUST be parked under a
+  fixed, Shdeps-reserved name so the next archive install recognizes and
+  finishes the interrupted switch and retires the parked link. An installer
+  lock beside the installer's root MUST block the update with a specific
+  detail. Raw assets over that layout are a fail-closed format change
+  (previously the raw install replaced the public link). The installer's
+  private directory is left in place.
 - Archive roots reserve `.shdeps-release-layout` for ownership metadata. An
   upstream archive containing that path MUST be rejected rather than having
   payload data overwritten or later mistaken for shdeps-owned state.

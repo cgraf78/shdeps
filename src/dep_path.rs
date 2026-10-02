@@ -146,7 +146,8 @@ fn github_root(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
     repo_root(entry, roots).or_else(|| install_root(entry, roots))
 }
 
-fn repo_root(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
+/// Resolves a repo checkout root: the development clone, then the managed clone.
+pub(crate) fn repo_root(entry: &Entry, roots: &Roots) -> Option<PathBuf> {
     // Local development clones intentionally win over managed clones for
     // concrete repo installs. Client projects use this to source assets from
     // the live checkout while iterating, and the Bash implementation has

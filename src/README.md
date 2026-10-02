@@ -21,6 +21,11 @@ over this implementation.
 - `state.rs`, `stamp.rs`, `install_metadata.rs`, `link_state.rs`,
   `dep_links.rs`, and `prune_journal.rs` own durable files written under
   shdeps-managed directories.
+- `health.rs` owns the read-only `shdeps health` report. It inspects state
+  through the owning modules' accessors rather than re-deriving paths or
+  formats. `github_release_install::upgrade_blocker` restates the release
+  update's layout gate next to `archive_state`; keep the two in step (a CLI
+  parity test runs both against the same root).
 
 ## Design Notes
 

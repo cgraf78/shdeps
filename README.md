@@ -313,6 +313,8 @@ The `owner/repo` is the `name` field. Override the repo URL with `SHDEPS_<NAME>_
 
 Downloads the latest release binary from GitHub, matching the current OS and architecture. Handles tarballs, zips, compressed singles (.gz, .bz2, .zst), and raw binaries. Archive-style releases install into a shdeps-owned root under `$SHDEPS_INSTALL_DIR/<owner>/<repo>` so bundled assets can be linked; their public symlink preserves an existing regular launcher. Raw and compressed single-binary releases install directly to `$SHDEPS_BIN_DIR/<cmd>` and preserve the historical Bash replacement behavior. If an upstream changes between archive and single-binary packaging, shdeps fails closed and requires a manual layout migration because the two layouts own different paths.
 
+Hosts bootstrapped by a project's standalone `install.sh` from the shared [cgraf78/actions](https://github.com/cgraf78/actions) release installer are adopted automatically. With default directories that installer publishes `${XDG_DATA_HOME:-~/.local/share}/cgraf78/<repo>` as a link to `.<repo>-standalone/current`, which is the root shdeps owns for a `cgraf78/<repo>` archive release. On its next update, even when the installed release is already current, shdeps reinstalls the selected release into its own marked root in place of that link, so dependency hooks such as dot's `post` run, but only after verifying it is the installer's own layout: its ownership marker, exact relative links that stay inside its private directory, release metadata naming this repository, real directories and files owned by you, and no installer lock (a lock left by a killed installer blocks the update with a message naming it). Where the filesystem can swap two paths atomically (Linux `renameat2`, macOS `renamex_np` where the volume supports it) the root never disappears during the switch. Elsewhere, including Android/Termux where the syscall is never attempted and filesystems that decline it (NFS, WSL1 drvfs, older ZFS), shdeps first points a public command symlink straight at the binary it runs, then parks the root link under a fixed name, so an interrupted switch is recognized and finished by the next archive install; a regular launcher in front of the root (such as dot's `client-launcher.sh`) depends on the root for the instant between those two renames, so a crash exactly there leaves it failing until `shdeps update` runs again. A transient download failure during adoption keeps the working command and retries on the next run. The installer's private `.<repo>-standalone` directory is left in place, because a running old binary may still use it; once the public command points into the new root it is inert and safe to delete. A raw single-binary asset over that layout is refused like any other archive-to-raw format change.
+
 ```text
 neovim/neovim    github:release    nvim
 mvdan/sh         github:release
@@ -439,7 +441,7 @@ export MANPATH="$HOME/.local/share/man:$MANPATH"
 fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
 ```
 
-Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdeps prune` removes symlinks along with the dep. Updates clean stale symlinks before re-linking.
+Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdeps prune` removes symlinks along with the dep. Updates clean stale symlinks before re-linking, and retire tracked links left dangling by an install root that no longer exists.
 
 ## CLI Usage
 
@@ -455,6 +457,7 @@ Commands:
   dep-path <name> <rel>  Print a path below a configured dependency root
   dep-file <name> <rel>  Print a readable regular file below a dependency root
   dep-links <name>       Print public command links owned by a dependency
+  health                 Report problems with installed dependencies
   prune                  Remove orphaned deps no longer in config
   version                Print shdeps version
   help                   Show this help message
@@ -480,11 +483,19 @@ Examples:
   shdeps check jq
   shdeps prune --dry-run
   shdeps prune -y
+  shdeps health
+
+Health output (stable): one problem per line, exactly five tab-separated
+fields: <severity> <package> <kind> <path> <detail>
+  severity is fail or warn; package and path are - when not applicable.
+  New kinds may be added; ignore unknown kinds. Healthy prints nothing.
+  Local reads only: no network, hooks, writes, or locks.
 
 Exit codes:
-  0  Success
-  1  Error
+  0  Success (health: no problems)
+  1  Error (health: problems reported)
   2  Usage error
+  3  health: report incomplete (state unreadable, or output not written)
   128+N  Interrupted by signal N after owned subprocess cleanup
 ```
 
@@ -505,6 +516,60 @@ shdeps prune --dry-run # preview without removing
 ```
 
 For `pkg` deps, prune warns that manual removal is needed (system packages may be shared). For `custom` deps, prune calls the optional `uninstall()` hook function.
+
+### Health Checks
+
+`shdeps health` reports problems with installed dependencies for health
+dashboards such as `dot doctor`. It reads only local config and state and
+`lstat`s the paths they name: no network, hooks, package-manager queries,
+state writes, or locks, so it is safe beside a running `shdeps update` and
+takes milliseconds. It honors `-c`/`SHDEPS_CONF_DIR` and the other root
+variables like every command; global options go before the command
+(`shdeps -c DIR health`).
+
+The output is a stable machine contract. A healthy host prints nothing;
+otherwise each problem is one line of exactly five tab-separated fields:
+
+```text
+<severity>\t<package>\t<kind>\t<path>\t<detail>
+```
+
+- `severity` is `fail` or `warn` (a closed set), fixed per kind. `fail` marks
+  states the next `shdeps update` cannot repair by itself.
+- `package` is the dependency name, or `-` for state no single dependency owns.
+- `path` is the affected path, or `-`.
+- `detail` is one line ending in a remediation hint. Tabs and newlines inside
+  fields are replaced with spaces, so every row has exactly five fields.
+- New kinds may be added in later releases; consumers should ignore kinds they
+  do not know. Columns are never added.
+
+| Kind                     | Severity | Meaning                                                                                      |
+| ------------------------ | -------- | -------------------------------------------------------------------------------------------- |
+| `missing-binlink`        | warn     | An expected public command link (as `shdeps dep-links` reports it) is absent                 |
+| `dangling-binlink`       | warn     | A public command link points at a missing path                                               |
+| `wrong-target`           | warn     | A public command link resolves somewhere other than its expected target                      |
+| `not-executable`         | fail     | A public command resolves to a non-executable file                                           |
+| `dangling-link`          | warn     | A tracked man page or completion link (`<name>.links`) dangles                               |
+| `not-installed`          | warn     | A configured `github*`, `cargo`, `go`, `uv`, or `npm` dependency has no recorded install     |
+| `install-root-unmanaged` | fail     | `shdeps update` would refuse to upgrade a `github:release` root (symlinked, unmarked, missing behind a public link, or corrupt marker) |
+| `archive-backup`         | warn     | An interrupted archive update left a `*.shdeps-archive-backup-*` sibling                     |
+| `deferred-post`          | warn     | A `post()` hook needed sudo without a terminal; run `shdeps update` from a terminal           |
+| `deferred-uninstall`     | warn     | An `uninstall()` hook needed sudo without a terminal; run `shdeps prune` from a terminal      |
+| `pending-post`           | warn     | A `post()` hook has not completed and will be retried                                        |
+| `recovery-state`         | warn     | An interrupted update or prune left recovery records                                         |
+| `unreadable-state`       | fail     | Config or state could not be read, so the report is incomplete                               |
+
+A regular executable file at a command path (a raw release binary, or a
+launcher a client deliberately placed there) is not a problem: shdeps
+preserves such files. `pending-post`, `recovery-state`, and `archive-backup`
+are omitted while the recorded state-lock owner is still running, because
+that update or prune is creating and retiring them itself.
+
+Exit status: `0` healthy, `1` problems reported, `3` the report is incomplete
+(some state could not be read, reported as `unreadable-state` alongside any
+other problems, or the report could not be written). `2` remains the
+usage-error status, which is also what a Shdeps release without `health`
+returns for the unknown command, so callers can treat `2` as "unsupported".
 
 ## Bash API
 

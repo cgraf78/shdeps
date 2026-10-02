@@ -22,7 +22,8 @@ use crate::method;
 use crate::process;
 use crate::state;
 
-const ARCHIVE_LAYOUT_FILE: &str = ".shdeps-release-layout";
+pub(crate) const ARCHIVE_LAYOUT_FILE: &str = ".shdeps-release-layout";
+const ARCHIVE_BACKUP_EXTENSION: &str = "shdeps-archive-backup-";
 const ARCHIVE_LAYOUT_CONTENT: &str = "v1 archive\n";
 
 struct RemoveOnDrop(PathBuf);
@@ -152,6 +153,149 @@ pub(crate) fn archive_state(
     }
 
     Ok(ArchiveState::None)
+}
+
+/// Why `shdeps update` would refuse to upgrade a `github:release` root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpgradeBlocker {
+    /// The stable root is a symlink. Ownership checks never follow it, so it
+    /// cannot be proven to be a Shdeps archive (e.g. another installer's
+    /// `current` link).
+    SymlinkedRoot {
+        /// Raw link target, for the report.
+        target: PathBuf,
+    },
+    /// Something other than a directory occupies the stable root.
+    NonDirectoryRoot,
+    /// A real directory without the archive marker or legacy proof.
+    UnprovenRoot {
+        /// The legacy evidence is contradictory (`ArchiveState::Ambiguous`),
+        /// which blocks raw and archive releases alike.
+        ambiguous: bool,
+    },
+    /// The root is gone while the public command is still a link, the shape
+    /// only an archive install leaves; an archive upgrade cannot prove the
+    /// link is not someone else's and refuses to replace it.
+    MissingRoot,
+    /// The marker exists but is not a regular file with the known content;
+    /// every update fails closed on it.
+    InvalidMarker(String),
+    /// The standalone release installer's publication lock exists (an
+    /// `install.sh` is running, or one was killed and left it), so the update
+    /// refuses to interpret the installer's tree. Only Unix hosts run the
+    /// installer.
+    #[cfg(unix)]
+    InstallerLocked {
+        /// The lock path to remove once no installer runs.
+        lock: PathBuf,
+    },
+}
+
+/// Read-only twin of the release update's layout gate.
+///
+/// For a dependency whose manifest row is already `github:release`,
+/// `update_release::install_request` refuses a download as a "release asset
+/// format changed" migration when, from the same `archive_state` snapshot, a
+/// raw asset meets any state other than `None`, or an archive asset meets a
+/// root that is not `Proven` while the public command path exists. Without
+/// network the asset kind is unknown, so this assumes the next asset keeps
+/// the root's current layout: a proven or installer-owned archive root and a
+/// rootless regular public file (a raw release) are healthy, and every other
+/// root that blocks either kind is reported. (A symlinked or
+/// unmarked root beside a regular launcher still blocks archive upgrades and
+/// is reported; that is the legacy-launcher shape of a standalone install.)
+/// Before the first recorded release only the explicit marker is read, and
+/// only a corrupt one blocks. It writes nothing (no marker backfill) and
+/// takes no lock, so diagnostics may run beside an update; a root a
+/// concurrent update is swapping can classify either way for that instant.
+///
+/// A root the cgraf78/actions standalone installer provably owns
+/// (`standalone_layout::classify`) is adopted by the archive switch, so it is
+/// not blocked, including an adoption interrupted with the root link parked;
+/// while that installer's lock exists the update refuses, so that is
+/// reported. Like the update, the layout is consulted only for a root that
+/// is not already `Proven`, so a lock left beside an adopted root is inert. The installer only publishes archives, so a raw asset over its
+/// root is an unknowable format change like any other.
+///
+/// The predicate is restated here rather than shared with `install_request`;
+/// the CLI parity test `health_agrees_with_update_on_every_release_root`
+/// runs both against each root shape and pins agreement.
+pub(crate) fn upgrade_blocker(
+    state_dir: &Path,
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+    prior_release: bool,
+) -> Result<Option<UpgradeBlocker>> {
+    // Validate the marker on its own first so a corrupt marker is reported
+    // as such, while any other read failure (a corrupt link ledger) stays an
+    // error for the caller instead of masquerading as a marker problem.
+    if let Some(install_dir) = managed_install_dir(install_base, name)? {
+        match marker_state(&install_dir) {
+            Ok(_) => {}
+            Err(crate::Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                return Ok(Some(UpgradeBlocker::InvalidMarker(error.to_string())));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // The same snapshot the update gate starts from: full legacy proof once a
+    // release is recorded, otherwise only the explicit marker.
+    let archive = if prior_release {
+        archive_state(state_dir, install_base, public, name)?
+    } else {
+        explicit_archive_state(install_base, name)?
+    };
+    // Like the update, consult the installer layout only for a root Shdeps
+    // has not proven: a marked root is its own, so a stale installer lock
+    // left in the inert control directory beside it blocks nothing.
+    if archive != ArchiveState::Proven {
+        match crate::standalone_layout::classify(install_base, name, public) {
+            crate::standalone_layout::Standalone::Adoptable => return Ok(None),
+            #[cfg(unix)]
+            crate::standalone_layout::Standalone::Locked(lock) => {
+                return Ok(Some(UpgradeBlocker::InstallerLocked { lock }));
+            }
+            crate::standalone_layout::Standalone::None => {}
+        }
+    }
+    if !prior_release {
+        // Before the first recorded release install the update consults only
+        // the explicit marker, which was just found valid or absent.
+        return Ok(None);
+    }
+    match archive {
+        ArchiveState::Proven => Ok(None),
+        ArchiveState::Ambiguous => Ok(Some(UpgradeBlocker::UnprovenRoot { ambiguous: true })),
+        ArchiveState::None => {
+            let public_type = match fs::symlink_metadata(public) {
+                Ok(metadata) => metadata.file_type(),
+                // The archive switch replaces an unowned root only when no
+                // public command could be stranded.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let root = install_base.join(name);
+            let root_type = match fs::symlink_metadata(&root) {
+                Ok(metadata) => metadata.file_type(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(public_type
+                        .is_symlink()
+                        .then_some(UpgradeBlocker::MissingRoot));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            Ok(Some(if root_type.is_symlink() {
+                UpgradeBlocker::SymlinkedRoot {
+                    target: fs::read_link(&root).unwrap_or_default(),
+                }
+            } else if root_type.is_dir() {
+                UpgradeBlocker::UnprovenRoot { ambiguous: false }
+            } else {
+                UpgradeBlocker::NonDirectoryRoot
+            }))
+        }
+    }
 }
 
 /// Backfills the marker for a proven legacy archive during a mutating update.
@@ -621,28 +765,124 @@ fn install_archive(
         fs::create_dir_all(parent)?;
     }
 
-    // Backup/switch/rollback pattern (mirrors `release_activate::activate`):
-    // the previous `remove_any(&install_dir)` immediately followed by
-    // `rename(&content_root, &install_dir)` had a window where, if the
-    // rename failed for any reason (transient FS error, permissions, a
-    // stale file handle preventing the parent's directory entry from being
-    // claimed), the existing install was already gone and the public
-    // symlink left pointing at a now-missing path. Atomically rename the
-    // old install to a sibling backup first, attempt the switch, and
-    // restore the backup if the switch fails. Both renames stay on the
-    // same filesystem (sibling paths) so they're atomic on POSIX.
-    let backup = install_backup_path(&install_dir);
+    // See `switch_root` for the backup/exchange/rollback contract.
+    let parked = switch_root(&content_root, &install_dir, public, &relative_binary)?;
+    let source = install_dir.join(relative_binary);
+    if let Err(link) = replace_symlink(&source, public) {
+        // Root activation and public-link publication are one transaction. If
+        // the link cannot be committed, remove the new root and restore the old
+        // one before the caller restores any parked raw public command. Leaving
+        // a marked new root beside that old command would make a retry mistake
+        // the raw binary for a deliberately preserved launcher.
+        if let Err(remove) = remove_any(&install_dir) {
+            return Err(io::Error::other(format!(
+                "archive public link failed and new root removal also failed: link={link}, remove={remove}"
+            ))
+            .into());
+        }
+        if let Some(parked) = &parked {
+            if let Err(rollback) = fs::rename(parked, &install_dir) {
+                return Err(io::Error::other(format!(
+                    "archive public link failed and root restore also failed: link={link}, restore={rollback}"
+                ))
+                .into());
+            }
+        }
+        return Err(link);
+    }
+    if let Some(parked) = &parked {
+        // The root and its public command are now committed. Backup cleanup is
+        // best-effort so an antivirus or transient handle does not turn a good
+        // install into a manifest-less failure. `remove_any` uses
+        // `symlink_metadata`, so a parked symlink is unlinked, never followed.
+        let _ = remove_any(parked);
+    }
+    // A fallback switch killed after its second rename leaves the parked root
+    // link beside a committed root. Shdeps alone creates that fixed name, so
+    // a later successful switch retires it.
+    let stale_parked = parked_root_link(&install_dir);
+    if fs::symlink_metadata(&stale_parked).is_ok_and(|metadata| metadata.is_symlink()) {
+        let _ = fs::remove_file(&stale_parked);
+    }
+    // Bin-dir fanout remains best-effort: the co-activated layout marker now
+    // carries archive ownership even when a regular launcher was preserved.
+    let _ = link_archive_bins(state_dir, public, name, &install_dir);
+    // Release archives commonly carry completions or man pages beside the
+    // binary. Reusing the shared extras linker keeps those secondary artifacts
+    // tracked and prunable exactly like repo-based installs.
+    //
+    // Extras linking is best-effort: a failure here (rare permission or
+    // state-dir error) must not undo a successfully installed binary. The
+    // binary symlink at `public` is already live; returning Err now would leave
+    // the dep installed but with no manifest entry, causing a spurious
+    // reinstall on every future `shdeps update`.
+    let _ = extras::link(state_dir, install_base, name, &install_dir);
+    Ok(public.to_path_buf())
+}
+
+/// Moves the staged root into place and returns where the previous root entry
+/// was parked, if there was one, so the caller can roll back or discard it.
+///
+/// Backup/switch/rollback pattern (mirrors `release_activate::activate`): an
+/// earlier `remove_any(&install_dir)` immediately followed by
+/// `rename(&content_root, &install_dir)` had a window where, if the rename
+/// failed for any reason (transient FS error, permissions, a stale file handle
+/// preventing the parent's directory entry from being claimed), the existing
+/// install was already gone and the public symlink left pointing at a
+/// now-missing path. The old install is therefore renamed to a sibling backup
+/// first and restored if the switch fails. Both renames stay on the same
+/// filesystem (sibling paths) so each is atomic on POSIX.
+///
+/// A symlinked root (the cgraf78/actions standalone installer's layout, see
+/// `standalone_layout`) gets stronger treatment because commands outside
+/// Shdeps' ledger resolve through it: a client launcher, Termux's
+/// `$PREFIX/bin` link, or the installer's manpage link. Where the filesystem
+/// can exchange two paths atomically, the staged directory and the link trade
+/// places in one step, so the root never disappears. Otherwise the public
+/// command is first pointed straight at the binary it currently runs and the
+/// link is parked under a fixed name ([`parked_root_link`]), so a crash
+/// between the two renames is recognizable and the next update finishes the
+/// switch and removes the parked link. A regular launcher (dot's
+/// `client-launcher.sh`) cannot be re-pointed, so on that fallback path a
+/// crash exactly between the renames leaves it failing until Shdeps runs
+/// again; the exchange path has no such window.
+fn switch_root(
+    content_root: &Path,
+    install_dir: &Path,
+    public: &Path,
+    relative_binary: &Path,
+) -> Result<Option<PathBuf>> {
     // Do not use `Path::exists()` here: it follows symlinks, so a dangling
     // repo-install root would look absent even though its directory entry still
     // blocks the destination rename. The archive switch owns entries at this
     // boundary, not whatever a prior symlink happened to target.
-    let had_existing = path_entry_exists(&install_dir)?;
+    let had_existing = path_entry_exists(install_dir)?;
+    let parked_link = parked_root_link(install_dir);
+    let mut backup = None;
     if had_existing {
-        fs::rename(&install_dir, &backup)?;
+        let parked = if fs::symlink_metadata(install_dir)?.file_type().is_symlink() {
+            if exchange_paths(content_root, install_dir).is_ok() {
+                // The old link now sits at the staged path. It is the parked
+                // entry: rollback renames it back, success unlinks it, and the
+                // extraction scope guard never follows it.
+                return Ok(Some(content_root.to_path_buf()));
+            }
+            keep_command_resolvable(public, install_dir, relative_binary)?;
+            parked_link
+        } else {
+            install_backup_path(install_dir)
+        };
+        fs::rename(install_dir, &parked)?;
+        backup = Some(parked);
+    } else if fs::symlink_metadata(&parked_link).is_ok_and(|metadata| metadata.is_symlink()) {
+        // A previous fallback switch parked the root link and was killed
+        // before the new root moved in. Treat that link as the prior root:
+        // rollback restores it, success removes it.
+        backup = Some(parked_link);
     }
-    if let Err(switch) = fs::rename(&content_root, &install_dir) {
-        if had_existing {
-            if let Err(rollback) = fs::rename(&backup, &install_dir) {
+    if let Err(switch) = fs::rename(content_root, install_dir) {
+        if let Some(parked) = backup.as_ref().filter(|_| had_existing) {
+            if let Err(rollback) = fs::rename(parked, install_dir) {
                 // Two failures in a row: the live switch and restore both
                 // failed. Keep the old backup for manual recovery, while the
                 // extraction scope guard removes the failed candidate so a
@@ -659,53 +899,131 @@ fn install_archive(
         // Clean up the staged content directory so retries don't
         // accumulate `.tmp.<pid>`-style stragglers next to the live
         // install — same hygiene `release_activate` applies.
-        let _ = remove_any(&content_root);
+        let _ = remove_any(content_root);
         return Err(switch.into());
     }
-    let source = install_dir.join(relative_binary);
-    if let Err(link) = replace_symlink(&source, public) {
-        // Root activation and public-link publication are one transaction. If
-        // the link cannot be committed, remove the new root and restore the old
-        // one before the caller restores any parked raw public command. Leaving
-        // a marked new root beside that old command would make a retry mistake
-        // the raw binary for a deliberately preserved launcher.
-        if let Err(remove) = remove_any(&install_dir) {
-            return Err(io::Error::other(format!(
-                "archive public link failed and new root removal also failed: link={link}, remove={remove}"
-            ))
-            .into());
+    Ok(backup)
+}
+
+/// Fixed sibling name for a symlinked root parked by the fallback switch.
+///
+/// Unlike the unique backup names used for real directories, this one is
+/// deterministic so an interrupted switch is recognizable afterwards (see
+/// `standalone_layout::classify`). The name is reserved: Shdeps treats a
+/// symlink there as its own parked root and replaces or retires it. The
+/// `.shdeps-` infix keeps it out of any upstream or installer namespace.
+pub(crate) fn parked_root_link(install_dir: &Path) -> PathBuf {
+    let mut name = install_dir
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".shdeps-parked-root");
+    install_dir.with_file_name(name)
+}
+
+/// Whether this build may attempt an atomic path exchange at all.
+///
+/// Android is excluded by owner policy: before Android 11 the app seccomp
+/// policy may kill the process with SIGSYS on `renameat2`, and a signal is not
+/// an error the fallback could catch, so the standalone adoption switch never
+/// risks it and Termux always takes the park-and-resume path. (Other
+/// `repo_transition` callers predate this policy and are not changed here.)
+/// Non-Unix platforms have no exchange primitive.
+pub(crate) const ATOMIC_EXCHANGE_ALLOWED: bool = cfg!(all(unix, not(target_os = "android")));
+
+/// Atomically swaps two existing paths on the same filesystem, or fails without
+/// changing either.
+///
+/// Callers must treat every error as "not swapped" and fall back: kernels
+/// before 3.15 report ENOSYS, and filesystems without exchange support (WSL1
+/// drvfs, NFS, older ZFS, overlay stacks, HFS+) report EINVAL, EOPNOTSUPP, or
+/// EXDEV. A failed `renameat2`/`renamex_np` never changes either path.
+fn exchange_paths(left: &Path, right: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        if let Some(errno) = EXCHANGE_FAULT.with(std::cell::Cell::get) {
+            return Err(io::Error::from_raw_os_error(errno));
         }
-        if had_existing {
-            if let Err(rollback) = fs::rename(&backup, &install_dir) {
-                return Err(io::Error::other(format!(
-                    "archive public link failed and root restore also failed: link={link}, restore={rollback}"
-                ))
-                .into());
-            }
+    }
+    if !ATOMIC_EXCHANGE_ALLOWED {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    }
+    #[cfg(unix)]
+    {
+        crate::repo_transition::rename_exchange(left, right)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Errno a test injects in place of the exchange syscall's result.
+    static EXCHANGE_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `body` with every exchange on this thread failing with `errno`, the
+/// way a kernel or filesystem without support would (tests only).
+#[cfg(test)]
+pub(crate) fn with_exchange_errno<T>(errno: i32, body: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXCHANGE_FAULT.with(|fault| fault.set(None));
         }
-        return Err(link);
     }
-    if had_existing {
-        // The root and its public command are now committed. Backup cleanup is
-        // best-effort so an antivirus or transient handle does not turn a good
-        // install into a manifest-less failure. `remove_any` uses
-        // `symlink_metadata`, so a parked symlink is unlinked, never followed.
-        let _ = remove_any(&backup);
-    }
-    // Bin-dir fanout remains best-effort: the co-activated layout marker now
-    // carries archive ownership even when a regular launcher was preserved.
-    let _ = link_archive_bins(state_dir, public, name, &install_dir);
-    // Release archives commonly carry completions or man pages beside the
-    // binary. Reusing the shared extras linker keeps those secondary artifacts
-    // tracked and prunable exactly like repo-based installs.
-    //
-    // Extras linking is best-effort: a failure here (rare permission or
-    // state-dir error) must not undo a successfully installed binary. The
-    // binary symlink at `public` is already live; returning Err now would leave
-    // the dep installed but with no manifest entry, causing a spurious
-    // reinstall on every future `shdeps update`.
-    let _ = extras::link(state_dir, install_base, name, &install_dir);
-    Ok(public.to_path_buf())
+    EXCHANGE_FAULT.with(|fault| fault.set(Some(errno)));
+    let _restore = Restore;
+    body()
+}
+
+/// Runs `body` as if this platform could not exchange paths (tests only).
+#[cfg(test)]
+pub(crate) fn without_exchange<T>(body: impl FnOnce() -> T) -> T {
+    with_exchange_errno(libc::ENOSYS, body)
+}
+
+/// Before a symlinked root is renamed away, points a public command symlink
+/// that currently resolves through the root straight at the same physical
+/// binary, creating it when absent. A regular launcher or a link elsewhere is
+/// never touched. The switch's final link publication then re-points the
+/// command into the new root.
+#[cfg(unix)]
+fn keep_command_resolvable(
+    public: &Path,
+    install_dir: &Path,
+    relative_binary: &Path,
+) -> Result<()> {
+    let Ok(root) = fs::canonicalize(install_dir) else {
+        // A dangling root link resolves nothing, so nothing can break.
+        return Ok(());
+    };
+    let target = match fs::symlink_metadata(public) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(public).ok(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Commands published outside SHDEPS_BIN_DIR (Termux's installer
+            // uses `$PREFIX/bin`) cannot be re-pointed; publishing Shdeps' own
+            // command early still leaves one that survives the switch.
+            fs::canonicalize(install_dir.join(relative_binary)).ok()
+        }
+        _ => None,
+    };
+    let Some(target) = target.filter(|target| target.starts_with(&root) && target.is_file()) else {
+        return Ok(());
+    };
+    replace_symlink(&target, public).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn keep_command_resolvable(
+    _public: &Path,
+    _install_dir: &Path,
+    _relative_binary: &Path,
+) -> Result<()> {
+    Ok(())
 }
 
 fn link_archive_bins(
@@ -813,9 +1131,45 @@ fn install_backup_path(install_dir: &Path) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     install_dir.with_extension(format!(
-        "shdeps-archive-backup-{}-{nanos}",
+        "{ARCHIVE_BACKUP_EXTENSION}{}-{nanos}",
         std::process::id()
     ))
+}
+
+/// Lists backups that an interrupted archive swap left beside a release root.
+///
+/// The swap renames the live root to [`install_backup_path`] and removes it
+/// after the new root is in place, so a survivor means a crash in between
+/// (or a swap still deleting the old tree). Matching uses the same
+/// `with_extension` derivation, so a repo name that already contains a dot is
+/// found too; that derivation also means `owner/foo` and `owner/foo.nvim`
+/// share backup names, so such a backup is listed for both. One `read_dir` of
+/// the owner directory; an unreadable directory reports nothing.
+pub(crate) fn archive_backups(install_base: &Path, name: &str) -> Vec<PathBuf> {
+    let prefix_path = install_base
+        .join(name)
+        .with_extension(ARCHIVE_BACKUP_EXTENSION);
+    let (Some(parent), Some(prefix)) = (
+        prefix_path.parent(),
+        prefix_path.file_name().and_then(|prefix| prefix.to_str()),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut backups = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|file| file.starts_with(prefix) && file.len() > prefix.len())
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups
 }
 
 fn content_root(extract_dir: &Path) -> Result<PathBuf> {
@@ -1750,6 +2104,58 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn archive_install_restores_a_symlinked_root_when_public_link_fails() {
+        // Covers both switch flavors: after an exchange the old link is parked
+        // at the staged path, after the fallback under the fixed parked name.
+        // Either way a failed publication must restore the exact old link and
+        // leave no staged, parked, or backup entries behind.
+        for exchange in [true, false] {
+            let dir = temp_dir(&format!("archive-symlinked-root-rollback-{exchange}"));
+            let install_base = dir.join("share");
+            let old_release = install_base.join("owner/.tool-standalone/releases/old");
+            let install_dir = install_base.join("owner/tool");
+            fs::create_dir_all(&old_release).unwrap();
+            crate::test_support::write_executable(&old_release.join("tool"), "#!/bin/sh\n");
+            symlink(".tool-standalone/releases/old", &install_dir).unwrap();
+            let blocker = dir.join("blocked");
+            fs::write(&blocker, "sentinel").unwrap();
+
+            let install = || {
+                super::install_tar_gz_to(
+                    &dir.join("state"),
+                    &install_base,
+                    &blocker.join("tool"),
+                    "owner/tool",
+                    "tool",
+                    &tar_gz(&[("tool", b"v2".as_slice(), 0o755)]),
+                )
+            };
+            let error = if exchange {
+                install().unwrap_err()
+            } else {
+                super::without_exchange(install).unwrap_err()
+            };
+
+            assert!(!error.to_string().is_empty());
+            assert_eq!(
+                fs::read_link(&install_dir).unwrap(),
+                std::path::Path::new(".tool-standalone/releases/old")
+            );
+            let mut leftovers: Vec<_> = fs::read_dir(install_base.join("owner"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            leftovers.sort();
+            assert_eq!(
+                leftovers,
+                [".tool-standalone", "tool"],
+                "exchange={exchange}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn archive_install_replaces_dangling_install_root_symlink() {
         // A repo-based install can leave its stable root as a symlink after the
         // checkout it targeted is removed. Path::exists follows that dangling
@@ -1778,6 +2184,208 @@ mod tests {
             fs::read(public.canonicalize().unwrap()).unwrap(),
             b"release"
         );
+    }
+
+    /// Builds a staged root plus a symlinked live root (the standalone
+    /// installer's shape) and returns `(staged, root, old_binary, public)`.
+    #[cfg(unix)]
+    fn symlinked_root_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        let old_release = dir.join("share/owner/.tool-standalone/releases/old");
+        let staged = dir.join("share/owner/.tool.tmp.1");
+        let root = dir.join("share/owner/tool");
+        let public = dir.join("bin/tool");
+        fs::create_dir_all(&old_release).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(&old_release.join("tool"), "#!/bin/sh\necho old\n");
+        crate::test_support::write_executable(&staged.join("tool"), "#!/bin/sh\necho new\n");
+        symlink(".tool-standalone/releases/old", &root).unwrap();
+        symlink(root.join("tool"), &public).unwrap();
+        let old_binary = fs::canonicalize(old_release.join("tool")).unwrap();
+        (staged, root, old_binary, public)
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn symlinked_root_switch_exchanges_without_a_missing_root() {
+        let (staged, root, old_binary, public) = symlinked_root_fixture("switch-exchange");
+
+        let parked =
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap();
+
+        // Whether the exchange path ran depends on the test filesystem, not on
+        // the code: tmpfs/ext4/btrfs/APFS exchange, while NFS, WSL1 drvfs, or
+        // older ZFS decline. Assert whichever switch this filesystem selects.
+        if exchange_supported(root.parent().unwrap()) {
+            assert_eq!(parked.as_deref(), Some(staged.as_path()));
+            assert_eq!(
+                fs::read_link(&staged).unwrap(),
+                std::path::Path::new(".tool-standalone/releases/old")
+            );
+            assert_eq!(fs::read_link(&public).unwrap(), root.join("tool"));
+        } else {
+            assert_eq!(parked, Some(super::parked_root_link(&root)));
+            assert_eq!(fs::read_link(&public).unwrap(), old_binary);
+        }
+        assert!(
+            !fs::symlink_metadata(&root)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("tool")).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
+        assert!(old_binary.is_file(), "the old release is never touched");
+    }
+
+    /// Probes whether this build and filesystem can exchange a directory with
+    /// a symlink, the exact shape `switch_root` swaps.
+    #[cfg(unix)]
+    fn exchange_supported(dir: &std::path::Path) -> bool {
+        let probe_dir = dir.join(".exchange-probe-dir");
+        let probe_link = dir.join(".exchange-probe-link");
+        fs::create_dir_all(&probe_dir).unwrap();
+        let _ = fs::remove_file(&probe_link);
+        symlink("target", &probe_link).unwrap();
+        let supported = super::exchange_paths(&probe_dir, &probe_link).is_ok();
+        let _ = fs::remove_file(&probe_dir);
+        let _ = fs::remove_dir(&probe_dir);
+        let _ = fs::remove_file(&probe_link);
+        let _ = fs::remove_dir(&probe_link);
+        supported
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_root_switch_falls_back_for_every_unsupported_exchange_errno() {
+        // Kernels without renameat2 (ENOSYS) and filesystems without exchange
+        // support (EINVAL on NFS/WSL1 drvfs, EOPNOTSUPP on older ZFS, EXDEV on
+        // overlay stacks) must select the park-and-resume switch, never fail.
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP, libc::EXDEV] {
+            let (staged, root, old_binary, public) =
+                symlinked_root_fixture(&format!("switch-errno-{errno}"));
+
+            let parked = super::with_exchange_errno(errno, || {
+                super::switch_root(&staged, &root, &public, std::path::Path::new("tool"))
+            })
+            .unwrap_or_else(|error| panic!("errno {errno} must fall back: {error}"));
+
+            assert_eq!(
+                parked,
+                Some(super::parked_root_link(&root)),
+                "errno {errno}"
+            );
+            assert_eq!(fs::read_link(&public).unwrap(), old_binary, "errno {errno}");
+            assert!(
+                !fs::symlink_metadata(&root)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "errno {errno}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "android")]
+    fn symlinked_root_switch_never_attempts_exchange_on_android() {
+        // Termux CI: the exchange syscall may be fatal under older app seccomp
+        // policies, so the build must select the fallback without trying it.
+        assert!(!super::ATOMIC_EXCHANGE_ALLOWED);
+        let (staged, root, old_binary, public) = symlinked_root_fixture("switch-android");
+
+        let parked =
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap();
+
+        assert_eq!(parked, Some(super::parked_root_link(&root)));
+        assert_eq!(fs::read_link(&public).unwrap(), old_binary);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_root_fallback_switch_pins_the_public_command_first() {
+        let (staged, root, old_binary, public) = symlinked_root_fixture("switch-fallback");
+
+        let parked = super::without_exchange(|| {
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap()
+        })
+        .unwrap();
+
+        // Before the root moved, the command was pointed straight at the
+        // binary it ran, so a crash between the renames left it working, and
+        // the link was parked under the fixed, recognizable name.
+        assert_eq!(fs::read_link(&public).unwrap(), old_binary);
+        assert_eq!(parked, super::parked_root_link(&root));
+        assert_eq!(
+            fs::read_link(&parked).unwrap(),
+            std::path::Path::new(".tool-standalone/releases/old")
+        );
+        assert!(
+            !fs::symlink_metadata(&root)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_root_fallback_switch_publishes_a_missing_command_early() {
+        let (staged, root, old_binary, public) = symlinked_root_fixture("switch-fallback-absent");
+        fs::remove_file(&public).unwrap();
+
+        super::without_exchange(|| {
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap()
+        });
+
+        assert_eq!(fs::read_link(&public).unwrap(), old_binary);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_root_fallback_switch_never_touches_launchers_or_foreign_links() {
+        let (staged, root, _old_binary, public) =
+            symlinked_root_fixture("switch-fallback-launcher");
+        fs::remove_file(&public).unwrap();
+        crate::test_support::write_executable(&public, "#!/bin/sh\nexec launcher\n");
+
+        super::without_exchange(|| {
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap()
+        });
+        assert_eq!(
+            fs::read_to_string(&public).unwrap(),
+            "#!/bin/sh\nexec launcher\n"
+        );
+
+        let (staged, root, _old_binary, public) = symlinked_root_fixture("switch-fallback-foreign");
+        let foreign = public.with_file_name("elsewhere");
+        crate::test_support::write_executable(&foreign, "#!/bin/sh\n");
+        fs::remove_file(&public).unwrap();
+        symlink(&foreign, &public).unwrap();
+
+        super::without_exchange(|| {
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap()
+        });
+        assert_eq!(fs::read_link(&public).unwrap(), foreign);
+
+        // A non-canonical spelling of a foreign target would be rewritten to
+        // its canonical form if the "resolves into the root" filter were lost,
+        // so this also pins that filter, not just the final target.
+        let (staged, root, _old_binary, public) =
+            symlinked_root_fixture("switch-fallback-foreign-noncanonical");
+        let foreign = public.with_file_name("elsewhere");
+        crate::test_support::write_executable(&foreign, "#!/bin/sh\n");
+        let spelled = public.parent().unwrap().join("../bin/elsewhere");
+        fs::remove_file(&public).unwrap();
+        symlink(&spelled, &public).unwrap();
+
+        super::without_exchange(|| {
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap()
+        });
+        assert_eq!(fs::read_link(&public).unwrap(), spelled);
     }
 
     #[test]
@@ -2154,5 +2762,184 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_support::temp_dir(&format!("shdeps-release-install-{name}"))
+    }
+
+    /// Layout fixture for `upgrade_blocker`: (state, install base, public).
+    fn blocker_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        let install_base = dir.join("share");
+        fs::create_dir_all(install_base.join("owner")).unwrap();
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        (dir.join("state"), install_base, dir.join("bin/tool"))
+    }
+
+    fn blocker(
+        state: &std::path::Path,
+        base: &std::path::Path,
+        public: &std::path::Path,
+        prior_release: bool,
+    ) -> Option<super::UpgradeBlocker> {
+        super::upgrade_blocker(state, base, public, "owner/tool", prior_release).unwrap()
+    }
+
+    #[test]
+    fn upgrade_blocker_allows_absent_marked_and_legacy_proven_roots() {
+        let (state, base, public) = blocker_fixture("blocker-allowed");
+        fs::write(&public, "raw").unwrap();
+        assert_eq!(blocker(&state, &base, &public, true), None, "raw release");
+
+        fs::remove_file(&public).unwrap();
+        let root = base.join("owner/tool");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/tool"), "bin").unwrap();
+        symlink(root.join("bin/tool"), &public).unwrap();
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            None,
+            "a live public link into the root proves a pre-marker archive"
+        );
+
+        fs::write(root.join(super::ARCHIVE_LAYOUT_FILE), "v1 archive\n").unwrap();
+        assert_eq!(blocker(&state, &base, &public, true), None, "marked root");
+    }
+
+    #[test]
+    fn upgrade_blocker_reports_symlinked_root_only_when_update_would_refuse() {
+        let (state, base, public) = blocker_fixture("blocker-symlink");
+        fs::create_dir_all(base.join("owner/.tool-standalone/current")).unwrap();
+        symlink(".tool-standalone/current", base.join("owner/tool")).unwrap();
+
+        // Without a public command or a prior release the archive switch
+        // replaces the unowned link, so nothing blocks.
+        assert_eq!(blocker(&state, &base, &public, true), None);
+        symlink(base.join("owner/tool/tool"), &public).unwrap();
+        assert_eq!(blocker(&state, &base, &public, false), None);
+
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::SymlinkedRoot {
+                target: PathBuf::from(".tool-standalone/current")
+            })
+        );
+    }
+
+    #[test]
+    fn upgrade_blocker_reports_unproven_and_ambiguous_directories() {
+        let (state, base, public) = blocker_fixture("blocker-unproven");
+        fs::create_dir_all(base.join("owner/tool")).unwrap();
+        let elsewhere = public.with_file_name("elsewhere");
+        fs::write(&elsewhere, "bin").unwrap();
+        symlink(&elsewhere, &public).unwrap();
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::UnprovenRoot { ambiguous: false })
+        );
+
+        fs::remove_file(&public).unwrap();
+        fs::write(&public, "launcher").unwrap();
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::UnprovenRoot { ambiguous: true })
+        );
+    }
+
+    #[test]
+    fn upgrade_blocker_reports_non_directory_root_and_corrupt_marker() {
+        let (state, base, public) = blocker_fixture("blocker-invalid");
+        fs::write(base.join("owner/tool"), "file").unwrap();
+        fs::write(&public, "bin").unwrap();
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::NonDirectoryRoot)
+        );
+
+        fs::remove_file(base.join("owner/tool")).unwrap();
+        fs::create_dir_all(base.join("owner/tool")).unwrap();
+        fs::write(
+            base.join("owner/tool").join(super::ARCHIVE_LAYOUT_FILE),
+            "v2\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::InvalidMarker(reason)) if reason.contains("unknown release archive marker")
+        ));
+    }
+
+    #[test]
+    fn upgrade_blocker_reports_missing_root_behind_a_public_link() {
+        let (state, base, public) = blocker_fixture("blocker-missing-root");
+        symlink(base.join("owner/tool/bin/tool"), &public).unwrap();
+
+        assert_eq!(
+            blocker(&state, &base, &public, true),
+            Some(super::UpgradeBlocker::MissingRoot)
+        );
+        assert_eq!(
+            blocker(&state, &base, &public, false),
+            None,
+            "before the first release install only the marker is consulted"
+        );
+    }
+
+    #[test]
+    fn upgrade_blocker_reads_only_a_corrupt_marker_before_the_first_release() {
+        let (state, base, public) = blocker_fixture("blocker-first-release");
+        fs::create_dir_all(base.join("owner/tool")).unwrap();
+        fs::write(&public, "bin").unwrap();
+        assert_eq!(blocker(&state, &base, &public, false), None);
+
+        fs::write(
+            base.join("owner/tool").join(super::ARCHIVE_LAYOUT_FILE),
+            "v2\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            blocker(&state, &base, &public, false),
+            Some(super::UpgradeBlocker::InvalidMarker(_))
+        ));
+    }
+
+    #[test]
+    fn upgrade_blocker_never_writes_the_marker() {
+        let (state, base, public) = blocker_fixture("blocker-read-only");
+        let root = base.join("owner/tool");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/tool"), "bin").unwrap();
+        symlink(root.join("bin/tool"), &public).unwrap();
+
+        assert_eq!(blocker(&state, &base, &public, true), None);
+        assert!(!root.join(super::ARCHIVE_LAYOUT_FILE).exists());
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn archive_backups_match_only_this_roots_swap_leftovers() {
+        let dir = temp_dir("archive-backups");
+        let base = dir.join("share");
+        for name in [
+            "owner/tool.shdeps-archive-backup-1-2",
+            "owner/tool.shdeps-archive-backup-3-4",
+            "owner/toolkit.shdeps-archive-backup-1-2",
+            "owner/tool",
+            "owner/foo.shdeps-archive-backup-5-6",
+        ] {
+            fs::create_dir_all(base.join(name)).unwrap();
+        }
+
+        assert_eq!(
+            super::archive_backups(&base, "owner/tool"),
+            [
+                base.join("owner/tool.shdeps-archive-backup-1-2"),
+                base.join("owner/tool.shdeps-archive-backup-3-4"),
+            ]
+        );
+        // `with_extension` replaces a dotted repo suffix, exactly as the swap
+        // names its backup, so `foo.nvim` backs up to `foo.shdeps-…`.
+        assert_eq!(
+            super::archive_backups(&base, "owner/foo.nvim"),
+            [base.join("owner/foo.shdeps-archive-backup-5-6")]
+        );
+        assert!(super::archive_backups(&base, "missing/tool").is_empty());
     }
 }
