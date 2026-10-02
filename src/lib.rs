@@ -59,6 +59,7 @@ mod repo_verify;
 pub mod runtime;
 pub mod self_update;
 pub mod stamp;
+mod standalone_layout;
 pub mod state;
 pub mod status;
 #[cfg(test)]

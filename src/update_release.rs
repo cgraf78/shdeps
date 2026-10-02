@@ -26,6 +26,7 @@ use crate::process::{self, Runner};
 use crate::release_asset::AssetKind;
 use crate::runtime::{Env, Roots};
 use crate::stamp;
+use crate::standalone_layout;
 use crate::update::{
     self, Context, Item, ItemReason, Options, Progress, detail_with_action, verbose_enabled,
 };
@@ -548,11 +549,28 @@ pub(crate) fn install_request(
     let Some(asset_kind) = crate::release_asset::install_kind(&selection.url) else {
         return Ok(failed("release asset type is not implemented yet"));
     };
+    // A root published by the shared standalone release installer is not a
+    // Shdeps archive, but it is provably that installer's and holds the same
+    // archive payload. Recognizing it lets the archive switch below adopt the
+    // root instead of failing closed on every host bootstrapped that way.
+    let standalone =
+        standalone_layout::classify(&context.roots.install_dir, request.name, request.public_bin);
+    #[cfg(unix)]
+    if let standalone_layout::Standalone::Locked(lock) = &standalone {
+        // Never race an installer publication, and never guess whether a lock
+        // is stale: say exactly what blocks the update instead.
+        return Ok(failed(&format!(
+            "standalone installer lock present at {}; remove it if no install.sh is running",
+            lock.display()
+        )));
+    }
+    let adoptable = standalone == standalone_layout::Standalone::Adoptable;
     let format_changed = (!is_archive(asset_kind)
-        && archive != github_release_install::ArchiveState::None)
+        && (archive != github_release_install::ArchiveState::None || adoptable))
         || (is_archive(asset_kind)
             && context.prior_release
             && archive != github_release_install::ArchiveState::Proven
+            && !adoptable
             && github_release_install::path_entry_exists(request.public_bin)?);
     if format_changed {
         // Switching between archive and single-file releases is not a normal
@@ -561,6 +579,8 @@ pub(crate) fn install_request(
         // Upstream release formats are normally stable, so fail before the
         // download and require a manual layout migration rather than risk
         // overwriting a launcher or stranding half-converted ownership state.
+        // The standalone installer only publishes archives, so a raw asset
+        // over its root is the same refusal.
         return Ok(failed(
             "release asset format changed; manual layout migration is required",
         ));
