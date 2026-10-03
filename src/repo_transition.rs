@@ -218,6 +218,19 @@ pub(crate) fn recover(checkout: &Path) -> Result<Option<ManifestEntry>> {
     recover_shdeps(checkout, true)
 }
 
+/// Reports, without recovering anything, whether a transaction that may own
+/// `checkout` is still on disk: Shdeps' sibling journal or the checkout
+/// installer's transaction.
+///
+/// Callers that must not mutate the checkout (for example, deciding whether an
+/// interrupted method transition left anything behind) use this to fail
+/// closed instead of running [`recover`], which may roll a publication forward
+/// or back.
+pub(crate) fn has_pending_transaction(checkout: &Path) -> Result<bool> {
+    Ok(path_present(&journal_path(checkout)?)?
+        || path_present(&actions_transaction_path(checkout)?)?)
+}
+
 /// Publishes a validated development checkout at the canonical repository root.
 pub(crate) fn publish_development(
     checkout: &Path,

@@ -972,21 +972,147 @@ fn entry_matches_target(record: &DurableTransitionRecord, entry: &Entry) -> bool
         && entry.filter == record.target_filter
 }
 
+/// Returns whether `entry` is the recorded target's config line resolved back
+/// to the old installed method (or edited back to it by hand).
+///
+/// The old manifest row carries only name, method, and command, so the
+/// remaining configured fields are compared against the recorded target: an
+/// entry qualifies only when the method is the *sole* difference from the
+/// interrupted intent and it names the old install exactly. Any other edit is
+/// a genuine configuration change and keeps failing closed.
+#[cfg(unix)]
+fn entry_reverts_to_old(record: &DurableTransitionRecord, entry: &Entry) -> bool {
+    let old = &record.transition.old;
+    entry.name == old.name
+        && entry.method == old.method
+        && entry.cmd == old.cmd
+        && entry.cmd == record.target_cmd
+        && entry.cmd_explicit == record.target_cmd_explicit
+        && entry.aliases == record.target_aliases
+        && entry.filter == record.target_filter
+}
+
+/// Returns the untouched old release root when an `Installing`
+/// release-to-repo handoff is provably moot, so retiring its journal changes
+/// nothing on disk.
+///
+/// This is the `github` auto-resolution flip: one run transiently resolved
+/// `github` to `github:repo`, the repo install failed (which leaves the journal
+/// in `Installing` just like an interruption does) or was interrupted, and
+/// later runs resolve back to the recorded `github:release`. Only this method
+/// pair qualifies because only it was audited: the repo installer clones into
+/// a sibling `<root>.tmp.<pid>` (or reuses a development checkout) and changes
+/// nothing shared until it publishes over the managed root under a sibling
+/// journal, then relinks commands and stages its manifest row. Every check
+/// below must hold, otherwise the caller keeps failing closed:
+///
+/// - some configured entry is the recorded target resolved back to the old
+///   method ([`entry_reverts_to_old`]);
+/// - the old release owned a proven archive root, whose captured
+///   generation (inode, timestamps, mode, tree fingerprint) and install base
+///   still match, so no publication replaced or edited it;
+/// - neither repository transaction format is pending at that root;
+/// - the public command still resolves into that root;
+/// - the prepared manifest still holds only the old row (or is already gone
+///   after an interrupted retirement), so the installer never staged new
+///   ownership.
+///
+/// Probe errors mean "not proven" rather than a new failure mode.
+#[cfg(unix)]
+fn moot_installing_root(
+    record: &DurableTransitionRecord,
+    entries: &[Entry],
+    roots: &Roots,
+) -> Option<PathBuf> {
+    let old = &record.transition.old;
+    if old.method != method::GITHUB_RELEASE
+        || record.target_method != method::GITHUB_REPO
+        || record.transition.archive_state != ArchiveState::Proven
+        || !entries
+            .iter()
+            .any(|entry| entry_reverts_to_old(record, entry))
+    {
+        return None;
+    }
+    let evidence = &record.transition.cleanup_evidence;
+    let root = cleanup::safe_repo_root(old, &cleanup_roots(roots))?;
+    let untouched = evidence.managed_install_root() == Some(root.as_path())
+        && evidence.install_base_matches()
+        && evidence.managed_root_matches()
+        && crate::repo_transition::has_pending_transaction(&root).ok() == Some(false)
+        && points_into(&roots.bin_dir.join(&old.cmd), &root)
+        && prepared_manifest_is_unstaged(&record.prepared_manifest, old);
+    untouched.then_some(root)
+}
+
+/// Returns whether the prepared manifest still holds exactly what
+/// [`write_prepared_manifest`] wrote, so no installer staged ownership.
+///
+/// A missing file also counts: installers replace it atomically and only
+/// [`remove_durable_transition`] deletes it, before the journal itself, so a
+/// crash while retiring a moot journal must not re-wedge the next run. The
+/// root, link, and journal checks still prove nothing was published.
+#[cfg(unix)]
+fn prepared_manifest_is_unstaged(path: &Path, old: &ManifestEntry) -> bool {
+    match fs::symlink_metadata(path) {
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => {
+            validate_private_transition_file(path).is_ok()
+                && crate::state::read_private_bounded(path, MAX_DURABLE_TRANSITION_RECORD_BYTES)
+                    .is_ok_and(|bytes| bytes == format!("{}\n", old.line()).as_bytes())
+        }
+    }
+}
+
+/// Lists interrupted repo clones (`<root>.tmp.<pid>`) beside `root`.
+///
+/// The repo installer removes its own clone on every failure it can observe,
+/// so a survivor means a process died mid-clone. Nothing proves such a
+/// directory is unused or Shdeps-owned, so recovery never removes it; the
+/// caller keeps failing closed and names it for the operator instead.
+#[cfg(unix)]
+fn interrupted_clones(root: &Path) -> Result<Vec<PathBuf>> {
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!("{name}.tmp.");
+    let mut clones = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let is_clone = entry.file_name().to_str().is_some_and(|file| {
+            file.strip_prefix(&prefix)
+                .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        });
+        if is_clone {
+            clones.push(entry.path());
+        }
+    }
+    clones.sort();
+    Ok(clones)
+}
+
 /// Recovers committed ownership before current configuration can hide it.
 ///
 /// Returned records require caller-coordinated old-repository locking before
 /// exact-evidence cleanup.  An `Installing` record is deliberately never
 /// inferred successful from current files: only the same configured target may
-/// retry its installer, while a removed or changed target fails closed.
+/// retry its installer, while a removed or changed target fails closed. The one
+/// exception is a release-to-repo handoff whose configuration resolved back to
+/// the provably untouched old release (see [`moot_installing_root`]): that
+/// journal is retired without running any installer or cleanup. An
+/// interrupted clone it may have left is never removed: recovery fails closed
+/// naming it instead.
 ///
 /// `pkg` carries the live installer identity (manager, Android selector) for
 /// resume-capable callers: a `pkg` retry additionally requires the exact
 /// normalized identity (manager, Android selector, resolved package) so an
 /// interrupted apt install can never resume under brew, and a legacy journal
 /// without that binding fails closed.  Commit-only callers (prune) pass `None`
-/// and defer `Installing` records untouched: they never re-resolve aliases or
-/// run installers, so no identity check is needed to leave those journals for
-/// a same-installer update.
+/// and defer matching `Installing` records untouched: they never re-resolve
+/// aliases or run installers, so no identity check is needed to leave those
+/// journals for a same-installer update. The moot retirement above applies to
+/// every caller, since it only deletes journal state.
 pub(crate) fn recover_pending_transitions(
     entries: &[Entry],
     custom_fingerprints: &HashMap<String, Option<String>>,
@@ -1012,6 +1138,32 @@ pub(crate) fn recover_pending_transitions(
         }
         if is_old && durable.record.phase == DurableTransitionPhase::Installing {
             if !configured_target_matches(&durable.record, entries, custom_fingerprints) {
+                // The journal exists to retry the target installer and, after
+                // commit, to clean the old provider. Once configuration
+                // resolves back to the untouched old install neither job
+                // remains, so retire it exactly like a `Prepared` record
+                // instead of wedging every later update.
+                #[cfg(unix)]
+                if let Some(root) = moot_installing_root(&durable.record, entries, roots) {
+                    let clones = interrupted_clones(&root)?;
+                    if clones.is_empty() {
+                        durable.finish(roots)?;
+                        continue;
+                    }
+                    let clones = clones
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "interrupted method transition for {} resolves back to its unchanged old install, but an interrupted clone remains at {clones}; remove it and retry",
+                            old.name
+                        ),
+                    )
+                    .into());
+                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -4122,6 +4274,361 @@ mod tests {
                     .contains("no longer matches configuration")
             );
         }
+    }
+
+    /// Live state of an abandoned release-to-repo handoff fixture.
+    #[cfg(unix)]
+    struct AbandonedHandoff {
+        roots: Roots,
+        manifest_path: PathBuf,
+        old: ManifestEntry,
+        root: PathBuf,
+        source: PathBuf,
+        public: PathBuf,
+        record: PathBuf,
+        prepared: PathBuf,
+    }
+
+    /// Old provider shape for an abandoned-handoff fixture.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OldProvider {
+        /// `github:release` archive with a layout marker and a public link.
+        ProvenRelease,
+        /// `github:release` raw binary written directly as the public command.
+        RawRelease,
+        /// External `cargo` install beneath the same managed root.
+        Cargo,
+    }
+
+    /// Models the `github` auto-resolution flip: a proven `github:release`
+    /// archive install whose `github:repo` replacement entered `Installing`
+    /// and then failed before publishing anything.
+    #[cfg(unix)]
+    fn abandoned_handoff(name: &str, target: &str) -> AbandonedHandoff {
+        abandoned_handoff_from(name, OldProvider::ProvenRelease, target)
+    }
+
+    /// Builds an `Installing` journal from the given old provider to `target`.
+    #[cfg(unix)]
+    fn abandoned_handoff_from(name: &str, provider: OldProvider, target: &str) -> AbandonedHandoff {
+        let dir = temp_dir(name);
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let root = roots.install_dir.join("owner/tool");
+        let source = root.join("bin/tool");
+        let public = roots.bin_dir.join("tool");
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        let method = match provider {
+            OldProvider::ProvenRelease => {
+                write_executable(&source, b"old release");
+                fs::write(
+                    github_release_install::archive_layout_path(&roots.install_dir, "owner/tool"),
+                    "v1 archive\n",
+                )
+                .unwrap();
+                symlink(&source, &public).unwrap();
+                crate::method::GITHUB_RELEASE
+            }
+            OldProvider::RawRelease => {
+                write_executable(&public, b"old release");
+                crate::method::GITHUB_RELEASE
+            }
+            OldProvider::Cargo => {
+                write_executable(&source, b"old release");
+                symlink(&source, &public).unwrap();
+                crate::method::CARGO
+            }
+        };
+        let manifest_path = crate::manifest::path(&roots.state_dir);
+        let install_path = if provider == OldProvider::Cargo {
+            source.to_string_lossy()
+        } else {
+            public.to_string_lossy()
+        };
+        let old = ManifestEntry::new("owner/tool", method, "tool", install_path);
+        crate::manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let entry = parse_entry(target, Some("apt"));
+        let transition = by_name(
+            &crate::manifest::read(&manifest_path).unwrap(),
+            std::slice::from_ref(&entry),
+            &roots,
+        )
+        .unwrap()
+        .remove("owner/tool")
+        .unwrap();
+        if provider == OldProvider::ProvenRelease {
+            assert_eq!(transition.archive_state, ArchiveState::Proven);
+        }
+        let pkg_identity = (entry.method == crate::method::PKG)
+            .then(|| PkgInstallerIdentity::for_target(&entry.name, &entry.aliases, "apt", false));
+        let mut durable = begin_durable_transition(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            pkg_identity,
+        )
+        .unwrap()
+        .unwrap();
+        durable.mark_installing(&roots).unwrap();
+        AbandonedHandoff {
+            roots,
+            manifest_path,
+            old,
+            root,
+            source,
+            public,
+            record: durable.path.clone(),
+            prepared: durable.manifest_path().to_path_buf(),
+        }
+    }
+
+    /// Runs update-style recovery against one configured entry.
+    #[cfg(unix)]
+    fn recover_with(fixture: &AbandonedHandoff, configured: &str) -> crate::Result<usize> {
+        recover_pending_transitions(
+            &[parse_entry(configured, Some("apt"))],
+            &HashMap::new(),
+            &fixture.manifest_path,
+            &fixture.roots,
+            Some(("apt", false)),
+        )
+        .map(|pending| pending.len())
+    }
+
+    /// Asserts recovery refused the journal and changed nothing on disk.
+    #[cfg(unix)]
+    fn assert_fails_closed(fixture: &AbandonedHandoff, configured: &str, expected: &str) {
+        let error = recover_with(fixture, configured).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(fixture.record.exists());
+        assert!(fixture.prepared.exists());
+        assert_eq!(
+            crate::manifest::read(&fixture.manifest_path)
+                .unwrap()
+                .get("owner/tool"),
+            Some(&fixture.old)
+        );
+    }
+
+    const RELEASE_ENTRY: &str = "owner/tool|github:release|tool|-|-";
+    const REPO_ENTRY: &str = "owner/tool|github:repo|tool|-|-";
+    const NO_LONGER_MATCHES: &str = "no longer matches configuration";
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_is_retired_when_github_resolves_back_to_release() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let fixture = abandoned_handoff("moot-flip-back", REPO_ENTRY);
+        let root_inode = fs::symlink_metadata(&fixture.root).unwrap().ino();
+
+        assert_eq!(recover_with(&fixture, RELEASE_ENTRY).unwrap(), 0);
+
+        assert!(durable_transitions(&fixture.roots).unwrap().is_empty());
+        assert!(!fixture.record.exists());
+        assert!(!fixture.prepared.exists());
+        assert_eq!(
+            crate::manifest::read(&fixture.manifest_path)
+                .unwrap()
+                .get("owner/tool"),
+            Some(&fixture.old)
+        );
+        assert_eq!(
+            fs::symlink_metadata(&fixture.root).unwrap().ino(),
+            root_inode
+        );
+        assert_eq!(fs::read(&fixture.source).unwrap(), b"old release");
+        assert_eq!(fs::read_link(&fixture.public).unwrap(), fixture.source);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_still_retries_when_target_is_configured() {
+        let fixture = abandoned_handoff("moot-target-still-configured", REPO_ENTRY);
+
+        assert_eq!(recover_with(&fixture, REPO_ENTRY).unwrap(), 0);
+
+        // The configured target keeps its journal so the installer retries.
+        assert!(fixture.record.exists());
+        assert!(fixture.prepared.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_for_another_method() {
+        let fixture = abandoned_handoff("moot-other-method", REPO_ENTRY);
+        assert_fails_closed(&fixture, "owner/tool|cargo|tool|-|-", NO_LONGER_MATCHES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_for_an_edited_config_line() {
+        let fixture = abandoned_handoff("moot-edited-line", REPO_ENTRY);
+        assert_fails_closed(
+            &fixture,
+            "owner/tool|github:release|tool|-|os:linux",
+            NO_LONGER_MATCHES,
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_when_old_root_changed() {
+        let fixture = abandoned_handoff("moot-root-changed", REPO_ENTRY);
+        fs::write(fixture.root.join("partial"), "written in place\n").unwrap();
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+        assert!(fixture.root.join("partial").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_when_root_was_replaced() {
+        let fixture = abandoned_handoff("moot-root-replaced", REPO_ENTRY);
+        // Model a publication that swapped a checkout in at the same path.
+        let parked = fixture.root.with_file_name("parked");
+        fs::rename(&fixture.root, &parked).unwrap();
+        write_executable(&fixture.source, b"old release");
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+        assert!(parked.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_when_installer_staged_ownership() {
+        let fixture = abandoned_handoff("moot-staged-row", REPO_ENTRY);
+        crate::manifest::upsert(
+            &fixture.prepared,
+            ManifestEntry::new(
+                "owner/tool",
+                crate::method::GITHUB_REPO,
+                "tool",
+                fixture.root.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_while_repo_journal_is_pending() {
+        let fixture = abandoned_handoff("moot-repo-journal", REPO_ENTRY);
+        let journal = fixture
+            .root
+            .with_file_name(".tool.shdeps-repo-transition-v1");
+        fs::create_dir(&journal).unwrap();
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+        assert!(journal.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_when_public_command_moved() {
+        let fixture = abandoned_handoff("moot-public-moved", REPO_ENTRY);
+        fs::remove_file(&fixture.public).unwrap();
+        write_executable(&fixture.public, b"foreign");
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+        assert_eq!(fs::read(&fixture.public).unwrap(), b"foreign");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_names_an_interrupted_clone_without_removing_it() {
+        let fixture = abandoned_handoff("moot-interrupted-clone", REPO_ENTRY);
+        let clone = fixture.root.with_file_name("tool.tmp.4242");
+        fs::create_dir_all(clone.join(".git")).unwrap();
+        assert_fails_closed(
+            &fixture,
+            RELEASE_ENTRY,
+            &format!("interrupted clone remains at {}", clone.display()),
+        );
+        assert!(clone.join(".git").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_retirement_survives_a_crash_after_prepared_removal() {
+        let fixture = abandoned_handoff("moot-retire-crash", REPO_ENTRY);
+        // `remove_durable_transition` deletes the prepared manifest first; a
+        // crash before the journal goes must not re-wedge the next run.
+        fs::remove_file(&fixture.prepared).unwrap();
+
+        assert_eq!(recover_with(&fixture, RELEASE_ENTRY).unwrap(), 0);
+
+        assert!(!fixture.record.exists());
+        assert_eq!(fs::read(&fixture.source).unwrap(), b"old release");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_when_root_changed_deep_inside() {
+        let fixture = abandoned_handoff("moot-deep-change", REPO_ENTRY);
+        // Only the tree fingerprint sees this: the root's own timestamps stay.
+        fs::write(fixture.root.join("bin/partial"), "written in place\n").unwrap();
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_while_installer_transaction_is_pending() {
+        let fixture = abandoned_handoff("moot-installer-transaction", REPO_ENTRY);
+        let transaction = fixture.root.with_file_name(".tool.install.transaction");
+        fs::write(&transaction, "pending\n").unwrap();
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+        assert!(transaction.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_without_a_proven_release_archive() {
+        // A raw release owns only its public binary, so no root generation
+        // proves the repo installer never published at the managed root.
+        let fixture =
+            abandoned_handoff_from("moot-raw-release", OldProvider::RawRelease, REPO_ENTRY);
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+        assert_eq!(fs::read(&fixture.public).unwrap(), b"old release");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_repo_handoff_fails_closed_when_the_old_provider_is_not_a_release() {
+        let fixture = abandoned_handoff_from("moot-old-cargo", OldProvider::Cargo, REPO_ENTRY);
+        assert_fails_closed(&fixture, "owner/tool|cargo|tool|-|-", NO_LONGER_MATCHES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_pkg_handoff_fails_closed_when_config_reverts_to_release() {
+        // Package installs have system-wide side effects no recorded identity
+        // covers, so reverting the config never retires a `pkg` journal.
+        let fixture = abandoned_handoff("moot-pkg-target", "owner/tool|pkg|tool|-|-");
+        assert_fails_closed(&fixture, RELEASE_ENTRY, NO_LONGER_MATCHES);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn abandoned_pkg_handoff_still_checks_installer_identity() {
+        let fixture = abandoned_handoff("moot-pkg-identity", "owner/tool|pkg|tool|-|-");
+        let error = recover_pending_transitions(
+            &[parse_entry("owner/tool|pkg|tool|-|-", Some("brew"))],
+            &HashMap::new(),
+            &fixture.manifest_path,
+            &fixture.roots,
+            Some(("brew", false)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("package installer identity"), "{error}");
+        assert!(fixture.record.exists());
     }
 
     #[test]

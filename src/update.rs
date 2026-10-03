@@ -4264,6 +4264,93 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         );
     }
 
+    /// Reproduces a `github` auto-resolution flip: one run resolves to
+    /// `github:repo`, whose install fails after the transition journal enters
+    /// `Installing`, and the next run resolves back to the recorded
+    /// `github:release`. Nothing was ever replaced, so the stale journal must
+    /// not wedge every later update.
+    #[test]
+    #[cfg(unix)]
+    fn release_update_proceeds_after_failed_repo_transition_flips_back() {
+        use std::os::unix::fs::{MetadataExt as _, symlink};
+
+        let fixture = Fixture::new("transition-flip-back-to-release");
+        fixture.write_lib();
+        let install_root = fixture.roots.install_dir.join("owner/tool");
+        let source = install_root.join("bin/tool");
+        write_executable(&source);
+        fs::write(
+            crate::github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/tool",
+            ),
+            "v1 archive\n",
+        )
+        .unwrap();
+        let public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(&source, &public).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            public.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let root_inode = fs::symlink_metadata(&install_root).unwrap().ino();
+
+        // `git` is absent, so the repo installer fails only after the durable
+        // transition has been marked `Installing`.
+        let failed = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert!(failed.has_errors());
+        assert!(crate::update_transition::has_pending_durable_transitions(
+            &fixture.roots
+        ));
+
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release"),
+            1_700_000_000,
+        )
+        .unwrap();
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options {
+                now: 1_700_000_100,
+                remote_ttl: 3600,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{:?}", summary.items);
+        assert!(summary.leftovers.is_empty());
+        assert!(!crate::update_transition::has_pending_durable_transitions(
+            &fixture.roots
+        ));
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
+        );
+        assert_eq!(
+            fs::symlink_metadata(&install_root).unwrap().ino(),
+            root_inode
+        );
+        assert_eq!(fs::read_link(&public).unwrap(), source);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "#!/bin/sh\n");
+    }
+
     #[test]
     #[cfg(unix)]
     fn repo_install_does_not_reuse_legacy_archive_proof_for_a_new_root_generation() {

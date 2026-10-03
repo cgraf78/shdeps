@@ -1050,7 +1050,17 @@ If a configured dependency's method differs from its manifest method:
   `Installing` journal whose configured target no longer matches MUST fail
   closed with a named remedy: restore the matching config entry and retry,
   or verify installed state, remove the stale `<sha256(name)>.json` (and
-  `.manifest`) record from `.method-transitions-v1/`, and retry;
+  `.manifest`) record from `.method-transitions-v1/`, and retry. The one
+  exception targets the bare-`github` resolution flip: a `github:release` ->
+  `github:repo` journal whose config line now resolves (or was edited) back
+  to the old `github:release` row, with the method the only difference, MUST
+  be retired without running any installer or cleanup, but only when the old
+  proven archive root's captured generation, the public command link into
+  it, the absence of any repository transaction at that root, and an
+  unstaged (or already removed) prepared manifest together prove nothing was
+  replaced. An interrupted `<root>.tmp.<pid>` clone beside the root is never
+  removed; recovery fails closed naming it. Every other method pair keeps
+  failing closed;
   `Installed` re-verifies the prepared ownership evidence before swapping;
   `ManifestCommitted` (or a live manifest already showing the journaled new
   row) re-attempts old cleanup. A live manifest matching neither the old
