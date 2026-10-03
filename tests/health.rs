@@ -588,7 +588,6 @@ fn pending_post_and_recovery_records_are_reported() {
     let fixture = Fixture::new("recovery");
     fixture.healthy_release("owner/tool", "tool");
     fixture.write("state/.pending-posts/owner/tool", "pending\n");
-    fixture.write("state/.method-transitions-v1/abc.json", "{}\n");
     fixture.write("state/.repo-publications/6f", "{}\n");
     fixture.write("state/.prune-hooks-v1/abc.json", "{}\n");
     fixture.write("state/owner/tool.links.reconcile-v1", "{}\n");
@@ -599,12 +598,6 @@ fn pending_post_and_recovery_records_are_reported() {
     assert_eq!(
         keys(&output),
         [
-            key(
-                "warn",
-                "-",
-                "recovery-state",
-                &fixture.path("state/.method-transitions-v1")
-            ),
             key(
                 "warn",
                 "-",
@@ -638,7 +631,7 @@ fn empty_recovery_directories_are_healthy() {
     let fixture = Fixture::new("empty-recovery");
     fixture.healthy_release("owner/tool", "tool");
     fs::create_dir_all(fixture.path("state/.prune-hooks-v1")).unwrap();
-    fs::create_dir_all(fixture.path("state/.method-transitions-v1")).unwrap();
+    private_transition_dir(&fixture);
 
     assert_exit(&fixture.health(), 0);
 }
@@ -648,9 +641,11 @@ fn transient_records_are_suppressed_while_an_update_holds_the_lock() {
     let fixture = Fixture::new("update-running");
     fixture.healthy_release("owner/tool", "tool");
     fixture.write("state/.pending-posts/owner/tool", "pending\n");
-    fixture.write("state/.method-transitions-v1/abc.json", "{}\n");
-    // A swap still deleting the old tree keeps its backup until it finishes.
+    fixture.write("state/.repo-publications/6f", "{}\n");
+    // A swap still deleting the old tree keeps its backup until it finishes,
+    // and a clone lives in its temp tree until it is published.
     fixture.write("share/owner/tool.shdeps-archive-backup-1-2/bin/tool", "");
+    fixture.write("share/owner/tool.tmp.4242/.git/HEAD", "");
     let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
     fixture.write(
         "state/.lock",
@@ -672,7 +667,421 @@ fn transient_records_are_suppressed_while_an_update_holds_the_lock() {
         .into_iter()
         .map(|row| row[2].clone())
         .collect::<Vec<_>>();
-    assert_eq!(kinds, ["recovery-state", "archive-backup", "pending-post"]);
+    assert_eq!(
+        kinds,
+        [
+            "recovery-state",
+            "archive-backup",
+            "pending-post",
+            "temp-tree"
+        ]
+    );
+}
+
+/// Creates the method-transition directory with the private mode Shdeps uses.
+fn private_transition_dir(fixture: &Fixture) -> PathBuf {
+    let dir = fixture.path("state/.method-transitions-v1");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
+/// Writes a private file the way Shdeps writes transition records.
+fn write_private(path: &Path, content: &str) {
+    fs::write(path, content).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// The record file name Shdeps derives from a dependency name.
+fn transition_stem(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn unreadable_method_transition_record_blocks_updates_and_names_its_package() {
+    // Recovery refuses a record it cannot parse before acting on any other,
+    // so every update and prune aborts: a fail naming the package and record.
+    let fixture = Fixture::new("blocked-record");
+    fixture.healthy_release("owner/tool", "tool");
+    let record =
+        private_transition_dir(&fixture).join(format!("{}.json", transition_stem("owner/tool")));
+    write_private(&record, "{}\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("fail", "owner/tool", "blocked-transition", &record)]
+    );
+    let detail = &rows(&output)[0][4];
+    assert!(
+        detail.contains("malformed method transition record"),
+        "{detail}"
+    );
+    assert!(
+        detail.ends_with("'shdeps update' fails until this is resolved"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn blocked_transitions_are_reported_while_an_update_holds_the_lock() {
+    // A live update fails on the same record, so it is not work in progress.
+    let fixture = Fixture::new("blocked-under-lock");
+    fixture.healthy_release("owner/tool", "tool");
+    let record = private_transition_dir(&fixture).join("unknown.json");
+    write_private(&record, "not json\n");
+    let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
+    fixture.write(
+        "state/.lock",
+        &format!(
+            "pid={}\nstate_dir=x\nacquired_unix={}\n",
+            holder.id(),
+            now_unix()
+        ),
+    );
+
+    let output = fixture.health();
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("fail", "-", "blocked-transition", &record)]
+    );
+}
+
+#[test]
+fn unsafe_method_transition_directory_blocks_even_when_empty() {
+    // Recovery validates the directory's mode before listing records.
+    let fixture = Fixture::new("unsafe-transition-dir");
+    fixture.healthy_release("owner/tool", "tool");
+    let dir = fixture.path("state/.method-transitions-v1");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("fail", "-", "blocked-transition", &dir)]
+    );
+}
+
+#[test]
+fn unexpected_method_transition_entries_block_updates() {
+    let fixture = Fixture::new("unexpected-transition-entry");
+    fixture.healthy_release("owner/tool", "tool");
+    let dir = private_transition_dir(&fixture);
+    let stray = dir.join("notes.txt");
+    write_private(&stray, "x\n");
+    let unindexed = dir.join(format!("{}.manifest", transition_stem("owner/tool")));
+    write_private(&unindexed, "owner/tool|github:release|tool|-\n");
+    // Staging temps are deleted by recovery and are not a problem.
+    write_private(
+        &dir.join(format!(".{}.json.tmp.12.34", transition_stem("owner/tool"))),
+        "{}",
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [
+            key("fail", "-", "blocked-transition", &stray),
+            key("fail", "owner/tool", "blocked-transition", &unindexed),
+        ]
+    );
+}
+
+#[test]
+fn pending_repo_journal_is_recovery_state_for_its_package() {
+    // A record write interrupted before the checkout moved: the next update
+    // clears it by itself.
+    let fixture = Fixture::new("repo-journal");
+    fixture.healthy_repo("owner/tool", "tool");
+    let journal = fixture.path("share/owner/.tool.shdeps-repo-transition-v1");
+    fixture.write(
+        "share/owner/.tool.shdeps-repo-transition-v1/.record.tmp.1.2.ab",
+        "partial",
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "owner/tool", "recovery-state", &journal)]
+    );
+}
+
+#[test]
+fn malformed_repo_journal_blocks_its_package() {
+    let fixture = Fixture::new("repo-journal-malformed");
+    fixture.healthy_repo("owner/tool", "tool");
+    let journal = fixture.path("share/owner/.tool.shdeps-repo-transition-v1");
+    fixture.write("share/owner/.tool.shdeps-repo-transition-v1/record", "{}\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("fail", "owner/tool", "blocked-transition", &journal)]
+    );
+    assert!(rows(&output)[0][4].contains("malformed repository transition record"));
+}
+
+#[test]
+fn collided_repo_journal_blocks_its_package() {
+    let fixture = Fixture::new("repo-journal-blocked");
+    fixture.healthy_repo("owner/tool", "tool");
+    let journal = fixture.path("share/owner/.tool.shdeps-repo-transition-v1");
+    fixture.write("share/owner/.tool.shdeps-repo-transition-v1/record", "{}\n");
+    fixture.write(
+        "share/owner/.tool.shdeps-repo-transition-v1/blocked",
+        "shdeps repository transition blocked v1\n",
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("fail", "owner/tool", "blocked-transition", &journal)]
+    );
+    assert!(rows(&output)[0][4].contains("repository transition"));
+}
+
+#[test]
+fn interrupted_collision_marker_also_blocks() {
+    // Recovery treats a marker whose atomic write was interrupted as set.
+    let fixture = Fixture::new("repo-journal-blocked-temp");
+    fixture.healthy_repo("owner/tool", "tool");
+    let journal = fixture.path("share/owner/.tool.shdeps-repo-transition-v1");
+    fixture.write(
+        "share/owner/.tool.shdeps-repo-transition-v1/.blocked.tmp.1.2.ab",
+        "",
+    );
+
+    let output = fixture.health();
+
+    assert_eq!(
+        keys(&output),
+        [key("fail", "owner/tool", "blocked-transition", &journal)]
+    );
+}
+
+#[test]
+fn checkout_journals_are_read_at_the_physical_path_recovery_records() {
+    // The checkout lock resolves the root's parent physically and the
+    // journal records that spelling; through a symlinked owner directory a
+    // valid, recoverable journal must not read as foreign.
+    use std::os::unix::fs::MetadataExt as _;
+
+    let fixture = Fixture::new("physical-journal");
+    let physical = fixture.path("elsewhere/owner");
+    fs::create_dir_all(&physical).unwrap();
+    fs::create_dir_all(fixture.path("share")).unwrap();
+    fixture.link(&physical, "share/owner");
+    fixture.append("conf/deps.conf", "owner/tool github:repo\n");
+    let checkout = physical.join("tool");
+    fixture.append(
+        "state/manifest",
+        &format!("owner/tool|github:repo|tool|{}\n", checkout.display()),
+    );
+    // A fresh publication interrupted after its journal, before the rename.
+    let staged = physical.join("tool.tmp.4242");
+    fs::create_dir_all(staged.join("bin")).unwrap();
+    let metadata = fs::symlink_metadata(&staged).unwrap();
+    let journal = physical.join(".tool.shdeps-repo-transition-v1");
+    fs::create_dir_all(&journal).unwrap();
+    let record = serde_json::json!({
+        "format": "shdeps repository transition v1",
+        "checkout": checkout,
+        "desired": {
+            "Directory": {
+                "identity": {
+                    "kind": "directory",
+                    "device": metadata.dev(),
+                    "inode": metadata.ino(),
+                    "target": null
+                },
+                "staged": staged
+            }
+        },
+        "ownership": {
+            "name": "owner/tool",
+            "method": "github:repo",
+            "cmd": "tool",
+            "install_path": checkout
+        }
+    });
+    write_private(&journal.join("record"), &format!("{record}\n"));
+
+    let output = fixture.health();
+
+    let journal_rows = keys(&output)
+        .into_iter()
+        .filter(|row| row.2 == "recovery-state" || row.2 == "blocked-transition")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        journal_rows,
+        [key("warn", "owner/tool", "recovery-state", &journal)]
+    );
+}
+
+#[test]
+fn checkout_installer_transaction_blocks_its_package() {
+    let fixture = Fixture::new("installer-transaction");
+    fixture.healthy_repo("owner/tool", "tool");
+    let transaction = fixture.write("share/owner/.tool.install.transaction", "pending\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key(
+            "fail",
+            "owner/tool",
+            "blocked-transition",
+            &transaction
+        )]
+    );
+    assert!(rows(&output)[0][4].contains("rerun it before Shdeps"));
+}
+
+#[test]
+fn orphaned_repo_checkouts_are_checked_for_journals() {
+    // Prune recovers the checkout of a dependency no longer configured.
+    let fixture = Fixture::new("orphan-journal");
+    fixture.healthy_release("owner/tool", "tool");
+    fixture.append(
+        "state/manifest",
+        &format!(
+            "owner/gone|github:repo|gone|{}\n",
+            fixture.path("share/owner/gone").display()
+        ),
+    );
+    let transaction = fixture.write("share/owner/.gone.install.transaction", "pending\n");
+
+    let output = fixture.health();
+
+    assert_eq!(
+        keys(&output),
+        [key(
+            "fail",
+            "owner/gone",
+            "blocked-transition",
+            &transaction
+        )]
+    );
+}
+
+#[test]
+fn interrupted_temp_trees_are_reported_for_cleanup() {
+    let fixture = Fixture::new("temp-trees");
+    fixture.healthy_release("owner/tool", "tool");
+    let clone = fixture.path("share/owner/tool.tmp.4242");
+    fs::create_dir_all(clone.join(".git")).unwrap();
+    let staging = fixture.path("share/owner/.tool.tmp.77");
+    fs::create_dir_all(&staging).unwrap();
+    // Atomic-write temps carry a nonce; other names merely share the prefix.
+    fs::create_dir_all(fixture.path("share/owner/.tool.tmp.77.1")).unwrap();
+    fs::create_dir_all(fixture.path("share/owner/tool.tmp.old")).unwrap();
+    fs::create_dir_all(fixture.path("share/owner/toolbox.tmp.1")).unwrap();
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [
+            key("warn", "owner/tool", "temp-tree", &staging),
+            key("warn", "owner/tool", "temp-tree", &clone),
+        ]
+    );
+}
+
+#[test]
+fn temp_trees_a_checkout_journal_may_publish_are_not_reported() {
+    // A fresh publication journals its `<root>.tmp.<pid>` clone as the tree
+    // recovery renames into place; deleting it would lose the install.
+    let fixture = Fixture::new("temp-tree-journaled");
+    fixture.healthy_repo("owner/tool", "tool");
+    fs::create_dir_all(fixture.path("share/owner/tool.tmp.4242/.git")).unwrap();
+    let journal = fixture.path("share/owner/.tool.shdeps-repo-transition-v1");
+    fixture.write(
+        "share/owner/.tool.shdeps-repo-transition-v1/.record.tmp.1.2.ab",
+        "partial",
+    );
+
+    let output = fixture.health();
+
+    assert_eq!(
+        keys(&output),
+        [key("warn", "owner/tool", "recovery-state", &journal)]
+    );
+}
+
+#[test]
+fn unreadable_public_command_transition_blocks_the_command_owner() {
+    let fixture = Fixture::new("public-transition");
+    fixture.healthy_release("owner/tool", "tool");
+    let journal = fixture.write("bin/.tool.shdeps-public-transition-v1", "not json\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("fail", "owner/tool", "blocked-transition", &journal)]
+    );
+    assert!(rows(&output)[0][4].contains("malformed public command transition record"));
+}
+
+#[test]
+fn runtime_identity_starts_no_host_probe_processes() {
+    // `dot doctor` runs health on every invocation; identity comes from
+    // uname(2), not from `uname`/`hostname` children.
+    let fixture = Fixture::new("no-probe-processes");
+    fixture.healthy_release("owner/tool", "tool");
+    let marker = fixture.path("probe-calls");
+    for probe in ["uname", "hostname"] {
+        let path = fixture.path(&format!("fakebin/{probe}"));
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho {probe} \"$@\" >> '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let output = fixture
+        .command(&["health"])
+        .env_remove("SHDEPS_TEST_PLATFORM")
+        .env_remove("SHDEPS_TEST_HOST")
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    assert!(
+        !marker.exists(),
+        "health ran host probes: {:?}",
+        fs::read_to_string(&marker)
+    );
 }
 
 #[test]
@@ -1021,6 +1430,8 @@ fn health_contract_is_advertised_and_tokens_are_stable() {
             ("deferred-uninstall", "warn"),
             ("pending-post", "warn"),
             ("recovery-state", "warn"),
+            ("blocked-transition", "fail"),
+            ("temp-tree", "warn"),
             ("unreadable-state", "fail"),
         ]
     );

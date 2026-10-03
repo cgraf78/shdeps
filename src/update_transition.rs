@@ -1092,6 +1092,324 @@ fn interrupted_clones(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(clones)
 }
 
+/// What recovery does with an `Installing` record whose manifest row is still
+/// the old ownership.
+#[derive(Debug)]
+enum InstallingDisposition {
+    /// The configured target still matches: the next update retries its
+    /// installer (prune leaves the record for that update).
+    Retry,
+    /// Configuration resolved back to the untouched old install; recovery
+    /// retires the record without running anything.
+    Moot,
+    /// Recovery refuses the record, so update and prune fail until an
+    /// operator resolves it.
+    Blocked(InstallingBlocker),
+}
+
+/// Why recovery refuses an `Installing` record.
+#[derive(Debug)]
+enum InstallingBlocker {
+    /// No configured entry is the recorded target (or its custom hook changed).
+    NoLongerConfigured,
+    /// The record would be moot, but an interrupted clone remains beside the
+    /// root and nothing proves it unused.
+    InterruptedClones(Vec<PathBuf>),
+    /// A `pkg` retry would run under a different installer identity.
+    PkgIdentity {
+        stored: Option<PkgInstallerIdentity>,
+        current: PkgInstallerIdentity,
+    },
+}
+
+impl InstallingBlocker {
+    /// Operator-facing reason, shared by the recovery error and `shdeps
+    /// health` so both name the same record and the same fix.
+    fn message(&self, name: &str, record: &Path) -> String {
+        match self {
+            Self::NoLongerConfigured => format!(
+                "ambiguous interrupted method transition for {name} no longer matches configuration; restore the matching config entry and retry, or verify installed state, remove the stale transition record at {} and retry",
+                record.display()
+            ),
+            Self::InterruptedClones(clones) => {
+                let clones = clones
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "interrupted method transition for {name} resolves back to its unchanged old install, but an interrupted clone remains at {clones}; remove it and retry"
+                )
+            }
+            Self::PkgIdentity { stored, current } => {
+                pkg_identity_error(name, stored.as_ref(), current).to_string()
+            }
+        }
+    }
+}
+
+/// Decides, without changing anything, how recovery treats an `Installing`
+/// record whose manifest row is still the old ownership.
+///
+/// Recovery and `shdeps health` both call this so the report can never drift
+/// from what the next update actually does. `custom_fingerprints` is `None`
+/// for read-only callers that cannot reproduce a hook fingerprint (it depends
+/// on the caller's quiet mode and library path); a matching custom target
+/// then reads as retryable. `pkg` follows [`recover_pending_transitions`].
+fn installing_disposition(
+    record: &DurableTransitionRecord,
+    entries: &[Entry],
+    custom_fingerprints: Option<&HashMap<String, Option<String>>>,
+    roots: &Roots,
+    pkg: Option<(&str, bool)>,
+) -> Result<InstallingDisposition> {
+    let old = &record.transition.old;
+    let target_matches = match custom_fingerprints {
+        Some(fingerprints) => configured_target_matches(record, entries, fingerprints),
+        None => entries
+            .iter()
+            .any(|entry| entry_matches_target(record, entry)),
+    };
+    if !target_matches {
+        #[cfg(unix)]
+        if let Some(root) = moot_installing_root(record, entries, roots) {
+            let clones = interrupted_clones(&root)?;
+            return Ok(if clones.is_empty() {
+                InstallingDisposition::Moot
+            } else {
+                InstallingDisposition::Blocked(InstallingBlocker::InterruptedClones(clones))
+            });
+        }
+        #[cfg(not(unix))]
+        let _ = roots;
+        return Ok(InstallingDisposition::Blocked(
+            InstallingBlocker::NoLongerConfigured,
+        ));
+    }
+    if record.target_method == method::PKG {
+        if let Some((pkg_manager, android)) = pkg {
+            let current = PkgInstallerIdentity::for_target(
+                &old.name,
+                &record.target_aliases,
+                pkg_manager,
+                android,
+            );
+            if record.target_pkg.as_ref() != Some(&current) {
+                return Ok(InstallingDisposition::Blocked(
+                    InstallingBlocker::PkgIdentity {
+                        stored: record.target_pkg.clone(),
+                        current,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(InstallingDisposition::Retry)
+}
+
+/// Read-only verdict on one pending method-transition record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingVerdict {
+    /// The next update finishes, retries, or retires it by itself.
+    Recoverable,
+    /// Recovery refuses it, so every update and prune fails until an operator
+    /// acts; the string is the same reason recovery reports.
+    Blocked(String),
+}
+
+/// One record found by [`classify_pending`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRecord {
+    /// Dependency the record belongs to, when it could be read.
+    pub(crate) name: Option<String>,
+    /// The record (or unexpected entry) recovery would act on or refuse.
+    pub(crate) path: PathBuf,
+    /// What the next update does with it.
+    pub(crate) verdict: PendingVerdict,
+}
+
+/// Classifies every durable method-transition record the way
+/// [`recover_pending_transitions`] would treat it, without writing anything,
+/// taking locks, or running installers.
+///
+/// `entries` are the active configured entries with bare `github` already
+/// resolved, as update passes them. Each record is judged against the
+/// manifest read after the record, as recovery reads it, so a commit racing
+/// the classification cannot make a record look unclassifiable; a file that
+/// vanishes meanwhile was retired and is skipped. Valid staging temp files
+/// are skipped (recovery deletes them); every other unreadable, unsafe, or
+/// unexpected entry is `Blocked` because recovery fails closed on it before
+/// looking at any record. Only a failure to list the directory itself is
+/// returned as an error.
+pub(crate) fn classify_pending(
+    entries: &[Entry],
+    manifest_path: &Path,
+    roots: &Roots,
+    pkg: Option<(&str, bool)>,
+) -> Result<Vec<PendingRecord>> {
+    let directory = durable_transition_dir(roots);
+    let mut paths = match fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    paths.sort();
+    let blocked = |name: Option<String>, path: PathBuf, reason: String| PendingRecord {
+        name,
+        path,
+        verdict: PendingVerdict::Blocked(reason),
+    };
+    // Recovery validates the directory even when it is empty.
+    if let Err(error) = validate_private_transition_dir(&directory) {
+        return Ok(vec![blocked(None, directory, error.to_string())]);
+    }
+    let snapshot = manifest::read(manifest_path).unwrap_or_default();
+    // Files are named by a digest of the dependency name, so a record that
+    // cannot be read can still be attributed to a configured or installed
+    // dependency.
+    let owner = |path: &Path| {
+        let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        // Staging temps are `.<digest>.<kind>.tmp.<pid>.<nonce>`.
+        let stem = name
+            .strip_prefix('.')
+            .and_then(|rest| rest.split_once('.'))
+            .map_or(stem, |(digest, _)| digest);
+        entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .chain(snapshot.entries().iter().map(|row| row.name.as_str()))
+            .find(|name| durable_transition_stem(name) == stem)
+            .map(str::to_owned)
+    };
+
+    let mut verdicts = Vec::new();
+    let mut records = Vec::new();
+    let mut prepared = BTreeSet::new();
+    for path in paths {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("json") => match read_durable_transition(&path, roots) {
+                Ok(record) => records.push((path, record)),
+                Err(error) if error.is_not_found() => {}
+                // Recovery refuses an unreadable record before acting on any.
+                Err(error) => verdicts.push(blocked(owner(&path), path, error.to_string())),
+            },
+            Some("manifest") => match validate_private_transition_file(&path) {
+                Ok(()) => {
+                    prepared.insert(path);
+                }
+                Err(error) if error.is_not_found() => {}
+                Err(error) => verdicts.push(blocked(owner(&path), path, error.to_string())),
+            },
+            _ if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_durable_transition_temp_name) =>
+            {
+                // Recovery deletes a valid staging file but refuses an unsafe
+                // or oversized one.
+                let checked = validate_private_transition_file(&path).and_then(|()| {
+                    if fs::metadata(&path)?.len() > MAX_DURABLE_TRANSITION_RECORD_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "oversized method transition staging file: {}",
+                                path.display()
+                            ),
+                        )
+                        .into());
+                    }
+                    Ok(())
+                });
+                match checked {
+                    Ok(()) => {}
+                    Err(error) if error.is_not_found() => {}
+                    Err(error) => verdicts.push(blocked(owner(&path), path, error.to_string())),
+                }
+            }
+            _ => {
+                let reason = format!(
+                    "unexpected entry in method transition state: {}",
+                    path.display()
+                );
+                verdicts.push(blocked(owner(&path), path, reason));
+            }
+        }
+    }
+
+    for (path, record) in records {
+        prepared.remove(&record.prepared_manifest);
+        let verdict = match manifest::read(manifest_path) {
+            Ok(manifest) => pending_verdict(&record, &path, entries, &manifest, roots, pkg),
+            Err(error) => PendingVerdict::Blocked(error.to_string()),
+        };
+        verdicts.push(PendingRecord {
+            name: Some(record.transition.old.name.clone()),
+            path,
+            verdict,
+        });
+    }
+    for path in prepared {
+        let reason = format!(
+            "unindexed prepared method-transition manifest exists: {}",
+            path.display()
+        );
+        verdicts.push(blocked(owner(&path), path, reason));
+    }
+    Ok(verdicts)
+}
+
+/// Mirrors one record's branch of [`recover_pending_transitions`].
+fn pending_verdict(
+    record: &DurableTransitionRecord,
+    path: &Path,
+    entries: &[Entry],
+    manifest: &Manifest,
+    roots: &Roots,
+    pkg: Option<(&str, bool)>,
+) -> PendingVerdict {
+    let old = &record.transition.old;
+    let current = manifest.get(&old.name);
+    let is_old = current == Some(old);
+    let is_new = record.new.as_ref().is_some_and(|new| current == Some(new));
+    let blocked = |reason: String| PendingVerdict::Blocked(reason);
+    match record.phase {
+        DurableTransitionPhase::Prepared if is_old => PendingVerdict::Recoverable,
+        DurableTransitionPhase::Installing if is_old => {
+            match installing_disposition(record, entries, None, roots, pkg) {
+                Ok(InstallingDisposition::Retry | InstallingDisposition::Moot) => {
+                    PendingVerdict::Recoverable
+                }
+                Ok(InstallingDisposition::Blocked(blocker)) => {
+                    blocked(blocker.message(&old.name, path))
+                }
+                Err(error) => blocked(error.to_string()),
+            }
+        }
+        DurableTransitionPhase::Installed if is_old => {
+            let entry = entry_from_record(record);
+            match installed_entry(&record.prepared_manifest, &entry) {
+                Ok(staged) if Some(&staged) == record.new.as_ref() => PendingVerdict::Recoverable,
+                Ok(_) => blocked(format!(
+                    "prepared method-transition manifest changed before recovery for {}",
+                    entry.name
+                )),
+                Err(error) => blocked(error.to_string()),
+            }
+        }
+        _ if is_new => PendingVerdict::Recoverable,
+        _ => blocked(format!(
+            "method transition cannot classify manifest ownership for {}",
+            old.name
+        )),
+    }
+}
+
 /// Recovers committed ownership before current configuration can hide it.
 ///
 /// Returned records require caller-coordinated old-repository locking before
@@ -1137,58 +1455,26 @@ pub(crate) fn recover_pending_transitions(
             continue;
         }
         if is_old && durable.record.phase == DurableTransitionPhase::Installing {
-            if !configured_target_matches(&durable.record, entries, custom_fingerprints) {
+            match installing_disposition(
+                &durable.record,
+                entries,
+                Some(custom_fingerprints),
+                roots,
+                pkg,
+            )? {
+                InstallingDisposition::Retry => {}
                 // The journal exists to retry the target installer and, after
                 // commit, to clean the old provider. Once configuration
                 // resolves back to the untouched old install neither job
                 // remains, so retire it exactly like a `Prepared` record
                 // instead of wedging every later update.
-                #[cfg(unix)]
-                if let Some(root) = moot_installing_root(&durable.record, entries, roots) {
-                    let clones = interrupted_clones(&root)?;
-                    if clones.is_empty() {
-                        durable.finish(roots)?;
-                        continue;
-                    }
-                    let clones = clones
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                InstallingDisposition::Moot => durable.finish(roots)?,
+                InstallingDisposition::Blocked(blocker) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!(
-                            "interrupted method transition for {} resolves back to its unchanged old install, but an interrupted clone remains at {clones}; remove it and retry",
-                            old.name
-                        ),
+                        blocker.message(&old.name, &durable.path),
                     )
                     .into());
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "ambiguous interrupted method transition for {} no longer matches configuration; restore the matching config entry and retry, or verify installed state, remove the stale transition record at {} and retry",
-                        old.name,
-                        durable.path.display()
-                    ),
-                )
-                .into());
-            }
-            if durable.record.target_method == method::PKG {
-                if let Some((pkg_manager, android)) = pkg {
-                    let current = PkgInstallerIdentity::for_target(
-                        &old.name,
-                        &durable.record.target_aliases,
-                        pkg_manager,
-                        android,
-                    );
-                    if durable.record.target_pkg.as_ref() != Some(&current) {
-                        return Err(pkg_identity_error(
-                            &old.name,
-                            durable.record.target_pkg.as_ref(),
-                            &current,
-                        ));
-                    }
                 }
             }
             continue;
@@ -1812,13 +2098,27 @@ fn settle_public_swap(public: &Path, swap: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Which side of a public-command exchange recovery keeps.
 #[cfg(unix)]
-fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots) -> Result<()> {
-    let Some((journal, record)) = read_public_transition(public)? else {
-        return Ok(());
-    };
-    let swap = record.swap.clone();
-    let installed = manifest::read(manifest_path)?;
+#[derive(Debug, Clone, Copy)]
+struct PublicRecoveryPlan {
+    /// The manifest still records the old release, so the old file returns.
+    restore_old: bool,
+    /// The two generations must be exchanged before the journal retires.
+    settle: bool,
+}
+
+/// Decides, without touching disk, how [`recover_public_transition`] finishes
+/// one journal, or returns the error it fails closed with.
+///
+/// Shared with `shdeps health` so a record the next update refuses is
+/// reported as blocking rather than as routine pending state.
+#[cfg(unix)]
+fn plan_public_recovery(
+    installed: &Manifest,
+    public: &Path,
+    record: &PublicTransitionRecord,
+) -> Result<PublicRecoveryPlan> {
     let current = installed.get(&record.old.name);
     let manifest_is_old = current == Some(&record.old);
     let manifest_is_new = current == Some(&record.new);
@@ -1833,23 +2133,16 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
         .into());
     }
 
+    let swap = &record.swap;
     let public_is_old = cleanup::regular_file_matches_after_rename(public, &record.expected)?;
     let public_is_new = public_symlink_matches(public, &record.source);
-    let swap_is_old = cleanup::regular_file_matches_after_rename(&swap, &record.expected)?;
-    let swap_is_new = public_symlink_matches(&swap, &record.source);
-    let swap_exists = fs::symlink_metadata(&swap).is_ok();
+    let swap_is_old = cleanup::regular_file_matches_after_rename(swap, &record.expected)?;
+    let swap_is_new = public_symlink_matches(swap, &record.source);
+    let swap_exists = fs::symlink_metadata(swap).is_ok();
 
     if manifest_is_old {
-        if public_is_new && swap_is_old {
-            settle_public_swap(public, &swap)?;
-            if !cleanup::regular_file_matches_after_rename(public, &record.expected)? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "restored public command does not match its transition record",
-                )
-                .into());
-            }
-        } else if !public_is_old {
+        let settle = public_is_new && swap_is_old;
+        if !settle && !public_is_old {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -1858,6 +2151,73 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
                 ),
             )
             .into());
+        }
+        // Settling moves the new link into `swap`; otherwise `swap` must
+        // already be that link or absent.
+        if !settle && !swap_is_new && swap_exists {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "public command transition preserved an unexpected rollback object at {}",
+                    swap.display()
+                ),
+            )
+            .into());
+        }
+        return Ok(PublicRecoveryPlan {
+            restore_old: true,
+            settle,
+        });
+    }
+
+    let settle = public_is_old && swap_is_new;
+    if !settle && !public_is_new {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "committed public command transition found an unrecognized live path at {}",
+                public.display()
+            ),
+        )
+        .into());
+    }
+    // Settling moves the old file into `swap`; otherwise `swap` must already
+    // be one of the two recorded generations or absent.
+    if !settle && swap_exists && !swap_is_old && !swap_is_new {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "public command transition preserved an unexpected commit object at {}",
+                swap.display()
+            ),
+        )
+        .into());
+    }
+    Ok(PublicRecoveryPlan {
+        restore_old: false,
+        settle,
+    })
+}
+
+#[cfg(unix)]
+fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots) -> Result<()> {
+    let Some((journal, record)) = read_public_transition(public)? else {
+        return Ok(());
+    };
+    let swap = record.swap.clone();
+    let installed = manifest::read(manifest_path)?;
+    let plan = plan_public_recovery(&installed, public, &record)?;
+
+    if plan.restore_old {
+        if plan.settle {
+            settle_public_swap(public, &swap)?;
+            if !cleanup::regular_file_matches_after_rename(public, &record.expected)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "restored public command does not match its transition record",
+                )
+                .into());
+            }
         }
 
         if public_symlink_matches(&swap, &record.source) {
@@ -1879,17 +2239,8 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
         return Ok(());
     }
 
-    if public_is_old && swap_is_new {
+    if plan.settle {
         settle_public_swap(public, &swap)?;
-    } else if !public_is_new {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "committed public command transition found an unrecognized live path at {}",
-                public.display()
-            ),
-        )
-        .into());
     }
     if !public_symlink_matches(public, &record.source) {
         return Err(std::io::Error::new(
@@ -1899,6 +2250,8 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
         .into());
     }
     ensure_transitioned_binlink(&record, roots)?;
+    let swap_exists = fs::symlink_metadata(&swap).is_ok();
+    let swap_is_new = public_symlink_matches(&swap, &record.source);
     if cleanup::regular_file_matches_after_rename(&swap, &record.expected)? {
         // `swap` is already a unique, journal-recorded recovery path whose
         // exact file generation was validated above. Moving it through the
@@ -1922,6 +2275,40 @@ fn recover_public_transition(manifest_path: &Path, public: &Path, roots: &Roots)
     }
     remove_public_transition_journal(&journal)?;
     Ok(())
+}
+
+/// Read-only verdict on the public-command journal beside `public`, or
+/// `None` when there is none.
+#[cfg(unix)]
+pub(crate) fn classify_public_transition(
+    manifest_path: &Path,
+    public: &Path,
+) -> Option<PendingRecord> {
+    let (journal, record) = match read_public_transition(public) {
+        Ok(None) => return None,
+        Ok(Some(found)) => found,
+        // Retired between the existence check and the read.
+        Err(error) if error.is_not_found() => return None,
+        Err(error) => {
+            return Some(PendingRecord {
+                name: None,
+                path: public_transition_path(public).unwrap_or_else(|_| public.to_path_buf()),
+                verdict: PendingVerdict::Blocked(error.to_string()),
+            });
+        }
+    };
+    // Read after the journal, as recovery does.
+    let verdict = match manifest::read(manifest_path)
+        .and_then(|manifest| plan_public_recovery(&manifest, public, &record))
+    {
+        Ok(_) => PendingVerdict::Recoverable,
+        Err(error) => PendingVerdict::Blocked(error.to_string()),
+    };
+    Some(PendingRecord {
+        name: Some(record.old.name),
+        path: journal,
+        verdict,
+    })
 }
 
 #[cfg(unix)]
@@ -2784,6 +3171,8 @@ mod tests {
         points_into, prepare_manifest_with_nonce, public_transition_path, read_public_transition,
         recover_pending_transitions, recover_public_transition, unlink_snapshot,
     };
+    #[cfg(unix)]
+    use super::{PendingVerdict, classify_pending, classify_public_transition};
     use crate::config::{Entry, parse_entry};
     use crate::github_release_install::{self, ArchiveState};
     use crate::link_state::{self, Kind, ReconcileLink};
@@ -5888,6 +6277,399 @@ mod tests {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    /// Classifies the fixture's journal read-only, then runs recovery, and
+    /// asserts the verdict predicted exactly what recovery did.
+    #[cfg(unix)]
+    fn assert_classify_predicts_recovery(
+        fixture: &AbandonedHandoff,
+        configured: &str,
+        pkg_mgr: &str,
+    ) -> PendingVerdict {
+        let entries = [parse_entry(configured, Some(pkg_mgr))];
+        let verdicts = classify_pending(
+            &entries,
+            &fixture.manifest_path,
+            &fixture.roots,
+            Some((pkg_mgr, false)),
+        )
+        .unwrap();
+        assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+        assert_eq!(verdicts[0].name.as_deref(), Some("owner/tool"));
+        assert_eq!(verdicts[0].path, fixture.record);
+        let recovered = recover_pending_transitions(
+            &entries,
+            &HashMap::new(),
+            &fixture.manifest_path,
+            &fixture.roots,
+            Some((pkg_mgr, false)),
+        );
+        match (&verdicts[0].verdict, recovered) {
+            (PendingVerdict::Recoverable, Ok(_)) => {}
+            (PendingVerdict::Blocked(reason), Err(error)) => {
+                assert_eq!(*reason, error.to_string());
+            }
+            (verdict, result) => panic!("classified {verdict:?} but recovery returned {result:?}"),
+        }
+        verdicts[0].verdict.clone()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_pending_predicts_every_installing_outcome() {
+        let recoverable = PendingVerdict::Recoverable;
+        let blocked = |verdict: PendingVerdict| matches!(verdict, PendingVerdict::Blocked(_));
+
+        let moot = abandoned_handoff("classify-moot", REPO_ENTRY);
+        assert_eq!(
+            assert_classify_predicts_recovery(&moot, RELEASE_ENTRY, "apt"),
+            recoverable
+        );
+        let retry = abandoned_handoff("classify-retry", REPO_ENTRY);
+        assert_eq!(
+            assert_classify_predicts_recovery(&retry, REPO_ENTRY, "apt"),
+            recoverable
+        );
+        let other = abandoned_handoff("classify-other-method", REPO_ENTRY);
+        assert!(blocked(assert_classify_predicts_recovery(
+            &other,
+            "owner/tool|cargo|tool|-|-",
+            "apt"
+        )));
+        let edited = abandoned_handoff("classify-edited", REPO_ENTRY);
+        assert!(blocked(assert_classify_predicts_recovery(
+            &edited,
+            "owner/tool|github:release|tool|-|os:linux",
+            "apt"
+        )));
+        let changed = abandoned_handoff("classify-root-changed", REPO_ENTRY);
+        fs::write(changed.root.join("partial"), "written in place\n").unwrap();
+        assert!(blocked(assert_classify_predicts_recovery(
+            &changed,
+            RELEASE_ENTRY,
+            "apt"
+        )));
+        let cloned = abandoned_handoff("classify-clone", REPO_ENTRY);
+        let clone = cloned.root.with_file_name("tool.tmp.4242");
+        fs::create_dir_all(&clone).unwrap();
+        let PendingVerdict::Blocked(reason) =
+            assert_classify_predicts_recovery(&cloned, RELEASE_ENTRY, "apt")
+        else {
+            panic!("an interrupted clone must block");
+        };
+        assert!(reason.contains(&clone.display().to_string()), "{reason}");
+        let transaction = abandoned_handoff("classify-installer-transaction", REPO_ENTRY);
+        fs::write(
+            transaction.root.with_file_name(".tool.install.transaction"),
+            "pending\n",
+        )
+        .unwrap();
+        assert!(blocked(assert_classify_predicts_recovery(
+            &transaction,
+            RELEASE_ENTRY,
+            "apt"
+        )));
+        let pkg_same = abandoned_handoff("classify-pkg-same", "owner/tool|pkg|tool|-|-");
+        assert_eq!(
+            assert_classify_predicts_recovery(&pkg_same, "owner/tool|pkg|tool|-|-", "apt"),
+            recoverable
+        );
+        let pkg_other = abandoned_handoff("classify-pkg-other", "owner/tool|pkg|tool|-|-");
+        let PendingVerdict::Blocked(reason) =
+            assert_classify_predicts_recovery(&pkg_other, "owner/tool|pkg|tool|-|-", "brew")
+        else {
+            panic!("a different package installer must block");
+        };
+        assert!(reason.contains("package installer identity"), "{reason}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_pending_reports_a_stale_record_with_the_recovery_fix() {
+        let fixture = abandoned_handoff("classify-stale-text", REPO_ENTRY);
+        let PendingVerdict::Blocked(reason) =
+            assert_classify_predicts_recovery(&fixture, "owner/tool|cargo|tool|-|-", "apt")
+        else {
+            panic!("a record no config entry matches must block");
+        };
+        assert!(
+            reason.contains("no longer matches configuration"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&fixture.record.display().to_string()),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_pending_reads_without_writing() {
+        let fixture = abandoned_handoff("classify-read-only", REPO_ENTRY);
+        let temp = fixture.record.with_file_name(format!(
+            ".{}.json.tmp.1.2",
+            fixture
+                .record
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap()
+        ));
+        fs::write(&temp, "{}").unwrap();
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Moot, so recovery would retire it; the classifier must not.
+        let verdicts = classify_pending(
+            &[parse_entry(RELEASE_ENTRY, Some("apt"))],
+            &fixture.manifest_path,
+            &fixture.roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].verdict, PendingVerdict::Recoverable);
+        assert!(fixture.record.exists());
+        assert!(fixture.prepared.exists());
+        assert!(temp.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_public_transition_predicts_recovery() {
+        let (roots, manifest_path, entry, transition, public, source) =
+            raw_release_transition("classify-public");
+        let new = ManifestEntry::new(
+            &entry.name,
+            &entry.method,
+            &entry.cmd,
+            source.to_string_lossy(),
+        );
+        let journal = public_transition_path(&public).unwrap();
+        let predict = |public: &std::path::Path| {
+            let record = classify_public_transition(&manifest_path, public).unwrap();
+            assert_eq!(record.path, journal);
+            assert_eq!(record.name.as_deref(), Some(entry.name.as_str()));
+            let recovered = recover_public_transition(&manifest_path, public, &roots);
+            match (&record.verdict, recovered) {
+                (PendingVerdict::Recoverable, Ok(())) => {}
+                (PendingVerdict::Blocked(reason), Err(error)) => {
+                    assert_eq!(*reason, error.to_string());
+                }
+                (verdict, result) => {
+                    panic!("classified {verdict:?} but recovery returned {result:?}")
+                }
+            }
+            record.verdict
+        };
+
+        assert!(classify_public_transition(&manifest_path, &public).is_none());
+        // Manifest still old: recovery restores the old command.
+        begin_public_transition(&transition, new.clone(), &roots, &manifest_path).unwrap();
+        assert_eq!(predict(&public), PendingVerdict::Recoverable);
+
+        // A foreign command replaced the published link: recovery refuses.
+        let manifest = crate::manifest::read(&manifest_path).unwrap();
+        let refreshed = by_name(&manifest, std::slice::from_ref(&entry), &roots)
+            .unwrap()
+            .remove(&entry.name)
+            .unwrap();
+        begin_public_transition(&refreshed, new.clone(), &roots, &manifest_path).unwrap();
+        fs::remove_file(&public).unwrap();
+        write_executable(&public, b"foreign");
+        let PendingVerdict::Blocked(reason) = predict(&public) else {
+            panic!("an unrecognized live command must block");
+        };
+        assert!(reason.contains("unrecognized live path"), "{reason}");
+
+        // The manifest names neither side: recovery refuses.
+        crate::manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(&entry.name, crate::method::CARGO, &entry.cmd, ""),
+        )
+        .unwrap();
+        let PendingVerdict::Blocked(reason) = predict(&public) else {
+            panic!("an unclassifiable manifest row must block");
+        };
+        assert!(reason.contains("cannot classify manifest row"), "{reason}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_public_transition_predicts_a_committed_handoff() {
+        let (roots, manifest_path, entry, transition, public, source) =
+            raw_release_transition("classify-public-committed");
+        let new = ManifestEntry::new(
+            &entry.name,
+            &entry.method,
+            &entry.cmd,
+            source.to_string_lossy(),
+        );
+        begin_public_transition(&transition, new.clone(), &roots, &manifest_path).unwrap();
+        crate::manifest::upsert(&manifest_path, new).unwrap();
+
+        let record = classify_public_transition(&manifest_path, &public).unwrap();
+
+        assert_eq!(record.verdict, PendingVerdict::Recoverable);
+        recover_public_transition(&manifest_path, &public, &roots).unwrap();
+        assert_eq!(fs::read_link(&public).unwrap(), source);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_pending_predicts_prepared_and_unclassifiable_records() {
+        // Prepared: recovery retires it without running anything.
+        let (_dir, roots, manifest_path, entry, transition) =
+            simple_transition("classify-prepared", crate::method::CARGO);
+        let durable =
+            begin_durable_transition(&entry, Some(&transition), &roots, &manifest_path, None)
+                .unwrap()
+                .unwrap();
+        let verdicts = classify_pending(
+            std::slice::from_ref(&entry),
+            &manifest_path,
+            &roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].verdict, PendingVerdict::Recoverable);
+        recover_pending_transitions(
+            std::slice::from_ref(&entry),
+            &HashMap::new(),
+            &manifest_path,
+            &roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+        assert!(!durable.path.exists());
+
+        // The manifest names neither side of the handoff: recovery refuses.
+        let fixture = abandoned_handoff("classify-unclassifiable", REPO_ENTRY);
+        crate::manifest::upsert(
+            &fixture.manifest_path,
+            ManifestEntry::new("owner/tool", crate::method::CARGO, "tool", ""),
+        )
+        .unwrap();
+        let PendingVerdict::Blocked(reason) =
+            assert_classify_predicts_recovery(&fixture, REPO_ENTRY, "apt")
+        else {
+            panic!("an unclassifiable manifest row must block");
+        };
+        assert!(
+            reason.contains("cannot classify manifest ownership"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_pending_blocks_on_unsafe_staging_files_like_recovery() {
+        let fixture = abandoned_handoff("classify-unsafe-staging", REPO_ENTRY);
+        let stem = fixture
+            .record
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap()
+            .to_owned();
+        let temp = fixture
+            .record
+            .with_file_name(format!(".{stem}.json.tmp.1.2"));
+        fs::write(&temp, "{}").unwrap();
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let verdicts = classify_pending(
+            &[parse_entry(REPO_ENTRY, Some("apt"))],
+            &fixture.manifest_path,
+            &fixture.roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+        let blocked = verdicts
+            .iter()
+            .find(|record| record.path == temp)
+            .expect("unsafe staging file is reported");
+        assert_eq!(blocked.name.as_deref(), Some("owner/tool"));
+        let PendingVerdict::Blocked(reason) = &blocked.verdict else {
+            panic!("an unsafe staging file must block");
+        };
+        let error = recover_with(&fixture, REPO_ENTRY).unwrap_err();
+        assert_eq!(*reason, error.to_string());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn health_reports_the_github_flip_by_its_recovery_outcome() {
+        // The watchexec shape: a bare `github` entry whose repo replacement
+        // entered `Installing`, after which the resolver cache flipped back.
+        let health_rows = |fixture: &AbandonedHandoff| {
+            fs::create_dir_all(&fixture.roots.conf_dir).unwrap();
+            fs::write(
+                fixture.roots.conf_dir.join("deps.conf"),
+                "owner/tool github tool\n",
+            )
+            .unwrap();
+            let env = RuntimeEnv::new("linux", "test-host").with_package_manager("apt");
+            crate::health::check(&fixture.roots, &env, "apt")
+                .problems
+                .into_iter()
+                .filter(|problem| {
+                    matches!(
+                        problem.kind,
+                        crate::health::ProblemKind::BlockedTransition
+                            | crate::health::ProblemKind::RecoveryState
+                    )
+                })
+                .map(|problem| (problem.kind, problem.package, problem.path))
+                .collect::<Vec<_>>()
+        };
+        let cache = |fixture: &AbandonedHandoff, method: &str| {
+            let path = fixture.roots.state_dir.join("owner/tool.github.method");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!("{method}\ncmd=tool\n")).unwrap();
+        };
+
+        // Resolves back to the untouched release: the next update retires it.
+        let moot = abandoned_handoff("health-flip-moot", REPO_ENTRY);
+        cache(&moot, crate::method::GITHUB_RELEASE);
+        assert_eq!(
+            health_rows(&moot),
+            [(
+                crate::health::ProblemKind::RecoveryState,
+                Some("owner/tool".to_owned()),
+                Some(moot.record.clone())
+            )]
+        );
+
+        // Same flip, but the old root changed: every update aborts.
+        let wedged = abandoned_handoff("health-flip-wedged", REPO_ENTRY);
+        cache(&wedged, crate::method::GITHUB_RELEASE);
+        fs::write(wedged.root.join("partial"), "written in place\n").unwrap();
+        let rows = health_rows(&wedged);
+        assert_eq!(
+            rows,
+            [(
+                crate::health::ProblemKind::BlockedTransition,
+                Some("owner/tool".to_owned()),
+                Some(wedged.record.clone())
+            )]
+        );
+        assert!(
+            recover_with(&wedged, RELEASE_ENTRY).is_err(),
+            "health must agree with recovery"
+        );
+
+        // Still resolving to the repo target: the next update retries it.
+        let retry = abandoned_handoff("health-flip-retry", REPO_ENTRY);
+        cache(&retry, "github:repo:no-compatible-release");
+        assert_eq!(
+            health_rows(&retry),
+            [(
+                crate::health::ProblemKind::RecoveryState,
+                Some("owner/tool".to_owned()),
+                Some(retry.record.clone())
+            )]
+        );
     }
 
     fn temp_dir(name: &str) -> PathBuf {

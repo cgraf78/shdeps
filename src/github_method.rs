@@ -422,6 +422,28 @@ where
     Ok(method)
 }
 
+/// Best local guess at what a bare `github` entry resolves to, for read-only
+/// callers such as `shdeps health` that may not fetch, write caches, or run
+/// commands.
+///
+/// It reads the resolver cache even when stale, because update keeps that
+/// answer whenever the remote check fails and usually reconfirms it when the
+/// check succeeds. Without a usable cache it uses the installed manifest row,
+/// then the resolver's own no-signal default. A remote check can still pick
+/// differently; callers must treat the answer as a forecast, not a fact.
+pub(crate) fn offline_method(state_dir: &Path, entry: &Entry, manifest: &Manifest) -> &'static str {
+    if let Ok(Some(cached)) = Cache::new(state_dir, &entry.name).read_stale_method(entry) {
+        return match cached {
+            METHOD_REPO_LAST_KNOWN => method::GITHUB_REPO,
+            concrete => concrete,
+        };
+    }
+    match manifest.get(&entry.name).map(|row| row.method.as_str()) {
+        Some(method::GITHUB_RELEASE) => method::GITHUB_RELEASE,
+        _ => method::GITHUB_REPO,
+    }
+}
+
 fn resolved_entry(entry: &Entry, method: &str) -> Entry {
     let mut resolved = entry.clone();
     resolved.method = method.to_owned();
@@ -1887,5 +1909,48 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!(r#"[{{"tag_name":"{tag}","draft":false,"prerelease":false,"assets":[{assets}]}}]"#)
+    }
+
+    #[test]
+    fn offline_method_forecasts_from_the_cache_then_the_manifest() {
+        let fixture = Fixture::new("offline-method");
+        let state = &fixture.roots.state_dir;
+        let entry = parse_entry("owner/tool|github|tool|-|-", None);
+        let none = crate::manifest::Manifest::parse("");
+        let release = crate::manifest::Manifest::parse("owner/tool|github:release|tool|/x\n");
+        let cache = |content: &str| {
+            let path = state.join("owner/tool.github.method");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        };
+
+        // No signal at all: the resolver's own soft default.
+        assert_eq!(super::offline_method(state, &entry, &none), "github:repo");
+        assert_eq!(
+            super::offline_method(state, &entry, &release),
+            "github:release"
+        );
+        // A cache answer wins over the installed row, stale or not.
+        cache("github:repo:no-compatible-release\ncmd=tool\n");
+        assert_eq!(
+            super::offline_method(state, &entry, &release),
+            "github:repo"
+        );
+        cache("github:repo:last-known\ncmd=tool\n");
+        assert_eq!(
+            super::offline_method(state, &entry, &release),
+            "github:repo"
+        );
+        cache("github:release\ncmd=tool\n");
+        assert_eq!(
+            super::offline_method(state, &entry, &none),
+            "github:release"
+        );
+        // A cache recorded for another command is ignored, as update does.
+        cache("github:repo:no-compatible-release\ncmd=other\n");
+        assert_eq!(
+            super::offline_method(state, &entry, &release),
+            "github:release"
+        );
     }
 }
