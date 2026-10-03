@@ -983,6 +983,105 @@ fn reused_lock_owner_pid_does_not_suppress_records() {
 }
 
 #[test]
+fn checkout_stuck_behind_its_peers_is_a_stale_remote() {
+    // The pull failure `update` only warns about once per run is durable
+    // here: the record names the cause, peer stamps prove it is stuck.
+    let fixture = Fixture::new("stale-remote");
+    let now = now_unix();
+    fixture.healthy_release("owner/tool", "tool");
+    fixture.healthy_repo("owner/kit", "kit");
+    fixture.write("state/owner/tool.release.stamp", &format!("{now}\n"));
+    fixture.write(
+        "state/owner/kit.repo.stamp",
+        &format!("{}\n", now - 3 * 86_400),
+    );
+    fixture.write(
+        "state/owner/kit.repo.pull-failure",
+        &format!(
+            "since={}\nlast={now}\nreason=fetch\ndetail=Could not resolve host: github.com\n",
+            now - 3 * 86_400 + 60
+        ),
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    let root = fixture.path("share/owner/kit");
+    assert_eq!(
+        keys(&output),
+        [key("warn", "owner/kit", "stale-remote", &root)]
+    );
+    assert_eq!(
+        rows(&output)[0][4],
+        format!(
+            "checkout has not refreshed for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C {} fetch', then run 'shdeps update'",
+            root.display()
+        )
+    );
+}
+
+#[test]
+fn stale_remote_is_suppressed_while_an_update_is_stamping() {
+    // After a long sleep a running update stamps sources one by one; the
+    // ones it has not reached yet are not stuck.
+    let fixture = Fixture::new("stale-remote-running");
+    let now = now_unix();
+    fixture.healthy_release("owner/tool", "tool");
+    fixture.healthy_repo("owner/kit", "kit");
+    fixture.write("state/owner/tool.release.stamp", &format!("{now}\n"));
+    fixture.write(
+        "state/owner/kit.repo.stamp",
+        &format!("{}\n", now - 3 * 86_400),
+    );
+    let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
+    fixture.write(
+        "state/.lock",
+        &format!("pid={}\nstate_dir=x\nacquired_unix={now}\n", holder.id()),
+    );
+
+    let running = fixture.health();
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let finished = fixture.health();
+
+    assert_exit(&running, 0);
+    assert_exit(&finished, 1);
+    assert_eq!(rows(&finished)[0][2], "stale-remote");
+}
+
+#[test]
+fn development_clone_and_fresh_peers_are_not_stale_remotes() {
+    // A development clone skips its pull while it has local edits, so its
+    // stamp trailing the others is normal; a stamp within a day of its
+    // newest peer is too.
+    let fixture = Fixture::new("stale-remote-quiet");
+    let now = now_unix();
+    fixture.healthy_release("owner/tool", "tool");
+    fixture.write("state/owner/tool.release.stamp", &format!("{now}\n"));
+    fixture.healthy_repo("owner/kit", "kit");
+    fixture.write("state/owner/kit.repo.stamp", &format!("{}\n", now - 86_400));
+    fixture.append("conf/deps.conf", "owner/dev github:repo\n");
+    let binary = fixture.write_executable("git/dev/bin/dev");
+    fixture.link(&fixture.path("git/dev"), "share/owner/dev");
+    fixture.link(&binary, "bin/dev");
+    fixture.append(
+        "state/manifest",
+        &format!(
+            "owner/dev|github:repo|dev|{}\n",
+            fixture.path("share/owner/dev").display()
+        ),
+    );
+    fixture.write(
+        "state/owner/dev.repo.stamp",
+        &format!("{}\n", now - 30 * 86_400),
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
+}
+
+#[test]
 fn health_help_is_not_an_unsupported_status() {
     let fixture = Fixture::new("help");
 
@@ -1021,6 +1120,7 @@ fn health_contract_is_advertised_and_tokens_are_stable() {
             ("deferred-uninstall", "warn"),
             ("pending-post", "warn"),
             ("recovery-state", "warn"),
+            ("stale-remote", "warn"),
             ("unreadable-state", "fail"),
         ]
     );

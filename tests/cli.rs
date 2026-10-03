@@ -1743,7 +1743,10 @@ case " $* " in
     printf 'origin/main\n'
     exit 0
     ;;
-  *" pull --ff-only --quiet ") exit 1 ;;
+  *" pull --ff-only --quiet ")
+    printf 'fatal: Not possible to fast-forward, aborting.\n' >&2
+    exit 1
+    ;;
   *) exit 1 ;;
 esac
 "##,
@@ -1761,12 +1764,14 @@ esac
             && event["group"] == "github-repos"
             && event["status"] == "warning"
             && event["name"] == "owner/tool"
-            && event["detail"] == "pull failed (no fast-forward; local clone)"
+            && event["detail"]
+                == "pull failed (Not possible to fast-forward, aborting; local clone)"
     }));
     assert!(events.iter().any(|event| {
         event["event"] == "warning"
             && event["status"] == "warning"
-            && event["detail"] == "owner/tool: pull failed (no fast-forward; local clone)"
+            && event["detail"]
+                == "owner/tool: pull failed (Not possible to fast-forward, aborting; local clone)"
     }));
     assert!(events.iter().any(|event| {
         event["event"] == "group_summary"

@@ -59,6 +59,7 @@ mod repo_transition;
 mod repo_verify;
 pub mod runtime;
 pub mod self_update;
+mod stale_remote;
 pub mod stamp;
 mod standalone_layout;
 pub mod state;
