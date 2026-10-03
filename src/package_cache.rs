@@ -143,6 +143,44 @@ pub fn current(inputs: &Inputs) -> Result<Status> {
     Ok(status)
 }
 
+/// Command lookups the last clean package scan recorded, keyed by command:
+/// `true` when the command was on PATH, `false` when the package manager
+/// proved the package without one (completion data, fonts, libraries).
+///
+/// Update writes the cache only after every active package dependency was
+/// proven installed, so this is read-only evidence of what each package's
+/// command looked like when it last worked. `None` when there is no usable
+/// cache: absent, unreadable, another schema, or written for another
+/// package manager or runtime identity (a state dir shared across hosts).
+#[must_use]
+pub fn recorded_commands(
+    state_dir: &Path,
+    env: &RuntimeEnv,
+    pkg_mgr: &str,
+) -> Option<BTreeMap<String, bool>> {
+    let content = fs::read_to_string(path(state_dir)).ok()?;
+    let cache = Cache::parse(&content);
+    let same_identity = [
+        ("version", CACHE_VERSION),
+        ("pkg_mgr", pkg_mgr),
+        ("platform", env.platform()),
+        ("android", bool_identity(env.is_android())),
+        ("host", env.host()),
+    ]
+    .into_iter()
+    .all(|(key, expected)| cache.one(key) == Some(expected));
+    if !same_identity {
+        return None;
+    }
+    Some(
+        cache
+            .pairs("cmd")
+            .into_iter()
+            .map(|(command, path)| (command, !path.is_empty()))
+            .collect(),
+    )
+}
+
 /// Writes a fresh package-check cache.
 pub fn write(inputs: &Inputs) -> Result<()> {
     if disabled_reason(inputs).is_some() {
@@ -1016,12 +1054,13 @@ impl Hasher for StableHasher {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::Duration;
 
-    use super::{Inputs, Status, apt_status_path, current, path, write};
+    use super::{Inputs, Status, apt_status_path, current, path, recorded_commands, write};
 
     use crate::platform::RuntimeEnv;
 
@@ -1065,6 +1104,38 @@ mod tests {
         write(&inputs).unwrap();
 
         assert_eq!(current(&inputs).unwrap(), Status::Hit { count: 1 });
+    }
+
+    #[test]
+    fn recorded_commands_reads_back_what_write_recorded() {
+        let fixture = Fixture::new("recorded-commands");
+        fixture.write("conf/deps.conf", "cache-tool  pkg\n");
+        let mut inputs = fixture.inputs();
+        inputs
+            .commands
+            .push(("cache-data".to_owned(), String::new()));
+        let env = RuntimeEnv::new("linux", "test-host");
+        assert_eq!(recorded_commands(&inputs.state_dir, &env, "apt"), None);
+
+        write(&inputs).unwrap();
+
+        assert_eq!(
+            recorded_commands(&inputs.state_dir, &env, "apt"),
+            Some(BTreeMap::from([
+                ("cache-data".to_owned(), false),
+                ("cache-tool".to_owned(), true),
+            ]))
+        );
+        // Lookups made under another manager or runtime resolved other
+        // names or saw another filesystem.
+        assert_eq!(recorded_commands(&inputs.state_dir, &env, "dnf"), None);
+        let other_host = RuntimeEnv::new("linux", "other-host");
+        assert_eq!(
+            recorded_commands(&inputs.state_dir, &other_host, "apt"),
+            None
+        );
+        let android = env.clone().with_android(true);
+        assert_eq!(recorded_commands(&inputs.state_dir, &android, "apt"), None);
     }
 
     #[test]
