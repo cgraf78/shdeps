@@ -433,6 +433,38 @@ fn normalize_requested_checkout(requested_checkout: &Path) -> io::Result<PathBuf
     Ok(normalized)
 }
 
+/// Whether a provably live process holds the shared lock for `checkout`,
+/// decided without creating, recovering, or changing anything; for
+/// `shdeps health`.
+///
+/// A legacy directory lock, a malformed lock, or an owner whose liveness
+/// cannot be proven reads as not held: the caller then reports the state it
+/// found rather than hiding it.
+pub(crate) fn held_by_live_owner(checkout: &Path) -> bool {
+    let (Some(parent), Ok(name)) = (checkout.parent(), checkout_basename(checkout)) else {
+        return false;
+    };
+    let Ok(parent) = fs::canonicalize(parent) else {
+        return false;
+    };
+    let paths = Paths {
+        checkout: parent.join(&name),
+        canonical: parent.join(format!(".{name}.install.lock")),
+        parent,
+        name,
+    };
+    match classify(&paths) {
+        Classified::Owner { liveness, .. } | Classified::Claim { liveness, .. } => {
+            liveness == Liveness::Live
+        }
+        // `Retry` is usually a writer mid-change, but a damaged lock reads
+        // the same way forever; report rather than hide in that case.
+        Classified::Missing | Classified::Legacy | Classified::Retry | Classified::Malformed(_) => {
+            false
+        }
+    }
+}
+
 // Run one mutation while holding the shared lock and report strict release errors.
 pub(crate) fn with_checkout_lock<T>(
     requested_checkout: &Path,
@@ -1538,9 +1570,10 @@ mod tests {
     use super::{
         CheckoutLock, Classified, Cleanup, Liveness, Paths, ProcessIdentity, Record, Role,
         canonical_target, classify, cleanup_detached_claims, cleanup_empty_claim, current_identity,
-        discard_unpublished_owner, hostname_hex, normalize_ps_lstart, parse_record, parse_timeout,
-        path_exists, prepare_claim, prepare_owner, process_identity, record_liveness,
-        retire_and_cleanup_claim, with_checkout_lock, with_checkout_lock_timeout, write_record,
+        discard_unpublished_owner, held_by_live_owner, hostname_hex, normalize_ps_lstart,
+        parse_record, parse_timeout, path_exists, prepare_claim, prepare_owner, process_identity,
+        record_liveness, retire_and_cleanup_claim, with_checkout_lock, with_checkout_lock_timeout,
+        write_record,
     };
 
     const OWNER_RECORD: &[u8] =
@@ -2150,6 +2183,26 @@ mod tests {
         assert_eq!(observed, expected);
         let paths = Paths::new(&requested).unwrap();
         assert!(!path_exists(&paths.canonical));
+    }
+
+    #[test]
+    fn live_owner_probe_reads_without_creating_anything() {
+        let requested = checkout("held-probe");
+        let parent = requested.parent().unwrap().to_path_buf();
+        let missing = parent.join("absent/tool");
+
+        assert!(!held_by_live_owner(&requested));
+        assert!(!held_by_live_owner(&missing));
+        assert!(!path_exists(missing.parent().unwrap()));
+        with_checkout_lock_timeout(&requested, Duration::ZERO, |normalized| {
+            assert!(held_by_live_owner(normalized));
+            Ok(())
+        })
+        .unwrap();
+        assert!(!held_by_live_owner(&requested));
+        // A legacy directory lock proves nothing about its owner.
+        fs::create_dir(parent.join(".tool.install.lock")).unwrap();
+        assert!(!held_by_live_owner(&requested));
     }
 
     #[test]

@@ -231,6 +231,194 @@ pub(crate) fn has_pending_transaction(checkout: &Path) -> Result<bool> {
         || path_present(&actions_transaction_path(checkout)?)?)
 }
 
+/// Read-only view of the transactions that may own one checkout, for
+/// `shdeps health`.
+#[derive(Debug, Default)]
+pub(crate) struct PendingState {
+    /// The checkout installer's transaction, which [`recover`] always refuses.
+    pub(crate) installer_transaction: Option<PathBuf>,
+    /// Shdeps' own sibling journal, if one is on disk.
+    pub(crate) journal: Option<JournalState>,
+}
+
+/// How [`recover`] will meet a Shdeps checkout journal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JournalState {
+    /// Rolled forward or back by the next run.
+    Pending(PathBuf),
+    /// Recovery fails closed on it; the string is recovery's own reason.
+    Blocked(PathBuf, String),
+}
+
+/// Inspects, without recovering anything, the transactions beside `checkout`.
+///
+/// Costs two `lstat`s when nothing is pending. An existing journal is read
+/// and classified by [`journal_blocker`], which mirrors [`recover`].
+pub(crate) fn pending_state(checkout: &Path) -> Result<PendingState> {
+    let actions = actions_transaction_path(checkout)?;
+    let journal = journal_path(checkout)?;
+    let installer_transaction = path_present(&actions)?.then_some(actions);
+    let journal = match fs::symlink_metadata(&journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+        Ok(_) => Some(match journal_blocker(checkout, &journal) {
+            Some(reason) => JournalState::Blocked(journal, reason),
+            None => JournalState::Pending(journal),
+        }),
+    };
+    Ok(PendingState {
+        installer_transaction,
+        journal,
+    })
+}
+
+/// Predicts, from `lstat`s and reads only, whether [`recover_shdeps`] (as the
+/// public [`recover`] entry point runs it) fails closed on the journal at
+/// `journal`, returning its error text. `None` means recovery finishes or
+/// rolls back by itself (or the journal vanished meanwhile).
+///
+/// This mirrors every decision of [`recover_shdeps`] (and the cleanup it ends
+/// with) that can be made before it mutates anything; the tests run both on
+/// each scenario so the two cannot drift. A recovery racing this read can
+/// still make it see a half-moved state, so callers should not trust a
+/// blocked verdict while the checkout lock has a live owner.
+fn journal_blocker(checkout: &Path, journal: &Path) -> Option<String> {
+    let metadata = match fs::symlink_metadata(journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(error.to_string()),
+        Ok(metadata) => metadata,
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Some(format!(
+            "repository transition is not a private directory: {}",
+            journal.display()
+        ));
+    }
+    let entries = match journal_entries(journal) {
+        Ok(entries) => entries,
+        // Retired between the lstat and the listing.
+        Err(error) if error.is_not_found() => return None,
+        Err(error) => return Some(error.to_string()),
+    };
+    let private_file = |entry: &String| {
+        fs::symlink_metadata(journal.join(entry)).is_ok_and(|metadata| {
+            metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.nlink() == 1
+        })
+    };
+    if entries.is_empty() {
+        return None;
+    }
+    if !entries.iter().any(|entry| entry == RECORD)
+        && !entries.iter().any(|entry| entry == PREVIOUS)
+        && entries
+            .iter()
+            .all(|entry| entry.starts_with(".record.tmp."))
+    {
+        return (!entries.iter().all(private_file))
+            .then(|| "repository transition preparation debris is not a private file".to_owned());
+    }
+    let blocked_temps = entries
+        .iter()
+        .filter(|entry| entry.starts_with(".blocked.tmp."))
+        .collect::<Vec<_>>();
+    if !blocked_temps.iter().all(|entry| private_file(entry)) {
+        return Some(
+            "repository transition collision preparation is not a private file".to_owned(),
+        );
+    }
+    let canonical_blocked = entries.iter().any(|entry| entry == BLOCKED);
+    let blocked = canonical_blocked || !blocked_temps.is_empty();
+    if canonical_blocked {
+        match crate::state::read_private_bounded(&journal.join(BLOCKED), 1024) {
+            Ok(bytes) if bytes == BLOCKED_CONTENT.as_bytes() => {}
+            Ok(_) => {
+                return Some("repository transition collision marker is malformed".to_owned());
+            }
+            Err(error) => return Some(error.to_string()),
+        }
+    }
+    if entries.iter().any(|entry| {
+        entry != RECORD
+            && entry != PREVIOUS
+            && entry != BLOCKED
+            && !entry.starts_with(".blocked.tmp.")
+    }) {
+        return Some(format!(
+            "repository transition contains unexpected state: {}",
+            journal.display()
+        ));
+    }
+
+    let record = match read_record(&journal.join(RECORD), checkout) {
+        Ok(record) => record,
+        Err(error) => return Some(error.to_string()),
+    };
+    let previous_path = journal.join(PREVIOUS);
+    let (previous_present, checkout_present) =
+        match (path_present(&previous_path), path_present(checkout)) {
+            (Ok(previous), Ok(checkout)) => (previous, checkout),
+            (Err(error), _) | (_, Err(error)) => return Some(error.to_string()),
+        };
+    let fail = |message: &str| Some(message.to_owned());
+    // Every successful path ends in `remove_journal`, which refuses a staged
+    // clone that no longer matches its recorded identity.
+    let staged_changed = || match &record.desired {
+        Desired::Directory { identity, staged }
+            if path_present(staged).unwrap_or(false) && !identity.matches(staged) =>
+        {
+            Some(format!(
+                "staged repository changed before transition cleanup: {}",
+                staged.display()
+            ))
+        }
+        _ => None,
+    };
+
+    let Some(previous) = record.previous.as_ref() else {
+        if previous_present {
+            return fail("fresh repository transition unexpectedly contains a previous object");
+        }
+        if checkout_present {
+            if !record.desired.matches(checkout) {
+                return fail("fresh repository transition found a foreign stable object");
+            }
+            return staged_changed();
+        }
+        return match &record.desired {
+            Desired::Directory { identity, staged } if identity.matches(staged) => None,
+            _ => fail("fresh repository transition lost both staged and stable objects"),
+        };
+    };
+
+    // The public entry point accepts a later checkout-installer generation
+    // unless a collision was already recorded.
+    let live_checkout_wins =
+        record.desired.matches(checkout) || (!blocked && is_real_directory(checkout));
+    if previous_present {
+        if !previous.matches(&previous_path) {
+            return fail("repository transition backup identity does not match its record");
+        }
+        if !checkout_present || live_checkout_wins {
+            // An absent stable path is restored from the exact backup.
+            return staged_changed();
+        }
+        return fail(if blocked {
+            "repository transition previously observed a foreign live collision; move the foreign stable object aside and rerun so the exact backup can be restored"
+        } else {
+            "repository transition found a foreign stable checkout object"
+        });
+    }
+    if !checkout_present {
+        return fail("repository transition lost both stable and backup objects");
+    }
+    if previous.matches(checkout) || live_checkout_wins {
+        return staged_changed();
+    }
+    fail("repository transition stable object does not match its record")
+}
+
 /// Publishes a validated development checkout at the canonical repository root.
 pub(crate) fn publish_development(
     checkout: &Path,
@@ -1359,10 +1547,12 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
 
+    use crate::manifest::ManifestEntry;
+
     use super::{
-        Desired, Identity, actions_transaction_path, begin, journal_path, publish_development,
-        publish_directory, publish_transaction, recover, rename_exchange, rename_noreplace,
-        restore_parked_previous, with_atomic_rename_errno,
+        Desired, Identity, JournalState, actions_transaction_path, begin, journal_path,
+        pending_state, publish_development, publish_directory, publish_transaction, recover,
+        rename_exchange, rename_noreplace, restore_parked_previous, with_atomic_rename_errno,
     };
 
     #[test]
@@ -1553,7 +1743,7 @@ mod tests {
         .unwrap();
         fs::rename(&checkout, journal.join("previous")).unwrap();
 
-        recover(&checkout).unwrap();
+        recover_checked(&checkout).unwrap();
 
         assert_eq!(fs::read_to_string(checkout.join("old")).unwrap(), "managed");
         assert!(!journal.exists());
@@ -1577,7 +1767,7 @@ mod tests {
         fs::rename(&checkout, journal.join("previous")).unwrap();
         symlink(&development, &checkout).unwrap();
 
-        recover(&checkout).unwrap();
+        recover_checked(&checkout).unwrap();
 
         assert_eq!(fs::read_link(&checkout).unwrap(), development);
         assert!(!journal.exists());
@@ -1601,7 +1791,7 @@ mod tests {
         fs::rename(&checkout, journal.join("previous")).unwrap();
         write_file(&checkout.join("installer"), "new generation");
 
-        recover(&checkout).unwrap();
+        recover_checked(&checkout).unwrap();
 
         assert_eq!(
             fs::read_to_string(checkout.join("installer")).unwrap(),
@@ -1649,7 +1839,7 @@ mod tests {
         )
         .unwrap();
 
-        let recovery = recover(&checkout).unwrap_err();
+        let recovery = recover_checked(&checkout).unwrap_err();
         assert!(recovery.to_string().contains("foreign live collision"));
         assert_eq!(
             fs::read_to_string(checkout.join("foreign")).unwrap(),
@@ -1662,7 +1852,7 @@ mod tests {
 
         let foreign = checkout.with_extension("foreign");
         fs::rename(&checkout, &foreign).unwrap();
-        recover(&checkout).unwrap();
+        recover_checked(&checkout).unwrap();
         assert_eq!(fs::read_to_string(checkout.join("old")).unwrap(), "managed");
         assert_eq!(
             fs::read_to_string(foreign.join("foreign")).unwrap(),
@@ -1695,7 +1885,7 @@ mod tests {
         let journal = journal_path(&checkout).unwrap();
         assert!(error.to_string().contains("does not match"));
         assert!(journal.join("blocked").is_file());
-        assert!(recover(&checkout).is_err());
+        assert!(recover_checked(&checkout).is_err());
         assert_eq!(
             fs::read_to_string(checkout.join("foreign")).unwrap(),
             "preserve"
@@ -1730,7 +1920,7 @@ mod tests {
         .unwrap();
         fs::rename(&checkout, journal.join("previous")).unwrap();
 
-        recover(&checkout).unwrap();
+        recover_checked(&checkout).unwrap();
 
         assert_eq!(fs::read_link(&checkout).unwrap(), development);
         assert!(!staged.exists());
@@ -1823,7 +2013,7 @@ mod tests {
             fs::read_to_string(journal.join("previous/old")).unwrap(),
             "managed"
         );
-        assert!(recover(&checkout).is_err());
+        assert!(recover_checked(&checkout).is_err());
     }
 
     #[test]
@@ -1834,7 +2024,7 @@ mod tests {
         let actions = actions_transaction_path(&checkout).unwrap();
         fs::create_dir_all(&actions).unwrap();
 
-        let error = recover(&checkout).unwrap_err();
+        let error = recover_checked(&checkout).unwrap_err();
 
         assert!(error.to_string().contains("rerun the checkout installer"));
         assert_eq!(
@@ -1853,7 +2043,7 @@ mod tests {
         fs::create_dir_all(&journal).unwrap();
         fs::write(journal.join("record"), "not a transaction\n").unwrap();
 
-        let error = recover(&checkout).unwrap_err();
+        let error = recover_checked(&checkout).unwrap_err();
 
         assert!(error.to_string().contains("repository transition"));
         assert_eq!(
@@ -1898,7 +2088,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = recover(&checkout).unwrap_err();
+        let error = recover_checked(&checkout).unwrap_err();
 
         assert!(error.to_string().contains("reserved sibling clone path"));
         assert_eq!(
@@ -1906,6 +2096,49 @@ mod tests {
             "preserve"
         );
         assert!(journal.is_dir());
+    }
+
+    #[test]
+    fn fresh_publication_recovery_is_predicted() {
+        let fresh = |name: &str| {
+            let dir = temp_dir(name);
+            let checkout = dir.join("share/owner/tool");
+            let staged = dir.join("share/owner/tool.tmp.4242");
+            write_file(&staged.join("bin/tool"), "fresh");
+            let ownership = ManifestEntry::new(
+                "owner/tool",
+                crate::method::GITHUB_REPO,
+                "tool",
+                checkout.to_string_lossy(),
+            );
+            let identity = Identity::read(&staged).unwrap();
+            begin(
+                &checkout,
+                None,
+                Desired::Directory {
+                    identity,
+                    staged: staged.clone(),
+                },
+                Some(ownership.clone()),
+            )
+            .unwrap();
+            (checkout, staged, ownership)
+        };
+
+        // Interrupted before the rename: recovery publishes the staged tree.
+        let (checkout, staged, ownership) = fresh("fresh-predict-publish");
+        assert_eq!(recover_checked(&checkout).unwrap(), Some(ownership));
+        assert!(!staged.exists());
+
+        // A foreign directory took the stable path: recovery refuses.
+        let (checkout, _staged, _) = fresh("fresh-predict-foreign");
+        fs::create_dir_all(&checkout).unwrap();
+        assert!(recover_checked(&checkout).is_err());
+
+        // Both the staged and stable trees are gone: recovery refuses.
+        let (checkout, staged, _) = fresh("fresh-predict-lost");
+        fs::remove_dir_all(&staged).unwrap();
+        assert!(recover_checked(&checkout).is_err());
     }
 
     #[test]
@@ -1917,13 +2150,41 @@ mod tests {
         fs::create_dir_all(&journal).unwrap();
         fs::write(journal.join(".record.tmp.123.456.abcdef"), "partial").unwrap();
 
-        recover(&checkout).unwrap();
+        recover_checked(&checkout).unwrap();
 
         assert_eq!(
             fs::read_to_string(checkout.join("managed")).unwrap(),
             "preserve"
         );
         assert!(!journal.exists());
+    }
+
+    /// Runs [`recover`] after predicting its outcome read-only, and asserts
+    /// [`pending_state`] predicted exactly what recovery then did.
+    fn recover_checked(checkout: &Path) -> crate::Result<Option<ManifestEntry>> {
+        let state = pending_state(checkout).unwrap();
+        let journal = journal_path(checkout).unwrap();
+        let predicted = match (&state.installer_transaction, &state.journal) {
+            (Some(_), _) => Some(None),
+            (None, Some(JournalState::Blocked(path, reason))) => {
+                assert_eq!(*path, journal);
+                Some(Some(reason.clone()))
+            }
+            (None, Some(JournalState::Pending(path))) => {
+                assert_eq!(*path, journal);
+                None
+            }
+            (None, None) => None,
+        };
+        let result = recover(checkout);
+        match (predicted, &result) {
+            (None, Ok(_)) | (Some(None), Err(_)) => {}
+            (Some(Some(reason)), Err(error)) => assert_eq!(reason, error.to_string()),
+            (predicted, result) => {
+                panic!("predicted {predicted:?} but recovery returned {result:?}")
+            }
+        }
+        result
     }
 
     fn write_file(path: &Path, content: &str) {
