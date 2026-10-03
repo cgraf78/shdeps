@@ -647,7 +647,9 @@ fn command_path(command: &str) -> Option<PathBuf> {
         .find(|path| is_executable(path))
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Whether `path` is an executable regular file, the test every command
+/// lookup here applies.
+pub(crate) fn is_executable(path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
