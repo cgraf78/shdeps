@@ -921,16 +921,6 @@ pub(crate) fn parked_root_link(install_dir: &Path) -> PathBuf {
     install_dir.with_file_name(name)
 }
 
-/// Whether this build may attempt an atomic path exchange at all.
-///
-/// Android is excluded by owner policy: before Android 11 the app seccomp
-/// policy may kill the process with SIGSYS on `renameat2`, and a signal is not
-/// an error the fallback could catch, so the standalone adoption switch never
-/// risks it and Termux always takes the park-and-resume path. (Other
-/// `repo_transition` callers predate this policy and are not changed here.)
-/// Non-Unix platforms have no exchange primitive.
-pub(crate) const ATOMIC_EXCHANGE_ALLOWED: bool = cfg!(all(unix, not(target_os = "android")));
-
 /// Atomically swaps two existing paths on the same filesystem, or fails without
 /// changing either.
 ///
@@ -938,6 +928,12 @@ pub(crate) const ATOMIC_EXCHANGE_ALLOWED: bool = cfg!(all(unix, not(target_os = 
 /// before 3.15 report ENOSYS, and filesystems without exchange support (WSL1
 /// drvfs, NFS, older ZFS, overlay stacks, HFS+) report EINVAL, EOPNOTSUPP, or
 /// EXDEV. A failed `renameat2`/`renamex_np` never changes either path.
+///
+/// Android never attempts the syscall: the crate-wide
+/// [`crate::repo_transition::renameat2_allowed`] policy (an older app
+/// seccomp filter may SIGSYS-kill the process) makes this report
+/// `Unsupported`, so Termux always takes the park-and-resume path. Non-Unix
+/// platforms have no exchange primitive.
 fn exchange_paths(left: &Path, right: &Path) -> io::Result<()> {
     #[cfg(test)]
     {
@@ -945,11 +941,11 @@ fn exchange_paths(left: &Path, right: &Path) -> io::Result<()> {
             return Err(io::Error::from_raw_os_error(errno));
         }
     }
-    if !ATOMIC_EXCHANGE_ALLOWED {
-        return Err(io::Error::from(io::ErrorKind::Unsupported));
-    }
     #[cfg(unix)]
     {
+        if !crate::repo_transition::renameat2_allowed() {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
         crate::repo_transition::rename_exchange(left, right)
     }
     #[cfg(not(unix))]
@@ -2290,11 +2286,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn symlinked_root_switch_parks_under_the_android_rename_policy() {
+        // The crate-wide rename policy, simulated on any host, must steer the
+        // standalone switch to park-and-resume even where the filesystem
+        // could exchange.
+        let (staged, root, old_binary, public) = symlinked_root_fixture("switch-android-policy");
+
+        let parked = crate::repo_transition::with_android_rename_policy(|| {
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool"))
+        })
+        .unwrap();
+
+        assert_eq!(parked, Some(super::parked_root_link(&root)));
+        assert_eq!(fs::read_link(&public).unwrap(), old_binary);
+    }
+
+    #[test]
     #[cfg(target_os = "android")]
     fn symlinked_root_switch_never_attempts_exchange_on_android() {
         // Termux CI: the exchange syscall may be fatal under older app seccomp
         // policies, so the build must select the fallback without trying it.
-        assert!(!super::ATOMIC_EXCHANGE_ALLOWED);
+        assert!(!crate::repo_transition::RENAMEAT2_ALLOWED);
         let (staged, root, old_binary, public) = symlinked_root_fixture("switch-android");
 
         let parked =
