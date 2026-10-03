@@ -27,6 +27,7 @@ use crate::manifest::{self, Manifest};
 use crate::method;
 use crate::platform::{self, RuntimeEnv};
 use crate::runtime::Roots;
+use crate::stale_remote;
 use crate::state;
 
 /// Exit status when no problem was found.
@@ -85,13 +86,16 @@ pub enum ProblemKind {
     PendingPost,
     /// An interrupted update or prune left recovery records behind.
     RecoveryState,
+    /// A repo or release source has not refreshed from its remote for a day
+    /// while its peers did, or its pull-failure streak spans a day.
+    StaleRemote,
     /// Config or state could not be read, so the report is incomplete.
     UnreadableState,
 }
 
 impl ProblemKind {
     /// Every kind, in token order, for documentation and contract tests.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::MissingBinlink,
         Self::DanglingBinlink,
         Self::WrongTarget,
@@ -104,6 +108,7 @@ impl ProblemKind {
         Self::DeferredUninstall,
         Self::PendingPost,
         Self::RecoveryState,
+        Self::StaleRemote,
         Self::UnreadableState,
     ];
 
@@ -123,6 +128,7 @@ impl ProblemKind {
             Self::DeferredUninstall => "deferred-uninstall",
             Self::PendingPost => "pending-post",
             Self::RecoveryState => "recovery-state",
+            Self::StaleRemote => "stale-remote",
             Self::UnreadableState => "unreadable-state",
         }
     }
@@ -149,7 +155,8 @@ impl ProblemKind {
             | Self::DeferredPost
             | Self::DeferredUninstall
             | Self::PendingPost
-            | Self::RecoveryState => Severity::Warn,
+            | Self::RecoveryState
+            | Self::StaleRemote => Severity::Warn,
         }
     }
 
@@ -158,9 +165,11 @@ impl ProblemKind {
     /// suppressed while the recorded lock owner is alive so a doctor run that
     /// races cron does not report healthy work in progress.
     const fn transient(self) -> bool {
+        // A running update stamps sources one by one; until it finishes,
+        // those not yet reached look stale next to those already done.
         matches!(
             self,
-            Self::PendingPost | Self::RecoveryState | Self::ArchiveBackup
+            Self::PendingPost | Self::RecoveryState | Self::ArchiveBackup | Self::StaleRemote
         )
     }
 }
@@ -264,6 +273,7 @@ pub fn check(roots: &Roots, env: &RuntimeEnv, pkg_mgr: &str) -> Report {
 
     scan.check_deferrals();
     scan.check_recovery();
+    scan.check_stale_remotes(&entries, &manifest);
     scan.finish()
 }
 
@@ -746,6 +756,47 @@ impl<'a> Scan<'a> {
                 ),
                 Err(error) => self.unreadable(None, &dir, error),
             }
+        }
+    }
+
+    /// Reports repo and release sources stuck behind their remote. The
+    /// update that fails to refresh them only warns once per run and
+    /// forgets; this is the durable signal.
+    fn check_stale_remotes(&mut self, entries: &[Entry], manifest: &Manifest) {
+        let candidates = entries
+            .iter()
+            .filter(|entry| manifest.get(&entry.name).is_some())
+            .filter_map(|entry| {
+                let source = match dep_links::concrete_method(&entry.method, &entry.name, manifest)
+                    .as_str()
+                {
+                    method::GITHUB_REPO => stale_remote::Source::Repo,
+                    method::GITHUB_RELEASE => stale_remote::Source::Release,
+                    _ => return None,
+                };
+                let root = self.roots.install_dir.join(&entry.name);
+                // A repo root that is a symlink is a development clone.
+                let subject = source == stale_remote::Source::Release
+                    || !fs::symlink_metadata(&root).is_ok_and(|meta| meta.file_type().is_symlink());
+                Some(stale_remote::Candidate {
+                    name: entry.name.clone(),
+                    source,
+                    root,
+                    subject,
+                })
+            })
+            .collect::<Vec<_>>();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let state_dir = self.roots.state_dir.clone();
+        for stale in stale_remote::find(&state_dir, &candidates, now, crate::cli::remote_ttl()) {
+            self.push(
+                ProblemKind::StaleRemote,
+                Some(&stale.name),
+                Some(&stale.root),
+                stale.detail,
+            );
         }
     }
 

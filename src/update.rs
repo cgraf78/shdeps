@@ -11155,7 +11155,7 @@ version() { printf 'saw-pkg\n'; }
                 ],
                 "origin/main\n",
             )
-            .with_failure(
+            .with_failure_stderr(
                 "git",
                 [
                     "-C",
@@ -11164,6 +11164,7 @@ version() { printf 'saw-pkg\n'; }
                     "--ff-only",
                     "--quiet",
                 ],
+                "hint: Diverging branches can't be fast-forwarded\nfatal: Not possible to fast-forward, aborting.\n",
             )
             .with_success(
                 "git",
@@ -11192,7 +11193,7 @@ version() { printf 'saw-pkg\n'; }
         assert_eq!(summary.items[0].reason, super::ItemReason::RepoPullFailed);
         assert_eq!(
             summary.items[0].detail,
-            "pull failed (no fast-forward; local clone)"
+            "pull failed (Not possible to fast-forward, aborting; local clone)"
         );
         assert_eq!(fs::read_link(&install_link).unwrap(), local_clone);
     }
@@ -11633,17 +11634,7 @@ version() { printf 'saw-pkg\n'; }
                 ],
             )
             .with_success("git", head_args, "old-head\n")
-            .with_success(
-                "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "pull",
-                    "--ff-only",
-                    "--quiet",
-                ],
-                "",
-            )
+            .with_refresh(&install_dir)
             .with_success("git", head_args, "new-head\n");
         let advanced = run(
             &[parse_entry("private/tool|github:repo|tool|-|-", None)],
@@ -13923,54 +13914,51 @@ version() { printf 'saw-pkg\n'; }
     /// practice for shdeps' test inventory.
     static STRICT_LEFTOVERS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A managed `owner/tool` checkout with a working command and a stale
+    /// TTL, plus the manifest row that routes it to the existing-clone path.
+    fn managed_checkout(fixture: &Fixture, name: &str) -> (PathBuf, manifest::Manifest) {
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let install_dir = fixture.roots.install_dir.join(name);
+        fs::create_dir_all(install_dir.join(".git")).unwrap();
+        write_executable(&install_dir.join("bin/tool"));
+        let installed = record_repo_manifest(&manifest_path, name, "tool", &install_dir);
+        (install_dir, installed)
+    }
+
+    fn git_key(install_dir: &Path, args: &[&str]) -> String {
+        let dir = install_dir.to_str().unwrap();
+        key("git", ["-C", dir].iter().chain(args))
+    }
+
     #[test]
     fn update_github_repo_existing_clone_pull_failure_reports_dirty_tree_cause() {
-        // When `git pull` fails on a managed clone, the user-visible
-        // detail must tell the operator WHY: dirty working tree vs
-        // network/fast-forward problem. The pre-fix code lumped both
-        // into the opaque "update failed", which gave no signal that a
-        // local edit had diverged the managed clone.
+        // The fetch worked but local edits block the fast-forward: a
+        // user-recoverable case the detail must name.
         let fixture = Fixture::new("repo-pull-dirty");
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
-        let install_dir = fixture.roots.install_dir.join("owner/tool");
-        fs::create_dir_all(install_dir.join(".git")).unwrap();
-        write_executable(&install_dir.join("bin/tool"));
-        let installed = record_repo_manifest(&manifest_path, "owner/tool", "tool", &install_dir);
+        let (install_dir, installed) = managed_checkout(&fixture, "owner/tool");
+        let dir = install_dir.to_str().unwrap();
         let runner = FakeRunner::default()
-            // No SSH retry: pretend origin has no GitHub fallback.
-            .with_failure(
+            // No transport retry: pretend origin has no GitHub fallback.
+            .with_failure("git", ["-C", dir, "remote", "get-url", "origin"])
+            .with_success("git", ["-C", dir, "rev-parse", "HEAD"], "head\n")
+            .with_success("git", ["-C", dir, "fetch", "--quiet"], "")
+            .with_failure_stderr(
                 "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "remote",
-                    "get-url",
-                    "origin",
-                ],
+                ["-C", dir, "merge", "--ff-only", "--quiet", "@{upstream}"],
+                "error: Your local changes to the following files would be overwritten by merge:\n",
             )
             .with_success(
                 "git",
-                ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"],
-                "head\n",
+                ["-C", dir, "rev-list", "--count", "@{upstream}..HEAD"],
+                "0\n",
             )
-            .with_failure(
-                "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "pull",
-                    "--ff-only",
-                    "--quiet",
-                ],
-            )
-            // After the pull failure, `git status --porcelain` returns
-            // non-empty → dirty working tree branch.
             .with_success(
                 "git",
                 [
                     "-C",
-                    install_dir.to_str().unwrap(),
+                    dir,
                     "status",
                     "--porcelain",
                     "--untracked-files=normal",
@@ -13994,54 +13982,90 @@ version() { printf 'saw-pkg\n'; }
     }
 
     #[test]
-    fn update_github_repo_existing_clone_pull_failure_reports_fast_forward_cause() {
-        // Clean tree but `git pull --ff-only` still fails — this is the
-        // network outage / non-FF case. The detail must distinguish it
-        // from the dirty-tree case so operators retry vs investigate.
-        let fixture = Fixture::new("repo-pull-clean");
+    fn update_github_repo_existing_clone_fetch_failure_reports_git_cause() {
+        // A clean checkout whose fetch failed used to read "no fast-forward".
+        // The cause is now Git's own first line, no status or merge runs, and
+        // the failure is persisted for `shdeps health`.
+        let fixture = Fixture::new("repo-pull-fetch");
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
-        let install_dir = fixture.roots.install_dir.join("owner/tool");
-        fs::create_dir_all(install_dir.join(".git")).unwrap();
-        write_executable(&install_dir.join("bin/tool"));
-        let installed = record_repo_manifest(&manifest_path, "owner/tool", "tool", &install_dir);
+        let (install_dir, installed) = managed_checkout(&fixture, "owner/tool");
+        let dir = install_dir.to_str().unwrap();
         let runner = FakeRunner::default()
-            .with_failure(
+            .with_failure("git", ["-C", dir, "remote", "get-url", "origin"])
+            .with_success("git", ["-C", dir, "rev-parse", "HEAD"], "head\n")
+            .with_failure_stderr(
                 "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "remote",
-                    "get-url",
-                    "origin",
-                ],
+                ["-C", dir, "fetch", "--quiet"],
+                "fatal: unable to access 'https://github.com/owner/tool/': Could not resolve host: github.com\n",
+            );
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                now: 1_700_000_000,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert_eq!(summary.items[0].reason, ItemReason::RepoPullFailed);
+        assert_eq!(
+            summary.items[0].detail,
+            "pull failed (fetch failed: unable to access 'https://github.com/owner/tool/': Could not resolve host: github.com)"
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("merge") || call.contains("status")),
+            "a failed fetch must not be reclassified by merge or status"
+        );
+        assert_eq!(
+            fs::read_to_string(crate::stale_remote::record_path(
+                &fixture.roots.state_dir,
+                "owner/tool"
+            ))
+            .unwrap(),
+            "since=1700000000\nlast=1700000000\nfailures=1\nreason=fetch\ndetail=unable to access 'https://github.com/owner/tool/': Could not resolve host: github.com\n"
+        );
+    }
+
+    #[test]
+    fn update_github_repo_existing_clone_unclassified_merge_failure_quotes_git() {
+        let fixture = Fixture::new("repo-pull-merge");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let (install_dir, installed) = managed_checkout(&fixture, "owner/tool");
+        let dir = install_dir.to_str().unwrap();
+        let runner = FakeRunner::default()
+            .with_failure("git", ["-C", dir, "remote", "get-url", "origin"])
+            .with_success("git", ["-C", dir, "rev-parse", "HEAD"], "head\n")
+            .with_success("git", ["-C", dir, "fetch", "--quiet"], "")
+            .with_failure_stderr(
+                "git",
+                ["-C", dir, "merge", "--ff-only", "--quiet", "@{upstream}"],
+                "fatal: no upstream configured for branch 'main'\n",
             )
             .with_success(
                 "git",
-                ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"],
-                "head\n",
-            )
-            .with_failure(
-                "git",
                 [
                     "-C",
-                    install_dir.to_str().unwrap(),
-                    "pull",
-                    "--ff-only",
-                    "--quiet",
-                ],
-            )
-            // After the pull failure, status returns empty → clean tree.
-            .with_success(
-                "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
+                    dir,
                     "status",
                     "--porcelain",
                     "--untracked-files=normal",
                 ],
                 "",
+            )
+            .with_success(
+                "git",
+                ["-C", dir, "rev-list", "--count", "@{upstream}..HEAD"],
+                "0\n",
             );
 
         let summary = run(
@@ -14052,85 +14076,49 @@ version() { printf 'saw-pkg\n'; }
         )
         .unwrap();
 
-        assert!(!summary.has_errors());
-        assert!(!summary.items[0].changed);
-        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
-        assert_eq!(summary.items[0].reason, ItemReason::RepoPullFailed);
-        assert_eq!(summary.items[0].detail, "pull failed (no fast-forward)");
+        assert_eq!(
+            summary.items[0].detail,
+            "pull failed (fast-forward failed: no upstream configured for branch 'main')"
+        );
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("set-url\0origin")),
+            "a merge failure is not a transport problem and must not touch origin"
+        );
     }
 
     #[test]
-    fn update_github_repo_existing_clone_retries_pull_with_ssh_origin() {
+    fn update_github_repo_existing_clone_retries_fetch_with_ssh_origin() {
+        // A repository that turned private: HTTPS fails, SSH works, so the
+        // SSH origin is kept for the next run.
         let fixture = Fixture::new("repo-pull-fallback");
         fixture.write_lib();
         let manifest_path = manifest::path(&fixture.roots.state_dir);
-        let install_dir = fixture.roots.install_dir.join("private/tool");
-        fs::create_dir_all(install_dir.join(".git")).unwrap();
-        write_executable(&install_dir.join("bin/tool"));
-        let installed = record_repo_manifest(&manifest_path, "private/tool", "tool", &install_dir);
+        let (install_dir, installed) = managed_checkout(&fixture, "private/tool");
+        let dir = install_dir.to_str().unwrap();
+        let ssh = "git@github.com:private/tool.git";
         let runner = FakeRunner::default()
             .with_success(
                 "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "remote",
-                    "get-url",
-                    "origin",
-                ],
+                ["-C", dir, "remote", "get-url", "origin"],
                 "https://github.com/private/tool.git\n",
             )
             .with_success(
                 "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "remote",
-                    "set-url",
-                    "--push",
-                    "origin",
-                    "git@github.com:private/tool.git",
-                ],
+                ["-C", dir, "remote", "set-url", "--push", "origin", ssh],
                 "",
             )
             .with_success(
                 "git",
-                ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"],
-                "old-head\n",
+                ["-C", dir, "config", "--get", "remote.origin.url"],
+                "https://github.com/private/tool.git\n",
             )
-            .with_failure(
-                "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "pull",
-                    "--ff-only",
-                    "--quiet",
-                ],
-            )
-            .with_success(
-                "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "remote",
-                    "set-url",
-                    "origin",
-                    "git@github.com:private/tool.git",
-                ],
-                "",
-            )
-            .with_success(
-                "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "pull",
-                    "--ff-only",
-                    "--quiet",
-                ],
-                "",
-            );
+            .with_success("git", ["-C", dir, "rev-parse", "HEAD"], "old-head\n")
+            .with_failure("git", ["-C", dir, "fetch", "--quiet"])
+            .with_success("git", ["-C", dir, "remote", "set-url", "origin", ssh], "")
+            .with_refresh(&install_dir);
 
         let summary = run(
             &[parse_entry("private/tool|github:repo|tool|-|-", None)],
@@ -14146,6 +14134,194 @@ version() { printf 'saw-pkg\n'; }
         assert!(!summary.has_errors());
         assert!(summary.items[0].changed);
         assert_eq!(summary.items[0].detail, "updated");
+        let calls = runner.calls();
+        assert!(calls.contains(&git_key(
+            &install_dir,
+            &["remote", "set-url", "origin", ssh]
+        )));
+        assert!(
+            !calls.contains(&git_key(
+                &install_dir,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/private/tool.git"
+                ]
+            )),
+            "a working SSH origin must be kept"
+        );
+        assert_eq!(
+            runner.timeouts_for("git", ["-C", dir, "fetch", "--quiet"]),
+            [None, Some(Duration::from_secs(600))],
+            "the fallback fetch must be bounded so it runs off the terminal"
+        );
+    }
+
+    #[test]
+    fn update_github_repo_existing_clone_restores_https_origin_when_ssh_also_fails() {
+        // The old fallback left origin on SSH for good after one failed
+        // pull, which stranded checkouts on hosts without a GitHub SSH key.
+        let fixture = Fixture::new("repo-pull-fallback-restore");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let (install_dir, installed) = managed_checkout(&fixture, "owner/tool");
+        let dir = install_dir.to_str().unwrap();
+        let https = "https://github.com/owner/tool";
+        let ssh = "git@github.com:owner/tool.git";
+        let runner = FakeRunner::default()
+            .with_success(
+                "git",
+                ["-C", dir, "remote", "get-url", "origin"],
+                &format!("{https}\n"),
+            )
+            .with_success(
+                "git",
+                ["-C", dir, "remote", "set-url", "--push", "origin", ssh],
+                "",
+            )
+            .with_success(
+                "git",
+                ["-C", dir, "config", "--get", "remote.origin.url"],
+                &format!("{https}\n"),
+            )
+            .with_success("git", ["-C", dir, "rev-parse", "HEAD"], "head\n")
+            .with_failure_stderr(
+                "git",
+                ["-C", dir, "fetch", "--quiet"],
+                "fatal: unable to access 'https://github.com/owner/tool/': Failed to connect\n",
+            )
+            .with_failure_stderr(
+                "git",
+                ["-C", dir, "fetch", "--quiet"],
+                "git@github.com: Permission denied (publickey).\n",
+            )
+            .with_success("git", ["-C", dir, "remote", "set-url", "origin", ssh], "")
+            .with_success("git", ["-C", dir, "remote", "set-url", "origin", https], "");
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.items[0].detail,
+            "pull failed (fetch failed: unable to access 'https://github.com/owner/tool/': Failed to connect)",
+            "the configured origin's failure is the one to report"
+        );
+        let calls = runner.calls();
+        let switch = calls
+            .iter()
+            .position(|call| call == &git_key(&install_dir, &["remote", "set-url", "origin", ssh]))
+            .expect("the SSH transport is tried");
+        let restore = calls
+            .iter()
+            .position(|call| {
+                call == &git_key(&install_dir, &["remote", "set-url", "origin", https])
+            })
+            .expect("origin must be restored after the SSH fetch fails");
+        assert!(switch < restore);
+    }
+
+    #[test]
+    fn update_github_repo_existing_clone_heals_origin_stranded_on_ssh() {
+        // A checkout the old fallback stranded on SSH moves back to the
+        // configured HTTPS origin once SSH fails and HTTPS works.
+        let fixture = Fixture::new("repo-pull-heal");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let (install_dir, installed) = managed_checkout(&fixture, "owner/tool");
+        let dir = install_dir.to_str().unwrap();
+        let https = "https://github.com/owner/tool";
+        let ssh = "git@github.com:owner/tool.git";
+        let runner = FakeRunner::default()
+            .with_success(
+                "git",
+                ["-C", dir, "remote", "get-url", "origin"],
+                &format!("{ssh}\n"),
+            )
+            .with_success(
+                "git",
+                ["-C", dir, "config", "--get", "remote.origin.url"],
+                &format!("{ssh}\n"),
+            )
+            .with_success("git", ["-C", dir, "rev-parse", "HEAD"], "head\n")
+            .with_failure("git", ["-C", dir, "fetch", "--quiet"])
+            .with_success("git", ["-C", dir, "remote", "set-url", "origin", https], "")
+            .with_success(
+                "git",
+                ["-C", dir, "remote", "set-url", "--push", "origin", ssh],
+                "",
+            )
+            .with_refresh(&install_dir);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].status, super::ItemStatus::Current);
+        let calls = runner.calls();
+        assert!(calls.contains(&git_key(
+            &install_dir,
+            &["remote", "set-url", "origin", https]
+        )));
+        assert!(
+            !calls.contains(&git_key(
+                &install_dir,
+                &["remote", "set-url", "origin", ssh]
+            )),
+            "the HTTPS origin that just worked must be kept"
+        );
+    }
+
+    #[test]
+    fn update_github_repo_existing_clone_keeps_explicit_ssh_override() {
+        // An explicit SSH clone URL is the user's choice, not a fallback, so
+        // a failed fetch never rewrites it.
+        let fixture = Fixture::new("repo-pull-explicit-ssh")
+            .with_env_var("SHDEPS_TOOL_REPO", "git@github.com:owner/tool.git");
+        fixture.write_lib();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let (install_dir, installed) = managed_checkout(&fixture, "owner/tool");
+        let dir = install_dir.to_str().unwrap();
+        let runner = FakeRunner::default()
+            .with_success(
+                "git",
+                ["-C", dir, "remote", "get-url", "origin"],
+                "git@github.com:owner/tool.git\n",
+            )
+            .with_success(
+                "git",
+                ["-C", dir, "config", "--get", "remote.origin.url"],
+                "git@github.com:owner/tool.git\n",
+            )
+            .with_success("git", ["-C", dir, "rev-parse", "HEAD"], "head\n")
+            .with_failure("git", ["-C", dir, "fetch", "--quiet"]);
+
+        let summary = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.items[0].detail, "pull failed (fetch failed)");
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|call| call.contains("set-url\0origin")),
+            "an explicit override must not be rewritten"
+        );
     }
 
     #[test]
@@ -14173,17 +14349,7 @@ version() { printf 'saw-pkg\n'; }
                 ["-C", install_dir.to_str().unwrap(), "rev-parse", "HEAD"],
                 "head\n",
             )
-            .with_success(
-                "git",
-                [
-                    "-C",
-                    install_dir.to_str().unwrap(),
-                    "pull",
-                    "--ff-only",
-                    "--quiet",
-                ],
-                "",
-            );
+            .with_refresh(&install_dir);
 
         let summary = run(
             &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
@@ -14531,9 +14697,18 @@ version() { printf 'saw-pkg\n'; }
         }
 
         fn with_failure(
+            self,
+            program: &str,
+            args: impl IntoIterator<Item = impl AsRef<str>>,
+        ) -> Self {
+            self.with_failure_stderr(program, args, "")
+        }
+
+        fn with_failure_stderr(
             mut self,
             program: &str,
             args: impl IntoIterator<Item = impl AsRef<str>>,
+            stderr: &str,
         ) -> Self {
             self.push_output(
                 key(program, args),
@@ -14541,10 +14716,21 @@ version() { printf 'saw-pkg\n'; }
                     success: false,
                     timed_out: false,
                     stdout: String::new(),
-                    stderr: String::new(),
+                    stderr: stderr.to_owned(),
                 },
             );
             self
+        }
+
+        /// A managed checkout refresh that fetches and fast-forwards.
+        fn with_refresh(self, install_dir: &Path) -> Self {
+            let dir = install_dir.to_str().unwrap();
+            self.with_success("git", ["-C", dir, "fetch", "--quiet"], "")
+                .with_success(
+                    "git",
+                    ["-C", dir, "merge", "--ff-only", "--quiet", "@{upstream}"],
+                    "",
+                )
         }
 
         fn with_delay(mut self, delay: Duration) -> Self {
