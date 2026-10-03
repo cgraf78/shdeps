@@ -275,7 +275,9 @@ pub fn run_with_config_loader(
     // Retry committed method transitions before orphan removal, mirroring the
     // update recovery order. Prune is a commit-only caller: `Installing`
     // journals whose target still matches are deferred untouched for a
-    // same-installer update, while a removed or changed target and malformed
+    // same-installer update, a release-to-repo journal whose config resolved
+    // back to the provably untouched old release is retired (no installer or
+    // cleanup runs), and any other removed or changed target and malformed
     // state fail closed before any hook, artifact cleanup, or manifest
     // mutation below.
     // Recovery evaluates the full config, including entries filtered out on
@@ -3192,6 +3194,68 @@ mod tests {
         );
         manifest::upsert(&manifest_path, old.clone()).unwrap();
         (manifest_path, old)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_retires_abandoned_repo_transition_once_config_resolves_back() {
+        let fixture = Fixture::new("transition-moot-flip-back");
+        let (manifest_path, old) = write_old_release_provider(&fixture);
+        let old_root = fixture.roots.install_dir.join("owner/tool");
+        let public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &public).unwrap();
+        let target = parse_entry("owner/tool|github:repo|tool|-|-", None);
+        let transition = update_transition::by_name(
+            &manifest::read(&manifest_path).unwrap(),
+            std::slice::from_ref(&target),
+            &fixture.roots,
+        )
+        .unwrap()
+        .remove("owner/tool")
+        .unwrap();
+        let mut durable = update_transition::begin_durable_transition(
+            &target,
+            Some(&transition),
+            &fixture.roots,
+            &manifest_path,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        durable.mark_installing(&fixture.roots).unwrap();
+        drop(durable);
+
+        let release = parse_entry("owner/tool|github:release|tool|-|-", None);
+        let summary = run(
+            std::slice::from_ref(&release),
+            &manifest::read(&manifest_path).unwrap(),
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(summary.orphans.is_empty());
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".method-transitions-v1")
+                .exists()
+        );
+        assert!(old_root.join("bin/tool").exists());
+        assert_eq!(fs::read_link(&public).unwrap(), old_root.join("bin/tool"));
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
+        );
     }
 
     #[test]
