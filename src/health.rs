@@ -306,6 +306,8 @@ struct Scan<'a> {
     roots: &'a Roots,
     problems: Vec<Problem>,
     reported: BTreeSet<(Option<String>, ProblemKind, Option<PathBuf>)>,
+    /// Whether every config file was read, so the entry list is complete.
+    config_complete: bool,
     checked_links: BTreeSet<PathBuf>,
     canonical_dirs: BTreeMap<PathBuf, Option<PathBuf>>,
 }
@@ -316,6 +318,7 @@ impl<'a> Scan<'a> {
             roots,
             problems: Vec::new(),
             reported: BTreeSet::new(),
+            config_complete: true,
             checked_links: BTreeSet::new(),
             canonical_dirs: BTreeMap::new(),
         }
@@ -399,11 +402,13 @@ impl<'a> Scan<'a> {
             Ok(loaded) => loaded,
             Err(error) => {
                 self.unreadable(None, &conf_dir, error);
+                self.config_complete = false;
                 return Vec::new();
             }
         };
         if let Some(reason) = loaded.unreadable {
             self.unreadable(None, &conf_dir, reason);
+            self.config_complete = false;
         }
         let pkg_mgr = (!pkg_mgr.is_empty()).then_some(pkg_mgr);
         let mut seen = BTreeSet::new();
@@ -711,7 +716,10 @@ impl<'a> Scan<'a> {
         // is read (as recovery does), not this earlier snapshot, so a commit
         // racing the report cannot look unclassifiable.
         let manifest_path = manifest::path(&self.roots.state_dir);
-        match update_transition::classify_pending(&resolved, &manifest_path, self.roots, pkg) {
+        // A partial entry list would make every pending install look
+        // abandoned; `classify_pending` leaves those undetermined instead.
+        let configured = self.config_complete.then_some(resolved.as_slice());
+        match update_transition::classify_pending(configured, &manifest_path, self.roots, pkg) {
             Ok(records) => {
                 for record in records {
                     self.push_pending(
@@ -793,6 +801,10 @@ impl<'a> Scan<'a> {
     fn push_pending(&mut self, record: update_transition::PendingRecord, pending: &str) {
         let (kind, detail) = match record.verdict {
             PendingVerdict::Recoverable => (ProblemKind::RecoveryState, pending.to_owned()),
+            PendingVerdict::Undetermined => (
+                ProblemKind::RecoveryState,
+                "an interrupted install-method change is pending, but whether the next update can retry it cannot be judged until the config reads; fix the unreadable config, then run 'shdeps update'".to_owned(),
+            ),
             PendingVerdict::Blocked(reason) => (
                 ProblemKind::BlockedTransition,
                 format!("{reason}; 'shdeps update' fails until this is resolved"),

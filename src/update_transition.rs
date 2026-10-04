@@ -1215,6 +1215,9 @@ pub(crate) enum PendingVerdict {
     /// Recovery refuses it, so every update and prune fails until an operator
     /// acts; the string is the same reason recovery reports.
     Blocked(String),
+    /// Whether recovery retries or refuses it depends on configuration the
+    /// caller could not read.
+    Undetermined,
 }
 
 /// One record found by [`classify_pending`].
@@ -1233,7 +1236,11 @@ pub(crate) struct PendingRecord {
 /// taking locks, or running installers.
 ///
 /// `entries` are the active configured entries with bare `github` already
-/// resolved, as update passes them. Each record is judged against the
+/// resolved, as update passes them, or `None` when the config could not be
+/// read completely: an `Installing` record is then `Undetermined`, because
+/// against a partial entry list every one would look "no longer configured"
+/// and its fix text would delete a record the next working update retries.
+/// Each record is judged against the
 /// manifest read after the record, as recovery reads it, so a commit racing
 /// the classification cannot make a record look unclassifiable; a file that
 /// vanishes meanwhile was retired and is skipped. Valid staging temp files
@@ -1242,7 +1249,7 @@ pub(crate) struct PendingRecord {
 /// looking at any record. Only a failure to list the directory itself is
 /// returned as an error.
 pub(crate) fn classify_pending(
-    entries: &[Entry],
+    entries: Option<&[Entry]>,
     manifest_path: &Path,
     roots: &Roots,
     pkg: Option<(&str, bool)>,
@@ -1281,7 +1288,8 @@ pub(crate) fn classify_pending(
             .and_then(|rest| rest.split_once('.'))
             .map_or(stem, |(digest, _)| digest);
         entries
-            .iter()
+            .into_iter()
+            .flatten()
             .map(|entry| entry.name.as_str())
             .chain(snapshot.entries().iter().map(|row| row.name.as_str()))
             .find(|name| durable_transition_stem(name) == stem)
@@ -1368,7 +1376,7 @@ pub(crate) fn classify_pending(
 fn pending_verdict(
     record: &DurableTransitionRecord,
     path: &Path,
-    entries: &[Entry],
+    entries: Option<&[Entry]>,
     manifest: &Manifest,
     roots: &Roots,
     pkg: Option<(&str, bool)>,
@@ -1381,6 +1389,9 @@ fn pending_verdict(
     match record.phase {
         DurableTransitionPhase::Prepared if is_old => PendingVerdict::Recoverable,
         DurableTransitionPhase::Installing if is_old => {
+            let Some(entries) = entries else {
+                return PendingVerdict::Undetermined;
+            };
             match installing_disposition(record, entries, None, roots, pkg) {
                 Ok(InstallingDisposition::Retry | InstallingDisposition::Moot) => {
                     PendingVerdict::Recoverable
@@ -6289,7 +6300,7 @@ mod tests {
     ) -> PendingVerdict {
         let entries = [parse_entry(configured, Some(pkg_mgr))];
         let verdicts = classify_pending(
-            &entries,
+            Some(&entries),
             &fixture.manifest_path,
             &fixture.roots,
             Some((pkg_mgr, false)),
@@ -6420,7 +6431,7 @@ mod tests {
 
         // Moot, so recovery would retire it; the classifier must not.
         let verdicts = classify_pending(
-            &[parse_entry(RELEASE_ENTRY, Some("apt"))],
+            Some(&[parse_entry(RELEASE_ENTRY, Some("apt"))]),
             &fixture.manifest_path,
             &fixture.roots,
             Some(("apt", false)),
@@ -6526,7 +6537,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         let verdicts = classify_pending(
-            std::slice::from_ref(&entry),
+            Some(std::slice::from_ref(&entry)),
             &manifest_path,
             &roots,
             Some(("apt", false)),
@@ -6579,7 +6590,7 @@ mod tests {
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o644)).unwrap();
 
         let verdicts = classify_pending(
-            &[parse_entry(REPO_ENTRY, Some("apt"))],
+            Some(&[parse_entry(REPO_ENTRY, Some("apt"))]),
             &fixture.manifest_path,
             &fixture.roots,
             Some(("apt", false)),
@@ -6595,6 +6606,65 @@ mod tests {
         };
         let error = recover_with(&fixture, REPO_ENTRY).unwrap_err();
         assert_eq!(*reason, error.to_string());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn classify_pending_leaves_installs_undetermined_without_entries() {
+        // Recovery would refuse this record against the current config, but
+        // without a complete entry list that cannot be known.
+        let fixture = abandoned_handoff("classify-no-entries", REPO_ENTRY);
+
+        let verdicts = classify_pending(
+            None,
+            &fixture.manifest_path,
+            &fixture.roots,
+            Some(("apt", false)),
+        )
+        .unwrap();
+
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].name.as_deref(), Some("owner/tool"));
+        assert_eq!(verdicts[0].verdict, PendingVerdict::Undetermined);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn health_does_not_judge_pending_installs_without_a_readable_config() {
+        // With the config unreadable every record would look "no longer
+        // configured", and the fix text would delete a record the next
+        // working update retries.
+        let fixture = abandoned_handoff("health-config-unreadable", REPO_ENTRY);
+        fs::create_dir_all(&fixture.roots.conf_dir).unwrap();
+        fs::write(
+            fixture.roots.conf_dir.join("10-deps.conf"),
+            "owner/tool github:repo tool\n",
+        )
+        .unwrap();
+        symlink(
+            fixture.roots.conf_dir.join("missing-overlay.conf"),
+            fixture.roots.conf_dir.join("20-overlay.conf"),
+        )
+        .unwrap();
+        let env = RuntimeEnv::new("linux", "test-host").with_package_manager("apt");
+
+        let problems = crate::health::check(&fixture.roots, &env, "apt").problems;
+
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.kind == crate::health::ProblemKind::UnreadableState),
+            "{problems:?}"
+        );
+        let record = problems
+            .iter()
+            .find(|problem| problem.path.as_ref() == Some(&fixture.record))
+            .expect("the pending record is still reported");
+        assert_eq!(record.kind, crate::health::ProblemKind::RecoveryState);
+        assert_eq!(record.package.as_deref(), Some("owner/tool"));
+        assert!(record.detail.contains("config"), "{}", record.detail);
+        assert!(!record.detail.contains("remove"), "{}", record.detail);
+        assert!(fixture.record.exists());
     }
 
     #[test]

@@ -591,7 +591,10 @@ Each pending record is classified the way the next update's recovery treats
 it. Two inputs are forecasts, since health never contacts GitHub or reads hook
 state the way update does: a bare `github` entry uses the cached resolver
 answer (or the installed method), and a `custom` target whose config still
-matches reads as retryable even if its hook changed.
+matches reads as retryable even if its hook changed. When the config cannot be
+read completely (reported as `unreadable-state`), a pending install is only a
+`recovery-state` warning: whether the next update retries or refuses it cannot
+be judged.
 
 Exit status: `0` healthy, `1` problems reported, `3` the report is incomplete
 (some state could not be read, reported as `unreadable-state` alongside any
