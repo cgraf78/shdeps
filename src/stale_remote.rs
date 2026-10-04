@@ -257,10 +257,11 @@ pub struct Stale {
     pub detail: String,
 }
 
-/// Finds dependencies whose last successful remote check trails their peers
-/// by more than [`STALE_AFTER_SECS`] plus `ttl`, or whose pull-failure streak
-/// itself spans that long (which also covers a host where every source fails,
-/// so no peer is newer). Costs one small read per candidate stamp and one
+/// Finds dependencies whose last successful remote check (or, for a
+/// checkout with a pull-failure record, its first failure since then) trails
+/// their peers by more than [`STALE_AFTER_SECS`] plus `ttl`, or whose
+/// pull-failure streak itself spans that long (which also covers a host
+/// where every source fails, so no peer is newer). Costs one small read per candidate stamp and one
 /// per repo record; never touches the network.
 #[must_use]
 pub fn find(state_dir: &Path, candidates: &[Candidate], now: u64, ttl: u64) -> Vec<Stale> {
@@ -292,9 +293,14 @@ pub fn find(state_dir: &Path, candidates: &[Candidate], now: u64, ttl: u64) -> V
             .then(|| read(&record_path(state_dir, &candidate.name)))
             .flatten()
             .filter(|record| stamp.is_none_or(|success| success <= record.since));
-        let last_success = stamp.or(record.as_ref().map(|record| record.since));
-        let peer_lag = match (reference, last_success) {
-            (Some(reference), Some(success)) => reference.saturating_sub(success),
+        // With a record, the lag runs from the first failure, not the last
+        // success: between the two the checkout was not due or the host was
+        // asleep or offline, so a stamp that trails its peers by a week after
+        // one failed catch-up run is not a week of failing while they
+        // succeeded. A surviving record is never older than the stamp.
+        let failing_since = record.as_ref().map(|record| record.since).or(stamp);
+        let peer_lag = match (reference, failing_since) {
+            (Some(reference), Some(since)) => reference.saturating_sub(since),
             _ => 0,
         };
         let streak = record
@@ -347,7 +353,7 @@ fn stale_detail(candidate: &Candidate, record: Option<&Record>, lag: u64) -> Str
                 ),
             };
             format!(
-                "checkout has not refreshed for {age} ({}); {hint}",
+                "checkout has failed to refresh for {age} ({}); {hint}",
                 record.failure.cause()
             )
         }
@@ -573,15 +579,62 @@ mod tests {
     }
 
     #[test]
+    fn single_failure_after_a_long_sleep_is_not_stale() {
+        // The first run after a week asleep refreshed the peers but failed
+        // this checkout once. The week its stamp trails them is sleep, not a
+        // week of failing while they succeeded.
+        let state = crate::test_support::temp_dir("stale-remote-woke-failing");
+        stamp(&state, "peer", "release", NOW);
+        stamp(&state, "tool", "repo", NOW - 7 * DAY);
+        record_failure(
+            &state,
+            "tool",
+            &Failure::new(Reason::Fetch, "boom"),
+            NOW - 60,
+        )
+        .unwrap();
+
+        let candidates = [
+            candidate("peer", Source::Release, true),
+            candidate("tool", Source::Repo, true),
+        ];
+        assert!(find(&state, &candidates, NOW, 3600).is_empty());
+    }
+
+    #[test]
+    fn failing_since_a_long_sleep_is_stale_once_peers_succeed_for_a_day() {
+        // The same checkout still failing a day and a TTL after waking, while
+        // its peers keep refreshing, is stuck; the age counts from the first
+        // failure, not from the last success before the sleep.
+        let state = crate::test_support::temp_dir("stale-remote-woke-stuck");
+        stamp(&state, "peer", "release", NOW);
+        stamp(&state, "tool", "repo", NOW - 9 * DAY);
+        let failure = Failure::new(Reason::Fetch, "boom");
+        record_failure(&state, "tool", &failure, NOW - 2 * DAY).unwrap();
+        record_failure(&state, "tool", &failure, NOW).unwrap();
+
+        let candidates = [
+            candidate("peer", Source::Release, true),
+            candidate("tool", Source::Repo, true),
+        ];
+        let stale = find(&state, &candidates, NOW, 3600);
+
+        assert_eq!(
+            stale[0].detail,
+            "checkout has failed to refresh for 2d (fetch failed: boom); check network and GitHub access with 'git -C /share/tool fetch', then run 'shdeps update'"
+        );
+    }
+
+    #[test]
     fn record_cause_and_hint_name_the_failure() {
         let state = crate::test_support::temp_dir("stale-remote-cause");
         stamp(&state, "peer", "repo", NOW);
-        stamp(&state, "tool", "repo", NOW - 3 * DAY);
+        stamp(&state, "tool", "repo", NOW - 3 * DAY - 3600);
         record_failure(
             &state,
             "tool",
             &Failure::new(Reason::Fetch, "fatal: Could not resolve host: github.com"),
-            NOW - 3 * DAY + 3600,
+            NOW - 3 * DAY,
         )
         .unwrap();
         let candidates = [
@@ -593,7 +646,7 @@ mod tests {
 
         assert_eq!(
             stale[0].detail,
-            "checkout has not refreshed for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C /share/tool fetch', then run 'shdeps update'"
+            "checkout has failed to refresh for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C /share/tool fetch', then run 'shdeps update'"
         );
     }
 
@@ -612,7 +665,7 @@ mod tests {
 
         assert_eq!(
             stale[0].detail,
-            "checkout has not refreshed for 2d (diverged from origin); move /share/tool aside and run 'shdeps update' to clone it again"
+            "checkout has failed to refresh for 2d (diverged from origin); move /share/tool aside and run 'shdeps update' to clone it again"
         );
     }
 

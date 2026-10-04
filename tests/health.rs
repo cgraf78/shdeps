@@ -1839,13 +1839,13 @@ fn checkout_stuck_behind_its_peers_is_a_stale_remote() {
     fixture.write("state/owner/tool.release.stamp", &format!("{now}\n"));
     fixture.write(
         "state/owner/kit.repo.stamp",
-        &format!("{}\n", now - 3 * 86_400),
+        &format!("{}\n", now - 3 * 86_400 - 60),
     );
     fixture.write(
         "state/owner/kit.repo.pull-failure",
         &format!(
             "since={}\nlast={now}\nreason=fetch\ndetail=Could not resolve host: github.com\n",
-            now - 3 * 86_400 + 60
+            now - 3 * 86_400
         ),
     );
 
@@ -1860,7 +1860,7 @@ fn checkout_stuck_behind_its_peers_is_a_stale_remote() {
     assert_eq!(
         rows(&output)[0][4],
         format!(
-            "checkout has not refreshed for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C {} fetch', then run 'shdeps update'",
+            "checkout has failed to refresh for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C {} fetch', then run 'shdeps update'",
             root.display()
         )
     );

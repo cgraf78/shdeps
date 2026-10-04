@@ -570,7 +570,7 @@ otherwise each problem is one line of exactly five tab-separated fields:
 | `deferred-uninstall`     | warn     | An `uninstall()` hook needed sudo without a terminal; run `shdeps prune` from a terminal      |
 | `pending-post`           | warn     | A `post()` hook has not completed and will be retried                                        |
 | `recovery-state`         | warn     | An interrupted update or prune left recovery records the next run finishes by itself         |
-| `stale-remote`           | warn     | A `github:repo` checkout or `github:release` install has not refreshed for over a day (plus the remote TTL) while other dependencies did, or at least three consecutive recorded pull failures span that long; the detail names the cause |
+| `stale-remote`           | warn     | A `github:repo` checkout or `github:release` install has not refreshed for over a day (plus the remote TTL) while other dependencies did, or at least three consecutive recorded pull failures span that long; a checkout with a recorded pull failure counts from its first failure, so time asleep or offline before it does not count; the detail names the cause |
 | `blocked-transition`     | fail     | An interrupted method change, command handoff, checkout publication, or checkout installer transaction that recovery refuses; `shdeps update` (or that checkout's update) fails until it is resolved as the detail says |
 | `temp-tree`              | warn     | An interrupted clone or release staging tree (`<root>.tmp.<pid>`, `.<root>.tmp.<pid>`) that shdeps never removes |
 | `unreadable-state`       | fail     | Config or state could not be read, so the report is incomplete                               |
