@@ -712,6 +712,27 @@ Validation cost rules:
 - On hash mismatch: cache invalid; record which input invalidated for verbose
   diagnostics.
 
+## Unavailable Package Record
+
+Path:
+
+```text
+$SHDEPS_STATE_DIR/pkg-unavailable
+```
+
+Purpose: carry `update`'s "not available from this manager" skips to
+`shdeps health`, which must not query package managers and must not report a
+skipped package's command as missing.
+
+- Every full package scan rewrites it with one `name<TAB>package` line per
+  package skipped as unavailable, after a header naming the record version,
+  package manager, platform, Android flag, and host; it is removed when the
+  set is empty.
+- A quiet run without sudo skips before checking availability, so it carries
+  forward the previous entry for the same name and package.
+- A package-cache hit leaves it untouched (the last full scan was clean).
+- Readers ignore a record whose header does not match exactly.
+
 ## Stamp And Link State
 
 Remote TTL stamps:

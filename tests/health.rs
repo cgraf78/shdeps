@@ -95,6 +95,43 @@ impl Fixture {
         self.command(&["health"]).output().unwrap()
     }
 
+    /// Makes `apt` the detected package manager on every host. Each manager
+    /// tool logs and fails if run, so tests can prove health queried none.
+    fn fake_apt(&self) {
+        for tool in ["apt-get", "apt-cache", "dpkg", "dpkg-query"] {
+            let path = self.write(
+                &format!("fakebin/{tool}"),
+                &format!(
+                    "#!/bin/sh\necho {tool} >> '{}'\nexit 99\n",
+                    self.path("pkg-calls").display()
+                ),
+            );
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Writes the package-check cache a clean `apt` update leaves, recording
+    /// each command's PATH lookup (an empty path: proven without a command).
+    fn pkg_cache(&self, pkg_mgr: &str, commands: &[(&str, &str)]) {
+        // The runtime identity matches the fixture's test platform and host.
+        let mut content = format!(
+            "version\tshdeps-pkg-check-cache-v5\npkg_mgr\t{pkg_mgr}\n\
+             platform\tlinux\nandroid\t0\nhost\ttest-host\n"
+        );
+        for (command, path) in commands {
+            content.push_str(&format!("cmd\t{command}\t{path}\n"));
+        }
+        self.write("state/pkg-check-cache-v3", &content);
+    }
+
+    fn assert_no_pkg_calls(&self) {
+        assert!(
+            !self.path("pkg-calls").exists(),
+            "health ran a package manager: {:?}",
+            fs::read_to_string(self.path("pkg-calls"))
+        );
+    }
+
     /// A healthy archive release: marker, public link into the root, and
     /// tracked bin/extras links.
     fn healthy_release(&self, name: &str, cmd: &str) {
@@ -1106,6 +1143,357 @@ fn configured_but_not_installed_dependency_is_reported() {
             ("owner/rel", "not-installed")
         ]
     );
+}
+
+#[test]
+fn pkg_with_explicit_command_missing_from_path_is_not_installed() {
+    let fixture = Fixture::new("pkg-missing");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "ripgrep pkg shdeps-test-rg\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "ripgrep", "not-installed", Path::new("-"))]
+    );
+    let detail = &rows(&output)[0][4];
+    assert!(detail.contains("'shdeps-test-rg'"), "{detail}");
+    assert!(detail.contains("'shdeps update'"), "{detail}");
+    fixture.assert_no_pkg_calls();
+}
+
+#[test]
+fn pkg_update_found_unavailable_here_is_not_reported() {
+    // `update` skips a package this manager cannot offer and exits 0, and
+    // that one skip keeps it from writing the package-check cache. Health
+    // must agree that the host is fine, yet still catch an available
+    // package whose command is genuinely gone.
+    let fixture = Fixture::new("pkg-unavailable");
+    let log = fixture.path("pkg-calls");
+    fixture.append(
+        "conf/deps.conf",
+        "eza pkg shdeps-test-eza\ngh pkg shdeps-test-gh\n",
+    );
+    let gh = fixture.write_executable("fakebin/shdeps-test-gh");
+    fixture.write_executable("fakebin/id");
+    fs::write(fixture.path("fakebin/id"), "#!/bin/sh\necho 0\n").unwrap();
+    for (tool, body) in [
+        ("apt-get", "exit 0"),
+        // gh is installed; the batch listing (no package argument) has it.
+        (
+            "dpkg-query",
+            "for last; do :; done\n\
+             case $last in\n\
+             gh) case $2 in *Package*) printf 'install ok installed\\tgh\\t1\\n' ;; \
+             *) printf 'install ok installed\\n' ;; esac ;;\n\
+             -f=*) printf 'install ok installed\\tgh\\t1\\n' ;;\n\
+             *) exit 1 ;;\n\
+             esac",
+        ),
+        // Only gh exists in this release's archive.
+        ("apt-cache", "[ \"$1:$2\" = show:gh ]"),
+    ] {
+        fixture.write(
+            &format!("fakebin/{tool}"),
+            &format!(
+                "#!/bin/sh\necho \"{tool} $*\" >> '{}'\n{body}\n",
+                log.display()
+            ),
+        );
+        fs::set_permissions(
+            fixture.path(&format!("fakebin/{tool}")),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    let update = fixture.command(&["-q", "update"]).output().unwrap();
+    assert_exit(&update, 0);
+    assert!(
+        !fixture.path("state/pkg-check-cache-v3").exists(),
+        "an unavailable package must keep the cache unwritten"
+    );
+    let record = fs::read_to_string(fixture.path("state/pkg-unavailable")).unwrap();
+    assert!(record.ends_with("\neza\teza\n"), "{record}");
+
+    // A quiet run without sudo skips before checking availability; it must
+    // keep the verdict rather than make health flap until the next run.
+    fs::write(fixture.path("fakebin/id"), "#!/bin/sh\necho 1000\n").unwrap();
+    fixture.write("fakebin/sudo", "#!/bin/sh\nexit 1\n");
+    fs::set_permissions(
+        fixture.path("fakebin/sudo"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let quiet = fixture.command(&["-q", "update"]).output().unwrap();
+    assert_exit(&quiet, 0);
+    assert_eq!(
+        fs::read_to_string(fixture.path("state/pkg-unavailable")).unwrap(),
+        record
+    );
+    fs::remove_file(&log).unwrap();
+
+    let output = fixture.health();
+    assert_exit(&output, 0);
+
+    fs::remove_file(&gh).unwrap();
+    let output = fixture.health();
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "gh", "not-installed", Path::new("-"))]
+    );
+    fixture.assert_no_pkg_calls();
+}
+
+#[test]
+fn pkg_unavailable_record_for_another_package_does_not_suppress() {
+    // The config now names a package the last scan never checked.
+    let fixture = Fixture::new("pkg-unavailable-other");
+    fixture.fake_apt();
+    fixture.append(
+        "conf/deps.conf",
+        "eza pkg shdeps-test-eza apt:eza-new\nexa pkg shdeps-test-exa\n",
+    );
+    // `exa` still matches its record, which proves the record is read.
+    fixture.write(
+        "state/pkg-unavailable",
+        "version\tshdeps-pkg-unavailable-v1\npkg_mgr\tapt\nplatform\tlinux\n\
+         android\t0\nhost\ttest-host\neza\teza\nexa\texa\n",
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "eza", "not-installed", Path::new("-"))]
+    );
+}
+
+#[test]
+fn pkg_command_on_path_is_healthy_whoever_provides_it() {
+    // Update counts any executable on PATH as the package being present (a
+    // release binary or a hook fallback may provide it); health agrees.
+    let fixture = Fixture::new("pkg-present");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "ripgrep pkg shdeps-test-rg\n");
+    fixture.write_executable("fakebin/shdeps-test-rg");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
+    fixture.assert_no_pkg_calls();
+}
+
+#[test]
+fn pkg_command_that_is_not_executable_counts_as_missing() {
+    let fixture = Fixture::new("pkg-not-exec");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "ripgrep pkg shdeps-test-rg\n");
+    fixture.write("fakebin/shdeps-test-rg", "#!/bin/sh\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "ripgrep", "not-installed", Path::new("-"))]
+    );
+}
+
+#[test]
+fn pkg_with_default_command_is_not_guessed_missing() {
+    // A defaulted command may not exist at all: completion data, fonts, and
+    // libraries are proven by the package manager, which health never asks.
+    let fixture = Fixture::new("pkg-default-cmd");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "shdeps-test-data pkg\n");
+    fixture.append("conf/deps.conf", "shdeps-test-data2 pkg -\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
+    fixture.assert_no_pkg_calls();
+}
+
+#[test]
+fn pkg_command_the_last_clean_update_found_is_reported_when_gone() {
+    let fixture = Fixture::new("pkg-cache-found");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "shdeps-test-gh pkg\n");
+    fixture.pkg_cache("apt", &[("shdeps-test-gh", "/usr/bin/shdeps-test-gh")]);
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key(
+            "warn",
+            "shdeps-test-gh",
+            "not-installed",
+            Path::new("-")
+        )]
+    );
+    fixture.assert_no_pkg_calls();
+}
+
+#[test]
+fn pkg_the_last_clean_update_proved_without_a_command_is_not_reported() {
+    let fixture = Fixture::new("pkg-cache-commandless");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "python pkg shdeps-test-python\n");
+    fixture.pkg_cache("apt", &[("shdeps-test-python", "")]);
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
+}
+
+#[test]
+fn pkg_cache_from_another_manager_is_not_evidence() {
+    let fixture = Fixture::new("pkg-cache-other-mgr");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "shdeps-test-gh pkg\n");
+    fixture.append("conf/deps.conf", "python pkg shdeps-test-python\n");
+    fixture.pkg_cache(
+        "dnf",
+        &[
+            ("shdeps-test-gh", "/usr/bin/shdeps-test-gh"),
+            ("shdeps-test-python", ""),
+        ],
+    );
+
+    let output = fixture.health();
+
+    // Without usable evidence the defaulted command is skipped and the
+    // declared one is still checked.
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "python", "not-installed", Path::new("-"))]
+    );
+}
+
+#[test]
+fn pkg_excluded_on_this_host_is_not_reported() {
+    let fixture = Fixture::new("pkg-filtered");
+    fixture.fake_apt();
+    fixture.append(
+        "conf/deps.conf",
+        "mac-only pkg shdeps-test-mac - os:macos\n\
+         dnf-only pkg shdeps-test-dnf - mgr:dnf\n\
+         no-apt-package pkg shdeps-test-none apt:NONE\n",
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
+}
+
+#[test]
+fn pkg_manager_qualified_command_resolves_like_update() {
+    let fixture = Fixture::new("pkg-qualified");
+    fixture.fake_apt();
+    // `apt:` picks the Debian command name; an unmatched qualifier falls
+    // back to the defaulted name, which is not guessed missing.
+    fixture.append(
+        "conf/deps.conf",
+        "bat pkg apt:shdeps-test-batcat\n\
+         shdeps-test-fd pkg dnf:shdeps-test-fdfind\n",
+    );
+
+    let missing = fixture.health();
+    assert_exit(&missing, 1);
+    assert_eq!(
+        keys(&missing),
+        [key("warn", "bat", "not-installed", Path::new("-"))]
+    );
+    assert!(rows(&missing)[0][4].contains("'shdeps-test-batcat'"));
+
+    fixture.write_executable("fakebin/shdeps-test-batcat");
+    assert_exit(&fixture.health(), 0);
+}
+
+#[test]
+fn pkg_android_qualified_command_resolves_on_termux() {
+    let fixture = Fixture::new("pkg-termux");
+    fixture.fake_apt();
+    fixture.append(
+        "conf/deps.conf",
+        "fd pkg android:shdeps-test-fd,apt:shdeps-test-fdfind\n",
+    );
+    fixture.write_executable("fakebin/shdeps-test-fdfind");
+
+    let output = fixture
+        .command(&["health"])
+        .env("TERMUX_VERSION", "0.118.3")
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 1);
+    assert!(rows(&output)[0][4].contains("'shdeps-test-fd'"));
+}
+
+#[test]
+fn pkg_git_subcommand_is_not_guessed_missing() {
+    // Update also accepts `git <sub>` from Git's exec path, which only a
+    // subprocess can see.
+    let fixture = Fixture::new("pkg-git-sub");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "absorb pkg git-shdeps-test-absorb\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
+}
+
+#[test]
+fn pkg_commands_are_not_checked_without_path() {
+    let fixture = Fixture::new("pkg-no-path");
+    fixture.append("conf/deps.conf", "ripgrep pkg shdeps-test-rg\n");
+
+    for path in [None, Some("")] {
+        let mut command = fixture.command(&["health"]);
+        match path {
+            Some(path) => command.env("PATH", path),
+            None => command.env_remove("PATH"),
+        };
+        assert_exit(&command.output().unwrap(), 0);
+    }
+}
+
+#[test]
+fn pkg_commands_are_not_checked_without_a_package_manager() {
+    // Detection failed (no manager on this PATH), so filters and package
+    // names cannot be resolved the way update would resolve them.
+    let fixture = Fixture::new("pkg-no-mgr");
+    fixture.append("conf/deps.conf", "ripgrep pkg shdeps-test-rg\n");
+
+    let output = fixture
+        .command(&["health"])
+        .env("PATH", fixture.path("fakebin"))
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+}
+
+#[test]
+fn pkg_command_in_the_bin_dir_is_found_off_path() {
+    // Update puts the bin dir first on PATH, so a command a hook or another
+    // method linked there satisfies it even when the caller's PATH lacks it.
+    let fixture = Fixture::new("pkg-bin-dir");
+    fixture.fake_apt();
+    fixture.append("conf/deps.conf", "ripgrep pkg shdeps-test-rg\n");
+    fixture.write_executable("bin/shdeps-test-rg");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
 }
 
 #[test]

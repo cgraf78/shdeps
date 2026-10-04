@@ -73,7 +73,8 @@ pub enum ProblemKind {
     NotExecutable,
     /// A tracked man page or completion link dangles.
     DanglingLink,
-    /// A configured repo/release/toolchain dependency has no install.
+    /// A configured repo/release/toolchain dependency has no install, or a
+    /// `pkg` dependency's command is not on PATH.
     NotInstalled,
     /// `shdeps update` would refuse to upgrade a `github:release` root.
     InstallRootUnmanaged,
@@ -276,6 +277,7 @@ pub fn check(roots: &Roots, env: &RuntimeEnv, pkg_mgr: &str) -> Report {
         }
         scan.check_transitions(&entries, manifest, env, pkg_mgr);
     }
+    scan.check_pkg_commands(&entries, env, pkg_mgr);
     let manifest = manifest.unwrap_or_default();
 
     let mut ledger_names = entries
@@ -484,6 +486,66 @@ impl<'a> Scan<'a> {
                     link_state::path(&self.roots.state_dir, &entry.name, LinkKind::Bin)
                 };
                 self.unreadable(Some(&entry.name), &path, error);
+            }
+        }
+    }
+
+    /// Reports active `pkg` dependencies whose command is not on PATH.
+    ///
+    /// Update counts a package present when its command is in the bin dir
+    /// or on PATH, and otherwise asks the package manager, which health
+    /// must not do. A miss is therefore reported only when the command is
+    /// known to be one: the last clean package scan found it, or, with no
+    /// record, the config names it explicitly. A defaulted name may be no
+    /// command at all (completion data, fonts), and `git-*` may live in
+    /// Git's exec path. Packages update skips as unavailable are not
+    /// reported (`pkg_unavailable`).
+    fn check_pkg_commands(&mut self, entries: &[Entry], env: &RuntimeEnv, pkg_mgr: &str) {
+        use crate::process::{self, Process, Runner};
+
+        // Without a PATH every lookup misses, and without a detected
+        // manager filters and package names resolve unlike update's; either
+        // way a miss says nothing about the packages.
+        if pkg_mgr.is_empty() || std::env::var_os("PATH").is_none_or(|path| path.is_empty()) {
+            return;
+        }
+        let recorded = crate::package_cache::recorded_commands(&self.roots.state_dir, env, pkg_mgr)
+            .unwrap_or_default();
+        let unavailable = crate::pkg_unavailable::read(&self.roots.state_dir, env, pkg_mgr);
+        for entry in entries.iter().filter(|entry| entry.method == method::PKG) {
+            let package = config::resolve_override_for_runtime(
+                &entry.name,
+                &entry.aliases,
+                Some(pkg_mgr),
+                env.is_android(),
+            );
+            // Update skips, without failing, a package with a NONE override
+            // on this manager and one its last full scan found unavailable
+            // here; health must not warn about what update considers fine.
+            // Deciding before the lookup keeps commandless packages from
+            // walking every PATH entry (slow `/mnt/c` ones on WSL).
+            let known_command = recorded
+                .get(&entry.cmd)
+                .copied()
+                .unwrap_or(entry.cmd_explicit && !entry.cmd.starts_with("git-"));
+            if package == "NONE" || unavailable.get(&entry.name) == Some(&package) || !known_command
+            {
+                continue;
+            }
+            // Update runs with the bin dir first on PATH (`update_cmd`), then
+            // looks the command up exactly like this (`Runner::path`).
+            let found = process::is_executable(&self.roots.bin_dir.join(&entry.cmd))
+                || Runner::path(&Process, &entry.cmd).is_some();
+            if !found {
+                self.push(
+                    ProblemKind::NotInstalled,
+                    Some(&entry.name),
+                    None,
+                    format!(
+                        "command '{}' from package '{package}' is not on PATH; run 'shdeps update', or reinstall '{package}' if the package manager still lists it",
+                        entry.cmd
+                    ),
+                );
             }
         }
     }

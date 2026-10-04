@@ -533,10 +533,10 @@ For `pkg` deps, prune warns that manual removal is needed (system packages may b
 ### Health Checks
 
 `shdeps health` reports problems with installed dependencies for health
-dashboards such as `dot doctor`. It reads only local config and state and
-`lstat`s the paths they name: no network, hooks, package-manager queries,
-state writes, or locks, so it is safe beside a running `shdeps update` and
-takes milliseconds. It honors `-c`/`SHDEPS_CONF_DIR` and the other root
+dashboards such as `dot doctor`. It reads only local config and state,
+`lstat`s the paths they name, and looks `pkg` commands up on `PATH`: no
+network, hooks, package-manager queries, state writes, or locks, so it is
+safe beside a running `shdeps update` and takes milliseconds. It honors `-c`/`SHDEPS_CONF_DIR` and the other root
 variables like every command; global options go before the command
 (`shdeps -c DIR health`).
 
@@ -563,7 +563,7 @@ otherwise each problem is one line of exactly five tab-separated fields:
 | `wrong-target`           | warn     | A public command link resolves somewhere other than its expected target                      |
 | `not-executable`         | fail     | A public command resolves to a non-executable file                                           |
 | `dangling-link`          | warn     | A tracked man page or completion link (`<name>.links`) dangles                               |
-| `not-installed`          | warn     | A configured `github*`, `cargo`, `go`, `uv`, or `npm` dependency has no recorded install     |
+| `not-installed`          | warn     | A configured `github*`, `cargo`, `go`, `uv`, or `npm` dependency has no recorded install, or a `pkg` dependency's command is not on `PATH` (see below) |
 | `install-root-unmanaged` | fail     | `shdeps update` would refuse to upgrade a `github:release` root (symlinked, unmarked, missing behind a public link, or corrupt marker) |
 | `archive-backup`         | warn     | An interrupted archive update left a `*.shdeps-archive-backup-*` sibling                     |
 | `deferred-post`          | warn     | A `post()` hook needed sudo without a terminal; run `shdeps update` from a terminal           |
@@ -595,6 +595,22 @@ matches reads as retryable even if its hook changed. When the config cannot be
 read completely (reported as `unreadable-state`), a pending install is only a
 `recovery-state` warning: whether the next update retries or refuses it cannot
 be judged.
+
+A `pkg` dependency is checked by looking up its command in `SHDEPS_BIN_DIR`
+and on the caller's `PATH`, as `update` does first; the package manager is
+never asked. Any executable with that name counts, whichever method
+provided it. A miss is reported only when the name is known to be a
+command: the last clean package scan (the package-check cache in the state
+dir, written for the same package manager and host) found it, or, with no
+such record, the config names it explicitly in the `cmd` field. A defaulted
+`cmd` may be no command at all (completion data, fonts, libraries), and
+`git-*` commands may live in Git's exec path, so those are not guessed
+missing without a record. Entries excluded on this host by a filter or a
+`NONE` package override are skipped, as are packages the last full package
+scan found unavailable from this manager (`update` skips those without
+failing; it records them in `pkg-unavailable` in the state dir). The check is
+skipped entirely when `PATH` is empty or no package manager is detected on
+it.
 
 Exit status: `0` healthy, `1` problems reported, `3` the report is incomplete
 (some state could not be read, reported as `unreadable-state` alongside any
