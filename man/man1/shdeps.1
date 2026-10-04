@@ -83,6 +83,7 @@ Stable
 tokens:
 .BR not-executable ,
 .BR install-root-unmanaged ,
+.BR blocked-transition ,
 and
 .B unreadable-state
 (fail);
@@ -96,9 +97,13 @@ and
 .BR deferred-uninstall ,
 .BR pending-post ,
 .BR recovery-state ,
+.BR stale-remote ,
 and
-.B stale-remote
+.B temp-tree
 (warn).
+.B blocked-transition
+marks an interrupted handoff that recovery refuses, so updates fail until it
+is resolved.
 Later releases may add kinds, never columns; ignore unknown kinds.
 Exits 0 when healthy, 1 when problems are reported, and 3 when the report is
 incomplete because some state could not be read or the report could not be

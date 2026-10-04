@@ -569,18 +569,32 @@ otherwise each problem is one line of exactly five tab-separated fields:
 | `deferred-post`          | warn     | A `post()` hook needed sudo without a terminal; run `shdeps update` from a terminal           |
 | `deferred-uninstall`     | warn     | An `uninstall()` hook needed sudo without a terminal; run `shdeps prune` from a terminal      |
 | `pending-post`           | warn     | A `post()` hook has not completed and will be retried                                        |
-| `recovery-state`         | warn     | An interrupted update or prune left recovery records                                         |
+| `recovery-state`         | warn     | An interrupted update or prune left recovery records the next run finishes by itself         |
 | `stale-remote`           | warn     | A `github:repo` checkout or `github:release` install has not refreshed for over a day (plus the remote TTL) while other dependencies did, or at least three consecutive recorded pull failures span that long; the detail names the cause |
+| `blocked-transition`     | fail     | An interrupted method change, command handoff, checkout publication, or checkout installer transaction that recovery refuses; `shdeps update` (or that checkout's update) fails until it is resolved as the detail says |
+| `temp-tree`              | warn     | An interrupted clone or release staging tree (`<root>.tmp.<pid>`, `.<root>.tmp.<pid>`) that shdeps never removes |
 | `unreadable-state`       | fail     | Config or state could not be read, so the report is incomplete                               |
 
 A regular executable file at a command path (a raw release binary, or a
 launcher a client deliberately placed there) is not a problem: shdeps
-preserves such files. `pending-post`, `recovery-state`, `archive-backup`, and
-`stale-remote` are omitted while the recorded state-lock owner is still
-running, because that update or prune is creating and retiring them itself.
-`stale-remote` compares stamps with each other rather than with the clock, so
-a host that was asleep stays quiet; its threshold adds the `SHDEPS_REMOTE_TTL`
-seen by `health`, so set the same value for `health` as for `update`.
+preserves such files. `pending-post`, `recovery-state`, `archive-backup`,
+`stale-remote`, and `temp-tree` are omitted while the recorded state-lock
+owner is still running, because that update or prune is creating and retiring
+them itself. `stale-remote` compares stamps with each other rather than with
+the clock, so a host that was asleep stays quiet; its threshold adds the
+`SHDEPS_REMOTE_TTL` seen by `health`, so set the same value for `health` as
+for `update`.
+`blocked-transition` is reported even while the state-lock owner runs, because
+that update fails on it too; only a checkout journal or installer transaction whose checkout
+lock has a provably live owner is left out as work in progress.
+Each pending record is classified the way the next update's recovery treats
+it. Two inputs are forecasts, since health never contacts GitHub or reads hook
+state the way update does: a bare `github` entry uses the cached resolver
+answer (or the installed method), and a `custom` target whose config still
+matches reads as retryable even if its hook changed. When the config cannot be
+read completely (reported as `unreadable-state`), a pending install is only a
+`recovery-state` warning: whether the next update retries or refuses it cannot
+be judged.
 
 Exit status: `0` healthy, `1` problems reported, `3` the report is incomplete
 (some state could not be read, reported as `unreadable-state` alongside any

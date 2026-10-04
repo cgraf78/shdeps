@@ -29,6 +29,7 @@ use crate::platform::{self, RuntimeEnv};
 use crate::runtime::Roots;
 use crate::stale_remote;
 use crate::state;
+use crate::update_transition::{self, PendingVerdict};
 
 /// Exit status when no problem was found.
 pub const EXIT_HEALTHY: i32 = 0;
@@ -89,13 +90,18 @@ pub enum ProblemKind {
     /// A repo or release source has not refreshed from its remote for a day
     /// while its peers did, or its pull-failure streak spans a day.
     StaleRemote,
+    /// An interrupted handoff that recovery refuses, so update or prune fails
+    /// until an operator resolves it.
+    BlockedTransition,
+    /// An interrupted clone or release staging tree was left beside a root.
+    TempTree,
     /// Config or state could not be read, so the report is incomplete.
     UnreadableState,
 }
 
 impl ProblemKind {
     /// Every kind, in token order, for documentation and contract tests.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::MissingBinlink,
         Self::DanglingBinlink,
         Self::WrongTarget,
@@ -109,6 +115,8 @@ impl ProblemKind {
         Self::PendingPost,
         Self::RecoveryState,
         Self::StaleRemote,
+        Self::BlockedTransition,
+        Self::TempTree,
         Self::UnreadableState,
     ];
 
@@ -129,6 +137,8 @@ impl ProblemKind {
             Self::PendingPost => "pending-post",
             Self::RecoveryState => "recovery-state",
             Self::StaleRemote => "stale-remote",
+            Self::BlockedTransition => "blocked-transition",
+            Self::TempTree => "temp-tree",
             Self::UnreadableState => "unreadable-state",
         }
     }
@@ -143,9 +153,10 @@ impl ProblemKind {
     #[must_use]
     pub const fn severity(self) -> Severity {
         match self {
-            Self::NotExecutable | Self::InstallRootUnmanaged | Self::UnreadableState => {
-                Severity::Fail
-            }
+            Self::NotExecutable
+            | Self::InstallRootUnmanaged
+            | Self::BlockedTransition
+            | Self::UnreadableState => Severity::Fail,
             Self::MissingBinlink
             | Self::DanglingBinlink
             | Self::WrongTarget
@@ -156,20 +167,27 @@ impl ProblemKind {
             | Self::DeferredUninstall
             | Self::PendingPost
             | Self::RecoveryState
-            | Self::StaleRemote => Severity::Warn,
+            | Self::StaleRemote
+            | Self::TempTree => Severity::Warn,
         }
     }
 
     /// Kinds an in-flight update or prune creates and retires itself (an
-    /// archive swap's backup lives while the old tree is deleted). They are
-    /// suppressed while the recorded lock owner is alive so a doctor run that
-    /// races cron does not report healthy work in progress.
+    /// archive swap's backup lives while the old tree is deleted, a clone
+    /// lives in its temp tree until it is published). They are suppressed
+    /// while the recorded lock owner is alive so a doctor run that races cron
+    /// does not report healthy work in progress. A blocked transition is
+    /// never transient: the running update fails on it too.
     const fn transient(self) -> bool {
         // A running update stamps sources one by one; until it finishes,
         // those not yet reached look stale next to those already done.
         matches!(
             self,
-            Self::PendingPost | Self::RecoveryState | Self::ArchiveBackup | Self::StaleRemote
+            Self::PendingPost
+                | Self::RecoveryState
+                | Self::ArchiveBackup
+                | Self::StaleRemote
+                | Self::TempTree
         )
     }
 }
@@ -256,6 +274,7 @@ pub fn check(roots: &Roots, env: &RuntimeEnv, pkg_mgr: &str) -> Report {
         for entry in &entries {
             scan.check_entry(entry, manifest);
         }
+        scan.check_transitions(&entries, manifest, env, pkg_mgr);
     }
     let manifest = manifest.unwrap_or_default();
 
@@ -287,6 +306,8 @@ struct Scan<'a> {
     roots: &'a Roots,
     problems: Vec<Problem>,
     reported: BTreeSet<(Option<String>, ProblemKind, Option<PathBuf>)>,
+    /// Whether every config file was read, so the entry list is complete.
+    config_complete: bool,
     checked_links: BTreeSet<PathBuf>,
     canonical_dirs: BTreeMap<PathBuf, Option<PathBuf>>,
 }
@@ -297,6 +318,7 @@ impl<'a> Scan<'a> {
             roots,
             problems: Vec::new(),
             reported: BTreeSet::new(),
+            config_complete: true,
             checked_links: BTreeSet::new(),
             canonical_dirs: BTreeMap::new(),
         }
@@ -380,11 +402,13 @@ impl<'a> Scan<'a> {
             Ok(loaded) => loaded,
             Err(error) => {
                 self.unreadable(None, &conf_dir, error);
+                self.config_complete = false;
                 return Vec::new();
             }
         };
         if let Some(reason) = loaded.unreadable {
             self.unreadable(None, &conf_dir, reason);
+            self.config_complete = false;
         }
         let pkg_mgr = (!pkg_mgr.is_empty()).then_some(pkg_mgr);
         let mut seen = BTreeSet::new();
@@ -658,6 +682,217 @@ impl<'a> Scan<'a> {
         }
     }
 
+    /// Reports interrupted ownership handoffs the next update must finish:
+    /// method-transition records, public-command exchanges, and checkout
+    /// journals. Each is classified the way recovery will treat it, so a
+    /// record recovery refuses (aborting every update or that package) is a
+    /// `blocked-transition` fail naming the package and the record, while one
+    /// recovery finishes by itself stays a `recovery-state` warning.
+    fn check_transitions(
+        &mut self,
+        entries: &[Entry],
+        manifest: &Manifest,
+        env: &RuntimeEnv,
+        pkg_mgr: &str,
+    ) {
+        // Update hands recovery its entries with bare `github` resolved.
+        let resolved = entries
+            .iter()
+            .map(|entry| {
+                let mut entry = entry.clone();
+                if entry.method == method::GITHUB {
+                    entry.method = crate::github_method::offline_method(
+                        &self.roots.state_dir,
+                        &entry,
+                        manifest,
+                    )
+                    .to_owned();
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        let pkg = Some((pkg_mgr, env.is_android()));
+        // Records are classified against the manifest as it is when each one
+        // is read (as recovery does), not this earlier snapshot, so a commit
+        // racing the report cannot look unclassifiable.
+        let manifest_path = manifest::path(&self.roots.state_dir);
+        // A partial entry list would make every pending install look
+        // abandoned; `classify_pending` leaves those undetermined instead.
+        let configured = self.config_complete.then_some(resolved.as_slice());
+        match update_transition::classify_pending(configured, &manifest_path, self.roots, pkg) {
+            Ok(records) => {
+                for record in records {
+                    self.push_pending(
+                        record,
+                        "an interrupted install-method change is pending; run 'shdeps update'",
+                    );
+                }
+            }
+            Err(error) => self.unreadable(
+                None,
+                &update_transition::transition_dir(&self.roots.state_dir),
+                error,
+            ),
+        }
+
+        #[cfg(unix)]
+        {
+            // The same command set publication recovery walks.
+            let commands = resolved
+                .iter()
+                .map(|entry| entry.cmd.as_str())
+                .chain(
+                    manifest
+                        .effective_entries()
+                        .into_iter()
+                        .map(|row| row.cmd.as_str()),
+                )
+                .filter(|cmd| config::valid_cmd_basename(cmd))
+                .collect::<BTreeSet<_>>();
+            for cmd in commands {
+                let public = self.roots.bin_dir.join(cmd);
+                if let Some(mut record) =
+                    update_transition::classify_public_transition(&manifest_path, &public)
+                {
+                    // An unreadable record still belongs to whoever owns the
+                    // command.
+                    if record.name.is_none() {
+                        record.name = resolved
+                            .iter()
+                            .map(|entry| (entry.name.as_str(), entry.cmd.as_str()))
+                            .chain(
+                                manifest
+                                    .effective_entries()
+                                    .into_iter()
+                                    .map(|row| (row.name.as_str(), row.cmd.as_str())),
+                            )
+                            .find(|(_, owned)| *owned == cmd)
+                            .map(|(name, _)| name.to_owned());
+                    }
+                    self.push_pending(
+                        record,
+                        "an interrupted command handoff is pending; run 'shdeps update'",
+                    );
+                }
+            }
+
+            // Every root a repo install, release install, or prune of either
+            // may publish, including orphans and the old side of a handoff.
+            let roots = resolved
+                .iter()
+                .filter(|entry| method::is_concrete_github(&entry.method))
+                .map(|entry| entry.name.as_str())
+                .chain(
+                    manifest
+                        .effective_entries()
+                        .into_iter()
+                        .filter(|row| method::is_concrete_github(&row.method))
+                        .map(|row| row.name.as_str()),
+                )
+                .collect::<BTreeSet<_>>();
+            for name in roots {
+                self.check_checkout(name);
+            }
+        }
+    }
+
+    /// Reports one classified handoff record; `pending` is the warning for a
+    /// record the next update finishes by itself.
+    fn push_pending(&mut self, record: update_transition::PendingRecord, pending: &str) {
+        let (kind, detail) = match record.verdict {
+            PendingVerdict::Recoverable => (ProblemKind::RecoveryState, pending.to_owned()),
+            PendingVerdict::Undetermined => (
+                ProblemKind::RecoveryState,
+                "an interrupted install-method change is pending, but whether the next update can retry it cannot be judged until the config reads; fix the unreadable config, then run 'shdeps update'".to_owned(),
+            ),
+            PendingVerdict::Blocked(reason) => (
+                ProblemKind::BlockedTransition,
+                format!("{reason}; 'shdeps update' fails until this is resolved"),
+            ),
+        };
+        self.push(kind, record.name.as_deref(), Some(&record.path), detail);
+    }
+
+    /// Reports the checkout journals and temp trees beside one managed root.
+    ///
+    /// Repo recovery fails closed on the checkout installer's transaction and
+    /// on a Shdeps journal it cannot finish (a recorded collision, a
+    /// malformed record, a foreign object at the root), so those block that
+    /// package; any other journal is rolled forward or back by the next
+    /// update. Both are in flight, not stuck, while the checkout lock has a
+    /// live owner. Temp trees never block on their own, but nothing removes
+    /// them, so they are reported for cleanup.
+    #[cfg(unix)]
+    fn check_checkout(&mut self, name: &str) {
+        let logical = self
+            .roots
+            .install_dir
+            .join(config::canonical_name(name, method::GITHUB_REPO));
+        // The checkout lock physically resolves the root's parent, and each
+        // journal records that exact spelling. Without a parent directory
+        // there is nothing beside the root to inspect.
+        let Some(root) = self.physical(&logical) else {
+            return;
+        };
+        let state = match crate::repo_transition::pending_state(&root) {
+            Ok(state) => state,
+            Err(error) => {
+                self.unreadable(Some(name), &root, error);
+                return;
+            }
+        };
+        // The installer keeps its transaction for its whole run, and Shdeps
+        // moves a journaled checkout, under the shared checkout lock (not
+        // Shdeps' state lock), so a live lock owner means work in progress.
+        // Only probed when something is pending.
+        let in_flight = (state.installer_transaction.is_some()
+            || matches!(
+                state.journal,
+                Some(crate::repo_transition::JournalState::Blocked(..))
+            ))
+            && crate::checkout_lock::held_by_live_owner(&root);
+        if let Some(transaction) = state.installer_transaction.as_ref().filter(|_| !in_flight) {
+            self.push(
+                ProblemKind::BlockedTransition,
+                Some(name),
+                Some(transaction),
+                "checkout installer transaction is still present; if no checkout installer is running, rerun it before Shdeps; update and prune of this checkout refuse until then".to_owned(),
+            );
+        }
+        match &state.journal {
+            Some(crate::repo_transition::JournalState::Blocked(..)) if in_flight => {}
+            Some(crate::repo_transition::JournalState::Blocked(journal, reason)) => self.push(
+                ProblemKind::BlockedTransition,
+                Some(name),
+                Some(journal),
+                format!(
+                    "{reason} (checkout {}); 'shdeps update' and 'shdeps prune' of this checkout fail until it is resolved",
+                    root.display()
+                ),
+            ),
+            Some(crate::repo_transition::JournalState::Pending(journal)) => self.push(
+                ProblemKind::RecoveryState,
+                Some(name),
+                Some(journal),
+                "an interrupted repository publication is pending; run 'shdeps update'".to_owned(),
+            ),
+            None => {}
+        }
+        // A journal may name a `<root>.tmp.<pid>` clone as the tree recovery
+        // will publish; advising its deletion would lose the publication.
+        if state.journal.is_some() {
+            return;
+        }
+        for tree in temp_trees(&root) {
+            self.push(
+                ProblemKind::TempTree,
+                Some(name),
+                Some(&tree),
+                "an interrupted install left this temporary tree, which shdeps never removes; delete it if no shdeps update is running".to_owned(),
+            );
+        }
+    }
+
     /// Reports dangling tracked links and interrupted ledger reconciliations.
     fn check_ledgers(&mut self, name: &str) {
         for kind in [LinkKind::Bin, LinkKind::Extras] {
@@ -729,11 +964,9 @@ impl<'a> Scan<'a> {
             Err(error) => self.unreadable(None, &hooks::pending_posts_dir(&state_dir), error),
         }
 
+        // Method-transition records are classified one by one in
+        // `check_transitions`.
         for (dir, detail) in [
-            (
-                crate::update_transition::transition_dir(&state_dir),
-                "an interrupted install-method change is pending; run 'shdeps update'",
-            ),
             (
                 crate::repo_transition::fresh_index_dir(&state_dir),
                 "an interrupted first repo install is pending; run 'shdeps update'",
@@ -832,6 +1065,37 @@ fn executable(metadata: &fs::Metadata) -> bool {
     {
         metadata.is_file()
     }
+}
+
+/// Interrupted clones (`<root>.tmp.<pid>`) and release staging trees
+/// (`.<root>.tmp.<pid>`) beside `root`. Atomic-write temps carry a nonce after
+/// the pid and are not matched.
+#[cfg(unix)]
+fn temp_trees(root: &Path) -> Vec<PathBuf> {
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name().and_then(|n| n.to_str()))
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let clone = format!("{name}.tmp.");
+    let staging = format!(".{name}.tmp.");
+    let mut trees = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|file| {
+                file.strip_prefix(&clone)
+                    .or_else(|| file.strip_prefix(&staging))
+                    .is_some_and(|pid| {
+                        !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    trees.sort();
+    trees
 }
 
 fn exists(path: &Path) -> bool {
