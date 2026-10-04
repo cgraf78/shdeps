@@ -7397,7 +7397,11 @@ fn non_tty_external_exit_130_remains_a_regular_failure() {
     fixture.write("conf/deps.conf", "tool cargo\n");
     fixture.write_executable("fakebin/cargo", "#!/bin/sh\nexit 130\n");
 
-    let output = run(&mut fixture.command(["update"]));
+    // The premise is "no controlling terminal". Inheriting the harness's
+    // terminal (a developer's shell or tmux pane) would let Shdeps hand that
+    // terminal to the child and classify its status as a terminal
+    // cancellation, so the outcome would depend on how the suite was run.
+    let output = run_without_terminal(&mut fixture.command(["update"]));
 
     assert_eq!(
         output.status.code(),
@@ -7417,7 +7421,9 @@ fn assert_non_tty_external_signal_is_regular_failure(signal: &str) {
         ),
     );
 
-    let output = run(&mut fixture.command(["update"]));
+    // See `non_tty_external_exit_130_remains_a_regular_failure`: never
+    // inherit the harness's controlling terminal.
+    let output = run_without_terminal(&mut fixture.command(["update"]));
 
     assert_eq!(
         output.status.code(),
