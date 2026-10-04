@@ -1263,6 +1263,46 @@ mod tests {
         );
     }
 
+    // A descendant without a readable boundary marker still holds the
+    // lifetime lease and stays in the leader's process group: its environment
+    // may read empty (permanently via `env -i`; transiently for any
+    // descendant inside `execve`) or simply lack the marker. Leader exit must
+    // attribute it through that topology and kill it at the deadline instead
+    // of failing the completion proof with an open-lease error.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn current_session_timed_run_kills_markerless_group_members() {
+        for (environment, published) in [("", ""), ("KEEP=1", "KEEP=1 ")] {
+            // The leader exits only once the grandchild's final environment
+            // is published, so the leader-exit observation always meets the
+            // markerless row.
+            let script = r#"env -i $1 sleep 30 & pid=$!
+while [ "$(tr '\000' ' ' < "/proc/$pid/environ")" != "$2" ]; do :; done
+printf %s "$pid"; exit 1"#;
+            let output = super::run_in_current_session(
+                "sh",
+                &["-c", script, "sh", environment, published],
+                Duration::from_secs(1),
+            )
+            .unwrap_or_else(|error| panic!("environment {environment:?}: {error}"));
+
+            assert!(output.timed_out, "environment {environment:?}: {output:?}");
+            assert!(!output.success);
+            let grandchild = output.stdout.parse::<u32>().unwrap();
+            let state = std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .and_then(|(_, rest)| rest.chars().next())
+                });
+            assert!(
+                matches!(state, None | Some('Z' | 'X')),
+                "environment {environment:?}: the markerless grandchild must not survive \
+                 cleanup: state={state:?}"
+            );
+        }
+    }
+
     #[test]
     fn timed_run_reports_fast_success_with_captured_output() {
         let output = super::run(

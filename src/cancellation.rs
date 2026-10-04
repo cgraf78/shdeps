@@ -4278,7 +4278,29 @@ fn linux_boundary_marker_snapshot(
         entries,
         deadline,
         linux_process_info_checked,
-        process_has_boundary_marker_checked,
+        // One buffer serves the whole scan; most environments fit the
+        // initial size, so each row costs one open and one pread.
+        {
+            let mut environment = Vec::new();
+            move |pid, token| process_marker_scan_checked(pid, token, &mut environment)
+        },
+        {
+            // One syscall answers "could this row be in the spawn topology?"
+            // without the stat read a full inspection costs per row.
+            let isolation = boundary.isolation;
+            move |pid| {
+                let pid = pid as i32;
+                // SAFETY: getpgid/getsid observe a process identity without
+                // pointers.
+                let id = match isolation {
+                    Isolation::DetachedSession => unsafe { libc::getsid(pid) },
+                    Isolation::ExactChild | Isolation::ParentSession => unsafe {
+                        libc::getpgid(pid)
+                    },
+                };
+                u32::try_from(id).ok()
+            }
+        },
     )
 }
 
@@ -4288,7 +4310,8 @@ fn collect_linux_boundary_marker_snapshot_with(
     entries: impl IntoIterator<Item = std::io::Result<Option<u32>>>,
     deadline: Instant,
     mut inspect: impl FnMut(u32) -> std::io::Result<Option<ProcessInfo>>,
-    mut has_marker: impl FnMut(u32, &str) -> std::io::Result<Option<bool>>,
+    mut scan_marker: impl FnMut(u32, &str) -> std::io::Result<Option<MarkerScan>>,
+    mut topology_id: impl FnMut(u32) -> Option<u32>,
 ) -> std::io::Result<Vec<ProcessInfo>> {
     let token = boundary
         .marker
@@ -4311,8 +4334,8 @@ fn collect_linux_boundary_marker_snapshot_with(
         let process = if retained {
             inspect(pid)?
         } else {
-            match has_marker(pid, token) {
-                Ok(Some(true)) => {
+            match scan_marker(pid, token) {
+                Ok(Some(MarkerScan::Matches)) => {
                     // The marker and stat files are separate procfs lookups.
                     // Bracket a second marker read with matching process
                     // identities so PID reuse cannot splice an old marker
@@ -4320,17 +4343,63 @@ fn collect_linux_boundary_marker_snapshot_with(
                     let Some(before) = inspect(pid)? else {
                         continue;
                     };
-                    if has_marker(pid, token)? != Some(true) {
-                        None
-                    } else {
-                        let after = inspect(pid)?;
-                        match after {
-                            Some(after) if after.identity == before.identity => Some(after),
-                            _ => None,
+                    // An exec that starts between the reads leaves the
+                    // environment empty until the new image is built, or
+                    // unreadable when the image is setuid. The first marker
+                    // may still belong to an older PID generation, so only
+                    // spawn topology can vouch for such a row.
+                    let second = match scan_marker(pid, token) {
+                        Ok(Some(MarkerScan::Matches)) => Some(true),
+                        Ok(Some(MarkerScan::Empty)) => Some(false),
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            Some(false)
                         }
+                        Ok(Some(MarkerScan::Absent) | None) => None,
+                        Err(error) => return Err(error),
+                    };
+                    match second {
+                        Some(marked) => match inspect(pid)? {
+                            Some(after)
+                                if after.identity == before.identity
+                                    && (marked
+                                        || boundary.contains_topology(&after)
+                                        || boundary.members.contains_key(&after.ppid)) =>
+                            {
+                                Some(after)
+                            }
+                            _ => None,
+                        },
+                        None => None,
                     }
                 }
-                Ok(Some(false) | None) => None,
+                // A descendant can drop the marker from its environment
+                // (`env -u`, `env -i VAR=...`) while staying in the spawn
+                // topology, where the full snapshot would attribute it. A
+                // single getpgid/getsid probe finds such rows; only a match
+                // pays for the stat read that confirms it.
+                Ok(Some(MarkerScan::Absent)) => {
+                    if boundary.leader_retained && topology_id(pid) == Some(boundary.leader) {
+                        inspect(pid)?.filter(|process| boundary.contains_topology(process))
+                    } else {
+                        None
+                    }
+                }
+                Ok(None) => None,
+                // An empty environment cannot prove ownership either way
+                // (see `MarkerScan::Empty`). Dropping a mid-`execve`
+                // descendant here leaves only the still-open lifetime lease
+                // as evidence, and the completion proof then fails closed
+                // although ordinary spawn topology attributes the process.
+                // Inspect its public topology instead, like a denied marker
+                // read but without the adoptee retry: a process that
+                // deliberately exec'd with an empty environment must not
+                // stall unrelated boundaries until their deadline.
+                // Registered adoptees need no case here: their identities
+                // are retained members and take the branch above.
+                Ok(Some(MarkerScan::Empty)) => inspect(pid)?.filter(|process| {
+                    boundary.contains_topology(process)
+                        || boundary.members.contains_key(&process.ppid)
+                }),
                 // Android hides other apps' environ files behind permission
                 // errors, and the stat read is denied the same way; those
                 // entries cannot be owned descendants or adoptees, so skip
@@ -4401,9 +4470,12 @@ fn collect_linux_boundary_marker_snapshot_with(
             if current.identity != expected.identity || !current.live {
                 continue;
             }
-            match has_marker(current.pid, token) {
-                Ok(Some(true)) => processes.push(current),
-                Ok(Some(false) | None) => {}
+            match scan_marker(current.pid, token) {
+                Ok(Some(MarkerScan::Matches)) => processes.push(current),
+                // An exec that began after the denial reads empty until the
+                // new image is built; keep retrying it like the denial.
+                Ok(Some(MarkerScan::Empty)) => still_unresolved.push(current),
+                Ok(Some(MarkerScan::Absent) | None) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                     still_unresolved.push(current);
                 }
@@ -5377,11 +5449,52 @@ fn process_group(pid: u32) -> Option<u32> {
     u32::try_from(unsafe { libc::getpgid(pid as i32) }).ok()
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 fn process_has_boundary_marker_checked(pid: u32, token: &str) -> std::io::Result<Option<bool>> {
     process_boundary_marker_disposition_checked(pid, token).map(|disposition| {
         disposition.map(|disposition| disposition == BoundaryMarkerDisposition::Matches)
     })
+}
+
+/// One `/proc/PID/environ` observation made by a boundary marker scan.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkerScan {
+    /// The environment carries this boundary's token.
+    Matches,
+    /// A non-empty environment without this boundary's token.
+    Absent,
+    /// The environment read back empty. Kernel threads and zombies have no
+    /// address space (some kernels deny these reads instead); a process
+    /// inside `execve` reports an empty range from `setup_new_exec` until
+    /// the new stack is published, and a descriptor opened before the exec
+    /// reads empty once the old address space is released; and a process
+    /// may exec with no environment at all. None of these prove or
+    /// disprove ownership.
+    Empty,
+}
+
+/// Classifies `pid`'s environment for a marker scan; `None` means the
+/// process vanished.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_marker_scan_checked(
+    pid: u32,
+    token: &str,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<Option<MarkerScan>> {
+    match read_process_environment(pid, buffer) {
+        Ok([]) => Ok(Some(MarkerScan::Empty)),
+        Ok(environment) => Ok(Some(
+            if boundary_marker_disposition(environment, token) == BoundaryMarkerDisposition::Matches
+            {
+                MarkerScan::Matches
+            } else {
+                MarkerScan::Absent
+            },
+        )),
+        Err(error) if procfs_process_gone(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -5389,10 +5502,53 @@ fn process_boundary_marker_disposition_checked(
     pid: u32,
     token: &str,
 ) -> std::io::Result<Option<BoundaryMarkerDisposition>> {
-    match std::fs::read(format!("/proc/{pid}/environ")) {
-        Ok(environment) => Ok(Some(boundary_marker_disposition(&environment, token))),
+    let mut environment = Vec::new();
+    match read_process_environment(pid, &mut environment) {
+        Ok(environment) => Ok(Some(boundary_marker_disposition(environment, token))),
         Err(error) if procfs_process_gone(&error) => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// First `/proc/PID/environ` read size; typical environments fit.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ENVIRONMENT_READ_INITIAL: usize = 16 * 1024;
+/// Largest environment read, matching the Darwin `KERN_PROCARGS2` cap.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ENVIRONMENT_READ_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Reads `/proc/PID/environ` as one all-or-nothing observation.
+///
+/// procfs serves every read from the address space captured at open, and
+/// each read call pins that address space only for its own duration. Once
+/// the process execs, the old address space is gone and later reads return
+/// EOF. A buffered multi-read (`std::fs::read` probes with small reads
+/// first) can therefore return a truncated prefix that looks like a
+/// complete environment without the boundary marker. A single `pread` from
+/// offset zero copies the whole range under one reference, so it yields the
+/// complete pre-exec environment, the complete post-exec one, or nothing.
+/// A full buffer is retried from offset zero with twice the space rather
+/// than continued, so the observation stays atomic.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_process_environment(pid: u32, buffer: &mut Vec<u8>) -> std::io::Result<&[u8]> {
+    use std::os::unix::fs::FileExt as _;
+
+    let file = std::fs::File::open(format!("/proc/{pid}/environ"))?;
+    if buffer.len() < ENVIRONMENT_READ_INITIAL {
+        buffer.resize(ENVIRONMENT_READ_INITIAL, 0);
+    }
+    loop {
+        let read = loop {
+            match file.read_at(buffer, 0) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => break result?,
+            }
+        };
+        if read < buffer.len() || buffer.len() >= ENVIRONMENT_READ_LIMIT {
+            return Ok(&buffer[..read]);
+        }
+        let grown = buffer.len().saturating_mul(2).min(ENVIRONMENT_READ_LIMIT);
+        buffer.resize(grown, 0);
     }
 }
 
@@ -10265,6 +10421,7 @@ while True:
             deadline,
             |_| panic!("a partial marker scan must not inspect a process"),
             |_, _| panic!("a partial marker scan must not inspect an environment"),
+            |_| None,
         );
         assert!(
             partial.is_err(),
@@ -10280,7 +10437,8 @@ while True:
                     "injected retained-process stat failure",
                 ))
             },
-            |_, _| Ok(Some(true)),
+            |_, _| Ok(Some(super::MarkerScan::Matches)),
+            |_| None,
         );
         assert!(
             unreadable.is_err(),
@@ -10314,9 +10472,10 @@ while True:
                         "injected transient marker read denial",
                     ))
                 } else {
-                    Ok(Some(false))
+                    Ok(Some(super::MarkerScan::Absent))
                 }
             },
+            |_| None,
         )
         .unwrap();
         assert!(transient_adoptee.is_empty());
@@ -10351,6 +10510,7 @@ while True:
                     "injected persistent marker read denial",
                 ))
             },
+            |_| None,
         );
         // Linux has setuid transitions, so an unreadable adoptee marker
         // stays fail-closed there; Android skips provably foreign rows.
@@ -10386,8 +10546,13 @@ while True:
             },
             |_, _| {
                 marker_reads.set(marker_reads.get() + 1);
-                Ok(Some(marker_reads.get() == 1))
+                Ok(Some(if marker_reads.get() == 1 {
+                    super::MarkerScan::Matches
+                } else {
+                    super::MarkerScan::Absent
+                }))
             },
+            |_| None,
         )
         .unwrap();
         assert!(
@@ -10452,6 +10617,222 @@ while True:
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn scan_row(pid: u32, ppid: u32, pgid: u32) -> super::ProcessInfo {
+        super::ProcessInfo {
+            pid,
+            ppid,
+            pgid,
+            sid: pgid,
+            live: true,
+            stopped: false,
+            identity: super::ProcessIdentity {
+                pid,
+                start: Some(format!("start-{pid}")),
+            },
+        }
+    }
+
+    // A descendant inside `execve` reads an empty environment, so the marker
+    // scan cannot see its token. It must still be found through the spawn
+    // topology; otherwise the open lifetime lease it holds turns a normal
+    // leader exit into a spurious fail-closed error.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn marker_snapshot_attributes_empty_environment_rows_by_topology() {
+        let boundary = super::Boundary::new(
+            41,
+            super::Isolation::ParentSession,
+            super::BoundaryMarker::without_lifetime(Some("empty-environment-boundary".to_owned())),
+        );
+        let rows = [
+            // The zombie leader, retained by identity.
+            scan_row(41, std::process::id(), 41),
+            // A group member mid-exec.
+            scan_row(42, 41, 41),
+            // A kernel thread: no address space, foreign topology.
+            scan_row(43, 2, 0),
+            // An unrelated process that exec'd with no environment.
+            scan_row(44, 1, 44),
+        ];
+        let snapshot = super::collect_linux_boundary_marker_snapshot_with(
+            &boundary,
+            rows.iter().map(|row| Ok(Some(row.pid))),
+            Instant::now() + Duration::from_secs(1),
+            |pid| Ok(rows.iter().find(|row| row.pid == pid).cloned()),
+            |_, _| Ok(Some(super::MarkerScan::Empty)),
+            |_| None,
+        )
+        .unwrap();
+
+        let pids = snapshot.iter().map(|row| row.pid).collect::<Vec<_>>();
+        assert_eq!(
+            pids,
+            [41, 42],
+            "an empty environment must defer to spawn topology"
+        );
+    }
+
+    // A descendant that drops the marker from a non-empty environment still
+    // belongs to the spawn group. The cheap topology probe must find it, and
+    // a foreign row must cost no stat read at all.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn marker_snapshot_attributes_markerless_group_members_by_topology() {
+        let boundary = super::Boundary::new(
+            41,
+            super::Isolation::ParentSession,
+            super::BoundaryMarker::without_lifetime(Some("markerless-member-boundary".to_owned())),
+        );
+        let rows = [
+            scan_row(41, std::process::id(), 41),
+            // `env -u` or `env -i VAR=...` inside the group.
+            scan_row(42, 41, 41),
+            // A foreign process without the marker.
+            scan_row(43, 1, 43),
+        ];
+        let snapshot = super::collect_linux_boundary_marker_snapshot_with(
+            &boundary,
+            rows.iter().map(|row| Ok(Some(row.pid))),
+            Instant::now() + Duration::from_secs(1),
+            |pid| {
+                assert_ne!(pid, 43, "a foreign markerless row must not be inspected");
+                Ok(rows.iter().find(|row| row.pid == pid).cloned())
+            },
+            |_, _| Ok(Some(super::MarkerScan::Absent)),
+            |pid| rows.iter().find(|row| row.pid == pid).map(|row| row.pgid),
+        )
+        .unwrap();
+
+        let pids = snapshot.iter().map(|row| row.pid).collect::<Vec<_>>();
+        assert_eq!(
+            pids,
+            [41, 42],
+            "a markerless group member must stay attributed"
+        );
+    }
+
+    // The forked child of a shell still carries the marker until it execs.
+    // When the exec starts between the bracketing marker reads, the second
+    // read is empty, or denied for a setuid image: topology must vouch for
+    // the row, while a row outside the topology stays excluded because its
+    // first marker may predate PID reuse.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn marker_snapshot_keeps_member_that_execs_between_marker_reads() {
+        let boundary = super::Boundary::new(
+            41,
+            super::Isolation::ParentSession,
+            super::BoundaryMarker::without_lifetime(Some("bracketed-exec-boundary".to_owned())),
+        );
+        let rows = [
+            scan_row(45, 41, 41),
+            scan_row(46, 1, 46),
+            scan_row(47, 41, 41),
+            scan_row(48, 1, 48),
+        ];
+        let reads = std::cell::RefCell::new(std::collections::BTreeMap::<u32, u32>::new());
+        let snapshot = super::collect_linux_boundary_marker_snapshot_with(
+            &boundary,
+            rows.iter().map(|row| Ok(Some(row.pid))),
+            Instant::now() + Duration::from_secs(1),
+            |pid| Ok(rows.iter().find(|row| row.pid == pid).cloned()),
+            |pid, _| {
+                let mut reads = reads.borrow_mut();
+                let count = reads.entry(pid).or_default();
+                *count += 1;
+                match (*count, pid) {
+                    (1, _) => Ok(Some(super::MarkerScan::Matches)),
+                    (_, 45 | 46) => Ok(Some(super::MarkerScan::Empty)),
+                    _ => Err(std::io::ErrorKind::PermissionDenied.into()),
+                }
+            },
+            |_| None,
+        )
+        .unwrap();
+
+        let pids = snapshot.iter().map(|row| row.pid).collect::<Vec<_>>();
+        assert_eq!(
+            pids,
+            [45, 47],
+            "only spawn topology may vouch for an empty or denied re-read"
+        );
+        assert_eq!(
+            *reads.borrow(),
+            std::collections::BTreeMap::from([(45, 2), (46, 2), (47, 2), (48, 2)]),
+            "each matching row must be re-read once across identity validation"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn marker_scan_classifies_complete_environments() {
+        let token = "classified-empty-environment";
+        // The padded case sorts a large variable ahead of the marker, which
+        // pushes the marker past the first read size: the grow-and-reread
+        // path must still find it.
+        let padding = "x".repeat(3 * super::ENVIRONMENT_READ_INITIAL);
+        let cases = [
+            (None, false),
+            (Some(token), false),
+            (Some("another-boundary"), false),
+            (Some(token), true),
+        ];
+        // Register each plain child before fork, as `run_subprocess` does, so
+        // a concurrent test's cleanup proof never mistakes it for its own
+        // unmarked adoptee.
+        let spawn_guard = super::test_spawn_guard().unwrap();
+        let registration = super::test_spawn_registration();
+        let mut children = cases.map(|(marker, padded)| {
+            let mut command = Command::new("sleep");
+            command.arg("30").env_clear();
+            if padded {
+                command.env("A_PADDING", &padding);
+            }
+            if let Some(marker) = marker {
+                command.env(super::BOUNDARY_ENV, marker);
+            }
+            let child = command.spawn().unwrap();
+            let registered = super::test_child_registration(child.id());
+            (child, registered)
+        });
+        drop(registration);
+        drop(spawn_guard);
+        // `spawn` returns once exec has closed the CLOEXEC status pipe, which
+        // happens before the new stack is published, so a marked child can
+        // still read empty here. Poll each non-empty case until its
+        // environment is published; the cleared case is read once.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let classified = [0, 1, 2, 3].map(|case| {
+            let (child, _) = &children[case];
+            loop {
+                let scanned =
+                    super::process_marker_scan_checked(child.id(), token, &mut Vec::new()).unwrap();
+                if cases[case].0.is_none()
+                    || scanned != Some(super::MarkerScan::Empty)
+                    || Instant::now() >= deadline
+                {
+                    break scanned;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        for (child, _) in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        assert_eq!(
+            classified,
+            [
+                Some(super::MarkerScan::Empty),
+                Some(super::MarkerScan::Matches),
+                Some(super::MarkerScan::Absent),
+                Some(super::MarkerScan::Matches),
+            ]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn marker_snapshot_denied_entry_is_platform_scoped() {
         let boundary = super::Boundary::new(
@@ -10491,8 +10872,9 @@ while True:
                         "injected foreign environ denial",
                     ));
                 }
-                Ok(Some(true))
+                Ok(Some(super::MarkerScan::Matches))
             },
+            |_| None,
         );
         #[cfg(target_os = "android")]
         {
@@ -10642,8 +11024,13 @@ while True:
             |pid| Ok(rows.get(&pid).cloned()),
             |pid, token| {
                 assert_eq!(token, "full-wrap-boundary");
-                Ok(Some(pid == adopted.pid))
+                Ok(Some(if pid == adopted.pid {
+                    super::MarkerScan::Matches
+                } else {
+                    super::MarkerScan::Absent
+                }))
             },
+            |_| None,
         )
         .unwrap();
         assert!(
