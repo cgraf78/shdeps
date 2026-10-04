@@ -6724,9 +6724,29 @@ mod tests {
                 Some(wedged.record.clone())
             )]
         );
+        // Health names the record in its path column, so the detail drops
+        // it; recovery's error has no such column and keeps it.
+        let env = RuntimeEnv::new("linux", "test-host").with_package_manager("apt");
+        let detail = crate::health::check(&wedged.roots, &env, "apt")
+            .problems
+            .into_iter()
+            .find(|problem| problem.kind == crate::health::ProblemKind::BlockedTransition)
+            .expect("the wedged record is reported")
+            .detail;
+        let record = wedged.record.display().to_string();
+        assert!(!detail.contains(&record), "{detail}");
         assert!(
-            recover_with(&wedged, RELEASE_ENTRY).is_err(),
-            "health must agree with recovery"
+            detail.contains("remove the stale transition record and retry;"),
+            "{detail}"
+        );
+        let error = recover_with(&wedged, RELEASE_ENTRY)
+            .expect_err("health must agree with recovery")
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "remove the stale transition record at {record} and retry"
+            )),
+            "{error}"
         );
 
         // Still resolving to the repo target: the next update retries it.

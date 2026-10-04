@@ -810,6 +810,12 @@ fn unsafe_method_transition_directory_blocks_even_when_empty() {
         keys(&output),
         [key("fail", "-", "blocked-transition", &dir)]
     );
+    // The path column already names the directory; the detail does not
+    // repeat it.
+    assert_eq!(
+        rows(&output)[0][4],
+        "method transition state has unsafe ownership or mode; 'shdeps update' fails until this is resolved"
+    );
 }
 
 #[test]
@@ -835,6 +841,17 @@ fn unexpected_method_transition_entries_block_updates() {
         [
             key("fail", "-", "blocked-transition", &stray),
             key("fail", "owner/tool", "blocked-transition", &unindexed),
+        ]
+    );
+    let details = rows(&output)
+        .into_iter()
+        .map(|row| row[4].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        details,
+        [
+            "unexpected entry in method transition state; 'shdeps update' fails until this is resolved",
+            "unindexed prepared method-transition manifest exists; 'shdeps update' fails until this is resolved",
         ]
     );
 }
@@ -875,6 +892,28 @@ fn malformed_repo_journal_blocks_its_package() {
         [key("fail", "owner/tool", "blocked-transition", &journal)]
     );
     assert!(rows(&output)[0][4].contains("malformed repository transition record"));
+}
+
+#[test]
+fn repo_journal_that_is_not_a_directory_names_it_once() {
+    // The path column carries the journal; the detail keeps only the cause.
+    let fixture = Fixture::new("repo-journal-file");
+    fixture.healthy_repo("owner/tool", "tool");
+    let journal = fixture.write("share/owner/.tool.shdeps-repo-transition-v1", "x\n");
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("fail", "owner/tool", "blocked-transition", &journal)]
+    );
+    let detail = &rows(&output)[0][4];
+    assert!(
+        detail.starts_with("repository transition is not a private directory (checkout "),
+        "{detail}"
+    );
+    assert!(!detail.contains(&journal.display().to_string()), "{detail}");
 }
 
 #[test]

@@ -869,7 +869,10 @@ impl<'a> Scan<'a> {
             ),
             PendingVerdict::Blocked(reason) => (
                 ProblemKind::BlockedTransition,
-                format!("{reason}; 'shdeps update' fails until this is resolved"),
+                format!(
+                    "{}; 'shdeps update' fails until this is resolved",
+                    without_record_path(&reason, &record.path)
+                ),
             ),
         };
         self.push(kind, record.name.as_deref(), Some(&record.path), detail);
@@ -928,7 +931,8 @@ impl<'a> Scan<'a> {
                 Some(name),
                 Some(journal),
                 format!(
-                    "{reason} (checkout {}); 'shdeps update' and 'shdeps prune' of this checkout fail until it is resolved",
+                    "{} (checkout {}); 'shdeps update' and 'shdeps prune' of this checkout fail until it is resolved",
+                    without_record_path(reason, journal),
                     root.display()
                 ),
             ),
@@ -1172,11 +1176,85 @@ fn non_empty_dir(dir: &Path) -> io::Result<bool> {
     }
 }
 
+/// Drops a handoff record's own path from the reason recovery gives for
+/// refusing it.
+///
+/// Recovery's error is the only place an update can name the record, so its
+/// reasons embed the path (`...: <record>`, `... at <record> and retry`).
+/// A health row already carries that path in its own column, and repeating
+/// it made one row several hundred characters long. Only the path introduced
+/// by `: ` or ` at ` and ending a phrase (at the end, or before `;`, `,`,
+/// a space, or `)`) is removed with its connector; a longer path that merely
+/// starts with it, and every other path a reason names, stay. That assumes no
+/// reason names a different path spelled as the record's plus a space, and a
+/// prefix occurrence that is not at a boundary is skipped, not rescanned: no
+/// reason has either shape, and both fail safe by leaving the path in.
+fn without_record_path(reason: &str, record: &Path) -> String {
+    let shown = record.display().to_string();
+    let mut reason = reason.to_owned();
+    if shown.is_empty() {
+        return reason;
+    }
+    for connector in [": ", " at "] {
+        let needle = format!("{connector}{shown}");
+        let mut from = 0;
+        while let Some(found) = reason[from..].find(&needle).map(|at| from + at) {
+            let end = found + needle.len();
+            if reason[end..]
+                .chars()
+                .next()
+                .is_none_or(|next| matches!(next, ';' | ',' | ' ' | ')'))
+            {
+                reason.replace_range(found..end, "");
+                from = found;
+            } else {
+                from = end;
+            }
+        }
+    }
+    reason
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use super::{Problem, ProblemKind, Report, write_tsv};
+    use super::{Problem, ProblemKind, Report, without_record_path, write_tsv};
+
+    #[test]
+    fn record_path_is_dropped_only_where_it_repeats_the_path_column() {
+        let record = Path::new("/state/t/abc.json");
+        for (reason, expected) in [
+            (
+                "unexpected entry in method transition state: /state/t/abc.json",
+                "unexpected entry in method transition state",
+            ),
+            (
+                "verify installed state, remove the stale transition record at /state/t/abc.json and retry",
+                "verify installed state, remove the stale transition record and retry",
+            ),
+            ("bad: /state/t/abc.json; then", "bad; then"),
+            ("bad (x: /state/t/abc.json)", "bad (x)"),
+            // A longer path that starts with the record's stays whole.
+            (
+                "clone remains at /state/t/abc.json.tmp.1",
+                "clone remains at /state/t/abc.json.tmp.1",
+            ),
+            (
+                "child at /state/t/abc.json/x",
+                "child at /state/t/abc.json/x",
+            ),
+            // Without a connector the path may be part of a command.
+            ("run 'rm /state/t/abc.json'", "run 'rm /state/t/abc.json'"),
+            (
+                "malformed record: missing field",
+                "malformed record: missing field",
+            ),
+        ] {
+            assert_eq!(without_record_path(reason, record), expected, "{reason}");
+        }
+        assert_eq!(without_record_path("x: ", Path::new("")), "x: ");
+    }
 
     #[test]
     fn rows_always_have_five_fields_whatever_the_values_contain() {
