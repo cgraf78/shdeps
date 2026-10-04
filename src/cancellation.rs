@@ -7060,17 +7060,227 @@ sys.exit(0)
         );
     }
 
+    /// Holds forked test fixtures between `fork` and `exec` until released.
+    ///
+    /// The release side is a pipe written with write(2): seccomp sandboxes
+    /// commonly deny send(2), which `UnixStream` writes use, and a failed
+    /// release must not strand a fixture. A stranded fixture holds the
+    /// process-wide spawn-registration frontier open, which times out every
+    /// later supervised run in this test binary. Each child closes its
+    /// inherited copy of this gate's write end before blocking, so dropping
+    /// the gate, including while a failing test unwinds, normally hands the
+    /// child EOF at once. Other processes still between fork and exec (for
+    /// example another gate's fixture) also hold copies, so the wait is
+    /// additionally bounded by `PRE_EXEC_GATE_LIMIT`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct PreExecGate {
+        reader: std::sync::Arc<std::os::fd::OwnedFd>,
+        writer: std::os::fd::OwnedFd,
+        pipe: (u64, u64),
+    }
+
+    /// Longest a gated fixture waits before failing its spawn. Gate users
+    /// release within about a second of readiness even under load; the
+    /// bound only caps how long simultaneous failures can strand children.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const PRE_EXEC_GATE_LIMIT: Duration = Duration::from_secs(10);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl PreExecGate {
+        fn new() -> Self {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+            let mut fds = [-1; 2];
+            // SAFETY: `fds` provides the two writable descriptor slots.
+            assert_eq!(
+                unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+                0,
+                "could not create the pre-exec gate: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: pipe2 succeeded, so both descriptors are fresh and owned.
+            let (reader, writer) = unsafe {
+                (
+                    std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                    std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+                )
+            };
+            let pipe = fd_identity(writer.as_raw_fd()).expect("fresh pipe must be identifiable");
+            Self {
+                reader: std::sync::Arc::new(reader),
+                writer,
+                pipe,
+            }
+        }
+
+        /// Returns the async-signal-safe pre-exec step that waits for one
+        /// release byte, failing with EPIPE on EOF and ETIMEDOUT after
+        /// `PRE_EXEC_GATE_LIMIT`.
+        ///
+        /// The step owns a reference to the read end, so it is open in the
+        /// parent at every fork. The write end is closed only while it still
+        /// names this pipe: if the gate was already dropped before the fork,
+        /// that descriptor number may name an unrelated file in the child.
+        fn hold(&self) -> impl Fn() -> std::io::Result<()> + Send + Sync + 'static {
+            use std::os::fd::AsRawFd as _;
+
+            let reader = std::sync::Arc::clone(&self.reader);
+            let writer = self.writer.as_raw_fd();
+            let pipe = self.pipe;
+            move || {
+                if fd_identity(writer) == Some(pipe) {
+                    // SAFETY: closes only the child's copy of this gate's
+                    // write end; close is async-signal-safe.
+                    unsafe { libc::close(writer) };
+                }
+                let limit = i32::try_from(PRE_EXEC_GATE_LIMIT.as_millis()).unwrap_or(i32::MAX);
+                let mut ready = libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let mut byte = [0_u8; 1];
+                loop {
+                    // SAFETY: the read end stays open through `reader`; poll
+                    // and read are async-signal-safe. EINTR restarts the full
+                    // limit, which only lengthens a wait that already failed.
+                    match unsafe { libc::poll(&mut ready, 1, limit) } {
+                        0 => return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+                        1 => {}
+                        _ if std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted =>
+                        {
+                            continue;
+                        }
+                        _ => return Err(std::io::Error::last_os_error()),
+                    }
+                    // SAFETY: as above.
+                    let read =
+                        unsafe { libc::read(reader.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+                    match read {
+                        1 => return Ok(()),
+                        // `Command` reports only an errno across exec; EPIPE
+                        // names the dropped release side.
+                        0 => return Err(std::io::Error::from_raw_os_error(libc::EPIPE)),
+                        _ if std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted => {}
+                        _ => return Err(std::io::Error::last_os_error()),
+                    }
+                }
+            }
+        }
+
+        /// Releases up to `children` gated fixtures.
+        ///
+        /// Writes through the gate's own descriptor: a duplicate would be a
+        /// second write end that gated children never close.
+        fn release(&self, children: usize) {
+            use std::os::fd::AsRawFd as _;
+
+            let bytes = vec![1_u8; children];
+            let mut written = 0;
+            while written < bytes.len() {
+                // SAFETY: the slice is valid for the remaining length.
+                let count = unsafe {
+                    libc::write(
+                        self.writer.as_raw_fd(),
+                        bytes[written..].as_ptr().cast(),
+                        bytes.len() - written,
+                    )
+                };
+                match count {
+                    1.. => written += count as usize,
+                    _ if std::io::Error::last_os_error().kind()
+                        == std::io::ErrorKind::Interrupted => {}
+                    _ => panic!(
+                        "could not release gated fixtures: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Returns the device and inode behind `fd`; fstat is async-signal-safe.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn fd_identity(fd: i32) -> Option<(u64, u64)> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes one complete `stat` on success.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: fstat succeeded and initialized the structure.
+        let stat = unsafe { stat.assume_init() };
+        // `stat` field widths differ from `dev_t`/`ino_t` on 32-bit Android.
+        #[allow(clippy::unnecessary_cast)]
+        Some((stat.st_dev as u64, stat.st_ino as u64))
+    }
+
+    // A test that fails between holding and releasing a fixture must not
+    // strand it pre-exec: that would keep the spawn-registration frontier
+    // open and time out every later supervised run in this binary.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn pre_exec_gate_drop_releases_a_stranded_fixture() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let (mut ready_reader, ready_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ready_fd = ready_writer.as_raw_fd();
+        let gate = PreExecGate::new();
+        let hold = gate.hold();
+        let fixture = std::thread::spawn(move || {
+            let _ready_writer = ready_writer;
+            let mut command = Command::new("/bin/true");
+            // SAFETY: the callback only writes, closes and reads raw
+            // descriptors, all async-signal-safe.
+            unsafe {
+                command.pre_exec(move || {
+                    let ready = [1_u8];
+                    if libc::write(ready_fd, ready.as_ptr().cast(), ready.len()) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    hold()
+                });
+            }
+            crate::test_support::run_subprocess(command)
+        });
+        // The fixture is now forked and blocked on the gate, as it would be
+        // when a test fails before releasing it.
+        let mut ready = [0_u8; 1];
+        ready_reader.read_exact(&mut ready).unwrap();
+        drop(gate);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fixture.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "a dropped gate left its fixture stranded before exec"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let spawned = fixture.join().unwrap();
+        assert_eq!(
+            spawned
+                .map(|output| output.status)
+                .map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::BrokenPipe),
+            "an unreleased fixture must fail its spawn instead of running"
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn concurrent_owned_spawns_do_not_serialize_registration() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
         use std::sync::{Arc, Barrier};
 
         const SPAWNS: usize = 8;
         let (mut ready_reader, ready_writer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (release_reader, mut release_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let gate = PreExecGate::new();
         ready_reader.set_nonblocking(true).unwrap();
         let start = Arc::new(Barrier::new(SPAWNS + 1));
         let mut workers = Vec::new();
@@ -7078,7 +7288,7 @@ sys.exit(0)
         for _ in 0..SPAWNS {
             let start = Arc::clone(&start);
             let ready_fd = ready_writer.as_raw_fd();
-            let release_fd = release_reader.as_raw_fd();
+            let hold = gate.hold();
             workers.push(std::thread::spawn(move || {
                 let mut command = Command::new("/bin/true");
                 command
@@ -7104,21 +7314,7 @@ sys.exit(0)
                             }
                             return Err(std::io::Error::last_os_error());
                         }
-                        let mut release = [0_u8; 1];
-                        loop {
-                            let read =
-                                libc::read(release_fd, release.as_mut_ptr().cast(), release.len());
-                            if read == 1 {
-                                return Ok(());
-                            }
-                            if read < 0
-                                && std::io::Error::last_os_error().kind()
-                                    == std::io::ErrorKind::Interrupted
-                            {
-                                continue;
-                            }
-                            return Err(std::io::Error::last_os_error());
-                        }
+                        hold()
                     });
                 }
                 start.wait();
@@ -7152,7 +7348,7 @@ sys.exit(0)
                 Err(error) => panic!("could not read spawn readiness: {error}"),
             }
         }
-        release_writer.write_all(&[1_u8; SPAWNS]).unwrap();
+        gate.release(SPAWNS);
         for worker in workers {
             assert!(worker.join().unwrap().success());
         }
@@ -7205,17 +7401,16 @@ sys.exit(0)
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn raw_test_fixture_helper_registers_before_exec() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
 
         let (mut ready_reader, ready_writer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (release_reader, mut release_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let gate = PreExecGate::new();
         let ready_fd = ready_writer.as_raw_fd();
-        let release_fd = release_reader.as_raw_fd();
+        let hold = gate.hold();
         let fixture = std::thread::spawn(move || {
             let _ready_writer = ready_writer;
-            let _release_reader = release_reader;
             let mut command = Command::new("/bin/true");
             // Hold the raw fixture in its inherited pre-exec environment. A
             // marker-only helper would still be invisible at this point.
@@ -7225,11 +7420,7 @@ sys.exit(0)
                     if libc::write(ready_fd, ready.as_ptr().cast(), ready.len()) != 1 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    let mut release = [0_u8; 1];
-                    if libc::read(release_fd, release.as_mut_ptr().cast(), release.len()) != 1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
+                    hold()
                 });
             }
             crate::test_support::run_subprocess(command)
@@ -7250,7 +7441,7 @@ sys.exit(0)
             observed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "a pre-exec fixture must remain behind the registration frontier"
         );
-        release_writer.write_all(&[1]).unwrap();
+        gate.release(1);
         assert!(
             observed_rx
                 .recv_timeout(Duration::from_secs(1))
