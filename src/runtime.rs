@@ -72,6 +72,23 @@ pub trait Env {
 
     /// Returns file content for host-probe files.
     fn read_to_string(&self, path: &Path) -> Option<String>;
+
+    /// Kernel name, as `uname -s` prints it.
+    fn kernel_name(&self) -> Option<String> {
+        self.command_output("uname", &["-s"])
+    }
+
+    /// Host name cut at the first dot, as `hostname -s` prints it.
+    fn short_host_name(&self) -> Option<String> {
+        self.command_output("hostname", &["-s"])
+            .or_else(|| self.command_output("hostname", &[]))
+    }
+
+    /// Whether the userland names itself Android, as `uname -o` does there.
+    fn userland_is_android(&self) -> bool {
+        self.command_output("uname", &["-o"])
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("android"))
+    }
 }
 
 /// Real process environment and host probes.
@@ -100,6 +117,53 @@ impl Env for ProcessEnv {
     fn read_to_string(&self, path: &Path) -> Option<String> {
         fs::read_to_string(path).ok()
     }
+
+    // Every command resolves its runtime identity first, and `dot doctor`
+    // runs `shdeps health` on every invocation, so answer the identity probes
+    // from uname(2) instead of starting `uname`/`hostname` children. The
+    // values are the ones those commands print: `uname -s` is the kernel
+    // name, `hostname -s` is the node name cut at the first dot.
+    #[cfg(unix)]
+    fn kernel_name(&self) -> Option<String> {
+        uname_fields().map(|(sysname, _)| sysname)
+    }
+
+    #[cfg(unix)]
+    fn short_host_name(&self) -> Option<String> {
+        uname_fields().map(|(_, nodename)| match nodename.split_once('.') {
+            Some((short, _)) => short.to_owned(),
+            None => nodename,
+        })
+    }
+
+    // `uname -o` names a build-time constant of the `uname` binary, not a
+    // kernel fact: Android-built coreutils print "Android". The equivalent for
+    // this process is whether Shdeps itself was built for Android, which is
+    // what the Android release artifacts are.
+    #[cfg(unix)]
+    fn userland_is_android(&self) -> bool {
+        cfg!(target_os = "android")
+    }
+}
+
+/// Kernel and node names from uname(2), or `None` if the call fails.
+#[cfg(unix)]
+fn uname_fields() -> Option<(String, String)> {
+    // SAFETY: `utsname` is plain C data for which all-zero bytes are valid,
+    // and uname(2) only writes NUL-terminated strings into its fixed arrays.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return None;
+    }
+    let field = |raw: &[libc::c_char]| {
+        let bytes = raw
+            .iter()
+            .take_while(|&&byte| byte != 0)
+            .map(|&byte| byte as u8)
+            .collect::<Vec<_>>();
+        String::from_utf8_lossy(&bytes).trim().to_owned()
+    };
+    Some((field(&name.sysname), field(&name.nodename)))
 }
 
 /// Resolves runtime roots from CLI overrides and environment defaults.
@@ -131,21 +195,20 @@ pub fn roots(env: &impl Env, overrides: &Overrides) -> Roots {
 pub fn runtime_env(env: &impl Env) -> RuntimeEnv {
     let platform = env_string(env, "SHDEPS_TEST_PLATFORM").unwrap_or_else(|| {
         let uname = env
-            .command_output("uname", &["-s"])
+            .kernel_name()
             .unwrap_or_else(|| std::env::consts::OS.to_owned());
         let proc_version = env.read_to_string(Path::new("/proc/version"));
         platform::normalize_platform(uname.trim(), proc_version.as_deref())
     });
     let host = env_string(env, "SHDEPS_TEST_HOST").unwrap_or_else(|| {
-        env.command_output("hostname", &["-s"])
-            .or_else(|| env.command_output("hostname", &[]))
+        env.short_host_name()
             // Bash command substitution produced an empty host when both
             // probes failed. That matters for legacy host-filter edge cases:
             // callers that build a spec from the same failed probe can produce
             // `hosts=!`, and the Bash matcher treated that as excluding the
-            // current empty host. Avoid inventing "unknown" here or child
-            // `__api host-match` calls stop matching the caller's shell view
-            // in minimal containers where `hostname -s` is unavailable.
+            // current empty host. Avoid inventing "unknown" here. With the
+            // uname(2) answer this is reached only where that call fails (or
+            // off Unix when the `hostname` command is unavailable).
             .unwrap_or_default()
     });
 
@@ -158,8 +221,9 @@ pub fn runtime_env(env: &impl Env) -> RuntimeEnv {
 ///
 /// Android reports a Linux kernel through `uname -s`, so release selection
 /// needs a separate Bionic-runtime signal. Environment variables are the cheap
-/// and reliable Termux path; `uname -o` keeps the detection useful in other
-/// Android terminal environments.
+/// and reliable Termux path; the userland check (`uname -o`, or an Android
+/// build of Shdeps itself) keeps the detection useful in other Android
+/// terminal environments.
 #[must_use]
 pub fn is_android(env: &impl Env) -> bool {
     env.var_os("ANDROID_ROOT")
@@ -167,9 +231,7 @@ pub fn is_android(env: &impl Env) -> bool {
         || env
             .var_os("TERMUX_VERSION")
             .is_some_and(|value| !value.is_empty())
-        || env
-            .command_output("uname", &["-o"])
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("android"))
+        || env.userland_is_android()
 }
 
 /// Returns whether force mode is active.
@@ -360,6 +422,30 @@ mod tests {
                 .with_var("ANDROID_ROOT", "")
                 .with_var("TERMUX_VERSION", "")
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_identity_matches_the_commands_it_replaces() {
+        use super::ProcessEnv;
+        let run = |command: &str, args: &[&str]| {
+            std::process::Command::new(command)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+
+        assert_eq!(ProcessEnv.kernel_name(), run("uname", &["-s"]));
+        if let Some(node) = run("uname", &["-n"]) {
+            let short = node.split('.').next().unwrap_or_default().to_owned();
+            assert_eq!(ProcessEnv.short_host_name(), Some(short));
+        }
+        assert_eq!(
+            ProcessEnv.userland_is_android(),
+            cfg!(target_os = "android")
+        );
     }
 
     #[test]

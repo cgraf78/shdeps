@@ -40,6 +40,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether this is an I/O "not found" error: a path that vanished, which
+    /// read-only callers treat as absent rather than as a failure.
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == io::ErrorKind::NotFound)
+    }
+}
+
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
