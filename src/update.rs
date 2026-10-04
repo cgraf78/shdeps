@@ -918,6 +918,14 @@ where
 
             let mut package_clean = true;
             let mut package_done = 0usize;
+            // Packages this manager cannot offer: skipped, not failed, so
+            // `shdeps health` must not report their commands missing.
+            let mut unavailable = BTreeMap::new();
+            let previously_unavailable = crate::pkg_unavailable::read(
+                &context.roots.state_dir,
+                context.env,
+                context.pkg_mgr,
+            );
 
             for entry in entries {
                 if entry.method != method::PKG || !active(entry, context.env) {
@@ -1008,6 +1016,27 @@ where
                 {
                     package_clean = false;
                 }
+                if !item.failed {
+                    let package = config::resolve_override_for_runtime(
+                        &entry.name,
+                        &entry.aliases,
+                        Some(context.pkg_mgr),
+                        context.env.is_android(),
+                    );
+                    // A quiet run without sudo skips before checking
+                    // availability, so it keeps the last verdict instead of
+                    // erasing it and making health flap between runs.
+                    let keep = match item.reason {
+                        ItemReason::PackageUnavailable => true,
+                        ItemReason::PackageSudoUnavailable => {
+                            previously_unavailable.get(&entry.name) == Some(&package)
+                        }
+                        _ => false,
+                    };
+                    if keep {
+                        unavailable.insert(entry.name.clone(), package);
+                    }
+                }
                 if item.changed {
                     record_changed(&mut changed, entry.name.clone());
                 }
@@ -1072,6 +1101,14 @@ where
                 cancellation::check()?;
                 update_pkg::write_cache(entries, context, installable_package_count, options)?;
             }
+            // Last, so this advisory record never blocks installs or their
+            // transition bookkeeping.
+            crate::pkg_unavailable::write(
+                &context.roots.state_dir,
+                context.env,
+                context.pkg_mgr,
+                &unavailable,
+            )?;
         }
         finish_group(&mut summary, GROUP_PACKAGES, group_started);
     }

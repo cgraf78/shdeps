@@ -592,8 +592,11 @@ such record, the config names it explicitly in the `cmd` field. A defaulted
 `cmd` may be no command at all (completion data, fonts, libraries), and
 `git-*` commands may live in Git's exec path, so those are not guessed
 missing without a record. Entries excluded on this host by a filter or a
-`NONE` package override are skipped, and the check is skipped entirely when
-`PATH` is empty or no package manager is detected on it.
+`NONE` package override are skipped, as are packages the last full package
+scan found unavailable from this manager (`update` skips those without
+failing; it records them in `pkg-unavailable` in the state dir). The check is
+skipped entirely when `PATH` is empty or no package manager is detected on
+it.
 
 Exit status: `0` healthy, `1` problems reported, `3` the report is incomplete
 (some state could not be read, reported as `unreadable-state` alongside any

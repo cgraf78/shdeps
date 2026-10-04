@@ -756,6 +756,115 @@ fn pkg_with_explicit_command_missing_from_path_is_not_installed() {
 }
 
 #[test]
+fn pkg_update_found_unavailable_here_is_not_reported() {
+    // `update` skips a package this manager cannot offer and exits 0, and
+    // that one skip keeps it from writing the package-check cache. Health
+    // must agree that the host is fine, yet still catch an available
+    // package whose command is genuinely gone.
+    let fixture = Fixture::new("pkg-unavailable");
+    let log = fixture.path("pkg-calls");
+    fixture.append(
+        "conf/deps.conf",
+        "eza pkg shdeps-test-eza\ngh pkg shdeps-test-gh\n",
+    );
+    let gh = fixture.write_executable("fakebin/shdeps-test-gh");
+    fixture.write_executable("fakebin/id");
+    fs::write(fixture.path("fakebin/id"), "#!/bin/sh\necho 0\n").unwrap();
+    for (tool, body) in [
+        ("apt-get", "exit 0"),
+        // gh is installed; the batch listing (no package argument) has it.
+        (
+            "dpkg-query",
+            "for last; do :; done\n\
+             case $last in\n\
+             gh) case $2 in *Package*) printf 'install ok installed\\tgh\\t1\\n' ;; \
+             *) printf 'install ok installed\\n' ;; esac ;;\n\
+             -f=*) printf 'install ok installed\\tgh\\t1\\n' ;;\n\
+             *) exit 1 ;;\n\
+             esac",
+        ),
+        // Only gh exists in this release's archive.
+        ("apt-cache", "[ \"$1:$2\" = show:gh ]"),
+    ] {
+        fixture.write(
+            &format!("fakebin/{tool}"),
+            &format!(
+                "#!/bin/sh\necho \"{tool} $*\" >> '{}'\n{body}\n",
+                log.display()
+            ),
+        );
+        fs::set_permissions(
+            fixture.path(&format!("fakebin/{tool}")),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    let update = fixture.command(&["-q", "update"]).output().unwrap();
+    assert_exit(&update, 0);
+    assert!(
+        !fixture.path("state/pkg-check-cache-v3").exists(),
+        "an unavailable package must keep the cache unwritten"
+    );
+    let record = fs::read_to_string(fixture.path("state/pkg-unavailable")).unwrap();
+    assert!(record.ends_with("\neza\teza\n"), "{record}");
+
+    // A quiet run without sudo skips before checking availability; it must
+    // keep the verdict rather than make health flap until the next run.
+    fs::write(fixture.path("fakebin/id"), "#!/bin/sh\necho 1000\n").unwrap();
+    fixture.write("fakebin/sudo", "#!/bin/sh\nexit 1\n");
+    fs::set_permissions(
+        fixture.path("fakebin/sudo"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let quiet = fixture.command(&["-q", "update"]).output().unwrap();
+    assert_exit(&quiet, 0);
+    assert_eq!(
+        fs::read_to_string(fixture.path("state/pkg-unavailable")).unwrap(),
+        record
+    );
+    fs::remove_file(&log).unwrap();
+
+    let output = fixture.health();
+    assert_exit(&output, 0);
+
+    fs::remove_file(&gh).unwrap();
+    let output = fixture.health();
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "gh", "not-installed", Path::new("-"))]
+    );
+    fixture.assert_no_pkg_calls();
+}
+
+#[test]
+fn pkg_unavailable_record_for_another_package_does_not_suppress() {
+    // The config now names a package the last scan never checked.
+    let fixture = Fixture::new("pkg-unavailable-other");
+    fixture.fake_apt();
+    fixture.append(
+        "conf/deps.conf",
+        "eza pkg shdeps-test-eza apt:eza-new\nexa pkg shdeps-test-exa\n",
+    );
+    // `exa` still matches its record, which proves the record is read.
+    fixture.write(
+        "state/pkg-unavailable",
+        "version\tshdeps-pkg-unavailable-v1\npkg_mgr\tapt\nplatform\tlinux\n\
+         android\t0\nhost\ttest-host\neza\teza\nexa\texa\n",
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "eza", "not-installed", Path::new("-"))]
+    );
+}
+
+#[test]
 fn pkg_command_on_path_is_healthy_whoever_provides_it() {
     // Update counts any executable on PATH as the package being present (a
     // release binary or a hook fallback may provide it); health agrees.

@@ -44,6 +44,7 @@ mod method;
 pub mod package_cache;
 mod package_proof;
 pub mod pkg;
+mod pkg_unavailable;
 pub mod platform;
 pub mod process;
 pub mod prune;

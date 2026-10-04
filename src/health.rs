@@ -474,7 +474,8 @@ impl<'a> Scan<'a> {
     /// known to be one: the last clean package scan found it, or, with no
     /// record, the config names it explicitly. A defaulted name may be no
     /// command at all (completion data, fonts), and `git-*` may live in
-    /// Git's exec path.
+    /// Git's exec path. Packages update skips as unavailable are not
+    /// reported (`pkg_unavailable`).
     fn check_pkg_commands(&mut self, entries: &[Entry], env: &RuntimeEnv, pkg_mgr: &str) {
         use crate::process::{self, Process, Runner};
 
@@ -486,6 +487,7 @@ impl<'a> Scan<'a> {
         }
         let recorded = crate::package_cache::recorded_commands(&self.roots.state_dir, env, pkg_mgr)
             .unwrap_or_default();
+        let unavailable = crate::pkg_unavailable::read(&self.roots.state_dir, env, pkg_mgr);
         for entry in entries.iter().filter(|entry| entry.method == method::PKG) {
             let package = config::resolve_override_for_runtime(
                 &entry.name,
@@ -493,14 +495,17 @@ impl<'a> Scan<'a> {
                 Some(pkg_mgr),
                 env.is_android(),
             );
-            // Update skips a package with a NONE override on this manager.
+            // Update skips, without failing, a package with a NONE override
+            // on this manager and one its last full scan found unavailable
+            // here; health must not warn about what update considers fine.
             // Deciding before the lookup keeps commandless packages from
             // walking every PATH entry (slow `/mnt/c` ones on WSL).
             let known_command = recorded
                 .get(&entry.cmd)
                 .copied()
                 .unwrap_or(entry.cmd_explicit && !entry.cmd.starts_with("git-"));
-            if package == "NONE" || !known_command {
+            if package == "NONE" || unavailable.get(&entry.name) == Some(&package) || !known_command
+            {
                 continue;
             }
             // Update runs with the bin dir first on PATH (`update_cmd`), then
