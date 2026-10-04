@@ -1621,12 +1621,16 @@ impl OwnedChild {
                         format!("reaping retained subprocess descendants failed: {error}"),
                     )
                 })?;
-                reap_unobserved_adopted_zombies(Instant::now() + GRACE).map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!("reaping adopted subprocess descendants failed: {error}"),
-                    )
-                })?;
+                // A missed deadline here fails the run, so this one-shot sweep
+                // gets the cleanup snapshot budget rather than the TERM grace.
+                reap_unobserved_adopted_zombies(Instant::now() + CLEANUP_SNAPSHOT_BUDGET).map_err(
+                    |error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("reaping adopted subprocess descendants failed: {error}"),
+                        )
+                    },
+                )?;
             }
             if received_signal().is_some() {
                 #[cfg(unix)]
@@ -2410,7 +2414,8 @@ fn stop_boundary(
     #[cfg(any(target_os = "linux", target_os = "android"))]
     retain_first_error(
         &mut first_error,
-        reap_unobserved_adopted_zombies(Instant::now() + GRACE),
+        // One-shot and final, like the sweep after a normal wait.
+        reap_unobserved_adopted_zombies(Instant::now() + CLEANUP_SNAPSHOT_BUDGET),
     );
     if let Some(error) = first_error {
         return Err(error);
