@@ -134,15 +134,13 @@ pub(crate) fn run_signal_boundary_subprocess(test_name: &str, child_env: &str) {
     )
     .unwrap();
     let started = Instant::now();
-    // The subprocess runs a full signal-injection flow, and snapshot-probed
-    // teardown spawns `ps` plus per-PID probes per round, so loaded macOS
-    // runners exceed 5s while Linux stays comfortably under. The ceiling
-    // still trips on a true hang.
-    let budget = if cfg!(target_os = "macos") {
-        Duration::from_secs(15)
-    } else {
-        Duration::from_secs(5)
-    };
+    // The subprocess runs a full signal-injection flow whose teardown scans
+    // the whole process table several times: `ps` plus per-PID probes on
+    // macOS, every /proc entry on Linux. Both scale with how busy the host
+    // is, and a loaded Linux host with thousands of processes overran the
+    // old 5s ceiling just as loaded macOS runners did. This only bounds a
+    // true hang, so one generous ceiling serves every platform.
+    let budget = Duration::from_secs(30);
     let status = loop {
         if child.exited().unwrap() {
             break Some(child.wait().unwrap());

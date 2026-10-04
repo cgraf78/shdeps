@@ -47,6 +47,24 @@ fn macos_cli_harness_runs_single_threaded() {
 // discard one isolated hosted-runner scheduler outlier in the serial pass.
 const CI_PERFORMANCE_SAMPLES: usize = 3;
 
+// Upper bound for a functional run whose regression is waiting out a much
+// longer finite alternative, such as the 300s default hook timeout. It sits
+// far below that, so it still detects the regression, and far above what a
+// debug build needs on a loaded host, so it is not a performance budget
+// (those run in the serial `--ignored` pass above). A regression that never
+// returns (a fixture that never exits, a read that never completes) hangs
+// the unbounded `run`/`timed` call instead of reaching the assertion.
+const WAITED_OUT_LIMIT: Duration = Duration::from_secs(60);
+
+// Bound for waiting on something that must eventually happen: a fixture
+// publishing its pid, or Shdeps exiting after a cancellation. A miss means a
+// hang, and the outcome is asserted separately (exit status, survivors), so
+// the bound only needs to exceed the slowest legitimate completion. That is
+// Shdeps' own bounded teardown, which chains several snapshot and KILL
+// verification windows (1s each on Linux, 5s on macOS) and stretches when a
+// loaded host makes full process-table scans slow.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn shdeps() -> Command {
     Command::new(env!("CARGO_BIN_EXE_shdeps"))
 }
@@ -2819,7 +2837,11 @@ fn nonregular_self_update_metadata_is_rejected_without_ttl() {
     let (output, elapsed) = timed(&mut command);
 
     assert_success(&output);
-    assert!(elapsed < Duration::from_secs(1));
+    // Reading the held-open FIFO would block forever; rejection is up front.
+    assert!(
+        elapsed < WAITED_OUT_LIMIT,
+        "nonregular metadata must be rejected without reading it: {elapsed:?}"
+    );
     assert!(
         !fixture.dir.join("state/shdeps.self-update.stamp").exists(),
         "rejected nonregular metadata consumed the durable self-update TTL"
@@ -2863,13 +2885,13 @@ install() {
     let mut shdeps = spawn_test_session(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/hook.pid"),
-        Duration::from_secs(2),
+        LIVENESS_TIMEOUT,
         "hook reached after rejecting nonregular install metadata",
     );
     let _hook_guard = EscapedProcessGuard::new(hook_pid);
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     if process_is_running(hook_pid) {
         kill_process_group(hook_pid);
     }
@@ -4515,7 +4537,7 @@ fn update_custom_hook_sudo_request_keeps_grandchild_cleanup_bounded() {
 exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
 install() {
   if [ ! -f "$SHDEPS_TEST_SUDO_CACHE" ]; then
-    /bin/sh -c '/bin/sleep 5' &
+    /bin/sh -c '/bin/sleep 60; : >"$SHDEPS_STATE_DIR/grandchild-finished"' &
     printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/grandchild.pid"
   fi
   shdeps_require_sudo || return $?
@@ -4524,14 +4546,20 @@ install() {
 "#,
     );
     let mut command = custom_sudo_command(&fixture, ["update"]);
-    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
+    // The authenticated retry must finish inside this deadline, so leave a
+    // loaded host room for it (a passing run waits it out once); the
+    // grandchild's 60s lifetime keeps the waited-out outcome distinguishable.
+    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "3");
 
-    let (output, elapsed) = timed_on_terminal(&mut command);
+    let output = run_on_terminal(&mut command);
 
     assert_success(&output);
+    // The grandchild only writes its marker after sleeping out its lifetime.
+    // Its absence once Shdeps returns proves the deadline stopped it instead
+    // of Shdeps waiting for it to release the hook's pipes.
     assert!(
-        elapsed < Duration::from_secs(3),
-        "the hook deadline must still apply after the leader requests sudo: {elapsed:?}"
+        !fixture.dir.join("state/grandchild-finished").exists(),
+        "the hook deadline must still apply after the leader requests sudo"
     );
     let pid = fs::read_to_string(fixture.dir.join("state/grandchild.pid"))
         .unwrap()
@@ -4562,13 +4590,16 @@ install() {
 "#,
     );
     let mut command = custom_sudo_command(&fixture, ["update"]);
-    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
+    // The first attempt must reach its sudo request inside this deadline, so
+    // leave a loaded host room for it (a passing run waits it out once). The
+    // retry's grandchild never exits.
+    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "3");
 
     let (output, elapsed) = timed_on_terminal(&mut command);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < WAITED_OUT_LIMIT,
         "the authenticated retry deadline must remain bounded: {elapsed:?}"
     );
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
@@ -4612,18 +4643,19 @@ exit 1
     let (output, elapsed) = timed(&mut command);
 
     assert_eq!(output.status.code(), Some(1));
+    // The probe's descendant never exits; only the hook deadline ends it.
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < WAITED_OUT_LIMIT,
         "the outer hook deadline must remain authoritative: {elapsed:?}"
     );
     let probe_pid = wait_for_pid(
         &fixture.dir.join("state/sudo-probe.pid"),
-        Duration::from_secs(2),
+        LIVENESS_TIMEOUT,
         "timed-out sudo probe pid",
     );
     let child_pid = wait_for_pid(
         &fixture.dir.join("state/sudo-probe-child.pid"),
-        Duration::from_secs(2),
+        LIVENESS_TIMEOUT,
         "timed-out sudo probe descendant pid",
     );
     let probe_running = process_is_running(probe_pid);
@@ -4711,8 +4743,9 @@ install() {
     let (output, elapsed) = timed(&mut command);
 
     assert_eq!(output.status.code(), Some(1));
+    // The grandchild never exits; only the hook deadline ends the run.
     assert!(
-        elapsed < Duration::from_secs(4),
+        elapsed < WAITED_OUT_LIMIT,
         "hook timeout should remain bounded: {elapsed:?}"
     );
     let pid = fs::read_to_string(fixture.dir.join("state/grandchild.pid"))
@@ -4753,13 +4786,13 @@ install() {
     let mut shdeps = spawn_test_session(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/hook.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "initial detached hook pid",
     );
     let _hook_guard = EscapedProcessGuard::new(hook_pid);
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let hook_survived = process_is_running(hook_pid);
     let mutations = fixture.dir.join("state/mutations");
     let size_after_exit = fs::metadata(&mutations).unwrap().len();
@@ -5053,7 +5086,7 @@ install() {
     let mut shdeps = spawn_test_session(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/hook.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "hook pid",
     );
     let _hook_guard = EscapedProcessGuard::new(hook_pid);
@@ -5065,7 +5098,7 @@ install() {
         "first-signal cleanup to start",
     );
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let hook_survived = process_is_running(hook_pid);
     if hook_survived {
         kill_process_group(hook_pid);
@@ -5103,15 +5136,15 @@ install() {
     let mut command = fixture.command(["update"]);
     command.stdout(Stdio::null()).stderr(Stdio::null());
     let mut shdeps = spawn_test_session(&mut command);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
-    let hook_pid = wait_for_pid(
-        &fixture.dir.join("state/hook.pid"),
-        Duration::from_secs(3),
-        "spawn-race hook pid",
-    );
-    let _hook_guard = EscapedProcessGuard::new_if_present(hook_pid);
-    let hook_survived = process_is_running(hook_pid);
-    if hook_survived {
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
+    // The hook signals Shdeps before it publishes its pid, so a starved hook
+    // can be stopped in between and never write it. After Shdeps has exited,
+    // a pid file still missing after a short grace means the hook did not
+    // survive; an escaped hook that was merely slow still gets to publish.
+    let hook_pid = wait_for_pid_opt(&fixture.dir.join("state/hook.pid"), Duration::from_secs(2));
+    let _hook_guard = hook_pid.and_then(EscapedProcessGuard::new_if_present);
+    let hook_survived = hook_pid.is_some_and(process_is_running);
+    if let Some(hook_pid) = hook_pid.filter(|_| hook_survived) {
         kill_process_group(hook_pid);
     }
     if status.is_none() {
@@ -5160,12 +5193,12 @@ install() {
     let mut shdeps = spawn_test_session(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/hook.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "detached hook pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("state/descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "detached descendant pid",
     );
     let _hook_guard = EscapedProcessGuard::new(hook_pid);
@@ -5181,7 +5214,7 @@ install() {
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let hook_survived = process_is_running(hook_pid);
     let descendant_survived = process_is_running(descendant_pid);
     if hook_survived {
@@ -5237,13 +5270,13 @@ done
     let mut shdeps = spawn_test_session(&mut command);
     let probe_pid = wait_for_pid(
         &fixture.dir.join("probe.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "detached probe pid",
     );
     let _probe_guard = EscapedProcessGuard::new(probe_pid);
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let probe_survived = process_is_running(probe_pid);
     let mutations = fixture.dir.join("probe-mutations");
     let size_after_exit = fs::metadata(&mutations).unwrap().len();
@@ -5301,13 +5334,13 @@ while :; do /bin/sleep 0.02; done
     let mut shdeps = spawn_test_session(&mut command);
     let external_pid = wait_for_pid(
         &fixture.dir.join("external.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "external installer pid",
     );
     let _external_guard = EscapedProcessGuard::new(external_pid);
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let external_survived = process_is_running(external_pid);
     if external_survived {
         kill_process(external_pid);
@@ -5360,7 +5393,7 @@ while :; do /bin/sleep 1; done
     let mut shdeps = spawn_test_session(&mut command);
     let child_pid = wait_for_pid(
         &fixture.dir.join("stopped-child.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "stoppable external child pid",
     );
     let _child_guard = EscapedProcessGuard::new(child_pid);
@@ -5372,7 +5405,7 @@ while :; do /bin/sleep 1; done
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
 
     assert_eq!(
         status.and_then(|status| status.code()),
@@ -5421,12 +5454,12 @@ exit 0
     let mut shdeps = spawn_test_session(&mut command);
     let leader_pid = wait_for_pid(
         &fixture.dir.join("external.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "external installer leader pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("external-descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "external installer descendant pid",
     );
     let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
@@ -5451,7 +5484,7 @@ exit 0
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let descendant_survived = process_is_running(descendant_pid);
     let mutations = fixture.dir.join("external-descendant-mutations");
     let size_before = fs::metadata(&mutations)
@@ -5531,12 +5564,12 @@ exit 0
     let mut shdeps = spawn_test_session(&mut command);
     let leader_pid = wait_for_pid(
         &fixture.dir.join("external.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "external installer leader pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("external-descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "escaped external descendant pid",
     );
     let _descendant_guard = EscapedProcessGuard::new(descendant_pid);
@@ -5561,7 +5594,7 @@ exit 0
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let descendant_survived = process_is_running(descendant_pid);
     let mutations = fixture.dir.join("external-descendant-mutations");
     let size_before = fs::metadata(&mutations)
@@ -5643,7 +5676,7 @@ while :; do /bin/sleep 1; done
     let mut shdeps = spawn_test_session(&mut command);
     let _leader = wait_for_pid(
         &fixture.dir.join("late-leader.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "late-fork leader pid",
     );
 
@@ -5660,7 +5693,7 @@ while :; do /bin/sleep 1; done
         "first late setsid descendant",
     )[0];
     let mut first_guard = EscapedProcessGuard::new(first_descendant);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let mut stderr = String::new();
     if status.is_some() {
         use std::io::Read as _;
@@ -5829,7 +5862,7 @@ while :; do /bin/sleep 1; done
     let mut shdeps = spawn_test_session(&mut command);
     let leader_pid = wait_for_pid(
         &fixture.dir.join("late-same-group-leader.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "late same-group leader pid",
     );
 
@@ -5857,7 +5890,7 @@ while :; do /bin/sleep 1; done
         "fixture child must retain the leader PGID"
     );
 
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let mut stderr = String::new();
     if status.is_some() {
         use std::io::Read as _;
@@ -5925,15 +5958,11 @@ done
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut shdeps = spawn_test_session(&mut command);
-    let curl_pid = wait_for_pid(
-        &fixture.dir.join("curl.pid"),
-        Duration::from_secs(3),
-        "curl pid",
-    );
+    let curl_pid = wait_for_pid(&fixture.dir.join("curl.pid"), LIVENESS_TIMEOUT, "curl pid");
     let _curl_guard = EscapedProcessGuard::new(curl_pid);
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let curl_survived = process_is_running(curl_pid);
     if curl_survived {
         kill_process(curl_pid);
@@ -5979,13 +6008,13 @@ while :; do /bin/sleep 0.02; done
     let mut shdeps = spawn_test_session(&mut command);
     let curl_pid = wait_for_pid(
         &fixture.dir.join("curl.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "nonreading curl pid",
     );
     let _curl_guard = EscapedProcessGuard::new(curl_pid);
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let curl_survived = process_is_running(curl_pid);
     if curl_survived {
         kill_process_group(curl_pid);
@@ -6050,7 +6079,7 @@ exit 2
     let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let sudo_pid = wait_for_pid(
         &fixture.dir.join("sudo.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "parent sudo pid",
     );
     let _sudo_guard = EscapedProcessGuard::new(sudo_pid);
@@ -6066,7 +6095,7 @@ exit 2
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let sudo_survived = process_is_running(sudo_pid);
     if sudo_survived {
         kill_process(sudo_pid);
@@ -6148,7 +6177,7 @@ exit 4
     master.flush().unwrap();
     drain_pty_master(&master);
 
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(5));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let stall = status
         .is_none()
         .then(|| describe_stall_self(shdeps.id(), &master));
@@ -6177,14 +6206,14 @@ fn terminal_interrupt_of_owned_foreground_child_returns_130() {
     fixture.write("conf/deps.conf", "tool cargo\n");
     fixture.write_executable(
         "fakebin/cargo",
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" >\"$SHDEPS_TEST_CHILD_PID\"\nexec /bin/sleep 30\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >\"$SHDEPS_TEST_CHILD_PID\"\nexec /bin/sleep 600\n",
     );
     let mut command = fixture.command(["update"]);
     command.env("SHDEPS_TEST_CHILD_PID", fixture.dir.join("foreground.pid"));
     let (mut shdeps, mut master) = spawn_on_pty(command);
     let child_pid = wait_for_pid(
         &fixture.dir.join("foreground.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground installer pid",
     );
     let _child_guard = EscapedProcessGuard::new(child_pid);
@@ -6203,7 +6232,7 @@ fn terminal_interrupt_of_owned_foreground_child_returns_130() {
     // exactly as a user pressing Ctrl-C would.
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let stall = status
         .is_none()
         .then(|| describe_stall(shdeps.id(), child_pid, &master));
@@ -6245,14 +6274,14 @@ while :; do /bin/sleep 1; done
     let (mut shdeps, mut master) = spawn_on_pty(command);
     let child_pid = wait_for_pid(
         &fixture.dir.join("foreground-trapped.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground trapped installer pid",
     );
     let _child_guard = EscapedProcessGuard::new(child_pid);
 
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let stall = status
         .is_none()
         .then(|| describe_stall(shdeps.id(), child_pid, &master));
@@ -6363,17 +6392,17 @@ os._exit(130)
     let shdeps_pid = shdeps.id();
     let leader_pid = wait_for_pid(
         &fixture.dir.join("foreground-leader.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground leader pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("foreground-descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground descendant pid",
     );
     let sibling_pid = wait_for_pid(
         &fixture.dir.join("sibling.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "parallel sibling pid",
     );
     let _leader_guard = EscapedProcessGuard::new(leader_pid);
@@ -6392,7 +6421,7 @@ os._exit(130)
         || descendant_int.is_file(),
         "descendant to acknowledge terminal Ctrl-C",
     );
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(5));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     descendant_guard.disarm_if_exited();
     sibling_guard.disarm_if_exited();
     let sibling_size = fs::metadata(&sibling_mutations)
@@ -6419,7 +6448,7 @@ os._exit(130)
     assert_eq!(
         wait_for_pid(
             &reclaimed_group,
-            Duration::from_secs(2),
+            LIVENESS_TIMEOUT,
             "parallel worker to record terminal restoration",
         ),
         shdeps_pid,
@@ -6446,7 +6475,7 @@ fn terminal_interrupt_of_leader_stops_ignoring_pipe_holder() {
   done
 ' &
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
-exec /bin/sleep 30
+exec /bin/sleep 600
 "#,
     );
     let mut command = fixture.command(["update"]);
@@ -6466,12 +6495,12 @@ exec /bin/sleep 30
     let (mut shdeps, mut master) = spawn_on_pty(command);
     let leader_pid = wait_for_pid(
         &fixture.dir.join("foreground-leader.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground installer leader pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("foreground-descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground pipe-holder pid",
     );
     let _leader_guard = EscapedProcessGuard::new(leader_pid);
@@ -6485,7 +6514,7 @@ exec /bin/sleep 30
 
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let stall = status
         .is_none()
         .then(|| describe_stall(shdeps.id(), leader_pid, &master));
@@ -6567,7 +6596,7 @@ with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
     pid_file.write(f"{os.getpid()}\n")
 while not os.path.exists(os.environ["SHDEPS_TEST_DESCENDANT_PID"]):
     time.sleep(0.001)
-os.execl("/bin/sleep", "sleep", "30")
+os.execl("/bin/sleep", "sleep", "600")
 "#,
     );
     let mutations = fixture.dir.join("closed-pipe-descendant-mutations");
@@ -6585,12 +6614,12 @@ os.execl("/bin/sleep", "sleep", "30")
     let (mut shdeps, mut master) = spawn_on_pty(command);
     let leader_pid = wait_for_pid(
         &fixture.dir.join("closed-pipe-leader.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground leader pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("closed-pipe-descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "closed-pipe escaped descendant pid",
     );
     let _leader_guard = EscapedProcessGuard::new(leader_pid);
@@ -6598,7 +6627,7 @@ os.execl("/bin/sleep", "sleep", "30")
 
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let stall = status
         .is_none()
         .then(|| describe_stall(shdeps.id(), leader_pid, &master));
@@ -6704,12 +6733,12 @@ os._exit(0)
     let (mut shdeps, mut master) = spawn_on_pty(command);
     let leader_pid = wait_for_pid(
         &fixture.dir.join("foreground-exited.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground installer leader pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("foreground-pipe-holder.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground pipe-holder pid",
     );
     let _leader_guard = EscapedProcessGuard::new_if_present(leader_pid);
@@ -6741,7 +6770,7 @@ os._exit(0)
 
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     descendant_guard.disarm_if_exited();
 
     assert_eq!(
@@ -6813,12 +6842,12 @@ while True:
     let shdeps_pid = shdeps.id();
     let leader_pid = wait_for_pid(
         &fixture.dir.join("cancel-descendant-leader.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground leader pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("cancel-descendant-owner.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground descendant owner pid",
     );
     let _leader_guard = EscapedProcessGuard::new(leader_pid);
@@ -6830,14 +6859,14 @@ while True:
     );
 
     signal_process(shdeps_pid, libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     descendant_guard.disarm_if_exited();
 
     assert_eq!(status.and_then(|status| status.code()), Some(143));
     assert!(!process_is_running(descendant_pid));
     let reclaimed_group = wait_for_pid(
         &fixture.dir.join("cancel-reclaimed-terminal-group"),
-        Duration::from_secs(2),
+        LIVENESS_TIMEOUT,
         "leader to record terminal ownership during cancellation",
     );
     assert_eq!(
@@ -6910,12 +6939,12 @@ while True:
     let shdeps_pid = shdeps.id();
     let leader_pid = wait_for_pid(
         &fixture.dir.join("late-terminal-leader.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "late-retake leader pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("late-terminal-descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "late-retake descendant pid",
     );
     let _leader_guard = EscapedProcessGuard::new(leader_pid);
@@ -6932,7 +6961,7 @@ while True:
         || late_ready.is_file(),
         "descendant to retake the terminal from its TERM handler",
     );
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     descendant_guard.disarm_if_exited();
 
     assert_eq!(status.and_then(|status| status.code()), Some(143));
@@ -6970,7 +6999,7 @@ while :; do /bin/sleep 1; done
     let (mut shdeps, mut master) = spawn_on_pty(command);
     let child_pid = wait_for_pid(
         &fixture.dir.join("foreground-stopped.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground stoppable child pid",
     );
     let _child_guard = EscapedProcessGuard::new(child_pid);
@@ -7002,7 +7031,7 @@ while :; do /bin/sleep 1; done
     );
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
 
     assert_eq!(
         status.and_then(|status| status.code()),
@@ -7037,7 +7066,12 @@ shdeps = os.fork()
 if shdeps == 0:
     os.setpgid(0, 0)
     os.execl(os.environ["SHDEPS_TEST_BINARY"], "shdeps", "update")
-os.setpgid(shdeps, shdeps)
+try:
+    os.setpgid(shdeps, shdeps)
+except PermissionError:
+    # As in the background harness: the child joins its own group before
+    # exec, so EACCES here means it already exec'd with the group set.
+    pass
 
 sibling = os.fork()
 if sibling == 0:
@@ -7096,17 +7130,17 @@ raise SystemExit(128 + os.WTERMSIG(status))
     let (mut harness, mut master) = spawn_on_pty(command);
     let shdeps_pid = wait_for_pid(
         &fixture.dir.join("pipeline-shdeps.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "pipeline Shdeps pid",
     );
     let sibling_pid = wait_for_pid(
         &fixture.dir.join("pipeline-sibling.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "pipeline sibling pid",
     );
     let child_pid = wait_for_pid(
         &fixture.dir.join("pipeline-child.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "pipeline foreground child pid",
     );
     wait_until(
@@ -7122,7 +7156,22 @@ raise SystemExit(128 + os.WTERMSIG(status))
         || process_is_stopped(shdeps_pid),
         "Shdeps pipeline member to stop",
     );
-    let sibling_stopped = process_is_stopped(sibling_pid);
+    // The group stop is one delivery, but each member enters the stopped
+    // state only once the kernel schedules it, so a loaded host can show
+    // Shdeps stopped while its sibling is still sleeping. Poll the sibling
+    // too; a missed stop still fails after the bound.
+    let sibling_stopped = {
+        let started = Instant::now();
+        loop {
+            if process_is_stopped(sibling_pid) {
+                break true;
+            }
+            if started.elapsed() >= LIVENESS_TIMEOUT {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
     if !sibling_stopped {
         harness.signal_session(libc::SIGKILL);
         let _ = harness.wait();
@@ -7244,7 +7293,7 @@ raise SystemExit(128 + os.WTERMSIG(status))
     };
     let child_pid = wait_for_pid(
         &child_pid_path,
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "background terminal child pid",
     );
     let _child_guard = EscapedProcessGuard::new(child_pid);
@@ -7261,7 +7310,7 @@ raise SystemExit(128 + os.WTERMSIG(status))
     );
     master.write_all(b"continue\n").unwrap();
     master.flush().unwrap();
-    let status = wait_for_child_exit_bounded(&mut harness, Duration::from_secs(5));
+    let status = wait_for_child_exit_bounded(&mut harness, LIVENESS_TIMEOUT);
 
     assert_eq!(status.and_then(|status| status.code()), Some(0));
     assert_eq!(
@@ -7297,7 +7346,7 @@ while :; do /bin/sleep 1; done
     let (mut shdeps, mut master) = spawn_on_pty(command);
     let child_pid = wait_for_pid(
         &fixture.dir.join("foreground-cancel-stopped.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "foreground child cancelled while stopped",
     );
     let _child_guard = EscapedProcessGuard::new(child_pid);
@@ -7316,7 +7365,7 @@ while :; do /bin/sleep 1; done
     );
     signal_process(shdeps.id(), libc::SIGTERM);
     signal_process(shdeps.id(), libc::SIGCONT);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
 
     assert_eq!(
         status.and_then(|status| status.code()),
@@ -7356,7 +7405,7 @@ printf '[]\n'
         .env("SHDEPS_JOBS", "2")
         .env("SHDEPS_TEST_CURL_PIDS", &pids_path);
     let (mut shdeps, mut master) = spawn_on_pty(command);
-    let pids = wait_for_pids(&pids_path, 2, Duration::from_secs(3), "two curl workers");
+    let pids = wait_for_pids(&pids_path, 2, LIVENESS_TIMEOUT, "two curl workers");
     let mut guards = pids
         .iter()
         .copied()
@@ -7378,7 +7427,7 @@ printf '[]\n'
     );
     master.write_all(&[3]).unwrap();
     master.flush().unwrap();
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(4));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     for guard in &mut guards {
         guard.disarm_if_exited();
     }
@@ -7487,12 +7536,12 @@ install() {
     let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/retry-hook.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "authenticated retry hook pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("state/retry-descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "authenticated retry descendant pid",
     );
     let _hook_guard = EscapedProcessGuard::new(hook_pid);
@@ -7519,7 +7568,7 @@ install() {
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let hook_survived = process_is_running(hook_pid);
     let descendant_survived = process_is_running(descendant_pid);
     let mutations = fixture.dir.join("state/retry-descendant-mutations");
@@ -7596,12 +7645,12 @@ install() {
     let (mut shdeps, _terminal) = spawn_test_session_on_terminal(&mut command);
     let hook_pid = wait_for_pid(
         &fixture.dir.join("state/retry-hook.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "authenticated retry hook pid",
     );
     let descendant_pid = wait_for_pid(
         &fixture.dir.join("state/retry-descendant.pid"),
-        Duration::from_secs(3),
+        LIVENESS_TIMEOUT,
         "tracked authenticated retry descendant pid",
     );
     let _hook_guard = EscapedProcessGuard::new_if_present(hook_pid);
@@ -7629,7 +7678,7 @@ install() {
     );
 
     signal_process(shdeps.id(), libc::SIGTERM);
-    let status = wait_for_child_exit_bounded(&mut shdeps, Duration::from_secs(3));
+    let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
     let descendant_survived = process_is_running(descendant_pid);
     let mutations = fixture.dir.join("state/retry-descendant-mutations");
     let size_before = fs::metadata(&mutations)
