@@ -2334,7 +2334,10 @@ mod tests {
         fn phase(&mut self, _phase: super::Phase<'_>) -> crate::Result<()> {
             if !self.waited_for_commits {
                 self.waited_for_commits = true;
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                // Both workers run real subprocesses before committing, which
+                // a loaded host can stretch well past a second. This only
+                // bounds a hang: a worker that never commits still fails.
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 loop {
                     let committed = manifest::read(&self.manifest_path)
                         .map(|manifest| {
