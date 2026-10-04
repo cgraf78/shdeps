@@ -586,7 +586,9 @@ the clock, so a host that was asleep stays quiet; its threshold adds the
 for `update`.
 `blocked-transition` is reported even while the state-lock owner runs, because
 that update fails on it too; only a checkout journal or installer transaction whose checkout
-lock has a provably live owner is left out as work in progress.
+lock has a provably live owner is left out as work in progress. For a refused
+handoff record or checkout journal, the detail is recovery's own reason
+without the record's path, which the path column already carries.
 Each pending record is classified the way the next update's recovery treats
 it. Two inputs are forecasts, since health never contacts GitHub or reads hook
 state the way update does: a bare `github` entry uses the cached resolver
