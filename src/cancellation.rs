@@ -53,6 +53,11 @@ const TRACK_SNAPSHOT_BUDGET: Duration = Duration::from_millis(250);
 const LINUX_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const LEADER_EXIT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
+// Attempts, each with a fresh LEADER_EXIT_SNAPSHOT_BUDGET, before a leader-exit
+// observation whose snapshot ran out of time fails the run. See
+// `with_leader_exit_attempts`.
+#[cfg(unix)]
+const LEADER_EXIT_SNAPSHOT_ATTEMPTS: u32 = 3;
 // A portable snapshot spawns `ps` plus per-PID probes; on loaded macOS
 // runners a single whole-table scan can exceed 1s, which permanently
 // fails an otherwise clean teardown (the discovery error is retained).
@@ -1470,23 +1475,22 @@ impl OwnedChild {
                 // attribution even though portable hot-path scans are shared. Do
                 // not reap and lose the leader identity if attribution timed out.
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                let observed = self
-                    .boundary
-                    .observe_leader_exit(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET);
+                let observed = with_leader_exit_attempts(|deadline| {
+                    self.boundary.observe_leader_exit(deadline)
+                });
                 // Portable snapshots spawn `ps` plus per-PID identity probes, so
                 // they need the same leader-exit budget as the procfs path; the
                 // tighter track budget expires under CI load and fails the
                 // completion proof for a leader that already exited cleanly.
                 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-                let observed = self
-                    .boundary
-                    .track(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET)
-                    .ok_or_else(|| {
+                let observed = with_leader_exit_attempts(|deadline| {
+                    self.boundary.track(deadline).ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "portable process snapshot deadline expired",
                         )
-                    });
+                    })
+                });
                 observed.map_err(|error| {
                     std::io::Error::new(
                         error.kind(),
@@ -1552,10 +1556,9 @@ impl OwnedChild {
                 &mut self.boundary,
             )?;
             self.leader_exited = true;
-            let empty = match self
-                .boundary
-                .observe_after_leader_reap(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET)
-            {
+            let empty = match with_leader_exit_attempts(|deadline| {
+                self.boundary.observe_after_leader_reap(deadline)
+            }) {
                 Ok(empty) => empty,
                 Err(error) => {
                     // The leader has already been reaped, so prevent Drop from
@@ -2673,6 +2676,35 @@ fn freeze_boundary(
     }
 }
 
+/// Runs a leader-exit observation, retrying only when its snapshot ran out of
+/// time, up to `LEADER_EXIT_SNAPSHOT_ATTEMPTS` attempts with a fresh budget
+/// each.
+///
+/// The observation aborts its process-table walk at the deadline, and failing
+/// it fails the run. On a host with thousands of processes a single loaded
+/// walk can outlast the budget, which reported a cleanly exited leader as a
+/// cleanup failure. Another attempt is simply a fresh observation of the same
+/// boundary, which supervision already repeats; a timed-out attempt can only
+/// have retained more identities, never dropped one. Every other error,
+/// including a lifetime lease that is still held, fails at once.
+#[cfg(unix)]
+fn with_leader_exit_attempts<T>(
+    mut observe: impl FnMut(Instant) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempts = 1;
+    loop {
+        match observe(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::TimedOut
+                    && attempts < LEADER_EXIT_SNAPSHOT_ATTEMPTS =>
+            {
+                attempts += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn delivery_then_deadline<T>(duration: Duration, deliver: impl FnOnce() -> T) -> (T, Instant) {
     let result = deliver();
@@ -2702,12 +2734,79 @@ fn settle_killed_boundary(
         final_kill_verification_deadline(|| boundary.signal_new(libc::SIGKILL));
     retain_first_error(first_error, delivery);
 
-    let mut consecutive_empty = usize::from(observed == Some(true));
-    while consecutive_empty < 2 && Instant::now() < verification_deadline {
-        std::thread::sleep(POLL);
-        let observed = observe_empty(boundary, verification_deadline);
+    prove_killed_boundary_empty(observed == Some(true), verification_deadline, |deadline| {
+        let observed = observe_empty(boundary, deadline);
         retain_terminal_restore(first_error, foreground, boundary);
-        if observed == Some(true) {
+        if observed != Some(true) {
+            // A walk that is not empty may have found an identity at the
+            // edge of the KILL phase or a member KILLed moments ago that is
+            // not yet a zombie: deliver to anything new before walking again.
+            retain_first_error(first_error, boundary.signal_new(libc::SIGKILL));
+        }
+        observed
+    })
+}
+
+/// Upper bound on settlement walks started after the KILL settlement window.
+/// See `kill_verification_deadline`.
+#[cfg(unix)]
+const KILL_VERIFY_LATE_ATTEMPTS: u32 = 3;
+
+/// Deadline for the next post-KILL settlement walk, or `None` when the
+/// settlement is over.
+///
+/// Before `verification_deadline` every walk shares it. Past it, KILL has
+/// already been delivered to every known member, so the remaining work is
+/// proof, not delivery or responsiveness. A loaded host with thousands of
+/// processes can reach this point with a walk that was cut off mid-scan by
+/// the shared deadline, with an empty walk whose confirming walk would start
+/// late, or with a walk that still sees a member KILLed moments ago. Failing
+/// then reports "owned subprocesses survived bounded SIGKILL cleanup" for a
+/// boundary that is empty or about to be. So, while the proof is incomplete,
+/// late walks continue until `KILL_VERIFY_LATE_ATTEMPTS` have started, each
+/// with a fresh `CLEANUP_SNAPSHOT_BUDGET` so a whole-table scan can finish.
+/// Three late walks certify after at most one refused or still-live walk
+/// followed by two empty ones. The proof is never weakened: certification
+/// still needs two consecutive successful empty walks, a refused walk never
+/// counts, and a member still live after the cap fails the stop.
+#[cfg(unix)]
+fn kill_verification_deadline(
+    now: Instant,
+    verification_deadline: Instant,
+    late_attempts: u32,
+) -> Option<Instant> {
+    if now < verification_deadline {
+        Some(verification_deadline)
+    } else if late_attempts >= KILL_VERIFY_LATE_ATTEMPTS {
+        None
+    } else {
+        Some(now + CLEANUP_SNAPSHOT_BUDGET)
+    }
+}
+
+/// Runs settlement walks until two consecutive walks prove the boundary empty
+/// or `kill_verification_deadline` ends the settlement. `observe` performs one
+/// walk bounded by the given deadline: `Some(true)` is a successful empty
+/// walk, `Some(false)` a walk that still saw a member, `None` a refused walk.
+#[cfg(unix)]
+fn prove_killed_boundary_empty(
+    initially_empty: bool,
+    verification_deadline: Instant,
+    mut observe: impl FnMut(Instant) -> Option<bool>,
+) -> bool {
+    let mut consecutive_empty = usize::from(initially_empty);
+    let mut late_attempts = 0;
+    while consecutive_empty < 2 {
+        let Some(walk_deadline) =
+            kill_verification_deadline(Instant::now(), verification_deadline, late_attempts)
+        else {
+            break;
+        };
+        if walk_deadline > verification_deadline {
+            late_attempts += 1;
+        }
+        std::thread::sleep(POLL);
+        if observe(walk_deadline) == Some(true) {
             consecutive_empty += 1;
         } else {
             consecutive_empty = 0;
@@ -2883,7 +2982,12 @@ impl Boundary {
                     || registered_linux_process_snapshot(requested_at, deadline),
                 )
                 .ok_or_else(|| {
-                    std::io::Error::other("could not snapshot owned subprocesses after leader exit")
+                    // Reported as a timeout so the leader-exit attempts can
+                    // retry a snapshot that a loaded host cut short.
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "could not snapshot owned subprocesses after leader exit",
+                    )
                 })?;
                 if locally_owned {
                     self.retain_owned_rows(&processes);
@@ -2931,7 +3035,10 @@ impl Boundary {
         let requested_at = Instant::now();
         let processes =
             registered_linux_process_snapshot(requested_at, deadline).ok_or_else(|| {
-                std::io::Error::other("could not snapshot owned subprocesses after leader reaping")
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "could not snapshot owned subprocesses after leader reaping",
+                )
             })?;
         let empty = self.observe_processes_with_unmarked_adoptees(&processes, deadline, true)?;
         self.verify_empty_observation(empty, deadline)
@@ -10519,6 +10626,157 @@ while True:
         assert!(
             deadline.saturating_duration_since(delivered_at) >= super::KILL_SETTLE_GRACE,
             "a delivery at the end of discovery must retain a separate stable-empty verification reserve"
+        );
+    }
+
+    #[test]
+    fn leader_exit_attempts_retry_only_timeouts_up_to_the_cap() {
+        let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "slow walk");
+
+        let mut deadlines = Vec::new();
+        let result = super::with_leader_exit_attempts(|deadline| {
+            deadlines.push(deadline);
+            if deadlines.len() < 2 {
+                Err(timed_out())
+            } else {
+                Ok(true)
+            }
+        });
+        assert!(result.unwrap(), "a retried observation lost its result");
+        assert_eq!(deadlines.len(), 2);
+        assert!(
+            deadlines[1] > deadlines[0],
+            "each attempt needs a fresh budget"
+        );
+
+        let mut calls = 0;
+        let result: std::io::Result<bool> = super::with_leader_exit_attempts(|_| {
+            calls += 1;
+            Err(timed_out())
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(calls, super::LEADER_EXIT_SNAPSHOT_ATTEMPTS);
+
+        let mut calls = 0;
+        let result: std::io::Result<bool> = super::with_leader_exit_attempts(|_| {
+            calls += 1;
+            Err(super::Boundary::open_lease_error())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "a held lease must fail without another attempt");
+    }
+
+    #[test]
+    fn kill_verification_shares_the_settlement_deadline_while_it_lasts() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+
+        assert_eq!(
+            super::kill_verification_deadline(now, deadline, 0),
+            Some(deadline)
+        );
+    }
+
+    #[test]
+    fn kill_verification_starts_late_walks_until_the_cap() {
+        let deadline = Instant::now();
+        let now = deadline + Duration::from_secs(2);
+
+        for late_attempts in 0..super::KILL_VERIFY_LATE_ATTEMPTS {
+            assert_eq!(
+                super::kill_verification_deadline(now, deadline, late_attempts),
+                Some(now + super::CLEANUP_SNAPSHOT_BUDGET)
+            );
+        }
+        assert_eq!(
+            super::kill_verification_deadline(now, deadline, super::KILL_VERIFY_LATE_ATTEMPTS),
+            None
+        );
+    }
+
+    // Drives the settlement loop past an already expired window, as on a
+    // starved host where the final discovery and KILL delivery used it up.
+    // Each queued entry is one walk's result; the walk count and the
+    // deadline each walk received are returned for inspection.
+    fn starved_settlement(
+        initially_empty: bool,
+        walks: &[Option<bool>],
+    ) -> (bool, usize, Vec<Instant>) {
+        let expired = Instant::now() - Duration::from_millis(1);
+        let mut queue = walks
+            .iter()
+            .copied()
+            .collect::<std::collections::VecDeque<_>>();
+        let mut deadlines = Vec::new();
+        let proved = super::prove_killed_boundary_empty(initially_empty, expired, |deadline| {
+            deadlines.push(deadline);
+            // Past the queue a walk keeps seeing a live member, so a loop
+            // without a cap would run until the guard below trips.
+            assert!(deadlines.len() <= 16, "settlement walks are unbounded");
+            queue.pop_front().unwrap_or(Some(false))
+        });
+        (proved, deadlines.len(), deadlines)
+    }
+
+    #[test]
+    fn starved_settlement_certifies_an_empty_boundary_with_late_walks() {
+        // The shared window is gone and the final discovery was refused:
+        // the old loop failed here for a boundary that was already empty.
+        let started = Instant::now();
+        let (proved, walks, deadlines) = starved_settlement(false, &[Some(true), Some(true)]);
+
+        assert!(proved, "an empty boundary failed a starved settlement");
+        assert_eq!(walks, 2);
+        assert!(
+            deadlines
+                .iter()
+                .all(|deadline| *deadline >= started + super::CLEANUP_SNAPSHOT_BUDGET),
+            "late walks must get a fresh snapshot budget: {deadlines:?}"
+        );
+    }
+
+    #[test]
+    fn late_walk_that_still_sees_a_killed_member_walks_again() {
+        let (proved, walks, _) = starved_settlement(false, &[Some(false), Some(true), Some(true)]);
+
+        assert!(proved, "a member seen live once was reported as a survivor");
+        assert_eq!(walks, 3);
+    }
+
+    #[test]
+    fn one_refused_late_walk_is_tolerated_but_never_counted() {
+        let (proved, walks, _) = starved_settlement(false, &[None, Some(true), Some(true)]);
+        assert!(proved, "one refused late walk failed the settlement");
+        assert_eq!(walks, 3);
+
+        // A refused walk between two empty ones resets the proof.
+        let (proved, walks, _) = starved_settlement(false, &[Some(true), None, Some(true)]);
+        assert!(!proved, "a refused walk counted toward the empty proof");
+        assert_eq!(walks, super::KILL_VERIFY_LATE_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn late_walks_stop_at_the_cap_and_fail_closed() {
+        let (proved, walks, _) = starved_settlement(false, &[]);
+
+        assert!(!proved, "a member live on every late walk still certified");
+        assert_eq!(walks, super::KILL_VERIFY_LATE_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn settlement_inside_its_window_shares_the_window_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = Vec::new();
+        let proved = super::prove_killed_boundary_empty(true, deadline, |walk_deadline| {
+            seen.push(walk_deadline);
+            Some(true)
+        });
+
+        assert!(proved);
+        assert_eq!(
+            seen,
+            vec![deadline],
+            "one empty walk confirms the final discovery"
         );
     }
 
