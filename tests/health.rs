@@ -1492,17 +1492,27 @@ fn pkg_git_subcommand_is_not_guessed_missing() {
 
 #[test]
 fn pkg_commands_are_not_checked_without_path() {
+    // The PATH guard is only reachable once a manager is detected, and
+    // detection itself walks PATH. An empty PATH is one empty element, which
+    // lookups resolve against the working directory, so running from the
+    // fake manager's directory detects apt while every command lookup
+    // misses. Without the guard this reports `shdeps-test-rg` missing.
     let fixture = Fixture::new("pkg-no-path");
+    fixture.fake_apt();
     fixture.append("conf/deps.conf", "ripgrep pkg shdeps-test-rg\n");
 
-    for path in [None, Some("")] {
-        let mut command = fixture.command(&["health"]);
-        match path {
-            Some(path) => command.env("PATH", path),
-            None => command.env_remove("PATH"),
-        };
-        assert_exit(&command.output().unwrap(), 0);
-    }
+    let output = fixture
+        .command(&["health"])
+        .env("PATH", "")
+        .current_dir(fixture.path("fakebin"))
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    assert!(
+        !fixture.path("pkg-calls").exists(),
+        "health must not run the package manager"
+    );
 }
 
 #[test]
