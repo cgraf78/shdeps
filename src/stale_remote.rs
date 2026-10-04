@@ -50,6 +50,10 @@ const DETAIL_MAX_CHARS: usize = 200;
 pub enum Reason {
     /// `git fetch` failed on every origin it was allowed to try.
     Fetch,
+    /// Origin answered but no longer has the branch the checkout tracks
+    /// (deleted, or the default branch was renamed), so the shallow clone's
+    /// single-branch fetch can never succeed again.
+    UpstreamGone,
     /// The checkout has commits its upstream does not (local commits, or the
     /// upstream history was rewritten), so it cannot fast-forward.
     Diverged,
@@ -67,6 +71,7 @@ impl Reason {
     pub const fn token(self) -> &'static str {
         match self {
             Self::Fetch => "fetch",
+            Self::UpstreamGone => "upstream-gone",
             Self::Diverged => "diverged",
             Self::Dirty => "dirty",
             Self::Merge => "merge",
@@ -77,6 +82,7 @@ impl Reason {
     fn parse(token: &str) -> Option<Self> {
         [
             Self::Fetch,
+            Self::UpstreamGone,
             Self::Diverged,
             Self::Dirty,
             Self::Merge,
@@ -118,6 +124,7 @@ impl Failure {
         };
         match self.reason {
             Reason::Fetch => with_detail("fetch failed"),
+            Reason::UpstreamGone => with_detail("upstream branch deleted"),
             Reason::Diverged => "diverged from origin".to_owned(),
             Reason::Dirty => "dirty working tree".to_owned(),
             Reason::Merge => with_detail("fast-forward failed"),
@@ -345,6 +352,9 @@ fn stale_detail(candidate: &Candidate, record: Option<&Record>, lag: u64) -> Str
                 Reason::Diverged => {
                     format!("move {root} aside and run 'shdeps update' to clone it again")
                 }
+                Reason::UpstreamGone => format!(
+                    "move {root} aside and run 'shdeps update' to clone the repository's current default branch"
+                ),
                 Reason::Dirty => format!(
                     "review 'git -C {root} status', discard the edits, then run 'shdeps update'"
                 ),
@@ -647,6 +657,42 @@ mod tests {
         assert_eq!(
             stale[0].detail,
             "checkout has failed to refresh for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C /share/tool fetch', then run 'shdeps update'"
+        );
+    }
+
+    #[test]
+    fn deleted_upstream_branch_hint_points_at_a_new_clone() {
+        // Checking the network is the wrong next step when origin answered
+        // without the tracked branch; only a new clone picks up the renamed
+        // default branch.
+        let state = crate::test_support::temp_dir("stale-remote-upstream-gone");
+        stamp(&state, "peer", "repo", NOW);
+        stamp(&state, "tool", "repo", NOW - 3 * DAY - 60);
+        record_failure(
+            &state,
+            "tool",
+            &Failure::new(
+                Reason::UpstreamGone,
+                "fatal: couldn't find remote ref refs/heads/master",
+            ),
+            NOW - 3 * DAY,
+        )
+        .unwrap();
+        let candidates = [
+            candidate("peer", Source::Repo, true),
+            candidate("tool", Source::Repo, true),
+        ];
+
+        let stale = find(&state, &candidates, NOW, 3600);
+
+        assert!(
+            fs::read_to_string(record_path(&state, "tool"))
+                .unwrap()
+                .contains("\nreason=upstream-gone\n")
+        );
+        assert_eq!(
+            stale[0].detail,
+            "checkout has failed to refresh for 3d (upstream branch deleted: couldn't find remote ref refs/heads/master); move /share/tool aside and run 'shdeps update' to clone the repository's current default branch"
         );
     }
 

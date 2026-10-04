@@ -1231,10 +1231,52 @@ fn fetch(
         return Ok(());
     }
     let stderr = primary.map(|output| output.stderr).unwrap_or_default();
-    Err(stale_remote::Failure::new(
-        stale_remote::Reason::Fetch,
-        &stderr,
-    ))
+    let reason = if upstream_branch_gone(runner, dir) {
+        stale_remote::Reason::UpstreamGone
+    } else {
+        stale_remote::Reason::Fetch
+    };
+    Err(stale_remote::Failure::new(reason, &stderr))
+}
+
+/// Bound on the deleted-upstream probe. It lists one ref, so a healthy
+/// remote answers in well under a second; the bound keeps an unreachable
+/// one from doubling a hung fetch's wait and runs the probe off the
+/// terminal so it cannot prompt.
+const UPSTREAM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether the remote answered but no longer has the branch HEAD tracks.
+///
+/// A managed clone is shallow, so its fetch refspec names that one branch
+/// and fails for good once the branch is deleted or the default branch is
+/// renamed. Git's message is localized and not a stable signal; an empty
+/// `ls-remote` listing from a remote that answered is. Any doubt (detached
+/// HEAD, no upstream, unreachable remote) reads as an ordinary fetch
+/// failure. Only runs after the fetch failed on every transport.
+fn upstream_branch_gone(runner: &impl Runner, dir: &Path) -> bool {
+    let config = |key: String| {
+        git(runner, dir, &["config", "--get", &key])
+            .map(|output| output.stdout.trim().to_owned())
+            .filter(|value| !value.is_empty() && !value.starts_with('-'))
+    };
+    let Some(branch) = git(runner, dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map(|output| output.stdout.trim().to_owned())
+    else {
+        return false;
+    };
+    let (Some(remote), Some(merge)) = (
+        config(format!("branch.{branch}.remote")),
+        config(format!("branch.{branch}.merge")),
+    ) else {
+        return false;
+    };
+    git_output_bounded(
+        runner,
+        dir,
+        &["ls-remote", &remote, &merge],
+        Some(UPSTREAM_PROBE_TIMEOUT),
+    )
+    .is_some_and(|output| output.success && !output.timed_out && output.stdout.trim().is_empty())
 }
 
 /// Retries the fetch over the other transport of the configured GitHub URL
@@ -1976,6 +2018,7 @@ mod tests {
     use super::{
         GitConfigEnv, install_existing, push_url_sync_redundant_with_configs,
         secure_managed_clone_permissions, sync_ssh_push_url, sync_ssh_push_url_with_configs,
+        upstream_branch_gone,
     };
     use crate::config::Entry;
     use crate::hooks::BashCustomProbe;
@@ -2172,6 +2215,92 @@ mod tests {
         let mut full = vec!["-C".to_owned(), dir];
         full.extend(args.iter().map(|arg| (*arg).to_owned()));
         full
+    }
+
+    #[test]
+    fn upstream_branch_gone_needs_an_answering_remote_without_the_branch() {
+        // Only an empty listing from a remote that answered proves the
+        // branch is gone; a listed branch, an unreachable remote, a detached
+        // HEAD or a missing upstream all stay ordinary fetch failures.
+        let dir = Path::new("/share/tool");
+        let tracked = || {
+            FakeRunner::default()
+                .with_output(
+                    "git",
+                    [
+                        "-C",
+                        "/share/tool",
+                        "symbolic-ref",
+                        "--quiet",
+                        "--short",
+                        "HEAD",
+                    ],
+                    true,
+                    "main\n",
+                )
+                .with_output(
+                    "git",
+                    ["-C", "/share/tool", "config", "--get", "branch.main.remote"],
+                    true,
+                    "origin\n",
+                )
+                .with_output(
+                    "git",
+                    ["-C", "/share/tool", "config", "--get", "branch.main.merge"],
+                    true,
+                    "refs/heads/main\n",
+                )
+        };
+        let listing = [
+            "-C",
+            "/share/tool",
+            "ls-remote",
+            "origin",
+            "refs/heads/main",
+        ];
+
+        assert!(upstream_branch_gone(
+            &tracked().with_output("git", listing, true, ""),
+            dir
+        ));
+        assert!(!upstream_branch_gone(
+            &tracked().with_output("git", listing, true, "abc123\trefs/heads/main\n"),
+            dir
+        ));
+        assert!(!upstream_branch_gone(
+            &tracked().with_output("git", listing, false, ""),
+            dir
+        ));
+
+        let detached = FakeRunner::default();
+        assert!(!upstream_branch_gone(&detached, dir));
+        assert_eq!(
+            detached.git_calls().len(),
+            1,
+            "no lookup past a detached HEAD"
+        );
+
+        let untracked = FakeRunner::default().with_output(
+            "git",
+            [
+                "-C",
+                "/share/tool",
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "HEAD",
+            ],
+            true,
+            "main\n",
+        );
+        assert!(!upstream_branch_gone(&untracked, dir));
+        assert!(
+            !untracked
+                .git_calls()
+                .iter()
+                .any(|args| args.iter().any(|arg| arg == "ls-remote")),
+            "no remote probe without an upstream"
+        );
     }
 
     #[test]
@@ -3611,6 +3740,40 @@ mod tests {
         assert!(
             !stamp::remote_path(&fixture.roots.state_dir, "tool", "repo").exists(),
             "a failed refresh must not refresh the TTL stamp"
+        );
+    }
+
+    #[test]
+    fn real_deleted_upstream_branch_reports_it_not_a_fetch_failure() {
+        // The repository renamed its default branch: origin is reachable but
+        // the shallow clone's single-branch fetch asks for a ref that is
+        // gone. That needs a new clone, not a network check.
+        let fixture = Fixture::new("real-upstream-gone");
+        let checkout = RealCheckout::new(&fixture, "tool");
+        fixture_git(
+            &checkout.origin,
+            &["branch", "--quiet", "-m", "main", "trunk"],
+        );
+
+        let item = run_existing(&fixture, &checkout);
+
+        assert_eq!(item.reason, ItemReason::RepoPullFailed);
+        assert!(!item.failed);
+        assert!(
+            item.detail
+                .starts_with("pull failed (upstream branch deleted: ")
+                && item.detail.contains("refs/heads/main"),
+            "{}",
+            item.detail
+        );
+        let record = crate::stale_remote::read(&crate::stale_remote::record_path(
+            &fixture.roots.state_dir,
+            "tool",
+        ))
+        .expect("a failed refresh must leave a pull-failure record");
+        assert_eq!(
+            record.failure.reason,
+            crate::stale_remote::Reason::UpstreamGone
         );
     }
 

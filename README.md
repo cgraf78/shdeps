@@ -273,8 +273,12 @@ managers cannot silently present the checkout as current.
 
 A managed (non-development) clone is refreshed with `git fetch` followed by
 `git merge --ff-only @{upstream}`, so a failure names its real cause: `fetch
-failed: <Git's first error line>`, `diverged from origin`, `dirty working
-tree`, or `fast-forward failed: <Git's error line>`. The failure stays a
+failed: <Git's first error line>`, `upstream branch deleted: <Git's line>`,
+`diverged from origin`, `dirty working tree`, or `fast-forward failed: <Git's
+error line>`. A deleted upstream branch is told apart from a network failure
+by listing the tracked branch on origin (bounded, off the terminal) after
+the fetch failed on every transport; it needs a new clone, which picks up
+the repository's current default branch. The failure stays a
 non-fatal warning and is recorded in
 `$SHDEPS_STATE_DIR/<owner>/<repo>.repo.pull-failure` until a refresh succeeds,
 which lets `shdeps health` report a checkout that has been stuck for a day.
