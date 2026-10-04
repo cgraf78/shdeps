@@ -1210,37 +1210,43 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timed_run_kills_grandchildren_that_keep_pipes_open() {
-        let started = std::time::Instant::now();
+        let dir = crate::test_support::temp_dir("shdeps-timed-run-pipe-grandchild");
+        let finished = dir.join("grandchild-finished");
         let output = super::run(
             "sh",
-            &["-c", "sleep 30 & printf ready; wait"],
+            &[
+                "-c",
+                "(sleep 60; : >\"$1\") & printf ready; wait",
+                "sh",
+                finished.to_str().unwrap(),
+            ],
             Some(Duration::from_millis(100)),
         )
         .unwrap();
 
         assert!(output.timed_out);
-        // Loaded macOS runners exceed 2s on snapshot-probed teardown while
-        // still killing (not joining) the 30s grandchild; the ceiling stays
-        // far below the join proof either way.
-        let ceiling = if cfg!(target_os = "macos") {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(2)
-        };
+        // The grandchild writes its marker only after outliving its 60s
+        // sleep. Its absence once the run returns proves cleanup killed it
+        // instead of joining it, without a load-sensitive elapsed bound.
         assert!(
-            started.elapsed() < ceiling,
-            "timeout cleanup should not wait for a pipe-holding grandchild; elapsed={:?}",
-            started.elapsed()
+            !finished.exists(),
+            "timeout cleanup waited for a pipe-holding grandchild"
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn current_session_timed_run_kills_pipe_holding_grandchild_after_leader_exits() {
-        let started = std::time::Instant::now();
+        let dir = crate::test_support::temp_dir("shdeps-current-session-pipe-grandchild");
+        let finished = dir.join("grandchild-finished");
         let output = super::run_in_current_session(
             "sh",
-            &["-c", "sleep 3 & printf ready; exit 1"],
+            &[
+                "-c",
+                "(sleep 60; : >\"$1\") & printf ready; exit 1",
+                "sh",
+                finished.to_str().unwrap(),
+            ],
             Duration::from_millis(100),
         )
         .unwrap();
@@ -1248,18 +1254,11 @@ mod tests {
         assert!(output.timed_out);
         assert!(!output.success);
         assert_eq!(output.stdout, "ready");
-        // The ceiling must stay below the grandchild's 3s sleep to prove a
-        // kill rather than a join; macOS gets the remaining headroom because
-        // snapshot-probed teardown spikes past 2s under CI load.
-        let ceiling = if cfg!(target_os = "macos") {
-            Duration::from_millis(2500)
-        } else {
-            Duration::from_secs(2)
-        };
+        // As above: the marker exists only if the grandchild outlived its
+        // 60s sleep, so its absence proves a kill rather than a join.
         assert!(
-            started.elapsed() < ceiling,
-            "timeout cleanup should not join a pipe-holding grandchild; elapsed={:?}",
-            started.elapsed()
+            !finished.exists(),
+            "timeout cleanup joined a pipe-holding grandchild"
         );
     }
 
