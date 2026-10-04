@@ -43,6 +43,10 @@ const KILL_VERIFY_GRACE: Duration = Duration::from_secs(1);
 const KILL_SETTLE_GRACE: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const POLL: Duration = Duration::from_millis(20);
+// Hot-path tracking budget. A periodic observation that misses it is simply
+// retried on the next poll, so it may stay short. A one-shot observation whose
+// failure is final needs a longer budget: CLEANUP_SNAPSHOT_BUDGET, or
+// LEADER_EXIT_SNAPSHOT_BUDGET on the leader-exit paths.
 #[cfg(unix)]
 const TRACK_SNAPSHOT_BUDGET: Duration = Duration::from_millis(250);
 #[cfg(unix)]
@@ -53,6 +57,11 @@ const LEADER_EXIT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
 // runners a single whole-table scan can exceed 1s, which permanently
 // fails an otherwise clean teardown (the discovery error is retained).
 // 5s tolerates loaded scans while still bounding a genuinely wedged `ps`.
+// Linux scans every /proc entry, so this budget also bounds one-shot
+// observations whose failure is final (cancellation discovery, terminal
+// classification and restoration): on a host with thousands of processes
+// a single fresh pass can exceed the 250ms hot-path tracking budget.
+// Leader-exit paths use LEADER_EXIT_SNAPSHOT_BUDGET instead.
 #[cfg(target_os = "macos")]
 const CLEANUP_SNAPSHOT_BUDGET: Duration = Duration::from_secs(5);
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -1708,13 +1717,21 @@ impl OwnedChild {
         if foreground.is_active() {
             return foreground.restore();
         }
+        // Normal completion and cancellation usually hand the terminal back
+        // before this point. Nothing is left to restore then, and a fresh
+        // scan could not change the outcome, so skip it: it would only add
+        // latency while TERMINAL_OWNER serializes other foreground children.
+        if foreground.returned_to_caller() {
+            return Ok(());
+        }
         // A retained descendant may have changed process group and taken the
         // terminal since the last hot-path observation. Refresh attribution
         // before deciding whether that foreground group still belongs to this
         // boundary; stale ownership must neither strand the terminal nor
-        // reclaim it from an unrelated process.
+        // reclaim it from an unrelated process. This observation is not
+        // retried, so it gets the one-shot cleanup budget.
         self.boundary
-            .observe(Instant::now() + TRACK_SNAPSHOT_BUDGET)
+            .observe(Instant::now() + CLEANUP_SNAPSHOT_BUDGET)
             .ok_or_else(|| {
                 std::io::Error::other(
                     "could not snapshot owned subprocesses before terminal restoration",
@@ -1749,9 +1766,10 @@ impl OwnedChild {
         // different process group. Conventional 128+signal status is a
         // cancellation acknowledgement only when a fresh boundary snapshot
         // proves that the current foreground group still belongs to this
-        // exact invocation.
+        // exact invocation. Like terminal restoration, this observation is
+        // not retried, so it gets the one-shot cleanup budget.
         self.boundary
-            .observe(Instant::now() + TRACK_SNAPSHOT_BUDGET)
+            .observe(Instant::now() + CLEANUP_SNAPSHOT_BUDGET)
             .ok_or_else(|| {
                 std::io::Error::other(
                     "could not snapshot owned subprocesses before classifying terminal exit",
@@ -1842,6 +1860,14 @@ impl TerminalForeground {
         use std::os::fd::AsRawFd as _;
         // SAFETY: tcgetpgrp only inspects this live terminal descriptor.
         unsafe { libc::tcgetpgrp(self.tty.as_raw_fd()) == self.child_group }
+    }
+
+    // Whether the terminal is already back with the group that held it when
+    // this lease was taken.
+    fn returned_to_caller(&self) -> bool {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: tcgetpgrp only inspects this live terminal descriptor.
+        unsafe { libc::tcgetpgrp(self.tty.as_raw_fd()) == self.previous_group }
     }
 
     fn restore(&self) -> std::io::Result<()> {
