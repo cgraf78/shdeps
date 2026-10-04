@@ -3437,7 +3437,7 @@ fn default_path() -> std::ffi::OsString {
     std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin")
 }
 
-fn remote_ttl() -> u64 {
+pub(crate) fn remote_ttl() -> u64 {
     env::var("SHDEPS_REMOTE_TTL")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -3942,7 +3942,7 @@ mod tests {
             items: vec![Item::warning(
                 "cgraf78/ds",
                 ItemReason::RepoPullFailed,
-                "pull failed (no fast-forward; local clone)",
+                "pull failed (Not possible to fast-forward, aborting; local clone)",
                 false,
             )],
             ..Summary::default()
@@ -3971,7 +3971,7 @@ mod tests {
         assert!(String::from_utf8(stdout).unwrap().is_empty());
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "  warning  cgraf78/ds: pull failed (no fast-forward; local clone)\n"
+            "  warning  cgraf78/ds: pull failed (Not possible to fast-forward, aborting; local clone)\n"
         );
     }
 
@@ -3981,7 +3981,7 @@ mod tests {
             items: vec![Item::warning(
                 "cgraf78/ds",
                 ItemReason::RepoPullFailed,
-                "pull failed (no fast-forward; local clone)",
+                "pull failed (Not possible to fast-forward, aborting; local clone)",
                 false,
             )],
             ..Summary::default()
@@ -4009,7 +4009,7 @@ mod tests {
         assert!(events.iter().any(|event| {
             event["event"] == "warning"
                 && event["status"] == "warning"
-                && event["detail"] == "cgraf78/ds: pull failed (no fast-forward; local clone)"
+                && event["detail"] == "cgraf78/ds: pull failed (Not possible to fast-forward, aborting; local clone)"
         }));
         let summary_event = events
             .iter()

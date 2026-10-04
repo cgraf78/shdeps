@@ -271,6 +271,19 @@ code until the clone's branch divergence or connectivity problem is resolved.
 This warning is also emitted in JSONL progress so parent tools such as dotfiles
 managers cannot silently present the checkout as current.
 
+A managed (non-development) clone is refreshed with `git fetch` followed by
+`git merge --ff-only @{upstream}`, so a failure names its real cause: `fetch
+failed: <Git's first error line>`, `diverged from origin`, `dirty working
+tree`, or `fast-forward failed: <Git's error line>`. The failure stays a
+non-fatal warning and is recorded in
+`$SHDEPS_STATE_DIR/<owner>/<repo>.repo.pull-failure` until a refresh succeeds,
+which lets `shdeps health` report a checkout that has been stuck for a day.
+When the fetch fails and origin is the configured GitHub HTTPS URL or its SSH
+form, shdeps retries once over the other transport and keeps that origin only
+if the retry fetched; otherwise origin is restored. The retry runs detached
+from the terminal, so it fails instead of prompting. Explicit SSH or
+non-GitHub `SHDEPS_<NAME>_REPO` origins are never rewritten.
+
 Repository-root publication and replacement uses a private same-parent recovery
 journal while the shared checkout lock is held whenever an owned managed
 directory and a development symlink change places. The same recovery also
@@ -557,13 +570,17 @@ otherwise each problem is one line of exactly five tab-separated fields:
 | `deferred-uninstall`     | warn     | An `uninstall()` hook needed sudo without a terminal; run `shdeps prune` from a terminal      |
 | `pending-post`           | warn     | A `post()` hook has not completed and will be retried                                        |
 | `recovery-state`         | warn     | An interrupted update or prune left recovery records                                         |
+| `stale-remote`           | warn     | A `github:repo` checkout or `github:release` install has not refreshed for over a day (plus the remote TTL) while other dependencies did, or at least three consecutive recorded pull failures span that long; the detail names the cause |
 | `unreadable-state`       | fail     | Config or state could not be read, so the report is incomplete                               |
 
 A regular executable file at a command path (a raw release binary, or a
 launcher a client deliberately placed there) is not a problem: shdeps
-preserves such files. `pending-post`, `recovery-state`, and `archive-backup`
-are omitted while the recorded state-lock owner is still running, because
-that update or prune is creating and retiring them itself.
+preserves such files. `pending-post`, `recovery-state`, `archive-backup`, and
+`stale-remote` are omitted while the recorded state-lock owner is still
+running, because that update or prune is creating and retiring them itself.
+`stale-remote` compares stamps with each other rather than with the clock, so
+a host that was asleep stays quiet; its threshold adds the `SHDEPS_REMOTE_TTL`
+seen by `health`, so set the same value for `health` as for `update`.
 
 Exit status: `0` healthy, `1` problems reported, `3` the report is incomplete
 (some state could not be read, reported as `unreadable-state` alongside any

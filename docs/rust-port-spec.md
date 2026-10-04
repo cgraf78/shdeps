@@ -726,6 +726,13 @@ Revision stamps:
 $SHDEPS_STATE_DIR/<name>.rev
 ```
 
+Managed-clone pull-failure records (`since=`, `last=`, `failures=`, `reason=`,
+`detail=` lines; removed after the next successful refresh and by prune):
+
+```text
+$SHDEPS_STATE_DIR/<name>.repo.pull-failure
+```
+
 Extras links:
 
 ```text
@@ -807,7 +814,14 @@ Behavior:
   pull. A failed pull MUST preserve the user-owned clone, remain non-fatal, and
   produce a structured warning with an actionable cause in human and JSONL
   output; it MUST NOT be reported as current.
-- Existing clones are pulled/updated according to current behavior.
+- Existing managed clones are refreshed with `git fetch` then
+  `git merge --ff-only @{upstream}`. A failure MUST stay non-fatal, MUST name
+  its cause from Git (fetch failure with Git's first error line, divergence,
+  dirty tree, or another fast-forward error), and MUST persist
+  `<name>.repo.pull-failure` until the next successful refresh. A failed fetch
+  MAY retry the other transport of the configured GitHub URL; origin MUST only
+  move to a URL whose fetch just succeeded and MUST otherwise be restored.
+  Explicit SSH or non-GitHub overrides MUST NOT be rewritten.
 - An unrecorded existing managed root MUST be inspected and independently
   verified before transition preparation, candidate Git execution, permission
   changes, link publication, stamps, or manifest writes. Verification MUST use

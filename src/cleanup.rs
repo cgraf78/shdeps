@@ -711,7 +711,8 @@ pub(crate) fn remove_legacy_repo_command(
     Ok(unlink_symlink_with_exact_target(&public, &expected)?.then_some(public))
 }
 
-/// Removes TTL and revision stamps for a dependency name.
+/// Removes TTL and revision stamps, and the pull-failure record, for a
+/// dependency name.
 pub fn remove_stamps(state_dir: &Path, name: &str, summary: &mut Summary) -> Result<()> {
     let stamp_dir = state_dir
         .join(name)
@@ -740,7 +741,9 @@ pub fn remove_stamps(state_dir: &Path, name: &str, summary: &mut Summary) -> Res
             .and_then(|s| s.strip_suffix(".stamp"))
             .is_some_and(|kind| !kind.contains('.'));
         let is_rev = file_name == format!("{base_name}.rev");
-        if is_stamp || is_rev {
+        let is_pull_failure =
+            file_name == format!("{base_name}.{}", crate::stale_remote::RECORD_SUFFIX);
+        if is_stamp || is_rev || is_pull_failure {
             remove_file_if_present(&path, summary)?;
         }
     }
@@ -1972,6 +1975,20 @@ mod tests {
                 .join("custom-tool.custom.stamp")
                 .exists()
         );
+    }
+
+    #[test]
+    fn remove_stamps_removes_the_pull_failure_record() {
+        let fixture = Fixture::new("stamp-pull-failure");
+        fixture.write_state("owner/tool.repo.pull-failure", "since=1\n");
+        fixture.write_state("owner/tool.extra.repo.pull-failure", "since=1\n");
+
+        let mut summary = Summary::default();
+        remove_stamps(&fixture.roots.state_dir, "owner/tool", &mut summary).unwrap();
+
+        let state = &fixture.roots.state_dir;
+        assert!(!state.join("owner/tool.repo.pull-failure").exists());
+        assert!(state.join("owner/tool.extra.repo.pull-failure").exists());
     }
 
     #[test]

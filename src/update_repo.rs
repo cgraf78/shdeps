@@ -22,6 +22,7 @@ use crate::process::Runner;
 use crate::repo;
 use crate::repo_adopt;
 use crate::repo_verify;
+use crate::stale_remote;
 use crate::stamp;
 use crate::state;
 use crate::update::{Context, Item, ItemReason, Options, detail_with_action, verbose_enabled};
@@ -223,9 +224,14 @@ pub(crate) fn apply(
 ) -> Result<Item> {
     cancellation::check()?;
     match plan.route {
-        InstallRoute::Managed if plan.install_dir.join(".git").is_dir() => {
-            install_existing(entry, context, options, &plan.install_dir, mutation)
-        }
+        InstallRoute::Managed if plan.install_dir.join(".git").is_dir() => install_existing(
+            entry,
+            context,
+            options,
+            &plan.install_dir,
+            &plan.source.url,
+            mutation,
+        ),
         InstallRoute::Managed => install_fresh(
             entry,
             context,
@@ -360,19 +366,18 @@ fn install_development(
     let rev_before = stamp::revision_read(&revision_path)?;
     let mut status = development_git_status(&verified, context.runner, local_clone)?;
     let mut refresh_stamp = false;
-    let mut pull_failed = false;
+    let mut pull_failure: Option<String> = None;
 
     if !stamp::remote_fresh(&stamp_path, options.freshness()) && status.is_clean() {
         if development_has_upstream(&verified, context.runner, local_clone)? {
             mutation.begin()?;
-            if development_pull(&verified, context.runner, local_clone)? {
-                refresh_stamp = true;
-            } else {
+            match development_pull(&verified, context.runner, local_clone)? {
+                Ok(()) => refresh_stamp = true,
                 // A local development clone is user-owned, so shdeps must not
                 // reset or rebase it. Keep serving the checkout, but preserve
                 // the failed pull as a first-class warning instead of making a
                 // stale command look current.
-                pull_failed = true;
+                Err(stderr) => pull_failure = Some(stderr),
             }
         } else {
             // Local-only dev clones are a valid dependency source. Touching the
@@ -405,7 +410,7 @@ fn install_development(
         || status.dirty
         || previous_target.as_deref() != Some(local_clone)
         || rev_before != rev_after;
-    if !pull_failed {
+    if pull_failure.is_none() {
         let _ = mutation.resolve(changed)?;
     }
     let action = if previous_target.as_deref() != Some(local_clone) {
@@ -422,11 +427,11 @@ fn install_development(
         detail = format!("{detail} (local clone)");
     }
 
-    Ok(if pull_failed {
+    Ok(if let Some(stderr) = pull_failure {
         Item::warning(
             entry.name.clone(),
             ItemReason::RepoPullFailed,
-            local_pull_failure_detail(status),
+            local_pull_failure_detail(status, &stderr),
             changed,
         )
     } else if changed {
@@ -470,6 +475,7 @@ fn install_verified_existing(
     }
     if !was_fresh {
         stamp::remote_touch(&stamp_path, options.now)?;
+        let _ = stale_remote::clear(&context.roots.state_dir, &entry.name);
     }
     record_success(entry, context, install_dir)?;
 
@@ -508,6 +514,7 @@ fn install_existing(
     context: &Context<'_, impl Runner>,
     options: Options,
     install_dir: &Path,
+    configured_url: &str,
     mutation: &mut MutationIntent,
 ) -> Result<Item> {
     cancellation::check()?;
@@ -532,35 +539,25 @@ fn install_existing(
     }
 
     let head_before = git_head(context.runner, install_dir);
-    let pulled = pull(context.runner, install_dir)
-        || (prefer_ssh_origin(context.runner, install_dir) && pull(context.runner, install_dir));
+    let refreshed = refresh(context.runner, install_dir, configured_url);
     cancellation::check()?;
-    if !pulled {
-        // Bash treats an existing clone pull failure as a warning, not an
-        // install failure: the previous checkout is still usable, and hooks
-        // should not run because no successful change happened.
+    if let Err(failure) = refreshed {
+        // An existing clone that cannot be refreshed is a warning, not an
+        // install failure: the previous checkout is still usable, a network
+        // blip must not turn a cron update red, and hooks should not run
+        // because nothing changed. The cause comes from Git itself, so a
+        // transient fetch failure no longer reads like a diverged checkout.
         //
-        // The pre-fix code reported every pull failure as the opaque string
-        // `"update failed"`, which gave operators no way to distinguish a
-        // transient network outage from a managed clone that diverged
-        // because someone edited files inside it. Run `git status` to
-        // bucket the failure: a dirty working tree is a user-recoverable
-        // situation, anything else is most likely a network/fast-forward
-        // problem that the next run will retry. Keep `failed: false` so a
-        // shdeps update does not turn a transient network failure into a
-        // hard build break — the more descriptive detail string is the
-        // operator-visible signal.
-        let post_status = git_status(context.runner, install_dir);
-        cancellation::check()?;
-        // Three-way bucketing: a dirty working tree is the
-        // user-recoverable case; a confirmed-clean tree with a pull
-        // failure points at a network/no-fast-forward issue; an
-        // unreported status (git command itself failed) means we
-        // genuinely cannot classify and must say so rather than
-        // guess. Lumping unreported into "no fast-forward" hid
-        // broken-index/missing-git failures behind a misleading
-        // label.
-        let detail = pull_failure_detail(post_status);
+        // The record keeps that warning from being forgotten: it survives
+        // until a refresh succeeds, so `shdeps health` can report a checkout
+        // that has been stuck for a day (`stale-remote`). It is diagnostic,
+        // so failing to write it must not fail the update.
+        let _ = stale_remote::record_failure(
+            &context.roots.state_dir,
+            &entry.name,
+            &failure,
+            options.now,
+        );
         secure_managed_clone_permissions(install_dir)?;
         let _ = write_permwalk_stamp(&context.roots.state_dir, &entry.name, install_dir);
         if let Some(item) = missing_explicit_command(entry, install_dir) {
@@ -570,7 +567,7 @@ fn install_existing(
         return Ok(Item::warning(
             entry.name.clone(),
             ItemReason::RepoPullFailed,
-            detail,
+            format!("pull failed ({})", failure.cause()),
             false,
         ));
     }
@@ -583,6 +580,7 @@ fn install_existing(
         return Ok(item);
     }
     stamp::remote_touch(&stamp_path, options.now)?;
+    let _ = stale_remote::clear(&context.roots.state_dir, &entry.name);
     record_success(entry, context, install_dir)?;
     let changed = options.reinstall || head_before != head_after;
     let _ = mutation.resolve(changed || push_url_changed)?;
@@ -682,6 +680,8 @@ fn install_fresh(
     cancellation::check()?;
     let stamp_path = stamp::remote_path(&context.roots.state_dir, &entry.name, "repo");
     stamp::remote_touch_cancellable(&stamp_path, options.now)?;
+    // A fresh clone supersedes whatever stopped the previous checkout.
+    let _ = stale_remote::clear(&context.roots.state_dir, &entry.name);
     cancellation::check()?;
     record_success(entry, context, install_dir)?;
     #[cfg(unix)]
@@ -1111,12 +1111,18 @@ fn development_has_upstream(
     Ok(output.success)
 }
 
+/// Pulls a development clone; `Err` carries Git's stderr for the warning.
 fn development_pull(
     verified: &repo_verify::VerifiedDevelopment,
     runner: &impl Runner,
     dir: &Path,
-) -> Result<bool> {
-    Ok(verified.run_pull(dir, runner)?.success)
+) -> Result<std::result::Result<(), String>> {
+    let output = verified.run_pull(dir, runner)?;
+    Ok(if output.success {
+        Ok(())
+    } else {
+        Err(output.stderr)
+    })
 }
 
 fn development_git_head(
@@ -1135,21 +1141,19 @@ fn development_git_head(
     Ok(output.success.then(|| output.stdout.trim().to_owned()))
 }
 
-fn pull_failure_detail(status: GitStatus) -> String {
-    format!("pull failed ({})", pull_failure_cause(status))
-}
-
-fn local_pull_failure_detail(status: GitStatus) -> String {
-    format!("pull failed ({}; local clone)", pull_failure_cause(status))
-}
-
-fn pull_failure_cause(status: GitStatus) -> &'static str {
-    if !status.reported {
-        "status unavailable"
-    } else if status.dirty {
-        "dirty working tree"
+fn local_pull_failure_detail(status: GitStatus, stderr: &str) -> String {
+    // A development clone is user-owned and pulled in one bounded command, so
+    // only the dirty case is classified; otherwise Git's own first line is
+    // the cause rather than a guess.
+    let cause = if status.dirty {
+        "dirty working tree".to_owned()
     } else {
-        "no fast-forward"
+        stale_remote::first_line(stderr)
+    };
+    if cause.is_empty() {
+        "pull failed (local clone)".to_owned()
+    } else {
+        format!("pull failed ({cause}; local clone)")
     }
 }
 
@@ -1157,32 +1161,143 @@ fn git_head(runner: &impl Runner, dir: &Path) -> Option<String> {
     git(runner, dir, &["rev-parse", "HEAD"]).map(|output| output.stdout.trim().to_owned())
 }
 
-fn pull(runner: &impl Runner, dir: &Path) -> bool {
-    git(runner, dir, &["pull", "--ff-only", "--quiet"]).is_some()
+/// Bound on the alternate-transport fetch retry. Generous for a shallow
+/// clone's incremental fetch; its real job is keeping the retry off the
+/// terminal (see [`fetch_via_alternate_origin`]).
+const ALTERNATE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Fetches, then fast-forwards, an existing managed checkout.
+///
+/// One `pull --ff-only` cannot say which half failed, and its exit status is
+/// all the old code kept, so a fetch that never reached the network was
+/// reported as "no fast-forward". Split, each half reports its own cause.
+fn refresh(
+    runner: &impl Runner,
+    dir: &Path,
+    configured_url: &str,
+) -> std::result::Result<(), stale_remote::Failure> {
+    fetch(runner, dir, configured_url)?;
+    let merge = git_output(
+        runner,
+        dir,
+        &["merge", "--ff-only", "--quiet", "@{upstream}"],
+    );
+    if merge.as_ref().is_some_and(|output| output.success) {
+        return Ok(());
+    }
+    let stderr = merge.map(|output| output.stderr).unwrap_or_default();
+    // Divergence is definitive (no fast-forward exists whatever the tree
+    // holds) and needs a new clone, so it wins over a dirty tree, which may
+    // only be untracked build output. An unreported status means the cause
+    // genuinely cannot be classified.
+    let reason = if has_unpublished_commits(runner, dir) {
+        stale_remote::Reason::Diverged
+    } else {
+        let status = git_status(runner, dir);
+        if !status.reported {
+            stale_remote::Reason::Status
+        } else if status.dirty {
+            stale_remote::Reason::Dirty
+        } else {
+            stale_remote::Reason::Merge
+        }
+    };
+    Err(stale_remote::Failure::new(reason, &stderr))
+}
+
+/// Whether HEAD has commits its upstream lacks, so no fast-forward exists.
+/// Exit codes and localized messages are not portable signals; a commit
+/// count is. In a shallow clone a rewritten upstream shares no visible
+/// history, which counts the local tip and correctly reads as diverged.
+fn has_unpublished_commits(runner: &impl Runner, dir: &Path) -> bool {
+    git(runner, dir, &["rev-list", "--count", "@{upstream}..HEAD"])
+        .and_then(|output| output.stdout.trim().parse::<u64>().ok())
+        .is_some_and(|count| count > 0)
+}
+
+/// Fetches the checkout's upstream, retrying once over the other GitHub
+/// transport. The reported failure is always the current origin's: that is
+/// the remote the checkout keeps using, so it is the one to act on.
+fn fetch(
+    runner: &impl Runner,
+    dir: &Path,
+    configured_url: &str,
+) -> std::result::Result<(), stale_remote::Failure> {
+    let primary = git_output(runner, dir, &["fetch", "--quiet"]);
+    if primary.as_ref().is_some_and(|output| output.success) {
+        return Ok(());
+    }
+    if fetch_via_alternate_origin(runner, dir, configured_url) {
+        return Ok(());
+    }
+    let stderr = primary.map(|output| output.stderr).unwrap_or_default();
+    Err(stale_remote::Failure::new(
+        stale_remote::Reason::Fetch,
+        &stderr,
+    ))
+}
+
+/// Retries the fetch over the other transport of the configured GitHub URL
+/// and keeps that origin only if the fetch succeeded.
+///
+/// The old fallback switched HTTPS to SSH for good after any failed pull,
+/// including a network blip or a diverged tree, and never switched back, so
+/// on a host without a GitHub SSH key one blip stranded the checkout on a
+/// remote it could never reach. The rule now: origin only moves to a URL
+/// that just worked, otherwise it is restored. That still adopts SSH for a
+/// repository that turned private, heals a checkout stranded by the old
+/// code once HTTPS works, and leaves a non-GitHub or explicit SSH origin
+/// alone.
+///
+/// The retry is bounded, which also runs it detached from the terminal: a
+/// fallback the user did not choose must fail fast rather than stop an
+/// interactive update at a credential or host-key prompt.
+fn fetch_via_alternate_origin(runner: &impl Runner, dir: &Path, configured_url: &str) -> bool {
+    // The stored value, not `remote get-url`: an `insteadOf` rewrite would
+    // otherwise be written back over the configured URL on restore.
+    let Some(origin) = git(runner, dir, &["config", "--get", "remote.origin.url"])
+        .map(|output| output.stdout.trim().to_owned())
+    else {
+        return false;
+    };
+    let Some(alternate) = alternate_origin(&origin, configured_url) else {
+        return false;
+    };
+    if git(runner, dir, &["remote", "set-url", "origin", &alternate]).is_none() {
+        return false;
+    }
+    let retry = git_output_bounded(
+        runner,
+        dir,
+        &["fetch", "--quiet"],
+        Some(ALTERNATE_FETCH_TIMEOUT),
+    );
+    if retry.is_some_and(|output| output.success) {
+        if let Some(ssh) = repo::ssh_fallback(configured_url) {
+            set_push_url(runner, dir, &ssh);
+        }
+        return true;
+    }
+    // Best effort: if this is interrupted, the next run's failed fetch over
+    // the alternate retries the original transport and moves back on success.
+    let _ = git(runner, dir, &["remote", "set-url", "origin", &origin]);
+    false
+}
+
+/// The other transport for `origin`, only within the configured GitHub URL
+/// and its SSH form. `None` for anything else: an explicit SSH or
+/// non-GitHub override is the user's choice, not a fallback candidate.
+fn alternate_origin(origin: &str, configured_url: &str) -> Option<String> {
+    let ssh = repo::ssh_fallback(configured_url)?;
+    if origin == ssh {
+        Some(configured_url.to_owned())
+    } else {
+        (repo::ssh_fallback(origin).as_deref() == Some(ssh.as_str())).then_some(ssh)
+    }
 }
 
 fn remote_origin(runner: &impl Runner, dir: &Path) -> Option<String> {
     git(runner, dir, &["remote", "get-url", "origin"]).map(|output| output.stdout.trim().to_owned())
-}
-
-fn prefer_ssh_origin(runner: &impl Runner, install_dir: &Path) -> bool {
-    let Some(origin) = remote_origin(runner, install_dir) else {
-        return false;
-    };
-    let Some(fallback) = repo::ssh_fallback(&origin) else {
-        return false;
-    };
-    if git(
-        runner,
-        install_dir,
-        &["remote", "set-url", "origin", &fallback],
-    )
-    .is_none()
-    {
-        return false;
-    }
-    set_push_url(runner, install_dir, &fallback);
-    true
 }
 
 fn sync_ssh_push_url(runner: &impl Runner, install_dir: &Path) -> bool {
@@ -1790,15 +1905,29 @@ fn clone_repo(runner: &impl Runner, url: &str, target: &Path) -> bool {
 }
 
 fn git(runner: &impl Runner, dir: &Path, args: &[&str]) -> Option<crate::process::Output> {
+    git_output(runner, dir, args).filter(|output| output.success)
+}
+
+/// Runs `git -C dir args` and keeps the output even when Git fails, so
+/// callers that report a failure can quote Git's stderr.
+fn git_output(runner: &impl Runner, dir: &Path, args: &[&str]) -> Option<crate::process::Output> {
+    git_output_bounded(runner, dir, args, None)
+}
+
+/// [`git_output`] with an optional bound. A bounded command runs in its own
+/// session without the controlling terminal, so it cannot prompt.
+fn git_output_bounded(
+    runner: &impl Runner,
+    dir: &Path,
+    args: &[&str],
+    timeout: Option<std::time::Duration>,
+) -> Option<crate::process::Output> {
     let dir = dir.display().to_string();
     let mut full = Vec::with_capacity(args.len() + 2);
     full.push("-C");
     full.push(dir.as_str());
     full.extend_from_slice(args);
-    runner
-        .run("git", &full, None)
-        .ok()
-        .filter(|output| output.success)
+    runner.run("git", &full, timeout).ok()
 }
 
 fn temp_clone_path(install_dir: &Path) -> PathBuf {
@@ -1971,11 +2100,7 @@ mod tests {
             }
         }
 
-        fn context<'a>(
-            &'a self,
-            runner: &'a FakeRunner,
-            pkg_mgr: &'a str,
-        ) -> Context<'a, FakeRunner> {
+        fn context<'a, R: Runner>(&'a self, runner: &'a R, pkg_mgr: &'a str) -> Context<'a, R> {
             Context {
                 manifest_path: &self.manifest_path,
                 roots: &self.roots,
@@ -2296,6 +2421,7 @@ mod tests {
             &context,
             Fixture::options(),
             &install_dir,
+            "https://github.com/owner/tool",
             &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
         )
         .unwrap();
@@ -3024,6 +3150,7 @@ mod tests {
             &context,
             Fixture::options(),
             &install_dir,
+            "https://github.com/owner/tool",
             &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
         )
         .unwrap();
@@ -3282,6 +3409,7 @@ mod tests {
             &context,
             Fixture::options(),
             &install_dir,
+            "https://github.com/owner/tool",
             &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
         )
         .unwrap();
@@ -3293,6 +3421,7 @@ mod tests {
             &context,
             Fixture::options(),
             &install_dir,
+            "https://github.com/owner/tool",
             &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
         )
         .unwrap();
@@ -3302,5 +3431,240 @@ mod tests {
             fs::read_link(fixture.roots.bin_dir.join("tool")).unwrap(),
             install_dir.join("bin").join("tool")
         );
+    }
+
+    /// Real Git isolated from the developer's global and system config, so a
+    /// personal `insteadOf`, hook, or localized message catalog cannot change
+    /// what these tests observe.
+    struct HermeticGit;
+
+    impl Runner for HermeticGit {
+        fn exists(&self, command: &str) -> bool {
+            command == "git"
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+            _timeout: Option<Duration>,
+        ) -> io::Result<Output> {
+            let mut command = std::process::Command::new(program);
+            hermetic_git_env(&mut command);
+            command.args(args);
+            let output = crate::test_support::run_subprocess(command)?;
+            Ok(Output {
+                success: output.status.success(),
+                timed_out: false,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        }
+    }
+
+    fn hermetic_git_env(command: &mut std::process::Command) {
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C");
+    }
+
+    fn fixture_git(dir: &Path, args: &[&str]) -> String {
+        let mut command = std::process::Command::new("git");
+        hermetic_git_env(&mut command);
+        command
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+            ])
+            .arg(dir)
+            .args(args);
+        let output = crate::test_support::run_subprocess(command).unwrap();
+        assert!(
+            output.status.success(),
+            "git -C {} {} failed: {}",
+            dir.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A bare `main` origin, a seed working copy that publishes to it, and a
+    /// shallow managed clone made the way `install_fresh` makes one.
+    struct RealCheckout {
+        origin: PathBuf,
+        seed: PathBuf,
+        install_dir: PathBuf,
+    }
+
+    impl RealCheckout {
+        fn new(fixture: &Fixture, name: &str) -> Self {
+            let origin = fixture.roots.home.join("origin.git");
+            let seed = fixture.roots.home.join("seed");
+            fs::create_dir_all(&origin).unwrap();
+            fs::create_dir_all(&seed).unwrap();
+            fixture_git(&origin, &["init", "--quiet", "--bare"]);
+            fixture_git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+            fixture_git(&seed, &["init", "--quiet"]);
+            fixture_git(&seed, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+            fs::write(seed.join("README"), "one\n").unwrap();
+            fixture_git(&seed, &["add", "README"]);
+            fixture_git(&seed, &["commit", "--quiet", "-m", "one"]);
+            let url = format!("file://{}", origin.display());
+            fixture_git(&seed, &["remote", "add", "origin", &url]);
+            fixture_git(&seed, &["push", "--quiet", "origin", "main"]);
+            let install_dir = fixture.install_dir(name);
+            fixture_git(
+                &fixture.roots.home,
+                &[
+                    "clone",
+                    "--quiet",
+                    "--depth",
+                    "1",
+                    &url,
+                    &install_dir.display().to_string(),
+                ],
+            );
+            Self {
+                origin,
+                seed,
+                install_dir,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("file://{}", self.origin.display())
+        }
+
+        fn publish(&self, content: &str, extra: &[&str]) {
+            fs::write(self.seed.join("README"), content).unwrap();
+            fixture_git(&self.seed, &["add", "README"]);
+            let mut commit = vec!["commit", "--quiet", "-m", content.trim()];
+            commit.extend_from_slice(extra);
+            fixture_git(&self.seed, &commit);
+            fixture_git(
+                &self.seed,
+                &["push", "--quiet", "--force", "origin", "main"],
+            );
+        }
+
+        fn head(&self) -> String {
+            fixture_git(&self.install_dir, &["rev-parse", "HEAD"])
+        }
+    }
+
+    fn run_existing(fixture: &Fixture, checkout: &RealCheckout) -> crate::update::Item {
+        let runner = HermeticGit;
+        let context = fixture.context(&runner, "apt");
+        install_existing(
+            &fixture.entry("tool"),
+            &context,
+            Fixture::options(),
+            &checkout.install_dir,
+            &checkout.url(),
+            &mut crate::hooks::MutationIntent::new(&fixture.roots.state_dir, "tool"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn real_fetch_failure_reports_git_cause_not_fast_forward() {
+        // The reported incident: the network fetch failed, nothing was
+        // fetched, and the clean checkout already matched upstream, yet the
+        // warning said "no fast-forward". Hide the origin (an empty directory
+        // in its place, so the URL still resolves on every platform).
+        let fixture = Fixture::new("real-fetch-failure");
+        let checkout = RealCheckout::new(&fixture, "tool");
+        fs::rename(&checkout.origin, fixture.roots.home.join("moved.git")).unwrap();
+        fs::create_dir_all(&checkout.origin).unwrap();
+
+        let item = run_existing(&fixture, &checkout);
+
+        assert_eq!(item.reason, ItemReason::RepoPullFailed);
+        assert!(!item.failed);
+        assert!(
+            item.detail.starts_with("pull failed (fetch failed: ")
+                && item
+                    .detail
+                    .contains("does not appear to be a git repository"),
+            "{}",
+            item.detail
+        );
+        let record = crate::stale_remote::read(&crate::stale_remote::record_path(
+            &fixture.roots.state_dir,
+            "tool",
+        ))
+        .expect("a failed refresh must leave a pull-failure record");
+        assert_eq!(record.failure.reason, crate::stale_remote::Reason::Fetch);
+        assert_eq!((record.since, record.last), (NOW, NOW));
+        assert_eq!(
+            fixture_git(&checkout.install_dir, &["remote", "get-url", "origin"]),
+            checkout.url()
+        );
+        assert!(
+            !stamp::remote_path(&fixture.roots.state_dir, "tool", "repo").exists(),
+            "a failed refresh must not refresh the TTL stamp"
+        );
+    }
+
+    #[test]
+    fn real_rewritten_upstream_reports_divergence() {
+        let fixture = Fixture::new("real-diverged");
+        let checkout = RealCheckout::new(&fixture, "tool");
+        checkout.publish("rewritten\n", &["--amend"]);
+
+        let item = run_existing(&fixture, &checkout);
+
+        assert_eq!(item.reason, ItemReason::RepoPullFailed);
+        assert_eq!(item.detail, "pull failed (diverged from origin)");
+    }
+
+    #[test]
+    fn real_conflicting_local_edit_reports_dirty_tree() {
+        let fixture = Fixture::new("real-dirty");
+        let checkout = RealCheckout::new(&fixture, "tool");
+        checkout.publish("two\n", &[]);
+        fs::write(checkout.install_dir.join("README"), "local edit\n").unwrap();
+
+        let item = run_existing(&fixture, &checkout);
+
+        assert_eq!(item.reason, ItemReason::RepoPullFailed);
+        assert_eq!(item.detail, "pull failed (dirty working tree)");
+    }
+
+    #[test]
+    fn real_successful_refresh_fast_forwards_and_clears_the_record() {
+        let fixture = Fixture::new("real-success");
+        let checkout = RealCheckout::new(&fixture, "tool");
+        let before = checkout.head();
+        checkout.publish("two\n", &[]);
+        crate::stale_remote::record_failure(
+            &fixture.roots.state_dir,
+            "tool",
+            &crate::stale_remote::Failure::new(crate::stale_remote::Reason::Fetch, "boom"),
+            NOW - 60,
+        )
+        .unwrap();
+
+        let item = run_existing(&fixture, &checkout);
+
+        assert!(item.changed, "{item:?}");
+        assert_ne!(checkout.head(), before);
+        assert_eq!(
+            fs::read_to_string(checkout.install_dir.join("README")).unwrap(),
+            "two\n"
+        );
+        assert!(
+            !crate::stale_remote::record_path(&fixture.roots.state_dir, "tool").exists(),
+            "a successful refresh must remove the pull-failure record"
+        );
+        assert!(stamp::remote_path(&fixture.roots.state_dir, "tool", "repo").exists());
     }
 }

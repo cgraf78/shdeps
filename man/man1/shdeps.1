@@ -95,8 +95,9 @@ and
 .BR deferred-post ,
 .BR deferred-uninstall ,
 .BR pending-post ,
+.BR recovery-state ,
 and
-.B recovery-state
+.B stale-remote
 (warn).
 Later releases may add kinds, never columns; ignore unknown kinds.
 Exits 0 when healthy, 1 when problems are reported, and 3 when the report is
@@ -301,6 +302,16 @@ If that pull fails, shdeps preserves the user-owned clone and reports a
 non-fatal warning instead of presenting potentially stale code as current.
 Resolve the clone's branch divergence or connectivity problem before retrying
 the update.
+Managed clones are refreshed with
+.B git fetch
+and
+.BR "git merge \-\-ff\-only" ;
+a failure is a non-fatal warning naming Git's cause, recorded as
+.IB name .repo.pull-failure
+in the state directory until a refresh succeeds.
+A failed fetch is retried once over the other GitHub transport (HTTPS or SSH)
+of the configured URL, and origin is kept on that transport only if the retry
+succeeded.
 .TP
 .B github:release
 Downloads a pre-built binary from GitHub Releases (the
