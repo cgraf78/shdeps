@@ -9104,6 +9104,7 @@ sys.exit(0)
         const READY_ENV: &str = "SHDEPS_TEST_EXACT_TERM_COUNT_READY";
         const LEADER_COUNT_ENV: &str = "SHDEPS_TEST_EXACT_TERM_LEADER_COUNT";
         const CHILD_READY_ENV: &str = "SHDEPS_TEST_EXACT_TERM_CHILD_READY";
+        const CHILD_READY_AT_ENV: &str = "SHDEPS_TEST_EXACT_TERM_CHILD_READY_AT";
         const CHILD_COUNT_ENV: &str = "SHDEPS_TEST_EXACT_TERM_CHILD_COUNT";
         fn record_count(path: &std::path::Path, count: usize) {
             use std::io::Write as _;
@@ -9125,6 +9126,8 @@ sys.exit(0)
             let child_ready = std::path::PathBuf::from(std::env::var(CHILD_READY_ENV).unwrap());
             let child_count = std::path::PathBuf::from(std::env::var(CHILD_COUNT_ENV).unwrap());
             if role == "child" {
+                let child_ready_at =
+                    std::path::PathBuf::from(std::env::var(CHILD_READY_AT_ENV).unwrap());
                 // The handler records each delivery synchronously, so the
                 // count file observes the TERM even when the grace freeze
                 // reaps this child before it wakes. Install before
@@ -9132,6 +9135,7 @@ sys.exit(0)
                 // racing installation, and unblocking runs it through the
                 // handler above.
                 install_test_term_recorder(&child_count);
+                std::fs::write(&child_ready_at, monotonic_nanos().to_string()).unwrap();
                 std::fs::write(&child_ready, std::process::id().to_string()).unwrap();
                 unblock_test_term();
                 // Linger until reaped so a duplicate delivery still lands in
@@ -9191,6 +9195,7 @@ sys.exit(0)
         let ready_path = dir.join("leader.ready");
         let leader_terms = dir.join("leader.terms");
         let child_ready = dir.join("child.ready");
+        let child_ready_at = dir.join("child.ready-at");
         let child_terms = dir.join("child.terms");
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -9199,6 +9204,7 @@ sys.exit(0)
             .env(READY_ENV, &ready_path)
             .env(LEADER_COUNT_ENV, &leader_terms)
             .env(CHILD_READY_ENV, &child_ready)
+            .env(CHILD_READY_AT_ENV, &child_ready_at)
             .env(CHILD_COUNT_ENV, &child_terms)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -9215,6 +9221,9 @@ sys.exit(0)
             std::thread::sleep(super::POLL);
         }
 
+        // Taken before stop() delivers TERM, so `ready_at - signaled_at`
+        // over-approximates how late in the grace window the child appeared.
+        let signaled_at = monotonic_nanos();
         child.stop(libc::SIGTERM).unwrap();
         // No settle wait belongs here: stop() reaps the whole boundary
         // before it returns, so both roles are already dead and their count
@@ -9231,12 +9240,39 @@ sys.exit(0)
                 .unwrap_or_default()
         };
         assert_eq!(count(&leader_terms), 1, "leader received repeated TERM");
+        // A handler-forked child gets graceful TERM only if the stop loop
+        // discovers it inside the TERM grace; one found later is KILLed
+        // without TERM. Report how late the child appeared so a failure on a
+        // starved host (slow procfs discovery) is distinguishable from a
+        // missed or duplicated delivery.
+        let ready_latency = std::fs::read_to_string(&child_ready_at)
+            .ok()
+            .and_then(|at| at.trim().parse::<u64>().ok())
+            .map(|at| Duration::from_nanos(at.saturating_sub(signaled_at)));
         assert_eq!(
             count(&child_terms),
             1,
-            "handler-created child did not receive exactly one TERM (child ready: {})",
-            child_ready.is_file()
+            "handler-created child did not receive exactly one TERM \
+             (child ready: {}, ready {ready_latency:?} after TERM, grace {:?})",
+            child_ready.is_file(),
+            super::GRACE
         );
+    }
+
+    // CLOCK_MONOTONIC is system-wide, so readings from the outer test and
+    // its re-executed roles are directly comparable.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn monotonic_nanos() -> u64 {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime initializes the complete local timespec.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+            0
+        );
+        now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
