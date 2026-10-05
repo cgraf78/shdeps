@@ -9592,6 +9592,7 @@ fn missing_term_after_slow_ready_is_inconclusive() {
     assert!(missing_term_is_inconclusive(true, Duration::from_secs(5)));
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_pids(path: &Path, count: usize, timeout: Duration, description: &str) -> Vec<u32> {
     let started = Instant::now();
     loop {
