@@ -1491,13 +1491,14 @@ impl OwnedChild {
                         )
                     })
                 });
-                // A signal that interrupted a retry takes precedence: report
-                // the leader as not yet exited so the caller's cancellation
-                // path stops the boundary with its own proof, instead of
-                // failing here or waiting out the retry budget.
-                if matches!(&observed, Err(error) if error.kind() == std::io::ErrorKind::Interrupted)
-                    && received_signal().is_some()
-                {
+                // A pending signal takes precedence over a failed leader-exit
+                // proof, whatever error the walk reported (a retry it
+                // interrupted can surface as another kind through a fallback
+                // snapshot): report the leader as not yet exited so the
+                // caller's cancellation path stops the boundary with its own
+                // bounded proof, instead of failing here and leaving teardown
+                // to the KILL-only Drop path.
+                if observed.is_err() && received_signal().is_some() {
                     return Ok(false);
                 }
                 observed.map_err(|error| {
@@ -1565,7 +1566,7 @@ impl OwnedChild {
                 &mut self.boundary,
             )?;
             self.leader_exited = true;
-            let empty = match with_leader_exit_attempts(|deadline| {
+            let empty = match with_leader_reap_attempts(|deadline| {
                 self.boundary.observe_after_leader_reap(deadline)
             }) {
                 Ok(empty) => empty,
@@ -2705,6 +2706,23 @@ fn with_leader_exit_attempts<T>(
 ) -> std::io::Result<T> {
     with_leader_exit_attempts_using(
         |attempt| escalating_budget(LEADER_EXIT_SNAPSHOT_BUDGET, attempt),
+        true,
+        observe,
+    )
+}
+
+/// `with_leader_exit_attempts` for the proof after the leader was reaped.
+/// Its retries are not interruptible: the leader is gone, so `exited` cannot
+/// hand the boundary back to the cancellation path, and an interrupted proof
+/// would fail a run whose walk could still have finished and acknowledged the
+/// signal through `finish_wait`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn with_leader_reap_attempts<T>(
+    observe: impl FnMut(Instant) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    with_leader_exit_attempts_using(
+        |attempt| escalating_budget(LEADER_EXIT_SNAPSHOT_BUDGET, attempt),
+        false,
         observe,
     )
 }
@@ -2717,6 +2735,7 @@ fn with_leader_exit_attempts<T>(
 #[cfg(unix)]
 fn with_leader_exit_attempts_using<T>(
     budget: impl Fn(u32) -> Duration,
+    interruptible_retries: bool,
     mut observe: impl FnMut(Instant) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let mut attempt = 1;
@@ -2724,7 +2743,8 @@ fn with_leader_exit_attempts_using<T>(
         let deadline = Instant::now() + budget(attempt);
         // The first attempt keeps its historical behavior; retries end early
         // on a pending signal (see `SIGNAL_ENDS_PROOF_WALK`).
-        let _interruptible = (attempt > 1).then(InterruptibleProofWalk::begin);
+        let _interruptible =
+            (interruptible_retries && attempt > 1).then(InterruptibleProofWalk::begin);
         match observe(deadline) {
             // A pending cancellation signal ends the retries: stopping the
             // boundary is the next step either way, so a starved proof must
@@ -10745,7 +10765,7 @@ while True:
             Duration::from_millis(5) * attempt
         };
         let mut calls = 0;
-        let result = super::with_leader_exit_attempts_using(budget, |deadline| {
+        let result = super::with_leader_exit_attempts_using(budget, true, |deadline| {
             calls += 1;
             if calls < 2 {
                 walk_cut_short(deadline)
@@ -10763,7 +10783,7 @@ while True:
 
         let mut calls = 0;
         let result: std::io::Result<bool> =
-            super::with_leader_exit_attempts_using(budget, |deadline| {
+            super::with_leader_exit_attempts_using(budget, true, |deadline| {
                 calls += 1;
                 walk_cut_short(deadline)
             });
@@ -10782,7 +10802,6 @@ while True:
         }
 
         let _signals = super::Signals::install_with_restore(true).unwrap();
-        let started = Instant::now();
         let mut attempts = 0;
         let result: std::io::Result<bool> = super::with_leader_exit_attempts_using(
             |attempt| {
@@ -10792,6 +10811,7 @@ while True:
                     Duration::from_secs(30)
                 }
             },
+            true,
             |deadline| {
                 attempts += 1;
                 if attempts == 1 {
@@ -10813,13 +10833,74 @@ while True:
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         assert_eq!(attempts, 2);
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the retry waited out its budget instead of stopping on the signal"
-        );
         // Outside a retry, a pending signal leaves the walk alone, as the
         // first attempt always did.
         assert!(super::check_snapshot_deadline(Instant::now() + Duration::from_secs(30)).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn pending_signal_interrupts_a_retry_waiting_on_a_held_lease() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_INTERRUPTED_LEASE_POLL";
+        const TEST_NAME: &str =
+            "cancellation::tests::pending_signal_interrupts_a_retry_waiting_on_a_held_lease";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let _signals = super::Signals::install_with_restore(true).unwrap();
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let _held_lease = writer.try_clone().unwrap();
+        let marker = super::BoundaryMarker {
+            token: Some("held-lease".to_owned()),
+            lifetime_reader: Some(reader),
+            lifetime_writer: Some(writer),
+        };
+        let mut boundary =
+            super::Boundary::new(u32::MAX - 111, super::Isolation::ExactChild, marker);
+
+        // Without a signal, a held lease makes every attempt use up its
+        // budget, so both kinds of attempts retry to the cap; only
+        // interruptible retries are marked.
+        for (interruptible_retries, expected) in
+            [(true, [false, true, true]), (false, [false, false, false])]
+        {
+            let mut marked = Vec::new();
+            let result: std::io::Result<bool> = super::with_leader_exit_attempts_using(
+                |_| Duration::from_millis(20),
+                interruptible_retries,
+                |deadline| {
+                    marked.push(super::SIGNAL_ENDS_PROOF_WALK.with(std::cell::Cell::get));
+                    boundary.verify_empty_observation(true, deadline)
+                },
+            );
+            assert!(result.is_err(), "a held lease proved the boundary empty");
+            assert_eq!(marked, expected, "interruptible: {interruptible_retries}");
+        }
+
+        // SAFETY: the isolated test subprocess owns the installed handler and
+        // deliberately signals itself.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        while super::received_signal().is_none() {
+            std::thread::yield_now();
+        }
+
+        // Inside a retry the lease poll stops at once instead of polling a
+        // held lease out to its 30s deadline.
+        let started = Instant::now();
+        let error = {
+            let _retry = super::InterruptibleProofWalk::begin();
+            boundary
+                .verify_empty_observation(true, Instant::now() + Duration::from_secs(30))
+                .unwrap_err()
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the lease poll waited for its deadline despite the pending signal"
+        );
     }
 
     #[test]
@@ -10834,6 +10915,7 @@ while True:
             let mut calls = 0;
             let result: std::io::Result<bool> = super::with_leader_exit_attempts_using(
                 |_| Duration::from_secs(30),
+                true,
                 |_| {
                     calls += 1;
                     Err(error.take().expect("one attempt"))
