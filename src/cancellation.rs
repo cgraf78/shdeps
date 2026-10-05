@@ -6364,6 +6364,11 @@ fn reap_members(_boundary: &Boundary) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // Bound for a fixture publishing its pid: a readiness wait whose miss is
+    // a hang, so it only needs to outlast a loaded host starting the fixture
+    // (often a python3 helper), not to assert speed.
+    const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
     use std::cell::Cell;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
@@ -7591,7 +7596,10 @@ sys.exit(0)
                     break pid;
                 }
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "orphan fixture never published its pid"
+            );
             std::thread::sleep(super::POLL);
         };
         wait_for_zombie(orphan_pid);
@@ -7657,7 +7665,10 @@ sys.exit(0)
                     break pid;
                 }
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "orphan fixture never published its pid"
+            );
             std::thread::sleep(super::POLL);
         };
         wait_for_zombie(orphan_pid);
@@ -7735,7 +7746,10 @@ sys.exit(0)
             if let Some((pid, _)) = read_published_identity(&descendant_path) {
                 break pid;
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "fixture never published its pid"
+            );
             std::thread::sleep(super::POLL);
         };
         let super::PidFd::Open(descendant_pidfd) = super::open_pidfd(descendant).unwrap() else {
@@ -7820,7 +7834,10 @@ sys.exit(0)
                     break pid;
                 }
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "fixture never published its pid"
+            );
             std::thread::sleep(super::POLL);
         };
         let super::PidFd::Open(descendant_pidfd) = super::open_pidfd(descendant).unwrap() else {
@@ -7897,7 +7914,10 @@ sys.exit(0)
                     break pid;
                 }
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "fixture never published its pid"
+            );
             std::thread::sleep(super::POLL);
         };
         let super::PidFd::Open(descendant_pidfd) = super::open_pidfd(descendant).unwrap() else {
@@ -7994,7 +8014,10 @@ sys.exit(0)
                     break pid;
                 }
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "fixture never published its pid"
+            );
             std::thread::sleep(super::POLL);
         };
         let super::PidFd::Open(descendant_pidfd) = super::open_pidfd(descendant).unwrap() else {
@@ -8364,7 +8387,10 @@ sys.exit(0)
                     break pid;
                 }
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "fixture never published its pid"
+            );
             std::thread::sleep(super::POLL);
         };
         let super::PidFd::Open(descendant_pidfd) = super::open_pidfd(descendant).unwrap() else {
@@ -8443,7 +8469,10 @@ sys.exit(0)
                 if let Some((pid, _)) = read_published_identity(&descendant_path) {
                     break pid;
                 }
-                assert!(started.elapsed() < Duration::from_secs(2));
+                assert!(
+                    started.elapsed() < FIXTURE_READY_TIMEOUT,
+                    "fixture never published its pid"
+                );
                 child.observe_boundary();
                 std::thread::sleep(super::POLL);
             };
@@ -9965,7 +9994,10 @@ sys.exit(0)
                     break pid;
                 }
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "fixture never published its pid"
+            );
             let _ = first.exited();
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -10048,7 +10080,10 @@ sys.exit(0)
             if let Some((pid, _)) = read_published_identity(&descendant_pid_path) {
                 break pid;
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "fixture never published its pid"
+            );
             let _ = child.exited();
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -10142,7 +10177,10 @@ sys.exit(0)
             if let Some((pid, _)) = read_published_identity(&descendant_pid_path) {
                 break pid;
             }
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "fixture never published its pid"
+            );
             let _ = child.exited();
             std::thread::sleep(Duration::from_millis(10));
         };

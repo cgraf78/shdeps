@@ -5126,8 +5126,8 @@ fn hook_signal_during_spawn_registration_is_not_lost() {
 exists() { return 1; }
 install() {
   trap '' HUP INT QUIT TERM
-  kill -TERM "$PPID"
   printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
+  kill -TERM "$PPID"
   while :; do /bin/sleep 1; done
 }
 "#,
@@ -5137,11 +5137,11 @@ install() {
     command.stdout(Stdio::null()).stderr(Stdio::null());
     let mut shdeps = spawn_test_session(&mut command);
     let status = wait_for_child_exit_bounded(&mut shdeps, LIVENESS_TIMEOUT);
-    // The hook signals Shdeps before it publishes its pid, so a starved hook
-    // can be stopped in between and never write it. After Shdeps has exited,
-    // a pid file still missing after a short grace means the hook did not
-    // survive; an escaped hook that was merely slow still gets to publish.
-    let hook_pid = wait_for_pid_opt(&fixture.dir.join("state/hook.pid"), Duration::from_secs(2));
+    // The hook publishes its pid before it signals Shdeps, so once Shdeps
+    // has exited on that signal the pid is always known: the test can probe
+    // and guard the hook however starved it was. A missing pid means the
+    // hook never signalled, which the status assertion below reports.
+    let hook_pid = wait_for_pid_opt(&fixture.dir.join("state/hook.pid"), Duration::ZERO);
     let _hook_guard = hook_pid.and_then(EscapedProcessGuard::new_if_present);
     let hook_survived = hook_pid.is_some_and(process_is_running);
     if let Some(hook_pid) = hook_pid.filter(|_| hook_survived) {
@@ -5246,13 +5246,19 @@ fn parent_signal_stops_detached_timed_probe_before_returning() {
     fixture.write("conf/deps.conf", "tool pkg\n");
     fixture.write_executable(
         "fakebin/tool",
+        // The probe outlives TERM by design. Bound it at about 120s (6000
+        // x 20ms) so a test that panics before its guard is armed, for
+        // example while waiting for the pid, cannot leave it looping in its
+        // own session forever; the checks below finish within seconds.
         r#"#!/bin/sh
 trap '' HUP INT QUIT
 trap 'printf term >"$SHDEPS_TEST_PROBE_TERM"' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_PROBE_PID"
-while :; do
+i=0
+while [ "$i" -lt 6000 ]; do
   printf x >>"$SHDEPS_TEST_PROBE_MUTATIONS"
   /bin/sleep 0.02
+  i=$((i + 1))
 done
 "#,
     );
@@ -7857,10 +7863,15 @@ post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
         &format!("#!/bin/sh\nexec {binary} \"$@\"\n"),
     );
     let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("shdeps.sh");
+    // Point the sourceable wrapper at the binary Cargo built for this run.
+    // Left alone it falls back to `<checkout>/target/debug/shdeps`, which is
+    // missing with a separate CARGO_TARGET_DIR or a fresh checkout, and stale
+    // when an older build is lying around.
 
     let cancelled = run(fixture
         .command(["update"])
         .env("SHDEPS_LIB", &wrapper)
+        .env("SHDEPS_RUST_CLI", binary)
         .env("PATH", &path_with_bash));
 
     assert_eq!(cancelled.status.code(), Some(143));
@@ -7874,6 +7885,7 @@ post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
     let retry = run(fixture
         .command(["update"])
         .env("SHDEPS_LIB", &wrapper)
+        .env("SHDEPS_RUST_CLI", binary)
         .env("PATH", &path_with_bash));
 
     assert_success(&retry);
