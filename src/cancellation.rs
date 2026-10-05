@@ -2676,33 +2676,63 @@ fn freeze_boundary(
     }
 }
 
-/// Runs a leader-exit observation, retrying only when its snapshot ran out of
-/// time, up to `LEADER_EXIT_SNAPSHOT_ATTEMPTS` attempts with a fresh budget
-/// each.
+/// Runs a leader-exit observation, retrying an attempt that used up its
+/// budget, up to `LEADER_EXIT_SNAPSHOT_ATTEMPTS` attempts with an escalating
+/// budget (`escalating_budget`: 1s, 2s, 4s).
 ///
 /// The observation aborts its process-table walk at the deadline, and failing
-/// it fails the run. On a host with thousands of processes a single loaded
-/// walk can outlast the budget, which reported a cleanly exited leader as a
-/// cleanup failure. Another attempt is simply a fresh observation of the same
-/// boundary, which supervision already repeats; a timed-out attempt can only
-/// have retained more identities, never dropped one. Every other error,
-/// including a lifetime lease that is still held, fails at once.
+/// it fails the run. On a host with thousands of processes a loaded walk can
+/// outlast the budget, which reported a cleanly exited leader as a cleanup
+/// failure. Another attempt is simply a fresh observation of the same
+/// boundary, which supervision already repeats; a failed attempt can only
+/// have retained more identities, never dropped one. A lifetime lease still
+/// open when an attempt's budget ran out is retried too: a descendant that
+/// inherited it and exits or execs late gets the longer budget as well, and a
+/// genuine leak still fails closed after the last attempt. A failure that
+/// returns before its deadline fails at once.
 #[cfg(unix)]
 fn with_leader_exit_attempts<T>(
+    observe: impl FnMut(Instant) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    with_leader_exit_attempts_using(
+        |attempt| escalating_budget(LEADER_EXIT_SNAPSHOT_BUDGET, attempt),
+        observe,
+    )
+}
+
+// `with_leader_exit_attempts` with an explicit per-attempt budget, so tests
+// can drive the retry rule with short budgets. An attempt is retried only
+// when it failed after its own deadline had passed: that is the walk a
+// loaded host cut short. A fast failure (an unreadable /proc, a held lease)
+// is returned at once whatever its error kind.
+#[cfg(unix)]
+fn with_leader_exit_attempts_using<T>(
+    budget: impl Fn(u32) -> Duration,
     mut observe: impl FnMut(Instant) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    let mut attempts = 1;
+    let mut attempt = 1;
     loop {
-        match observe(Instant::now() + LEADER_EXIT_SNAPSHOT_BUDGET) {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::TimedOut
-                    && attempts < LEADER_EXIT_SNAPSHOT_ATTEMPTS =>
-            {
-                attempts += 1;
+        let deadline = Instant::now() + budget(attempt);
+        match observe(deadline) {
+            Err(_) if Instant::now() >= deadline && attempt < LEADER_EXIT_SNAPSHOT_ATTEMPTS => {
+                attempt += 1;
             }
             result => return result,
         }
     }
+}
+
+/// Budget for the `attempt`th (1-based) try of a proof walk that a loaded host
+/// already cut short at `base`: it doubles each time, up to
+/// `ESCALATED_SNAPSHOT_BUDGET_CAP`. A walk aborts at its deadline, so a host
+/// whose every whole-table scan takes longer than `base` needs a longer
+/// budget, not just another attempt; the cap and the attempt limits keep the
+/// total bounded.
+#[cfg(unix)]
+fn escalating_budget(base: Duration, attempt: u32) -> Duration {
+    let factor = 1_u32 << attempt.saturating_sub(1).min(16);
+    base.saturating_mul(factor)
+        .min(ESCALATED_SNAPSHOT_BUDGET_CAP.max(base))
 }
 
 #[cfg(unix)]
@@ -2752,6 +2782,11 @@ fn settle_killed_boundary(
 #[cfg(unix)]
 const KILL_VERIFY_LATE_ATTEMPTS: u32 = 3;
 
+/// Largest budget an escalated retry of a proof walk may get; see
+/// `escalating_budget`. Linux late walks get 1s, 2s and 4s.
+#[cfg(unix)]
+const ESCALATED_SNAPSHOT_BUDGET_CAP: Duration = Duration::from_secs(5);
+
 /// Deadline for the next post-KILL settlement walk, or `None` when the
 /// settlement is over.
 ///
@@ -2763,8 +2798,10 @@ const KILL_VERIFY_LATE_ATTEMPTS: u32 = 3;
 /// late, or with a walk that still sees a member KILLed moments ago. Failing
 /// then reports "owned subprocesses survived bounded SIGKILL cleanup" for a
 /// boundary that is empty or about to be. So, while the proof is incomplete,
-/// late walks continue until `KILL_VERIFY_LATE_ATTEMPTS` have started, each
-/// with a fresh `CLEANUP_SNAPSHOT_BUDGET` so a whole-table scan can finish.
+/// late walks continue until `KILL_VERIFY_LATE_ATTEMPTS` have started. A walk
+/// aborts at its deadline, so each late walk gets an escalating budget
+/// (`escalating_budget` from `CLEANUP_SNAPSHOT_BUDGET`) that lets even a
+/// host whose every whole-table scan is slow finish one.
 /// Three late walks certify after at most one refused or still-live walk
 /// followed by two empty ones. The proof is never weakened: certification
 /// still needs two consecutive successful empty walks, a refused walk never
@@ -2780,7 +2817,7 @@ fn kill_verification_deadline(
     } else if late_attempts >= KILL_VERIFY_LATE_ATTEMPTS {
         None
     } else {
-        Some(now + CLEANUP_SNAPSHOT_BUDGET)
+        Some(now + escalating_budget(CLEANUP_SNAPSHOT_BUDGET, late_attempts + 1))
     }
 }
 
@@ -2797,6 +2834,9 @@ fn prove_killed_boundary_empty(
     let mut consecutive_empty = usize::from(initially_empty);
     let mut late_attempts = 0;
     while consecutive_empty < 2 {
+        // Poll first, then take the deadline, so a walk never starts with
+        // its budget already shortened by the poll.
+        std::thread::sleep(POLL);
         let Some(walk_deadline) =
             kill_verification_deadline(Instant::now(), verification_deadline, late_attempts)
         else {
@@ -2805,7 +2845,6 @@ fn prove_killed_boundary_empty(
         if walk_deadline > verification_deadline {
             late_attempts += 1;
         }
-        std::thread::sleep(POLL);
         if observe(walk_deadline) == Some(true) {
             consecutive_empty += 1;
         } else {
@@ -2982,12 +3021,7 @@ impl Boundary {
                     || registered_linux_process_snapshot(requested_at, deadline),
                 )
                 .ok_or_else(|| {
-                    // Reported as a timeout so the leader-exit attempts can
-                    // retry a snapshot that a loaded host cut short.
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "could not snapshot owned subprocesses after leader exit",
-                    )
+                    std::io::Error::other("could not snapshot owned subprocesses after leader exit")
                 })?;
                 if locally_owned {
                     self.retain_owned_rows(&processes);
@@ -3035,10 +3069,7 @@ impl Boundary {
         let requested_at = Instant::now();
         let processes =
             registered_linux_process_snapshot(requested_at, deadline).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "could not snapshot owned subprocesses after leader reaping",
-                )
+                std::io::Error::other("could not snapshot owned subprocesses after leader reaping")
             })?;
         let empty = self.observe_processes_with_unmarked_adoptees(&processes, deadline, true)?;
         self.verify_empty_observation(empty, deadline)
@@ -10629,41 +10660,79 @@ while True:
         );
     }
 
-    #[test]
-    fn leader_exit_attempts_retry_only_timeouts_up_to_the_cap() {
-        let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "slow walk");
+    // A walk that a loaded host cut short: it fails only once its own
+    // deadline has passed.
+    fn walk_cut_short(deadline: Instant) -> std::io::Result<bool> {
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        Err(std::io::Error::other(
+            "could not snapshot owned subprocesses",
+        ))
+    }
 
-        let mut deadlines = Vec::new();
-        let result = super::with_leader_exit_attempts(|deadline| {
-            deadlines.push(deadline);
-            if deadlines.len() < 2 {
-                Err(timed_out())
+    #[test]
+    fn leader_exit_attempts_retry_walks_cut_short_with_growing_budgets() {
+        let budget = |attempt: u32| Duration::from_millis(5) * attempt;
+        let mut budgets = Vec::new();
+        let result = super::with_leader_exit_attempts_using(budget, |deadline| {
+            budgets.push(deadline.saturating_duration_since(Instant::now()));
+            if budgets.len() < 2 {
+                walk_cut_short(deadline)
             } else {
                 Ok(true)
             }
         });
         assert!(result.unwrap(), "a retried observation lost its result");
-        assert_eq!(deadlines.len(), 2);
+        assert_eq!(budgets.len(), 2);
         assert!(
-            deadlines[1] > deadlines[0],
-            "each attempt needs a fresh budget"
+            budgets[1] > Duration::from_millis(5),
+            "a retry must get a longer budget: {budgets:?}"
         );
 
         let mut calls = 0;
-        let result: std::io::Result<bool> = super::with_leader_exit_attempts(|_| {
-            calls += 1;
-            Err(timed_out())
-        });
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
-        assert_eq!(calls, super::LEADER_EXIT_SNAPSHOT_ATTEMPTS);
-
-        let mut calls = 0;
-        let result: std::io::Result<bool> = super::with_leader_exit_attempts(|_| {
-            calls += 1;
-            Err(super::Boundary::open_lease_error())
-        });
+        let result: std::io::Result<bool> =
+            super::with_leader_exit_attempts_using(budget, |deadline| {
+                calls += 1;
+                walk_cut_short(deadline)
+            });
         assert!(result.is_err());
-        assert_eq!(calls, 1, "a held lease must fail without another attempt");
+        assert_eq!(calls, super::LEADER_EXIT_SNAPSHOT_ATTEMPTS);
+    }
+
+    #[test]
+    fn leader_exit_attempts_return_a_fast_failure_at_once() {
+        // An unreadable /proc or a held lease reported before the deadline
+        // is not a walk the host cut short, whatever its error kind.
+        for error in [
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "fast"),
+            super::Boundary::open_lease_error(),
+        ] {
+            let mut error = Some(error);
+            let mut calls = 0;
+            let result: std::io::Result<bool> = super::with_leader_exit_attempts_using(
+                |_| Duration::from_secs(30),
+                |_| {
+                    calls += 1;
+                    Err(error.take().expect("one attempt"))
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(calls, 1, "a fast failure was retried");
+        }
+    }
+
+    #[test]
+    fn escalating_budget_doubles_up_to_its_cap() {
+        let base = Duration::from_secs(1);
+        assert_eq!(super::escalating_budget(base, 1), base);
+        assert_eq!(super::escalating_budget(base, 2), base * 2);
+        assert_eq!(super::escalating_budget(base, 3), base * 4);
+        assert_eq!(
+            super::escalating_budget(base, 4),
+            super::ESCALATED_SNAPSHOT_BUDGET_CAP
+        );
+        // A base already at the cap is never shortened.
+        let large = super::ESCALATED_SNAPSHOT_BUDGET_CAP * 2;
+        assert_eq!(super::escalating_budget(large, 3), large);
     }
 
     #[test]
@@ -10685,7 +10754,12 @@ while True:
         for late_attempts in 0..super::KILL_VERIFY_LATE_ATTEMPTS {
             assert_eq!(
                 super::kill_verification_deadline(now, deadline, late_attempts),
-                Some(now + super::CLEANUP_SNAPSHOT_BUDGET)
+                Some(
+                    now + super::escalating_budget(
+                        super::CLEANUP_SNAPSHOT_BUDGET,
+                        late_attempts + 1
+                    )
+                )
             );
         }
         assert_eq!(
@@ -10733,6 +10807,25 @@ while True:
                 .all(|deadline| *deadline >= started + super::CLEANUP_SNAPSHOT_BUDGET),
             "late walks must get a fresh snapshot budget: {deadlines:?}"
         );
+    }
+
+    // macOS already gives every cleanup walk the escalation cap.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn starved_settlement_certifies_when_every_scan_outlasts_the_base_budget() {
+        // A host whose every whole-table scan needs more than the base
+        // budget: a walk only completes when its budget is at least twice
+        // the base. Fixed-budget late walks would all be refused.
+        let expired = Instant::now() - Duration::from_millis(1);
+        let mut walks = 0;
+        let proved = super::prove_killed_boundary_empty(false, expired, |deadline| {
+            walks += 1;
+            let budget = deadline.saturating_duration_since(Instant::now());
+            (budget > super::CLEANUP_SNAPSHOT_BUDGET * 3 / 2).then_some(true)
+        });
+
+        assert!(proved, "escalated late walks never let a slow scan finish");
+        assert_eq!(walks, super::KILL_VERIFY_LATE_ATTEMPTS as usize);
     }
 
     #[test]
