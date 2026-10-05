@@ -53,8 +53,8 @@ const TRACK_SNAPSHOT_BUDGET: Duration = Duration::from_millis(250);
 const LINUX_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const LEADER_EXIT_SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
-// Attempts, each with a fresh LEADER_EXIT_SNAPSHOT_BUDGET, before a leader-exit
-// observation whose snapshot ran out of time fails the run. See
+// Attempts, with budgets escalating from LEADER_EXIT_SNAPSHOT_BUDGET, before a
+// leader-exit observation that keeps running out of time fails the run. See
 // `with_leader_exit_attempts`.
 #[cfg(unix)]
 const LEADER_EXIT_SNAPSHOT_ATTEMPTS: u32 = 3;
@@ -2714,7 +2714,14 @@ fn with_leader_exit_attempts_using<T>(
     loop {
         let deadline = Instant::now() + budget(attempt);
         match observe(deadline) {
-            Err(_) if Instant::now() >= deadline && attempt < LEADER_EXIT_SNAPSHOT_ATTEMPTS => {
+            // A pending cancellation signal ends the retries: stopping the
+            // boundary is the next step either way, so a starved proof must
+            // not delay a Ctrl-C by the remaining attempts.
+            Err(_)
+                if Instant::now() >= deadline
+                    && attempt < LEADER_EXIT_SNAPSHOT_ATTEMPTS
+                    && received_signal().is_none() =>
+            {
                 attempt += 1;
             }
             result => return result,
@@ -10671,21 +10678,28 @@ while True:
 
     #[test]
     fn leader_exit_attempts_retry_walks_cut_short_with_growing_budgets() {
-        let budget = |attempt: u32| Duration::from_millis(5) * attempt;
-        let mut budgets = Vec::new();
+        // Record which attempt each budget was asked for instead of timing
+        // the remaining budget, which preemption could distort.
+        let requested = std::cell::RefCell::new(Vec::new());
+        let budget = |attempt: u32| {
+            requested.borrow_mut().push(attempt);
+            Duration::from_millis(5) * attempt
+        };
+        let mut calls = 0;
         let result = super::with_leader_exit_attempts_using(budget, |deadline| {
-            budgets.push(deadline.saturating_duration_since(Instant::now()));
-            if budgets.len() < 2 {
+            calls += 1;
+            if calls < 2 {
                 walk_cut_short(deadline)
             } else {
                 Ok(true)
             }
         });
         assert!(result.unwrap(), "a retried observation lost its result");
-        assert_eq!(budgets.len(), 2);
-        assert!(
-            budgets[1] > Duration::from_millis(5),
-            "a retry must get a longer budget: {budgets:?}"
+        assert_eq!(calls, 2);
+        assert_eq!(
+            *requested.borrow(),
+            vec![1, 2],
+            "a retry must ask for the next, longer budget"
         );
 
         let mut calls = 0;
