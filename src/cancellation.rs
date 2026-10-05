@@ -27,12 +27,16 @@ use std::time::Instant;
 const SIGNAL_CLOSED: i32 = -1;
 // Preserve the timed-command runner's existing 250ms TERM grace. An outer
 // supervisor can apply its own longer fallback, so nested escalation remains
-// bounded without compounding interactive cancellation latency.
+// bounded without compounding interactive cancellation latency. On Linux a
+// slow discovery walk that finds live members is refunded to it, up to
+// GRACE_WALK_REFUND_CAP, and a walk in flight at the deadline finishes
+// before KILL (see `grace_discovery_walk`).
 #[cfg(unix)]
 const GRACE: Duration = Duration::from_millis(250);
 // Killed descendants still need to be observed twice and adopted children
 // reaped. Keep that verification bounded but give loaded/slow procfs systems
-// enough room for two fresh scans; the user-visible TERM grace stays 250ms.
+// enough room for two fresh scans; the TERM grace deadline stays 250ms
+// unless slow discovery walks are refunded to it.
 #[cfg(unix)]
 const KILL_VERIFY_GRACE: Duration = Duration::from_secs(1);
 // The discovery window can end immediately after delivering SIGKILL to a
@@ -73,6 +77,13 @@ const CLEANUP_SNAPSHOT_BUDGET: Duration = Duration::from_secs(5);
 const CLEANUP_SNAPSHOT_BUDGET: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const TRACK_POLL: Duration = Duration::from_millis(50);
+// How far fresh-discovery walks may extend the TERM grace (see
+// `grace_after_walk`): twice the budget a one-shot cancellation discovery
+// walk already gets. A child that a TERM handler forks while a walk is
+// enumerating is usually found right after that walk, by the next 20ms
+// poll's per-task child lists, and the refund keeps the grace open for it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const GRACE_WALK_REFUND_CAP: Duration = CLEANUP_SNAPSHOT_BUDGET.saturating_mul(2);
 // A concurrent exec can present a markerless row that gains its marker
 // microseconds later, and a short-lived unrelated child can exit between
 // back-to-back inspections. Re-verify once after this settle before the
@@ -2264,6 +2275,69 @@ fn grace_empty_counts(now: Instant, last_counted: &mut Option<Instant>, spacing:
     }
 }
 
+// The TERM grace is time handlers get to run while this supervisor keeps
+// discovering what they fork, not time spent walking the process table. A
+// fresh-discovery walk is a whole-process-table scan: tens of milliseconds
+// on a quiet host, but on a loaded one a single walk can outlast the 250ms
+// grace, so a child forked while it enumerates was never discovered and
+// never got TERM. A walk within the 50ms discovery cadence is ordinary
+// polling and changes nothing; the excess of a slower walk is refunded to
+// the deadline, never past `cap`. Each walk plus the cadence gap after it
+// still spends at least 100ms of grace, so about three refunded walks fit,
+// and the grace ends by `cap` at the latest (plus one poll).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn grace_after_walk(deadline: Instant, cap: Instant, spent: Duration) -> Instant {
+    (deadline + spent.saturating_sub(TRACK_POLL)).min(cap.max(deadline))
+}
+
+// One fresh-discovery walk of the TERM grace loop. The walk itself may run
+// to `cap`: cut at the grace deadline, a slow walk would discover nothing.
+// Only a walk that found live members is refunded, since only a running
+// handler can still fork something to discover. An empty or failed walk
+// leaves the deadline alone, but a walk already in flight still finishes
+// (bounded by `cap`), so a slow walk can delay escalation to KILL by its
+// own length even when nothing survived TERM. An empty view with the lease
+// still held waits only to the grace deadline, as before, so that settle
+// is never extended or refunded.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn grace_discovery_walk(boundary: &mut Boundary, graceful_deadline: &mut Instant, cap: Instant) {
+    let walk_started = Instant::now();
+    #[cfg(test)]
+    if let Some(delay) = GRACE_WALK_DELAY.with(std::cell::Cell::take) {
+        std::thread::sleep(delay);
+    }
+    let before = *graceful_deadline;
+    if boundary.reconcile_fresh_until(cap, before) == Some(false) {
+        *graceful_deadline = grace_after_walk(before, cap, walk_started.elapsed());
+    }
+    #[cfg(test)]
+    GRACE_WALK_REFUNDS.with(|refunds| {
+        refunds
+            .borrow_mut()
+            .push(graceful_deadline.saturating_duration_since(before))
+    });
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+thread_local! {
+    // Delays the next grace discovery walk, inside its measured time, so a
+    // test can make one walk outlast the grace on any host.
+    static GRACE_WALK_DELAY: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    // How far each grace discovery walk moved the grace deadline.
+    static GRACE_WALK_REFUNDS: std::cell::RefCell<Vec<Duration>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// The latest a refunded TERM grace may run. An uncatchable first signal has
+// no handler to wait for, so its grace is never extended.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn grace_walk_cap(graceful_deadline: Instant, first_signal: i32) -> Instant {
+    if first_signal == libc::SIGKILL || first_signal == libc::SIGSTOP {
+        graceful_deadline
+    } else {
+        graceful_deadline + GRACE_WALK_REFUND_CAP
+    }
+}
+
 // Dispatches teardown through the boundary retained from spawn. Keeping its
 // identity set alive while the leader runs is what lets cancellation reach a
 // descendant after that descendant changes group/session and is reparented.
@@ -2295,6 +2369,11 @@ fn stop_boundary(
     let mut consecutive_empty = 0;
     let mut grace_empty_at: Option<Instant> = None;
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    let grace_cap = grace_walk_cap(graceful_deadline, first_signal);
+    // Fresh-discovery walks refund their excess to this deadline.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mut graceful_deadline = graceful_deadline;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let exact_grace_delivery = exact_descendant_authority_available();
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let mut next_fresh_discovery = Instant::now();
@@ -2305,8 +2384,9 @@ fn stop_boundary(
                 // A catchable-signal handler can fork after the initial exact
                 // delivery. Discover that child at a bounded 50ms cadence and
                 // deliver exactly to its pidfd below. Fresh global snapshots
-                // are coalesced when task child lists are unavailable.
-                let _ = boundary.reconcile_fresh(graceful_deadline);
+                // are coalesced when task child lists are unavailable. A slow
+                // walk is refunded to the grace (see `grace_discovery_walk`).
+                grace_discovery_walk(boundary, &mut graceful_deadline, grace_cap);
                 next_fresh_discovery = Instant::now() + TRACK_POLL;
             } else {
                 boundary.refresh_known(graceful_deadline);
@@ -2468,6 +2548,11 @@ fn stop_reaped_boundary(
     let mut consecutive_empty = 0;
     let mut grace_empty_at: Option<Instant> = None;
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    let grace_cap = grace_walk_cap(graceful_deadline, first_signal);
+    // Fresh-discovery walks refund their excess to this deadline.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mut graceful_deadline = graceful_deadline;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let exact_grace_delivery = exact_descendant_authority_available();
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let mut next_fresh_discovery = Instant::now();
@@ -2475,7 +2560,7 @@ fn stop_reaped_boundary(
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let observed = {
             if exact_grace_delivery && Instant::now() >= next_fresh_discovery {
-                let _ = boundary.reconcile_fresh(graceful_deadline);
+                grace_discovery_walk(boundary, &mut graceful_deadline, grace_cap);
                 next_fresh_discovery = Instant::now() + TRACK_POLL;
             } else {
                 boundary.refresh_known(graceful_deadline);
@@ -3238,27 +3323,7 @@ impl Boundary {
     fn reconcile_fresh(&mut self, deadline: Instant) -> Option<bool> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            match linux_owned_process_snapshot(self, deadline) {
-                Ok(processes) => {
-                    self.retain_owned_rows(&processes);
-                    self.observe_processes(&processes).ok()?;
-                    let processes = linux_boundary_marker_snapshot(self, deadline).ok()?;
-                    let empty = self.observe_processes(&processes).ok()?;
-                    self.verify_empty_observation(empty, deadline).ok()
-                }
-                Err(_) => {
-                    // CONFIG_PROC_CHILDREN is optional. When local traversal
-                    // cannot prove completeness, use a fresh whole-process
-                    // snapshot at this cancellation boundary rather than
-                    // treating the missing interface as an empty child set.
-                    let requested_at = Instant::now();
-                    let processes = registered_linux_process_snapshot(requested_at, deadline)?;
-                    let empty = self
-                        .observe_processes_with_unmarked_adoptees(&processes, deadline, true)
-                        .ok()?;
-                    self.verify_empty_observation(empty, deadline).ok()
-                }
-            }
+            self.reconcile_fresh_until(deadline, deadline)
         }
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         let processes = fresh_process_snapshot(Instant::now(), deadline)?;
@@ -3266,6 +3331,37 @@ impl Boundary {
         let empty = self.observe_processes(&processes).ok()?;
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         self.verify_empty_observation(empty, deadline).ok()
+    }
+
+    // `reconcile_fresh` with separate deadlines for the walk and for settling
+    // an empty view whose lease is still held (`verify_empty_observation`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reconcile_fresh_until(
+        &mut self,
+        walk_deadline: Instant,
+        settle_deadline: Instant,
+    ) -> Option<bool> {
+        match linux_owned_process_snapshot(self, walk_deadline) {
+            Ok(processes) => {
+                self.retain_owned_rows(&processes);
+                self.observe_processes(&processes).ok()?;
+                let processes = linux_boundary_marker_snapshot(self, walk_deadline).ok()?;
+                let empty = self.observe_processes(&processes).ok()?;
+                self.verify_empty_observation(empty, settle_deadline).ok()
+            }
+            Err(_) => {
+                // CONFIG_PROC_CHILDREN is optional. When local traversal
+                // cannot prove completeness, use a fresh whole-process
+                // snapshot at this cancellation boundary rather than
+                // treating the missing interface as an empty child set.
+                let requested_at = Instant::now();
+                let processes = registered_linux_process_snapshot(requested_at, walk_deadline)?;
+                let empty = self
+                    .observe_processes_with_unmarked_adoptees(&processes, walk_deadline, true)
+                    .ok()?;
+                self.verify_empty_observation(empty, settle_deadline).ok()
+            }
+        }
     }
 
     // Grace-loop polling on portable platforms. Identical membership
@@ -9546,9 +9642,10 @@ sys.exit(0)
         assert_eq!(count(&leader_terms), 1, "leader received repeated TERM");
         // A handler-forked child gets graceful TERM only if the stop loop
         // discovers it inside the TERM grace; one found later is KILLed
-        // without TERM. Report how late the child appeared so a failure on a
-        // starved host (slow procfs discovery) is distinguishable from a
-        // missed or duplicated delivery.
+        // without TERM. Slow discovery walks are refunded to the grace (see
+        // `grace_after_walk`), so a loaded host still discovers it. Report
+        // how late the child appeared so a failure past the refund cap is
+        // distinguishable from a missed or duplicated delivery.
         let ready_latency = std::fs::read_to_string(&child_ready_at)
             .ok()
             .and_then(|at| at.trim().parse::<u64>().ok())
@@ -9557,9 +9654,172 @@ sys.exit(0)
             count(&child_terms),
             1,
             "handler-created child did not receive exactly one TERM \
-             (child ready: {}, ready {ready_latency:?} after TERM, grace {:?})",
+             (child ready: {}, ready {ready_latency:?} after TERM, grace {:?}, \
+             refund cap {:?})",
             child_ready.is_file(),
-            super::GRACE
+            super::GRACE,
+            super::GRACE_WALK_REFUND_CAP
+        );
+    }
+
+    // Makes the first grace discovery walk outlast the TERM grace, then
+    // proves the walk was refunded and the child a TERM handler forked
+    // still got TERM and ran its trap. Dropping the refund or cutting the
+    // walk at the grace deadline fails the refund assertion.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn assert_slow_grace_walk_terms_handler_forked_child(reaped: bool) {
+        if !super::exact_descendant_authority_available() {
+            eprintln!("SKIP: no exact descendant authority; grace discovery walks never run");
+            return;
+        }
+        super::adopt_descendants().unwrap();
+        let dir = crate::test_support::temp_dir("shdeps-slow-grace-walk");
+        let ready = dir.join("member.ready");
+        let child_term = dir.join("child.term");
+        let member = format!(
+            "trap '( trap \"printf term > {child_term}; exit 0\" TERM; /bin/sleep 30 & wait $! ) & wait $!; exit 0' TERM\nprintf ready > {ready}\n/bin/sleep 30 & wait $!\n",
+            child_term = child_term.display(),
+            ready = ready.display(),
+        );
+        // A reaped boundary keeps the member after its leader exits.
+        let script = if reaped {
+            format!("(\n{member}) &\n")
+        } else {
+            member
+        };
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let marker = super::isolate(&mut command, super::Isolation::DetachedSession);
+        let mut child = super::OwnedChild::new(
+            command.spawn().unwrap(),
+            super::Isolation::DetachedSession,
+            marker,
+        );
+        let started = Instant::now();
+        while !ready.is_file() {
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "member never became ready"
+            );
+            std::thread::sleep(super::POLL);
+        }
+        if reaped {
+            let status = loop {
+                if let Some(status) = child.wait_if_exited_and_output_drained().unwrap() {
+                    break status;
+                }
+                assert!(
+                    started.elapsed() < FIXTURE_READY_TIMEOUT,
+                    "leader never exited"
+                );
+                std::thread::sleep(super::POLL);
+            };
+            assert!(status.success());
+        }
+
+        let delay = super::GRACE * 2;
+        super::GRACE_WALK_DELAY.with(|slot| slot.set(Some(delay)));
+        super::GRACE_WALK_REFUNDS.with(|refunds| refunds.borrow_mut().clear());
+        if reaped {
+            super::stop_reaped_boundary(&mut child.boundary, libc::SIGTERM, None).unwrap();
+            child.cleanup_complete = true;
+        } else {
+            child.stop(libc::SIGTERM).unwrap();
+        }
+        let refunds = super::GRACE_WALK_REFUNDS.with(|refunds| refunds.take());
+
+        assert!(
+            refunds
+                .first()
+                .is_some_and(|refund| *refund >= delay - super::TRACK_POLL),
+            "the slow first walk must be refunded to the grace: {refunds:?}"
+        );
+        assert!(
+            child_term.is_file(),
+            "the handler-forked child must get TERM within the refunded grace (refunds {refunds:?})"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn slow_grace_walk_still_terms_a_handler_forked_child() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_SLOW_GRACE_WALK_CHILD";
+        const TEST_NAME: &str =
+            "cancellation::tests::slow_grace_walk_still_terms_a_handler_forked_child";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+        assert_slow_grace_walk_terms_handler_forked_child(false);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn slow_reaped_grace_walk_still_terms_a_handler_forked_child() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_SLOW_REAPED_GRACE_WALK_CHILD";
+        const TEST_NAME: &str =
+            "cancellation::tests::slow_reaped_grace_walk_still_terms_a_handler_forked_child";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+        assert_slow_grace_walk_terms_handler_forked_child(true);
+    }
+
+    // When every member exits on the first TERM, a slow walk only proves the
+    // boundary empty and must not stretch the grace.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn slow_grace_walk_that_finds_the_boundary_empty_is_not_refunded() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_EMPTY_SLOW_GRACE_WALK_CHILD";
+        const TEST_NAME: &str =
+            "cancellation::tests::slow_grace_walk_that_finds_the_boundary_empty_is_not_refunded";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+        if !super::exact_descendant_authority_available() {
+            eprintln!("SKIP: no exact descendant authority; grace discovery walks never run");
+            return;
+        }
+        super::adopt_descendants().unwrap();
+        let dir = crate::test_support::temp_dir("shdeps-empty-slow-grace-walk");
+        let ready = dir.join("leader.ready");
+        let script =
+            format!("trap 'exit 0' TERM\nprintf ready > {ready:?}\n/bin/sleep 30 & wait $!\n");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let marker = super::isolate(&mut command, super::Isolation::DetachedSession);
+        let mut child = super::OwnedChild::new(
+            command.spawn().unwrap(),
+            super::Isolation::DetachedSession,
+            marker,
+        );
+        let started = Instant::now();
+        while !ready.is_file() {
+            assert!(
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
+                "leader never became ready"
+            );
+            std::thread::sleep(super::POLL);
+        }
+
+        super::GRACE_WALK_DELAY.with(|slot| slot.set(Some(super::GRACE * 2)));
+        super::GRACE_WALK_REFUNDS.with(|refunds| refunds.borrow_mut().clear());
+        child.stop(libc::SIGTERM).unwrap();
+        let refunds = super::GRACE_WALK_REFUNDS.with(|refunds| refunds.take());
+
+        assert!(
+            !refunds.is_empty() && refunds.iter().all(Duration::is_zero),
+            "walks that find the boundary empty must leave the grace alone: {refunds:?}"
         );
     }
 
@@ -10603,6 +10863,28 @@ time.sleep(600)
             !kill_set.is_empty(),
             "the intermediate tree must contain a parent to kill"
         );
+        // A launcher stub waits for the interpreter it forked, so when the
+        // interpreter dies first the still-dying stub can reap it before its
+        // own SIGKILL lands, and that status never reaches this subreaper.
+        // Record each parent's identity so such a parent still counts as
+        // settled once that exact identity is gone. An unreaped zombie keeps
+        // its identity, so it still has to reach this subreaper.
+        let identity_of = |pid: u32| {
+            super::linux_process_info_checked(pid)
+                .ok()
+                .flatten()
+                .map(|process| process.identity)
+        };
+        let kill_identities: std::collections::HashMap<u32, Option<super::ProcessIdentity>> =
+            kill_set
+                .iter()
+                .map(|pid| (*pid, identity_of(*pid)))
+                .collect();
+        let reaped_elsewhere = |pid: &u32| {
+            kill_identities
+                .get(pid)
+                .is_some_and(|identity| identity_of(*pid).is_none_or(|now| Some(now) != *identity))
+        };
         for pid in &kill_set {
             // SAFETY: kill targets our own live descendants (unreaped, so pids
             // cannot be reused) and SIGKILL takes no handler. ESRCH means the
@@ -10620,11 +10902,13 @@ time.sleep(600)
 
         let mut statuses = std::collections::HashMap::new();
         let reap_started = std::time::Instant::now();
-        while !kill_set
-            .iter()
-            .chain(&[descendant_pid, watchdog_pid])
-            .all(|pid| statuses.contains_key(pid))
-        {
+        let settled = |statuses: &std::collections::HashMap<u32, i32>| {
+            kill_set
+                .iter()
+                .chain(&[descendant_pid, watchdog_pid])
+                .all(|pid| statuses.contains_key(pid) || reaped_elsewhere(pid))
+        };
+        while !settled(&statuses) {
             let mut status = 0;
             // SAFETY: waitpid with WNOHANG reaps this subprocess's children
             // only; the subprocess runs this single test, whose only
@@ -10643,11 +10927,9 @@ time.sleep(600)
                     "unexpected waitpid failure: {error}"
                 );
                 assert!(
-                    kill_set
-                        .iter()
-                        .chain(&[descendant_pid, watchdog_pid])
-                        .all(|pid| statuses.contains_key(pid)),
-                    "no child may reparent past the subreaper: {statuses:?}"
+                    settled(&statuses),
+                    "no child may reparent past the subreaper: {statuses:?} \
+                     (parents {kill_set:?}, fixture {descendant_pid}, watchdog {watchdog_pid})"
                 );
                 break;
             }
@@ -11196,6 +11478,49 @@ time.sleep(600)
         let first = Instant::now();
         assert!(super::grace_empty_counts(first, &mut last, Duration::ZERO));
         assert!(super::grace_empty_counts(first, &mut last, Duration::ZERO));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn grace_walk_within_the_discovery_cadence_keeps_the_deadline() {
+        let deadline = Instant::now() + super::GRACE;
+        let cap = super::grace_walk_cap(deadline, libc::SIGTERM);
+        assert_eq!(
+            super::grace_after_walk(deadline, cap, super::TRACK_POLL),
+            deadline
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn slow_grace_walk_refunds_its_excess_up_to_the_cap() {
+        let deadline = Instant::now() + super::GRACE;
+        let cap = super::grace_walk_cap(deadline, libc::SIGTERM);
+        assert_eq!(cap, deadline + super::GRACE_WALK_REFUND_CAP);
+        let walk = Duration::from_millis(800);
+        assert_eq!(
+            super::grace_after_walk(deadline, cap, walk),
+            deadline + walk - super::TRACK_POLL
+        );
+        assert_eq!(
+            super::grace_after_walk(deadline, cap, super::GRACE_WALK_REFUND_CAP * 2),
+            cap,
+            "a walk longer than the cap must not extend the grace past it"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn uncatchable_first_signal_never_extends_the_grace() {
+        let deadline = Instant::now() + super::GRACE;
+        for signal in [libc::SIGKILL, libc::SIGSTOP] {
+            let cap = super::grace_walk_cap(deadline, signal);
+            assert_eq!(cap, deadline);
+            assert_eq!(
+                super::grace_after_walk(deadline, cap, Duration::from_secs(1)),
+                deadline
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -5760,10 +5760,11 @@ while [ $((fixture_loop_15 = ${fixture_loop_15:-0} + 1)) -le 300 ]; do /bin/slee
 #[test]
 fn parent_signal_delivers_term_to_late_same_group_descendant() {
     // Whether the late child records its TERM before the grace's KILL
-    // escalation depends on the child being scheduled inside a fixed 250 ms
-    // window, which a loaded runner can deny even to a child that became
-    // ready early (the prior readiness gate and `wait` idling narrowed but
-    // could not close that window). The recorded TERM is therefore a sample,
+    // escalation depends on the child being scheduled inside a 250 ms
+    // window (on Linux, plus any refunded slow discovery walks), which a
+    // loaded runner can deny even to a child that became ready early (the
+    // prior readiness gate and `wait` idling narrowed but could not close
+    // that window). The recorded TERM is therefore a sample,
     // not a deterministic observation: retry the whole scenario and fail only
     // when no attempt records it. A product that never delivers the graceful
     // phase to late descendants still fails every attempt, while a load
@@ -5926,11 +5927,12 @@ while [ $((fixture_loop_18 = ${fixture_loop_18:-0} + 1)) -le 300 ]; do /bin/slee
         Some(128 + libc::SIGTERM),
         "late same-group cancellation diagnostics: {stderr}"
     );
-    // The graceful phase lasts exactly the 250 ms stop grace: discovery
-    // runs at a 50 ms cadence with per-iteration redelivery, so a child
-    // ready within 100 ms of the parent signal usually leaves margin for
-    // delivery plus trap execution. A later-ready child may have missed the
-    // grace through fixture slowness alone (documented 4 s+ starvation).
+    // The graceful phase lasts the 250 ms stop grace, plus any refunded
+    // slow discovery walks: discovery runs at a 50 ms cadence with
+    // per-iteration redelivery, so a child ready within 100 ms of the
+    // parent signal usually leaves margin for delivery plus trap execution.
+    // A later-ready child may have missed the grace through fixture
+    // slowness alone (documented 4 s+ starvation).
     let term_missing = !child_term_path.is_file();
     if !term_missing {
         assert!(
