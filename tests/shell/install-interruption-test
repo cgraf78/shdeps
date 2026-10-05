@@ -148,7 +148,7 @@ case "${SHDEPS_TEST_PHASE:-}:$dest" in
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    while :; do sleep 1; done
+    while [ $((fixture_loop_1 = ${fixture_loop_1:-0} + 1)) -le 300 ]; do sleep 1; done
     ;;
 esac
 "$SHDEPS_TEST_REAL_CP" "$@" || exit $?
@@ -202,10 +202,10 @@ case "$url" in
       trap 'exit 130' INT
       if [[ "${SHDEPS_TEST_IGNORE_TERM:-0}" == 1 ]]; then
         trap ': >"$SHDEPS_TEST_MARKERS/term-forwarded"' TERM
-        while :; do sleep 0.02; done
+        while [ $((fixture_loop_2 = ${fixture_loop_2:-0} + 1)) -le 15000 ]; do sleep 0.02; done
       else
         trap 'exit 143' TERM
-        while :; do sleep 1; done
+        while [ $((fixture_loop_3 = ${fixture_loop_3:-0} + 1)) -le 300 ]; do sleep 1; done
       fi
     fi
     ;;
@@ -249,7 +249,7 @@ if [[ "${SHDEPS_TEST_PHASE:-}" == extract && "${1:-}" == -xzf ]]; then
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  while :; do sleep 1; done
+  while [ $((fixture_loop_4 = ${fixture_loop_4:-0} + 1)) -le 300 ]; do sleep 1; done
 fi
 SH
 
@@ -385,7 +385,7 @@ if [[ "${SHDEPS_TEST_PHASE:-}" == backup-remove && "$target" == *.backup && ! -e
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  while :; do sleep 1; done
+  while [ $((fixture_loop_5 = ${fixture_loop_5:-0} + 1)) -le 300 ]; do sleep 1; done
 fi
 if [[ ("${SHDEPS_TEST_PHASE:-}" == cleanup-remove ||
     "${SHDEPS_TEST_PHASE:-}" == cleanup-failure ||
@@ -402,7 +402,7 @@ if [[ ("${SHDEPS_TEST_PHASE:-}" == cleanup-remove ||
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    while :; do sleep 1; done
+    while [ $((fixture_loop_6 = ${fixture_loop_6:-0} + 1)) -le 300 ]; do sleep 1; done
   fi
 fi
 if [[ ("${SHDEPS_TEST_PHASE:-}" == cleanup-failure ||
@@ -542,7 +542,7 @@ case "$SHDEPS_TEST_MODE" in
       printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
       : >"$SHDEPS_TEST_MARKERS/blocker-started"
       trap 'exit 143' TERM
-      while :; do sleep 1; done
+      while [ $((fixture_loop_7 = ${fixture_loop_7:-0} + 1)) -le 300 ]; do sleep 1; done
     }
     _install_bundle_core() {
       _install_transaction_signal TERM
