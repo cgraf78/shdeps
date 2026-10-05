@@ -1492,14 +1492,15 @@ impl OwnedChild {
                     })
                 });
                 // A pending signal takes precedence over a failed leader-exit
-                // proof, whatever error the walk reported (a retry it
-                // interrupted can surface as another kind through a fallback
-                // snapshot): report the leader as not yet exited so the
-                // caller's cancellation path stops the boundary with its own
-                // bounded proof, instead of failing here and leaving teardown
-                // to the KILL-only Drop path.
-                if observed.is_err() && received_signal().is_some() {
-                    return Ok(false);
+                // proof: report the leader as not yet exited so the caller's
+                // cancellation path stops the boundary with its own bounded
+                // proof (TERM grace included), instead of failing here and
+                // leaving teardown to the KILL-only Drop path.
+                if let Err(error) = &observed {
+                    if received_signal().is_some() {
+                        hand_over_failed_leader_exit(error);
+                        return Ok(false);
+                    }
                 }
                 observed.map_err(|error| {
                     std::io::Error::new(
@@ -2711,6 +2712,26 @@ fn with_leader_exit_attempts<T>(
     )
 }
 
+/// Records a failed leader-exit proof that is being handed to the
+/// cancellation path, unless it only ran out of time or was interrupted.
+///
+/// An incomplete proof (`TimedOut`, `Interrupted`) is superseded by the stop
+/// path's own proof. Any other failure may be a positive detection, such as
+/// an adopted escapee that no single boundary can claim, which the stop
+/// path's proof does not necessarily see; record it so acknowledging the
+/// signal still fails closed. An interrupted retry whose error was relabelled
+/// by a fallback snapshot lands here too: it fails closed, but teardown still
+/// gets the TERM grace.
+#[cfg(unix)]
+fn hand_over_failed_leader_exit(error: &std::io::Error) {
+    if !matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+    ) {
+        record_cleanup_error(error);
+    }
+}
+
 /// `with_leader_exit_attempts` for the proof after the leader was reaped.
 /// Its retries are not interruptible: the leader is gone, so `exited` cannot
 /// hand the boundary back to the cancellation path, and an interrupted proof
@@ -2749,10 +2770,13 @@ fn with_leader_exit_attempts_using<T>(
             // A pending cancellation signal ends the retries: stopping the
             // boundary is the next step either way, so a starved proof must
             // not delay a Ctrl-C by the remaining attempts.
+            // Uninterruptible retries (the reap path) keep going: nothing
+            // there hands the boundary to a stop, so giving up would turn
+            // the signal into a failed proof.
             Err(_)
                 if Instant::now() >= deadline
                     && attempt < LEADER_EXIT_SNAPSHOT_ATTEMPTS
-                    && received_signal().is_none() =>
+                    && (!interruptible_retries || received_signal().is_none()) =>
             {
                 attempt += 1;
             }
@@ -10901,6 +10925,42 @@ while True:
             started.elapsed() < Duration::from_secs(10),
             "the lease poll waited for its deadline despite the pending signal"
         );
+
+        // With the signal pending, interruptible retries stop after the
+        // first attempt; reap-style retries still run to the cap.
+        for (interruptible_retries, expected_attempts) in [(true, 1), (false, 3)] {
+            let mut attempts = 0;
+            let result: std::io::Result<bool> = super::with_leader_exit_attempts_using(
+                |_| Duration::from_millis(20),
+                interruptible_retries,
+                |deadline| {
+                    attempts += 1;
+                    walk_cut_short(deadline)
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                attempts, expected_attempts,
+                "interruptible: {interruptible_retries}"
+            );
+        }
+
+        // A handed-over proof that only ran out of time is superseded by the
+        // stop path; any other failure is recorded so the run fails closed.
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            super::hand_over_failed_leader_exit(&std::io::Error::new(kind, "incomplete"));
+            assert!(
+                !super::CLEANUP_FAILED.load(std::sync::atomic::Ordering::SeqCst),
+                "{kind:?}"
+            );
+        }
+        super::hand_over_failed_leader_exit(&std::io::Error::other(
+            "could not attribute adopted subprocess to one active boundary",
+        ));
+        assert!(super::CLEANUP_FAILED.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
