@@ -419,26 +419,47 @@ fn unsafe_char(ch: char) -> bool {
         || matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// Replaces the userinfo of every `scheme://user:secret@host` in `text`.
-/// An `insteadOf` rewrite can put a token into the URL Git prints.
+/// Schemes whose user name is an account name, never a secret
+/// (`ssh://git@host`): a user-only userinfo stays visible for them.
+const USER_SCHEMES: [&str; 4] = ["ssh", "git+ssh", "ssh+git", "git"];
+
+/// Replaces the userinfo of every `scheme://userinfo@host` URL in `text`
+/// with `***`. An `insteadOf` rewrite can put a token into the URL Git
+/// prints.
+///
+/// The authority ends at the first `/`, `?`, `#`, or whitespace, as Git's
+/// own URL parser ends it, and its last `@` separates userinfo from host, so
+/// a password containing `@` or a quote is still hidden whole. A user name
+/// alone is redacted too (a bare token often sits in that position) except
+/// for SSH-style schemes, whose user is an account such as `git`.
+///
+/// Same rule as dot's `update.last-failure` redaction, so the two tools
+/// redact one line alike; dot is released independently, so the rule is
+/// restated there rather than shared.
 fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(index) = rest.find("://") {
         let (head, tail) = rest.split_at(index + 3);
         out.push_str(head);
-        let authority_end = tail
-            .find(|ch: char| ch == '/' || ch == '\'' || ch == '"' || ch.is_whitespace())
+        let scheme_start = head[..index]
+            .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || "+-.".contains(ch)))
+            .map_or(0, |at| at + 1);
+        let scheme = head[scheme_start..index].to_ascii_lowercase();
+        let end = tail
+            .find(|ch: char| ch == '/' || ch == '?' || ch == '#' || ch.is_whitespace())
             .unwrap_or(tail.len());
-        let authority = &tail[..authority_end];
+        let authority = &tail[..end];
         match authority.rfind('@') {
-            Some(at) => {
+            Some(at)
+                if authority[..at].contains(':') || !USER_SCHEMES.contains(&scheme.as_str()) =>
+            {
                 out.push_str("***");
                 out.push_str(&authority[at..]);
             }
-            None => out.push_str(authority),
+            _ => out.push_str(authority),
         }
-        rest = &tail[authority_end..];
+        rest = &tail[end..];
     }
     out.push_str(rest);
     out
@@ -451,7 +472,7 @@ mod tests {
 
     use super::{
         Candidate, Failure, Reason, STALE_AFTER_SECS, Source, clear, find, first_line, read,
-        record_failure, record_path,
+        record_failure, record_path, redact_credentials,
     };
 
     const NOW: u64 = 1_700_000_000;
@@ -488,6 +509,83 @@ mod tests {
         assert_eq!(first_line(""), "");
         let long = "a".repeat(500);
         assert_eq!(first_line(&long).chars().count(), 203);
+    }
+
+    // The redaction cases mirror dot's `redact::credentials` tests: the two
+    // tools persist and print the same kind of Git line and must hide the
+    // same secrets.
+    #[test]
+    fn redaction_hides_userinfo_and_keeps_the_rest() {
+        for (text, redacted) in [
+            (
+                "unable to access 'https://user:tok3n@github.com/o/r.git/': 403",
+                "unable to access 'https://***@github.com/o/r.git/': 403",
+            ),
+            (
+                "https://ghp_abc@github.com/o/r",
+                "https://***@github.com/o/r",
+            ),
+            (
+                "https://u:p@ss@host.example/x",
+                "https://***@host.example/x",
+            ),
+            (
+                "from https://a:b@one/x to ssh://git:pw@two:22/y",
+                "from https://***@one/x to ssh://***@two:22/y",
+            ),
+            ("remote https://a:b@host", "remote https://***@host"),
+        ] {
+            assert_eq!(redact_credentials(text), redacted, "{text}");
+        }
+    }
+
+    #[test]
+    fn redaction_hides_a_password_containing_a_quote() {
+        assert_eq!(
+            redact_credentials("unable to access 'https://user:it's@host/x/': 403"),
+            "unable to access 'https://***@host/x/': 403"
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_an_ssh_user_name_but_not_its_password() {
+        for text in [
+            "ssh://git@github.com/o/r.git",
+            "git+ssh://git@host/r",
+            "ssh+git://git@host/r",
+            "git://git@host/r",
+            "SSH://git@host:22/r",
+        ] {
+            assert_eq!(redact_credentials(text), text);
+        }
+        assert_eq!(
+            redact_credentials("ssh://git:pw@host/r"),
+            "ssh://***@host/r"
+        );
+    }
+
+    #[test]
+    fn redaction_ends_the_host_at_a_query_or_fragment() {
+        for text in [
+            "https://example.com?email=me@x.example",
+            "https://example.com#me@x.example",
+        ] {
+            assert_eq!(redact_credentials(text), text);
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_text_without_credentials_unchanged() {
+        for text in [
+            "",
+            "no url here",
+            "https://github.com/o/r.git",
+            "git@github.com:o/r.git",
+            "mail me at a@b.example",
+            "https://host/path?next=a@b",
+        ] {
+            assert_eq!(redact_credentials(text), text);
+        }
     }
 
     #[test]
