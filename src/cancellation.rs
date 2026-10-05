@@ -6366,7 +6366,9 @@ fn reap_members(_boundary: &Boundary) -> std::io::Result<()> {
 mod tests {
     // Bound for a fixture publishing its pid: a readiness wait whose miss is
     // a hang, so it only needs to outlast a loaded host starting the fixture
-    // (often a python3 helper), not to assert speed.
+    // (often a python3 helper), not to assert speed. Only the Linux/Android
+    // fixture tests use it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
     use std::cell::Cell;
