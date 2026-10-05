@@ -54,10 +54,12 @@ pub const REENTRY_ENV: &str = "SHDEPS_STATE_LOCK_HELD";
 ///
 /// The lock exists to keep Rust-owned state files coherent when two
 /// `shdeps update` or `prune` runs overlap. It is intentionally held
-/// for the full duration of `update::run` and `prune::run` —
-/// including package-manager installs, network downloads, and hooks
-/// — because the manifest/link-state writes interleaved through
-/// those operations all need the same serialization guarantee.
+/// for the full mutating phase of an update
+/// (`update::run_with_progress_locked`) or prune (after the lock-free
+/// preview in `prune::run_with_config_loader`) — including package-manager
+/// installs, network downloads, and hooks — because the manifest/link-state
+/// writes interleaved through those operations all need the same
+/// serialization guarantee.
 ///
 /// **Reentry contract:** a hook subprocess that recursively invokes
 /// `shdeps update` / `shdeps prune` (e.g., a `post()` hook that
@@ -122,10 +124,11 @@ impl StateLock {
 
     /// Attempts to acquire the per-state-dir lock without waiting.
     ///
-    /// This is primarily useful for tests and diagnostics. Normal update code
-    /// should use `acquire` so concurrent invocations serialize until the
-    /// configured wait budget is exhausted.
-    pub fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
+    /// Tests use this to observe whether the lock is held. Product code uses
+    /// `acquire` so concurrent invocations serialize until the configured wait
+    /// budget is exhausted.
+    #[cfg(test)]
+    pub(crate) fn try_acquire(state_dir: &Path) -> Result<Option<Self>> {
         crate::cancellation::check()?;
         if is_legitimate_reentry() {
             // Same re-entry rule as `acquire`: report success without
@@ -377,6 +380,7 @@ fn temp_nonce() -> u64 {
     hasher.finish()
 }
 
+#[cfg(test)]
 fn acquire_impl(state_dir: &Path) -> Result<Option<StateLock>> {
     const MAX_PATH_REPLACEMENT_RETRIES: usize = 8;
 

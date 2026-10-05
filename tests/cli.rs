@@ -109,7 +109,7 @@ fn version_output_is_generated_and_commit_traceable() {
 }
 
 #[test]
-fn help_output_is_stable_and_hides_removed_migrate_command() {
+fn help_output_is_stable() {
     let output = run(shdeps().arg("help"));
 
     assert_success(&output);
@@ -152,12 +152,13 @@ fn usage_errors_match_public_cli_contract() {
         "error: dep-path requires a dependency name and relative path\nUsage: shdeps dep-path <name> <relative-path>\n"
     );
 
-    let migrate = run(shdeps().arg("migrate"));
-    assert_eq!(migrate.status.code(), Some(2));
-    assert_eq!(text(&migrate.stdout), "");
+    // The shell-era `migrate` command gets no special case.
+    let unknown_command = run(shdeps().arg("migrate"));
+    assert_eq!(unknown_command.status.code(), Some(2));
+    assert_eq!(text(&unknown_command.stdout), "");
     assert_eq!(
-        text(&migrate.stderr),
-        "error: migrate has been removed from the user-facing CLI\nRun 'shdeps help' for usage.\n"
+        text(&unknown_command.stderr),
+        "error: unknown command 'migrate'\nRun 'shdeps help' for usage.\n"
     );
 }
 

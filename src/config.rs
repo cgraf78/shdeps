@@ -55,19 +55,12 @@ pub fn short_name(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
-/// Resolves a package-manager-qualified override list.
+/// Resolves a package-manager-qualified override list for a concrete runtime.
 ///
-/// The Bash reference uses this both for package aliases and for command names
-/// such as `apt:batcat`. A missing or non-matching package manager returns the
-/// default value unchanged; the `NONE` sentinel is intentionally just another
-/// resolved value because higher-level package logic owns the skip behavior.
-#[must_use]
-pub fn resolve_override(default: &str, overrides: &str, pkg_mgr: Option<&str>) -> String {
-    resolve_override_match_for_runtime(overrides, pkg_mgr, false)
-        .unwrap_or_else(|| default.to_owned())
-}
-
-/// Resolves a package override for a concrete runtime.
+/// This serves both package aliases and command names such as `apt:batcat`.
+/// A missing or non-matching package manager returns the default value
+/// unchanged; the `NONE` sentinel is intentionally just another resolved value
+/// because higher-level package logic owns the skip behavior.
 ///
 /// Android overrides take precedence over the underlying package manager so a
 /// Termux host can express package names that differ from Debian/Ubuntu even
@@ -146,9 +139,9 @@ pub fn parse_entry_for_runtime(raw: &str, pkg_mgr: Option<&str>, android: bool) 
         }
     }
     // The `cmd` field is concatenated into `<bin_dir>/<cmd>` at install
-    // (`bin_link::one`), cleanup (`cleanup::remove_builtin`), and release
-    // staging (`release_activate::activate`) time. `Path::join` discards
-    // its left operand whenever the right operand is absolute, so a
+    // (`bin_link::one`), cleanup (`cleanup::remove_builtin_with_evidence`),
+    // and release staging (`release_activate::activate`) time. `Path::join`
+    // discards its left operand whenever the right operand is absolute, so a
     // config line with `cmd=/etc/passwd` would let shdeps symlink-over /
     // remove that exact path — outside any managed root. Repository cleanup
     // derives its root from the validated dependency name, but commands still
@@ -241,54 +234,21 @@ pub fn sort_entries(entries: &mut [String]) {
     });
 }
 
-/// Parses config text from already ordered files into sorted raw entries.
-///
-/// When the same dependency name appears more than once across the input
-/// files (or within one file), only the *last* occurrence is kept. This
-/// matches the `manifest::get` semantics — which already returns the last
-/// matching record for a given name — and prevents the updater from
-/// processing the same dep twice (and consequently running install / post
-/// hooks twice). Inputs are iterated in caller-supplied order, so the
-/// directory loader's lexical file ordering is preserved end-to-end.
-#[must_use]
-pub fn parse_config_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    let entries = texts
-        .into_iter()
-        .flat_map(|text| text.lines().filter_map(parse_config_line))
-        .collect::<Vec<_>>();
-    let mut entries = dedupe_last_wins(entries);
-    // Match `load_dir`: drop entries with unsafe dep names BEFORE any
-    // downstream caller starts joining the name into managed paths.
-    // See `valid_dep_name` for the full list of rejected forms. The
-    // in-memory bridge path (used by the Bash wrapper's `__api`
-    // callers) gets the same fail-closed treatment as the on-disk
-    // loader so a hostile or malformed config can't escape via the
-    // shorter code path. Emit the same stderr warning as `load_dir`
-    // so a misconfigured dep surfaces with an actionable message
-    // through every entry point, not just the on-disk loader.
-    entries.retain(|entry| {
-        let name = entry_name(entry);
-        if valid_dep_name(name) {
-            true
-        } else {
-            eprintln!("shdeps: skipping config entry with unsafe dep name: {name:?}");
-            false
-        }
-    });
-    sort_entries(&mut entries);
-    entries
-}
-
 /// Deduplicates entries by dependency name, keeping the LAST occurrence.
+///
+/// This matches the `manifest::get` semantics — which already returns the
+/// last matching record for a given name — and prevents the updater from
+/// processing the same dep twice (and consequently running install / post
+/// hooks twice).
 ///
 /// Two-pass: first walk records the index of each name's last
 /// occurrence, then a second walk keeps only entries whose index
 /// matches. The dedupe DECISION is stable with respect to load order
 /// (the latest occurrence per name is the one that survives), and the
 /// SURVIVING entries are returned in their original load-order
-/// positions — `parse_config_texts` and `load_dir` then pass that
-/// result through `sort_entries`, so the user-visible final order is
-/// sort order, NOT load order. Callers that need load-order output
+/// positions — `load_dir` then passes that result through
+/// `sort_entries`, so the user-visible final order is sort order, NOT
+/// load order. Callers that need load-order output
 /// must call this helper directly and skip the sort.
 ///
 /// Runs in O(n) time on top of one `HashMap` — suitable for the
@@ -437,10 +397,9 @@ fn load_dir_entries(conf_dir: &Path, env: Option<&RuntimeEnv>) -> Result<DirStat
         let content = read_config_file(&file)?;
         entries.extend(content.lines().filter_map(parse_config_line));
     }
-    // Match `parse_config_texts`: dedupe by dep name before sorting so a
-    // user who declares the same dep in two `*.conf` files gets the last
-    // (lex-order) definition rather than two adjacent entries that would
-    // both get processed by `update`.
+    // Dedupe by dep name before sorting so a user who declares the same
+    // dep in two `*.conf` files gets the last (lex-order) definition rather
+    // than two adjacent entries that would both get processed by `update`.
     let mut entries = match env {
         Some(env) => select_filtered_duplicates(entries, env),
         None => dedupe_last_wins(entries),
@@ -674,9 +633,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        RuntimeEnv, canonical_name, load_dir, load_dir_for_runtime, parse_config_line,
-        parse_config_texts, parse_entry, parse_entry_for_runtime, resolve_override,
-        resolve_override_for_runtime, short_name, sort_entries, valid_cmd_basename, valid_dep_name,
+        RuntimeEnv, canonical_name, load_dir, load_dir_for_runtime, parse_config_line, parse_entry,
+        parse_entry_for_runtime, resolve_override_for_runtime, short_name, sort_entries,
+        valid_cmd_basename, valid_dep_name,
     };
 
     #[test]
@@ -773,28 +732,33 @@ mod tests {
 
     #[test]
     fn resolve_override_returns_matching_manager_value() {
-        assert_eq!(resolve_override("fd", "", Some("apt")), "fd");
         assert_eq!(
-            resolve_override("fd", "apt:fd-find,dnf:fd-find", Some("apt")),
-            "fd-find"
-        );
-        assert_eq!(
-            resolve_override("fd", "apt:fd-find,dnf:fd-find", Some("pacman")),
+            resolve_override_for_runtime("fd", "", Some("apt"), false),
             "fd"
         );
         assert_eq!(
-            resolve_override(
+            resolve_override_for_runtime("fd", "apt:fd-find,dnf:fd-find", Some("apt"), false),
+            "fd-find"
+        );
+        assert_eq!(
+            resolve_override_for_runtime("fd", "apt:fd-find,dnf:fd-find", Some("pacman"), false),
+            "fd"
+        );
+        assert_eq!(
+            resolve_override_for_runtime(
                 "nerd-fonts",
                 "apt:NONE,brew:font-hack-nerd-font",
-                Some("apt")
+                Some("apt"),
+                false,
             ),
             "NONE"
         );
         assert_eq!(
-            resolve_override(
+            resolve_override_for_runtime(
                 "nerd-fonts",
                 "apt:NONE,brew:font-hack-nerd-font",
-                Some("brew")
+                Some("brew"),
+                false,
             ),
             "font-hack-nerd-font"
         );
@@ -966,12 +930,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_texts_merges_and_sorts_entries_by_name() {
-        let entries = parse_config_texts([
-            "tool-a  pkg\ntool-b  pkg\n",
-            "owner/tool-c  github:release\n",
-            "tool-d  custom\n",
-        ]);
+    fn load_dir_merges_and_sorts_entries_by_name() {
+        let dir = temp_dir("merge-sort");
+        write(&dir.join("00-a.conf"), "tool-a  pkg\ntool-b  pkg\n");
+        write(&dir.join("01-b.conf"), "owner/tool-c  github:release\n");
+        write(&dir.join("02-c.conf"), "tool-d  custom\n");
+
+        let entries = load_dir(&dir).unwrap();
 
         assert_eq!(
             entries,
@@ -986,7 +951,13 @@ mod tests {
 
     #[test]
     fn checked_in_dependency_example_uses_the_production_grammar() {
-        let entries = parse_config_texts([include_str!("../examples/deps.conf")]);
+        let dir = temp_dir("checked-in-example");
+        write(
+            &dir.join("deps.conf"),
+            include_str!("../examples/deps.conf"),
+        );
+
+        let entries = load_dir(&dir).unwrap();
 
         assert_eq!(entries.len(), 22, "every active example name should parse");
         assert!(entries.contains(&"fd|pkg|apt:fdfind|apt:fd-find,dnf:fd-find".to_owned()));
@@ -999,25 +970,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_texts_deduplicates_repeats_with_last_occurrence_winning() {
-        // `manifest::get` is last-wins, so loading the same dep twice from
-        // two `.conf` files must collapse to one entry — the later one.
-        // Otherwise `update` would process the dep twice and run install
-        // and post-hook side effects twice, with the user seeing two rows
-        // in `shdeps list`.
-        let entries = parse_config_texts([
-            "tool-a  pkg\ntool-b  pkg\n",
-            "tool-a  cargo\n", // same name, different method: later wins
-        ]);
-        assert_eq!(entries, vec!["tool-a|cargo", "tool-b|pkg"]);
-    }
-
-    #[test]
-    fn parse_config_texts_deduplicates_repeats_within_one_file() {
+    fn load_dir_deduplicates_repeats_within_one_file() {
         // Duplicates inside one file also collapse — the last definition
         // wins, mirroring the cross-file behavior so a user can override a
         // shared template by re-declaring later in the same file.
-        let entries = parse_config_texts(["tool-a  pkg\ntool-b  pkg\ntool-a  cargo\n"]);
+        let dir = temp_dir("dedupe-single");
+        write(
+            &dir.join("deps.conf"),
+            "tool-a  pkg\ntool-b  pkg\ntool-a  cargo\n",
+        );
+
+        let entries = load_dir(&dir).unwrap();
+
         assert_eq!(entries, vec!["tool-a|cargo", "tool-b|pkg"]);
     }
 
@@ -1267,10 +1231,11 @@ tool pkg - - os:macos
     fn parse_entry_falls_back_to_short_name_when_cmd_is_unsafe() {
         // A hostile or typo'd `cmd=/etc/passwd` would, without this
         // guard, propagate into `bin_link::one` and
-        // `cleanup::remove_builtin` where `<bin_dir>.join("/etc/passwd")`
-        // resolves to `/etc/passwd` outright. `parse_entry` now falls
-        // back to the dep's short name (already validated upstream)
-        // rather than carrying the unsafe value forward.
+        // `cleanup::remove_builtin_with_evidence` where
+        // `<bin_dir>.join("/etc/passwd")` resolves to `/etc/passwd`
+        // outright. `parse_entry` now falls back to the dep's short name
+        // (already validated upstream) rather than carrying the unsafe
+        // value forward.
         let entry = parse_entry("tool|github:release|/etc/passwd", None);
         assert_eq!(entry.cmd, "tool");
         assert!(!entry.cmd_explicit);
@@ -1302,16 +1267,6 @@ tool pkg - - os:macos
         let entries = load_dir(&dir).unwrap();
 
         // The only entry that survives is the safe one.
-        assert_eq!(entries, vec!["ok-tool|pkg"]);
-    }
-
-    #[test]
-    fn parse_config_texts_rejects_unsafe_dep_names() {
-        // The in-memory bridge path (used by Bash `__api` callers)
-        // gets the same fail-closed treatment as `load_dir` — if it
-        // didn't, the shorter code path would be a hole around the
-        // loader-side guard.
-        let entries = parse_config_texts([". pkg\n./tool pkg\nowner/. pkg\nok-tool pkg\n"]);
         assert_eq!(entries, vec!["ok-tool|pkg"]);
     }
 

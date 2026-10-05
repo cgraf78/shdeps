@@ -1433,8 +1433,12 @@ mod tests {
             &["tool-v9.0.0-linux-x86_64.tar.gz"],
         ))
         .unwrap();
-        github::write_cached_releases(&fixture.roots.state_dir, "owner/tool", &stale_releases)
-            .unwrap();
+        github::write_cached_releases_cancellable(
+            &fixture.roots.state_dir,
+            "owner/tool",
+            &stale_releases,
+        )
+        .unwrap();
         let client = FakeClient::new().with_redirect("owner/tool", "v1.2.3");
         let runner = FakeRunner::new().with_version("tool", "1.2.3");
         let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];

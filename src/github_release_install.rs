@@ -415,11 +415,6 @@ fn symlink_points_into(path: &Path, root: &Path) -> bool {
     }
 }
 
-/// Installs a raw standalone release binary into `SHDEPS_BIN_DIR`.
-pub fn install_plain(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
-    install_plain_to(&bin_dir.join(cmd), bytes)
-}
-
 /// Installs a raw standalone release binary to an exact caller-owned path.
 pub(crate) fn install_plain_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     if let Some(parent) = target.parent() {
@@ -439,11 +434,6 @@ pub(crate) fn install_plain_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     Ok(target.to_path_buf())
 }
 
-/// Installs a gzip-compressed standalone release binary.
-pub fn install_gz(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
-    install_gz_to(&bin_dir.join(cmd), bytes)
-}
-
 /// Installs a gzip-compressed standalone release binary to an exact path.
 pub(crate) fn install_gz_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let mut decoder = flate2::read::GzDecoder::new(bytes);
@@ -456,11 +446,6 @@ pub(crate) fn install_gz_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     install_plain_to(target, &decoded)
 }
 
-/// Installs a bzip2-compressed standalone release binary.
-pub fn install_bz2(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
-    install_bz2_to(&bin_dir.join(cmd), bytes)
-}
-
 /// Installs a bzip2-compressed standalone release binary to an exact path.
 pub(crate) fn install_bz2_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let mut decoder = bzip2::read::BzDecoder::new(bytes);
@@ -469,18 +454,8 @@ pub(crate) fn install_bz2_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
 
     // Like `.gz`, Bash treats `.bz2` assets as compressed single binaries.
     // Keep the decompression-only difference isolated so raw release ownership
-    // behavior has one implementation in `install_plain`.
+    // behavior has one implementation in `install_plain_to`.
     install_plain_to(target, &decoded)
-}
-
-/// Installs a zstd-compressed standalone release binary.
-pub fn install_zst(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
-    install_zst_to(&bin_dir.join(cmd), bytes)
-}
-
-/// Installs an xz-compressed standalone release binary.
-pub fn install_xz(bin_dir: &Path, cmd: &str, bytes: &[u8]) -> Result<PathBuf> {
-    install_xz_to(&bin_dir.join(cmd), bytes)
 }
 
 /// Installs an xz-compressed standalone release binary to an exact path.
@@ -497,28 +472,9 @@ pub(crate) fn install_zst_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let decoded = zstd::stream::decode_all(bytes)?;
 
     // `.zst` completes the Bash compressed-single behavior. Keep all public
-    // bin ownership in `install_plain` so adding formats does not accidentally
+    // bin ownership in `install_plain_to` so adding formats does not accidentally
     // drift from the raw release replacement contract.
     install_plain_to(target, &decoded)
-}
-
-/// Installs a gzip-compressed tar release archive.
-pub fn install_tar_gz(
-    state_dir: &Path,
-    install_base: &Path,
-    bin_dir: &Path,
-    name: &str,
-    cmd: &str,
-    bytes: &[u8],
-) -> Result<PathBuf> {
-    install_tar_gz_to(
-        state_dir,
-        install_base,
-        &bin_dir.join(cmd),
-        name,
-        cmd,
-        bytes,
-    )
 }
 
 /// Installs a gzip-compressed tar archive and links to an exact public path.
@@ -535,25 +491,6 @@ pub(crate) fn install_tar_gz_to(
     })
 }
 
-/// Installs an uncompressed tar release archive.
-pub fn install_tar(
-    state_dir: &Path,
-    install_base: &Path,
-    bin_dir: &Path,
-    name: &str,
-    cmd: &str,
-    bytes: &[u8],
-) -> Result<PathBuf> {
-    install_tar_to(
-        state_dir,
-        install_base,
-        &bin_dir.join(cmd),
-        name,
-        cmd,
-        bytes,
-    )
-}
-
 /// Installs an uncompressed tar archive and links to an exact public path.
 pub(crate) fn install_tar_to(
     state_dir: &Path,
@@ -566,25 +503,6 @@ pub(crate) fn install_tar_to(
     install_archive(state_dir, install_base, public, name, cmd, false, |dest| {
         archive::unpack_tar(bytes, dest).map(|_| ())
     })
-}
-
-/// Installs a bzip2-compressed tar release archive.
-pub fn install_tar_bz2(
-    state_dir: &Path,
-    install_base: &Path,
-    bin_dir: &Path,
-    name: &str,
-    cmd: &str,
-    bytes: &[u8],
-) -> Result<PathBuf> {
-    install_tar_bz2_to(
-        state_dir,
-        install_base,
-        &bin_dir.join(cmd),
-        name,
-        cmd,
-        bytes,
-    )
 }
 
 /// Installs a bzip2-compressed tar archive and links to an exact public path.
@@ -601,25 +519,6 @@ pub(crate) fn install_tar_bz2_to(
     })
 }
 
-/// Installs a zstd-compressed tar release archive.
-pub fn install_tar_zst(
-    state_dir: &Path,
-    install_base: &Path,
-    bin_dir: &Path,
-    name: &str,
-    cmd: &str,
-    bytes: &[u8],
-) -> Result<PathBuf> {
-    install_tar_zst_to(
-        state_dir,
-        install_base,
-        &bin_dir.join(cmd),
-        name,
-        cmd,
-        bytes,
-    )
-}
-
 /// Installs a zstd-compressed tar archive and links to an exact public path.
 pub(crate) fn install_tar_zst_to(
     state_dir: &Path,
@@ -634,25 +533,6 @@ pub(crate) fn install_tar_zst_to(
     })
 }
 
-/// Installs an xz-compressed tar release archive.
-pub fn install_tar_xz(
-    state_dir: &Path,
-    install_base: &Path,
-    bin_dir: &Path,
-    name: &str,
-    cmd: &str,
-    bytes: &[u8],
-) -> Result<PathBuf> {
-    install_tar_xz_to(
-        state_dir,
-        install_base,
-        &bin_dir.join(cmd),
-        name,
-        cmd,
-        bytes,
-    )
-}
-
 /// Installs an xz-compressed tar archive and links to an exact public path.
 pub(crate) fn install_tar_xz_to(
     state_dir: &Path,
@@ -665,25 +545,6 @@ pub(crate) fn install_tar_xz_to(
     install_archive(state_dir, install_base, public, name, cmd, false, |dest| {
         archive::unpack_tar_xz(bytes, dest).map(|_| ())
     })
-}
-
-/// Installs a zip release archive.
-pub fn install_zip(
-    state_dir: &Path,
-    install_base: &Path,
-    bin_dir: &Path,
-    name: &str,
-    cmd: &str,
-    bytes: &[u8],
-) -> Result<PathBuf> {
-    install_zip_to(
-        state_dir,
-        install_base,
-        &bin_dir.join(cmd),
-        name,
-        cmd,
-        bytes,
-    )
 }
 
 /// Installs a zip archive and links to an exact public path.
@@ -1625,7 +1486,7 @@ mod tests {
     fn plain_install_writes_executable_binary() {
         let dir = temp_dir("plain");
 
-        let path = super::install_plain(&dir.join("bin"), "tool", b"binary").unwrap();
+        let path = super::install_plain_to(&dir.join("bin/tool"), b"binary").unwrap();
 
         assert_eq!(path, dir.join("bin/tool"));
         assert_eq!(fs::read(&path).unwrap(), b"binary");
@@ -1640,7 +1501,7 @@ mod tests {
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"user-owned").unwrap();
 
-        super::install_plain(&dir.join("bin"), "tool", b"release").unwrap();
+        super::install_plain_to(&dir.join("bin/tool"), b"release").unwrap();
 
         assert_eq!(fs::read(target).unwrap(), b"release");
     }
@@ -1651,7 +1512,7 @@ mod tests {
         let dir = temp_dir("gz-single");
         let bytes = gzip(b"binary");
 
-        let target = super::install_gz(&dir, "tool", &bytes).unwrap();
+        let target = super::install_gz_to(&dir.join("tool"), &bytes).unwrap();
 
         assert_eq!(target, dir.join("tool"));
         assert_eq!(fs::read(&target).unwrap(), b"binary");
@@ -1664,7 +1525,7 @@ mod tests {
         let dir = temp_dir("bz2-single");
         let bytes = bzip2(b"binary");
 
-        let target = super::install_bz2(&dir, "tool", &bytes).unwrap();
+        let target = super::install_bz2_to(&dir.join("tool"), &bytes).unwrap();
 
         assert_eq!(target, dir.join("tool"));
         assert_eq!(fs::read(&target).unwrap(), b"binary");
@@ -1677,7 +1538,7 @@ mod tests {
         let dir = temp_dir("xz-single");
         let bytes = xz(b"binary");
 
-        let target = super::install_xz(&dir, "tool", &bytes).unwrap();
+        let target = super::install_xz_to(&dir.join("tool"), &bytes).unwrap();
 
         assert_eq!(target, dir.join("tool"));
         assert_eq!(fs::read(&target).unwrap(), b"binary");
@@ -1690,7 +1551,7 @@ mod tests {
         let dir = temp_dir("zst-single");
         let bytes = zstd(b"binary");
 
-        let target = super::install_zst(&dir, "tool", &bytes).unwrap();
+        let target = super::install_zst_to(&dir.join("tool"), &bytes).unwrap();
 
         assert_eq!(target, dir.join("tool"));
         assert_eq!(fs::read(&target).unwrap(), b"binary");
@@ -1707,10 +1568,10 @@ mod tests {
             ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
         ]);
 
-        let public = super::install_tar_gz(
+        let public = super::install_tar_gz_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -1752,10 +1613,10 @@ mod tests {
             ("tool-v2.0/bin/new-helper", b"new".as_slice(), 0o755),
         ]);
 
-        super::install_tar_gz(
+        super::install_tar_gz_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes_v1,
@@ -1763,10 +1624,10 @@ mod tests {
         .unwrap();
         assert!(dir.join("bin/old-helper").is_symlink());
 
-        super::install_tar_gz(
+        super::install_tar_gz_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes_v2,
@@ -1791,10 +1652,10 @@ mod tests {
         ]);
         let bytes_v2 = tar_gz(&[("tool-v2.0/tool", b"v2".as_slice(), 0o755)]);
 
-        super::install_tar_gz(
+        super::install_tar_gz_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes_v1,
@@ -1803,10 +1664,10 @@ mod tests {
         assert!(dir.join("bin/tool").is_symlink());
         assert!(dir.join("bin/tool-helper").is_symlink());
 
-        super::install_tar_gz(
+        super::install_tar_gz_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes_v2,
@@ -1833,10 +1694,10 @@ mod tests {
             ("tool-v1.0/bin/tool-helper", b"helper".as_slice(), 0o755),
         ]);
 
-        super::install_tar_gz(
+        super::install_tar_gz_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -1897,10 +1758,10 @@ mod tests {
             ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
         ]);
 
-        let public = super::install_tar(
+        let public = super::install_tar_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -2458,10 +2319,10 @@ mod tests {
         let state_as_file = dir.join("state");
         fs::write(&state_as_file, "blocker").unwrap();
 
-        let public = super::install_tar_gz(
+        let public = super::install_tar_gz_to(
             &state_as_file,
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -2513,10 +2374,10 @@ mod tests {
         let dir = temp_dir("missing");
         let bytes = tar_gz(&[("tool-v1.0/README.md", b"readme".as_slice(), 0o644)]);
 
-        let error = super::install_tar_gz(
+        let error = super::install_tar_gz_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -2541,10 +2402,10 @@ mod tests {
             ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
         ]);
 
-        let public = super::install_tar_bz2(
+        let public = super::install_tar_bz2_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -2571,10 +2432,10 @@ mod tests {
             ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
         ]);
 
-        let public = super::install_tar_zst(
+        let public = super::install_tar_zst_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -2601,10 +2462,10 @@ mod tests {
             ("tool-v1.0/share/man/man1/tool.1", b"man".as_slice(), 0o644),
         ]);
 
-        let public = super::install_tar_xz(
+        let public = super::install_tar_xz_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -2635,10 +2496,10 @@ mod tests {
             ),
         ]);
 
-        let public = super::install_zip(
+        let public = super::install_zip_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -2662,10 +2523,10 @@ mod tests {
         let dir = temp_dir("zip-no-mode");
         let bytes = zip(&[("tool-v1.0/bin/tool", b"binary".as_slice(), 0o644)]);
 
-        let public = super::install_zip(
+        let public = super::install_zip_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,
@@ -2686,10 +2547,10 @@ mod tests {
             ("tool-v1.0/bin/tool", b"binary".as_slice(), 0o755),
         ]);
 
-        let public = super::install_zip(
+        let public = super::install_zip_to(
             &dir.join("state"),
             &dir.join("share"),
-            &dir.join("bin"),
+            &dir.join("bin/tool"),
             "owner/tool",
             "tool",
             &bytes,

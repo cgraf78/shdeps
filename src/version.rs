@@ -3,26 +3,17 @@
 //! The version contract is intentionally small: report the same generated
 //! version string used by release tags, archive names, and installer metadata.
 
-/// Git commit embedded into the binary at build time.
+/// Public version embedded into the binary at build time.
 ///
 /// `shdeps` is installed onto machines that may not keep a VERSION file or a
-/// full git checkout. Embedding both the public version and the concrete commit
-/// during compilation keeps `shdeps version` useful on those machines and
-/// prevents the Rust port from falling back to an ambiguous `unknown` string.
-pub const COMMIT: &str = env!("SHDEPS_BUILD_COMMIT");
-
-/// Public version embedded into the binary at build time.
+/// full git checkout. Embedding the version during compilation keeps
+/// `shdeps version` useful on those machines and prevents falling back to an
+/// ambiguous `unknown` string.
 ///
 /// The format is `YYYYMMDD-HHMMSS-<8hex>`. The timestamp makes release assets
 /// human-sortable and easy to inspect, while the hash suffix preserves the
 /// commit-based identity that mattered for the old source-only Bash install.
 pub const VERSION: &str = env!("SHDEPS_BUILD_VERSION");
-
-/// Returns the embedded git commit hash.
-#[must_use]
-pub const fn commit() -> &'static str {
-    COMMIT
-}
 
 /// Returns the public generated version string.
 #[must_use]
@@ -44,15 +35,17 @@ pub fn line() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{commit, line, version};
+    use super::{line, version};
+
+    /// The build script resolves this commit and derives `VERSION`'s hash
+    /// suffix from it; tests read it to prove the two stay traceable.
+    const COMMIT: &str = env!("SHDEPS_BUILD_COMMIT");
 
     #[test]
     fn embedded_commit_is_concrete() {
-        let commit = commit();
-
-        assert!(commit.len() >= 8);
-        assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_ne!(commit, "unknown");
+        assert!(COMMIT.len() >= 8);
+        assert!(COMMIT.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(COMMIT, "unknown");
     }
 
     #[test]
@@ -67,7 +60,7 @@ mod tests {
         assert!(parts[0].bytes().all(|byte| byte.is_ascii_digit()));
         assert!(parts[1].bytes().all(|byte| byte.is_ascii_digit()));
         assert!(parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(parts[2], &commit()[..8]);
+        assert_eq!(parts[2], &COMMIT[..8]);
         assert_ne!(version, "unknown");
     }
 

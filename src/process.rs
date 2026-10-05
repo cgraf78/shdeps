@@ -189,18 +189,11 @@ pub fn detect_package_manager(runner: &impl Runner) -> String {
     String::new()
 }
 
-/// Returns whether a dependency is installed.
-///
-/// This mirrors `_shdeps_exists`: command lookup wins first because many
-/// package names differ from their executable names. Package-manager ownership
-/// is only consulted as a fallback so font packages and similar no-binary deps
-/// can still report installed.
-#[must_use]
-pub fn dep_exists(runner: &impl Runner, command: &str, package_name: &str, pkg_mgr: &str) -> bool {
-    dep_exists_with_versions(runner, command, package_name, pkg_mgr, &BTreeMap::new())
-}
-
 /// Returns whether a dependency is installed, using batch package data first.
+///
+/// Command lookup wins first because many package names differ from their
+/// executable names. Package-manager ownership is only consulted as a fallback
+/// so font packages and similar no-binary deps can still report installed.
 ///
 /// `shdeps list` already pays for one manager-wide package-version snapshot on
 /// platforms where the Bash reference knows how to parse it. Reusing that map
@@ -680,8 +673,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Output, Process, Runner, command_path, dep_exists, dep_version, detect_package_manager,
-        package_installed, package_version, package_versions,
+        Output, Process, Runner, command_path, dep_exists_with_versions, dep_version,
+        detect_package_manager, package_installed, package_version, package_versions,
     };
 
     #[derive(Debug, Default)]
@@ -945,7 +938,13 @@ mod tests {
             "missing",
         );
 
-        assert!(dep_exists(&runner, "bat", "bat", "apt"));
+        assert!(dep_exists_with_versions(
+            &runner,
+            "bat",
+            "bat",
+            "apt",
+            &BTreeMap::new()
+        ));
     }
 
     #[test]
@@ -958,7 +957,13 @@ mod tests {
             "",
         );
 
-        assert!(dep_exists(&runner, "git-foo", "", ""));
+        assert!(dep_exists_with_versions(
+            &runner,
+            "git-foo",
+            "",
+            "",
+            &BTreeMap::new()
+        ));
     }
 
     #[test]

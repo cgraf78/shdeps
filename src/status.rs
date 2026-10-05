@@ -68,20 +68,6 @@ pub trait CustomProbe {
     fn installed_detail(&self, entry: &Entry, roots: &Roots) -> Result<Option<String>>;
 }
 
-/// Probe that treats all custom dependencies as missing.
-///
-/// This is useful while building non-hook status plumbing and for tests that
-/// intentionally focus on config, manifest, and package behavior. The real CLI
-/// should use the Bash hook probe before `custom` status is user-facing.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoCustomProbe;
-
-impl CustomProbe for NoCustomProbe {
-    fn installed_detail(&self, _entry: &Entry, _roots: &Roots) -> Result<Option<String>> {
-        Ok(None)
-    }
-}
-
 /// Shared inputs used while classifying dependency status.
 ///
 /// This keeps the public resolver API compact and makes the expensive inputs
@@ -107,18 +93,6 @@ where
     pub pkg_mgr: &'a str,
     /// Batch-loaded package versions keyed by resolved package name.
     pub package_versions: &'a BTreeMap<String, String>,
-}
-
-/// Classifies all configured dependencies in already-loaded config order.
-pub fn list<R, C>(entries: &[Entry], context: &Context<'_, R, C>) -> Result<Vec<DependencyStatus>>
-where
-    R: Runner,
-    C: CustomProbe,
-{
-    entries
-        .iter()
-        .map(|entry| classify(entry, context))
-        .collect()
 }
 
 /// Classifies all configured dependencies with bounded read-only parallelism.
@@ -297,15 +271,25 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Context, CustomProbe, DependencyStatus, NoCustomProbe, SkipReason, State, classify, list,
-        list_with_jobs,
+        Context, CustomProbe, DependencyStatus, SkipReason, State, classify, list_with_jobs,
     };
     use crate::Result;
-    use crate::config::parse_entry;
+    use crate::config::{Entry, parse_entry};
     use crate::manifest::{Manifest, ManifestEntry};
     use crate::platform::RuntimeEnv;
     use crate::process::{Output, Runner};
     use crate::runtime::Roots;
+
+    /// Probe that treats all custom dependencies as missing, for tests that
+    /// intentionally focus on config, manifest, and package behavior.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct NoCustomProbe;
+
+    impl CustomProbe for NoCustomProbe {
+        fn installed_detail(&self, _entry: &Entry, _roots: &Roots) -> Result<Option<String>> {
+            Ok(None)
+        }
+    }
 
     #[derive(Debug, Default)]
     struct FakeRunner {
@@ -773,7 +757,7 @@ mod tests {
             &package_versions,
         );
 
-        let statuses = list(&entries, &context).unwrap();
+        let statuses = list_with_jobs(&entries, &context, 1).unwrap();
 
         assert_eq!(
             statuses,

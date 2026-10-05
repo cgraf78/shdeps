@@ -299,18 +299,12 @@ pub fn read_cached_releases(state_dir: &Path, repo: &str) -> Option<Vec<Release>
     serde_json::from_str(&content).ok()
 }
 
-/// Writes parsed release metadata for reuse by later update phases.
+/// Writes parsed release metadata for reuse by later update phases, only
+/// while the CLI cancellation latch is clear.
 ///
 /// Bare `github` resolution and `github:release` installation both need the
 /// same GitHub release payload. Persisting the parsed model lets one update run
 /// share that fact without inventing a wider in-memory planner object.
-pub fn write_cached_releases(state_dir: &Path, repo: &str, releases: &[Release]) -> Result<()> {
-    let mut content = serde_json::to_string(releases)?;
-    content.push('\n');
-    state::write_atomic(&releases_cache_path(state_dir, repo), &content)
-}
-
-/// Writes release metadata only while the CLI cancellation latch is clear.
 pub(crate) fn write_cached_releases_cancellable(
     state_dir: &Path,
     repo: &str,

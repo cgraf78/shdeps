@@ -97,10 +97,11 @@ impl Summary {
 /// Runs prune against one already-loaded config snapshot.
 ///
 /// `env` is the runtime identity used to decide which config entries still
-/// own their manifest rows on this host (see `Manifest::orphans`). Callers
-/// that can reload config should use `run_with_config_loader` so the
-/// mutating phase sees config as of state-lock acquisition.
-pub fn run(
+/// own their manifest rows on this host (see `Manifest::orphans`). Test entry
+/// point: the CLI uses `run_with_config_loader` so the mutating phase sees
+/// config as of state-lock acquisition.
+#[cfg(test)]
+pub(crate) fn run(
     config: &[Entry],
     manifest: &Manifest,
     manifest_path: &Path,

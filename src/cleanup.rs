@@ -390,54 +390,6 @@ pub fn method_transitions(
         .collect()
 }
 
-/// Removes built-in artifacts for one manifest entry.
-///
-/// Hook `uninstall()` execution intentionally lives outside this function. Hooks
-/// can run arbitrary shell, so coordinators run them outside the non-reentrant
-/// checkout lock and acquire that narrower lock only for deterministic filesystem
-/// cleanup. The broader Shdeps state lock remains held across the full update or
-/// prune transaction.
-pub fn remove_builtin(entry: &ManifestEntry, roots: &Roots) -> Result<Summary> {
-    if entry.method == method::GITHUB_REPO {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "github:repo cleanup requires an acquired checkout-lock root",
-        )
-        .into());
-    }
-    remove_builtin_with_repo_root(entry, roots, None)
-}
-
-/// Removes built-in artifacts while honoring an already locked repo root.
-///
-/// Coordinators pass the normalized path yielded by checkout-lock acquisition
-/// so a configured install-root symlink cannot be retargeted between locking
-/// and cleanup. Non-repository methods ignore this argument.
-pub(crate) fn remove_builtin_with_repo_root(
-    entry: &ManifestEntry,
-    roots: &Roots,
-    locked_repo_root: Option<&Path>,
-) -> Result<Summary> {
-    remove_builtin_with_protection(entry, roots, locked_repo_root, false)
-}
-
-/// Removes built-in artifacts while preserving a proven surviving raw command.
-pub(crate) fn remove_builtin_with_protection(
-    entry: &ManifestEntry,
-    roots: &Roots,
-    locked_repo_root: Option<&Path>,
-    preserve_regular_public: bool,
-) -> Result<Summary> {
-    let evidence = capture_evidence(entry, roots)?;
-    remove_builtin_with_evidence(
-        entry,
-        roots,
-        locked_repo_root,
-        preserve_regular_public,
-        evidence,
-    )
-}
-
 /// Captures generation identity before an arbitrary uninstall hook can replace it.
 pub(crate) fn capture_evidence(entry: &ManifestEntry, roots: &Roots) -> Result<Evidence> {
     let public_regular_identity = if entry.method == method::GITHUB_RELEASE {
@@ -541,6 +493,16 @@ fn capture_release_archive_state(
 }
 
 /// Removes built-in artifacts using identity captured before caller-owned hooks.
+///
+/// Hook `uninstall()` execution intentionally lives outside this function. Hooks
+/// can run arbitrary shell, so coordinators run them outside the non-reentrant
+/// checkout lock and acquire that narrower lock only for deterministic filesystem
+/// cleanup. The broader Shdeps state lock remains held across the full update or
+/// prune transaction.
+///
+/// Coordinators pass the normalized path yielded by checkout-lock acquisition
+/// as `locked_repo_root` so a configured install-root symlink cannot be
+/// retargeted between locking and cleanup. Non-repository methods ignore it.
 pub(crate) fn remove_builtin_with_evidence(
     entry: &ManifestEntry,
     roots: &Roots,
@@ -1383,8 +1345,8 @@ mod tests {
     #[cfg(unix)]
     use super::quarantine_matching_with;
     use super::{
-        Roots, Summary, lexical_normalize, method_transitions, remove_builtin_with_repo_root,
-        remove_stamps, safe_repo_root, symlink_targets_any_root,
+        Roots, Summary, capture_evidence, lexical_normalize, method_transitions,
+        remove_builtin_with_evidence, remove_stamps, safe_repo_root, symlink_targets_any_root,
     };
     use crate::config::Entry;
     use crate::github_release_install;
@@ -1395,7 +1357,8 @@ mod tests {
         let repo_root = (entry.method == crate::method::GITHUB_REPO)
             .then(|| safe_repo_root(entry, roots))
             .flatten();
-        remove_builtin_with_repo_root(entry, roots, repo_root.as_deref())
+        let evidence = capture_evidence(entry, roots)?;
+        remove_builtin_with_evidence(entry, roots, repo_root.as_deref(), false, evidence)
     }
 
     #[test]
@@ -1522,7 +1485,9 @@ mod tests {
         let fixture = Fixture::new("repo-missing-lock-authority");
         let entry = ManifestEntry::new("owner/tool", "github:repo", "tool", "");
 
-        let error = super::remove_builtin(&entry, &fixture.roots).unwrap_err();
+        let evidence = capture_evidence(&entry, &fixture.roots).unwrap();
+        let error = remove_builtin_with_evidence(&entry, &fixture.roots, None, false, evidence)
+            .unwrap_err();
 
         assert!(
             error

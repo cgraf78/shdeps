@@ -410,8 +410,9 @@ If any latent state-rewrite need emerges, expose it under
 command MUST remain harmless and idempotent if kept under `__api`.
 
 `shdeps help` MUST NOT mention `migrate`. `shdeps migrate` invoked directly
-on the user-facing CLI MUST return a usage error (exit code 2) with a
-message pointing at the removal.
+on the user-facing CLI is an unknown command: it returns the generic usage
+error (exit code 2). The interim removal notice for shell-era callers was
+retired once the fleet had moved to the Rust CLI.
 
 ## Environment Contract
 
@@ -2195,7 +2196,7 @@ delta-regression tests.
 | Δ12 | Wrapper caches ABI check and common RuntimeEnv values in shell vars | Reduces fork overhead on dotfiles bootstrap from ~250 ms to ~30 ms | Sourced wrapper followed by 5 helper calls measured under 50 ms |
 | Δ13 | `shdeps_pkg_mgr` MUST NOT trigger detection (cached-read only) | Matches current Bash semantics; the naive Rust impl would change it | Test sourcing wrapper and calling `shdeps_pkg_mgr` BEFORE `shdeps_update` returns empty, not a freshly-detected value |
 | Δ14 | Cross-state-dir sharing of install/bin/extras dirs unsupported | Single-user single-state-dir is the documented case | Warning logged if `SHDEPS_INSTALL_DIR` is overridden without matching `SHDEPS_STATE_DIR` |
-| Δ15 | `migrate` removed from user-facing CLI | Canonicalization happens at parse-time; user command is moot | `shdeps help` does not mention `migrate`; `shdeps migrate` returns usage error |
+| Δ15 | `migrate` removed from user-facing CLI | Canonicalization happens at parse-time; user command is moot | `shdeps help` does not mention `migrate`; `shdeps migrate` is an unknown command (usage error) |
 
 Any future intentional behavior change MUST add a row here before landing.
 
