@@ -6621,6 +6621,16 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
+    // Upper bound for a cleanup call that runs outside the signal-boundary
+    // subprocess, whose 30s ceiling bounds the other self-bounded fixtures
+    // here. Such a fixture never exits on its own before its ~300s bound, so
+    // a regression that waits for it returns late instead of hanging; this
+    // bound fails it. It is twice that 30s ceiling for the same bounded
+    // teardown, so it is not a performance budget. Only the Linux/Android
+    // fixture tests use it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const WAITED_OUT_LIMIT: Duration = Duration::from_secs(60);
+
     use std::cell::Cell;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
@@ -7896,7 +7906,7 @@ sys.exit(0)
         let dir = crate::test_support::temp_dir("shdeps-cancel-immediate-zombie");
         let orphan_pid_path = dir.join("orphan.pid");
         let script = format!(
-            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n open({orphan_pid_path:?}, 'w').write(str(os.getpid()))\n os._exit(0)\nsignal.signal(signal.SIGTERM, lambda *_: os._exit(0))\nwhile True:\n time.sleep(1)\n"
+            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n open({orphan_pid_path:?}, 'w').write(str(os.getpid()))\n os._exit(0)\nsignal.signal(signal.SIGTERM, lambda *_: os._exit(0))\nfor _ in range(300):\n time.sleep(1)\n"
         );
         let mut command = Command::new("python3");
         command
@@ -7979,7 +7989,7 @@ sys.exit(0)
         let descendant_path = dir.join("descendant.pid");
         let _fixture_cleanup = PublishedPidCleanup::new(&descendant_path);
         let script = format!(
-            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n os.closerange(3, 1024)\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant_path:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n while True: time.sleep(1)\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nos._exit(0)\n"
+            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n os.closerange(3, 1024)\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant_path:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n for _ in range(300): time.sleep(1)\n os._exit(0)\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nos._exit(0)\n"
         );
         let mut command = Command::new("python3");
         command
@@ -8065,7 +8075,7 @@ sys.exit(0)
         let dir = crate::test_support::temp_dir("shdeps-missing-children-escape");
         let descendant_path = dir.join("descendant.pid");
         let script = format!(
-            "import os, signal, time\nos.closerange(3, 1024)\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n open({descendant_path:?}, 'w').write(str(os.getpid()))\n while True: time.sleep(1)\n[signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nwhile True: time.sleep(1)\n"
+            "import os, signal, time\nos.closerange(3, 1024)\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n open({descendant_path:?}, 'w').write(str(os.getpid()))\n for _ in range(300): time.sleep(1)\n os._exit(0)\n[signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nfor _ in range(300): time.sleep(1)\n"
         );
         let mut command = Command::new("/usr/bin/env");
         command
@@ -8144,7 +8154,7 @@ sys.exit(0)
         let dir = crate::test_support::temp_dir("shdeps-unmarked-adoptee");
         let descendant_path = dir.join("descendant.pid");
         let script = format!(
-            "import os, signal, time\nos.closerange(3, 1024)\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n open({descendant_path:?}, 'w').write(str(os.getpid()))\n while True: time.sleep(1)\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nos._exit(0)\n"
+            "import os, signal, time\nos.closerange(3, 1024)\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n open({descendant_path:?}, 'w').write(str(os.getpid()))\n for _ in range(300): time.sleep(1)\n os._exit(0)\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nos._exit(0)\n"
         );
         let mut command = Command::new("/usr/bin/env");
         command
@@ -8237,7 +8247,7 @@ sys.exit(0)
         let dir = crate::test_support::temp_dir("shdeps-different-marker-adoptee");
         let descendant_path = dir.join("descendant.pid");
         let script = format!(
-            "import os, signal, time\nos.closerange(3, 1024)\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n open({descendant_path:?}, 'w').write(str(os.getpid()))\n while True: time.sleep(1)\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nos._exit(0)\n"
+            "import os, signal, time\nos.closerange(3, 1024)\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n open({descendant_path:?}, 'w').write(str(os.getpid()))\n for _ in range(300): time.sleep(1)\n os._exit(0)\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nos._exit(0)\n"
         );
         let mut command = Command::new("/usr/bin/env");
         command
@@ -8617,7 +8627,7 @@ sys.exit(0)
         let dir = crate::test_support::temp_dir("shdeps-ambiguous-live-adoptee");
         let descendant_path = dir.join("descendant.pid");
         let script = format!(
-            "import os, signal, time\nos.closerange(3, 1024)\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n open({descendant_path:?}, 'w').write(str(os.getpid()))\n while True: time.sleep(1)\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nos._exit(0)\n"
+            "import os, signal, time\nos.closerange(3, 1024)\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n open({descendant_path:?}, 'w').write(str(os.getpid()))\n for _ in range(300): time.sleep(1)\n os._exit(0)\nwhile not os.path.exists({descendant_path:?}): time.sleep(0.001)\nos._exit(0)\n"
         );
         let mut command = Command::new("/usr/bin/env");
         command
@@ -8705,7 +8715,7 @@ sys.exit(0)
             let descendant_path = dir.join("descendant.pid");
             let _fixture_cleanup = PublishedPidCleanup::new(&descendant_path);
             let script = format!(
-                "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)]\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant_path:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n while True: time.sleep(1)\nwhile True: time.sleep(1)\n"
+                "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT)]\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant_path:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n for _ in range(300): time.sleep(1)\n os._exit(0)\nfor _ in range(300): time.sleep(1)\n"
             );
             let mut command = Command::new("python3");
             command
@@ -8730,6 +8740,7 @@ sys.exit(0)
             };
             let fail_at = if second_reader { 2 } else { 1 };
             let calls = Cell::new(0_usize);
+            let cleanup_started = Instant::now();
             let result = super::spawn_output_readers_with(
                 &mut child,
                 Box::new(|| Ok(Vec::new())),
@@ -8745,6 +8756,7 @@ sys.exit(0)
                     }
                 },
             );
+            let cleanup_elapsed = cleanup_started.elapsed();
             assert!(result.is_err());
             let stopped = !super::linux_process_info_checked(leader)
                 .unwrap()
@@ -8759,6 +8771,12 @@ sys.exit(0)
                 stopped,
                 "a {} reader creation failure left the owned tree running",
                 if second_reader { "second" } else { "first" }
+            );
+            // Both fixture processes outlive any bounded teardown, so a stop
+            // that waited for them instead of killing them fails here.
+            assert!(
+                cleanup_elapsed < WAITED_OUT_LIMIT,
+                "reader setup cleanup waited out the fixture: {cleanup_elapsed:?}"
             );
         }
     }
@@ -9593,7 +9611,7 @@ sys.exit(0)
         let ready = dir.join("leader.ready");
         let term = dir.join("leader.term");
         let script = format!(
-            "trap 'printf term > {term:?}; exit 0' TERM\nprintf ready > {ready:?}\nwhile :; do /bin/sleep 0.02; done\n"
+            "trap 'printf term > {term:?}; exit 0' TERM\nprintf ready > {ready:?}\nwhile [ $((fixture_loop = ${{fixture_loop:-0}} + 1)) -le 15000 ]; do /bin/sleep 0.02; done\n"
         );
         let mut command = Command::new("/bin/sh");
         command
@@ -10310,7 +10328,7 @@ sys.exit(0)
         let release_path = dir.join("release");
         let mutation_path = dir.join("mutations");
         let script = format!(
-            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n while True:\n  open({mutation:?}, 'a').write('x')\n  time.sleep(0.01)\nwhile not os.path.exists({release:?}):\n time.sleep(0.001)\n",
+            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n for _ in range(30000):\n  open({mutation:?}, 'a').write('x')\n  time.sleep(0.01)\n os._exit(0)\nwhile not os.path.exists({release:?}):\n time.sleep(0.001)\n",
             descendant = descendant_pid_path,
             mutation = mutation_path,
             release = release_path,
@@ -10407,7 +10425,7 @@ sys.exit(0)
         let release_path = dir.join("release");
         let term_path = dir.join("term");
         let script = format!(
-            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT)]\n def term(_signal, _frame):\n  open({term:?}, 'w').write('term')\n signal.signal(signal.SIGTERM, term)\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n while True:\n  time.sleep(0.01)\nwhile not os.path.exists({release:?}):\n time.sleep(0.001)\n",
+            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT)]\n def term(_signal, _frame):\n  open({term:?}, 'w').write('term')\n signal.signal(signal.SIGTERM, term)\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n for _ in range(30000):\n  time.sleep(0.01)\n os._exit(0)\nwhile not os.path.exists({release:?}):\n time.sleep(0.001)\n",
             descendant = descendant_pid_path,
             release = release_path,
             term = term_path,
@@ -10497,7 +10515,7 @@ subprocess.Popen(
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
 )
-time.sleep(3600)
+time.sleep(600)
 "#;
         let fixture_script = r#"
 import os, signal, sys, time
@@ -10506,8 +10524,9 @@ for handled in (signal.SIGTERM, signal.SIGINT):
 path = sys.argv[1]
 stat = open('/proc/self/stat').read().rsplit(')', 1)[1].split()
 open(path, 'w').write(f"{os.getpid()} {stat[19]}")
-while True:
-    time.sleep(3600)
+# Outlives its test by far; bounded so a failed test cannot leave it
+# running indefinitely.
+time.sleep(600)
 "#;
         let registration = super::SpawnRegistrationWindow::begin();
         let mut intermediate_command = Command::new("python3");
@@ -12652,7 +12671,7 @@ while True:
         command
             .arg("-c")
             .arg(
-                "sh -c 'trap \"\" HUP INT QUIT TERM; printf \"%s\\n\" \"$$\" >\"$SHDEPS_TEST_PID\"; while :; do sleep 1; done' & exit 0",
+                "sh -c 'trap \"\" HUP INT QUIT TERM; printf \"%s\\n\" \"$$\" >\"$SHDEPS_TEST_PID\"; while [ $((fixture_loop = ${fixture_loop:-0} + 1)) -le 300 ]; do sleep 1; done' & exit 0",
             )
             .env("SHDEPS_TEST_PID", &pid_path);
         let signaler = std::thread::spawn({
@@ -12675,9 +12694,17 @@ while True:
             }
         });
 
+        let started = Instant::now();
         let result = super::output(command, None);
+        let elapsed = started.elapsed();
         signaler.join().unwrap();
         assert!(result.is_err());
         assert_eq!(signals.close(), Some(libc::SIGTERM));
+        // The descendant ignores TERM and loops for ~300s, so cancellation
+        // that waited for it instead of killing it fails here.
+        assert!(
+            elapsed < WAITED_OUT_LIMIT,
+            "cancellation waited out the descendant: {elapsed:?}"
+        );
     }
 }

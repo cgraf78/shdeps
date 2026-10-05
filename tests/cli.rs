@@ -51,10 +51,22 @@ const CI_PERFORMANCE_SAMPLES: usize = 3;
 // longer finite alternative, such as the 300s default hook timeout. It sits
 // far below that, so it still detects the regression, and far above what a
 // debug build needs on a loaded host, so it is not a performance budget
-// (those run in the serial `--ignored` pass above). A regression that never
-// returns (a fixture that never exits, a read that never completes) hangs
-// the unbounded `run`/`timed` call instead of reaching the assertion.
+// (those run in the serial `--ignored` pass above). A long-lived fixture
+// stops after its ~300s self-bound (see below), so a regression that waits
+// for it returns late instead of hanging; a test whose run could wait out
+// such a fixture must check its elapsed time against this limit, or bound
+// its wait with `LIVENESS_TIMEOUT`, to fail it. A regression blocked on a
+// read that never completes still hangs the unbounded `run`/`timed` call
+// instead of reaching the assertion.
 const WAITED_OUT_LIMIT: Duration = Duration::from_secs(60);
+
+// Fixtures that model a process which never exits on its own (TERM ignored,
+// `while :` or `while True` loops) are bounded instead: each loop runs a
+// fixed number of iterations whose sleeps add up to at least 300s, and a
+// forked Python child exits after its loop. That is five times the longest
+// assertion window here (`WAITED_OUT_LIMIT`), so no fixture exits inside a
+// window it is checked against, while a test that panics before its guard
+// is armed, or a killed test binary, can no longer leave an immortal process.
 
 // Bound for waiting on something that must eventually happen: a fixture
 // publishing its pid, or Shdeps exiting after a cancellation. A miss means a
@@ -2860,7 +2872,7 @@ exists() { return 1; }
 install() {
   printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
   trap '' HUP INT QUIT TERM
-  while :; do /bin/sleep 1; done
+  while [ $((fixture_loop_1 = ${fixture_loop_1:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 }
 "#,
     );
@@ -4552,6 +4564,9 @@ install() {
     command.env("SHDEPS_HOOK_TIMEOUT_SECS", "3");
 
     let output = run_on_terminal(&mut command);
+    // Arm the cleanup guard before any assertion below can panic.
+    let grandchild = wait_for_pid_opt(&fixture.dir.join("state/grandchild.pid"), Duration::ZERO);
+    let _grandchild_guard = grandchild.and_then(EscapedProcessGuard::new_if_present);
 
     assert_success(&output);
     // The grandchild only writes its marker after sleeping out its lifetime.
@@ -4561,11 +4576,7 @@ install() {
         !fixture.dir.join("state/grandchild-finished").exists(),
         "the hook deadline must still apply after the leader requests sudo"
     );
-    let pid = fs::read_to_string(fixture.dir.join("state/grandchild.pid"))
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
+    let pid = grandchild.expect("pre-sudo hook grandchild pid");
     wait_until(
         Duration::from_secs(2),
         || !process_is_running(pid),
@@ -4583,7 +4594,7 @@ exists() { return 1; }
 install() {
   printf '%s install\n' "$1" >>"$SHDEPS_TEST_SUDO_LOG"
   shdeps_require_sudo || return $?
-  /bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+  /bin/sh -c 'trap "" TERM; while [ $((fixture_loop_2 = ${fixture_loop_2:-0} + 1)) -le 300 ]; do /bin/sleep 1; done' &
   printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/retry-grandchild.pid"
   wait
 }
@@ -4596,6 +4607,12 @@ install() {
     command.env("SHDEPS_HOOK_TIMEOUT_SECS", "3");
 
     let (output, elapsed) = timed_on_terminal(&mut command);
+    // Arm the cleanup guard before any assertion below can panic.
+    let grandchild = wait_for_pid_opt(
+        &fixture.dir.join("state/retry-grandchild.pid"),
+        Duration::ZERO,
+    );
+    let _grandchild_guard = grandchild.and_then(EscapedProcessGuard::new_if_present);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -4605,11 +4622,7 @@ install() {
     let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
     assert_eq!(log.matches("parent sudo true\n").count(), 1, "{log}");
     assert_eq!(log.matches("tool install\n").count(), 2, "{log}");
-    let pid = fs::read_to_string(fixture.dir.join("state/retry-grandchild.pid"))
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
+    let pid = grandchild.expect("authenticated retry grandchild pid");
     wait_until(
         Duration::from_secs(2),
         || !process_is_running(pid),
@@ -4630,7 +4643,7 @@ fn update_custom_hook_timeout_kills_inflight_sudo_probe_group() {
         r#"#!/bin/sh
 if [ "$1:$2" = '-n:true' ]; then
   printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/sudo-probe.pid"
-  /bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+  /bin/sh -c 'trap "" TERM; while [ $((fixture_loop_3 = ${fixture_loop_3:-0} + 1)) -le 300 ]; do /bin/sleep 1; done' &
   printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/sudo-probe-child.pid"
   wait
 fi
@@ -4641,6 +4654,14 @@ exit 1
     command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
 
     let (output, elapsed) = timed(&mut command);
+    // Arm the cleanup guards before any assertion below can panic.
+    let probe_pid = wait_for_pid_opt(&fixture.dir.join("state/sudo-probe.pid"), Duration::ZERO);
+    let _probe_guard = probe_pid.and_then(EscapedProcessGuard::new_if_present);
+    let child_pid = wait_for_pid_opt(
+        &fixture.dir.join("state/sudo-probe-child.pid"),
+        Duration::ZERO,
+    );
+    let _child_guard = child_pid.and_then(EscapedProcessGuard::new_if_present);
 
     assert_eq!(output.status.code(), Some(1));
     // The probe's descendant never exits; only the hook deadline ends it.
@@ -4648,27 +4669,14 @@ exit 1
         elapsed < WAITED_OUT_LIMIT,
         "the outer hook deadline must remain authoritative: {elapsed:?}"
     );
-    let probe_pid = wait_for_pid(
-        &fixture.dir.join("state/sudo-probe.pid"),
-        LIVENESS_TIMEOUT,
-        "timed-out sudo probe pid",
-    );
-    let child_pid = wait_for_pid(
-        &fixture.dir.join("state/sudo-probe-child.pid"),
-        LIVENESS_TIMEOUT,
-        "timed-out sudo probe descendant pid",
-    );
-    let probe_running = process_is_running(probe_pid);
-    let child_running = process_is_running(child_pid);
-    if probe_running {
-        kill_process(probe_pid);
-    }
-    if child_running {
-        kill_process(child_pid);
-    }
-    assert!(!probe_running, "sudo probe survived hook timeout");
+    let probe_pid = probe_pid.expect("timed-out sudo probe pid");
+    let child_pid = child_pid.expect("timed-out sudo probe descendant pid");
     assert!(
-        !child_running,
+        !process_is_running(probe_pid),
+        "sudo probe survived hook timeout"
+    );
+    assert!(
+        !process_is_running(child_pid),
         "sudo probe descendant survived hook timeout"
     );
 }
@@ -4731,7 +4739,7 @@ fn custom_hook_timeout_still_kills_its_detached_grandchild() {
         r#"
 exists() { return 1; }
 install() {
-  /bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' &
+  /bin/sh -c 'trap "" TERM; while [ $((fixture_loop_4 = ${fixture_loop_4:-0} + 1)) -le 300 ]; do /bin/sleep 1; done' &
   printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/grandchild.pid"
   wait
 }
@@ -4741,6 +4749,9 @@ install() {
     let mut command = fixture.command(["update"]);
     command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
     let (output, elapsed) = timed(&mut command);
+    // Arm the cleanup guard before any assertion below can panic.
+    let grandchild = wait_for_pid_opt(&fixture.dir.join("state/grandchild.pid"), Duration::ZERO);
+    let _grandchild_guard = grandchild.and_then(EscapedProcessGuard::new_if_present);
 
     assert_eq!(output.status.code(), Some(1));
     // The grandchild never exits; only the hook deadline ends the run.
@@ -4748,11 +4759,7 @@ install() {
         elapsed < WAITED_OUT_LIMIT,
         "hook timeout should remain bounded: {elapsed:?}"
     );
-    let pid = fs::read_to_string(fixture.dir.join("state/grandchild.pid"))
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
+    let pid = grandchild.expect("timed-out hook grandchild pid");
     wait_until(
         Duration::from_secs(2),
         || !process_is_running(pid),
@@ -4773,7 +4780,7 @@ install() {
   trap '' HUP INT QUIT
   trap 'printf term >"$SHDEPS_STATE_DIR/term-seen"' TERM
   printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
-  while :; do
+  while [ $((fixture_loop_5 = ${fixture_loop_5:-0} + 1)) -le 15000 ]; do
     printf x >>"$SHDEPS_STATE_DIR/mutations"
     /bin/sleep 0.02
   done
@@ -5076,7 +5083,7 @@ install() {
   trap '' HUP INT QUIT
   trap 'printf cleanup-started >"$SHDEPS_STATE_DIR/cleanup-started"; trap "" TERM' TERM
   printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
-  while :; do /bin/sleep 1; done
+  while [ $((fixture_loop_6 = ${fixture_loop_6:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 }
 "#,
     );
@@ -5128,7 +5135,7 @@ install() {
   trap '' HUP INT QUIT TERM
   printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
   kill -TERM "$PPID"
-  while :; do /bin/sleep 1; done
+  while [ $((fixture_loop_7 = ${fixture_loop_7:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 }
 "#,
     );
@@ -5177,7 +5184,7 @@ install() {
   /bin/sh -c '
     trap "" HUP INT QUIT TERM
     printf "%s\n" "$$" >"$SHDEPS_STATE_DIR/descendant.pid"
-    while :; do
+    while [ $((fixture_loop_8 = ${fixture_loop_8:-0} + 1)) -le 15000 ]; do
       printf x >>"$SHDEPS_STATE_DIR/descendant-mutations"
       /bin/sleep 0.02
     done
@@ -5327,7 +5334,7 @@ fn parent_signal_stops_unbounded_external_install_before_returning() {
 trap '' HUP INT QUIT
 trap 'printf term >"$SHDEPS_TEST_CHILD_TERM"' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
-while :; do /bin/sleep 0.02; done
+while [ $((fixture_loop_9 = ${fixture_loop_9:-0} + 1)) -le 15000 ]; do /bin/sleep 0.02; done
 "#,
     );
 
@@ -5380,7 +5387,7 @@ fn parent_cancellation_resumes_stopped_child_before_term() {
         r#"#!/bin/sh
 trap 'printf term >"$SHDEPS_TEST_CHILD_TERM"; exit 0' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
-while :; do /bin/sleep 1; done
+while [ $((fixture_loop_10 = ${fixture_loop_10:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 "#,
     );
 
@@ -5434,7 +5441,7 @@ fn parent_signal_stops_unbounded_external_descendant_after_leader_exits() {
 /bin/sh -c '
   trap "" HUP INT QUIT TERM
   printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
-  while :; do
+  while [ $((fixture_loop_11 = ${fixture_loop_11:-0} + 1)) -le 15000 ]; do
     printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
     /bin/sleep 0.02
   done
@@ -5544,7 +5551,7 @@ fn parent_signal_stops_tracked_external_descendant_after_session_escape_and_lead
 /usr/bin/setsid /bin/sh -c '
   trap "" HUP INT QUIT TERM
   printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
-  while :; do
+  while [ $((fixture_loop_12 = ${fixture_loop_12:-0} + 1)) -le 15000 ]; do
     printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
     /bin/sleep 0.02
   done
@@ -5654,7 +5661,7 @@ trap '
     /usr/bin/setsid /bin/sh -c '\''
       trap "" HUP INT QUIT TERM
       printf "%s\n" "$$" >>"$SHDEPS_TEST_LATE_PIDS"
-      while :; do
+      while [ $((fixture_loop_13 = ${fixture_loop_13:-0} + 1)) -le 15000 ]; do
         printf x >>"$SHDEPS_TEST_LATE_MUTATIONS"
         /bin/sleep 0.02
       done
@@ -5662,10 +5669,10 @@ trap '
     i=$((i + 1))
     /bin/sleep 0.003
   done
-  while :; do /bin/sleep 1; done
+  while [ $((fixture_loop_14 = ${fixture_loop_14:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 ' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
-while :; do /bin/sleep 1; done
+while [ $((fixture_loop_15 = ${fixture_loop_15:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 "#,
     );
     let pids_path = fixture.dir.join("late-descendants.pids");
@@ -5836,7 +5843,7 @@ fn late_same_group_term_attempt(attempt: usize) -> LateTermAttempt {
         r#"#!/bin/sh
 trap 'printf term >"$SHDEPS_TEST_LATE_CHILD_TERM"' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_LATE_CHILD_PID"
-while :; do /bin/sleep 1 & wait $!; done
+while [ $((fixture_loop_16 = ${fixture_loop_16:-0} + 1)) -le 300 ]; do /bin/sleep 1 & wait $!; done
 "#,
     );
     fixture.write_executable(
@@ -5844,11 +5851,11 @@ while :; do /bin/sleep 1 & wait $!; done
         r#"#!/bin/sh
 trap '
   "$SHDEPS_TEST_LATE_CHILD" &
-  while [ ! -s "$SHDEPS_TEST_LATE_CHILD_PID" ]; do :; done
-  while :; do /bin/sleep 1; done
+  while [ ! -s "$SHDEPS_TEST_LATE_CHILD_PID" ] && [ $((fixture_wait = ${fixture_wait:-0} + 1)) -le 10000000 ]; do :; done
+  while [ $((fixture_loop_17 = ${fixture_loop_17:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 ' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
-while :; do /bin/sleep 1; done
+while [ $((fixture_loop_18 = ${fixture_loop_18:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 "#,
     );
     let child_path = fixture.dir.join("fakebin/late-same-group-child");
@@ -6000,7 +6007,7 @@ fn parent_signal_interrupts_large_stdin_write_to_nonreading_curl() {
 trap '' HUP INT QUIT
 trap 'printf term >"$SHDEPS_TEST_CURL_TERM"' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_CURL_PID"
-while :; do /bin/sleep 0.02; done
+while [ $((fixture_loop_19 = ${fixture_loop_19:-0} + 1)) -le 15000 ]; do /bin/sleep 0.02; done
 "#,
     );
 
@@ -6066,7 +6073,7 @@ if [ "$1" = true ]; then
   trap '' HUP INT QUIT
   trap 'printf term >"$SHDEPS_TEST_SUDO_TERM"' TERM
   printf '%s\n' "$$" >"$SHDEPS_TEST_SUDO_PID"
-  while :; do /bin/sleep 0.02; done
+  while [ $((fixture_loop_20 = ${fixture_loop_20:-0} + 1)) -le 15000 ]; do /bin/sleep 0.02; done
 fi
 exit 2
 "#,
@@ -6269,7 +6276,7 @@ fn terminal_interrupt_trapped_as_conventional_exit_returns_130() {
         r#"#!/bin/sh
 trap 'exit 130' INT
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
-while :; do /bin/sleep 1; done
+while [ $((fixture_loop_21 = ${fixture_loop_21:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 "#,
     );
     let mut command = fixture.command(["update"]);
@@ -6342,9 +6349,10 @@ if worker == 0:
     with open(os.environ["SHDEPS_TEST_SIBLING_PID"], "w") as pid_file:
         pid_file.write(f"{os.getpid()}\n")
     with open(os.environ["SHDEPS_TEST_SIBLING_MUTATIONS"], "ab", buffering=0) as mutations:
-        while True:
+        for _ in range(30000):
             mutations.write(b"x")
             time.sleep(0.01)
+        os._exit(0)
 
 descendant = os.fork()
 if descendant == 0:
@@ -6363,8 +6371,9 @@ if descendant == 0:
         pid_file.write(f"{os.getpid()}\n")
     with open(os.environ["SHDEPS_TEST_DESCENDANT_READY"], "w") as ready_file:
         ready_file.write("ready\n")
-    while True:
+    for _ in range(300):
         time.sleep(1)
+    os._exit(0)
 
 os.close(write_fd)
 with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
@@ -6475,7 +6484,7 @@ fn terminal_interrupt_of_leader_stops_ignoring_pipe_holder() {
 /bin/sh -c '
   trap "" HUP INT QUIT TERM
   printf "%s\n" "$$" >"$SHDEPS_TEST_DESCENDANT_PID"
-  while :; do
+  while [ $((fixture_loop_22 = ${fixture_loop_22:-0} + 1)) -le 15000 ]; do
     printf x >>"$SHDEPS_TEST_DESCENDANT_MUTATIONS"
     /bin/sleep 0.02
   done
@@ -6594,9 +6603,10 @@ if descendant == 0:
         os.O_WRONLY | os.O_CREAT | os.O_APPEND,
         0o600,
     )
-    while True:
+    for _ in range(15000):
         os.write(mutation, b"x")
         time.sleep(0.02)
+    os._exit(0)
 
 with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
     pid_file.write(f"{os.getpid()}\n")
@@ -6704,8 +6714,9 @@ if descendant == 0:
     os.tcsetpgrp(tty, os.getpgrp())
     with open(os.environ["SHDEPS_TEST_TTY_OWNER_READY"], "w") as ready_file:
         ready_file.write("ready\n")
-    while True:
+    for _ in range(300):
         time.sleep(1)
+    os._exit(0)
 
 with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
     pid_file.write(f"{os.getpid()}\n")
@@ -6813,8 +6824,9 @@ if descendant == 0:
         signal.signal(caught, signal.SIG_IGN)
     with open(os.environ["SHDEPS_TEST_DESCENDANT_PID"], "w") as pid_file:
         pid_file.write(f"{os.getpid()}\n")
-    while True:
+    for _ in range(300):
         time.sleep(1)
+    os._exit(0)
 
 with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
     pid_file.write(f"{os.getpid()}\n")
@@ -6824,7 +6836,7 @@ tty = os.open("/dev/tty", os.O_RDWR)
 os.tcsetpgrp(tty, descendant)
 with open(os.environ["SHDEPS_TEST_TTY_OWNER_READY"], "w") as ready_file:
     ready_file.write("ready\n")
-while True:
+for _ in range(300):
     time.sleep(1)
 "#,
     );
@@ -6911,11 +6923,12 @@ if descendant == 0:
         signal.signal(caught, signal.SIG_IGN)
     with open(os.environ["SHDEPS_TEST_DESCENDANT_PID"], "w") as pid_file:
         pid_file.write(f"{os.getpid()}\n")
-    while True:
+    for _ in range(30000):
         if took_terminal and os.tcgetpgrp(tty) != os.getpgrp():
             with open(os.environ["SHDEPS_TEST_LATE_TTY_RECLAIMED"], "w") as reclaimed_file:
                 reclaimed_file.write("reclaimed\n")
         time.sleep(0.01)
+    os._exit(0)
 
 for caught in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
     signal.signal(caught, signal.SIG_IGN)
@@ -6923,7 +6936,7 @@ with open(os.environ["SHDEPS_TEST_CHILD_PID"], "w") as pid_file:
     pid_file.write(f"{os.getpid()}\n")
 while not os.path.exists(os.environ["SHDEPS_TEST_DESCENDANT_PID"]):
     time.sleep(0.001)
-while True:
+for _ in range(30000):
     time.sleep(0.01)
 "#,
     );
@@ -6991,7 +7004,7 @@ fn terminal_stop_suspends_shdeps_and_resume_rehands_off_before_interrupt() {
 trap 'printf continued >"$SHDEPS_TEST_CONTINUED"' CONT
 trap 'exit 130' INT
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
-while :; do /bin/sleep 1; done
+while [ $((fixture_loop_23 = ${fixture_loop_23:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 "#,
     );
     let continued = fixture.dir.join("foreground-continued");
@@ -7056,7 +7069,7 @@ fn terminal_stop_suspends_the_complete_original_pipeline_job() {
     fixture.write("conf/deps.conf", "tool cargo\n");
     fixture.write_executable(
         "fakebin/cargo",
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" >\"$SHDEPS_TEST_CHILD_PID\"\nwhile :; do /bin/sleep 1; done\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >\"$SHDEPS_TEST_CHILD_PID\"\nwhile [ $((fixture_loop_24 = ${fixture_loop_24:-0} + 1)) -le 300 ]; do /bin/sleep 1; done\n",
     );
     fixture.write_executable(
         "fakebin/pipeline-harness",
@@ -7084,8 +7097,9 @@ if sibling == 0:
     os.setpgid(0, shdeps)
     with open(os.environ["SHDEPS_TEST_PIPELINE_SIBLING_PID"], "w") as pid_file:
         pid_file.write(f"{os.getpid()}\n")
-    while True:
+    for _ in range(300):
         time.sleep(1)
+    os._exit(0)
 os.setpgid(sibling, shdeps)
 
 with open(os.environ["SHDEPS_TEST_PIPELINE_SHDEPS_PID"], "w") as pid_file:
@@ -7338,7 +7352,7 @@ fn cancellation_pending_while_shdeps_is_stopped_wakes_child_before_term() {
         r#"#!/bin/sh
 trap 'printf term >"$SHDEPS_TEST_CHILD_TERM"; exit 0' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_CHILD_PID"
-while :; do /bin/sleep 1; done
+while [ $((fixture_loop_25 = ${fixture_loop_25:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 "#,
     );
     let term = fixture.dir.join("foreground-stopped-term");
@@ -7541,7 +7555,7 @@ install() {
   /bin/sh -c '
     trap "" HUP INT QUIT TERM
     printf "%s\n" "$$" >"$SHDEPS_STATE_DIR/retry-descendant.pid"
-    while :; do
+    while [ $((fixture_loop_26 = ${fixture_loop_26:-0} + 1)) -le 15000 ]; do
       printf x >>"$SHDEPS_STATE_DIR/retry-descendant-mutations"
       /bin/sleep 0.02
     done
@@ -7645,7 +7659,7 @@ install() {
   /bin/sh -c '
     trap "" HUP INT QUIT TERM
     printf "%s\n" "$$" >"$SHDEPS_STATE_DIR/retry-descendant.pid"
-    while :; do
+    while [ $((fixture_loop_27 = ${fixture_loop_27:-0} + 1)) -le 15000 ]; do
       printf x >>"$SHDEPS_STATE_DIR/retry-descendant-mutations"
       /bin/sleep 0.02
     done
@@ -7973,15 +7987,21 @@ install() {
   printf 'installed\n' >"$SHDEPS_STATE_DIR/tool-installed"
   trap '' TERM
   kill -TERM "$PPID"
-  while :; do /bin/sleep 1; done
+  while [ $((fixture_loop_28 = ${fixture_loop_28:-0} + 1)) -le 300 ]; do /bin/sleep 1; done
 }
 post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
 "#,
     );
 
-    let cancelled = run(&mut fixture.command(["update"]));
+    let (cancelled, elapsed) = timed(&mut fixture.command(["update"]));
 
     assert_eq!(cancelled.status.code(), Some(143));
+    // The hook ignores TERM and loops for ~300s, so only Shdeps killing it
+    // ends the cancelled run in time.
+    assert!(
+        elapsed < WAITED_OUT_LIMIT,
+        "cancellation waited out the hook: {elapsed:?}"
+    );
     assert!(fixture.dir.join("state/tool-installed").is_file());
     assert!(
         fixture.dir.join("state/.pending-posts/tool").is_file(),
