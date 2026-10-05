@@ -7411,7 +7411,23 @@ printf '[]\n'
         .env("SHDEPS_JOBS", "2")
         .env("SHDEPS_TEST_CURL_PIDS", &pids_path);
     let (mut shdeps, mut master) = spawn_on_pty(command);
-    let pids = wait_for_pids(&pids_path, 2, LIVENESS_TIMEOUT, "two curl workers");
+    // Both workers must start their curl while the first holds the terminal.
+    // If one never does, report what each child was doing (a stopped `T`
+    // curl waiting for the terminal, one blocked on stdin, or no second
+    // curl at all) so the stall explains itself.
+    let started = Instant::now();
+    let pids = loop {
+        let pids = read_pids(&pids_path);
+        if pids.len() >= 2 {
+            break pids[..2].to_vec();
+        }
+        if started.elapsed() >= LIVENESS_TIMEOUT {
+            let stall = describe_stall_self(shdeps.id(), &master);
+            kill_process_group(shdeps.id());
+            panic!("timed out waiting for two curl workers: pids={pids:?} {stall}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let mut guards = pids
         .iter()
         .copied()
@@ -9600,7 +9616,7 @@ fn wait_for_pids(path: &Path, count: usize, timeout: Duration, description: &str
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_pids(path: &Path) -> Vec<u32> {
     let mut pids = fs::read_to_string(path)
         .unwrap_or_default()
