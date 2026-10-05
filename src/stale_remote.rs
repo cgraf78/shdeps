@@ -442,8 +442,11 @@ fn redact_credentials(text: &str) -> String {
     while let Some(index) = rest.find("://") {
         let (head, tail) = rest.split_at(index + 3);
         out.push_str(head);
-        let scheme_start = head[..index]
-            .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || "+-.".contains(ch)))
+        // Scan bytes: a scheme is ASCII, and a multi-byte character ends in
+        // a non-ASCII continuation byte, so `at + 1` is a char boundary.
+        let scheme_start = head.as_bytes()[..index]
+            .iter()
+            .rposition(|byte| !(byte.is_ascii_alphanumeric() || b"+-.".contains(byte)))
             .map_or(0, |at| at + 1);
         let scheme = head[scheme_start..index].to_ascii_lowercase();
         let end = tail
@@ -572,6 +575,43 @@ mod tests {
         ] {
             assert_eq!(redact_credentials(text), text);
         }
+    }
+
+    #[test]
+    fn redaction_keeps_non_ascii_text_before_a_scheme() {
+        // A multi-byte character right before the scheme once made the
+        // scheme scan slice inside it and panic; `remote:` lines put
+        // server-chosen text there.
+        for (text, redacted) in [
+            (
+                "unable to access \u{201e}https://user:tok@host/\u{201c}",
+                "unable to access \u{201e}https://***@host/\u{201c}",
+            ),
+            ("\u{e9}https://tok@host", "\u{e9}https://***@host"),
+            ("\u{2192}ssh://git@host/r", "\u{2192}ssh://git@host/r"),
+        ] {
+            assert_eq!(redact_credentials(text), redacted, "{text}");
+        }
+    }
+
+    #[test]
+    fn read_redacts_a_recorded_detail_with_non_ascii_text() {
+        // Health re-redacts details recorded by older releases, whose rule
+        // left such text alone, so the read path must not panic on it.
+        let state = crate::test_support::temp_dir("stale-remote-non-ascii");
+        let path = record_path(&state, "owner/tool");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "since={NOW}\nlast={NOW}\nfailures=3\nreason=fetch\n\
+                 detail=see \u{2192}https://user:tok@host/x\n"
+            ),
+        )
+        .unwrap();
+
+        let record = read(&path).expect("record");
+        assert_eq!(record.failure.detail, "see \u{2192}https://***@host/x");
     }
 
     #[test]
