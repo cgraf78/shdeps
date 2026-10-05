@@ -624,8 +624,9 @@ fn strict_leftovers() -> bool {
     std::env::var_os("SHDEPS_STRICT_LEFTOVERS").is_some_and(|value| value == "1")
 }
 
-/// Runs update for already-parsed entries.
-pub fn run<R>(
+/// Runs update for already-parsed entries without terminal progress.
+#[cfg(test)]
+pub(crate) fn run<R>(
     entries: &[Entry],
     manifest: &Manifest,
     context: &Context<'_, R>,
@@ -638,7 +639,12 @@ where
 }
 
 /// Runs update while reporting phase and item progress to `progress`.
-pub fn run_with_progress<R>(
+///
+/// Test entry point: it acquires the state lock itself, where the CLI takes it
+/// earlier through `prepare_for_resolution` so method resolution sees
+/// serialized state.
+#[cfg(test)]
+pub(crate) fn run_with_progress<R>(
     entries: &[Entry],
     manifest: &Manifest,
     context: &Context<'_, R>,
@@ -648,7 +654,8 @@ pub fn run_with_progress<R>(
 where
     R: Runner + Sync,
 {
-    run_with_progress_lock(entries, manifest, context, options, progress, None)
+    let lock = crate::state::StateLock::acquire(&context.roots.state_dir)?;
+    run_with_progress_locked(entries, manifest, context, options, progress, lock)
 }
 
 /// Acquires the update state lock and finalizes crash-recoverable repository
@@ -663,21 +670,6 @@ pub(crate) fn prepare_for_resolution(
     recover_fresh_repo_publications_at(roots, manifest_path, env_vars)?;
     cancellation::check()?;
     Ok((lock, manifest::read(manifest_path)?))
-}
-
-/// Runs update while retaining a state lock acquired before method resolution.
-pub(crate) fn run_with_progress_locked<R>(
-    entries: &[Entry],
-    manifest: &Manifest,
-    context: &Context<'_, R>,
-    options: Options,
-    progress: &mut dyn Progress,
-    lock: crate::state::StateLock,
-) -> Result<Summary>
-where
-    R: Runner + Sync,
-{
-    run_with_progress_lock(entries, manifest, context, options, progress, Some(lock))
 }
 
 /// Runs update without terminal progress while retaining a state lock acquired
@@ -695,24 +687,24 @@ where
     run_with_progress_locked(entries, manifest, context, options, &mut NoProgress, lock)
 }
 
-fn run_with_progress_lock<R>(
+/// Runs update while retaining a state lock acquired before method resolution.
+pub(crate) fn run_with_progress_locked<R>(
     entries: &[Entry],
     _manifest: &Manifest,
     context: &Context<'_, R>,
     options: Options,
     progress: &mut dyn Progress,
-    held_lock: Option<crate::state::StateLock>,
+    state_lock: crate::state::StateLock,
 ) -> Result<Summary>
 where
     R: Runner + Sync,
 {
-    cancellation::check()?;
-    // Serialize concurrent update runs through the per-state-directory
-    // advisory `flock`. Without this, two `shdeps update` processes
-    // (e.g., a user-triggered run racing a periodic timer, or two
-    // panes that both source the dotfiles entry point) could
-    // interleave manifest writes and link-state mutations and leave
-    // shdeps in a half-applied state.
+    // `state_lock` serializes concurrent update runs through the
+    // per-state-directory advisory `flock`. Without it, two `shdeps update`
+    // processes (e.g., a user-triggered run racing a periodic timer, or two
+    // panes that both source the dotfiles entry point) could interleave
+    // manifest writes and link-state mutations and leave shdeps in a
+    // half-applied state.
     //
     // Re-entry safety: when a hook subprocess calls back into shdeps
     // (e.g., a `post()` hook that runs `shdeps update some-other-dep`),
@@ -723,12 +715,8 @@ where
     // a security boundary; `StateLock` documents the full threat model.
     // Independent top-level invocations still take the real file lock.
     //
-    // The handle is bound to a local so its `Drop` releases the lock
-    // when `run` returns by any path.
-    let state_lock = match held_lock {
-        Some(lock) => lock,
-        None => crate::state::StateLock::acquire(&context.roots.state_dir)?,
-    };
+    // The handle is owned by this function so its `Drop` releases the lock
+    // when the run returns by any path.
     cancellation::check()?;
     let mut summary = Summary::default();
 

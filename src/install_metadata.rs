@@ -101,8 +101,12 @@ pub struct Metadata {
 
 impl Metadata {
     /// Creates metadata with the current schema.
+    ///
+    /// Product code only reads installer-written metadata and clones it for
+    /// self-update, so this constructor exists for test fixtures.
+    #[cfg(test)]
     #[must_use]
-    pub fn new(method: Method) -> Self {
+    pub(crate) fn new(method: Method) -> Self {
         Self {
             schema: SCHEMA,
             method,
