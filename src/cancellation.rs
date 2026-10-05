@@ -1491,6 +1491,15 @@ impl OwnedChild {
                         )
                     })
                 });
+                // A signal that interrupted a retry takes precedence: report
+                // the leader as not yet exited so the caller's cancellation
+                // path stops the boundary with its own proof, instead of
+                // failing here or waiting out the retry budget.
+                if matches!(&observed, Err(error) if error.kind() == std::io::ErrorKind::Interrupted)
+                    && received_signal().is_some()
+                {
+                    return Ok(false);
+                }
                 observed.map_err(|error| {
                     std::io::Error::new(
                         error.kind(),
@@ -2713,6 +2722,9 @@ fn with_leader_exit_attempts_using<T>(
     let mut attempt = 1;
     loop {
         let deadline = Instant::now() + budget(attempt);
+        // The first attempt keeps its historical behavior; retries end early
+        // on a pending signal (see `SIGNAL_ENDS_PROOF_WALK`).
+        let _interruptible = (attempt > 1).then(InterruptibleProofWalk::begin);
         match observe(deadline) {
             // A pending cancellation signal ends the retries: stopping the
             // boundary is the next step either way, so a starved proof must
@@ -3145,6 +3157,9 @@ impl Boundary {
                         }
                         if Instant::now() >= deadline {
                             return Err(Self::open_lease_error());
+                        }
+                        if proof_walk_interrupted() {
+                            return Err(proof_walk_interrupted_error());
                         }
                         std::thread::sleep(
                             Duration::from_millis(10)
@@ -5027,8 +5042,52 @@ fn check_snapshot_deadline(deadline: Instant) -> std::io::Result<()> {
             std::io::ErrorKind::TimedOut,
             "process discovery deadline expired",
         ))
+    } else if proof_walk_interrupted() {
+        Err(proof_walk_interrupted_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+thread_local! {
+    // Set while a leader-exit retry runs. A retry only extends a proof that a
+    // loaded host already cut short, so a pending cancellation signal ends it
+    // at the next deadline check instead of after its whole longer budget.
+    static SIGNAL_ENDS_PROOF_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Only the procfs walks and the lease poll check it; portable `ps` snapshots
+// stop between attempts instead.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proof_walk_interrupted() -> bool {
+    SIGNAL_ENDS_PROOF_WALK.with(std::cell::Cell::get) && received_signal().is_some()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proof_walk_interrupted_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "process discovery interrupted by a pending cancellation signal",
+    )
+}
+
+// Marks the current thread's leader-exit attempt as a retry for its lifetime.
+#[cfg(unix)]
+struct InterruptibleProofWalk;
+
+#[cfg(unix)]
+impl InterruptibleProofWalk {
+    fn begin() -> Self {
+        SIGNAL_ENDS_PROOF_WALK.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InterruptibleProofWalk {
+    fn drop(&mut self) {
+        SIGNAL_ENDS_PROOF_WALK.with(|flag| flag.set(false));
     }
 }
 
@@ -10710,6 +10769,57 @@ while True:
             });
         assert!(result.is_err());
         assert_eq!(calls, super::LEADER_EXIT_SNAPSHOT_ATTEMPTS);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn pending_signal_interrupts_a_leader_exit_retry_but_not_the_first_attempt() {
+        const CHILD_ENV: &str = "SHDEPS_TEST_INTERRUPTED_RETRY_WALK";
+        const TEST_NAME: &str = "cancellation::tests::pending_signal_interrupts_a_leader_exit_retry_but_not_the_first_attempt";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            crate::test_support::run_signal_boundary_subprocess(TEST_NAME, CHILD_ENV);
+            return;
+        }
+
+        let _signals = super::Signals::install_with_restore(true).unwrap();
+        let started = Instant::now();
+        let mut attempts = 0;
+        let result: std::io::Result<bool> = super::with_leader_exit_attempts_using(
+            |attempt| {
+                if attempt == 1 {
+                    Duration::from_millis(10)
+                } else {
+                    Duration::from_secs(30)
+                }
+            },
+            |deadline| {
+                attempts += 1;
+                if attempts == 1 {
+                    // A first attempt the host cut short, before any signal.
+                    return walk_cut_short(deadline);
+                }
+                // The retry is walking when the signal arrives.
+                assert!(super::check_snapshot_deadline(deadline).is_ok());
+                // SAFETY: the isolated test subprocess owns the installed
+                // handler and deliberately signals itself.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                while super::received_signal().is_none() {
+                    std::thread::yield_now();
+                }
+                Err(super::check_snapshot_deadline(deadline).unwrap_err())
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(attempts, 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the retry waited out its budget instead of stopping on the signal"
+        );
+        // Outside a retry, a pending signal leaves the walk alone, as the
+        // first attempt always did.
+        assert!(super::check_snapshot_deadline(Instant::now() + Duration::from_secs(30)).is_ok());
     }
 
     #[test]
