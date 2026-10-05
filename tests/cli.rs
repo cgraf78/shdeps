@@ -67,6 +67,8 @@ const WAITED_OUT_LIMIT: Duration = Duration::from_secs(60);
 // assertion window here (`WAITED_OUT_LIMIT`), so no fixture exits inside a
 // window it is checked against, while a test that panics before its guard
 // is armed, or a killed test binary, can no longer leave an immortal process.
+// A fixture loop that waits for a file the test writes gives up after the
+// same 300s, since a test that failed first never writes it.
 
 // Bound for waiting on something that must eventually happen: a fixture
 // publishing its pid, or Shdeps exiting after a cancellation. A miss means a
@@ -5253,7 +5255,7 @@ fn parent_signal_stops_detached_timed_probe_before_returning() {
     fixture.write("conf/deps.conf", "tool pkg\n");
     fixture.write_executable(
         "fakebin/tool",
-        // The probe outlives TERM by design. Bound it at about 120s (6000
+        // The probe outlives TERM by design. Bound it at about 300s (15000
         // x 20ms) so a test that panics before its guard is armed, for
         // example while waiting for the pid, cannot leave it looping in its
         // own session forever; the checks below finish within seconds.
@@ -5262,7 +5264,7 @@ trap '' HUP INT QUIT
 trap 'printf term >"$SHDEPS_TEST_PROBE_TERM"' TERM
 printf '%s\n' "$$" >"$SHDEPS_TEST_PROBE_PID"
 i=0
-while [ "$i" -lt 6000 ]; do
+while [ "$i" -lt 15000 ]; do
   printf x >>"$SHDEPS_TEST_PROBE_MUTATIONS"
   /bin/sleep 0.02
   i=$((i + 1))
@@ -6708,8 +6710,12 @@ if descendant == 0:
     signal.signal(signal.SIGTTOU, signal.SIG_IGN)
     with open(os.environ["SHDEPS_TEST_DESCENDANT_PID"], "w") as pid_file:
         pid_file.write(f"{os.getpid()}\n")
-    while not os.path.exists(os.environ["SHDEPS_TEST_TTY_TAKEOVER"]):
+    for _ in range(300000):
+        if os.path.exists(os.environ["SHDEPS_TEST_TTY_TAKEOVER"]):
+            break
         time.sleep(0.001)
+    else:
+        os._exit(0)
     tty = os.open("/dev/tty", os.O_RDWR)
     os.tcsetpgrp(tty, os.getpgrp())
     with open(os.environ["SHDEPS_TEST_TTY_OWNER_READY"], "w") as ready_file:
@@ -6726,7 +6732,9 @@ while not os.path.exists(os.environ["SHDEPS_TEST_DESCENDANT_PID"]):
 # even while it is still a zombie, so the leader must stay alive until
 # the test has observed its topology. It still exits before the
 # descendant takes the terminal below.
-while not os.path.exists(os.environ["SHDEPS_TEST_TOPOLOGY_OBSERVED"]):
+for _ in range(300000):
+    if os.path.exists(os.environ["SHDEPS_TEST_TOPOLOGY_OBSERVED"]):
+        break
     time.sleep(0.001)
 os._exit(0)
 "#,
@@ -7251,8 +7259,12 @@ if waited != shdeps or not os.WIFSTOPPED(status):
     raise SystemExit(70)
 with open(os.environ["SHDEPS_TEST_BACKGROUND_STOPPED"], "w") as stopped:
     stopped.write(str(os.WSTOPSIG(status)))
-while not os.path.exists(os.environ["SHDEPS_TEST_BACKGROUND_RESUME"]):
+for _ in range(300000):
+    if os.path.exists(os.environ["SHDEPS_TEST_BACKGROUND_RESUME"]):
+        break
     time.sleep(0.001)
+else:
+    raise SystemExit(71)
 os.tcsetpgrp(tty, shdeps)
 os.killpg(shdeps, signal.SIGCONT)
 
@@ -7668,7 +7680,8 @@ install() {
   # Darwin answers ESRCH for getpgid/getsid once a process has exited,
   # even while it is still a zombie, so the hook must stay alive until
   # the test has observed its topology. It still exits before SIGTERM.
-  while [ ! -e "$SHDEPS_STATE_DIR/retry-topology-observed" ]; do
+  while [ ! -e "$SHDEPS_STATE_DIR/retry-topology-observed" ] &&
+    [ $((fixture_gate_1 = ${fixture_gate_1:-0} + 1)) -le 30000 ]; do
     /bin/sleep 0.01
   done
   return 0

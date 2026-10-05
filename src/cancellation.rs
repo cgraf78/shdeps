@@ -10328,7 +10328,7 @@ sys.exit(0)
         let release_path = dir.join("release");
         let mutation_path = dir.join("mutations");
         let script = format!(
-            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n for _ in range(30000):\n  open({mutation:?}, 'a').write('x')\n  time.sleep(0.01)\n os._exit(0)\nwhile not os.path.exists({release:?}):\n time.sleep(0.001)\n",
+            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n for _ in range(30000):\n  open({mutation:?}, 'a').write('x')\n  time.sleep(0.01)\n os._exit(0)\nfor _ in range(300000):\n if os.path.exists({release:?}):\n  break\n time.sleep(0.001)\n",
             descendant = descendant_pid_path,
             mutation = mutation_path,
             release = release_path,
@@ -10425,7 +10425,7 @@ sys.exit(0)
         let release_path = dir.join("release");
         let term_path = dir.join("term");
         let script = format!(
-            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT)]\n def term(_signal, _frame):\n  open({term:?}, 'w').write('term')\n signal.signal(signal.SIGTERM, term)\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n for _ in range(30000):\n  time.sleep(0.01)\n os._exit(0)\nwhile not os.path.exists({release:?}):\n time.sleep(0.001)\n",
+            "import os, signal, time\nchild = os.fork()\nif child == 0:\n os.setsid()\n [signal.signal(s, signal.SIG_IGN) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT)]\n def term(_signal, _frame):\n  open({term:?}, 'w').write('term')\n signal.signal(signal.SIGTERM, term)\n start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]\n open({descendant:?}, 'w').write(f'{{os.getpid()}} {{start}}')\n for _ in range(30000):\n  time.sleep(0.01)\n os._exit(0)\nfor _ in range(300000):\n if os.path.exists({release:?}):\n  break\n time.sleep(0.001)\n",
             descendant = descendant_pid_path,
             release = release_path,
             term = term_path,
