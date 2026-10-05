@@ -6366,10 +6366,12 @@ fn reap_members(_boundary: &Boundary) -> std::io::Result<()> {
 mod tests {
     // Bound for a fixture publishing its pid: a readiness wait whose miss is
     // a hang, so it only needs to outlast a loaded host starting the fixture
-    // (often a python3 helper), not to assert speed. Only the Linux/Android
+    // (often a python3 helper), not to assert speed. It stays below the 30s
+    // `run_signal_boundary_subprocess` ceiling, so tests running inside that
+    // subprocess still report which fixture stalled. Only the Linux/Android
     // fixture tests use it.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+    const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
     use std::cell::Cell;
     #[cfg(unix)]
@@ -7758,7 +7760,7 @@ sys.exit(0)
             panic!("fixture descendant must have stable pidfd authority");
         };
         let _descendant_guard = PidfdGuard(descendant_pidfd);
-        let leader_deadline = Instant::now() + Duration::from_secs(2);
+        let leader_deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
         while super::observe_exit(child.child.as_mut().unwrap())
             .unwrap()
             .is_none()
@@ -7926,7 +7928,7 @@ sys.exit(0)
             panic!("fixture descendant must have stable pidfd authority");
         };
         let _descendant_guard = PidfdGuard(descendant_pidfd);
-        let leader_deadline = Instant::now() + Duration::from_secs(2);
+        let leader_deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
         while super::linux_process_info_checked(leader)
             .unwrap()
             .is_some_and(|process| process.live)
@@ -8026,7 +8028,7 @@ sys.exit(0)
             panic!("fixture descendant must have stable pidfd authority");
         };
         let descendant_guard = PidfdGuard(descendant_pidfd);
-        let leader_deadline = Instant::now() + Duration::from_secs(2);
+        let leader_deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
         while super::linux_process_info_checked(leader)
             .unwrap()
             .is_some_and(|process| process.live)
@@ -8399,7 +8401,7 @@ sys.exit(0)
             panic!("fixture descendant must have stable pidfd authority");
         };
         let descendant_guard = PidfdGuard(descendant_pidfd);
-        let leader_deadline = Instant::now() + Duration::from_secs(2);
+        let leader_deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
         while super::linux_process_info_checked(leader)
             .unwrap()
             .is_some_and(|process| process.live)
@@ -9206,7 +9208,7 @@ sys.exit(0)
             )]
             let _descendant = descendant.spawn().unwrap();
             unblock_test_term();
-            let child_deadline = Instant::now() + Duration::from_secs(2);
+            let child_deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
             while !child_ready.is_file() {
                 assert!(Instant::now() < child_deadline);
                 std::thread::sleep(Duration::from_millis(1));
@@ -9251,7 +9253,7 @@ sys.exit(0)
             super::Isolation::DetachedSession,
             marker,
         );
-        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        let ready_deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
         while !ready_path.is_file() {
             assert!(Instant::now() < ready_deadline);
             std::thread::sleep(super::POLL);
@@ -9357,7 +9359,7 @@ sys.exit(0)
             super::Isolation::DetachedSession,
             marker,
         );
-        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        let ready_deadline = Instant::now() + FIXTURE_READY_TIMEOUT;
         while !ready.is_file() {
             assert!(Instant::now() < ready_deadline);
             std::thread::sleep(super::POLL);
@@ -10287,7 +10289,7 @@ while True:
                 break identity;
             }
             assert!(
-                started.elapsed() < Duration::from_secs(2),
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
                 "fixture must publish its exact identity"
             );
             std::thread::sleep(Duration::from_millis(5));
@@ -10299,7 +10301,7 @@ while True:
                 }
             }
             assert!(
-                started.elapsed() < Duration::from_secs(2),
+                started.elapsed() < FIXTURE_READY_TIMEOUT,
                 "intermediate must publish the watchdog pid"
             );
             std::thread::sleep(Duration::from_millis(5));

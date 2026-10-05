@@ -7898,9 +7898,17 @@ post() { printf 'post\n' >>"$SHDEPS_STATE_DIR/post-runs"; }
     let settled = run(fixture
         .command(["update"])
         .env("SHDEPS_LIB", &wrapper)
+        .env("SHDEPS_RUST_CLI", binary)
         .env("PATH", &path_with_bash));
 
     assert_success(&settled);
+    // Without a binary the wrapper skips the hook and this run would pass
+    // without exercising anything.
+    assert!(
+        !text(&settled.stdout).contains("skipped"),
+        "the settled run must evaluate the hook: {}",
+        text(&settled.stdout)
+    );
     assert_eq!(
         fs::read_to_string(fixture.dir.join("state/post-runs")).unwrap(),
         "post\n",
