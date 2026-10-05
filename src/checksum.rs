@@ -29,38 +29,17 @@ fn hex_digest(bytes: &[u8]) -> String {
     hex
 }
 
-/// Parses the expected SHA-256 for `file_name` from checksum file text.
+/// Returns whether `bytes` match the expected SHA-256 checksum text for
+/// `file_name`.
 ///
 /// Only filename-bound lines (the standard `<hash>  <file>` /
 /// `<hash> *<file>` formats produced by `sha256sum` and `shasum -a 256`)
-/// are accepted. Bare-hash lines are rejected here: accepting a
-/// detached digest would let any checksum-file payload match any
-/// downloaded asset, silently dropping the per-file binding that the
-/// whole verification is supposed to enforce. A mirror that publishes a
-/// checksum file without the filename — accidentally or otherwise —
-/// must fail verification rather than vacuously pass it.
-#[must_use]
-pub fn expected_sha256(content: &str, file_name: &str) -> Option<String> {
-    expected_hex(content, file_name, 64)
-}
-
-fn expected_hex(content: &str, file_name: &str, hex_len: usize) -> Option<String> {
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(hash) = parse_named_line(line, file_name, hex_len) {
-            return Some(hash);
-        }
-    }
-
-    None
-}
-
-/// Returns whether `bytes` match the expected SHA-256 checksum text for
-/// `file_name`.
+/// are accepted. Bare-hash lines are rejected: accepting a detached digest
+/// would let any checksum-file payload match any downloaded asset, silently
+/// dropping the per-file binding that the whole verification is supposed to
+/// enforce. A mirror that publishes a checksum file without the filename —
+/// accidentally or otherwise — must fail verification rather than vacuously
+/// pass it.
 #[must_use]
 pub fn verify(content: &str, file_name: &str, bytes: &[u8]) -> bool {
     let actual = sha256_hex(bytes);
@@ -174,7 +153,7 @@ fn push_hex(output: &mut String, byte: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{expected_sha256, has_named_checksum, sha256_hex, sha512_hex, verify, verify_any};
+    use super::{has_named_checksum, sha256_hex, sha512_hex, verify, verify_any};
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const EMPTY_SHA512: &str = concat!(
@@ -199,60 +178,34 @@ mod tests {
     }
 
     #[test]
-    fn expected_sha256_parses_sha256sum_and_shasum_formats() {
-        assert_eq!(
-            expected_sha256(
-                &format!("{EMPTY_SHA256}  shdeps-v1-linux-x86_64-musl.tar.gz\n"),
-                "shdeps-v1-linux-x86_64-musl.tar.gz",
-            )
-            .as_deref(),
-            Some(EMPTY_SHA256)
-        );
-        assert_eq!(
-            expected_sha256(
-                &format!("{EMPTY_SHA256} *shdeps-v1-linux-x86_64-musl.tar.gz\n"),
-                "shdeps-v1-linux-x86_64-musl.tar.gz",
-            )
-            .as_deref(),
-            Some(EMPTY_SHA256)
-        );
-        assert_eq!(
-            expected_sha256(
-                &format!("{EMPTY_SHA256}  ./shdeps-v1-linux-x86_64-musl.tar.gz\n"),
-                "shdeps-v1-linux-x86_64-musl.tar.gz",
-            )
-            .as_deref(),
-            Some(EMPTY_SHA256)
-        );
-        assert_eq!(
-            expected_sha256(
-                &format!("{EMPTY_SHA256} *./shdeps-v1-linux-x86_64-musl.tar.gz\n"),
-                "shdeps-v1-linux-x86_64-musl.tar.gz",
-            )
-            .as_deref(),
-            Some(EMPTY_SHA256)
-        );
+    fn verify_accepts_sha256sum_and_shasum_formats() {
+        // `verify` hashes the payload itself, so an empty payload pins each
+        // parsed line to `EMPTY_SHA256`.
+        for line in [
+            format!("{EMPTY_SHA256}  shdeps-v1-linux-x86_64-musl.tar.gz\n"),
+            format!("{EMPTY_SHA256} *shdeps-v1-linux-x86_64-musl.tar.gz\n"),
+            format!("{EMPTY_SHA256}  ./shdeps-v1-linux-x86_64-musl.tar.gz\n"),
+            format!("{EMPTY_SHA256} *./shdeps-v1-linux-x86_64-musl.tar.gz\n"),
+        ] {
+            assert!(
+                verify(&line, "shdeps-v1-linux-x86_64-musl.tar.gz", b""),
+                "{line:?}"
+            );
+        }
     }
 
     #[test]
-    fn expected_sha256_rejects_bare_hash_to_preserve_filename_binding() {
+    fn verify_rejects_bare_hash_to_preserve_filename_binding() {
         // A checksum file that contains only a bare digest (no filename)
         // must NOT verify any asset. Otherwise a mirror that strips
         // filenames (accidentally or maliciously) would let any payload
         // pass verification against any expected name. The strict form
         // protects the per-file binding that the whole verification step
         // is supposed to enforce.
-        assert_eq!(
-            expected_sha256(EMPTY_SHA256, "archive.tar.gz").as_deref(),
-            None
-        );
-        assert_eq!(
-            expected_sha256(
-                &format!("{EMPTY_SHA256} archive.tar.gz extra"),
-                "archive.tar.gz",
-            ),
-            None
-        );
+        assert!(!has_named_checksum(EMPTY_SHA256, "archive.tar.gz"));
+        let trailing = format!("{EMPTY_SHA256} archive.tar.gz extra");
+        assert!(!verify(&trailing, "archive.tar.gz", b""));
+        assert!(!has_named_checksum(&trailing, "archive.tar.gz"));
     }
 
     #[test]
@@ -265,14 +218,12 @@ mod tests {
     }
 
     #[test]
-    fn expected_sha256_ignores_comments_and_wrong_filenames() {
-        assert_eq!(
-            expected_sha256(
-                &format!("# generated\n{EMPTY_SHA256}  wrong.tar.gz"),
-                "archive.tar.gz",
-            ),
-            None
-        );
+    fn verify_ignores_comments_and_wrong_filenames() {
+        assert!(!verify(
+            &format!("# generated\n{EMPTY_SHA256}  wrong.tar.gz"),
+            "archive.tar.gz",
+            b"",
+        ));
     }
 
     #[test]

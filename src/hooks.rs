@@ -827,12 +827,6 @@ impl BashCustomProbe {
         self
     }
 
-    /// Returns the configured compatibility-layer path.
-    #[must_use]
-    pub fn shdeps_lib(&self) -> &Path {
-        &self.shdeps_lib
-    }
-
     /// Returns a stable digest of every file-backed input that selects custom
     /// install code. Recovery uses it only to decide whether an interrupted
     /// install may be retried; it never treats a matching digest as proof that
@@ -984,12 +978,8 @@ impl BashCustomProbe {
         })
     }
 
-    /// Runs optional `post(name)` for a dependency that changed.
-    pub fn post(&self, name: &str, roots: &Roots) -> Result<Post> {
-        self.post_with_txn(name, roots, None)
-    }
-
-    /// Runs optional `post(name)` with update-transaction context.
+    /// Runs optional `post(name)` for a dependency that changed, with
+    /// update-transaction context when one is active.
     pub(crate) fn post_with_txn(
         &self,
         name: &str,
@@ -1858,7 +1848,7 @@ post() { printf '%s:%s\n' "$1" "$SHDEPS_HOOK_PHASE" > "$SHDEPS_STATE_DIR/post-ra
         );
 
         let probe = BashCustomProbe::new(&lib);
-        let result = probe.post("tool", &roots).unwrap();
+        let result = probe.post_with_txn("tool", &roots, None).unwrap();
 
         assert_eq!(result, Post::Ran);
         assert_eq!(
@@ -1883,7 +1873,7 @@ post() {
         );
 
         let result = BashCustomProbe::rust_prelude()
-            .post("tool", &roots)
+            .post_with_txn("tool", &roots, None)
             .unwrap();
 
         assert_eq!(
@@ -1903,7 +1893,9 @@ post() {
         fs::write(&lib, "shdeps_version() { :; }\n").unwrap();
         write_hook(&roots.hooks_dir.join("tool.sh"), "post() { return 2; }\n");
 
-        let result = BashCustomProbe::new(&lib).post("tool", &roots).unwrap();
+        let result = BashCustomProbe::new(&lib)
+            .post_with_txn("tool", &roots, None)
+            .unwrap();
 
         assert_eq!(result, Post::Skipped);
     }

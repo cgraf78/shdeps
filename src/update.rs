@@ -3423,7 +3423,7 @@ install() { printf 'installed\n' > "$SHDEPS_STATE_DIR/tool-installed"; }
     fn update_collects_hook_changed_markers_for_post_scheduling() {
         let fixture = Fixture::new("custom-marker");
         fs::write(
-            fixture.hooks.shdeps_lib(),
+            fixture.roots.home.join("shdeps.sh"),
             r#"
 shdeps_mark_changed() {
   local marker="$SHDEPS_STATE_DIR/.changed-markers/$SHDEPS_UPDATE_TXN_ID/$1"
@@ -7440,8 +7440,12 @@ version() { printf 'saw-pkg\n'; }
                 },
             ],
         }];
-        github::write_cached_releases(&fixture.roots.state_dir, "owner/tool", &stale_releases)
-            .unwrap();
+        github::write_cached_releases_cancellable(
+            &fixture.roots.state_dir,
+            "owner/tool",
+            &stale_releases,
+        )
+        .unwrap();
         let now = options.now;
         stamp::remote_touch(
             &stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "github"),
@@ -14454,7 +14458,11 @@ version() { printf 'saw-pkg\n'; }
         }
 
         fn write_lib(&self) {
-            fs::write(self.hooks.shdeps_lib(), "shdeps_version() { :; }\n").unwrap();
+            fs::write(
+                self.roots.home.join("shdeps.sh"),
+                "shdeps_version() { :; }\n",
+            )
+            .unwrap();
         }
 
         fn write_hook(&self, name: &str, body: &str) {
