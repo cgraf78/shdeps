@@ -837,8 +837,9 @@ Behavior:
   output; it MUST NOT be reported as current.
 - Existing managed clones are refreshed with `git fetch` then
   `git merge --ff-only @{upstream}`. A failure MUST stay non-fatal, MUST name
-  its cause from Git (fetch failure with Git's first error line, divergence,
-  dirty tree, or another fast-forward error), and MUST persist
+  its cause from Git (fetch failure with Git's first error line, a deleted
+  upstream branch, divergence, dirty tree, or another fast-forward error),
+  and MUST persist
   `<name>.repo.pull-failure` until the next successful refresh. A failed fetch
   MAY retry the other transport of the configured GitHub URL; origin MUST only
   move to a URL whose fetch just succeeded and MUST otherwise be restored.

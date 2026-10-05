@@ -50,6 +50,10 @@ const DETAIL_MAX_CHARS: usize = 200;
 pub enum Reason {
     /// `git fetch` failed on every origin it was allowed to try.
     Fetch,
+    /// Origin answered but no longer has the branch the checkout tracks
+    /// (deleted, or the default branch was renamed), so the shallow clone's
+    /// single-branch fetch can never succeed again.
+    UpstreamGone,
     /// The checkout has commits its upstream does not (local commits, or the
     /// upstream history was rewritten), so it cannot fast-forward.
     Diverged,
@@ -67,6 +71,7 @@ impl Reason {
     pub const fn token(self) -> &'static str {
         match self {
             Self::Fetch => "fetch",
+            Self::UpstreamGone => "upstream-gone",
             Self::Diverged => "diverged",
             Self::Dirty => "dirty",
             Self::Merge => "merge",
@@ -77,6 +82,7 @@ impl Reason {
     fn parse(token: &str) -> Option<Self> {
         [
             Self::Fetch,
+            Self::UpstreamGone,
             Self::Diverged,
             Self::Dirty,
             Self::Merge,
@@ -118,6 +124,7 @@ impl Failure {
         };
         match self.reason {
             Reason::Fetch => with_detail("fetch failed"),
+            Reason::UpstreamGone => with_detail("upstream branch deleted"),
             Reason::Diverged => "diverged from origin".to_owned(),
             Reason::Dirty => "dirty working tree".to_owned(),
             Reason::Merge => with_detail("fast-forward failed"),
@@ -257,10 +264,11 @@ pub struct Stale {
     pub detail: String,
 }
 
-/// Finds dependencies whose last successful remote check trails their peers
-/// by more than [`STALE_AFTER_SECS`] plus `ttl`, or whose pull-failure streak
-/// itself spans that long (which also covers a host where every source fails,
-/// so no peer is newer). Costs one small read per candidate stamp and one
+/// Finds dependencies whose last successful remote check (or, for a
+/// checkout with a pull-failure record, its first failure since then) trails
+/// their peers by more than [`STALE_AFTER_SECS`] plus `ttl`, or whose
+/// pull-failure streak itself spans that long (which also covers a host
+/// where every source fails, so no peer is newer). Costs one small read per candidate stamp and one
 /// per repo record; never touches the network.
 #[must_use]
 pub fn find(state_dir: &Path, candidates: &[Candidate], now: u64, ttl: u64) -> Vec<Stale> {
@@ -292,9 +300,14 @@ pub fn find(state_dir: &Path, candidates: &[Candidate], now: u64, ttl: u64) -> V
             .then(|| read(&record_path(state_dir, &candidate.name)))
             .flatten()
             .filter(|record| stamp.is_none_or(|success| success <= record.since));
-        let last_success = stamp.or(record.as_ref().map(|record| record.since));
-        let peer_lag = match (reference, last_success) {
-            (Some(reference), Some(success)) => reference.saturating_sub(success),
+        // With a record, the lag runs from the first failure, not the last
+        // success: between the two the checkout was not due or the host was
+        // asleep or offline, so a stamp that trails its peers by a week after
+        // one failed catch-up run is not a week of failing while they
+        // succeeded. A surviving record is never older than the stamp.
+        let failing_since = record.as_ref().map(|record| record.since).or(stamp);
+        let peer_lag = match (reference, failing_since) {
+            (Some(reference), Some(since)) => reference.saturating_sub(since),
             _ => 0,
         };
         let streak = record
@@ -339,6 +352,9 @@ fn stale_detail(candidate: &Candidate, record: Option<&Record>, lag: u64) -> Str
                 Reason::Diverged => {
                     format!("move {root} aside and run 'shdeps update' to clone it again")
                 }
+                Reason::UpstreamGone => format!(
+                    "move {root} aside and run 'shdeps update' to clone the repository's current default branch"
+                ),
                 Reason::Dirty => format!(
                     "review 'git -C {root} status', discard the edits, then run 'shdeps update'"
                 ),
@@ -347,7 +363,7 @@ fn stale_detail(candidate: &Candidate, record: Option<&Record>, lag: u64) -> Str
                 ),
             };
             format!(
-                "checkout has not refreshed for {age} ({}); {hint}",
+                "checkout has failed to refresh for {age} ({}); {hint}",
                 record.failure.cause()
             )
         }
@@ -403,26 +419,47 @@ fn unsafe_char(ch: char) -> bool {
         || matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// Replaces the userinfo of every `scheme://user:secret@host` in `text`.
-/// An `insteadOf` rewrite can put a token into the URL Git prints.
+/// Schemes whose user name is an account name, never a secret
+/// (`ssh://git@host`): a user-only userinfo stays visible for them.
+const USER_SCHEMES: [&str; 4] = ["ssh", "git+ssh", "ssh+git", "git"];
+
+/// Replaces the userinfo of every `scheme://userinfo@host` URL in `text`
+/// with `***`. An `insteadOf` rewrite can put a token into the URL Git
+/// prints.
+///
+/// The authority ends at the first `/`, `?`, `#`, or whitespace, as Git's
+/// own URL parser ends it, and its last `@` separates userinfo from host, so
+/// a password containing `@` or a quote is still hidden whole. A user name
+/// alone is redacted too (a bare token often sits in that position) except
+/// for SSH-style schemes, whose user is an account such as `git`.
+///
+/// Same rule as dot's `update.last-failure` redaction, so the two tools
+/// redact one line alike; dot is released independently, so the rule is
+/// restated there rather than shared.
 fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(index) = rest.find("://") {
         let (head, tail) = rest.split_at(index + 3);
         out.push_str(head);
-        let authority_end = tail
-            .find(|ch: char| ch == '/' || ch == '\'' || ch == '"' || ch.is_whitespace())
+        let scheme_start = head[..index]
+            .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || "+-.".contains(ch)))
+            .map_or(0, |at| at + 1);
+        let scheme = head[scheme_start..index].to_ascii_lowercase();
+        let end = tail
+            .find(|ch: char| ch == '/' || ch == '?' || ch == '#' || ch.is_whitespace())
             .unwrap_or(tail.len());
-        let authority = &tail[..authority_end];
+        let authority = &tail[..end];
         match authority.rfind('@') {
-            Some(at) => {
+            Some(at)
+                if authority[..at].contains(':') || !USER_SCHEMES.contains(&scheme.as_str()) =>
+            {
                 out.push_str("***");
                 out.push_str(&authority[at..]);
             }
-            None => out.push_str(authority),
+            _ => out.push_str(authority),
         }
-        rest = &tail[authority_end..];
+        rest = &tail[end..];
     }
     out.push_str(rest);
     out
@@ -435,7 +472,7 @@ mod tests {
 
     use super::{
         Candidate, Failure, Reason, STALE_AFTER_SECS, Source, clear, find, first_line, read,
-        record_failure, record_path,
+        record_failure, record_path, redact_credentials,
     };
 
     const NOW: u64 = 1_700_000_000;
@@ -472,6 +509,83 @@ mod tests {
         assert_eq!(first_line(""), "");
         let long = "a".repeat(500);
         assert_eq!(first_line(&long).chars().count(), 203);
+    }
+
+    // The redaction cases mirror dot's `redact::credentials` tests: the two
+    // tools persist and print the same kind of Git line and must hide the
+    // same secrets.
+    #[test]
+    fn redaction_hides_userinfo_and_keeps_the_rest() {
+        for (text, redacted) in [
+            (
+                "unable to access 'https://user:tok3n@github.com/o/r.git/': 403",
+                "unable to access 'https://***@github.com/o/r.git/': 403",
+            ),
+            (
+                "https://ghp_abc@github.com/o/r",
+                "https://***@github.com/o/r",
+            ),
+            (
+                "https://u:p@ss@host.example/x",
+                "https://***@host.example/x",
+            ),
+            (
+                "from https://a:b@one/x to ssh://git:pw@two:22/y",
+                "from https://***@one/x to ssh://***@two:22/y",
+            ),
+            ("remote https://a:b@host", "remote https://***@host"),
+        ] {
+            assert_eq!(redact_credentials(text), redacted, "{text}");
+        }
+    }
+
+    #[test]
+    fn redaction_hides_a_password_containing_a_quote() {
+        assert_eq!(
+            redact_credentials("unable to access 'https://user:it's@host/x/': 403"),
+            "unable to access 'https://***@host/x/': 403"
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_an_ssh_user_name_but_not_its_password() {
+        for text in [
+            "ssh://git@github.com/o/r.git",
+            "git+ssh://git@host/r",
+            "ssh+git://git@host/r",
+            "git://git@host/r",
+            "SSH://git@host:22/r",
+        ] {
+            assert_eq!(redact_credentials(text), text);
+        }
+        assert_eq!(
+            redact_credentials("ssh://git:pw@host/r"),
+            "ssh://***@host/r"
+        );
+    }
+
+    #[test]
+    fn redaction_ends_the_host_at_a_query_or_fragment() {
+        for text in [
+            "https://example.com?email=me@x.example",
+            "https://example.com#me@x.example",
+        ] {
+            assert_eq!(redact_credentials(text), text);
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_text_without_credentials_unchanged() {
+        for text in [
+            "",
+            "no url here",
+            "https://github.com/o/r.git",
+            "git@github.com:o/r.git",
+            "mail me at a@b.example",
+            "https://host/path?next=a@b",
+        ] {
+            assert_eq!(redact_credentials(text), text);
+        }
     }
 
     #[test]
@@ -573,15 +687,62 @@ mod tests {
     }
 
     #[test]
+    fn single_failure_after_a_long_sleep_is_not_stale() {
+        // The first run after a week asleep refreshed the peers but failed
+        // this checkout once. The week its stamp trails them is sleep, not a
+        // week of failing while they succeeded.
+        let state = crate::test_support::temp_dir("stale-remote-woke-failing");
+        stamp(&state, "peer", "release", NOW);
+        stamp(&state, "tool", "repo", NOW - 7 * DAY);
+        record_failure(
+            &state,
+            "tool",
+            &Failure::new(Reason::Fetch, "boom"),
+            NOW - 60,
+        )
+        .unwrap();
+
+        let candidates = [
+            candidate("peer", Source::Release, true),
+            candidate("tool", Source::Repo, true),
+        ];
+        assert!(find(&state, &candidates, NOW, 3600).is_empty());
+    }
+
+    #[test]
+    fn failing_since_a_long_sleep_is_stale_once_peers_succeed_for_a_day() {
+        // The same checkout still failing a day and a TTL after waking, while
+        // its peers keep refreshing, is stuck; the age counts from the first
+        // failure, not from the last success before the sleep.
+        let state = crate::test_support::temp_dir("stale-remote-woke-stuck");
+        stamp(&state, "peer", "release", NOW);
+        stamp(&state, "tool", "repo", NOW - 9 * DAY);
+        let failure = Failure::new(Reason::Fetch, "boom");
+        record_failure(&state, "tool", &failure, NOW - 2 * DAY).unwrap();
+        record_failure(&state, "tool", &failure, NOW).unwrap();
+
+        let candidates = [
+            candidate("peer", Source::Release, true),
+            candidate("tool", Source::Repo, true),
+        ];
+        let stale = find(&state, &candidates, NOW, 3600);
+
+        assert_eq!(
+            stale[0].detail,
+            "checkout has failed to refresh for 2d (fetch failed: boom); check network and GitHub access with 'git -C /share/tool fetch', then run 'shdeps update'"
+        );
+    }
+
+    #[test]
     fn record_cause_and_hint_name_the_failure() {
         let state = crate::test_support::temp_dir("stale-remote-cause");
         stamp(&state, "peer", "repo", NOW);
-        stamp(&state, "tool", "repo", NOW - 3 * DAY);
+        stamp(&state, "tool", "repo", NOW - 3 * DAY - 3600);
         record_failure(
             &state,
             "tool",
             &Failure::new(Reason::Fetch, "fatal: Could not resolve host: github.com"),
-            NOW - 3 * DAY + 3600,
+            NOW - 3 * DAY,
         )
         .unwrap();
         let candidates = [
@@ -593,7 +754,43 @@ mod tests {
 
         assert_eq!(
             stale[0].detail,
-            "checkout has not refreshed for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C /share/tool fetch', then run 'shdeps update'"
+            "checkout has failed to refresh for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C /share/tool fetch', then run 'shdeps update'"
+        );
+    }
+
+    #[test]
+    fn deleted_upstream_branch_hint_points_at_a_new_clone() {
+        // Checking the network is the wrong next step when origin answered
+        // without the tracked branch; only a new clone picks up the renamed
+        // default branch.
+        let state = crate::test_support::temp_dir("stale-remote-upstream-gone");
+        stamp(&state, "peer", "repo", NOW);
+        stamp(&state, "tool", "repo", NOW - 3 * DAY - 60);
+        record_failure(
+            &state,
+            "tool",
+            &Failure::new(
+                Reason::UpstreamGone,
+                "fatal: couldn't find remote ref refs/heads/master",
+            ),
+            NOW - 3 * DAY,
+        )
+        .unwrap();
+        let candidates = [
+            candidate("peer", Source::Repo, true),
+            candidate("tool", Source::Repo, true),
+        ];
+
+        let stale = find(&state, &candidates, NOW, 3600);
+
+        assert!(
+            fs::read_to_string(record_path(&state, "tool"))
+                .unwrap()
+                .contains("\nreason=upstream-gone\n")
+        );
+        assert_eq!(
+            stale[0].detail,
+            "checkout has failed to refresh for 3d (upstream branch deleted: couldn't find remote ref refs/heads/master); move /share/tool aside and run 'shdeps update' to clone the repository's current default branch"
         );
     }
 
@@ -612,7 +809,7 @@ mod tests {
 
         assert_eq!(
             stale[0].detail,
-            "checkout has not refreshed for 2d (diverged from origin); move /share/tool aside and run 'shdeps update' to clone it again"
+            "checkout has failed to refresh for 2d (diverged from origin); move /share/tool aside and run 'shdeps update' to clone it again"
         );
     }
 

@@ -1492,17 +1492,27 @@ fn pkg_git_subcommand_is_not_guessed_missing() {
 
 #[test]
 fn pkg_commands_are_not_checked_without_path() {
+    // The PATH guard is only reachable once a manager is detected, and
+    // detection itself walks PATH. An empty PATH is one empty element, which
+    // lookups resolve against the working directory, so running from the
+    // fake manager's directory detects apt while every command lookup
+    // misses. Without the guard this reports `shdeps-test-rg` missing.
     let fixture = Fixture::new("pkg-no-path");
+    fixture.fake_apt();
     fixture.append("conf/deps.conf", "ripgrep pkg shdeps-test-rg\n");
 
-    for path in [None, Some("")] {
-        let mut command = fixture.command(&["health"]);
-        match path {
-            Some(path) => command.env("PATH", path),
-            None => command.env_remove("PATH"),
-        };
-        assert_exit(&command.output().unwrap(), 0);
-    }
+    let output = fixture
+        .command(&["health"])
+        .env("PATH", "")
+        .current_dir(fixture.path("fakebin"))
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    assert!(
+        !fixture.path("pkg-calls").exists(),
+        "health must not run the package manager"
+    );
 }
 
 #[test]
@@ -1829,13 +1839,13 @@ fn checkout_stuck_behind_its_peers_is_a_stale_remote() {
     fixture.write("state/owner/tool.release.stamp", &format!("{now}\n"));
     fixture.write(
         "state/owner/kit.repo.stamp",
-        &format!("{}\n", now - 3 * 86_400),
+        &format!("{}\n", now - 3 * 86_400 - 60),
     );
     fixture.write(
         "state/owner/kit.repo.pull-failure",
         &format!(
             "since={}\nlast={now}\nreason=fetch\ndetail=Could not resolve host: github.com\n",
-            now - 3 * 86_400 + 60
+            now - 3 * 86_400
         ),
     );
 
@@ -1850,7 +1860,7 @@ fn checkout_stuck_behind_its_peers_is_a_stale_remote() {
     assert_eq!(
         rows(&output)[0][4],
         format!(
-            "checkout has not refreshed for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C {} fetch', then run 'shdeps update'",
+            "checkout has failed to refresh for 3d (fetch failed: Could not resolve host: github.com); check network and GitHub access with 'git -C {} fetch', then run 'shdeps update'",
             root.display()
         )
     );
