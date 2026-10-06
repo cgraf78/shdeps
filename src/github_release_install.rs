@@ -415,6 +415,24 @@ fn symlink_points_into(path: &Path, root: &Path) -> bool {
     }
 }
 
+/// Verifies the installed release command instead of a PATH shadow.
+///
+/// Raw installs own a regular public binary. Archive commands may be symlinks,
+/// but retaining one requires it to still resolve into this dependency's root;
+/// a healthy executable reached through a repointed link is not the old tool.
+pub(crate) fn usable_version(
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+    runner: &impl process::Runner,
+) -> Option<String> {
+    let metadata = fs::symlink_metadata(public).ok()?;
+    if metadata.file_type().is_symlink() && !symlink_points_into(public, &install_base.join(name)) {
+        return None;
+    }
+    process::verified_version(runner, public)
+}
+
 /// Installs a raw standalone release binary to an exact caller-owned path.
 pub(crate) fn install_plain_to(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
     if let Some(parent) = target.parent() {

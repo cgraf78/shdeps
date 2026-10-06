@@ -287,8 +287,12 @@ A durable proof preserves the command-only fast path on later healthy updates.
 Resolves to
 .B github:release
 when the latest stable release has a compatible asset for the current host and
-command; otherwise falls back to
+command; first installations without a compatible asset fall back to
 .BR github:repo .
+An existing matching release manifest row retains its release provider even
+when upstream assets or metadata are unavailable. Use explicit
+.B github:repo
+to request a provider change.
 The manifest and
 .B shdeps list
 record only the resolved concrete method.
@@ -326,6 +330,14 @@ field is the
 Handles
 .BR .tar.gz ", " .tar.xz ", " .tar.bz2 ", " .zip ", " .gz ", " .bz2 ", " .zst ,
 and raw binaries.
+If the latest stable release has no compatible asset, an owned executable
+that passes a version probe is kept with a non-fatal update-pending warning.
+The next ordinary update rechecks; incomplete publication does not refresh
+resolver or release freshness. Missing or unusable owned commands, first
+installations, and explicit
+.B \-\-reinstall
+still fail without a compatible asset. Download and checksum failures remain
+errors. Shdeps does not fall back to arbitrary older releases.
 .TP
 .B cargo
 Installs Rust crates via

@@ -199,8 +199,12 @@ Use `host:` to limit deps to specific machines.
 Resolves to an existing concrete GitHub method before install, status, prune,
 and method-transition logic runs. shdeps prefers `github:release` when the
 latest stable release has a compatible asset for the current host and requested
-command. If no compatible release asset is available, it falls back to
-`github:repo`.
+command. If no compatible release asset is available on a first installation,
+it falls back to `github:repo`. Once the matching command is recorded as
+`github:release`, missing assets or unavailable metadata preserve that release
+ownership. Publishing a release and uploading its assets are separate upstream
+operations; a temporary asset gap must not silently switch installers. Use
+explicit `github:repo` to request a provider change.
 
 ```text
 cgraf78/ds    github
@@ -219,6 +223,15 @@ For stale or forced checks, a working release-backed install remains
 same tag. This avoids both the REST API quota and a `gh auth token` probe; a new
 tag or unusable local install still triggers authoritative asset and method
 selection through the API.
+
+If the latest release has no compatible asset, an owned executable that passes
+a version probe is retained with a nonfatal warning naming the pending update.
+Neither release nor resolver freshness is cached for that incomplete check, so
+the next ordinary update checks for newly uploaded assets. Missing or unusable
+owned commands and explicit `--reinstall` still fail when no asset is available;
+`--force` checks immediately without granting permission to change providers.
+Shdeps continues to target the latest stable release and does not install an
+arbitrary older release as a fallback.
 
 ### `github:repo` — GitHub Repos
 
@@ -347,6 +360,11 @@ unauthenticated API's per-IP quota or probing `gh auth token`. Fresh installs
 and changed releases still use the API because shdeps needs authoritative asset
 metadata; set `GH_TOKEN` for those checks when operating a large fleet or using
 private repositories.
+
+An upstream release with no host-compatible asset keeps an already-owned,
+usable release command with an update-pending warning and retries on the next
+update. Fresh installations and `--reinstall` require a compatible asset and
+fail if it is unavailable. Download and checksum failures remain errors.
 
 ### `cargo` — Rust Crates
 

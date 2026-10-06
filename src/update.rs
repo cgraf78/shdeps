@@ -117,6 +117,8 @@ pub enum ItemReason {
     Installed,
     /// A repository remained usable after its fast-forward pull failed.
     RepoPullFailed,
+    /// The owned release remains usable while upstream assets are unavailable.
+    ReleaseAssetUnavailable,
     /// Package manager override disabled this dependency.
     PackageManagerOverride,
     /// Package is unavailable on this host/package manager.
@@ -4377,6 +4379,118 @@ uninstall() { printf 'old\n' > "$SHDEPS_STATE_DIR/tool-uninstalled"; }
         );
         assert_eq!(fs::read_link(&public).unwrap(), source);
         assert_eq!(fs::read_to_string(&source).unwrap(), "#!/bin/sh\n");
+    }
+
+    /// Covers old installations already wedged by the publication-window
+    /// fallback, not only prevention of new release-to-repo journals.
+    #[test]
+    #[cfg(unix)]
+    fn github_publication_retires_an_untouched_failed_repo_handoff() {
+        use std::os::unix::fs::{MetadataExt as _, symlink};
+
+        let fixture = unpublished_release_fixture("publication-existing-handoff");
+        fs::write(
+            fixture.roots.conf_dir.join("tools.conf"),
+            "owner/tool github tool\n",
+        )
+        .unwrap();
+        let root = fixture.roots.install_dir.join("owner/tool");
+        let source = root.join("bin/tool");
+        write_executable(&source);
+        fs::write(
+            crate::github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/tool",
+            ),
+            "v1 archive\n",
+        )
+        .unwrap();
+        let public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(&source, &public).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            public.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let inode = fs::symlink_metadata(&root).unwrap().ino();
+
+        // An old resolver chose the repo provider, whose installer fails.
+        let failed = run(
+            &[parse_entry("owner/tool|github:repo|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+        assert!(failed.has_errors());
+        assert!(crate::update_transition::has_pending_durable_transitions(
+            &fixture.roots
+        ));
+        fs::create_dir_all(fixture.roots.state_dir.join("owner")).unwrap();
+        fs::write(
+            fixture.roots.state_dir.join("owner/tool.github.method"),
+            "github:repo:no-compatible-release\ncmd=tool\n",
+        )
+        .unwrap();
+        crate::stamp::remote_touch(
+            &crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "github"),
+            Options::default().now,
+        )
+        .unwrap();
+
+        let runner = FakeRunner::default().with_success(
+            public.to_str().unwrap(),
+            ["--version"],
+            "tool 1.0.0\n",
+        );
+        let installed = manifest::read(&manifest_path).unwrap();
+        let raw = [parse_entry("owner/tool|github|tool|-|-", None)];
+        let resolved = crate::github_method::resolve_entries(
+            &raw,
+            &crate::github_method::Context {
+                roots: &fixture.roots,
+                manifest: Some(&installed),
+                env: &fixture.env,
+                env_vars: &fixture.env_vars,
+                runner: &runner,
+                client: &fixture.client,
+            },
+            crate::github_method::Options::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved[0].method, "github:release");
+        let summary = run(
+            &resolved,
+            &installed,
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert!(!crate::update_transition::has_pending_durable_transitions(
+            &fixture.roots
+        ));
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
+        );
+        assert_eq!(fs::symlink_metadata(&root).unwrap().ino(), inode);
+        assert_eq!(fs::read_link(&public).unwrap(), source);
+        let health = crate::health::check(&fixture.roots, &fixture.env, "apt");
+        assert!(
+            !health.problems.iter().any(|problem| matches!(
+                problem.kind,
+                crate::health::ProblemKind::RecoveryState
+                    | crate::health::ProblemKind::BlockedTransition
+            )),
+            "{health:?}"
+        );
     }
 
     #[test]
@@ -8884,6 +8998,309 @@ version() { printf 'saw-pkg\n'; }
         );
     }
 
+    /// An asset gap is not an upgrade, and must never run the post hook or
+    /// mark the old executable freshly verified against a newer release.
+    #[test]
+    fn update_github_release_warns_and_retains_owned_binary_during_publication() {
+        let fixture = unpublished_release_fixture("release-publication-retain");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&public);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            public.display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.0.0\n")
+            .with_success(public.to_str().unwrap(), ["--version"], "tool 1.0.0\n");
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert!(!summary.items[0].changed);
+        assert!(
+            summary.items[0]
+                .detail
+                .contains("no compatible release asset")
+        );
+        assert!(summary.items[0].detail.contains("1.0.0"));
+        assert!(summary.items[0].detail.contains("v2.0.0"));
+        assert!(
+            !fixture
+                .roots
+                .state_dir
+                .join(".pending-posts/owner/tool")
+                .exists()
+        );
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
+        );
+        assert_eq!(fs::read(&public).unwrap(), b"#!/bin/sh\n");
+        assert!(
+            !crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release").exists()
+        );
+    }
+
+    #[test]
+    fn update_github_release_missing_asset_does_not_adopt_unowned_command() {
+        let fixture = unpublished_release_fixture("release-publication-unowned");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        write_executable(&fixture.roots.bin_dir.join("tool"));
+        let runner = FakeRunner::default().with_success("tool", ["--version"], "tool 1.0.0\n");
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::Manifest::default(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn update_github_release_missing_asset_fails_for_missing_owned_command() {
+        let fixture = unpublished_release_fixture("release-publication-missing");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let old = ManifestEntry::new(
+            "owner/tool",
+            "github:release",
+            "tool",
+            fixture.roots.bin_dir.join("tool").display().to_string(),
+        );
+        manifest::upsert(&manifest_path, old.clone()).unwrap();
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &FakeRunner::default(), "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(
+            manifest::read(&manifest_path).unwrap().get("owner/tool"),
+            Some(&old)
+        );
+    }
+
+    #[test]
+    fn update_github_release_missing_asset_fails_for_broken_version_probe() {
+        let fixture = unpublished_release_fixture("release-publication-broken");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&public);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let runner = FakeRunner::default()
+            .with_failure_stderr("tool", ["--version"], "tool 1.0.0 failed\n")
+            .with_failure_stderr(
+                public.to_str().unwrap(),
+                ["--version"],
+                "tool 1.0.0 failed\n",
+            );
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(
+            summary.has_errors(),
+            "a failed version probe cannot prove the old tool usable"
+        );
+    }
+
+    #[test]
+    fn update_github_release_missing_asset_fails_explicit_reinstall() {
+        let fixture = unpublished_release_fixture("release-publication-reinstall");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&public);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let runner = FakeRunner::default().with_success("tool", ["--version"], "tool 1.0.0\n");
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert_eq!(fs::read(&public).unwrap(), b"#!/bin/sh\n");
+    }
+
+    #[test]
+    fn update_github_release_publication_does_not_trust_a_shadow_reporting_latest() {
+        let fixture = unpublished_release_fixture("release-publication-shadow");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&public);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 2.0.0\n")
+            .with_success(public.to_str().unwrap(), ["--version"], "tool 1.0.0\n");
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert!(summary.items[0].detail.contains("keeping 1.0.0"));
+        assert!(
+            !crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release").exists()
+        );
+    }
+
+    #[test]
+    fn update_github_release_publication_does_not_trust_failed_probe_reporting_latest() {
+        let fixture = unpublished_release_fixture("release-publication-failed-latest");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        write_executable(&public);
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let runner = FakeRunner::default()
+            .with_failure_stderr("tool", ["--version"], "tool 2.0.0 failed\n")
+            .with_failure_stderr(
+                public.to_str().unwrap(),
+                ["--version"],
+                "tool 2.0.0 failed\n",
+            );
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(summary.has_errors());
+        assert!(
+            !crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release").exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_github_release_publication_refuses_repointed_archive_command() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = unpublished_release_fixture("release-publication-repointed");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let owned = fixture.roots.install_dir.join("owner/tool/bin/tool");
+        write_executable(&owned);
+        fs::write(
+            crate::github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/tool",
+            ),
+            "v1 archive\n",
+        )
+        .unwrap();
+        let foreign = fixture.roots.home.join("foreign-tool");
+        write_executable(&foreign);
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(&foreign, &public).unwrap();
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let runner = FakeRunner::default()
+            .with_success("tool", ["--version"], "tool 1.0.0\n")
+            .with_success(public.to_str().unwrap(), ["--version"], "tool 1.0.0\n");
+        let summary = run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, &runner, "apt"),
+            Options::default(),
+        )
+        .unwrap();
+
+        assert!(
+            summary.has_errors(),
+            "a foreign command is not a usable owned archive"
+        );
+        assert_eq!(fs::read_link(&public).unwrap(), foreign);
+        assert_eq!(fs::read(&owned).unwrap(), b"#!/bin/sh\n");
+    }
+
+    fn unpublished_release_fixture(name: &str) -> Fixture {
+        let mut fixture = Fixture::new(name);
+        fixture.write_lib();
+        fixture.client = FakeClient::default().with(
+            "https://api.github.com/repos/owner/tool/releases?per_page=100",
+            br#"[{"tag_name":"v2.0.0","draft":false,"prerelease":false,"assets":[]}]"#.to_vec(),
+        );
+        fixture
+    }
+
     #[test]
     fn rate_limited_metadata_fetch_fails_uninstalled_release_with_classified_detail() {
         let mut fixture = Fixture::new("release-metadata-rate-limit-missing");
@@ -9749,7 +10166,11 @@ version() { printf 'saw-pkg\n'; }
             let summary = run_dot_update(
                 &fixture,
                 &manifest_path,
-                &standalone_dot_runner_reporting(installed),
+                &standalone_dot_runner_reporting(installed).with_success(
+                    public.to_str().unwrap(),
+                    ["--version"],
+                    &format!("dot {installed}\n"),
+                ),
             );
 
             assert_eq!(summary.has_errors(), should_fail, "{summary:#?}");

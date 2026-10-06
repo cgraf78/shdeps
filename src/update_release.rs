@@ -55,15 +55,17 @@ pub(crate) fn install_with_prefetch(
             client: context.client,
             options,
             prefetch,
-            prior_release: manifest::read(context.manifest_path)?
-                .get(&entry.name)
-                .is_some_and(|installed| installed.method == method::GITHUB_RELEASE),
+            prior_release: github_release::owns_command(
+                &manifest::read(context.manifest_path)?,
+                &entry.name,
+                &entry.cmd,
+            ),
             mutation: Some(mutation),
         };
         install_request(&request, &mut request_context)?
     };
     cancellation::check()?;
-    if !outcome.failed {
+    if !outcome.failed && outcome.warning.is_none() {
         // Ordering matters: write the manifest record BEFORE refreshing the
         // TTL stamp. If a crash/SIGINT lands between the two writes, the next
         // shdeps run must see "stamp older than manifest" (re-evaluate) rather
@@ -80,6 +82,14 @@ pub(crate) fn install_with_prefetch(
     }
     let _ = mutation.resolve(outcome.changed)?;
 
+    if let Some(reason) = outcome.warning {
+        return Ok(Item::warning(
+            entry.name.clone(),
+            reason,
+            outcome.detail,
+            false,
+        ));
+    }
     Ok(match (outcome.failed, outcome.changed) {
         (true, _) => Item::failed(
             entry.name.clone(),
@@ -316,6 +326,8 @@ pub(crate) struct RequestContext<'a, R: Runner> {
 pub(crate) struct ReleaseOutcome {
     pub(crate) changed: bool,
     pub(crate) failed: bool,
+    /// A usable installation was retained without confirming it current.
+    pub(crate) warning: Option<ItemReason>,
     pub(crate) detail: String,
     /// True when the caller should refresh the TTL stamp after writing the
     /// manifest record. Set to `true` only for paths that confirmed the
@@ -404,6 +416,7 @@ pub(crate) fn install_request(
         return Ok(ReleaseOutcome {
             changed: false,
             failed: false,
+            warning: None,
             detail,
             // The TTL stamp is already fresh in this branch; nothing to
             // refresh.
@@ -411,19 +424,34 @@ pub(crate) fn install_request(
         });
     }
 
-    let current_version = context
-        .prefetch
-        .version(request.name)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            process::executable_path(request.public_bin)
-                .then(|| process::dep_version(context.runner, request.cmd))
-                .flatten()
-        });
+    let current_version = if context.prior_release {
+        // Freshness decisions need the same evidence as retaining an older
+        // tool. PATH lookup and nonzero version text are display conveniences,
+        // not proof that the release command itself still works.
+        github_release_install::usable_version(
+            &context.roots.install_dir,
+            request.public_bin,
+            request.name,
+            context.runner,
+        )
+    } else {
+        context
+            .prefetch
+            .version(request.name)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                process::executable_path(request.public_bin)
+                    .then(|| process::dep_version(context.runner, request.cmd))
+                    .flatten()
+            })
+    };
     cancellation::check()?;
 
     let redirect_confirms_current = !adopting
-        && (context.prefetch.is_current(request.name)
+        && ((context.prefetch.is_current(request.name)
+            && (!context.prior_release
+                || (current_version.is_some()
+                    && context.prefetch.version(request.name) == current_version.as_deref())))
             || (!context.options.reinstall
                 && !context.prefetch.releases.contains_key(request.repo)
                 && current_version.as_deref().is_some_and(|current| {
@@ -443,6 +471,7 @@ pub(crate) fn install_request(
         return Ok(ReleaseOutcome {
             changed: false,
             failed: false,
+            warning: None,
             detail: current_version.unwrap_or_else(|| "current".to_owned()),
             // The public redirect proved the installed tag is still GitHub's
             // latest stable release, so this is a successful remote check.
@@ -503,6 +532,7 @@ pub(crate) fn install_request(
                     return Ok(ReleaseOutcome {
                         changed: false,
                         failed: false,
+                        warning: None,
                         detail,
                         // Transient metadata failure: preserve the working
                         // binary but do NOT refresh the TTL stamp so the
@@ -550,6 +580,7 @@ pub(crate) fn install_request(
             return Ok(ReleaseOutcome {
                 changed: false,
                 failed: false,
+                warning: None,
                 detail: current_version.unwrap_or_else(|| latest.tag.clone()),
                 // The remote was checked and confirms the installed tag is
                 // current. Refresh the stamp — but only after the caller
@@ -563,6 +594,31 @@ pub(crate) fn install_request(
     let Some(selection) =
         github_release::select(request.cmd, releases, context.runtime_env, context.runner)
     else {
+        cancellation::check()?;
+        github::invalidate_release_checks(&context.roots.state_dir, request.name)?;
+        if context.prior_release
+            && !context.options.reinstall
+            && process::executable_path(request.public_bin)
+        {
+            // A successful local version probe proves there is still a tool
+            // to keep. Missing assets are an upstream publication condition,
+            // not a local install failure or a reason to downgrade to an older
+            // release. Keep ownership and post obligations unchanged, and let
+            // the next update recheck instead of stamping this as current.
+            if let Some(version) = current_version {
+                let latest = github_release::latest_stable(releases)
+                    .map_or("latest release", |release| release.tag.as_str());
+                return Ok(ReleaseOutcome {
+                    changed: false,
+                    failed: false,
+                    warning: Some(ItemReason::ReleaseAssetUnavailable),
+                    detail: format!(
+                        "keeping {version}; {latest} has no compatible release asset; update pending, retry later"
+                    ),
+                    stamp: false,
+                });
+            }
+        }
         return Ok(failed("no matching release asset"));
     };
     cancellation::check()?;
@@ -629,6 +685,7 @@ pub(crate) fn install_request(
             return Ok(ReleaseOutcome {
                 changed: false,
                 failed: false,
+                warning: None,
                 detail: current_version
                     .map(|version| format!("{version} (standalone adoption pending)"))
                     .unwrap_or_else(|| "standalone adoption pending".to_owned()),
@@ -817,6 +874,7 @@ pub(crate) fn install_request(
     Ok(ReleaseOutcome {
         changed: true,
         failed: false,
+        warning: None,
         detail,
         stamp: true,
     })
@@ -921,6 +979,7 @@ fn failed(detail: &str) -> ReleaseOutcome {
     ReleaseOutcome {
         changed: false,
         failed: true,
+        warning: None,
         detail: detail.to_owned(),
         // A failed run must not refresh the TTL stamp; otherwise the next
         // run's fast path could mask the persistent failure.
