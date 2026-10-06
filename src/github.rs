@@ -329,6 +329,22 @@ pub fn remove_cached_releases(state_dir: &Path, repo: &str) -> io::Result<()> {
     }
 }
 
+/// Invalidates resolver and installer freshness after an incomplete release.
+///
+/// Tags become visible before uploads finish. Neither a previous forced check
+/// nor the incomplete asset list may hide a later upload behind the normal TTL.
+/// These are disposable freshness facts; installed ownership is never removed.
+pub(crate) fn invalidate_release_checks(state_dir: &Path, repo: &str) -> io::Result<()> {
+    for kind in [crate::method::GITHUB, "release"] {
+        match fs::remove_file(crate::stamp::remote_path(state_dir, repo, kind)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    remove_cached_releases(state_dir, repo)
+}
+
 /// Resolves the runtime token used for GitHub API calls.
 ///
 /// `GH_TOKEN` wins because it is the most explicit runtime credential knob for

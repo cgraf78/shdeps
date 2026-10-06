@@ -243,6 +243,21 @@ pub fn dep_exists_with_versions(
 /// Extracts an installed command version using Bash-compatible probes.
 #[must_use]
 pub fn dep_version(runner: &impl Runner, command: &str) -> Option<String> {
+    probe_version(runner, command, false)
+}
+
+/// Probes the owned executable successfully before relying on it as usable.
+///
+/// Display probes accept nonzero output for tools such as OpenSSH. A retained
+/// install needs stronger evidence, and must not accidentally probe a different
+/// command that shadows the owned path on PATH.
+pub(crate) fn verified_version(runner: &impl Runner, command: &Path) -> Option<String> {
+    probe_version(runner, command.to_str()?, true)
+}
+
+/// Shares version extraction while keeping display and usability contracts
+/// distinct. Only successful, non-timeout output can prove usability.
+fn probe_version(runner: &impl Runner, command: &str, require_success: bool) -> Option<String> {
     if command.is_empty() {
         return None;
     }
@@ -257,15 +272,20 @@ pub fn dep_version(runner: &impl Runner, command: &str) -> Option<String> {
             &[subcommand, "--version"],
             Some(VERSION_PROBE_TIMEOUT),
         ) {
-            let combined = output.combined();
-            if let Some(version) = record_version_probe(&mut probes, combined) {
-                return Some(version);
+            if !require_success || (output.success && !output.timed_out) {
+                let combined = output.combined();
+                if let Some(version) = record_version_probe(&mut probes, combined) {
+                    return Some(version);
+                }
             }
         }
     }
 
     for flag in ["--version", "-V"] {
         if let Ok(output) = runner.run(command, &[flag], Some(VERSION_PROBE_TIMEOUT)) {
+            if require_success && (!output.success || output.timed_out) {
+                continue;
+            }
             let combined = output.combined();
             if let Some(version) = record_version_probe(&mut probes, combined) {
                 return Some(version);

@@ -2677,9 +2677,9 @@ fn update_bare_github_rechecks_legacy_repo_cache_and_transitions_to_release() {
 }
 
 #[test]
-fn update_bare_github_transitions_release_to_repo_when_release_is_unavailable() {
+fn update_explicit_github_repo_can_transition_release_without_release_assets() {
     let fixture = Fixture::new("update-github-release-to-repo");
-    fixture.write("conf/deps.conf", "owner/tool github tool\n");
+    fixture.write("conf/deps.conf", "owner/tool github:repo tool\n");
     fixture.write_executable("git/tool/bin/tool", "#!/bin/sh\nprintf 'local clone\\n'\n");
     fixture.initialize_dev_checkout("tool", "https://github.com/owner/tool");
     fixture.write_executable("bin/tool", "#!/bin/sh\nprintf 'old release\\n'\n");
@@ -9787,6 +9787,112 @@ fn release_json(tag: &str, assets: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(r#"[{{"tag_name":"{tag}","draft":false,"prerelease":false,"assets":[{assets}]}}]"#)
+}
+
+/// A publication gap must preserve the installed tool and provider, then
+/// discover assets on the next ordinary update even inside the previous TTL.
+#[test]
+fn github_publication_window_recovers_on_the_next_ordinary_update() {
+    let fixture = Fixture::new("github-publication-window");
+    fixture.write("conf/tools.conf", "owner/tool github tool\n");
+    fixture.write_executable("bin/tool", "#!/bin/sh\nprintf 'tool 1.0.0\\n'\n");
+    let manifest = format!(
+        "owner/tool|github:release|tool|{}\n",
+        fixture.dir.join("bin/tool").display()
+    );
+    fixture.write("state/manifest", &manifest);
+    // Older Shdeps releases can leave both a fresh negative method cache and
+    // a fresh release stamp behind. Force observes the incomplete publication;
+    // its deferral must invalidate both so a normal next run actually checks.
+    fixture.write(
+        "state/owner/tool.github.method",
+        "github:repo:no-compatible-release\ncmd=tool\n",
+    );
+    fixture.write_fresh_stamp("owner/tool", "github");
+    fixture.write_fresh_stamp("owner/tool", "release");
+    fixture.write_fake_curl(&release_json("v2.0.0", &[]), "unused");
+    fixture.write_executable("fakebin/git", "#!/bin/sh\nexit 99\n");
+    let mut first = fixture.command(["--force", "update"]);
+    first.env(
+        "PATH",
+        format!(
+            "{}:{}:/usr/bin:/bin",
+            fixture.dir.join("bin").display(),
+            fixture.dir.join("fakebin").display()
+        ),
+    );
+    let first = run(&mut first);
+
+    assert_success(&first);
+    assert!(
+        text(&first.stderr).contains("no compatible release asset"),
+        "{first:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("bin/tool")).unwrap(),
+        "#!/bin/sh\nprintf 'tool 1.0.0\\n'\n"
+    );
+    assert!(!fixture.dir.join("state/.method-transitions-v1").exists());
+
+    let asset = host_linux_asset("tool", "v2.0.0");
+    fixture.write_fake_curl(
+        &release_json("v2.0.0", &[&asset]),
+        "#!/bin/sh\nprintf 'tool 2.0.0\\n'\n",
+    );
+    let mut second = fixture.command(["update"]);
+    second.env(
+        "PATH",
+        format!(
+            "{}:{}:/usr/bin:/bin",
+            fixture.dir.join("bin").display(),
+            fixture.dir.join("fakebin").display()
+        ),
+    );
+    let second = run(&mut second);
+
+    assert_success(&second);
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("bin/tool")).unwrap(),
+        "#!/bin/sh\nprintf 'tool 2.0.0\\n'\n"
+    );
+    assert!(fixture.dir.join("state/owner/tool.release.stamp").exists());
+    let health = run(&mut fixture.command(["health"]));
+    assert_success(&health);
+}
+
+#[test]
+fn github_release_bridge_warns_without_marking_retained_tool_changed() {
+    let fixture = Fixture::new("github-publication-bridge");
+    fixture.write_executable("bin/tool", "#!/bin/sh\nprintf 'tool 1.0.0\\n'\n");
+    fixture.write(
+        "state/manifest",
+        &format!(
+            "owner/tool|github:release|tool|{}\n",
+            fixture.dir.join("bin/tool").display()
+        ),
+    );
+    fixture.write_fake_curl(&release_json("v2.0.0", &[]), "unused");
+    let mut command = fixture.command(["__api", "github-release-install", "owner/tool", "tool"]);
+    command.env("SHDEPS_UPDATE_TXN_ID", "publication-bridge");
+    let output = run(&mut command);
+
+    assert_success(&output);
+    assert!(text(&output.stderr).contains("no compatible release asset"));
+    assert!(!fixture.dir.join("state/.pending-posts/owner/tool").exists());
+    assert!(
+        !fixture
+            .dir
+            .join("state/.changed-markers/publication-bridge/owner/tool")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("bin/tool")).unwrap(),
+        "#!/bin/sh\nprintf 'tool 1.0.0\\n'\n"
+    );
 }
 
 fn count_release_fetches(log: &Path) -> usize {

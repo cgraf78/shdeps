@@ -454,9 +454,11 @@ where
             client: &Curl,
             options,
             prefetch: &prefetch,
-            prior_release: crate::manifest::read(&crate::manifest::path(&roots.state_dir))?
-                .get(&name)
-                .is_some_and(|installed| installed.method == method::GITHUB_RELEASE),
+            prior_release: crate::github_release::owns_command(
+                &crate::manifest::read(&crate::manifest::path(&roots.state_dir))?,
+                &name,
+                cmd,
+            ),
             mutation: Some(&mut mutation),
         };
         update_release::install_request(&request, &mut request_context)?
@@ -496,6 +498,9 @@ where
             outcome.detail
         )?;
         return Ok(1);
+    }
+    if outcome.warning.is_some() {
+        writeln!(stderr, "warning: {name}: {}", outcome.detail)?;
     }
     if outcome.changed {
         mark_changed(state_dir, name)?;
@@ -1118,6 +1123,7 @@ mod tests {
             crate::update_release::ReleaseOutcome {
                 changed: true,
                 failed: false,
+                warning: None,
                 detail: "v1.0.0".to_owned(),
                 stamp: true,
             },

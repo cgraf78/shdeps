@@ -322,7 +322,12 @@ where
     if !process::executable_path(&public_bin) {
         return false;
     }
-    let Some(version) = process::dep_version(context.runner, &candidate.cmd) else {
+    let Some(version) = crate::github_release_install::usable_version(
+        &context.roots.install_dir,
+        &public_bin,
+        &candidate.name,
+        context.runner,
+    ) else {
         return false;
     };
     github::latest_release_matches(&candidate.name, &version, context.client).unwrap_or(false)
@@ -384,6 +389,16 @@ where
                 stamp::remote_touch_cancellable(&cache.stamp, options.now)?;
                 method::GITHUB_RELEASE
             } else {
+                if release_owned(entry, context.manifest) {
+                    // Publishing a tag and uploading its host assets are not
+                    // atomic. A missing asset is not permission to replace an
+                    // already-owned release with an unrelated source installer.
+                    // Do not cache this incomplete snapshot as a fresh check:
+                    // the next ordinary update must see newly uploaded assets.
+                    github::invalidate_release_checks(&context.roots.state_dir, &entry.name)?;
+                    cache.write_method(method::GITHUB_RELEASE, entry)?;
+                    return Ok(method::GITHUB_RELEASE);
+                }
                 // This is the only repo fallback worth caching: GitHub
                 // answered successfully, and the current host has no matching
                 // release asset. Cache it with an explicit reason so old
@@ -400,6 +415,11 @@ where
             }
         }
         None => {
+            if release_owned(entry, context.manifest) {
+                // Ownership survives both missing assets and failed metadata
+                // probes, even when an older negative cache says "repo".
+                return Ok(method::GITHUB_RELEASE);
+            }
             // Prefer the last proven concrete method during transient GitHub
             // failures. A stale cache is not authoritative enough to skip a
             // successful remote re-check, but it is much better than flipping
@@ -426,12 +446,16 @@ where
 /// callers such as `shdeps health` that may not fetch, write caches, or run
 /// commands.
 ///
-/// It reads the resolver cache even when stale, because update keeps that
+/// Matching release ownership wins before the cache, as it does in update.
+/// Otherwise it reads the resolver cache even when stale, because update keeps that
 /// answer whenever the remote check fails and usually reconfirms it when the
 /// check succeeds. Without a usable cache it uses the installed manifest row,
 /// then the resolver's own no-signal default. A remote check can still pick
 /// differently; callers must treat the answer as a forecast, not a fact.
 pub(crate) fn offline_method(state_dir: &Path, entry: &Entry, manifest: &Manifest) -> &'static str {
+    if release_owned(entry, Some(manifest)) {
+        return method::GITHUB_RELEASE;
+    }
     if let Ok(Some(cached)) = Cache::new(state_dir, &entry.name).read_stale_method(entry) {
         return match cached {
             METHOD_REPO_LAST_KNOWN => method::GITHUB_REPO,
@@ -442,6 +466,12 @@ pub(crate) fn offline_method(state_dir: &Path, entry: &Entry, manifest: &Manifes
         Some(method::GITHUB_RELEASE) => method::GITHUB_RELEASE,
         _ => method::GITHUB_REPO,
     }
+}
+
+/// Release ownership follows the configured identity, not current executable
+/// health. A broken binary still needs release repair, not a provider switch.
+fn release_owned(entry: &Entry, manifest: Option<&Manifest>) -> bool {
+    manifest.is_some_and(|manifest| github_release::owns_command(manifest, &entry.name, &entry.cmd))
 }
 
 fn resolved_entry(entry: &Entry, method: &str) -> Entry {
@@ -606,6 +636,7 @@ where
     R: Runner,
 {
     match method {
+        method::GITHUB_REPO if release_owned(entry, context.manifest) => None,
         METHOD_REPO_LAST_KNOWN if last_known_repo_still_matches(entry, context) => {
             Some(method::GITHUB_REPO)
         }
@@ -855,6 +886,135 @@ mod tests {
             fixture.cached_method("owner/tool"),
             "github:repo:no-compatible-release"
         );
+    }
+
+    #[test]
+    fn github_keeps_release_ownership_while_latest_assets_are_unpublished() {
+        let fixture = Fixture::new("release-publication-window");
+        let manifest = Manifest::parse("owner/tool|github:release|tool|/missing/tool\n");
+        let client = FakeClient::new().with_releases("owner/tool", releases_json("v2", &[]));
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = [parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            fixture.options(true),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(fixture.cached_method("owner/tool"), "github:release");
+        assert!(!stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "github").exists());
+    }
+
+    #[test]
+    fn github_keeps_release_ownership_when_only_other_hosts_assets_are_published() {
+        let fixture = Fixture::new("release-partial-publication");
+        let manifest = Manifest::parse("owner/tool|github:release|tool|/missing/tool\n");
+        let client = FakeClient::new().with_releases(
+            "owner/tool",
+            releases_json("v2", &["tool-v2-darwin-aarch64.tar.gz"]),
+        );
+        let runner = FakeRunner::new().with_uname("x86_64");
+        let entries = [parse_entry("owner/tool|github|tool|-|-", None)];
+
+        let resolved = resolve_entries(
+            &entries,
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            fixture.options(true),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+    }
+
+    #[test]
+    fn github_reinstall_does_not_change_release_ownership_when_assets_are_missing() {
+        let fixture = Fixture::new("release-publication-reinstall");
+        let manifest = Manifest::parse("owner/tool|github:release|tool|/missing/tool\n");
+        let client = FakeClient::new().with_releases("owner/tool", releases_json("v2", &[]));
+        let runner = FakeRunner::new().with_uname("x86_64");
+
+        let resolved = resolve_entries(
+            &[parse_entry("owner/tool|github|tool|-|-", None)],
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                reinstall: true,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+    }
+
+    #[test]
+    fn github_rechecks_negative_cache_against_release_ownership() {
+        let fixture = Fixture::new("release-negative-cache");
+        fixture.write_cache_for_cmd(
+            "owner/tool",
+            "github:repo:no-compatible-release",
+            "tool",
+            10,
+        );
+        let manifest = Manifest::parse("owner/tool|github:release|tool|/missing/tool\n");
+        let client = FakeClient::new().with_releases("owner/tool", releases_json("v2", &[]));
+        let runner = FakeRunner::new().with_uname("x86_64");
+
+        let resolved = resolve_entries(
+            &[parse_entry("owner/tool|github|tool|-|-", None)],
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            Options {
+                now: 20,
+                ..fixture.options(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+        assert_eq!(client.urls(), vec![github::releases_url("owner/tool")]);
+        assert!(!stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "github").exists());
+    }
+
+    #[test]
+    fn github_metadata_outage_cannot_restore_a_negative_repo_cache_over_release_ownership() {
+        let fixture = Fixture::new("release-negative-cache-outage");
+        fixture.write_cache_for_cmd(
+            "owner/tool",
+            "github:repo:no-compatible-release",
+            "tool",
+            10,
+        );
+        let manifest = Manifest::parse("owner/tool|github:release|tool|/missing/tool\n");
+        let client = FakeClient::new();
+        let runner = FakeRunner::new();
+
+        let resolved = resolve_entries(
+            &[parse_entry("owner/tool|github|tool|-|-", None)],
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            fixture.options(true),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:release");
+    }
+
+    #[test]
+    fn github_changed_command_does_not_inherit_release_ownership() {
+        let fixture = Fixture::new("release-changed-command");
+        let manifest = Manifest::parse("owner/tool|github:release|old-tool|/missing/tool\n");
+        let client = FakeClient::new().with_releases("owner/tool", releases_json("v2", &[]));
+        let runner = FakeRunner::new();
+
+        let resolved = resolve_entries(
+            &[parse_entry("owner/tool|github|new-tool|-|-", None)],
+            &fixture.context_with_manifest(&runner, &client, &manifest),
+            fixture.options(true),
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].method, "github:repo");
     }
 
     #[test]
@@ -1440,7 +1600,7 @@ mod tests {
         )
         .unwrap();
         let client = FakeClient::new().with_redirect("owner/tool", "v1.2.3");
-        let runner = FakeRunner::new().with_version("tool", "1.2.3");
+        let runner = FakeRunner::new().with_version(public_bin.to_str().unwrap(), "1.2.3");
         let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
 
         let resolved = resolve_entries(
@@ -1489,7 +1649,7 @@ mod tests {
                 "owner/tool",
                 releases_json("v1.2.3", &["tool-v1.2.3-linux-x86_64.tar.gz"]),
             );
-        let runner = FakeRunner::new().with_version("tool", "1.2.2");
+        let runner = FakeRunner::new().with_version(public_bin.to_str().unwrap(), "1.2.2");
         let entries = vec![parse_entry("owner/tool|github|tool|-|-", None)];
 
         let resolved = resolve_entries(
@@ -1916,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_method_forecasts_from_the_cache_then_the_manifest() {
+    fn offline_method_preserves_release_ownership_before_consulting_cache() {
         let fixture = Fixture::new("offline-method");
         let state = &fixture.roots.state_dir;
         let entry = parse_entry("owner/tool|github|tool|-|-", None);
@@ -1934,16 +2094,17 @@ mod tests {
             super::offline_method(state, &entry, &release),
             "github:release"
         );
-        // A cache answer wins over the installed row, stale or not.
+        // A negative cache must not forecast a provider switch for an owned
+        // release. Health and update use the same ownership policy.
         cache("github:repo:no-compatible-release\ncmd=tool\n");
         assert_eq!(
             super::offline_method(state, &entry, &release),
-            "github:repo"
+            "github:release"
         );
         cache("github:repo:last-known\ncmd=tool\n");
         assert_eq!(
             super::offline_method(state, &entry, &release),
-            "github:repo"
+            "github:release"
         );
         cache("github:release\ncmd=tool\n");
         assert_eq!(

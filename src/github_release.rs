@@ -8,9 +8,20 @@
 //! without touching the network.
 
 use crate::github::Release;
+use crate::manifest::Manifest;
 use crate::platform::RuntimeEnv;
 use crate::process::Runner;
 use crate::release_asset::{self, Target};
+
+/// Returns whether the configured identity is already owned by a release.
+///
+/// Ownership survives a missing/broken executable; installer health decides
+/// whether to retain or repair it. A changed command is a new install intent.
+pub(crate) fn owns_command(manifest: &Manifest, name: &str, cmd: &str) -> bool {
+    manifest
+        .get(name)
+        .is_some_and(|row| row.method == crate::method::GITHUB_RELEASE && row.cmd == cmd)
+}
 
 /// Concrete release asset selected for a `github:release` dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
