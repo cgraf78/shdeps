@@ -21,6 +21,8 @@ use crate::github_release_install::{self, ArchiveState};
 use crate::link_state::{self, Kind};
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::method;
+#[cfg(unix)]
+use crate::persisted_identity::{self, Journaled};
 use crate::platform::{self, RuntimeEnv};
 use crate::runtime::Roots;
 use crate::update::Item;
@@ -76,6 +78,53 @@ struct FileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    #[serde(skip)]
+    journaled: Journaled,
+}
+
+impl FileIdentity {
+    /// Whether the real directory at `path` is still this generation.
+    /// Platforms without a stable inode API never match, so an identity
+    /// without fields cannot become ownership evidence.
+    fn matches(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && persisted_identity::matches(
+                        self.device,
+                        self.inode,
+                        path,
+                        &metadata,
+                        self.journaled,
+                    )
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
+    }
+}
+
+impl Transition {
+    /// Binds every recorded identity to the durable record it was just read
+    /// from (see `persisted_identity`), before anything validates it.
+    fn bind_to_journal(&mut self, journal: &Path) {
+        #[cfg(unix)]
+        {
+            let journaled = Journaled::at(journal);
+            if let Some(identity) = self.archive_root_identity.as_mut() {
+                identity.journaled = journaled;
+            }
+            self.cleanup_evidence.bind(journaled);
+        }
+        #[cfg(not(unix))]
+        let _ = journal;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -550,12 +599,13 @@ fn read_durable_transition(path: &Path, roots: &Roots) -> Result<DurableTransiti
         )
         .into());
     }
-    let record: DurableTransitionRecord = serde_json::from_slice(&bytes).map_err(|error| {
+    let mut record: DurableTransitionRecord = serde_json::from_slice(&bytes).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("malformed method transition record: {error}"),
         )
     })?;
+    record.transition.bind_to_journal(path);
     validate_durable_transition(path, &record, roots)?;
     Ok(record)
 }
@@ -1807,13 +1857,15 @@ pub(crate) fn revalidate_for_repo_install(
             })?;
         let explicit =
             github_release_install::explicit_archive_state(&install_base, &refreshed.old.name)?;
-        let current_identity = file_identity(locked_repo_root)?;
+        let recorded_root_matches = refreshed
+            .archive_root_identity
+            .is_some_and(|identity| identity.matches(locked_repo_root));
         let checkout_metadata_present = path_entry_exists(&locked_repo_root.join(".git"))?;
         refreshed.archive_state = if explicit == ArchiveState::Proven {
             ArchiveState::Proven
         } else if !checkout_metadata_present
             && refreshed.archive_state == ArchiveState::Proven
-            && same_file_identity(refreshed.archive_root_identity, current_identity)
+            && recorded_root_matches
         {
             github_release_install::archive_state(
                 &roots.state_dir,
@@ -1828,7 +1880,12 @@ pub(crate) fn revalidate_for_repo_install(
             // identity was observed before waiting for the checkout lock.
             ArchiveState::None
         };
-        refreshed.archive_root_identity = current_identity;
+        // A recorded identity that still names this root stays as recorded:
+        // a reboot may have renumbered its device, and a resumed handoff
+        // must present the snapshot its durable record holds.
+        if !recorded_root_matches {
+            refreshed.archive_root_identity = file_identity(locked_repo_root)?;
+        }
     }
     Ok(Some(refreshed))
 }
@@ -1848,25 +1905,12 @@ fn file_identity(path: &Path) -> Result<Option<FileIdentity>> {
             Ok(Some(FileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                journaled: Journaled::default(),
             }))
         }
         Ok(_) => Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
-    }
-}
-
-// Require a present, unchanged Unix identity rather than allowing None == None
-// to become accidental ownership evidence.
-fn same_file_identity(before: Option<FileIdentity>, current: Option<FileIdentity>) -> bool {
-    #[cfg(unix)]
-    {
-        before.is_some() && before == current
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (before, current);
-        false
     }
 }
 
@@ -2008,12 +2052,13 @@ fn read_public_transition(public: &Path) -> Result<Option<(PathBuf, PublicTransi
         .into());
     }
     let bytes = crate::state::read_private_bounded(&journal, MAX_PUBLIC_TRANSITION_RECORD_BYTES)?;
-    let record: PublicTransitionRecord = serde_json::from_slice(&bytes).map_err(|error| {
+    let mut record: PublicTransitionRecord = serde_json::from_slice(&bytes).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("malformed public command transition record: {error}"),
         )
     })?;
+    record.expected.bind(Journaled::at(&journal));
     validate_public_transition(public, &journal, &record)?;
     Ok(Some((journal, record)))
 }
@@ -2386,7 +2431,7 @@ fn begin_public_transition(
                 "raw release transition has no public command identity",
             )
         })?;
-    if cleanup::regular_file_identity(&public)?.as_ref() != Some(&expected) {
+    if !cleanup::regular_file_unchanged(&public, &expected)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "public command changed before transition publication",
@@ -2787,7 +2832,7 @@ fn publish_replacement_public_bin(
             original.display()
         )));
     };
-    if cleanup::regular_file_identity(&original)?.as_ref() != Some(expected) {
+    if !cleanup::regular_file_unchanged(&original, expected)? {
         return Ok(PublicPublication::Warning(format!(
             "public command changed during method transition; preserved replacement at {}",
             original.display()
@@ -3183,7 +3228,10 @@ mod tests {
         recover_pending_transitions, recover_public_transition, unlink_snapshot,
     };
     #[cfg(unix)]
-    use super::{PendingVerdict, classify_pending, classify_public_transition};
+    use super::{
+        PendingVerdict, classify_pending, classify_public_transition, durable_transition_path,
+        revalidate_for_repo_install,
+    };
     use crate::config::{Entry, parse_entry};
     use crate::github_release_install::{self, ArchiveState};
     use crate::link_state::{self, Kind, ReconcileLink};
@@ -3195,6 +3243,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn cleanup_snapshot_for_test(
@@ -4852,6 +4902,59 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn abandoned_repo_handoff_is_retired_after_a_renumbered_device() {
+        let fixture = abandoned_handoff("moot-flip-back-renumbered", REPO_ENTRY);
+        assert!(crate::test_support::renumber_journal_devices(&fixture.record) > 0);
+        if !crate::persisted_identity::reports_birth_time(&fixture.root) {
+            // Without birth times the exact rule still refuses the record.
+            assert!(recover_with(&fixture, RELEASE_ENTRY).is_err());
+            return;
+        }
+
+        assert_eq!(recover_with(&fixture, RELEASE_ENTRY).unwrap(), 0);
+
+        assert!(!fixture.record.exists());
+        assert_eq!(fs::read(&fixture.source).unwrap(), b"old release");
+        assert_eq!(fs::read_link(&fixture.public).unwrap(), fixture.source);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installing_repo_handoff_resumes_after_a_renumbered_device() {
+        // The retry revalidates the release root under the checkout lock and
+        // must still present the snapshot its record holds.
+        let fixture = abandoned_handoff("resume-renumbered", REPO_ENTRY);
+        assert!(crate::test_support::renumber_journal_devices(&fixture.record) > 0);
+        if !crate::persisted_identity::reports_birth_time(&fixture.root) {
+            return;
+        }
+        let entry = parse_entry(REPO_ENTRY, Some("apt"));
+        let manifest = crate::manifest::read(&fixture.manifest_path).unwrap();
+        let transition = by_name(&manifest, std::slice::from_ref(&entry), &fixture.roots)
+            .unwrap()
+            .remove("owner/tool")
+            .unwrap();
+        let refreshed =
+            revalidate_for_repo_install(Some(&transition), &fixture.roots, &fixture.root)
+                .unwrap()
+                .unwrap();
+        assert_eq!(refreshed.archive_state, ArchiveState::Proven);
+
+        let durable = begin_durable_transition(
+            &entry,
+            Some(&refreshed),
+            &fixture.roots,
+            &fixture.manifest_path,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(durable.is_retry());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn abandoned_repo_handoff_still_retries_when_target_is_configured() {
         let fixture = abandoned_handoff("moot-target-still-configured", REPO_ENTRY);
 
@@ -5177,6 +5280,144 @@ mod tests {
                 .method,
             crate::method::PKG
         );
+    }
+
+    /// Commits a cargo-to-pkg transition whose old managed root still awaits
+    /// cleanup, as a process killed right after the manifest commit leaves
+    /// it. Returns the roots, the manifest, and the old root.
+    #[cfg(unix)]
+    fn committed_cargo_to_pkg(name: &str) -> (Roots, PathBuf, PathBuf) {
+        let (_dir, roots, manifest_path, entry, transition) = pkg_transition_fixture(name, "-");
+        let mut durable = begin_durable_transition(
+            &entry,
+            Some(&transition),
+            &roots,
+            &manifest_path,
+            Some(PkgInstallerIdentity::for_target(
+                &entry.name,
+                &entry.aliases,
+                "apt",
+                false,
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        durable.mark_installing(&roots).unwrap();
+        crate::manifest::upsert(
+            durable.manifest_path(),
+            ManifestEntry::new("tool", crate::method::PKG, "tool", ""),
+        )
+        .unwrap();
+        durable.mark_installed(&entry, &roots).unwrap();
+        durable.commit(&entry, &roots, &manifest_path).unwrap();
+        let old_root = roots.install_dir.join("tool");
+        (roots, manifest_path, old_root)
+    }
+
+    /// Finishes every committed cleanup the way the next update does.
+    #[cfg(unix)]
+    fn finish_committed_cleanups(roots: &Roots, manifest_path: &Path) -> crate::Result<()> {
+        let pending = recover_pending_transitions(
+            &[],
+            &HashMap::new(),
+            manifest_path,
+            roots,
+            Some(("apt", false)),
+        )?;
+        for cleanup in pending {
+            assert_eq!(cleanup.finish(roots, None)?, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn committed_cleanup_survives_a_renumbered_device() {
+        // A reboot renumbered the filesystem between the commit and the
+        // cleanup: the recorded devices no longer match, the inodes do.
+        let (roots, manifest_path, old_root) = committed_cargo_to_pkg("renumbered-cleanup");
+        let journal = durable_transition_path(&roots, "tool");
+        assert!(crate::test_support::renumber_journal_devices(&journal) > 0);
+        if !crate::persisted_identity::reports_birth_time(&old_root) {
+            // Without birth times the exact rule still refuses the record.
+            assert!(finish_committed_cleanups(&roots, &manifest_path).is_err());
+            assert!(old_root.exists());
+            return;
+        }
+
+        finish_committed_cleanups(&roots, &manifest_path).unwrap();
+
+        assert!(!old_root.exists());
+        assert!(durable_transitions(&roots).unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn renumbered_cleanup_preserves_a_recreated_root() {
+        let (roots, manifest_path, old_root) = committed_cargo_to_pkg("renumbered-recreated");
+        let journal = durable_transition_path(&roots, "tool");
+        assert!(crate::test_support::renumber_journal_devices(&journal) > 0);
+        // The install base must pass the renumbering rule for cleanup to
+        // judge the root at all.
+        if !crate::persisted_identity::reports_birth_time(&roots.install_dir) {
+            return;
+        }
+        fs::remove_dir_all(&old_root).unwrap();
+        write_executable(&old_root.join("bin/tool"), b"recreated");
+
+        finish_committed_cleanups(&roots, &manifest_path).unwrap();
+
+        assert_eq!(fs::read(old_root.join("bin/tool")).unwrap(), b"recreated");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn renumbered_cleanup_preserves_a_copied_root() {
+        // A time-preserving copy keeps every timestamp but not the inode.
+        let (roots, manifest_path, old_root) = committed_cargo_to_pkg("renumbered-copied");
+        let journal = durable_transition_path(&roots, "tool");
+        assert!(crate::test_support::renumber_journal_devices(&journal) > 0);
+        // The install base must pass the renumbering rule for cleanup to
+        // judge the root at all.
+        if !crate::persisted_identity::reports_birth_time(&roots.install_dir) {
+            return;
+        }
+        let copy = roots.install_dir.join("tool.copy");
+        let copied = std::process::Command::new("cp")
+            .arg("-pR")
+            .arg(&old_root)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        fs::remove_dir_all(&old_root).unwrap();
+        fs::rename(&copy, &old_root).unwrap();
+
+        finish_committed_cleanups(&roots, &manifest_path).unwrap();
+
+        assert_eq!(fs::read(old_root.join("bin/tool")).unwrap(), b"old");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn renumbered_cleanup_refuses_objects_born_after_the_journal() {
+        // An object that reuses a recorded inode number on the renumbered
+        // device but was created after the journal was written is not the
+        // recorded one. Placing the journal before every object's birth
+        // models exactly that, so the install root itself is refused.
+        let (roots, manifest_path, old_root) = committed_cargo_to_pkg("renumbered-born-later");
+        let journal = durable_transition_path(&roots, "tool");
+        assert!(crate::test_support::renumber_journal_devices(&journal) > 0);
+        crate::test_support::set_journal_time(
+            &journal,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+        );
+
+        let error = finish_committed_cleanups(&roots, &manifest_path).unwrap_err();
+
+        assert!(error.to_string().contains("no longer matches"), "{error}");
+        assert!(old_root.exists());
+        assert!(journal.exists());
     }
 
     /// Builds a cargo-to-pkg transition fixture with the given raw aliases.
@@ -5789,6 +6030,65 @@ mod tests {
         assert_eq!(fs::read_link(&public).unwrap(), source);
         assert!(fs::symlink_metadata(public_transition_path(&public).unwrap()).is_err());
         assert_eq!(fs::read_dir(&roots.bin_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interrupted_publication_recovers_after_a_renumbered_device() {
+        let (roots, manifest_path, entry, transition, public, source) =
+            raw_release_transition("public-journal-renumbered");
+        let new = ManifestEntry::new(
+            &entry.name,
+            &entry.method,
+            &entry.cmd,
+            source.to_string_lossy(),
+        );
+        let old_bytes = fs::read(&public).unwrap();
+        begin_public_transition(&transition, new, &roots, &manifest_path).unwrap();
+        let journal = public_transition_path(&public).unwrap();
+        assert!(crate::test_support::renumber_journal_devices(&journal) > 0);
+        let (_, record) = read_public_transition(&public).unwrap().unwrap();
+        if !crate::persisted_identity::reports_birth_time(&record.swap) {
+            // Without birth times the exact rule still refuses the record.
+            assert!(recover_public_transition(&manifest_path, &public, &roots).is_err());
+            return;
+        }
+
+        recover_public_transition(&manifest_path, &public, &roots).unwrap();
+
+        assert_eq!(fs::read(&public).unwrap(), old_bytes);
+        assert!(fs::symlink_metadata(&journal).is_err());
+        assert_eq!(fs::read_dir(&roots.bin_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn renumbered_publication_refuses_a_copied_old_command() {
+        let (roots, manifest_path, entry, transition, public, source) =
+            raw_release_transition("public-journal-renumbered-copy");
+        let new = ManifestEntry::new(
+            &entry.name,
+            &entry.method,
+            &entry.cmd,
+            source.to_string_lossy(),
+        );
+        begin_public_transition(&transition, new, &roots, &manifest_path).unwrap();
+        let journal = public_transition_path(&public).unwrap();
+        assert!(crate::test_support::renumber_journal_devices(&journal) > 0);
+        let (_, record) = read_public_transition(&public).unwrap().unwrap();
+        // Replace the parked old generation with a time-preserving copy.
+        let copy = roots.bin_dir.join("copy");
+        let copied = std::process::Command::new("cp")
+            .arg("-p")
+            .arg(&record.swap)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        fs::rename(&copy, &record.swap).unwrap();
+
+        assert!(recover_public_transition(&manifest_path, &public, &roots).is_err());
+        assert!(journal.exists());
     }
 
     #[test]

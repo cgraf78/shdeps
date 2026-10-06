@@ -1055,6 +1055,14 @@ If a configured dependency's method differs from its manifest method:
   lives in `$SHDEPS_STATE_DIR/.method-transitions-v1/<sha256(name)>.json`
   next to a prepared manifest holding the staged ownership evidence at
   `<sha256(name)>.manifest` in the same directory.
+- Filesystem identities recorded in any recovery journal (this one, the
+  public-command and repository-root transition records, and the prune hook
+  records) MUST still match after a reboot that renumbers the device
+  (`st_dev`) under an unchanged object: a recorded object matches when its
+  inode matches and either its device matches or its birth time is known
+  and no later than the journal's modification time. Without a birth time
+  (Android, filesystems that store none) the device MUST match exactly.
+  Journal formats stay unchanged so older releases can still read them.
 - Stageable methods (repo clones, release downloads) MUST stage the new
   artifact in a private location and verify it is present and runnable
   before the manifest swap.

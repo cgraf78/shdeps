@@ -9,10 +9,6 @@
 
 use std::fs;
 #[cfg(unix)]
-use std::hash::{Hash, Hasher};
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -24,6 +20,10 @@ use crate::github_release_install::{self, ArchiveState};
 use crate::link_state::{self, Kind};
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::method;
+#[cfg(unix)]
+use crate::persisted_identity::{self, Journaled};
+#[cfg(unix)]
+use crate::tree_fingerprint::{self, Renumbering};
 
 #[cfg(unix)]
 static UNLINK_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +35,9 @@ struct DirectoryIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    #[serde(skip)]
+    journaled: Journaled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,6 +49,9 @@ struct LogicalBaseIdentity {
     inode: u64,
     #[cfg(unix)]
     kind: LogicalBaseKind,
+    #[cfg(unix)]
+    #[serde(skip)]
+    journaled: Journaled,
 }
 
 #[cfg(unix)]
@@ -77,6 +83,9 @@ struct ManagedRootIdentity {
     mode: u32,
     #[cfg(unix)]
     tree_fingerprint: Option<u64>,
+    #[cfg(unix)]
+    #[serde(skip)]
+    journaled: Journaled,
 }
 
 #[cfg(unix)]
@@ -124,6 +133,35 @@ pub(crate) struct Evidence {
 }
 
 impl Evidence {
+    /// Binds every recorded identity to the journal this evidence was just
+    /// read from, so a reboot that renumbered the filesystem does not refuse
+    /// it (see `persisted_identity`). Call it before any validation; evidence
+    /// this process captured itself stays unbound and keeps the exact rule.
+    pub(crate) fn bind_to_journal(&mut self, journal: &Path) {
+        #[cfg(unix)]
+        self.bind(Journaled::at(journal));
+        #[cfg(not(unix))]
+        let _ = journal;
+    }
+
+    /// [`Evidence::bind_to_journal`] with an already observed bound, for a
+    /// journal that also records identities of its own.
+    #[cfg(unix)]
+    pub(crate) fn bind(&mut self, journaled: Journaled) {
+        if let Some(identity) = self.public_regular_identity.as_mut() {
+            identity.bind(journaled);
+        }
+        if let Some(identity) = self.logical_install_base_identity.as_mut() {
+            identity.journaled = journaled;
+        }
+        if let Some(identity) = self.physical_install_base_identity.as_mut() {
+            identity.journaled = journaled;
+        }
+        if let Some(identity) = self.managed_install_root_identity.as_mut() {
+            identity.journaled = journaled;
+        }
+    }
+
     /// Validates persisted cleanup authority against the configured state roots.
     ///
     /// A transition journal is durable authorization to remove an old provider
@@ -909,6 +947,9 @@ pub(crate) struct FileIdentity {
     changed_nanoseconds: i64,
     #[cfg(unix)]
     mode: u32,
+    #[cfg(unix)]
+    #[serde(skip)]
+    journaled: Journaled,
     #[cfg(not(unix))]
     length: u64,
     #[cfg(not(unix))]
@@ -950,11 +991,13 @@ fn logical_base_identity(path: &Path) -> Result<Option<LogicalBaseIdentity>> {
             device: metadata.dev(),
             inode: metadata.ino(),
             kind: LogicalBaseKind::Directory,
+            journaled: Journaled::default(),
         })),
         Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(LogicalBaseIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
             kind: LogicalBaseKind::Symlink(fs::read_link(path)?),
+            journaled: Journaled::default(),
         })),
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -981,6 +1024,7 @@ fn directory_identity(path: &Path) -> Result<Option<DirectoryIdentity>> {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(DirectoryIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
+            journaled: Journaled::default(),
         })),
         Ok(_) => Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1006,7 +1050,11 @@ fn managed_root_identity(path: &Path) -> Result<Option<ManagedRootIdentity>> {
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
             mode: metadata.mode(),
-            tree_fingerprint: Some(tree_fingerprint(path)?),
+            tree_fingerprint: Some(tree_fingerprint::of(
+                path,
+                Renumbering::none(metadata.dev()),
+            )?),
+            journaled: Journaled::default(),
         })),
         Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(ManagedRootIdentity {
             device: metadata.dev(),
@@ -1018,6 +1066,7 @@ fn managed_root_identity(path: &Path) -> Result<Option<ManagedRootIdentity>> {
             changed_nanoseconds: metadata.ctime_nsec(),
             mode: metadata.mode(),
             tree_fingerprint: None,
+            journaled: Journaled::default(),
         })),
         Ok(_) => Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1030,8 +1079,13 @@ impl DirectoryIdentity {
     fn matches(&self, path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|metadata| {
             metadata.file_type().is_dir()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
+                && persisted_identity::matches(
+                    self.device,
+                    self.inode,
+                    path,
+                    &metadata,
+                    self.journaled,
+                )
         })
     }
 }
@@ -1040,7 +1094,13 @@ impl DirectoryIdentity {
 impl LogicalBaseIdentity {
     fn matches(&self, path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|metadata| {
-            if metadata.dev() != self.device || metadata.ino() != self.inode {
+            if !persisted_identity::matches(
+                self.device,
+                self.inode,
+                path,
+                &metadata,
+                self.journaled,
+            ) {
                 return false;
             }
             match &self.kind {
@@ -1058,18 +1118,30 @@ impl LogicalBaseIdentity {
 impl ManagedRootIdentity {
     fn matches_before_removal(&self, path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|metadata| {
-            if metadata.dev() != self.device || metadata.ino() != self.inode {
+            if !persisted_identity::matches(
+                self.device,
+                self.inode,
+                path,
+                &metadata,
+                self.journaled,
+            ) {
                 return false;
             }
             match &self.kind {
                 ManagedRootKind::Directory => {
+                    // The root is proven to be the recorded object, so a
+                    // device that moved under it moved for its entries too.
+                    let devices = Renumbering {
+                        live: metadata.dev(),
+                        recorded: self.device,
+                    };
                     metadata.file_type().is_dir()
                         && metadata.mtime() == self.modified_seconds
                         && metadata.mtime_nsec() == self.modified_nanoseconds
                         && metadata.ctime() == self.changed_seconds
                         && metadata.ctime_nsec() == self.changed_nanoseconds
                         && metadata.mode() == self.mode
-                        && tree_fingerprint(path).ok() == self.tree_fingerprint
+                        && tree_fingerprint::of(path, devices).ok() == self.tree_fingerprint
                 }
                 ManagedRootKind::Symlink(target) => {
                     metadata.file_type().is_symlink()
@@ -1078,43 +1150,6 @@ impl ManagedRootIdentity {
             }
         })
     }
-}
-
-#[cfg(unix)]
-fn tree_fingerprint(root: &Path) -> Result<u64> {
-    fn visit(root: &Path, dir: &Path, hasher: &mut impl Hasher) -> Result<()> {
-        let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let relative = path.strip_prefix(root).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "managed-root entry escaped its captured root",
-                )
-            })?;
-            relative.as_os_str().as_bytes().hash(hasher);
-            let metadata = fs::symlink_metadata(&path)?;
-            metadata.dev().hash(hasher);
-            metadata.ino().hash(hasher);
-            metadata.mode().hash(hasher);
-            metadata.size().hash(hasher);
-            metadata.mtime().hash(hasher);
-            metadata.mtime_nsec().hash(hasher);
-            metadata.ctime().hash(hasher);
-            metadata.ctime_nsec().hash(hasher);
-            if metadata.file_type().is_symlink() {
-                fs::read_link(&path)?.as_os_str().as_bytes().hash(hasher);
-            } else if metadata.file_type().is_dir() {
-                visit(root, &path, hasher)?;
-            }
-        }
-        Ok(())
-    }
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    visit(root, root, &mut hasher)?;
-    Ok(hasher.finish())
 }
 
 pub(crate) fn regular_file_identity(path: &Path) -> Result<Option<FileIdentity>> {
@@ -1130,6 +1165,7 @@ pub(crate) fn regular_file_identity(path: &Path) -> Result<Option<FileIdentity>>
                 changed_seconds: metadata.ctime(),
                 changed_nanoseconds: metadata.ctime_nsec(),
                 mode: metadata.mode(),
+                journaled: Journaled::default(),
             };
             #[cfg(not(unix))]
             let identity = FileIdentity {
@@ -1157,12 +1193,25 @@ pub(crate) fn remove_owned_regular_file(path: &Path, identity: &FileIdentity) ->
 
     #[cfg(not(unix))]
     {
-        if regular_file_identity(path)?.as_ref() == Some(identity) {
+        if regular_file_unchanged(path, identity)? {
             fs::remove_file(path)?;
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+}
+
+/// Returns whether the regular file at `path` is still the exact generation
+/// `identity` recorded, change time included.
+pub(crate) fn regular_file_unchanged(path: &Path, identity: &FileIdentity) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        #[cfg(unix)]
+        Ok(metadata) => Ok(identity.matches(path, &metadata, true)),
+        #[cfg(not(unix))]
+        Ok(_) => Ok(regular_file_identity(path)?.as_ref() == Some(identity)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1172,7 +1221,7 @@ pub(crate) fn regular_file_matches_after_rename(
 ) -> Result<bool> {
     match fs::symlink_metadata(path) {
         #[cfg(unix)]
-        Ok(metadata) => Ok(identity.matches_after_rename(&metadata)),
+        Ok(metadata) => Ok(identity.matches(path, &metadata, false)),
         #[cfg(not(unix))]
         Ok(_) => Ok(regular_file_identity(path)?.as_ref() == Some(identity)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1188,7 +1237,7 @@ fn quarantine_regular_file_with(
     rename_noreplace: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<bool> {
     let owned = if require_unchanged_ctime {
-        regular_file_identity(path)?.as_ref() == Some(identity)
+        regular_file_unchanged(path, identity)?
     } else {
         regular_file_matches_after_rename(path, identity)?
     };
@@ -1204,14 +1253,25 @@ fn quarantine_regular_file_with(
 
 #[cfg(unix)]
 impl FileIdentity {
-    fn matches_after_rename(&self, metadata: &fs::Metadata) -> bool {
+    /// Binds this recorded identity to the journal it was read from (see
+    /// [`Evidence::bind_to_journal`]).
+    pub(crate) fn bind(&mut self, journaled: Journaled) {
+        self.journaled = journaled;
+    }
+
+    /// Whether `metadata`, the `lstat` of `path`, is this generation. A
+    /// rename moves the change time, so only a file that was never renamed
+    /// since its capture can also be held to it.
+    fn matches(&self, path: &Path, metadata: &fs::Metadata, require_unchanged_ctime: bool) -> bool {
         metadata.file_type().is_file()
-            && self.device == metadata.dev()
-            && self.inode == metadata.ino()
+            && persisted_identity::matches(self.device, self.inode, path, metadata, self.journaled)
             && self.length == metadata.size()
             && self.modified_seconds == metadata.mtime()
             && self.modified_nanoseconds == metadata.mtime_nsec()
             && self.mode == metadata.mode()
+            && (!require_unchanged_ctime
+                || self.changed_seconds == metadata.ctime()
+                    && self.changed_nanoseconds == metadata.ctime_nsec())
     }
 }
 

@@ -25,6 +25,7 @@ use crate::Result;
 use crate::config;
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::method;
+use crate::persisted_identity::{self, Journaled};
 
 const FORMAT: &str = "shdeps repository transition v1";
 const RECORD: &str = "record";
@@ -43,6 +44,8 @@ struct Identity {
     device: u64,
     inode: u64,
     target: Option<PathBuf>,
+    #[serde(skip)]
+    journaled: Journaled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,13 +57,17 @@ enum IdentityKind {
 
 impl Identity {
     fn read(path: &Path) -> Result<Self> {
-        let metadata = fs::symlink_metadata(path)?;
+        Self::from_metadata(path, &fs::symlink_metadata(path)?)
+    }
+
+    fn from_metadata(path: &Path, metadata: &fs::Metadata) -> Result<Self> {
         if metadata.file_type().is_dir() {
             return Ok(Self {
                 kind: IdentityKind::Directory,
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 target: None,
+                journaled: Journaled::default(),
             });
         }
         if metadata.file_type().is_symlink() {
@@ -69,6 +76,7 @@ impl Identity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 target: Some(fs::read_link(path)?),
+                journaled: Journaled::default(),
             });
         }
         Err(invalid_transition(format!(
@@ -91,7 +99,20 @@ impl Identity {
     }
 
     fn matches(&self, path: &Path) -> bool {
-        Self::read(path).is_ok_and(|actual| actual == *self)
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        Self::from_metadata(path, &metadata).is_ok_and(|actual| {
+            actual.kind == self.kind
+                && actual.target == self.target
+                && persisted_identity::matches(
+                    self.device,
+                    self.inode,
+                    path,
+                    &metadata,
+                    self.journaled,
+                )
+        })
     }
 }
 
@@ -1124,9 +1145,18 @@ fn read_record(path: &Path, checkout: &Path) -> Result<Record> {
             "repository transition record contains a NUL byte",
         ));
     }
-    let record: Record = serde_json::from_slice(&bytes).map_err(|error| {
+    let mut record: Record = serde_json::from_slice(&bytes).map_err(|error| {
         invalid_transition(format!("malformed repository transition record: {error}"))
     })?;
+    // The record is written once, after both identities were read, so its
+    // modification time bounds them (see `persisted_identity`).
+    let journaled = Journaled::at(path);
+    if let Some(previous) = record.previous.as_mut() {
+        previous.journaled = journaled;
+    }
+    if let Desired::Directory { identity, .. } = &mut record.desired {
+        identity.journaled = journaled;
+    }
     record.validate(checkout)?;
     Ok(record)
 }
@@ -1747,6 +1777,87 @@ mod tests {
 
         assert_eq!(fs::read_to_string(checkout.join("old")).unwrap(), "managed");
         assert!(!journal.exists());
+    }
+
+    /// Starts a directory-to-link publication and dies after parking the old
+    /// checkout, as an uncatchable process death leaves it. Returns the
+    /// checkout and its journal.
+    fn parked_directory_to_link(name: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        let checkout = dir.join("share/owner/tool");
+        let development = dir.join("git/tool");
+        write_file(&checkout.join("old"), "managed");
+        write_file(&development.join("bin/tool"), "development");
+        let previous = Identity::read(&checkout).unwrap();
+        let journal = begin(
+            &checkout,
+            Some(previous),
+            Desired::Symlink(development),
+            None,
+        )
+        .unwrap();
+        fs::rename(&checkout, journal.join("previous")).unwrap();
+        (checkout, journal)
+    }
+
+    #[test]
+    fn interrupted_publication_rolls_back_after_a_renumbered_device() {
+        // A reboot renumbered the filesystem before recovery ran: the
+        // recorded device no longer matches, the inode does.
+        let (checkout, journal) = parked_directory_to_link("renumbered-rollback");
+        assert_eq!(
+            crate::test_support::renumber_journal_devices(&journal.join("record")),
+            1
+        );
+        if !crate::persisted_identity::reports_birth_time(&journal.join("previous")) {
+            // Without birth times the exact rule still refuses the record.
+            assert!(recover_checked(&checkout).is_err());
+            return;
+        }
+
+        recover_checked(&checkout).unwrap();
+
+        assert_eq!(fs::read_to_string(checkout.join("old")).unwrap(), "managed");
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn renumbered_publication_refuses_a_copied_backup() {
+        let (checkout, journal) = parked_directory_to_link("renumbered-copied-backup");
+        assert_eq!(
+            crate::test_support::renumber_journal_devices(&journal.join("record")),
+            1
+        );
+        let previous = journal.join("previous");
+        let copy = journal.join("copy");
+        let copied = std::process::Command::new("cp")
+            .arg("-pR")
+            .arg(&previous)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        fs::remove_dir_all(&previous).unwrap();
+        fs::rename(&copy, &previous).unwrap();
+
+        assert!(recover_checked(&checkout).is_err());
+        assert!(!checkout.exists());
+        assert_eq!(fs::read_to_string(previous.join("old")).unwrap(), "managed");
+    }
+
+    #[test]
+    fn renumbered_publication_refuses_a_backup_born_after_the_record() {
+        let (checkout, journal) = parked_directory_to_link("renumbered-born-later");
+        let record = journal.join("record");
+        assert_eq!(crate::test_support::renumber_journal_devices(&record), 1);
+        crate::test_support::set_journal_time(
+            &record,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+        );
+
+        assert!(recover_checked(&checkout).is_err());
+        assert!(!checkout.exists());
+        assert!(journal.join("previous/old").exists());
     }
 
     #[test]

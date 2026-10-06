@@ -43,6 +43,8 @@ pub mod manifest;
 mod method;
 pub mod package_cache;
 mod package_proof;
+#[cfg(unix)]
+mod persisted_identity;
 pub mod pkg;
 mod pkg_unavailable;
 pub mod platform;
@@ -68,6 +70,8 @@ pub mod status;
 #[cfg(test)]
 mod test_support;
 pub mod tool_version;
+#[cfg(unix)]
+mod tree_fingerprint;
 pub mod update;
 mod update_external;
 mod update_pkg;
