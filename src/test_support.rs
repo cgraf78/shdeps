@@ -38,6 +38,76 @@ pub(crate) fn short_temp_dir() -> PathBuf {
     create_temp_dir(&std::env::temp_dir(), "s")
 }
 
+/// Rewrites the JSON journal at `path` as if it had been recorded while the
+/// filesystem was numbered one higher, which is how a journal written before
+/// a renumbering reboot reads afterwards: every recorded `device` names
+/// another number while every inode stays. A recorded managed-root tree
+/// fingerprint is recomputed for that numbering too, since it hashes each
+/// entry's device. Returns how many devices moved, so a test cannot silently
+/// renumber nothing.
+///
+/// The rewrite keeps the file's inode, mode, and single link, which journal
+/// readers require. Its mtime becomes now, which, like the original write,
+/// still follows the birth of every object the journal recorded.
+#[cfg(unix)]
+pub(crate) fn renumber_journal_devices(path: &std::path::Path) -> usize {
+    use serde_json::Value;
+
+    fn renumber(value: &mut Value) -> usize {
+        match value {
+            Value::Object(fields) => {
+                let renumbered = fields
+                    .iter_mut()
+                    .map(|(key, field)| match field.as_u64() {
+                        Some(device) if key == "device" => {
+                            *field = Value::from(device + 1);
+                            1
+                        }
+                        _ => renumber(field),
+                    })
+                    .sum();
+                // `cleanup::Evidence` names its managed root beside the
+                // root's identity.
+                let root = fields
+                    .get("managed_install_root")
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from);
+                let identity = fields.get_mut("managed_install_root_identity");
+                if let (Some(root), Some(Value::Object(identity))) = (root, identity) {
+                    if identity.get("tree_fingerprint").is_some_and(Value::is_u64) {
+                        let recorded = identity["device"].as_u64().unwrap();
+                        let devices = crate::tree_fingerprint::Renumbering {
+                            live: recorded - 1,
+                            recorded,
+                        };
+                        let fingerprint = crate::tree_fingerprint::of(&root, devices).unwrap();
+                        identity.insert("tree_fingerprint".to_owned(), Value::from(fingerprint));
+                    }
+                }
+                renumbered
+            }
+            Value::Array(items) => items.iter_mut().map(renumber).sum(),
+            _ => 0,
+        }
+    }
+
+    let mut journal: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let renumbered = renumber(&mut journal);
+    let mut encoded = serde_json::to_vec_pretty(&journal).unwrap();
+    encoded.push(b'\n');
+    fs::write(path, encoded).unwrap();
+    renumbered
+}
+
+/// Sets the modification time of the journal at `path`, to place it before
+/// or after the birth of an object it records.
+#[cfg(unix)]
+pub(crate) fn set_journal_time(path: &std::path::Path, time: std::time::SystemTime) {
+    fs::File::open(path)
+        .and_then(|file| file.set_modified(time))
+        .unwrap();
+}
+
 /// Writes an executable fixture at `path` that a subprocess will exec.
 ///
 /// Linux refuses to exec a file while any process holds it open for writing

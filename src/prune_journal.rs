@@ -119,13 +119,14 @@ pub(crate) fn retain(roots: &cleanup::Roots, manifest: &Manifest) -> Result<()> 
 
 fn read(path: &Path) -> Result<Record> {
     let bytes = crate::state::read_private_bounded(path, MAX_RECORD_BYTES)?;
-    serde_json::from_slice(&bytes).map_err(|error| {
+    let mut record: Record = serde_json::from_slice(&bytes).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("malformed prune record {}: {error}", path.display()),
         )
-        .into()
-    })
+    })?;
+    record.evidence.bind_to_journal(path);
+    Ok(record)
 }
 
 fn dir(roots: &cleanup::Roots) -> PathBuf {

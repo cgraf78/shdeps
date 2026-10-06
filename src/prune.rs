@@ -1790,6 +1790,78 @@ mod tests {
         assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
     }
 
+    /// Records an external orphan whose uninstall hook already completed, as
+    /// a prune killed after the hook leaves it, and renumbers the record's
+    /// devices as a reboot before the next prune does. Returns the manifest,
+    /// the orphan's managed root, and the record.
+    #[cfg(unix)]
+    fn renumbered_external_orphan(fixture: &Fixture) -> (PathBuf, PathBuf, PathBuf) {
+        let root = fixture.roots.install_dir.join("tool");
+        fixture.write(&root.join("old"), "old\n");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let entry = ManifestEntry::new(
+            "tool",
+            "cargo",
+            "tool",
+            root.join("bin/tool").display().to_string(),
+        );
+        manifest::upsert(&manifest_path, entry.clone()).unwrap();
+        let cleanup_roots = super::cleanup_roots(&fixture.roots);
+        let evidence = super::capture_cleanup_evidence(&entry, &cleanup_roots).unwrap();
+        crate::prune_journal::save(
+            &cleanup_roots,
+            &crate::prune_journal::Record {
+                entry,
+                evidence,
+                hook_completed: true,
+            },
+        )
+        .unwrap();
+        let record = fs::read_dir(fixture.roots.state_dir.join(".prune-hooks-v1"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(crate::test_support::renumber_journal_devices(&record) > 0);
+        (manifest_path, root, record)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_resumes_recorded_evidence_after_a_renumbered_device() {
+        let fixture = Fixture::new("prune-renumbered-device");
+        let (manifest_path, root, _record) = renumbered_external_orphan(&fixture);
+        if !crate::persisted_identity::reports_birth_time(&root) {
+            // Without birth times the exact rule still preserves the payload.
+            prune_all(&fixture, &manifest_path).unwrap();
+            assert!(root.exists());
+            return;
+        }
+
+        let summary = prune_all(&fixture, &manifest_path).unwrap();
+
+        assert!(!summary.has_errors(), "{summary:?}");
+        assert!(!root.exists());
+        assert!(manifest::read(&manifest_path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn renumbered_prune_preserves_a_root_recreated_since_the_record() {
+        let fixture = Fixture::new("prune-renumbered-recreated");
+        let (manifest_path, root, _record) = renumbered_external_orphan(&fixture);
+        fs::remove_dir_all(&root).unwrap();
+        fixture.write(&root.join("replacement"), "replacement\n");
+
+        prune_all(&fixture, &manifest_path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("replacement")).unwrap(),
+            "replacement\n"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn prune_preserves_external_root_modified_in_place_by_uninstall_hook() {

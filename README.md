@@ -292,7 +292,8 @@ Repository-root publication and replacement uses a private same-parent recovery
 journal while the shared checkout lock is held whenever an owned managed
 directory and a development symlink change places. The same recovery also
 covers replacement of an owned managed checkout. A later Shdeps run rolls an
-interrupted move back or finishes it from the exact recorded inode; if the
+interrupted move back or finishes it from the exact recorded inode (a reboot
+that renumbers the filesystem's device does not invalidate the record); if the
 generated checkout installer filled the temporarily vacant path with a new
 managed checkout, that new generation wins and Shdeps retires only its own
 backup. Publishing into an absent/unowned root and restoring a parked backup
