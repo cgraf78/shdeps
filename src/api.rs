@@ -34,13 +34,15 @@ use crate::update::Options;
 use crate::update_release::{self, ReleaseRequest};
 
 const RELEASE_ARCHIVE_LAUNCHER_CAPABILITY: &str = "release-archive-launcher-preservation-v1";
+const RELEASE_ARCHIVE_SYMLINK_LAUNCHER_CAPABILITY: &str =
+    "release-archive-symlink-launcher-preservation-v1";
 const OWNED_SUBPROCESS_CANCELLATION_CAPABILITY: &str = "owned-subprocess-cancellation-v1";
 const PROMPT_FIFO_READER_BEFORE_EVENT_CAPABILITY: &str = "prompt-fifo-reader-before-event-v1";
 const WRAPPER_ABI: u32 = 1;
 
 fn capability_available(capability: &str, unix: bool, owned_subprocesses: bool) -> bool {
     match capability {
-        RELEASE_ARCHIVE_LAUNCHER_CAPABILITY => true,
+        RELEASE_ARCHIVE_LAUNCHER_CAPABILITY | RELEASE_ARCHIVE_SYMLINK_LAUNCHER_CAPABILITY => true,
         PROMPT_FIFO_READER_BEFORE_EVENT_CAPABILITY => unix,
         OWNED_SUBPROCESS_CANCELLATION_CAPABILITY => owned_subprocesses,
         _ => false,

@@ -10198,6 +10198,53 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
+    fn update_github_release_standalone_download_failure_behind_symlink_launcher_is_pending() {
+        // Behind a client's symlink launcher the installer's payload, not the
+        // launcher, proves the installed release is current, so a download
+        // failure during adoption stays a pending repair like it does behind
+        // a regular launcher.
+        let mut fixture = Fixture::new("release-standalone-download-symlink-launcher");
+        fixture.write_lib();
+        let (_control, _old_release, public) = write_standalone_dot(&fixture);
+        fs::remove_file(&public).unwrap();
+        write_executable(&fixture.roots.home.join("overlay/bin/dot"));
+        std::os::unix::fs::symlink("../overlay/bin/dot", &public).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        record_dot_release(&fixture, &manifest_path);
+        let asset = format!("dot-{STANDALONE_NEW}-linux-x86_64-musl.tar.gz");
+        let url =
+            format!("https://github.com/cgraf78/dot/releases/download/{STANDALONE_NEW}/{asset}");
+        fixture.client = FakeClient::default().with(
+            "https://api.github.com/repos/cgraf78/dot/releases?per_page=100",
+            release_asset_response(&asset, STANDALONE_NEW, &url),
+        );
+        let payload = fixture.roots.install_dir.join("cgraf78/dot/dot");
+
+        let summary = run_dot_update(
+            &fixture,
+            &manifest_path,
+            &standalone_dot_runner_reporting(STANDALONE_NEW).with_success(
+                payload.to_str().unwrap(),
+                ["--version"],
+                &format!("dot {STANDALONE_NEW}\n"),
+            ),
+        );
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert!(
+            summary.items[0]
+                .detail
+                .contains("standalone adoption pending"),
+            "{summary:#?}"
+        );
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            Path::new("../overlay/bin/dot")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_github_release_standalone_download_failure_with_a_parked_root_fails() {
         // An interrupted fallback switch left only the parked link, so a
         // regular launcher in front of the root no longer runs even though it
@@ -10524,6 +10571,230 @@ version() { printf 'saw-pkg\n'; }
                 .join("cgraf78/dot/.shdeps-release-layout")
                 .is_file()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_standalone_adopts_behind_symlink_launcher() {
+        // A host bootstrapped by the standalone installer may already have
+        // dot's overlay launcher linked in front of the command. Adoption must
+        // proceed (it used to refuse forever) and keep the launcher.
+        let mut fixture = Fixture::new("release-standalone-symlink-launcher");
+        fixture.write_lib();
+        let (_control, _old_release, public) = write_standalone_dot(&fixture);
+        fs::remove_file(&public).unwrap();
+        let launcher = fixture.roots.home.join("overlay/bin/dot");
+        write_executable(&launcher);
+        std::os::unix::fs::symlink("../overlay/bin/dot", &public).unwrap();
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        record_dot_release(&fixture, &manifest_path);
+        fixture.client =
+            standalone_dot_client(STANDALONE_NEW, standalone_dot_archive(STANDALONE_NEW));
+
+        let summary = run_dot_update(&fixture, &manifest_path, &standalone_dot_runner());
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            Path::new("../overlay/bin/dot")
+        );
+        assert!(
+            fixture
+                .roots
+                .install_dir
+                .join("cgraf78/dot/.shdeps-release-layout")
+                .is_file()
+        );
+    }
+
+    /// Links `bin/<cmd>` to a tracked overlay launcher the way dot does: a
+    /// relative symlink to a regular script that delegates to the archive
+    /// payload at its fixed path. Returns the public path and literal target.
+    #[cfg(unix)]
+    fn overlay_launcher(fixture: &Fixture, cmd: &str) -> (PathBuf, PathBuf) {
+        let launcher = fixture.roots.home.join("overlay/bin").join(cmd);
+        write_executable(&launcher);
+        let public = fixture.roots.bin_dir.join(cmd);
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        let target = PathBuf::from("../overlay/bin").join(cmd);
+        std::os::unix::fs::symlink(&target, &public).unwrap();
+        (public, target)
+    }
+
+    /// One `owner/tool` archive release whose payload is `bin/tool`.
+    fn archive_release_client(tag: &str, payload: &[u8]) -> FakeClient {
+        let asset = format!("tool-{tag}-linux-x86_64.tar.gz");
+        let url = format!("https://github.com/owner/tool/releases/download/{tag}/{asset}");
+        FakeClient::default()
+            .with(
+                "https://api.github.com/repos/owner/tool/releases?per_page=100",
+                release_asset_response(&asset, tag, &url),
+            )
+            .with(
+                &url,
+                tar_gz(&[(&format!("tool-{tag}/bin/tool"), payload, 0o755)]),
+            )
+    }
+
+    /// Runs one `owner/tool` archive update against the recorded manifest.
+    fn run_tool_release(fixture: &Fixture, runner: &FakeRunner, options: Options) -> Summary {
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        run(
+            &[parse_entry("owner/tool|github:release|tool|-|-", None)],
+            &manifest::read(&manifest_path).unwrap(),
+            &fixture.context(&manifest_path, runner, "apt"),
+            options,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_first_install_preserves_overlay_symlink_launcher() {
+        // dot may link the overlay launcher before Shdeps ever installs the
+        // dependency, so no manifest row or root exists yet.
+        let mut fixture = Fixture::new("release-overlay-launcher-first");
+        fixture.write_lib();
+        let (public, target) = overlay_launcher(&fixture, "tool");
+        fixture.client = archive_release_client("v1.0.0", b"#!/bin/sh\necho v1\n");
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+
+        let summary = run_tool_release(&fixture, &runner, Options::default());
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert!(summary.items[0].changed);
+        assert_eq!(fs::read_link(&public).unwrap(), target);
+        let install_dir = fixture.roots.install_dir.join("owner/tool");
+        assert_eq!(
+            fs::read(install_dir.join("bin/tool")).unwrap(),
+            b"#!/bin/sh\necho v1\n"
+        );
+        assert!(
+            link_state::read(&link_state::path(
+                &fixture.roots.state_dir,
+                "owner/tool",
+                Kind::Bin
+            ))
+            .unwrap()
+            .is_empty(),
+            "the launcher is never recorded as a Shdeps link"
+        );
+        assert_eq!(
+            manifest::read(&manifest::path(&fixture.roots.state_dir))
+                .unwrap()
+                .get("owner/tool"),
+            Some(&ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_keeps_current_payload_behind_symlink_launcher() {
+        // The launcher is not evidence of the installed release: the payload
+        // in the marked root is. A current payload must not be reinstalled
+        // even though the launcher reports another version, or every
+        // freshness check would download the release again.
+        let mut fixture = Fixture::new("release-overlay-launcher-current");
+        fixture.write_lib();
+        let (public, target) = overlay_launcher(&fixture, "tool");
+        fixture.client = archive_release_client("v1.0.0", b"#!/bin/sh\necho v1\n");
+        let payload = fixture.roots.install_dir.join("owner/tool/bin/tool");
+        let runner = FakeRunner::default()
+            .with_success("uname", ["-m"], "x86_64\n")
+            .with_success(payload.to_str().unwrap(), ["--version"], "tool 1.0.0\n")
+            .with_success(public.to_str().unwrap(), ["--version"], "tool 0.9.0\n");
+        assert!(!run_tool_release(&fixture, &runner, Options::default()).has_errors());
+
+        let summary = run_tool_release(
+            &fixture,
+            &runner,
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        );
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert!(!summary.items[0].changed, "{summary:#?}");
+        assert_eq!(fs::read_link(&public).unwrap(), target);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_upgrades_and_reinstalls_behind_symlink_launcher() {
+        let mut fixture = Fixture::new("release-overlay-launcher-upgrade");
+        fixture.write_lib();
+        let (public, target) = overlay_launcher(&fixture, "tool");
+        let payload = fixture.roots.install_dir.join("owner/tool/bin/tool");
+        let runner = FakeRunner::default()
+            .with_success("uname", ["-m"], "x86_64\n")
+            .with_success(payload.to_str().unwrap(), ["--version"], "tool 1.0.0\n");
+        fixture.client = archive_release_client("v1.0.0", b"v1");
+        assert!(!run_tool_release(&fixture, &runner, Options::default()).has_errors());
+
+        fixture.client = archive_release_client("v2.0.0", b"v2");
+        let upgrade = run_tool_release(
+            &fixture,
+            &runner,
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        );
+        assert!(!upgrade.has_errors(), "{upgrade:#?}");
+        assert!(upgrade.items[0].changed);
+        assert_eq!(fs::read(&payload).unwrap(), b"v2");
+        assert_eq!(fs::read_link(&public).unwrap(), target);
+
+        fixture.client = archive_release_client("v2.0.0", b"v2-rebuilt");
+        let reinstall = run_tool_release(
+            &fixture,
+            &runner,
+            Options {
+                reinstall: true,
+                ..Options::default()
+            },
+        );
+        assert!(!reinstall.has_errors(), "{reinstall:#?}");
+        assert!(reinstall.items[0].changed);
+        assert_eq!(fs::read(&payload).unwrap(), b"v2-rebuilt");
+        assert_eq!(fs::read_link(&public).unwrap(), target);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_reinstalls_missing_payload_behind_symlink_launcher() {
+        // With the payload gone the launcher cannot work, whatever it reports,
+        // so the update must restore the payload and still keep the launcher.
+        let mut fixture = Fixture::new("release-overlay-launcher-missing-payload");
+        fixture.write_lib();
+        let (public, target) = overlay_launcher(&fixture, "tool");
+        let payload = fixture.roots.install_dir.join("owner/tool/bin/tool");
+        let runner = FakeRunner::default()
+            .with_success("uname", ["-m"], "x86_64\n")
+            .with_success(public.to_str().unwrap(), ["--version"], "tool 1.0.0\n");
+        fixture.client = archive_release_client("v1.0.0", b"v1");
+        assert!(!run_tool_release(&fixture, &runner, Options::default()).has_errors());
+        fs::remove_file(&payload).unwrap();
+
+        let summary = run_tool_release(
+            &fixture,
+            &runner,
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        );
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert!(summary.items[0].changed);
+        assert_eq!(fs::read(&payload).unwrap(), b"v1");
+        assert_eq!(fs::read_link(&public).unwrap(), target);
     }
 
     #[test]

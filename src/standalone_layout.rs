@@ -43,9 +43,7 @@
 //! migration. Once the public command points into the adopted root, nothing
 //! Shdeps publishes refers to the directory and it is safe to delete.
 
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Exact marker the cgraf78/actions release installer writes to
 /// `<control>/owner`. The installer refuses to touch a control directory
@@ -77,6 +75,17 @@ pub(crate) enum Standalone {
     Locked(PathBuf),
 }
 
+/// The installer's private control directory for the dependency root `root`
+/// (`<owner>/<repo>` -> `<owner>/.<repo>-standalone`).
+///
+/// The name is the installer's namespace for exactly this dependency, so
+/// whatever it holds belongs to the layout an archive update adopts; a public
+/// command pinned into it is Shdeps' or the installer's, never a client's.
+pub(crate) fn control_dir(root: &Path) -> Option<PathBuf> {
+    let repo = root.file_name()?.to_str()?;
+    Some(root.with_file_name(format!(".{repo}-standalone")))
+}
+
 /// Classifies the Shdeps root for `name` against the standalone layout.
 ///
 /// Classification is a probe: an unreadable or unexpected entry anywhere makes
@@ -103,7 +112,10 @@ fn probe(install_base: &Path, name: &str, public: &Path) -> std::io::Result<Stan
         return Ok(Standalone::None);
     };
     let owner_dir = install_base.join(owner);
-    let control = owner_dir.join(format!(".{repo}-standalone"));
+    let root = install_base.join(name);
+    let Some(control) = control_dir(&root) else {
+        return Ok(Standalone::None);
+    };
     // The installer requires its parent and control directory to be real
     // directories. A symlink at either level could redirect every later check
     // to arbitrary content, so treat it as foreign.
@@ -122,7 +134,6 @@ fn probe(install_base: &Path, name: &str, public: &Path) -> std::io::Result<Stan
     // latter only when it still carries the installer's exact target. Any
     // other root entry (a real directory, a link elsewhere) is someone else's.
     let link_target = format!(".{repo}-standalone/current");
-    let root = install_base.join(name);
     let root_evidence = match fs::symlink_metadata(&root) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             if fs::read_link(&root)? != Path::new(&link_target) {
@@ -169,10 +180,19 @@ fn probe(install_base: &Path, name: &str, public: &Path) -> std::io::Result<Stan
     }
 
     let adoptable = match fs::symlink_metadata(public) {
+        // A client's symlink launcher (its own target outside every root of
+        // this dependency) is preserved by the archive switch exactly like a
+        // regular one, so only the root evidence matters.
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                && !crate::github_release_install::targets_own_root(public, &root) =>
+        {
+            root_evidence
+        }
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            // Only a command that resolves into the active release is the
-            // installer's (or a fallback switch's pin). A link anywhere else is
-            // a user choice that adoption must not silently replace.
+            // A link of this dependency's own is the installer's, or a
+            // fallback switch's pin, only while it resolves into the active
+            // release; a stale pin elsewhere stays unrecognized.
             fs::canonicalize(public)?.starts_with(fs::canonicalize(&release_dir)?)
         }
         // A regular launcher in front of the installer's root is preserved by
@@ -479,7 +499,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_public_link_outside_the_active_release() {
+    fn recognizes_a_client_symlink_launcher_in_front_of_the_root_link() {
+        // The archive switch preserves a client's symlink launcher (a dotfiles
+        // overlay link, or a link to a development build) exactly like a
+        // regular one, so the root evidence alone decides adoption.
         let root = temp_dir("standalone-foreign-public");
         let (base, public) = standalone(&root);
         let other = root.join("dev/dot");
@@ -488,7 +511,29 @@ mod tests {
         fs::remove_file(&public).unwrap();
         symlink(&other, &public).unwrap();
 
-        assert_none(&base, &public, "a user-chosen command link is foreign");
+        assert_eq!(
+            classify(&base, "cgraf78/dot", &public),
+            Standalone::Adoptable
+        );
+
+        fs::remove_file(base.join("cgraf78/dot")).unwrap();
+        assert_none(&base, &public, "a launcher alone is no root evidence");
+    }
+
+    #[test]
+    fn rejects_a_stale_pin_outside_the_active_release() {
+        // A command pinned into another release of the installer's control
+        // directory is this dependency's own link, but not the active
+        // release's, so the layout stays unrecognized.
+        let root = temp_dir("standalone-stale-pin");
+        let (base, public) = standalone(&root);
+        let stale = base.join("cgraf78/.dot-standalone/releases/old/dot");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        write_executable(&stale, "#!/bin/sh\necho old\n");
+        fs::remove_file(&public).unwrap();
+        symlink(&stale, &public).unwrap();
+
+        assert_none(&base, &public, "only a pin into the active release counts");
     }
 
     #[test]

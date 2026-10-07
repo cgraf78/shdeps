@@ -479,6 +479,52 @@ fn dangling_tracked_binlink_is_reported_once() {
     );
 }
 
+/// A marked archive release fronted by a dot-style overlay launcher: the
+/// public command is a relative link to a tracked script outside any root.
+fn release_behind_symlink_launcher(fixture: &Fixture) -> PathBuf {
+    fixture.append("conf/deps.conf", "owner/tool github:release tool\n");
+    fixture.write_executable("share/owner/tool/bin/tool");
+    fixture.write("share/owner/tool/.shdeps-release-layout", "v1 archive\n");
+    fixture.write_executable("overlay/bin/tool");
+    let public = fixture.link(Path::new("../overlay/bin/tool"), "bin/tool");
+    fixture.append(
+        "state/manifest",
+        &format!("owner/tool|github:release|tool|{}\n", public.display()),
+    );
+    public
+}
+
+#[test]
+fn symlink_launcher_in_front_of_a_release_is_healthy() {
+    let fixture = Fixture::new("symlink-launcher");
+    release_behind_symlink_launcher(&fixture);
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
+    assert_eq!(text(&output.stdout), "");
+}
+
+#[test]
+fn dangling_symlink_launcher_is_not_sent_to_update() {
+    // Update preserves the client's link, so suggesting it would loop; the
+    // detail must send the owner to the launcher instead.
+    let fixture = Fixture::new("dangling-symlink-launcher");
+    let public = release_behind_symlink_launcher(&fixture);
+    fs::remove_file(fixture.path("overlay/bin/tool")).unwrap();
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("warn", "owner/tool", "dangling-binlink", &public)]
+    );
+    let detail = &rows(&output)[0][4];
+    assert!(detail.contains("repair or remove it"), "{detail}");
+    assert!(!detail.contains("shdeps update"), "{detail}");
+}
+
 #[test]
 fn symlinked_release_root_from_another_installer_is_unmanaged() {
     // Shape of the standalone-installer incident: the stable root is a link

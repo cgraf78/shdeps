@@ -4156,6 +4156,65 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn cleanup_snapshot_preserves_archive_symlink_launcher_chain() {
+        // A tracked overlay link that reaches the payload through its own
+        // chain is the client's link: ownership follows the immediate target,
+        // so moving off the archive release must not delete it.
+        let dir = temp_dir("preserve-archive-symlink-launcher");
+        let roots = Roots {
+            conf_dir: dir.join("conf"),
+            hooks_dir: dir.join("hooks"),
+            state_dir: dir.join("state"),
+            git_dev_dir: dir.join("git-dev"),
+            install_dir: dir.join("install"),
+            bin_dir: dir.join("bin"),
+            home: dir.join("home"),
+        };
+        let public = roots.bin_dir.join("tool");
+        let overlay = dir.join("overlay/tool");
+        let install_root = roots.install_dir.join("owner/tool");
+        fs::create_dir_all(&roots.bin_dir).unwrap();
+        fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        fs::create_dir_all(&install_root).unwrap();
+        fs::create_dir_all(roots.state_dir.join("owner")).unwrap();
+        fs::write(install_root.join("tool"), "archive binary").unwrap();
+        std::os::unix::fs::symlink(install_root.join("tool"), &overlay).unwrap();
+        std::os::unix::fs::symlink(&overlay, &public).unwrap();
+        fs::write(
+            github_release_install::archive_layout_path(&roots.install_dir, "owner/tool"),
+            "v1 archive\n",
+        )
+        .unwrap();
+        let transition = Transition {
+            old: ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.to_string_lossy(),
+            ),
+            bin_links: vec![public.clone()],
+            extra_links: Vec::new(),
+            archive_state: ArchiveState::Proven,
+            archive_root_identity: None,
+            cleanup_evidence: crate::cleanup::Evidence::default(),
+        };
+        let new_entry = Entry {
+            name: "owner/tool".to_owned(),
+            method: "pkg".to_owned(),
+            cmd: "tool".to_owned(),
+            cmd_explicit: false,
+            aliases: String::new(),
+            filter: String::new(),
+        };
+
+        cleanup_snapshot_for_test(&new_entry, &transition, &roots).unwrap();
+
+        assert_eq!(fs::read_link(&public).unwrap(), overlay);
+        assert!(!install_root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn cleanup_snapshot_keeps_preserved_binlinks_in_state() {
         let dir = temp_dir("preserve-binlink-state");
         let roots = Roots {
