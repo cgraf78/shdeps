@@ -1631,6 +1631,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn prune_preserves_overlay_symlink_release_launcher() {
+        let fixture = Fixture::new("prune-overlay-release-launcher");
+        let manifest_path = manifest::path(&fixture.roots.state_dir);
+        let public = fixture.roots.bin_dir.join("tool");
+        let root = fixture.roots.install_dir.join("owner/tool");
+        fixture.write(&fixture.roots.home.join("overlay/tool"), "launcher\n");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        std::os::unix::fs::symlink("../overlay/tool", &public).unwrap();
+        fixture.write(&root.join("bin/tool"), "payload\n");
+        fixture.write(&root.join(".shdeps-release-layout"), "v1 archive\n");
+        manifest::upsert(
+            &manifest_path,
+            ManifestEntry::new(
+                "owner/tool",
+                "github:release",
+                "tool",
+                public.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let manifest = manifest::read(&manifest_path).unwrap();
+
+        run(
+            &[],
+            &manifest,
+            &manifest_path,
+            &fixture.roots,
+            &fixture.hooks,
+            &fixture.env,
+            Options {
+                yes: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            Path::new("../overlay/tool")
+        );
+        assert!(!root.exists());
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn prune_rejects_corrupt_explicit_release_marker_before_retiring_state() {
         let fixture = Fixture::new("prune-corrupt-release-marker");
         let manifest_path = manifest::path(&fixture.roots.state_dir);

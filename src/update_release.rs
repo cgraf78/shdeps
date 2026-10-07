@@ -429,9 +429,11 @@ pub(crate) fn install_request(
         // tool. PATH lookup and nonzero version text are display conveniences,
         // not proof that the release command itself still works.
         github_release_install::usable_version(
+            &context.roots.state_dir,
             &context.roots.install_dir,
             request.public_bin,
             request.name,
+            request.cmd,
             context.runner,
         )
     } else {

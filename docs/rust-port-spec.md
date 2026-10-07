@@ -934,9 +934,34 @@ Behavior:
   explicitly reject unsafe archive paths before extraction. The Rust port MUST
   add safe extraction as an intentional security hardening, while preserving
   behavior for normal safe archives.
-- Archive assets use the same public-link ownership rule as other managed
-  install roots: replace a tracked symlink, but preserve an existing regular
-  launcher. Raw and compressed single-binary assets retain the Bash behavior
+- Archive assets replace only their own public-command symlink and preserve
+  any other launcher: a regular file, or a symlink Shdeps did not publish
+  (such as a dotfiles overlay link created before the first install). A
+  symlink is the archive's own only when its immediate target, lexically
+  normalized against the link's directory, lies inside one of the
+  dependency's roots (its logical path, its canonical or physical spelling,
+  the release behind a parked root link, or the standalone installer's
+  control directory for this dependency, where an interrupted fallback
+  switch's pin lives) or inside the managed root of any row the manifest
+  still records (a renamed dependency or a command moved from another
+  method), spelled logically or through the physical install base as Shdeps
+  writes and prune recognizes those links, never through a root link's
+  target such as a repo's development clone. The final resolution is
+  deliberately ignored, so a client chain that ends in the root is preserved
+  while a dangling link into a removed root is replaced; this is the same
+  immediate-target test prune and method-transition cleanup use to delete
+  links. The decision is derived from the filesystem and manifest and adds no
+  manifest, ledger, or journal field. A link into a root nothing records
+  (for example under a previous `SHDEPS_INSTALL_DIR`) is indistinguishable
+  from a client's and is preserved. A preserved symlink launcher is
+  never recorded in the bin-link ledger, never re-pointed by the fallback
+  switch, and never used as version evidence once a release is recorded:
+  freshness probes the command inside a marked root (or the standalone
+  installer's adoptable root), found by the install's own binary search
+  without following links, and treats a missing payload as not installed. Clients can require this contract with
+  the `release-archive-symlink-launcher-preservation-v1` capability; older
+  Shdeps lacking it replaces such links on install. Raw and compressed
+  single-binary assets retain the Bash behavior
   of replacing the requested public `bin_path`. Automatic transitions between
   archive and single-binary layouts MUST fail closed: the layouts own different
   paths, and safe conversion would require a durable multi-path transaction.
@@ -957,7 +982,10 @@ Behavior:
   fixed, Shdeps-reserved name so the next archive install recognizes and
   finishes the interrupted switch and retires the parked link. An installer
   lock beside the installer's root MUST block the update with a specific
-  detail. Raw assets over that layout are a fail-closed format change
+  detail. A client launcher in front of that root, a regular file or a
+  symlink whose immediate target lies outside the dependency's roots, does
+  not block adoption and is preserved by it. Raw assets over that layout are
+  a fail-closed format change
   (previously the raw install replaced the public link). The installer's
   private directory is left in place.
 - Archive roots reserve `.shdeps-release-layout` for ownership metadata. An
@@ -1523,6 +1551,10 @@ functions and hook preludes:
   additive to wrapper ABI 1 so consumers can negotiate the ordering without
   rejecting older binaries for unrelated bridge calls. It is advertised only
   on Unix platforms, where the FIFO handshake is implemented.
+  `release-archive-launcher-preservation-v1` guarantees that an archive
+  release preserves a regular launcher at its public command, and
+  `release-archive-symlink-launcher-preservation-v1` extends that to a
+  symlink the archive did not publish (see `github:release` above).
 - `adopt-release-archive-launcher <name> <cmd>` — explicitly resolves a
   pre-marker archive whose Shdeps-created public symlink was replaced by a
   regular consumer-owned launcher. It requires a matching `github:release`

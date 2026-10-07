@@ -323,9 +323,11 @@ where
         return false;
     }
     let Some(version) = crate::github_release_install::usable_version(
+        &context.roots.state_dir,
         &context.roots.install_dir,
         &public_bin,
         &candidate.name,
+        &candidate.cmd,
         context.runner,
     ) else {
         return false;

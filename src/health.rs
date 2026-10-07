@@ -465,10 +465,13 @@ impl<'a> Scan<'a> {
             );
             return;
         }
+        // Only an archive release preserves a client's symlink launcher; the
+        // other managed methods replace any symlink at their command paths.
+        let release = concrete == method::GITHUB_RELEASE;
         match dep_links::links_for_entry(entry, self.roots, manifest) {
             Ok(links) => {
                 for link in links {
-                    self.check_public_link(&entry.name, &link);
+                    self.check_public_link(&entry.name, &link, release);
                 }
             }
             Err(crate::Error::Resolve(ResolveError::NotFound)) => self.push(
@@ -551,7 +554,15 @@ impl<'a> Scan<'a> {
     }
 
     /// Verifies one public command against the dep-links contract.
-    fn check_public_link(&mut self, package: &str, link: &dep_links::DependencyLink) {
+    ///
+    /// `release` marks a `github:release` dependency, whose update preserves a
+    /// client's symlink launcher at the command path.
+    fn check_public_link(
+        &mut self,
+        package: &str,
+        link: &dep_links::DependencyLink,
+        release: bool,
+    ) {
         let public = &link.public_path;
         self.checked_links.insert(public.clone());
         let metadata = match fs::symlink_metadata(public) {
@@ -585,7 +596,18 @@ impl<'a> Scan<'a> {
             let target = match fs::metadata(public) {
                 Ok(target) => target,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.push_dangling(LinkKind::Bin, package, public);
+                    if release
+                        && github_release_install::is_foreign_launcher(
+                            &self.roots.state_dir,
+                            &self.roots.install_dir,
+                            package,
+                            public,
+                        )
+                    {
+                        self.push_dangling_launcher(package, link);
+                    } else {
+                        self.push_dangling(LinkKind::Bin, package, public);
+                    }
                     return;
                 }
                 Err(error) => {
@@ -634,6 +656,23 @@ impl<'a> Scan<'a> {
             format!(
                 "command '{}' is not executable; run 'shdeps --reinstall update'",
                 link.command
+            ),
+        );
+    }
+
+    /// Reports a broken client launcher link. `update` preserves links it did
+    /// not create, so unlike a dangling Shdeps link it cannot repair this one.
+    fn push_dangling_launcher(&mut self, package: &str, link: &dep_links::DependencyLink) {
+        let public = &link.public_path;
+        let target = fs::read_link(public).unwrap_or_default();
+        self.push(
+            ProblemKind::DanglingBinlink,
+            Some(package),
+            Some(public),
+            format!(
+                "command '{}' is a launcher link to missing {}; shdeps preserves links it did not create, so repair or remove it",
+                link.command,
+                target.display()
             ),
         );
     }

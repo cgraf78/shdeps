@@ -287,6 +287,12 @@ enum InstallerRoot {
     LockedFresh,
     /// The installer's root behind a regular launcher at the public path.
     AdoptableLauncher,
+    /// The installer's root behind a client's relative symlink launcher.
+    AdoptableSymlinkLauncher,
+    /// A parked root link behind a client's symlink launcher.
+    ParkedSymlinkLauncher,
+    /// The command pinned into a release other than the active one.
+    StalePin,
     /// An adoption interrupted after parking the root link: finished by update.
     Parked,
     /// The same symlinked root without the installer's ownership marker.
@@ -337,7 +343,29 @@ fn installer_root_fixture(name: &str, shape: InstallerRoot) -> Fixture {
     let root = fixture.dir.join("share/owner/tool");
     let public = fixture.dir.join("bin/tool");
     fs::create_dir_all(public.parent().unwrap()).unwrap();
-    if matches!(shape, InstallerRoot::Parked) {
+    if matches!(
+        shape,
+        InstallerRoot::AdoptableSymlinkLauncher | InstallerRoot::ParkedSymlinkLauncher
+    ) {
+        fixture.write_executable("overlay/tool", "#!/bin/sh\nexec launcher\n");
+        symlink("../overlay/tool", &public).unwrap();
+    }
+    if matches!(shape, InstallerRoot::ParkedSymlinkLauncher) {
+        symlink(
+            ".tool-standalone/current",
+            fixture.dir.join("share/owner/tool.shdeps-parked-root"),
+        )
+        .unwrap();
+    } else if matches!(shape, InstallerRoot::AdoptableSymlinkLauncher) {
+        symlink(".tool-standalone/current", &root).unwrap();
+    } else if matches!(shape, InstallerRoot::StalePin) {
+        fixture.write_executable(
+            "share/owner/.tool-standalone/releases/old/tool",
+            "#!/bin/sh\necho old\n",
+        );
+        symlink(".tool-standalone/current", &root).unwrap();
+        symlink(control.join("releases/old/tool"), &public).unwrap();
+    } else if matches!(shape, InstallerRoot::Parked) {
         // An interrupted fallback switch pinned the command at the active
         // release and parked the root link under its fixed name.
         symlink(
@@ -385,6 +413,9 @@ fn health_agrees_with_update_on_every_release_root() {
         (InstallerRoot::Locked, true),
         (InstallerRoot::LockedFresh, true),
         (InstallerRoot::AdoptableLauncher, false),
+        (InstallerRoot::AdoptableSymlinkLauncher, false),
+        (InstallerRoot::ParkedSymlinkLauncher, false),
+        (InstallerRoot::StalePin, true),
         (InstallerRoot::Parked, false),
         (InstallerRoot::Unmanaged, true),
         (InstallerRoot::AdoptedStaleLock, false),
@@ -410,6 +441,20 @@ fn health_agrees_with_update_on_every_release_root() {
         );
         assert_eq!(update_refused, refused, "{shape:?}: {update_out}");
         match shape {
+            InstallerRoot::AdoptableSymlinkLauncher | InstallerRoot::ParkedSymlinkLauncher => {
+                assert_eq!(health.status.code(), Some(0), "{shape:?}: {rows}");
+                assert!(fs::symlink_metadata(&root).unwrap().is_dir(), "{shape:?}");
+                assert_eq!(
+                    fs::read_link(fixture.dir.join("bin/tool")).unwrap(),
+                    Path::new("../overlay/tool"),
+                    "{shape:?}: adoption keeps the launcher"
+                );
+                let healthy = run(&mut fixture.command(["health"]));
+                assert_eq!(text(&healthy.stdout), "", "{shape:?} after adoption");
+            }
+            InstallerRoot::StalePin => {
+                assert!(update_out.contains("release asset format changed"));
+            }
             InstallerRoot::Adoptable
             | InstallerRoot::AdoptableLauncher
             | InstallerRoot::Parked
@@ -465,6 +510,15 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert_success(&capability);
     assert_eq!(text(&capability.stdout), "");
     assert_eq!(text(&capability.stderr), "");
+
+    let symlink_launcher = run(&mut fixture.command([
+        "__api",
+        "capability",
+        "release-archive-symlink-launcher-preservation-v1",
+    ]));
+    assert_success(&symlink_launcher);
+    assert_eq!(text(&symlink_launcher.stdout), "");
+    assert_eq!(text(&symlink_launcher.stderr), "");
 
     let cancellation =
         run(&mut fixture.command(["__api", "capability", "owned-subprocess-cancellation-v1"]));

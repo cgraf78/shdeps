@@ -415,22 +415,154 @@ fn symlink_points_into(path: &Path, root: &Path) -> bool {
     }
 }
 
+/// This dependency's roots that its own public-command links can name.
+///
+/// Shdeps publishes the command as an absolute link into the dependency root:
+/// the logical root after a normal switch, or the physical release behind a
+/// symlinked root while the fallback switch pins the command
+/// (`keep_command_resolvable`). After an interrupted fallback switch that
+/// release is reachable only through the parked root link, or, once that link
+/// is gone too, only by its place inside the standalone installer's control
+/// directory, a namespace reserved for this exact dependency. The physical
+/// spelling of the logical root also covers links written through a symlinked
+/// install base whose root has since disappeared.
+fn own_public_roots(install_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![install_dir.to_path_buf()];
+    roots.extend(fs::canonicalize(install_dir).ok());
+    roots.extend(physical_spelling(install_dir));
+    roots.extend(fs::canonicalize(parked_root_link(install_dir)).ok());
+    if let Some(control) = crate::standalone_layout::control_dir(install_dir) {
+        roots.extend(physical_spelling(&control));
+        roots.push(control);
+    }
+    roots
+}
+
+/// Spells `path` through its deepest existing ancestor's canonical form.
+fn physical_spelling(path: &Path) -> Option<PathBuf> {
+    path.ancestors().skip(1).find_map(|ancestor| {
+        let canonical = fs::canonicalize(ancestor).ok()?;
+        Some(canonical.join(path.strip_prefix(ancestor).ok()?))
+    })
+}
+
+/// Whether `public` is a symlink whose own target lies in this dependency's
+/// roots ([`own_public_roots`]).
+pub(crate) fn targets_own_root(public: &Path, install_dir: &Path) -> bool {
+    crate::cleanup::symlink_targets_any_root(public, &own_public_roots(install_dir))
+}
+
+/// Managed roots of every dependency the manifest still records.
+///
+/// A link into one of them was published by Shdeps for that row: the same
+/// command under an old dependency name or method (a renamed repo, `cargo`
+/// to `github:release`) until prune retires the row. Roots are spelled the
+/// way Shdeps writes such links and prune recognizes them: logically and
+/// through the physical install base (a repo's checkout-lock path), never
+/// through a root link's target, so a development clone a repo root links to
+/// stays client territory and a human-edited row cannot claim an arbitrary
+/// tree through a symlinked root. Rows with an unsafe name are skipped, and
+/// an unreadable manifest contributes nothing, which errs toward preserving.
+fn recorded_roots(state_dir: &Path, install_base: &Path) -> Vec<PathBuf> {
+    let Ok(installed) = manifest::read(&manifest::path(state_dir)) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for entry in installed.entries() {
+        if !(entry.method == method::GITHUB_REPO || method::is_binary_install_root(&entry.method))
+            || !crate::config::valid_dep_name(&entry.name)
+        {
+            continue;
+        }
+        let root = install_base.join(crate::config::canonical_name(&entry.name, &entry.method));
+        roots.extend(physical_spelling(&root));
+        roots.push(root);
+    }
+    roots
+}
+
+/// Whether `public` is a symlink Shdeps did not publish: a launcher a client
+/// put in front of the command, such as a dotfiles overlay linking a tracked
+/// script into the bin directory.
+///
+/// Such a link is preserved exactly like a regular launcher. A link is Shdeps'
+/// own when its immediate target, lexically normalized, lies in this
+/// dependency's roots or another recorded dependency's root; this is the
+/// immediate-target test prune applies through `cleanup::unlink_owned_symlink`.
+/// The final resolution is deliberately ignored: a chain that eventually
+/// reaches the root is still the client's link, while a dangling link into
+/// the root is still Shdeps' own. The decision is filesystem- and
+/// manifest-derived, so no state format records it, and an overlay link
+/// created before the first install is classified correctly.
+pub(crate) fn is_foreign_launcher(
+    state_dir: &Path,
+    install_base: &Path,
+    name: &str,
+    public: &Path,
+) -> bool {
+    if !fs::symlink_metadata(public).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return false;
+    }
+    let install_dir = install_base.join(name);
+    !targets_own_root(public, &install_dir)
+        && !crate::cleanup::symlink_targets_any_root(
+            public,
+            &recorded_roots(state_dir, install_base),
+        )
+}
+
+/// Whether `public` is the archive's own live link into `install_dir`.
+fn owns_public_link(public: &Path, install_dir: &Path) -> bool {
+    symlink_points_into(public, install_dir) && targets_own_root(public, install_dir)
+}
+
 /// Verifies the installed release command instead of a PATH shadow.
 ///
 /// Raw installs own a regular public binary. Archive commands may be symlinks,
 /// but retaining one requires it to still resolve into this dependency's root;
 /// a healthy executable reached through a repointed link is not the old tool.
+/// A client's symlink launcher is never that evidence either: behind one, the
+/// payload in a marked archive root (or the standalone installer's adoptable
+/// root) is probed directly, so freshness neither trusts whatever the
+/// launcher runs nor reinstalls a current payload.
 pub(crate) fn usable_version(
+    state_dir: &Path,
     install_base: &Path,
     public: &Path,
     name: &str,
+    cmd: &str,
     runner: &impl process::Runner,
 ) -> Option<String> {
+    let install_dir = install_base.join(name);
+    if is_foreign_launcher(state_dir, install_base, name, public) {
+        let payload = installed_payload(install_base, name, public, cmd)?;
+        return process::verified_version(runner, &payload);
+    }
     let metadata = fs::symlink_metadata(public).ok()?;
-    if metadata.file_type().is_symlink() && !symlink_points_into(public, &install_base.join(name)) {
+    if metadata.file_type().is_symlink() && !symlink_points_into(public, &install_dir) {
         return None;
     }
     process::verified_version(runner, public)
+}
+
+/// Locates the command inside a marked archive root, by the same search the
+/// install used so no layout state beyond the marker has to be recorded, or
+/// inside the standalone installer's adoptable root by that same lookup.
+fn installed_payload(install_base: &Path, name: &str, public: &Path, cmd: &str) -> Option<PathBuf> {
+    // Only the explicit marker proves the root is this release's archive; a
+    // checkout or another installer's tree may hold a same-named binary. The
+    // standalone installer's provable layout holds the same payload, and its
+    // version keeps a transient download failure during adoption lenient,
+    // as running a regular launcher in front of it does.
+    if explicit_archive_state(install_base, name).ok()? != ArchiveState::Proven
+        && crate::standalone_layout::classify(install_base, name, public)
+            != crate::standalone_layout::Standalone::Adoptable
+    {
+        return None;
+    }
+    // The install made the selected binary executable, so the executable-only
+    // search finds the same file without the zip-only relaxation.
+    find_binary(&install_base.join(name), cmd, false)
 }
 
 /// Installs a raw standalone release binary to an exact caller-owned path.
@@ -589,6 +721,10 @@ fn install_archive(
     extract: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<PathBuf> {
     let install_dir = install_base.join(name);
+    // Classify the public command before the switch: a fallback switch may
+    // pin Shdeps' own link at the physical release and park the root link,
+    // and only the pre-switch state still names those roots.
+    let preserve_launcher = is_foreign_launcher(state_dir, install_base, name, public);
     let extract_dir = temp_install_path(&install_dir);
     remove_any(&extract_dir)?;
     let _extract_cleanup = RemoveOnDrop(extract_dir.clone());
@@ -647,7 +783,14 @@ fn install_archive(
     // See `switch_root` for the backup/exchange/rollback contract.
     let parked = switch_root(&content_root, &install_dir, public, &relative_binary)?;
     let source = install_dir.join(relative_binary);
-    if let Err(link) = replace_symlink(&source, public) {
+    // A client's symlink launcher stays in front of the new root just like a
+    // regular one; it reaches the payload through its own fixed path.
+    let published = if preserve_launcher {
+        Ok(false)
+    } else {
+        replace_symlink(&source, public)
+    };
+    if let Err(link) = published {
         // Root activation and public-link publication are one transaction. If
         // the link cannot be committed, remove the new root and restore the old
         // one before the caller restores any parked raw public command. Leaving
@@ -863,7 +1006,8 @@ pub(crate) fn without_exchange<T>(body: impl FnOnce() -> T) -> T {
 
 /// Before a symlinked root is renamed away, points a public command symlink
 /// that currently resolves through the root straight at the same physical
-/// binary, creating it when absent. A regular launcher or a link elsewhere is
+/// binary, creating it when absent. A regular launcher, a client's symlink
+/// launcher (even one whose chain reaches the root), or a link elsewhere is
 /// never touched. The switch's final link publication then re-points the
 /// command into the new root.
 #[cfg(unix)]
@@ -877,7 +1021,11 @@ fn keep_command_resolvable(
         return Ok(());
     };
     let target = match fs::symlink_metadata(public) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(public).ok(),
+        Ok(metadata)
+            if metadata.file_type().is_symlink() && targets_own_root(public, install_dir) =>
+        {
+            fs::canonicalize(public).ok()
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             // Commands published outside SHDEPS_BIN_DIR (Termux's installer
             // uses `$PREFIX/bin`) cannot be re-pointed; publishing Shdeps' own
@@ -937,16 +1085,18 @@ fn link_archive_bins(
     for (cmd, path) in sources {
         let target = public_bin_dir.join(&cmd);
         if target == public {
-            if symlink_points_into(public, install_dir) {
+            if owns_public_link(public, install_dir) {
                 created.push(public.to_path_buf());
             }
         } else if let Link::Linked(link) = bin_link::one(public_bin_dir, &cmd, &path)? {
             created.push(link);
         }
     }
+    // A preserved launcher chain may resolve into the root, but recording it
+    // would make a later reader treat the client's link as Shdeps-created.
     if !created.is_empty()
         && !created.iter().any(|link| link == public)
-        && symlink_points_into(public, install_dir)
+        && owns_public_link(public, install_dir)
     {
         created.push(public.to_path_buf());
     }
@@ -1096,10 +1246,18 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
         return files;
     };
     for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // The archive extractor rejects symlinks and hardlinks in a staged
+        // tree, but a live root probed behind a launcher may have gained
+        // links since. Never following one keeps the walk inside the root
+        // (and out of link cycles) and finds what the install selected.
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            // The archive extractor rejects symlinks and hardlinks before this
-            // walk runs, so recursive descent cannot escape the staged tree.
+        if file_type.is_dir() {
             files.extend(walk_files(&path));
         } else {
             files.push(path);
@@ -1142,10 +1300,10 @@ fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
     })?;
     fs::create_dir_all(parent)?;
 
-    // Archive installs follow the same public-path ownership rule as every
-    // other symlink-based method: replace a Shdeps-owned symlink, but preserve
-    // a regular launcher. Raw and compressed-single release assets retain the
-    // historical replacement behavior in `install_plain_to` above.
+    // The shared helper preserves a regular launcher; `install_archive` has
+    // already skipped a client's symlink launcher, so any symlink reaching
+    // this point is Shdeps' own. Raw and compressed-single release assets
+    // retain the historical replacement behavior in `install_plain_to` above.
     extras::replace_symlink(source, target)
 }
 
@@ -1851,6 +2009,357 @@ mod tests {
         }
     }
 
+    /// Two archive generations with a helper command, for launcher tests.
+    #[cfg(unix)]
+    fn launcher_archives() -> [(Vec<u8>, &'static [u8]); 2] {
+        [
+            (
+                tar_gz(&[
+                    ("tool-v1.0/bin/tool", b"v1".as_slice(), 0o755),
+                    ("tool-v1.0/bin/tool-helper", b"helper-v1".as_slice(), 0o755),
+                ]),
+                b"v1",
+            ),
+            (
+                tar_gz(&[
+                    ("tool-v2.0/bin/tool", b"v2".as_slice(), 0o755),
+                    ("tool-v2.0/bin/tool-helper", b"helper-v2".as_slice(), 0o755),
+                ]),
+                b"v2",
+            ),
+        ]
+    }
+
+    /// Installs both launcher archives in order and asserts after each that
+    /// the public symlink still has `target`, the payload moved on, and the
+    /// bin ledger never claims the launcher.
+    #[cfg(unix)]
+    fn assert_symlink_launcher_survives_updates(dir: &std::path::Path, target: &std::path::Path) {
+        let public = dir.join("bin/tool");
+        for (bytes, expected) in launcher_archives() {
+            super::install_tar_gz_to(
+                &dir.join("state"),
+                &dir.join("share"),
+                &public,
+                "owner/tool",
+                "tool",
+                &bytes,
+            )
+            .unwrap();
+
+            assert_eq!(fs::read_link(&public).unwrap(), target);
+            assert_eq!(
+                fs::read(dir.join("share/owner/tool/bin/tool")).unwrap(),
+                expected
+            );
+            assert_eq!(
+                link_state::read(&link_state::path(
+                    &dir.join("state"),
+                    "owner/tool",
+                    Kind::Bin,
+                ))
+                .unwrap(),
+                vec![dir.join("bin/tool-helper")]
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_preserves_relative_overlay_symlink_launcher_across_updates() {
+        // dot links a tracked overlay launcher into the bin dir with a
+        // relative symlink, and that launcher delegates to the payload at its
+        // fixed path inside the archive root. The link exists before the first
+        // install and must survive it and every update.
+        let dir = temp_dir("archive-overlay-symlink-launcher");
+        let launcher = dir.join("overlay/home/.local/bin/tool");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(
+            &launcher,
+            "#!/bin/sh\nexec \"$HOME/share/owner/tool/bin/tool\" \"$@\"\n",
+        );
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let target = std::path::Path::new("../overlay/home/.local/bin/tool");
+        symlink(target, dir.join("bin/tool")).unwrap();
+
+        assert_symlink_launcher_survives_updates(&dir, target);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_preserves_dangling_foreign_symlink_launcher() {
+        // An overlay that is not checked out yet leaves its link dangling.
+        // Shdeps cannot tell it apart from any other client link, so it must
+        // not be claimed merely because it is broken.
+        let dir = temp_dir("archive-dangling-foreign-launcher");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let target = dir.join("overlay/missing/tool");
+        symlink(&target, dir.join("bin/tool")).unwrap();
+
+        assert_symlink_launcher_survives_updates(&dir, &target);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_replaces_link_into_a_recorded_dependency_root() {
+        // Renaming a dependency or moving its command to another method leaves
+        // the public link in the old row's root until prune retires the row.
+        // That link is Shdeps' own and must move to the new install, or the
+        // command would keep running the old binary.
+        let dir = temp_dir("archive-recorded-root-link");
+        let old = dir.join("share/old/tool/bin/tool");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(&old, "#!/bin/sh\necho old\n");
+        crate::manifest::upsert(
+            &crate::manifest::path(&dir.join("state")),
+            crate::manifest::ManifestEntry::new(
+                "old/tool",
+                "github:repo",
+                "tool",
+                dir.join("share/old/tool").display().to_string(),
+            ),
+        )
+        .unwrap();
+        let public = dir.join("bin/tool");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        symlink(&old, &public).unwrap();
+
+        super::install_tar_gz_to(
+            &dir.join("state"),
+            &dir.join("share"),
+            &public,
+            "owner/tool",
+            "tool",
+            &launcher_archives()[0].0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            dir.join("share/owner/tool/bin/tool")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_preserves_launcher_in_a_recorded_repo_development_clone() {
+        // A recorded repo root may link to a development clone. Shdeps writes
+        // and prunes that repo's links through the root, never the clone, so
+        // an overlay link into the clone stays the client's.
+        let dir = temp_dir("archive-dev-clone-launcher");
+        let clone = dir.join("git/kit");
+        let launcher = clone.join("bin/tool-launcher");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(&launcher, "#!/bin/sh\n");
+        fs::create_dir_all(dir.join("share/owner")).unwrap();
+        symlink(&clone, dir.join("share/owner/kit")).unwrap();
+        crate::manifest::upsert(
+            &crate::manifest::path(&dir.join("state")),
+            crate::manifest::ManifestEntry::new(
+                "owner/kit",
+                "github:repo",
+                "kit",
+                dir.join("share/owner/kit").display().to_string(),
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        symlink(&launcher, dir.join("bin/tool")).unwrap();
+
+        assert_symlink_launcher_survives_updates(&dir, &launcher);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_replaces_recorded_repo_link_through_the_physical_base() {
+        // Repo installs publish links through the checkout-lock path: the
+        // physical install base plus the name, not the root link's target.
+        // Both differ from the logical spelling when the install base is a
+        // symlink and the old root links to a development clone.
+        let dir = temp_dir("archive-recorded-physical-base");
+        let physical_base = dir.join("physical-share");
+        let clone = dir.join("git/tool");
+        fs::create_dir_all(clone.join("bin")).unwrap();
+        crate::test_support::write_executable(&clone.join("bin/tool"), "#!/bin/sh\n");
+        fs::create_dir_all(physical_base.join("old")).unwrap();
+        symlink(&clone, physical_base.join("old/tool")).unwrap();
+        symlink(&physical_base, dir.join("share")).unwrap();
+        let old = fs::canonicalize(physical_base.join("old"))
+            .unwrap()
+            .join("tool/bin/tool");
+        crate::manifest::upsert(
+            &crate::manifest::path(&dir.join("state")),
+            crate::manifest::ManifestEntry::new(
+                "old/tool",
+                "github:repo",
+                "tool",
+                dir.join("share/old/tool").display().to_string(),
+            ),
+        )
+        .unwrap();
+        let public = dir.join("bin/tool");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        symlink(&old, &public).unwrap();
+
+        super::install_tar_gz_to(
+            &dir.join("state"),
+            &dir.join("share"),
+            &public,
+            "owner/tool",
+            "tool",
+            &launcher_archives()[0].0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            dir.join("share/owner/tool/bin/tool")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_finishes_adoption_of_a_pin_without_any_root_link() {
+        // The standalone classifier adopts a command pinned at the active
+        // release even after both the root link and the parked link are gone.
+        // The pin lies in the installer's control directory for this exact
+        // dependency, so it is Shdeps' own and must move into the new root.
+        let (staged, root, old_binary, public) = symlinked_root_fixture("pin-without-root-link");
+        fs::remove_dir_all(&staged).unwrap();
+        fs::remove_file(&public).unwrap();
+        symlink(&old_binary, &public).unwrap();
+        fs::remove_file(&root).unwrap();
+        let base = root.parent().unwrap().parent().unwrap();
+
+        super::install_tar_gz_to(
+            &base.with_file_name("state"),
+            base,
+            &public,
+            "owner/tool",
+            "tool",
+            &tar_gz(&[("tool-v2.0/tool", b"new".as_slice(), 0o755)]),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_link(&public).unwrap(), root.join("tool"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_preserves_symlink_into_an_unrecorded_dependency_root() {
+        let dir = temp_dir("archive-other-dependency-launcher");
+        let other = dir.join("share/owner/other/bin/tool");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        crate::test_support::write_executable(&other, "#!/bin/sh\n");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        symlink(&other, dir.join("bin/tool")).unwrap();
+
+        assert_symlink_launcher_survives_updates(&dir, &other);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_preserves_symlink_chain_that_ends_in_its_own_root() {
+        // Ownership follows the link's own target, as prune does: a tracked
+        // overlay link to the payload is still the client's link even though
+        // it finally resolves into the archive root.
+        let dir = temp_dir("archive-chain-launcher");
+        let overlay = dir.join("overlay/home/.local/bin/tool");
+        fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        symlink(dir.join("share/owner/tool/bin/tool"), &overlay).unwrap();
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        symlink(&overlay, dir.join("bin/tool")).unwrap();
+
+        assert_symlink_launcher_survives_updates(&dir, &overlay);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_install_replaces_its_own_links_in_every_spelling() {
+        // Shdeps-owned links stay replaceable whatever their spelling: a
+        // dangling absolute link left after the root vanished, a relative
+        // link into the root, and a link through the physical spelling of a
+        // symlinked install base.
+        let dir = temp_dir("archive-owned-link-spellings");
+        let physical_base = dir.join("physical-share");
+        fs::create_dir_all(&physical_base).unwrap();
+        symlink(&physical_base, dir.join("share")).unwrap();
+        let public = dir.join("bin/tool");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let physical_root = fs::canonicalize(&physical_base).unwrap().join("owner/tool");
+        let expected = dir.join("share/owner/tool/bin/tool");
+        for owned in [
+            dir.join("share/owner/tool/bin/old-tool"),
+            PathBuf::from("../share/owner/tool/tool"),
+            physical_root.join("bin/old-tool"),
+        ] {
+            let _ = fs::remove_dir_all(physical_base.join("owner"));
+            let _ = fs::remove_file(&public);
+            symlink(&owned, &public).unwrap();
+
+            super::install_tar_gz_to(
+                &dir.join("state"),
+                &dir.join("share"),
+                &public,
+                "owner/tool",
+                "tool",
+                &launcher_archives()[0].0,
+            )
+            .unwrap();
+
+            assert_eq!(fs::read_link(&public).unwrap(), expected, "{owned:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interrupted_fallback_switch_still_owns_the_pinned_command() {
+        // A fallback switch killed between its renames leaves the command
+        // pinned at the physical release behind the parked root link. That
+        // pin is Shdeps' own and the finishing install must re-point it.
+        let (staged, root, old_binary, public) = symlinked_root_fixture("pinned-command-owned");
+        fs::remove_dir_all(&staged).unwrap();
+        fs::remove_file(&public).unwrap();
+        symlink(&old_binary, &public).unwrap();
+        fs::rename(&root, super::parked_root_link(&root)).unwrap();
+        let base = root.parent().unwrap().parent().unwrap();
+
+        super::install_tar_gz_to(
+            &base.with_file_name("state"),
+            base,
+            &public,
+            "owner/tool",
+            "tool",
+            &tar_gz(&[("tool-v2.0/tool", b"new".as_slice(), 0o755)]),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_link(&public).unwrap(), root.join("tool"));
+        assert!(fs::symlink_metadata(super::parked_root_link(&root)).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fallback_switch_never_repoints_a_launcher_chain_through_the_root() {
+        // The fallback switch pins a command that resolves through the
+        // symlinked root. A client link that only reaches the root through
+        // its own chain is a launcher and is left alone.
+        let (staged, root, _old_binary, public) = symlinked_root_fixture("switch-chain-launcher");
+        let overlay = public.parent().unwrap().join("overlay-tool");
+        symlink(root.join("tool"), &overlay).unwrap();
+        fs::remove_file(&public).unwrap();
+        symlink("overlay-tool", &public).unwrap();
+
+        super::without_exchange(|| {
+            super::switch_root(&staged, &root, &public, std::path::Path::new("tool")).unwrap()
+        });
+
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            std::path::Path::new("overlay-tool")
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn archive_install_uses_backup_swap_and_cleans_up() {
@@ -2292,9 +2801,11 @@ mod tests {
         let public = dir.join("bin/tool");
 
         // Stage a dangling symlink at the target so the path already
-        // has an entry that needs to be replaced.
+        // has an entry that needs to be replaced. It names this dependency's
+        // root, as a link left behind by a removed root would; a dangling link
+        // anywhere else is a client launcher and is preserved.
         fs::create_dir_all(dir.join("bin")).unwrap();
-        std::os::unix::fs::symlink(dir.join("nonexistent"), &public).unwrap();
+        std::os::unix::fs::symlink(dir.join("share/owner/tool/bin/nonexistent"), &public).unwrap();
 
         super::install_tar_gz_to(
             &dir.join("state"),

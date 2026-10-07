@@ -1906,6 +1906,53 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn archive_cleanup_preserves_symlink_public_launcher() {
+        // dot links an overlay launcher into the bin dir with a relative
+        // symlink. Even a stale ledger entry from before the launcher existed
+        // must not let cleanup claim it: only links into the root are owned.
+        let fixture = Fixture::new("archive-symlink-launcher");
+        let entry = ManifestEntry::new(
+            "owner/archive-tool",
+            "github:release",
+            "archive-tool",
+            fixture.roots.bin_dir.join("archive-tool").to_string_lossy(),
+        );
+        let public = fixture.roots.bin_dir.join("archive-tool");
+        let launcher = fixture.roots.bin_dir.join("../overlay/archive-tool");
+        fixture.write_at(&launcher, "#!/bin/sh\n# overlay launcher\n");
+        symlink("../overlay/archive-tool", &public).unwrap();
+        fixture.write_install("owner/archive-tool/bin/archive-tool", "#!/bin/sh\n");
+        fs::write(
+            github_release_install::archive_layout_path(
+                &fixture.roots.install_dir,
+                "owner/archive-tool",
+            ),
+            "v1 archive\n",
+        )
+        .unwrap();
+        link_state::write(
+            &link_state::path(&fixture.roots.state_dir, "owner/archive-tool", Kind::Bin),
+            std::slice::from_ref(&public),
+        )
+        .unwrap();
+
+        remove_for_test(&entry, &fixture.roots).unwrap();
+
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            Path::new("../overlay/archive-tool")
+        );
+        assert!(
+            !fixture
+                .roots
+                .install_dir
+                .join("owner/archive-tool")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn archive_cleanup_preserves_regular_public_launcher() {
         let fixture = Fixture::new("archive-launcher");
         let entry = ManifestEntry::new(
