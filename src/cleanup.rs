@@ -792,7 +792,9 @@ fn symlink_targets_any_exact_path(path: &Path, expected: &[PathBuf]) -> bool {
         .any(|path| target == path)
 }
 
-fn immediate_symlink_target(path: &Path) -> Option<PathBuf> {
+/// A symlink's own target, resolved against its directory and lexically
+/// normalized, without following any further link.
+pub(crate) fn immediate_symlink_target(path: &Path) -> Option<PathBuf> {
     let target = fs::read_link(path).ok()?;
     let resolved = if target.is_absolute() {
         target

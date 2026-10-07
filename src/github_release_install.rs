@@ -175,7 +175,9 @@ pub(crate) enum UpgradeBlocker {
     },
     /// The root is gone while the public command is still a link, the shape
     /// only an archive install leaves; an archive upgrade cannot prove the
-    /// link is not someone else's and refuses to replace it.
+    /// link is not someone else's and refuses to replace it. A provable
+    /// client launcher is the exception (`launcher_fronts_missing_root`):
+    /// the install preserves it, so recreating the root is safe.
     MissingRoot,
     /// The marker exists but is not a regular file with the known content;
     /// every update fails closed on it.
@@ -217,7 +219,9 @@ pub(crate) enum UpgradeBlocker {
 /// is not already `Proven`, so a lock left beside an adopted root is inert. The installer only publishes archives, so a raw asset over its
 /// root is an unknowable format change like any other.
 ///
-/// The predicate is restated here rather than shared with `install_request`;
+/// A missing root behind a client's symlink launcher is not blocked: both
+/// sides share `launcher_fronts_missing_root` for that exception. The rest of
+/// the predicate is restated here rather than shared with `install_request`;
 /// the CLI parity test `health_agrees_with_update_on_every_release_root`
 /// runs both against each root shape and pins agreement.
 pub(crate) fn upgrade_blocker(
@@ -279,9 +283,9 @@ pub(crate) fn upgrade_blocker(
             let root_type = match fs::symlink_metadata(&root) {
                 Ok(metadata) => metadata.file_type(),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(public_type
-                        .is_symlink()
-                        .then_some(UpgradeBlocker::MissingRoot));
+                    return Ok((public_type.is_symlink()
+                        && !launcher_fronts_missing_root(state_dir, install_base, public, name)?)
+                    .then_some(UpgradeBlocker::MissingRoot));
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -296,6 +300,54 @@ pub(crate) fn upgrade_blocker(
             }))
         }
     }
+}
+
+/// Whether a client's symlink launcher fronts a release whose root is gone.
+///
+/// A missing root behind a public link normally blocks an archive upgrade,
+/// because the link could be someone else's that the install would replace.
+/// A provably foreign launcher is preserved by `install_archive`, so the
+/// update may recreate the root behind it. Shared by the update gate and
+/// `upgrade_blocker` so health and update cannot disagree.
+///
+/// A link into a Shdeps archive root elsewhere (a relocated install base, or
+/// `$HOME` spelled differently) is unrecorded and so looks foreign, but it
+/// is really this dependency's old command: recreating the root behind it
+/// would report success while the command keeps running the old payload.
+/// Such links keep the refusal, as does any link through a directory spelled
+/// like this dependency's root (an unmarked legacy root elsewhere).
+pub(crate) fn launcher_fronts_missing_root(
+    state_dir: &Path,
+    install_base: &Path,
+    public: &Path,
+    name: &str,
+) -> Result<bool> {
+    let root = install_base.join(name);
+    Ok(!path_entry_exists(&root)?
+        && !path_entry_exists(&parked_root_link(&root))?
+        && is_foreign_launcher(state_dir, install_base, name, public)
+        && !targets_archive_root_elsewhere(public, name))
+}
+
+/// Whether `public`'s immediate target, or where its chain finally resolves,
+/// lies inside a marked archive root or a directory named like `name`'s root,
+/// wherever that tree lives.
+///
+/// The resolved target catches a client chain into a relocated root and a
+/// relative link whose `..` the kernel resolves through a symlinked
+/// directory. The name test also refuses a launcher in a development clone
+/// laid out like `github.com/<owner>/<repo>`; that fails closed, as every
+/// missing root behind a link did before.
+fn targets_archive_root_elsewhere(public: &Path, name: &str) -> bool {
+    let inside = |target: &Path| {
+        target.ancestors().skip(1).any(|dir| {
+            dir.ends_with(name)
+                || fs::symlink_metadata(dir.join(ARCHIVE_LAYOUT_FILE))
+                    .is_ok_and(|metadata| metadata.is_file())
+        })
+    };
+    crate::cleanup::immediate_symlink_target(public).is_some_and(|target| inside(&target))
+        || fs::canonicalize(public).is_ok_and(|target| inside(&target))
 }
 
 /// Backfills the marker for a proven legacy archive during a mutating update.

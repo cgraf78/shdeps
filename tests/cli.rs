@@ -293,6 +293,9 @@ enum InstallerRoot {
     ParkedSymlinkLauncher,
     /// The command pinned into a release other than the active one.
     StalePin,
+    /// A recorded release whose root is gone entirely behind a client's
+    /// symlink launcher: update recreates the root and keeps the launcher.
+    MissingRootSymlinkLauncher,
     /// An adoption interrupted after parking the root link: finished by update.
     Parked,
     /// The same symlinked root without the installer's ownership marker.
@@ -345,12 +348,16 @@ fn installer_root_fixture(name: &str, shape: InstallerRoot) -> Fixture {
     fs::create_dir_all(public.parent().unwrap()).unwrap();
     if matches!(
         shape,
-        InstallerRoot::AdoptableSymlinkLauncher | InstallerRoot::ParkedSymlinkLauncher
+        InstallerRoot::AdoptableSymlinkLauncher
+            | InstallerRoot::ParkedSymlinkLauncher
+            | InstallerRoot::MissingRootSymlinkLauncher
     ) {
         fixture.write_executable("overlay/tool", "#!/bin/sh\nexec launcher\n");
         symlink("../overlay/tool", &public).unwrap();
     }
-    if matches!(shape, InstallerRoot::ParkedSymlinkLauncher) {
+    if matches!(shape, InstallerRoot::MissingRootSymlinkLauncher) {
+        // Neither a root nor a parked root link remains.
+    } else if matches!(shape, InstallerRoot::ParkedSymlinkLauncher) {
         symlink(
             ".tool-standalone/current",
             fixture.dir.join("share/owner/tool.shdeps-parked-root"),
@@ -416,6 +423,7 @@ fn health_agrees_with_update_on_every_release_root() {
         (InstallerRoot::AdoptableSymlinkLauncher, false),
         (InstallerRoot::ParkedSymlinkLauncher, false),
         (InstallerRoot::StalePin, true),
+        (InstallerRoot::MissingRootSymlinkLauncher, false),
         (InstallerRoot::Parked, false),
         (InstallerRoot::Unmanaged, true),
         (InstallerRoot::AdoptedStaleLock, false),
@@ -441,7 +449,9 @@ fn health_agrees_with_update_on_every_release_root() {
         );
         assert_eq!(update_refused, refused, "{shape:?}: {update_out}");
         match shape {
-            InstallerRoot::AdoptableSymlinkLauncher | InstallerRoot::ParkedSymlinkLauncher => {
+            InstallerRoot::AdoptableSymlinkLauncher
+            | InstallerRoot::ParkedSymlinkLauncher
+            | InstallerRoot::MissingRootSymlinkLauncher => {
                 assert_eq!(health.status.code(), Some(0), "{shape:?}: {rows}");
                 assert!(fs::symlink_metadata(&root).unwrap().is_dir(), "{shape:?}");
                 assert_eq!(
