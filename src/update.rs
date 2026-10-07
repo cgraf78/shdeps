@@ -10768,6 +10768,132 @@ version() { printf 'saw-pkg\n'; }
 
     #[test]
     #[cfg(unix)]
+    fn update_github_release_recreates_missing_root_behind_symlink_launcher() {
+        // A removed root behind a public link normally blocks the upgrade,
+        // since the link could be someone else's. A provable client launcher
+        // is preserved by the install, so the root is recreated behind it.
+        let mut fixture = Fixture::new("release-overlay-launcher-missing-root");
+        fixture.write_lib();
+        let (public, target) = overlay_launcher(&fixture, "tool");
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+        fixture.client = archive_release_client("v1.0.0", b"v1");
+        assert!(!run_tool_release(&fixture, &runner, Options::default()).has_errors());
+        let root = fixture.roots.install_dir.join("owner/tool");
+        fs::remove_dir_all(&root).unwrap();
+
+        let summary = run_tool_release(
+            &fixture,
+            &runner,
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        );
+
+        assert!(!summary.has_errors(), "{summary:#?}");
+        assert_eq!(fs::read(root.join("bin/tool")).unwrap(), b"v1");
+        assert!(root.join(".shdeps-release-layout").is_file());
+        assert_eq!(fs::read_link(&public).unwrap(), target);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_refuses_missing_root_behind_link_into_relocated_archive() {
+        // After the install base moved, the command still names the old
+        // marked root. That link is unrecorded, so it looks foreign, but it is
+        // this dependency's old command: recreating the root behind it would
+        // report success while the command keeps running the old payload.
+        let mut fixture = Fixture::new("release-relocated-archive-link");
+        fixture.write_lib();
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+        fixture.client = archive_release_client("v1.0.0", b"v1");
+        assert!(!run_tool_release(&fixture, &runner, Options::default()).has_errors());
+        let old_root = fixture.roots.home.join("old-share/owner/tool");
+        fs::create_dir_all(old_root.parent().unwrap()).unwrap();
+        fs::rename(fixture.roots.install_dir.join("owner/tool"), &old_root).unwrap();
+        let public = fixture.roots.bin_dir.join("tool");
+        fs::remove_file(&public).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &public).unwrap();
+
+        let summary = run_tool_release(
+            &fixture,
+            &runner,
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        );
+
+        assert!(summary.has_errors(), "{summary:#?}");
+        assert_eq!(fs::read_link(&public).unwrap(), old_root.join("bin/tool"));
+        assert!(!fixture.roots.install_dir.join("owner/tool").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_refuses_missing_root_behind_chain_into_relocated_archive() {
+        // A client chain that reaches the relocated root still runs the old
+        // payload, so its final resolution keeps the refusal too.
+        let mut fixture = Fixture::new("release-relocated-archive-chain");
+        fixture.write_lib();
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+        fixture.client = archive_release_client("v1.0.0", b"v1");
+        assert!(!run_tool_release(&fixture, &runner, Options::default()).has_errors());
+        let old_root = fixture.roots.home.join("old-share/owner/tool");
+        fs::create_dir_all(old_root.parent().unwrap()).unwrap();
+        fs::rename(fixture.roots.install_dir.join("owner/tool"), &old_root).unwrap();
+        let overlay = fixture.roots.home.join("overlay/bin/tool");
+        fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(old_root.join("bin/tool"), &overlay).unwrap();
+        let public = fixture.roots.bin_dir.join("tool");
+        fs::remove_file(&public).unwrap();
+        std::os::unix::fs::symlink("../overlay/bin/tool", &public).unwrap();
+
+        let summary = run_tool_release(
+            &fixture,
+            &runner,
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        );
+
+        assert!(summary.has_errors(), "{summary:#?}");
+        assert_eq!(
+            fs::read_link(&public).unwrap(),
+            Path::new("../overlay/bin/tool")
+        );
+        assert!(!fixture.roots.install_dir.join("owner/tool").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_github_release_refuses_missing_root_behind_its_own_link() {
+        // The launcher exception never extends to Shdeps' own dangling link:
+        // a removed root behind it stays a refusal, as before.
+        let mut fixture = Fixture::new("release-own-link-missing-root");
+        fixture.write_lib();
+        let runner = FakeRunner::default().with_success("uname", ["-m"], "x86_64\n");
+        fixture.client = archive_release_client("v1.0.0", b"v1");
+        assert!(!run_tool_release(&fixture, &runner, Options::default()).has_errors());
+        let root = fixture.roots.install_dir.join("owner/tool");
+        fs::remove_dir_all(&root).unwrap();
+
+        let summary = run_tool_release(
+            &fixture,
+            &runner,
+            Options {
+                force: true,
+                ..Options::default()
+            },
+        );
+
+        assert!(summary.has_errors(), "{summary:#?}");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn update_github_release_reinstalls_missing_payload_behind_symlink_launcher() {
         // With the payload gone the launcher cannot work, whatever it reports,
         // so the update must restore the payload and still keep the launcher.

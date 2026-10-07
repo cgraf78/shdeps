@@ -587,7 +587,7 @@ otherwise each problem is one line of exactly five tab-separated fields:
 | `not-executable`         | fail     | A public command resolves to a non-executable file                                           |
 | `dangling-link`          | warn     | A tracked man page or completion link (`<name>.links`) dangles                               |
 | `not-installed`          | warn     | A configured `github*`, `cargo`, `go`, `uv`, or `npm` dependency has no recorded install, or a `pkg` dependency's command is not on `PATH` (see below) |
-| `install-root-unmanaged` | fail     | `shdeps update` would refuse to upgrade a `github:release` root (symlinked, unmarked, missing behind a public link, or corrupt marker) |
+| `install-root-unmanaged` | fail     | `shdeps update` would refuse to upgrade a `github:release` root (symlinked, unmarked, missing behind a public link other than a client's symlink launcher, or corrupt marker) |
 | `archive-backup`         | warn     | An interrupted archive update left a `*.shdeps-archive-backup-*` sibling                     |
 | `deferred-post`          | warn     | A `post()` hook needed sudo without a terminal; run `shdeps update` from a terminal           |
 | `deferred-uninstall`     | warn     | An `uninstall()` hook needed sudo without a terminal; run `shdeps prune` from a terminal      |
@@ -603,8 +603,10 @@ launcher a client deliberately placed there) is not a problem: shdeps
 preserves such files. The same holds for a working symlink launcher in front
 of an archive release. A dangling one is reported as `dangling-binlink` with
 a hint to repair or remove it, because `shdeps update` deliberately leaves it
-alone; like a regular launcher, it is checked only when the archive links no
-helper commands, since health then inspects the tracked helper links instead. `pending-post`, `recovery-state`, `archive-backup`,
+alone, and a non-executable one gets a hint to repair it rather than
+reinstall. Like a regular launcher, it is checked only when the archive
+links no helper commands, since health then inspects the tracked helper
+links instead. `pending-post`, `recovery-state`, `archive-backup`,
 `stale-remote`, and `temp-tree` are omitted while the recorded state-lock
 owner is still running, because that update or prune is creating and retiring
 them itself. `stale-remote` compares stamps with each other rather than with

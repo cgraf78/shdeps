@@ -526,6 +526,50 @@ fn dangling_symlink_launcher_is_not_sent_to_update() {
 }
 
 #[test]
+fn non_executable_symlink_launcher_is_not_sent_to_reinstall() {
+    let fixture = Fixture::new("non-executable-symlink-launcher");
+    let public = release_behind_symlink_launcher(&fixture);
+    fs::set_permissions(
+        fixture.path("overlay/bin/tool"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        keys(&output),
+        [key("fail", "owner/tool", "not-executable", &public)]
+    );
+    let detail = &rows(&output)[0][4];
+    assert!(detail.contains("repair the launcher"), "{detail}");
+    assert!(!detail.contains("--reinstall"), "{detail}");
+}
+
+#[test]
+fn non_executable_payload_behind_launcher_chain_is_sent_to_reinstall() {
+    // A launcher chain that ends in the dependency's own payload is repaired
+    // by a reinstall, so that hint stays.
+    let fixture = Fixture::new("launcher-chain-non-executable-payload");
+    fixture.append("conf/deps.conf", "owner/tool github:release tool\n");
+    let payload = fixture.write("share/owner/tool/bin/tool", "#!/bin/sh\n");
+    fixture.write("share/owner/tool/.shdeps-release-layout", "v1 archive\n");
+    fixture.link(&payload, "overlay/bin/tool");
+    let public = fixture.link(Path::new("../overlay/bin/tool"), "bin/tool");
+    fixture.append(
+        "state/manifest",
+        &format!("owner/tool|github:release|tool|{}\n", public.display()),
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 1);
+    let detail = &rows(&output)[0][4];
+    assert!(detail.contains("--reinstall"), "{detail}");
+}
+
+#[test]
 fn symlinked_release_root_from_another_installer_is_unmanaged() {
     // Shape of the standalone-installer incident: the stable root is a link
     // to `.tool-standalone/current`, which shdeps refuses to upgrade.

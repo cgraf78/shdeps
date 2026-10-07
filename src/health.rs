@@ -596,14 +596,7 @@ impl<'a> Scan<'a> {
             let target = match fs::metadata(public) {
                 Ok(target) => target,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    if release
-                        && github_release_install::is_foreign_launcher(
-                            &self.roots.state_dir,
-                            &self.roots.install_dir,
-                            package,
-                            public,
-                        )
-                    {
+                    if release && self.is_launcher(package, public) {
                         self.push_dangling_launcher(package, link);
                     } else {
                         self.push_dangling(LinkKind::Bin, package, public);
@@ -635,7 +628,16 @@ impl<'a> Scan<'a> {
                 return;
             }
             if !executable(&target) {
-                self.push_not_executable(package, link);
+                // A launcher chain that ends in the dependency's own payload
+                // is repaired by a reinstall; anything else is the client's.
+                let root = self.roots.install_dir.join(package);
+                let client_target = release
+                    && self.is_launcher(package, public)
+                    && !matches!(
+                        (fs::canonicalize(public), fs::canonicalize(&root)),
+                        (Ok(resolved), Ok(root)) if resolved.starts_with(&root)
+                    );
+                self.push_not_executable(package, link, client_target);
             }
             return;
         }
@@ -644,20 +646,42 @@ impl<'a> Scan<'a> {
         // launcher a client deliberately put in front of the command; shdeps
         // preserves both, so only a broken (non-executable) one is a problem.
         if !executable(&metadata) {
-            self.push_not_executable(package, link);
+            self.push_not_executable(package, link, false);
         }
     }
 
-    fn push_not_executable(&mut self, package: &str, link: &dep_links::DependencyLink) {
+    /// Reports a command that does not execute; `launcher` marks a client's
+    /// symlink launcher whose target a reinstall cannot repair.
+    fn push_not_executable(
+        &mut self,
+        package: &str,
+        link: &dep_links::DependencyLink,
+        launcher: bool,
+    ) {
+        let hint = if launcher {
+            "repair the launcher link's target; shdeps preserves links it did not create"
+        } else {
+            "run 'shdeps --reinstall update'"
+        };
         self.push(
             ProblemKind::NotExecutable,
             Some(package),
             Some(&link.public_path),
-            format!(
-                "command '{}' is not executable; run 'shdeps --reinstall update'",
-                link.command
-            ),
+            format!("command '{}' is not executable; {hint}", link.command),
         );
+    }
+
+    /// Whether `public` is a client's launcher link in front of a release,
+    /// which `update` never repairs, so its problems must send the owner to
+    /// the launcher rather than back to `update`. Evaluated only once a
+    /// problem is found, since it reads the manifest.
+    fn is_launcher(&self, package: &str, public: &Path) -> bool {
+        github_release_install::is_foreign_launcher(
+            &self.roots.state_dir,
+            &self.roots.install_dir,
+            package,
+            public,
+        )
     }
 
     /// Reports a broken client launcher link. `update` preserves links it did

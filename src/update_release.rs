@@ -646,7 +646,13 @@ pub(crate) fn install_request(
             && context.prior_release
             && archive != github_release_install::ArchiveState::Proven
             && !adopting
-            && github_release_install::path_entry_exists(request.public_bin)?);
+            && github_release_install::path_entry_exists(request.public_bin)?
+            && !github_release_install::launcher_fronts_missing_root(
+                &context.roots.state_dir,
+                &context.roots.install_dir,
+                request.public_bin,
+                request.name,
+            )?);
     if format_changed {
         // Switching between archive and single-file releases is not a normal
         // update: each layout owns different paths, and making the conversion

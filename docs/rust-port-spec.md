@@ -958,7 +958,13 @@ Behavior:
   switch, and never used as version evidence once a release is recorded:
   freshness probes the command inside a marked root (or the standalone
   installer's adoptable root), found by the install's own binary search
-  without following links, and treats a missing payload as not installed. Clients can require this contract with
+  without following links, and treats a missing payload as not installed.
+  A recorded release whose root (and parked root link) is gone behind such a
+  launcher is reinstalled rather than refused, since the launcher cannot be
+  replaced, unless the link's immediate or resolved target lies in a marked
+  archive root or a directory named like this root elsewhere (a relocated install base),
+  which is this dependency's old command and keeps the refusal; `health`
+  applies the same predicate so the two cannot drift. Clients can require this contract with
   the `release-archive-symlink-launcher-preservation-v1` capability; older
   Shdeps lacking it replaces such links on install. Raw and compressed
   single-binary assets retain the Bash behavior
