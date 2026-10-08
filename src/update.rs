@@ -10465,8 +10465,8 @@ version() { printf 'saw-pkg\n'; }
     #[test]
     #[cfg(unix)]
     fn update_github_release_adopts_standalone_bin_layout() {
-        // termnav and grafhome-ca package their command as `bin/<cmd>`, so the
-        // installer's public link targets `<root>/bin/<cmd>`.
+        // Some releases (termnav, for example) package their command as
+        // `bin/<cmd>`, so the installer's public link targets `<root>/bin/<cmd>`.
         use std::os::unix::fs::symlink;
 
         let mut fixture = Fixture::new("release-standalone-bin-layout");
