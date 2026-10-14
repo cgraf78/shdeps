@@ -1533,6 +1533,42 @@ impl OwnedChild {
         Ok(leader_exited)
     }
 
+    /// Observes a failed leader without relinquishing its cleanup authority.
+    ///
+    /// Hook failures, including an authenticated retry request, cannot finish
+    /// their intended work through surviving descendants. Stop that boundary
+    /// promptly instead of spending the hook deadline waiting for pipe EOF.
+    pub(crate) fn exited_unsuccessfully(&mut self) -> std::io::Result<bool> {
+        let failed = match observe_exit(self.child.as_mut().expect("owned child available"))? {
+            Some(ObservedTermination::Exited(code)) => code != 0,
+            Some(ObservedTermination::Signaled(_)) => true,
+            _ => false,
+        };
+        // Avoid a topology scan for every still-running or successful trivial
+        // hook; the existing drained-output fast path owns those completions.
+        if failed {
+            return self.exited();
+        }
+        Ok(false)
+    }
+
+    /// Waits for the whole bounded command tree, including silent descendants.
+    ///
+    /// Output EOF alone is insufficient: a daemon can redirect both streams
+    /// while retaining lifetime descriptors inherited from our consumer. Keep
+    /// the leader unreaped so the caller's existing timeout or cancellation
+    /// still has safe authority to stop the complete boundary.
+    pub(crate) fn wait_if_exited_and_tree_drained(
+        &mut self,
+    ) -> std::io::Result<Option<ExitStatus>> {
+        #[cfg(unix)]
+        if self.boundary.lifetime_has_holders()? == Some(true) {
+            let _ = self.exited()?;
+            return Ok(None);
+        }
+        self.wait_if_exited_and_output_drained()
+    }
+
     /// Reaps a completed non-terminal leader once all of its output has
     /// drained, then proves whether the subreaper has any remaining children.
     ///
@@ -4560,7 +4596,7 @@ fn process_snapshot(deadline: Instant) -> Option<Vec<ProcessInfo>> {
                     if Instant::now() >= deadline {
                         return None;
                     }
-                    return Some((process.pgid, process.sid, process.identity.start));
+                    Some((process.pgid, process.sid, process.identity.start))
                 }
                 #[cfg(not(target_vendor = "apple"))]
                 let pgid = process_group(pid)?;

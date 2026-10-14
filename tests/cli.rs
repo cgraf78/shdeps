@@ -4798,6 +4798,175 @@ fn update_current_custom_hook_never_probes_or_prompts_for_sudo() {
 }
 
 #[test]
+fn custom_hook_waits_for_silent_descendants_and_releases_outer_lease() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt as _;
+
+    let fixture = Fixture::new("custom-hook-silent-finite-descendant");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  (/bin/sleep 1; printf done >"$SHDEPS_STATE_DIR/helper.done") </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/helper.pid"
+}
+"#,
+    );
+    let (mut reader, writer) = UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let fd = writer.as_raw_fd();
+    let mut command = fixture.command(["update"]);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Emulate a supervising consumer's lifetime lease. A helper that closes
+    // its output still inherits this descriptor, independently of Shdeps' own.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(writer);
+    let output = child.wait_with_output().unwrap();
+    let pid = wait_for_pid_opt(&fixture.dir.join("state/helper.pid"), Duration::ZERO);
+    let _guard = pid.and_then(EscapedProcessGuard::new_if_present);
+    assert_success(&output);
+    assert!(
+        fixture.dir.join("state/helper.done").exists(),
+        "hook returned before its finite helper completed"
+    );
+    assert!(
+        matches!(reader.read(&mut [0]), Ok(0)),
+        "successful provider retained its consumer's lease"
+    );
+}
+
+#[test]
+fn custom_hook_cleans_silent_descendant_before_trusted_sudo_retry() {
+    let fixture = custom_sudo_fixture("custom-sudo-silent-descendant", &["tool"]);
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { test -f "$SHDEPS_STATE_DIR/tool-installed"; }
+install() {
+  if [ ! -f "$SHDEPS_TEST_SUDO_CACHE" ]; then
+    /bin/sh -c '
+      trap '\''printf stopped >"$SHDEPS_STATE_DIR/helper.stopped"; exit 0'\'' TERM
+      printf "%s\n" "$$" >"$SHDEPS_STATE_DIR/helper.pid"
+      i=0
+      while [ "$i" -lt 15000 ]; do /bin/sleep 0.02; i=$((i + 1)); done
+    ' </dev/null >/dev/null 2>&1 &
+    i=0
+    while [ ! -s "$SHDEPS_STATE_DIR/helper.pid" ] && [ "$i" -lt 10000 ]; do
+      /bin/sleep 0.01; i=$((i + 1))
+    done
+  fi
+  shdeps_require_sudo || return $?
+  test -f "$SHDEPS_STATE_DIR/helper.stopped" || return 1
+  printf installed >"$SHDEPS_STATE_DIR/tool-installed"
+}
+"#,
+    );
+    let mut command = custom_sudo_command(&fixture, ["update"]);
+    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "3");
+    let output = run_on_terminal(&mut command);
+    let pid = wait_for_pid_opt(&fixture.dir.join("state/helper.pid"), Duration::ZERO);
+    let _guard = pid.and_then(EscapedProcessGuard::new_if_present);
+    assert_success(&output);
+    assert!(fixture.dir.join("state/helper.stopped").exists());
+    let log = fs::read_to_string(fixture.dir.join("sudo.log")).unwrap();
+    assert_eq!(log.matches("parent sudo true\n").count(), 1, "{log}");
+    assert!(!process_is_running(pid.expect("silent helper pid")));
+}
+
+#[test]
+fn custom_hook_timeout_stops_silent_descendant_after_leader_exit() {
+    let fixture = Fixture::new("custom-hook-silent-timeout");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  /bin/sleep 300 </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/helper.pid"
+}
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command.env("SHDEPS_HOOK_TIMEOUT_SECS", "1");
+    let output = run(&mut command);
+    let pid = wait_for_pid_opt(&fixture.dir.join("state/helper.pid"), Duration::ZERO);
+    let _guard = pid.and_then(EscapedProcessGuard::new_if_present);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "silent helper bypassed deadline: {output:?}"
+    );
+    let pid = pid.expect("silent helper pid");
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(pid),
+        "silent helper cleanup",
+    );
+}
+
+#[test]
+fn parent_signal_stops_silent_hook_descendant_after_leader_exit() {
+    let fixture = Fixture::new("custom-hook-silent-cancellation");
+    fixture.write("conf/deps.conf", "tool custom\n");
+    fixture.write(
+        "conf/hooks.d/tool.sh",
+        r#"
+exists() { return 1; }
+install() {
+  /bin/sleep 300 </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$SHDEPS_STATE_DIR/helper.pid"
+  printf '%s\n' "$$" >"$SHDEPS_STATE_DIR/hook.pid"
+}
+"#,
+    );
+    let mut command = fixture.command(["update"]);
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = spawn_test_session(&mut command);
+    let pid = wait_for_pid(
+        &fixture.dir.join("state/helper.pid"),
+        LIVENESS_TIMEOUT,
+        "silent helper pid",
+    );
+    let _guard = EscapedProcessGuard::new(pid);
+    let hook_pid = wait_for_pid(
+        &fixture.dir.join("state/hook.pid"),
+        LIVENESS_TIMEOUT,
+        "hook leader pid",
+    );
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(hook_pid),
+        "hook leader exit before cancellation",
+    );
+    signal_process(child.id(), libc::SIGTERM);
+    let status = wait_for_child_exit_bounded(&mut child, LIVENESS_TIMEOUT);
+    assert_eq!(
+        status
+            .expect("Shdeps cancelled within its cleanup deadline")
+            .code(),
+        Some(128 + libc::SIGTERM)
+    );
+    wait_until(
+        Duration::from_secs(2),
+        || !process_is_running(pid),
+        "cancelled silent helper cleanup",
+    );
+}
+
+#[test]
 fn custom_hook_timeout_still_kills_its_detached_grandchild() {
     let fixture = Fixture::new("custom-hook-timeout-grandchild");
     fixture.write("conf/deps.conf", "tool custom\n");

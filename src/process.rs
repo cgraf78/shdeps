@@ -525,7 +525,7 @@ fn run_command_with_isolation(
         }
         let output_drained = stdout_reader.is_finished() && stderr_reader.is_finished();
         if output_drained {
-            if let Some(status) = child.wait_if_exited_and_output_drained()? {
+            if let Some(status) = child.wait_if_exited_and_tree_drained()? {
                 break Some(status);
             }
         } else if !leader_exited {
@@ -1325,6 +1325,42 @@ printf %s "$pid"; exit 1"#;
                  cleanup: state={state:?}"
             );
         }
+    }
+
+    #[test]
+    fn timed_run_waits_for_silent_descendant_completion() {
+        let dir = crate::test_support::temp_dir("timed-silent-descendant");
+        let done = dir.join("done");
+        let output = super::run(
+            "sh",
+            &[
+                "-c",
+                "(sleep 1; printf done >\"$1\") </dev/null >/dev/null 2>&1 & exit 0",
+                "sh",
+                done.to_str().unwrap(),
+            ],
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert!(output.success);
+        assert!(
+            done.exists(),
+            "timed command returned before its silent descendant completed"
+        );
+    }
+
+    #[test]
+    fn timed_run_stops_silent_descendant_at_deadline() {
+        let output = super::run(
+            "sh",
+            &["-c", "sleep 300 </dev/null >/dev/null 2>&1 & exit 0"],
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+        assert!(
+            output.timed_out,
+            "silent descendant escaped timeout: {output:?}"
+        );
     }
 
     #[test]
