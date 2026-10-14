@@ -215,24 +215,33 @@ fn run_hook_command_with(
     // is still terminated at the configured deadline.
     let deadline = Instant::now() + timeout;
     let mut leader_exited = false;
+    let mut timed_out = false;
     let (status, interrupted, stopped_boundary) = loop {
         if cancellation::received_signal().is_some() {
             break (child.stop(cancellation::TERMINATE_SIGNAL)?, true, true);
         }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break (child.stop(cancellation::KILL_SIGNAL)?, false, true);
+        }
+        // A failed leader has no successful background work to await. Retain
+        // its status (notably the trusted sudo retry request) while cleaning
+        // its descendants now, rather than confusing cleanup with a timeout.
+        if child.exited_unsuccessfully()? {
+            let interrupted = cancellation::received_signal().is_some();
+            break (
+                child.stop(cancellation::TERMINATE_SIGNAL)?,
+                interrupted,
+                true,
+            );
+        }
         let output_drained = stdout_handle.is_finished() && stderr_handle.is_finished();
         if output_drained {
-            if let Some(status) = child.wait_if_exited_and_output_drained()? {
+            if let Some(status) = child.wait_if_exited_and_tree_drained()? {
                 break (status, false, false);
             }
         } else if !leader_exited {
             leader_exited = child.exited()?;
-        }
-        if Instant::now() >= deadline {
-            // Hook timed out. Signal the whole process group so any
-            // grandchildren the hook backgrounded are reaped too —
-            // otherwise they keep the inherited pipes open and the
-            // reader threads hang past the timeout.
-            break (child.stop(cancellation::KILL_SIGNAL)?, false, true);
         }
         thread::sleep(HOOK_WAIT_POLL);
     };
@@ -257,6 +266,12 @@ fn run_hook_command_with(
     };
     let stdout = stdout?;
     let stderr = stderr?;
+    // A retained zombie can have exited successfully before its descendants
+    // hit the deadline. Its cached status cannot turn that timeout into a
+    // successful hook completion.
+    if timed_out {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "hook timed out"));
+    }
     let completed = signal_policy == SignalPolicy::ReportSuccess && status.success();
     if !completed && (interrupted || cancellation::received_signal().is_some()) {
         return Err(io::Error::other("interrupted by signal"));
