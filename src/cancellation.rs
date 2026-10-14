@@ -1547,6 +1547,13 @@ impl OwnedChild {
         // Avoid a topology scan for every still-running or successful trivial
         // hook; the existing drained-output fast path owns those completions.
         if failed {
+            #[cfg(unix)]
+            if self.boundary.lifetime_has_holders()? == Some(false) {
+                // Missing optional hook functions also return nonzero. With
+                // lease EOF they need only the ordinary fast reap,
+                // not a full teardown scan for each metadata probe.
+                return Ok(false);
+            }
             return self.exited();
         }
         Ok(false)
