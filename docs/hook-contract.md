@@ -58,8 +58,8 @@ controlling terminal `update` runs no sudo for the request and does not retry:
 it defers a post (kept pending, one warning, not a failure) or fails an
 install. Quiet hooks still get `1` from `shdeps_require_sudo` (fallbacks keep
 working) but leave a note, so a quiet post or uninstall that then fails without
-a terminal is deferred the same way. The authenticated
-retry must keep closed stdin and its own killable process group but remain in the parent's session so
+a terminal is deferred the same way. The authenticated retry must keep closed
+stdin and its own killable process group but remain in the parent's session so
 terminal-scoped sudo timestamps and subsequent direct `sudo` commands work.
 Keep quiet mode noninteractive, preserve the direct helper's normal prompt
 behavior outside hooks, and never prompt for an `install()` that was skipped

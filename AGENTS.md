@@ -28,8 +28,8 @@ link it instead of copying it here.
 
 - Public `shdeps_*` functions in `shdeps.sh` stay one-line shims unless they
   must affect the caller's shell (`shdeps_dep_source`, changed-marker
-  coordination). Put new behavior in Rust behind `__api`, covered by
-  `tests/shell/shdeps-wrapper-test`.
+  coordination). Put new wrapper-facing behavior in Rust behind `__api`,
+  covered by `tests/shell/shdeps-wrapper-test`.
 - Hook execution and `shdeps_require_sudo` follow `docs/hook-contract.md`.
 - `install.sh` must run under stock macOS Bash 3.2. The sourceable API and hook
   prelude require Bash 4.3+.
@@ -43,7 +43,7 @@ link it instead of copying it here.
 
 ## Testing
 
-CI runs, and local runs should match:
+The commands CI runs:
 
 ```bash
 cargo test --locked
@@ -59,6 +59,13 @@ tests/shell/helpers-test && tests/shell/install-sh-test &&
 ```
 
 - The ignored `cli` tests are wall-clock budgets; run them serially.
+- `lua-api-test`, `lua-bootstrap-test`, and the Lua part of `examples-test`
+  skip without a standalone `lua`; the `zsh` part of `completion-test` skips
+  without `zsh`. CI's `base` shell profile has no `lua` on any platform and no
+  `zsh` on the Ubuntu, Debian, or Arch legs, so green CI does not cover them.
+  Run them locally after touching `lua/`, `completions/`, or `examples/`.
+- `scripts/smoke-install-bash32.sh` meets stock Bash 3.2 only in CI's macOS
+  `bash32` job; `/bin/bash` on Linux is Bash 5.
 - The shared Rust gate also runs `cargo fmt --check`,
   `cargo clippy --locked --all-targets --all-features -- -D warnings`,
   `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps`,
@@ -81,6 +88,10 @@ tests/shell/helpers-test && tests/shell/install-sh-test &&
 - Files listed in `scripts/.release-scripts.manifest` are vendored byte for
   byte from that commit; don't edit them here. `scripts/release.conf` and
   `scripts/release-smoke-hook.sh` are repo-owned.
+- `tests/shell/release-scripts-test` pins text in `release.yml` and
+  `test.yml`, including the package-smoke and Termux host commands, and
+  requires `msrv-toolchain` in `test.yml` to equal `rust-version` in
+  `Cargo.toml`. Edit the workflow and that test together.
 - `retry-infrastructure.yml` keys on the workflow name `Tests`; don't rename it.
 
 ## Release
