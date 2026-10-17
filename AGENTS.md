@@ -33,7 +33,7 @@ link it instead of copying it here.
 - Hook execution and `shdeps_require_sudo` follow `docs/hook-contract.md`.
 - `install.sh` must run under stock macOS Bash 3.2. The sourceable API and hook
   prelude require Bash 4.3+.
-- MSRV is 1.85 (`rust-version` in `Cargo.toml`), and `Cargo.toml` sets
+- MSRV is 1.88 (`rust-version` in `Cargo.toml`), and `Cargo.toml` sets
   `warnings = "deny"`, so a local warning fails the build.
 - `tests/health.rs` asserts every health problem token appears in both
   `README.md` and `man/man1/shdeps.1`.
@@ -70,7 +70,7 @@ tests/shell/helpers-test && tests/shell/install-sh-test &&
   `cargo clippy --locked --all-targets --all-features -- -D warnings`,
   `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps`,
   `cargo audit --file Cargo.lock`, and
-  `cargo check --locked --all-targets --all-features` on the 1.85 toolchain.
+  `cargo check --locked --all-targets --all-features` on the 1.88 toolchain.
 - Termux CI compiles `tests/termux-pidfd-signal.c` with
   `-Wall -Wextra -Werror` and runs `scripts/termux-ci.sh` against the packaged
   release binary.

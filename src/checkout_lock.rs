@@ -248,7 +248,7 @@ fn checkout_hex(checkout: &Path) -> String {
 fn valid_hex(value: &str, max_len: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_len
-        && value.len() % 2 == 0
+        && value.len().is_multiple_of(2)
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())

@@ -23,7 +23,7 @@ jobs:
       # shared required gate instead of leaving the README badge aspirational.
       # The shared defaults own Clippy's locked all-target/all-feature scope and
       # rustdoc's locked missing-doc lint; local copies would add a drift site.
-      msrv-toolchain: "1.85"
+      msrv-toolchain: "1.88"
       # Cancellation tests fork Python fixtures (fork/setsid ladders, pid
       # publishers, the published-pid watchdog). Minimal Rust images do not
       # otherwise install its interpreter.
