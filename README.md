@@ -376,6 +376,12 @@ usable release command with an update-pending warning and retries on the next
 update. Fresh installations and `--reinstall` require a compatible asset and
 fail if it is unavailable. Download and checksum failures remain errors.
 
+A release metadata check that fails (an exhausted API quota or a GitHub outage)
+keeps a usable installed command and retries on the next update, but reports it
+as a warning, not as current: the installed release may be out of date. A
+missing command and `--reinstall` still fail. Hosts sharing one egress IP share
+the unauthenticated quota, so set `GH_TOKEN` for unattended fleet updates.
+
 ### `cargo` — Rust Crates
 
 Installs crates from crates.io via `cargo install --locked --root "$SHDEPS_INSTALL_DIR/<name>" <name>`. Binaries land in a per-dep install directory and are symlinked into `$SHDEPS_BIN_DIR`.

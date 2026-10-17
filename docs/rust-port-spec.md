@@ -912,6 +912,11 @@ Behavior:
 - Dependency name is GitHub `owner/repo`.
 - `.git` suffix spelling is canonicalized.
 - Latest release JSON is fetched from GitHub API unless cached/prefetched.
+- When that fetch fails for a usable installed command (rate limit, outage)
+  and `--reinstall` is not set, the command MUST be kept, the failure MUST stay
+  non-fatal and MUST NOT refresh the release stamp, and the item MUST produce a
+  structured warning in human and JSONL output; it MUST NOT be reported as
+  current.
 - Runtime GitHub credential precedence is `GH_TOKEN`, then `GITHUB_TOKEN`, then
   `gh auth token`.
 - `GH_TOKEN` support is a compatibility-safe expansion over the Bash reference.
