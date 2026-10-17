@@ -888,6 +888,19 @@ fn quarantine_matching_with(
                 }
                 match rename_noreplace(&quarantine, path) {
                     Ok(()) => return Ok(false),
+                    // A newer entry already holds the name, so the foreign
+                    // link we displaced is obsolete. Shared public names hit
+                    // this when several dependencies relink in the parallel
+                    // pool; failing would turn the update red and strand the
+                    // hidden link. A displaced regular file is still kept.
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::AlreadyExists
+                            && fs::symlink_metadata(&quarantine)
+                                .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+                    {
+                        fs::remove_file(&quarantine)?;
+                        return Ok(false);
+                    }
                     Err(error) => {
                         return Err(std::io::Error::other(format!(
                             "tracked link changed during cleanup; preserved replacement at {} after restore failed: {error}",
@@ -1507,6 +1520,89 @@ mod tests {
 
         assert!(!removed);
         assert_eq!(fs::read_to_string(public).unwrap(), "replacement command");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owned_unlink_drops_displaced_foreign_link_when_a_newer_link_wins() {
+        // Three dependencies sharing a name: another one retargets the link
+        // before the claim, and a third publishes the name again before the
+        // restore. The newest link stays and the displaced one is not left
+        // behind under a hidden quarantine name.
+        let fixture = Fixture::new("unlink-restore-race");
+        let managed = fixture.roots.install_dir.join("managed");
+        let public = fixture.roots.bin_dir.join("tool");
+        let foreign = fixture.roots.install_dir.join("other/bin/tool");
+        let newest = fixture.roots.install_dir.join("third/bin/tool");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(managed.join("bin/tool"), &public).unwrap();
+        let mut calls = 0;
+
+        let removed = quarantine_matching_with(
+            &public,
+            |claimed| symlink_targets_any_root(claimed, std::slice::from_ref(&managed)),
+            |source, destination| {
+                calls += 1;
+                if calls == 1 {
+                    fs::remove_file(source)?;
+                    symlink(&foreign, source)?;
+                } else {
+                    symlink(&newest, destination)?;
+                }
+                crate::repo_transition::rename_noreplace(source, destination)
+            },
+        )
+        .unwrap();
+
+        assert!(!removed);
+        assert_eq!(fs::read_link(&public).unwrap(), newest);
+        let leftovers: Vec<_> = fs::read_dir(&fixture.roots.bin_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "tool")
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owned_unlink_keeps_displaced_regular_file_when_restore_collides() {
+        let fixture = Fixture::new("unlink-restore-regular");
+        let managed = fixture.roots.install_dir.join("managed");
+        let public = fixture.roots.bin_dir.join("tool");
+        fs::create_dir_all(&fixture.roots.bin_dir).unwrap();
+        symlink(managed.join("bin/tool"), &public).unwrap();
+        let mut calls = 0;
+
+        let error = quarantine_matching_with(
+            &public,
+            |claimed| symlink_targets_any_root(claimed, std::slice::from_ref(&managed)),
+            |source, destination| {
+                calls += 1;
+                if calls == 1 {
+                    fs::remove_file(source)?;
+                    fs::write(source, "user command")?;
+                } else {
+                    // A symlink winner, as another pool dep would publish:
+                    // what decides is the displaced entry, not the winner.
+                    symlink(
+                        fixture.roots.install_dir.join("third/bin/tool"),
+                        destination,
+                    )?;
+                }
+                crate::repo_transition::rename_noreplace(source, destination)
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("preserved replacement"));
+        let preserved: Vec<_> = fs::read_dir(&fixture.roots.bin_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path != &public)
+            .collect();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(fs::read_to_string(&preserved[0]).unwrap(), "user command");
     }
 
     #[test]
