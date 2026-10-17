@@ -99,3 +99,5 @@ tests/shell/helpers-test && tests/shell/install-sh-test &&
 From a clean, green `main`, run `scripts/release.sh --push` (see the README's
 Releasing section). The shared `rust-release` workflow publishes Linux musl,
 macOS, and Android aarch64 and x86_64 archives.
+
+Verify published assets using the shared [attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
