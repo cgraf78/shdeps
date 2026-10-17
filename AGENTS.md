@@ -1,236 +1,101 @@
 # AGENTS.md
 
-This file provides context for AI agents when working in this repo.
-
 ## About
 
-**shdeps** is a standalone shell dependency manager. It reads declarative
-config files (`*.conf`) from a config directory and installs/updates tools
-via system package managers, GitHub repos, or GitHub release binaries.
-Post-install hooks let callers run arbitrary setup after each dependency
-changes.
+shdeps installs and updates CLI tools from declarative `*.conf` files. The Rust
+crate and binary (`src/`) own all behavior. `shdeps.sh` is a thin sourceable
+Bash wrapper over the hidden `shdeps __api ...` bridge. The README is the user
+reference for config format, methods, environment variables, state, and extras;
+link it instead of copying it here.
 
-## Architecture
+## Layout
 
-- **Rust crate and binary (`src/`)** — the behavior owner for the CLI,
-  install/update logic, state handling, hook execution, and hidden `__api`
-  bridge used by shell callers.
-- **`shdeps.sh`** — sourceable Bash compatibility wrapper for the Rust
-  implementation. Existing callers still do:
-  `source shdeps.sh; shdeps_update`.
-- **`tests/shell/`** — shell-owned test suites for the sourceable wrapper,
-  installer, and release scripts.
-- **`install.sh`** — curl-pipeable installer and bootstrap script. It installs
-  release archives when available, can build explicit source checkouts, symlinks
-  the CLI into `~/.local/bin`, and supports `--uninstall` plus sourceable
-  `--bootstrap` for client integration.
-- **`tests/shell/shdeps-wrapper-test`** — focused tests for the sourceable
-  Rust-era wrapper API.
-- **Files listed in `scripts/.release-scripts.manifest`** — generated verbatim
-  from the `cgraf78/actions` commit in `.github/cgraf78-actions.lock`. Do not
-  edit them here: the same consumer sync that updates workflow pins owns these
-  files so executable code cannot drift from the reviewed action commit.
-  `scripts/release.conf` and `scripts/release-smoke-hook.sh` are intentionally
-  repo-owned; they define shdeps-specific inputs and runtime smoke assertions.
+- `src/`: CLI, install/update/prune logic, state, hooks, and the `__api` bridge.
+  `src/extras.rs` holds the man page and completion discovery globs.
+- `shdeps.sh`: sourceable wrapper. `install.sh`: curl-pipeable installer and
+  sourceable `--bootstrap`; repo-owned here (not generated).
+- `tests/*.rs`: Cargo integration tests. `tests/shell/*`: wrapper, installer,
+  completion, Lua, and release-script suites (see `tests/shell/README.md`).
+  `tests/termux-pidfd-signal.c`: Termux pidfd fixture.
+- `scripts/`: release tooling. `smoke-install-bash32.sh` and `termux-ci.sh`
+  are CI entry points.
+- `docs/`: Rust port spec and plan, `checkout-lock-v1.md`, and
+  `hook-contract.md` (hook, toolkit, and sudo retry invariants).
+- `lua/`, `man/man1/shdeps.1`, `completions/`. `demo/record.sh` regenerates
+  `demo/demo.gif`.
 
-## Code Organization
+## Invariants
 
-- `shdeps.sh` must stay small: public `shdeps_*` functions should be one-line
-  delegating shims unless the helper genuinely must affect the caller's current
-  shell, such as `shdeps_dep_source` or changed-marker coordination.
-- Hidden `shdeps __api ...` commands are the contract between the Bash wrapper
-  and Rust. Keep that bridge narrow, documented, and covered by wrapper tests.
-- Rust modules should own real behavior. Prefer adding Rust APIs and CLI/API
-  tests over growing Bash wrapper logic.
-
-## Configuration
-
-All behavior is controlled via environment variables (no hardcoded paths):
-
-| Variable             | Default                                            | Description                                                                                                |
-| -------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `SHDEPS_CONF_DIR`    | `${XDG_CONFIG_HOME:-~/.config}/shdeps/`            | Config directory (all `*.conf` files loaded)                                                               |
-| `SHDEPS_HOOKS_DIR`   | `<conf_dir>/hooks.d`                               | Post-install hooks                                                                                         |
-| `SHDEPS_STATE_DIR`   | `${XDG_STATE_HOME:-$HOME/.local/state}/shdeps`     | Cache/state dir                                                                                            |
-| `SHDEPS_FORCE`       | `0`                                                | Bypass TTL cache                                                                                           |
-| `SHDEPS_BOOTSTRAP_FORCE` | `0`                                          | Force provider freshness during bootstrap without forcing dependency updates                              |
-| `SHDEPS_REINSTALL`   | `0`                                                | Force reinstall all deps                                                                                   |
-| `SHDEPS_QUIET`       | `0`                                                | Suppress non-result output and interactive prompts                                                             |
-| `SHDEPS_REMOTE_TTL`  | `3600`                                             | Cache TTL in seconds                                                                                       |
-| `SHDEPS_SELF_UPDATE_TTL` | `3600`                                         | Self-update attempt TTL for `shdeps update`                                                                |
-| `SHDEPS_GIT_DEV_DIR` | `~/git`                                            | Dev clone directory for the `github:repo` method                                                           |
-| `SHDEPS_INSTALL_DIR` | `~/.local/share`                                   | Base directory for `github:*`, `cargo`, `go`, `uv`, and `npm` installs (each dep lives in `<dir>/<name>/`) |
-| `SHDEPS_BIN_DIR`     | `~/.local/bin`                                     | Directory for binary symlinks                                                                              |
-| `SHDEPS_LUA_DIR`     | `~/.local/lib/shdeps`                              | Installer-owned stable link to the active Shdeps Lua API tree                                              |
-| `SHDEPS_LOG_LEVEL`   | `1`                                                | Logging: 0=quiet, 1=normal, 2=verbose                                                                      |
-| `SHDEPS_JOBS`        | auto (`nproc`)                                     | Max concurrent probes and parallel non-package installs (`github*`, `cargo`, `go`, `uv`, `npm`). Explicit values win; `1` = sequential. |
-| `SHDEPS_STATE_LOCK_TIMEOUT_SECS` | `1800`                                | Max seconds a mutating command waits for another live `update`/`prune` holder before failing with metadata. |
-| `SHDEPS_CHECKOUT_LOCK_TIMEOUT_SECS` | `1800`                             | Max seconds a `github:repo` mutation waits for the shared installer/Shdeps checkout lock; strict nonnegative decimal, at most 9 digits. |
-
-## Config File Format
-
-```text
-# name              method           [cmd]            [aliases]                [filter]
-jq                  pkg
-bat                 pkg              apt:batcat
-fd                  pkg              apt:fdfind       apt:fd-find,dnf:fd-find
-cgraf78/ds          github
-cgraf78/ds          github:repo
-neovim/neovim       github:release   nvim
-ripgrep             cargo            rg
-github.com/junegunn/fzf              go
-ruff                uv
-nerd-fonts          custom
-openai/codex        github:release   -                -                        host:nas
-dust                pkg              -                -                        os:macos
-ast-grep            pkg              ast-grep         brew:ast-grep,pacman:ast-grep mgr:brew,mgr:pacman
-ast-grep            cargo            -                -                        mgr:!brew,mgr:!pacman
-```
-
-Methods: `pkg` (system package manager), `github` (auto-resolve to release or repo), `github:repo` (GitHub clone), `github:release` (GitHub release binary), `cargo` (Rust crate), `go` (Go module), `uv` (Python CLI tool), `npm` (Node.js package), `custom` (hook-only).
-Fields are ordered most-used to least-used. For `github`/`github:repo`/`github:release`, the `owner/repo` is the `name` field. For `go`, the full module path (e.g. `github.com/junegunn/fzf`) is the `name`. `cmd` supports `mgr:name` qualifiers (e.g., `apt:batcat`). `aliases` holds per-manager package name overrides for `pkg` deps. `filter` uses `os:`, `host:`, and `mgr:` prefixes (e.g., `os:linux`, `host:nas`, `mgr:brew`, `mgr:!pacman`). Termux exposes `mgr:android`.
-
-## State Tracking
-
-shdeps tracks installed deps in a manifest file at
-`$SHDEPS_STATE_DIR/manifest`. Each line is pipe-delimited:
-`name|method|cmd|install_path`. Written automatically during `shdeps update`.
-
-When a dep is removed from config (or every config entry for its name is
-filtered out on this host) but still in the manifest, `shdeps update` prints
-an orphan notice. Run `shdeps prune` to remove orphaned artifacts. Only
-stable identities count (`os:`, and `mgr:` once a manager was detected);
-`host:` filters never make a dep orphaned.
-
-## Extras Linking
-
-shdeps auto-discovers man pages and shell completions from `github`
-installs and symlinks them to XDG user-local directories. `cargo`, `go`,
-`uv`, and `npm` installs produce single binaries only — users should generate
-extras from the tool itself in a `post()` hook:
-
-| Type             | Target                                        | Auto-discovered?     |
-| ---------------- | --------------------------------------------- | -------------------- |
-| Man pages        | `~/.local/share/man/man<N>/`                  | No — needs `MANPATH` |
-| Bash completions | `~/.local/share/bash-completion/completions/` | Yes                  |
-| Zsh completions  | `~/.local/share/zsh/site-functions/`          | No — needs `fpath`   |
-| Fish completions | `~/.local/share/fish/vendor_completions.d/`   | Yes                  |
-
-Discovery uses pattern constants in `src/extras.rs`. Adding a new convention =
-appending one glob to the appropriate list and covering it with an extras unit
-test.
-
-State tracking: each dep's linked symlinks are recorded in
-`$SHDEPS_STATE_DIR/<name>.links`. On re-link (update), stale symlinks are
-cleaned before new ones are created. When the install root is gone, update
-removes only tracked symlinks that dangle into that root and keeps anything
-re-pointed elsewhere. On prune, the hidden
-`shdeps __api unlink-extras` bridge removes all tracked symlinks.
-
-## Hook Contract
-
-Hook files in `hooks.d/$name.sh` may define these functions (for `github:*`
-and `go` deps, hooks go in a nested path mirroring the `name` — e.g.
-`hooks.d/owner/repo.sh` or `hooks.d/github.com/owner/repo.sh`):
-
-- `exists(name)` — **required for `custom`**. Returns 0 if the dep is installed.
-- `install(name)` — **required for `custom`**. Called when `exists` returns 1.
-- `version(name)` — return version string.
-- `post(name)` — post-install setup. Runs after any change; a failed post
-  stays pending and is retried on the next update.
-- `uninstall(name)` — **optional**. Called by `shdeps prune` when removing
-  an orphaned dep (any method). For custom deps, this is the only cleanup.
-  For other methods, runs before the built-in cleanup — use it to reverse
-  what `post()` created (symlinks, config files). A failed or unsourceable
-  hook keeps the manifest row and built-in payload for the next prune to
-  retry, and prune exits 1; a hook that succeeded is recorded and not rerun.
-  A hook that needs sudo when prune has no terminal is deferred instead: no
-  `sudo` runs, the row is kept, one warning is printed (without a terminal,
-  only when the deferred set changes; `prune --dry-run` always shows it), and
-  prune exits 0.
-
-### Hook helper toolkit
-
-Fallback-install hooks may call these public helpers instead of re-implementing
-the plumbing. Like every `shdeps_*` function they are thin one-line shims; the
-behavior lives in Rust (`src/hook_toolkit.rs`, bridged through `__api`).
-
-- `shdeps_skip <dep> [reason]` — record a `.skipped` marker (with an optional
-  reason) under the dependency's install dir, e.g. when no runtime is available.
-- `shdeps_skipped <dep>` — predicate: `0` if the dep is marked skipped.
-- `shdeps_skip_reason <dep>` — print the recorded reason; `1` if not skipped.
-- `shdeps_unskip <dep>` — remove the marker.
-- `shdeps_find_runtime [--path DIR]... [--reject SUBSTR] [--verify] <name>...` —
-  print the first executable found in the `--path` dirs then `$PATH`. `--reject`
-  drops a candidate whose `--version` output contains `SUBSTR`; `--verify`
-  requires a successful `--version`. Exit `1` when none qualifies.
-- `shdeps_write_wrapper [--env VAR=value]... <name> <interp> [args...] -- <payload>`
-  — write an executable `<bin_dir>/<name>` that execs
-  `<interp> <args...> <payload> "$@"`. `--env` lines are emitted before the exec
-  (e.g. a gem `PATH=...:$PATH`). Prints the wrapper path.
-
-Initial mutating hook subprocesses are deliberately detached with closed stdin
-so cancellation and timeouts can kill their complete session.
-`shdeps_require_sudo` must not prompt from that detached child: after a failed
-`sudo -n` probe it requests authentication from the attached parent, which
-pauses progress, runs the prompt, and retries the hook once. Without a
-controlling terminal `update` runs no sudo for the request and does not retry:
-it defers a post (kept pending, one warning, not a failure) or fails an
-install. Quiet hooks still get `1` from `shdeps_require_sudo` (fallbacks keep
-working) but leave a note, so a quiet post or uninstall that then fails without
-a terminal is deferred the same way. The authenticated
-retry must keep closed
-stdin and its own killable process group but remain in the parent's session so
-terminal-scoped sudo timestamps and subsequent direct `sudo` commands work.
-Keep quiet mode noninteractive, preserve the direct helper's normal prompt
-behavior outside hooks, and never prompt for an `install()` that was skipped
-because `exists()` already succeeded.
-JSONL progress adapters that render on the controlling terminal can set
-`SHDEPS_PROGRESS_PROMPT_ACK` to a private FIFO. Shdeps opens its nonblocking
-read end before it flushes the `prompt` event, then waits up to five seconds for
-an exact `ready\n` token before writing the visible prompt status to `/dev/tty`
-and invoking sudo. The consumer suspends its display, opens the FIFO
-write-only/nonblocking, and writes the token; the exact token alone completes
-the acknowledgement, so the writer may stay open and closing is optional.
-`ENXIO` means there is no live acknowledgement reader. Without the variable, JSONL progress remains
-standalone-compatible and does not wait.
-Hooks are trusted same-user code, but the request file still requires a private,
-parent-created regular file and a no-follow open on Unix; do not weaken that
-defense or treat an exit status alone as a prompt request.
-The retry restarts the hook function, so hooks that need sudo must call
-`shdeps_require_sudo` before any side effect. If an install attempt changes its
-`exists()` result before requesting sudo, the retry fails closed instead of
-silently accepting the partial installation or running it twice.
-
-## Code Quality
-
-- ShellCheck must pass on every program in `.github/shellcheck-files.txt`;
-  the shared CI inventory gate rejects newly discovered shell programs until
-  they are reviewed and classified.
-- All variables quoted, edge cases handled, return codes checked
-- Comments explain WHY, not WHAT
-- Every function has a brief comment explaining purpose and params
+- Public `shdeps_*` functions in `shdeps.sh` stay one-line shims unless they
+  must affect the caller's shell (`shdeps_dep_source`, changed-marker
+  coordination). Put new wrapper-facing behavior in Rust behind `__api`,
+  covered by `tests/shell/shdeps-wrapper-test`.
+- Hook execution and `shdeps_require_sudo` follow `docs/hook-contract.md`.
+- `install.sh` must run under stock macOS Bash 3.2. The sourceable API and hook
+  prelude require Bash 4.3+.
+- MSRV is 1.85 (`rust-version` in `Cargo.toml`), and `Cargo.toml` sets
+  `warnings = "deny"`, so a local warning fails the build.
+- `tests/health.rs` asserts every health problem token appears in both
+  `README.md` and `man/man1/shdeps.1`.
+- dot pins shdeps' `install.sh` by revision, sha256, and wrapper ABI in its
+  `support/shdeps.lock`. Changing `install.sh` or the wrapper ABI needs a dot
+  repin.
 
 ## Testing
 
-Run the test suite:
+The commands CI runs:
 
 ```bash
 cargo test --locked
 cargo test --locked --test cli -- --ignored --test-threads=1
-tests/shell/helpers-test
-tests/shell/install-sh-test
-tests/shell/install-interruption-test
-tests/shell/completion-test
-tests/shell/examples-test
-tests/shell/installer-flow-test
-tests/shell/lua-api-test
-tests/shell/lua-bootstrap-test
-tests/shell/release-scripts-test
-SHDEPS_RUST_CLI=target/debug/shdeps tests/shell/shdeps-wrapper-test
+cargo build --release --locked
+SHDEPS_RUST_CLI=target/release/shdeps tests/shell/shdeps-wrapper-test
+tests/shell/helpers-test && tests/shell/install-sh-test &&
+  tests/shell/install-interruption-test && tests/shell/completion-test &&
+  tests/shell/examples-test && tests/shell/installer-flow-test &&
+  tests/shell/lua-api-test && tests/shell/lua-bootstrap-test &&
+  tests/shell/release-scripts-test
+/bin/bash scripts/smoke-install-bash32.sh
 ```
 
-The second Cargo command runs the four wall-clock performance budgets serially.
-They are ignored by the first command so concurrent functional tests cannot
-distort their timings; CI requires both commands on every standard Rust matrix
-platform.
+- The ignored `cli` tests are wall-clock budgets; run them serially.
+- `lua-api-test`, `lua-bootstrap-test`, and the Lua part of `examples-test`
+  skip without a standalone `lua`; the `zsh` part of `completion-test` skips
+  without `zsh`. CI's `base` shell profile has no `lua` on any platform and no
+  `zsh` on the Ubuntu, Debian, or Arch legs, so green CI does not cover them.
+  Run them locally after touching `lua/`, `completions/`, or `examples/`.
+- `scripts/smoke-install-bash32.sh` meets stock Bash 3.2 only in CI's macOS
+  `bash32` job; `/bin/bash` on Linux is Bash 5.
+- The shared Rust gate also runs `cargo fmt --check`,
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`,
+  `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps`,
+  `cargo audit --file Cargo.lock`, and
+  `cargo check --locked --all-targets --all-features` on the 1.85 toolchain.
+- Termux CI compiles `tests/termux-pidfd-signal.c` with
+  `-Wall -Wextra -Werror` and runs `scripts/termux-ci.sh` against the packaged
+  release binary.
+
+## CI and generated files
+
+- CI's ShellCheck job fails on any shell program missing from
+  `.github/shellcheck-files.txt` (untracked files included) and on stale rows;
+  the local suites do not detect this. Before pushing, run
+  `bash <actions@lock>/.github/actions/shellcheck-inventory/run.sh "$PWD" .github/shellcheck-files.txt`
+  from a cgraf78/actions checkout at the SHA in `.github/cgraf78-actions.lock`.
+- `.github/cgraf78-actions.lock` and every `uses: cgraf78/actions/...@sha`
+  move together, only via `consumer-ci/sync.sh <this checkout>` run from
+  cgraf78/actions at the locked SHA.
+- Files listed in `scripts/.release-scripts.manifest` are vendored byte for
+  byte from that commit; don't edit them here. `scripts/release.conf` and
+  `scripts/release-smoke-hook.sh` are repo-owned.
+- `tests/shell/release-scripts-test` pins text in `release.yml` and
+  `test.yml`, including the package-smoke and Termux host commands, and
+  requires `msrv-toolchain` in `test.yml` to equal `rust-version` in
+  `Cargo.toml`. Edit the workflow and that test together.
+- `retry-infrastructure.yml` keys on the workflow name `Tests`; don't rename it.
+
+## Release
+
+From a clean, green `main`, run `scripts/release.sh --push` (see the README's
+Releasing section). The shared `rust-release` workflow publishes Linux musl,
+macOS, and Android aarch64 and x86_64 archives.
