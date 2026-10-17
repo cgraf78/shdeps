@@ -127,22 +127,24 @@ fn safe_entry_path(path: &Path) -> io::Result<Option<PathBuf>> {
     Ok(Some(safe))
 }
 
-fn safe_zip_path(entry: &zip::read::ZipFile<'_>) -> io::Result<PathBuf> {
-    // `ZipFile::enclosed_name` handles absolute paths and `..` traversal, but
-    // zip archives created on Windows can carry backslashes. On Unix those are
+fn safe_zip_path(entry: &zip::read::ZipFile<'_, impl Read>) -> io::Result<PathBuf> {
+    // `ZipFile::enclosed_name` checks traversal but zip 9 strips absolute
+    // roots. Reject those explicitly to retain our fail-closed policy.
+    // Archives created on Windows can carry backslashes. On Unix those are
     // legal filename bytes, which would make an archive that looks like
     // `bin\tool` fail binary discovery and could hide malicious intent. Reject
     // them uniformly so release archives use one portable path grammar.
-    if entry.name().contains('\\') {
+    let name = entry.name()?;
+    if name.starts_with('/') || name.contains('\\') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsafe zip path {}", entry.name()),
+            format!("unsafe zip path {name}"),
         ));
     }
     entry.enclosed_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsafe zip path {}", entry.name()),
+            format!("unsafe zip path {name}"),
         )
     })
 }
@@ -157,7 +159,7 @@ fn reject_links(kind: EntryType) -> io::Result<()> {
     Ok(())
 }
 
-fn reject_zip_link(entry: &zip::read::ZipFile<'_>) -> io::Result<()> {
+fn reject_zip_link(entry: &zip::read::ZipFile<'_, impl Read>) -> io::Result<()> {
     if let Some(mode) = entry.unix_mode() {
         if mode & 0o170000 == 0o120000 {
             return Err(io::Error::new(
@@ -170,7 +172,7 @@ fn reject_zip_link(entry: &zip::read::ZipFile<'_>) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn set_zip_mode(path: &Path, entry: &zip::read::ZipFile<'_>) -> io::Result<()> {
+fn set_zip_mode(path: &Path, entry: &zip::read::ZipFile<'_, impl Read>) -> io::Result<()> {
     if let Some(mode) = entry.unix_mode() {
         fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))?;
     }
@@ -178,7 +180,7 @@ fn set_zip_mode(path: &Path, entry: &zip::read::ZipFile<'_>) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_zip_mode(_path: &Path, _entry: &zip::read::ZipFile<'_>) -> io::Result<()> {
+fn set_zip_mode(_path: &Path, _entry: &zip::read::ZipFile<'_, impl Read>) -> io::Result<()> {
     Ok(())
 }
 
@@ -349,19 +351,26 @@ mod tests {
     }
 
     #[test]
-    fn unpack_zip_rejects_traversal_absolute_and_backslash_paths() {
+    fn unpack_zip_rejects_traversal_and_backslash_paths() {
         let dest = temp_dir("zip-paths");
 
         let traversal =
             unpack_zip(&zip(&[ZipEntry::file("../escape", b"x", 0o644)]), &dest).unwrap_err();
-        let absolute =
-            unpack_zip(&zip(&[ZipEntry::file("/tmp/escape", b"x", 0o644)]), &dest).unwrap_err();
         let backslash =
             unpack_zip(&zip(&[ZipEntry::file("bin\\tool", b"x", 0o755)]), &dest).unwrap_err();
 
         assert_eq!(traversal.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(absolute.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(backslash.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn unpack_zip_rejects_absolute_paths_without_extracting_relative_files() {
+        let dest = temp_dir("zip-absolute");
+        let error =
+            unpack_zip(&zip(&[ZipEntry::file("/tmp/escape", b"x", 0o644)]), &dest).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!dest.join("tmp").exists());
     }
 
     #[test]
