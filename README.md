@@ -1,10 +1,11 @@
 # shdeps
 
-![Tests](https://github.com/cgraf78/shdeps/actions/workflows/test.yml/badge.svg?branch=main)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-%3E%3D1.88-orange.svg)](https://www.rust-lang.org/)
-[![Bash API](https://img.shields.io/badge/bash%20API-%3E%3D4.3-blue.svg)](https://www.gnu.org/software/bash/)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20Android-lightgrey.svg)](#)
+[![Tests](https://github.com/cgraf78/shdeps/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/shdeps/actions/workflows/test.yml?query=branch%3Amain)
+[![Latest release](https://img.shields.io/github/release-date/cgraf78/shdeps?display_date=published_at&label=latest%20release)](https://github.com/cgraf78/shdeps/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-%3E%3D1.88-blue)](Cargo.toml)
+[![Bash API](https://img.shields.io/badge/bash%20API-%3E%3D4.3-blue)](#bash-api)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20Termux-lightgrey)](#quick-start)
 
 Declare your shell tools in one config file. shdeps installs and updates them everywhere — brew, apt, dnf, pacman, zypper, apk, GitHub repos, or GitHub release binaries. One manifest, any machine.
 
@@ -657,6 +658,8 @@ usage-error status, which is also what a Shdeps release without `health`
 returns for the unknown command, so callers can treat `2` as "unsupported".
 
 ## Bash API
+
+Sourcing `shdeps.sh` requires Bash 4.3 or newer.
 
 ```bash
 export SHDEPS_CONF_DIR="$HOME/.config/myapp"
