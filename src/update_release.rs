@@ -65,7 +65,11 @@ pub(crate) fn install_with_prefetch(
         install_request(&request, &mut request_context)?
     };
     cancellation::check()?;
-    if !outcome.failed && outcome.warning.is_none() {
+    // An unavailable asset deliberately leaves ownership untouched. A failed
+    // metadata check still records the retained command: the manifest is the
+    // ownership record, while freshness lives in the stamp, which that path
+    // leaves stale so the next run retries.
+    if !outcome.failed && outcome.warning != Some(ItemReason::ReleaseAssetUnavailable) {
         // Ordering matters: write the manifest record BEFORE refreshing the
         // TTL stamp. If a crash/SIGINT lands between the two writes, the next
         // shdeps run must see "stamp older than manifest" (re-evaluate) rather
@@ -509,14 +513,16 @@ pub(crate) fn install_request(
                     // exhaust unauthenticated API quota long before anything
                     // is actually stale, so preserve the working tool and try
                     // again on the next run instead of turning a transient API
-                    // failure into a broken `dot update`. Rate-limited checks
-                    // say so in the detail so stale "current" rows are
-                    // distinguishable from verified ones.
+                    // failure into a broken `dot update`. The check still
+                    // failed, though: report a warning rather than a current
+                    // row, or a host whose shared unauthenticated quota is
+                    // exhausted every interval keeps an old release while
+                    // each update claims everything is current.
                     let detail = match (current_version, failure) {
                         (Some(version), github::FetchFailure::RateLimited) => {
                             format!("{version} (update check rate-limited)")
                         }
-                        (Some(version), _) => version,
+                        (Some(version), _) => format!("{version} (update check failed)"),
                         (None, github::FetchFailure::RateLimited) => {
                             "update check rate-limited".to_owned()
                         }
@@ -534,7 +540,7 @@ pub(crate) fn install_request(
                     return Ok(ReleaseOutcome {
                         changed: false,
                         failed: false,
-                        warning: None,
+                        warning: Some(ItemReason::ReleaseMetadataUnavailable),
                         detail,
                         // Transient metadata failure: preserve the working
                         // binary but do NOT refresh the TTL stamp so the

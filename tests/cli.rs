@@ -3677,6 +3677,72 @@ fn update_warns_rate_limit_before_concrete_prerequisite_failure() {
     );
 }
 
+/// Hosts behind one egress IP can exhaust the unauthenticated quota on every
+/// cron interval. A kept release whose check was rate-limited must reach the
+/// parent (dot) as a warning, not as one more current dependency, or the host
+/// silently runs an old release while every update reports success.
+#[test]
+fn update_reports_rate_limited_release_check_as_warning() {
+    let fixture = Fixture::new("update-rate-limited-release-warning");
+    fixture.write("conf/deps.conf", "owner/tool github:release tool\n");
+    fixture.write_executable("bin/tool", "#!/bin/sh\nprintf 'tool 1.0.0\\n'\n");
+    let manifest = format!(
+        "owner/tool|github:release|tool|{}\n",
+        fixture.dir.join("bin/tool").display()
+    );
+    fixture.write("state/manifest", &manifest);
+    // Both the public redirect probe and the REST fallback are refused, as
+    // when the shared quota is spent.
+    fixture.write_executable(
+        "fakebin/curl",
+        "#!/bin/sh\nprintf 'curl: (22) The requested URL returned error: 403\\n' >&2\nprintf '\\n403\\n'\nexit 22\n",
+    );
+
+    let mut command = fixture.command(["--force", "update"]);
+    command
+        .env("SHDEPS_PROGRESS", "jsonl")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/bin:/bin",
+                fixture.dir.join("bin").display(),
+                fixture.dir.join("fakebin").display()
+            ),
+        )
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("SHDEPS_ALLOW_GH_AUTH_TOKEN");
+    let output = run(&mut command);
+
+    // Still non-fatal: the working binary is kept and the update succeeds.
+    assert_success(&output);
+    let events = jsonl(&output.stdout);
+    assert!(
+        events.iter().any(|event| event["event"] == "item"
+            && event["name"] == "owner/tool"
+            && event["status"] == "warning"
+            && event["detail"] == "1.0.0 (update check rate-limited)"),
+        "expected a warning item in {events:#?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event"] == "summary"
+            && event["status"] == "warning"
+            && event["warnings"] == 1
+            && event["current"] == 0
+            && event["failed"] == 0),
+        "expected a warning summary in {events:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("bin/tool")).unwrap(),
+        "#!/bin/sh\nprintf 'tool 1.0.0\\n'\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.dir.join("state/manifest")).unwrap(),
+        manifest
+    );
+    assert!(!fixture.dir.join("state/owner/tool.release.stamp").exists());
+}
+
 #[test]
 fn update_quiet_environment_suppresses_normal_output() {
     let fixture = Fixture::new("update-quiet-env");

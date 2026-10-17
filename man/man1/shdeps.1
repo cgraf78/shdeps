@@ -338,6 +338,12 @@ installations, and explicit
 .B \-\-reinstall
 still fail without a compatible asset. Download and checksum failures remain
 errors. Shdeps does not fall back to arbitrary older releases.
+A failed release metadata check (an exhausted API quota or a GitHub outage)
+keeps a usable installed command with a non-fatal warning rather than
+reporting it current, and does not refresh release freshness; a missing
+command and
+.B \-\-reinstall
+still fail.
 .TP
 .B cargo
 Installs Rust crates via

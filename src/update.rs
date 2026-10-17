@@ -119,6 +119,9 @@ pub enum ItemReason {
     RepoPullFailed,
     /// The owned release remains usable while upstream assets are unavailable.
     ReleaseAssetUnavailable,
+    /// An installed release was kept because its update check could not fetch
+    /// release metadata (rate limit, outage), so it may be out of date.
+    ReleaseMetadataUnavailable,
     /// Package manager override disabled this dependency.
     PackageManagerOverride,
     /// Package is unavailable on this host/package manager.
@@ -8951,7 +8954,12 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(!summary.has_errors());
         assert!(!summary.items[0].changed);
-        assert_eq!(summary.items[0].detail, "1.2.3");
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert_eq!(
+            summary.items[0].reason,
+            super::ItemReason::ReleaseMetadataUnavailable
+        );
+        assert_eq!(summary.items[0].detail, "1.2.3 (update check failed)");
         assert_eq!(fs::read(&bin_path).unwrap(), b"#!/bin/sh\n");
         assert_eq!(
             manifest::read(&manifest_path).unwrap().get("owner/tool"),
@@ -9350,7 +9358,25 @@ version() { printf 'saw-pkg\n'; }
 
         assert!(!summary.has_errors());
         assert!(!summary.items[0].changed);
+        // A kept binary whose check failed is not verified current: it must
+        // count as a warning, or an exhausted shared quota reads as healthy.
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
+        assert_eq!(
+            summary.items[0].reason,
+            super::ItemReason::ReleaseMetadataUnavailable
+        );
         assert_eq!(summary.items[0].detail, "1.0.0 (update check rate-limited)");
+        // Ownership is still recorded, but the TTL stamp stays stale so the
+        // next run retries the check instead of trusting this one.
+        assert!(
+            manifest::read(&manifest_path)
+                .unwrap()
+                .get("owner/tool")
+                .is_some()
+        );
+        assert!(
+            !crate::stamp::remote_path(&fixture.roots.state_dir, "owner/tool", "release").exists()
+        );
     }
 
     #[test]
@@ -9409,6 +9435,7 @@ version() { printf 'saw-pkg\n'; }
         .unwrap();
 
         assert!(!summary.has_errors());
+        assert_eq!(summary.items[0].status, super::ItemStatus::Warning);
         assert_eq!(summary.items[0].detail, "release metadata unavailable");
     }
 
