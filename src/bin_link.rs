@@ -140,17 +140,15 @@ pub fn from_dir(
     // removed from config before another update runs.
     link_state::recover_reconcile(&state_path)?;
 
+    // A stale command may since have been retargeted by another dependency
+    // that now publishes the same name; remove only links still pointing into
+    // this install, and tolerate a concurrent removal.
+    let owner_roots = link_state::owner_roots(install_dir);
     for stale in tracked.iter().filter(|path| !desired.contains(*path)) {
-        if is_symlink(stale) {
-            fs::remove_file(stale)?;
-        }
+        crate::cleanup::unlink_owned_symlink(stale, &owner_roots)?;
     }
     link_state::write(&state_path, &created)?;
     Ok(created)
-}
-
-fn is_symlink(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 #[cfg(test)]
@@ -365,7 +363,9 @@ mod tests {
             let desired = bin_dir.join("tool");
             let stale = bin_dir.join("old-tool");
             let desired_source = install.join("bin/tool");
-            let stale_source = dir.join("old/tool");
+            // Under the install root but outside `bin/`: a command this repo
+            // used to publish, so the stale link is still its own.
+            let stale_source = install.join("old/tool");
             let state = link_state::path(&dir.join("state"), "owner/repo", Kind::Bin);
             write_executable(&desired_source);
             write_executable(&stale_source);
@@ -407,6 +407,67 @@ mod tests {
                 "phase {phase}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_from_dir_keeps_stale_command_another_dependency_retargeted() {
+        // Two repos can publish the same command while it moves between
+        // them. Once the other repo has retargeted the shared name, this
+        // repo dropping the command must not delete the other repo's link.
+        let dir = temp_dir("shared-name");
+        let install = dir.join("share/owner/old");
+        let other = dir.join("share/owner/new");
+        let bin_dir = dir.join("bin");
+        write_executable(&install.join("bin/shared"));
+        write_executable(&install.join("bin/own"));
+        write_executable(&other.join("bin/shared"));
+        super::from_dir(&dir.join("state"), &bin_dir, "owner/old", &install).unwrap();
+        fs::remove_file(bin_dir.join("shared")).unwrap();
+        symlink(other.join("bin/shared"), bin_dir.join("shared")).unwrap();
+        fs::remove_file(install.join("bin/shared")).unwrap();
+        fs::remove_file(install.join("bin/own")).unwrap();
+
+        let owned = super::from_dir(&dir.join("state"), &bin_dir, "owner/old", &install).unwrap();
+
+        assert!(owned.is_empty());
+        assert_eq!(
+            fs::read_link(bin_dir.join("shared")).unwrap(),
+            other.join("bin/shared")
+        );
+        assert!(
+            fs::symlink_metadata(bin_dir.join("own")).is_err(),
+            "its own stale command is still removed"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_from_dir_removes_stale_command_through_development_checkout() {
+        // A development checkout sits behind the managed root as a symlink.
+        // A link spelled with the checkout's physical path is still owned.
+        let dir = temp_dir("development-root");
+        let checkout = dir.join("git/repo");
+        let install = dir.join("share/owner/repo");
+        let bin_dir = dir.join("bin");
+        write_executable(&checkout.join("bin/tool"));
+        write_executable(&checkout.join("bin/old-tool"));
+        fs::create_dir_all(install.parent().unwrap()).unwrap();
+        symlink(&checkout, &install).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        let physical = fs::canonicalize(&checkout).unwrap();
+        symlink(physical.join("bin/old-tool"), bin_dir.join("old-tool")).unwrap();
+        link_state::write(
+            &link_state::path(&dir.join("state"), "owner/repo", Kind::Bin),
+            &[bin_dir.join("old-tool")],
+        )
+        .unwrap();
+        fs::remove_file(checkout.join("bin/old-tool")).unwrap();
+
+        let owned = super::from_dir(&dir.join("state"), &bin_dir, "owner/repo", &install).unwrap();
+
+        assert_eq!(owned, [bin_dir.join("tool")]);
+        assert!(fs::symlink_metadata(bin_dir.join("old-tool")).is_err());
     }
 
     fn write_executable(path: &PathBuf) {
