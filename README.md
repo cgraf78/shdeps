@@ -332,7 +332,9 @@ Public command relinking is desired-first. Shdeps inventories the complete
 repo `bin/` directory, records the exact intended link/target pairs before the
 first publication, publishes usable desired links, atomically records a
 superset recovery ledger, and only then removes stale tracked symlinks before
-writing final ownership. It never removes a previously live desired command
+writing final ownership. A stale link is removed only while it still points
+into the dependency's own install, so a command another dependency has since
+taken over keeps working. It never removes a previously live desired command
 before its replacement is published. After a crash, cleanup can claim every
 exact desired link that became live, while a later update publishes any
 remaining desired commands and converges the ledger. A regular file at a
@@ -485,7 +487,7 @@ export MANPATH="$HOME/.local/share/man:$MANPATH"
 fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
 ```
 
-Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdeps prune` removes symlinks along with the dep. Updates clean stale symlinks before re-linking, and retire tracked links left dangling by an install root that no longer exists.
+Symlinks are tracked per-dep in `$SHDEPS_STATE_DIR/<name>.links`. Running `shdeps prune` removes symlinks along with the dep. Updates clean stale symlinks that still point into the dep's install before re-linking (a name another dep has since taken over is left alone), and retire tracked links left dangling by an install root that no longer exists. A custom hook that calls `shdeps_link_extras` should pass the same install dir on every run, since only stale links pointing into that dir are removed.
 
 ## CLI Usage
 

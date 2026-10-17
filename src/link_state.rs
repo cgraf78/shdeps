@@ -232,6 +232,37 @@ pub fn unlink_tracked(path: &Path) -> Result<()> {
     .map(|_| ())
 }
 
+/// Removes tracked symlinks that still point into `install_dir`, then removes
+/// the state file.
+///
+/// Relinking uses this instead of [`unlink_tracked`]: two dependencies may
+/// publish the same public name (a command or man page moving between repos),
+/// and the other one may have retargeted it since this ledger recorded it.
+/// Removing that link would break the other dependency until its next update.
+/// A tracked link that points elsewhere stays in place and drops out of this
+/// ledger, since its current owner tracks it.
+pub(crate) fn unlink_tracked_owned(path: &Path, install_dir: &Path) -> Result<()> {
+    let roots = owner_roots(install_dir);
+    unlink_tracked_matching(path, |link| {
+        crate::cleanup::unlink_owned_symlink(link, &roots)
+    })
+    .map(|_| ())
+}
+
+/// Returns the roots whose links belong to a dependency installed at
+/// `install_dir`: the root as spelled in the links shdeps creates, plus its
+/// canonical path when that differs (a development checkout behind the
+/// managed root link).
+pub(crate) fn owner_roots(install_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![install_dir.to_path_buf()];
+    if let Ok(canonical) = fs::canonicalize(install_dir) {
+        if canonical != install_dir {
+            roots.push(canonical);
+        }
+    }
+    roots
+}
+
 /// Runs an ownership-aware unlink operation, then retires the state file.
 ///
 /// Cleanup callers use this to prove that a live symlink still belongs to the

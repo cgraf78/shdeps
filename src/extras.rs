@@ -69,7 +69,7 @@ pub fn link(
         return Ok(Vec::new());
     }
 
-    link_state::unlink_tracked(&state_path)?;
+    link_state::unlink_tracked_owned(&state_path, install_dir)?;
 
     let mut linker = Linker {
         install_base,
@@ -418,6 +418,19 @@ fn normalize_ancestor_perms(leaf: &Path) -> Result<()> {
 /// aware.
 #[cfg(unix)]
 pub(crate) fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
+    replace_symlink_with(source, target, |source, target| {
+        std::os::unix::fs::symlink(source, target)
+    })
+}
+
+/// [`replace_symlink`] with the create-when-absent step injectable, so tests
+/// can make another writer win the path between the lstat and the create.
+#[cfg(unix)]
+fn replace_symlink_with(
+    source: &Path,
+    target: &Path,
+    create: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<bool> {
     use std::os::unix::fs::symlink;
 
     // `symlink_metadata` does not follow symlinks, so a dangling symlink is
@@ -429,8 +442,20 @@ pub(crate) fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
             // No existing entry — `symlink` followed by no rename is
             // the simplest path. There is no TOCTOU window because
             // nothing to remove first.
-            symlink(source, target)?;
-            return Ok(true);
+            match create(source, target) {
+                Ok(()) => return Ok(true),
+                // Another dependency in the parallel pool published the
+                // same name since the lstat. Apply the ownership rule to
+                // what it left, then replace a symlink through the
+                // staging rename below like any existing link.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if fs::symlink_metadata(target).is_ok_and(|meta| !meta.file_type().is_symlink())
+                    {
+                        return Ok(false);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         Err(error) => return Err(error.into()),
     }
@@ -471,15 +496,14 @@ pub(crate) fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
             "target path has no file name",
         )
     })?;
-    let staging = parent.join(format!(
-        ".{}.shdeps-link.{}.{}",
-        file_name.to_string_lossy(),
-        std::process::id(),
+    let staging = staging_path(
+        parent,
+        file_name,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default(),
-    ));
+    );
     // Clean any stale staging file from a previous crashed run before
     // creating the new symlink — `symlink` errors out if the path
     // already exists.
@@ -487,12 +511,30 @@ pub(crate) fn replace_symlink(source: &Path, target: &Path) -> Result<bool> {
     symlink(source, &staging)?;
     if let Err(error) = fs::rename(&staging, target) {
         // Best-effort cleanup of the staging symlink so a failed
-        // rename does not leave a `.tool.1.shdeps-link.<pid>.<nanos>`
+        // rename does not leave a `.tool.1.shdeps-link.<pid>.<nanos>.<n>`
         // stub next to the target.
         let _ = fs::remove_file(&staging);
         return Err(error.into());
     }
     Ok(true)
+}
+
+/// Returns a staging path beside a link that no other caller in this process
+/// will use, even one passing the same clock reading `nanos`.
+///
+/// Parallel pool workers replace the same shared name at once, and two of
+/// them can read the same clock value; without the per-process counter they
+/// would share one staging path, so one worker's stale-staging cleanup would
+/// delete the other's link and fail its `symlink` or `rename`.
+#[cfg(unix)]
+fn staging_path(parent: &Path, file_name: &std::ffi::OsStr, nanos: u128) -> PathBuf {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    parent.join(format!(
+        ".{}.shdeps-link.{}.{nanos}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ))
 }
 
 #[cfg(test)]
@@ -928,6 +970,135 @@ mod tests {
 
         assert!(!dir.join("xdg/man/man1/tool.1").exists());
         assert!(!state_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relink_keeps_shared_page_another_dependency_retargeted() {
+        // Two deps can ship the same man page while it moves between them.
+        // Relinking one must not delete the page the other now provides.
+        let dir = temp_dir("shared-page");
+        let xdg = dir.join("xdg");
+        let install = xdg.join("owner/old");
+        let other = xdg.join("owner/new");
+        fs::create_dir_all(install.join("man/man1")).unwrap();
+        fs::create_dir_all(other.join("man/man1")).unwrap();
+        fs::write(install.join("man/man1/shared.1"), ".TH SHARED 1\n").unwrap();
+        fs::write(install.join("man/man1/own.1"), ".TH OWN 1\n").unwrap();
+        fs::write(other.join("man/man1/shared.1"), ".TH SHARED 1\n").unwrap();
+        let shared = xdg.join("man/man1/shared.1");
+        let own = xdg.join("man/man1/own.1");
+        let state = dir.join("state");
+        super::link(&state, &xdg, "owner/old", &install).unwrap();
+        fs::remove_file(&shared).unwrap();
+        std::os::unix::fs::symlink(other.join("man/man1/shared.1"), &shared).unwrap();
+        fs::remove_file(install.join("man/man1/shared.1")).unwrap();
+
+        let created = super::link(&state, &xdg, "owner/old", &install).unwrap();
+
+        assert_eq!(created, std::slice::from_ref(&own));
+        assert_eq!(
+            fs::read_link(&shared).unwrap(),
+            other.join("man/man1/shared.1")
+        );
+        assert_eq!(fs::read_link(&own).unwrap(), install.join("man/man1/own.1"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replace_symlink_takes_over_a_link_published_concurrently() {
+        // Another pool worker creates the same name between the lstat and the
+        // create; the create's EEXIST must fall through to the staging rename
+        // instead of failing the dependency.
+        let dir = temp_dir("eexist-link");
+        let source = dir.join("mine.1");
+        let theirs = dir.join("theirs.1");
+        let target = dir.join("man/man1/tool.1");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let replaced = super::replace_symlink_with(&source, &target, |source, target| {
+            std::os::unix::fs::symlink(&theirs, target)?;
+            std::os::unix::fs::symlink(source, target)
+        })
+        .unwrap();
+
+        assert!(replaced);
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+        let leftovers: Vec<_> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "tool.1")
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replace_symlink_preserves_a_regular_file_created_concurrently() {
+        let dir = temp_dir("eexist-file");
+        let source = dir.join("mine.1");
+        let target = dir.join("man/man1/tool.1");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let replaced = super::replace_symlink_with(&source, &target, |source, target| {
+            fs::write(target, "user page")?;
+            std::os::unix::fs::symlink(source, target)
+        })
+        .unwrap();
+
+        assert!(!replaced);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "user page");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staging_paths_differ_for_the_same_clock_reading() {
+        let parent = PathBuf::from("/man/man1");
+        let name = std::ffi::OsStr::new("tool.1");
+        assert_ne!(
+            super::staging_path(&parent, name, 42),
+            super::staging_path(&parent, name, 42)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_relinks_of_shared_pages_never_fail() {
+        // The parallel update pool relinks several deps that ship the same
+        // pages at once. Their relinks race on every shared path; none may
+        // fail and every page must stay linked to one of the deps. Three deps
+        // also reach the quarantine restore collision and staging reuse.
+        let dir = temp_dir("concurrent");
+        let xdg = dir.join("xdg");
+        let state = dir.join("state");
+        let roots: Vec<PathBuf> = ["a", "b", "c"].iter().map(|name| xdg.join(name)).collect();
+        for root in &roots {
+            fs::create_dir_all(root.join("man/man1")).unwrap();
+            for page in 0..40 {
+                fs::write(root.join(format!("man/man1/shared{page}.1")), ".TH S 1\n").unwrap();
+            }
+        }
+
+        std::thread::scope(|scope| {
+            for (name, root) in ["a", "b", "c"].iter().zip(&roots) {
+                let (xdg, state) = (&xdg, &state);
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        super::link(state, xdg, name, root).unwrap();
+                    }
+                });
+            }
+        });
+
+        // Exactly the 40 pages: no staging or quarantine leftovers.
+        assert_eq!(fs::read_dir(xdg.join("man/man1")).unwrap().count(), 40);
+        for page in 0..40 {
+            let target = fs::read_link(xdg.join(format!("man/man1/shared{page}.1"))).unwrap();
+            assert!(
+                roots.iter().any(|root| target.starts_with(root)),
+                "{target:?}"
+            );
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {
