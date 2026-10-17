@@ -37,6 +37,10 @@ the installer fails instead of silently cloning and building a managed source
 checkout. Developer/source-checkout installs are still supported when you run
 `install.sh` from a git checkout or set `SHDEPS_REPO` explicitly.
 
+The installer verifies the release archive's SHA-256 checksum. For manual
+provenance verification against the source commit and shared release signer,
+follow the [attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+
 `~/.local/bin` must be on your `PATH`. The installer prints a hint when it
 isn't; add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file.
 
@@ -991,6 +995,10 @@ CI cross-builds both Android archives and verifies their ELF identity plus the
 Bionic `/system/bin/linker64` interpreter. The x86_64 build also runs inside the
 official Termux app on a hardware-accelerated emulator, covering the actual
 runtime while the AArch64 artifact retains structural cross-build coverage.
+
+After publication, verify the archives and checksums using the shared
+[attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations),
+which identifies the source and signing workflow at their release-time commits.
 
 ## License
 

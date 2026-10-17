@@ -36,3 +36,7 @@ policy.
 Published releases are immutable and their tags are derived from the commit.
 Force a replacement build from a new commit and tag instead of replacing assets
 under an existing release.
+
+After publication, follow the shared
+[attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations)
+to check the archives against their source commit and pinned signing workflow.
