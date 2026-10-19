@@ -2678,8 +2678,10 @@ mod tests {
     }
 
     /// Probes whether this build and filesystem can exchange a directory with
-    /// a symlink, the exact shape `switch_root` swaps.
-    #[cfg(unix)]
+    /// a symlink, the exact shape `switch_root` swaps. Gated like its only
+    /// caller: Android never attempts the exchange, so the probe would be dead
+    /// code there and `warnings = "deny"` would break the Termux test build.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn exchange_supported(dir: &std::path::Path) -> bool {
         let probe_dir = dir.join(".exchange-probe-dir");
         let probe_link = dir.join(".exchange-probe-link");
