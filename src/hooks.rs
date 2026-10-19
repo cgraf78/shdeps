@@ -1259,11 +1259,13 @@ const PENDING_POSTS_DIR: &str = ".pending-posts";
 const PENDING_SELF_MARKER: &str = "|pending";
 const PENDING_MOVING_SUFFIX: &str = "|moving";
 
-/// Serializes pending-post marker updates across parallel tool threads.
+/// Serializes pending-post marker updates and walks across parallel tool
+/// threads.
 ///
 /// `mark` creates parent dirs while `acknowledge` removes them; without
 /// mutual exclusion the mkdir and the climbing rmdir interleave and the
-/// write fails with ENOENT. Cross-process updates serialize on the state
+/// write fails with ENOENT, and a concurrent `pending_posts` walk can fail
+/// or miss a marker. Cross-process updates serialize on the state
 /// lock, so a process-local mutex is complete (the atomic writer's ENOENT
 /// retry remains as a net for reentrant nested updates).
 static PENDING_POSTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1337,6 +1339,11 @@ pub(crate) fn pending_post_path(state_dir: &Path, name: &str) -> PathBuf {
 
 /// Lists every dependency whose durable post-hook obligation is still open.
 pub(crate) fn pending_posts(state_dir: &Path) -> Result<Vec<String>> {
+    // Walk under the marker lock too. A parallel tool thread can otherwise
+    // rmdir a directory mid-iteration: Bionic (Android/Termux) then reports
+    // ENOENT from `readdir`, failing an unrelated dependency, and a marker
+    // mid-relocation can be missed so its owed post hook looks acknowledged.
+    let _guard = PENDING_POSTS_LOCK.lock().unwrap();
     let root = state_dir.join(PENDING_POSTS_DIR);
     let mut names = Vec::new();
     collect_markers(&root, &root, &mut names)?;
@@ -2041,5 +2048,62 @@ post() {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn pending_posts_walk_survives_concurrent_marker_churn() {
+        use super::{acknowledge_pending_post, mark_pending_post, pending_posts};
+
+        // Owner-scoped names make acknowledge rmdir the owner directory the
+        // walker may be iterating, which Bionic reports as ENOENT. Thread 0
+        // marks the bare owner names, so the others relocate its plain marker
+        // into a directory mid-walk. The stable marker must never drop out.
+        let state_dir = temp_dir("pending-posts-walk-race");
+        mark_pending_post(&state_dir, "stable/tool").unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for thread in 0..4 {
+            let dir = state_dir.clone();
+            writers.push(std::thread::spawn(move || {
+                for item in 0..300 {
+                    let name = if thread == 0 {
+                        format!("owner-{}", item % 3)
+                    } else {
+                        format!("owner-{}/tool-{thread}", item % 3)
+                    };
+                    mark_pending_post(&dir, &name).unwrap();
+                    acknowledge_pending_post(&dir, &name).unwrap();
+                }
+            }));
+        }
+        let walker = {
+            let dir = state_dir.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                loop {
+                    // Walk before checking `done` so at least one walk overlaps
+                    // the writers even when they finish first.
+                    let names = pending_posts(&dir).expect("walk must not fail under churn");
+                    assert!(
+                        names.iter().any(|name| name == "stable/tool"),
+                        "walk missed a marker that stayed pending: {names:?}"
+                    );
+                    if done.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            })
+        };
+        // Stop the walker before propagating a writer panic so it cannot spin.
+        let results = writers
+            .into_iter()
+            .map(std::thread::JoinHandle::join)
+            .collect::<Vec<_>>();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        walker.join().unwrap();
+        for result in results {
+            result.unwrap();
+        }
+        assert_eq!(pending_posts(&state_dir).unwrap(), ["stable/tool"]);
     }
 }
