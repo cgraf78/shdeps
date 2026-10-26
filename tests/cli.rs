@@ -2428,7 +2428,7 @@ fn user_filtered_dependency_is_skipped_by_list_check_and_update() {
     let fixture = Fixture::new("user-filtered-commands");
     fixture.write(
         "conf/deps.conf",
-        "owner/tool github:repo tool - users=shdeps_no_such_account\n",
+        "owner/tool github:repo tool - hosts=other,test-host;users=shdeps_no_such_account,also_no_such_account\n",
     );
     let missing_path = fixture.dir.join("missing-path");
     fs::create_dir_all(&missing_path).unwrap();
@@ -2447,6 +2447,30 @@ fn user_filtered_dependency_is_skipped_by_list_check_and_update() {
     let updated = run(&mut update);
     assert_success(&updated);
     assert!(!text(&updated.stderr).contains("missing required tools"));
+    assert!(!fixture.dir.join("share/owner/tool").exists());
+}
+
+#[test]
+fn invalid_plural_filter_is_reported_and_never_installed() {
+    let fixture = Fixture::new("invalid-plural-filter");
+    fixture.write(
+        "conf/deps.conf",
+        "owner/tool github:repo tool - hosts=test-host;user=root\n",
+    );
+
+    let listed = run(&mut fixture.command(["list"]));
+    assert_success(&listed);
+    assert!(text(&listed.stdout).contains("(invalid filter)"));
+
+    let checked = run(&mut fixture.command(["check", "owner/tool"]));
+    assert_success(&checked);
+    assert_eq!(
+        text(&checked.stdout),
+        "owner/tool: skipped (invalid filter)\n"
+    );
+
+    let updated = run(&mut fixture.command(["update"]));
+    assert_success(&updated);
     assert!(!fixture.dir.join("share/owner/tool").exists());
 }
 

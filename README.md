@@ -17,7 +17,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 
 - **Declarative config** — one line per dependency in `*.conf` files
 - **Multiple install methods** — system packages (brew/apt/dnf/pacman/zypper/apk), automatic GitHub release/repo selection, explicit GitHub repos, explicit GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), Node.js CLI tools (`npm install -g`), or fully custom hooks
-- **Cross-platform** — Linux, macOS, WSL, and Android (Termux) with `os:`, `host:`, `mgr:`, and `users=` filtering per dep
+- **Cross-platform** — Linux, macOS, WSL, and Android (Termux) with platform, host, package-manager, and account filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
 - **TTL-based caching** — avoids redundant network calls
@@ -131,13 +131,26 @@ shdeps does not own `$PATH` or shadow other tools. It is designed to run alongsi
 | `method`  | yes      | Install method: `pkg`, `github`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, `npm`, or `custom`                                             |
 | `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` and higher-priority `android:name` qualifiers (e.g., `android:fd,apt:fdfind`). |
 | `aliases` | no       | For `pkg`: per-manager package overrides (`apt:fd-find,dnf:fd-find`). `android:name` takes priority on Android. Use `NONE` to skip a runtime. |
-| `filter`  | no       | Platform, hostname, package-manager, and effective-account filter. Use `os:`, `host:`, `mgr:`, and `users=` prefixes (e.g., `os:linux`, `host:nas`, `mgr:brew`, `mgr:!pacman`, `users=root`). Android matches both `os:linux` and `mgr:android`. |
+| `filter`  | no       | Platform, hostname, package-manager, and effective-account filter. Use `hosts=nas,laptop;users=root,backup` for host/account lists. Legacy `os:`, `host:`, `mgr:`, and repeated `users=` tokens remain supported. Android matches both `os:linux` and `mgr:android`. |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
 
-Values within one filter dimension are alternatives, while different dimensions
-must all match. For example, `os:linux,mgr:apt,mgr:dnf` means Linux with either
-APT or DNF. A filter containing only exclusions matches unknown managers, so
+For host and account lists, separate filter keys with `;` and names within each
+list with `,`: `hosts=nas,laptop;users=root,backup`. Quote filters containing
+`;` when passing them as shell arguments. `hosts=` is case-insensitive;
+`users=` is case-sensitive. A name prefixed with `!` is excluded. Values within
+one dimension are alternatives, while different dimensions must all match.
+An empty or malformed host/account list blocks installation; that list alone
+does not authorize prune. Unknown clauses in the semicolon form also block
+installation and pruning. The existing comma-separated, repeated-prefix form remains supported:
+`host:nas,host:laptop,users=root,users=backup`. With this older form, each
+value needs its prefix; `host:nas,laptop` never selected laptop.
+
+The older `os:` and `mgr:` filters continue to use repeated comma-separated
+tokens. For example, `os:linux,mgr:apt,mgr:dnf` means Linux with either APT or
+DNF. They can be combined with plural lists using `;`, as in
+`os:linux,mgr:apt;hosts=nas,laptop;users=root`. A filter containing only
+package-manager exclusions matches unknown managers, so
 `mgr:!brew,mgr:!pacman` is a useful fallback route. Filtered declarations may
 share one dependency name; Shdeps selects the last matching declaration before
 applying its normal last-wins rule, preserving one manifest identity across
@@ -198,8 +211,8 @@ fd        pkg    apt:fdfind       apt:fd-find,dnf:fd-find
 go        pkg    -                android:golang,apt:golang-go,dnf:golang
 dust      pkg    -                -                        os:macos
 uv        pkg    -                -                        os:android
-htop      pkg    -                -                        host:nas
-backup    custom -                -                        host:nas,users=root
+htop      pkg    -                -                        hosts=nas,laptop
+backup    custom -                -                        hosts=nas,laptop;users=root
 ```
 
 Use `aliases` to map names across package managers. An `android:` override wins
@@ -207,7 +220,7 @@ over the underlying manager override, which lets Termux differ from
 Debian/Ubuntu even though both use APT. Use `NONE` to skip a dep on a specific
 manager or on Android. `os:android` targets Android specifically; Android also
 continues to match `os:linux` so existing Linux-inclusive configs remain valid.
-Use `host:` to limit deps to specific machines and `users=` to limit them to
+Use `hosts=` to limit deps to specific machines and `users=` to limit them to
 effective accounts.
 
 ### `github` — Automatic GitHub Install
@@ -732,9 +745,9 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_prune [-y] [--dry-run]`   | Remove orphaned deps no longer in config                                                    |
 | `shdeps_load`                     | Parse config and return dep count                                                           |
 | `shdeps_version`                  | Print version string                                                                        |
-| `shdeps_filter_match <spec>`      | Check if the current platform, host, package manager, and effective account match a filter spec (e.g., `os:linux,host:nas,mgr:apt,users=root`) |
+| `shdeps_filter_match <spec>`      | Check if the current platform, host, package manager, and effective account match a filter spec (e.g., `os:linux,mgr:apt;hosts=nas,laptop;users=root`) |
 | `shdeps_platform_match <spec>`    | Check if current platform matches a spec (e.g., `linux,macos`, `!wsl`)                      |
-| `shdeps_host_match <spec>`        | Check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`)               |
+| `shdeps_host_match <spec>`        | Check if current hostname matches a spec (e.g., `nas,laptop`, `!workstation`)               |
 | `shdeps_platform`                 | Print normalized platform name (`linux`, `macos`, `wsl`)                                    |
 | `shdeps_force`                    | Return 0 if force mode is active (TTL bypass)                                               |
 | `shdeps_reinstall`                | Return 0 if reinstall mode is active                                                        |

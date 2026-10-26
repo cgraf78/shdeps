@@ -31,6 +31,8 @@ pub enum SkipReason {
     ManagerFilter,
     /// The dependency's `users=` filter excludes the effective account.
     UserFilter,
+    /// The dependency has an invalid filter clause.
+    InvalidFilter,
     /// The active package-manager override resolves to `NONE`.
     PackageManager,
 }
@@ -166,6 +168,7 @@ where
         2 => return Ok(State::Skipped(SkipReason::Host)),
         3 => return Ok(State::Skipped(SkipReason::ManagerFilter)),
         4 => return Ok(State::Skipped(SkipReason::UserFilter)),
+        5 => return Ok(State::Skipped(SkipReason::InvalidFilter)),
         _ => {}
     }
 
