@@ -73,6 +73,11 @@ pub trait Env {
     /// Returns file content for host-probe files.
     fn read_to_string(&self, path: &Path) -> Option<String>;
 
+    /// Account name resolved from the process's effective UID, if available.
+    fn effective_user(&self) -> Option<String> {
+        None
+    }
+
     /// Kernel name, as `uname -s` prints it.
     fn kernel_name(&self) -> Option<String> {
         self.command_output("uname", &["-s"])
@@ -116,6 +121,11 @@ impl Env for ProcessEnv {
 
     fn read_to_string(&self, path: &Path) -> Option<String> {
         fs::read_to_string(path).ok()
+    }
+
+    #[cfg(unix)]
+    fn effective_user(&self) -> Option<String> {
+        effective_user_name()
     }
 
     // Every command resolves its runtime identity first, and `dot doctor`
@@ -164,6 +174,48 @@ fn uname_fields() -> Option<(String, String)> {
         String::from_utf8_lossy(&bytes).trim().to_owned()
     };
     Some((field(&name.sysname), field(&name.nodename)))
+}
+
+/// Resolve through the OS account database. `USER` and `LOGNAME` are caller
+/// controlled and must not authorize a root-only dependency.
+#[cfg(unix)]
+fn effective_user_name() -> Option<String> {
+    // SAFETY: geteuid reads the current process identity and has no pointers.
+    let uid = unsafe { libc::geteuid() };
+    let mut capacity = 1024usize;
+    while capacity <= 1024 * 1024 {
+        let mut buffer = vec![0u8; capacity];
+        // SAFETY: passwd is a plain output record initialized before the call.
+        let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result = std::ptr::null_mut();
+        // SAFETY: all pointers reference live writable values; buffer stays
+        // alive while pw_name is read, and getpwuid_r bounds writes by len.
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut passwd,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE {
+            capacity *= 2;
+            continue;
+        }
+        if status != 0 || result.is_null() || passwd.pw_name.is_null() {
+            return None;
+        }
+        // SAFETY: a successful getpwuid_r returns a NUL-terminated pw_name
+        // within the live result storage supplied above.
+        let name = unsafe { std::ffi::CStr::from_ptr(passwd.pw_name) };
+        return name
+            .to_str()
+            .ok()
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
+    }
+    None
 }
 
 /// Resolves runtime roots from CLI overrides and environment defaults.
@@ -215,6 +267,7 @@ pub fn runtime_env(env: &impl Env) -> RuntimeEnv {
     RuntimeEnv::new(platform, host.trim())
         .with_package_manager(pkg_mgr(env))
         .with_android(is_android(env))
+        .with_effective_user(env.effective_user())
 }
 
 /// Returns whether the process is running directly on Android.
@@ -380,6 +433,20 @@ mod tests {
     }
 
     #[test]
+    fn runtime_identity_uses_effective_account_instead_of_user_environment() {
+        let env = FakeEnv::new()
+            .with_var("USER", "root")
+            .with_var("LOGNAME", "root")
+            .with_effective_user("operator");
+
+        assert_eq!(runtime_env(&env).effective_user(), Some("operator"));
+        assert_eq!(
+            runtime_env(&FakeEnv::new().with_var("USER", "root")).effective_user(),
+            None
+        );
+    }
+
+    #[test]
     fn runtime_identity_carries_termux_signal_when_uname_o_is_unavailable() {
         let env = FakeEnv::new()
             .with_var("TERMUX_VERSION", "0.118.3")
@@ -470,6 +537,7 @@ mod tests {
         vars: BTreeMap<String, OsString>,
         commands: BTreeMap<String, String>,
         files: BTreeMap<PathBuf, String>,
+        effective_user: Option<String>,
     }
 
     impl FakeEnv {
@@ -484,6 +552,11 @@ mod tests {
 
         fn with_command(mut self, command: &str, output: &str) -> Self {
             self.commands.insert(command.to_owned(), output.to_owned());
+            self
+        }
+
+        fn with_effective_user(mut self, name: &str) -> Self {
+            self.effective_user = Some(name.to_owned());
             self
         }
     }
@@ -504,6 +577,10 @@ mod tests {
 
         fn read_to_string(&self, path: &Path) -> Option<String> {
             self.files.get(path).cloned()
+        }
+
+        fn effective_user(&self) -> Option<String> {
+            self.effective_user.clone()
         }
     }
 }

@@ -114,7 +114,10 @@ Remove orphaned dependencies that are no longer present in any config file,
 or whose config entries are all excluded on this host by
 .B os:
 (or by a detected
-.BR mgr: )
+.BR mgr: ,
+or by
+.B users=
+when the effective account is known)
 filters.
 Accepts
 .B \-y
@@ -242,16 +245,19 @@ Use
 to skip a specific manager.
 .TP
 .B filter
-Combined platform, hostname, and package-manager filter using
+Combined platform, hostname, package-manager, and effective-account filter using
 .B os:
 ,
 .B host:
 ,
 and
 .B mgr:
+,
+and
+.B users=
 prefixes.
 Comma-separated (e.g.,
-.BR os:linux,host:nas,mgr:apt ).
+.BR os:linux,host:nas,mgr:apt,users=root ).
 Prefix with
 .B !
 to exclude (e.g.,
@@ -261,6 +267,19 @@ Termux exposes
 even though its package operations use APT-compatible commands internally.
 Values within one prefix are alternatives; different prefixes must all match.
 A filter containing only package-manager exclusions matches an unknown manager.
+The
+.B users=
+filter checks the account resolved from the process's effective UID, never
+the caller-controlled
+.B USER
+or
+.B LOGNAME
+environment variables. If that account cannot be resolved, user-filtered
+entries are skipped without authorizing prune. For example,
+.B users=root
+selects root-only dependencies and
+.B users=!root
+excludes root.
 Filtered declarations may share one dependency name; the last matching
 declaration is selected before ordinary last-wins override handling.
 .PP

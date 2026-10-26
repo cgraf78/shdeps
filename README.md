@@ -17,7 +17,7 @@ Declare your shell tools in one config file. shdeps installs and updates them ev
 
 - **Declarative config** — one line per dependency in `*.conf` files
 - **Multiple install methods** — system packages (brew/apt/dnf/pacman/zypper/apk), automatic GitHub release/repo selection, explicit GitHub repos, explicit GitHub release binaries, Rust crates (`cargo install`), Go modules (`go install`), Python CLI tools (`uv tool install`), Node.js CLI tools (`npm install -g`), or fully custom hooks
-- **Cross-platform** — Linux, macOS, WSL, and Android (Termux) with `os:`, `host:`, and `mgr:` filtering per dep
+- **Cross-platform** — Linux, macOS, WSL, and Android (Termux) with `os:`, `host:`, `mgr:`, and `users=` filtering per dep
 - **Package manager abstraction** — batched installs with individual retry fallback
 - **Smart binary matching** — multi-pass asset selection by OS, arch, and libc
 - **TTL-based caching** — avoids redundant network calls
@@ -131,7 +131,7 @@ shdeps does not own `$PATH` or shadow other tools. It is designed to run alongsi
 | `method`  | yes      | Install method: `pkg`, `github`, `github:repo`, `github:release`, `cargo`, `go`, `uv`, `npm`, or `custom`                                             |
 | `cmd`     | no       | Command to check for existence (defaults to name). Supports `mgr:name` and higher-priority `android:name` qualifiers (e.g., `android:fd,apt:fdfind`). |
 | `aliases` | no       | For `pkg`: per-manager package overrides (`apt:fd-find,dnf:fd-find`). `android:name` takes priority on Android. Use `NONE` to skip a runtime. |
-| `filter`  | no       | Platform, hostname, and package-manager filter. Use `os:`, `host:`, and `mgr:` prefixes (e.g., `os:linux`, `host:nas`, `mgr:brew`, `mgr:!pacman`). Android matches both `os:linux` and `mgr:android`. |
+| `filter`  | no       | Platform, hostname, package-manager, and effective-account filter. Use `os:`, `host:`, `mgr:`, and `users=` prefixes (e.g., `os:linux`, `host:nas`, `mgr:brew`, `mgr:!pacman`, `users=root`). Android matches both `os:linux` and `mgr:android`. |
 
 Use `-` for fields you want to skip. See [examples/deps.conf](examples/deps.conf) for a full example.
 
@@ -142,6 +142,12 @@ APT or DNF. A filter containing only exclusions matches unknown managers, so
 share one dependency name; Shdeps selects the last matching declaration before
 applying its normal last-wins rule, preserving one manifest identity across
 provider transitions.
+
+Use `users=root` to limit a dependency to the root account, or `users=!root`
+to exclude it. Shdeps resolves the process's effective UID through the OS
+account database; `USER` and `LOGNAME` do not affect this filter. If the
+effective account cannot be resolved, a `users=` dependency is skipped and
+its installed files are retained by prune until the identity can be checked.
 
 Treat `name` as a stable manifest identity. To rename a dependency while
 reusing its command, first remove the old declaration, run `shdeps prune`, then
@@ -193,6 +199,7 @@ go        pkg    -                android:golang,apt:golang-go,dnf:golang
 dust      pkg    -                -                        os:macos
 uv        pkg    -                -                        os:android
 htop      pkg    -                -                        host:nas
+backup    custom -                -                        host:nas,users=root
 ```
 
 Use `aliases` to map names across package managers. An `android:` override wins
@@ -200,7 +207,8 @@ over the underlying manager override, which lets Termux differ from
 Debian/Ubuntu even though both use APT. Use `NONE` to skip a dep on a specific
 manager or on Android. `os:android` targets Android specifically; Android also
 continues to match `os:linux` so existing Linux-inclusive configs remain valid.
-Use `host:` to limit deps to specific machines.
+Use `host:` to limit deps to specific machines and `users=` to limit them to
+effective accounts.
 
 ### `github` — Automatic GitHub Install
 
@@ -553,7 +561,7 @@ Exit codes:
 
 ### Removing Dependencies
 
-When you remove a dep from your config (or exclude it from the current host with an `os:` filter, or with an `mgr:` filter once the package manager is detected), `shdeps update` will notify you that it's orphaned. Run `shdeps prune` to clean up the artifacts:
+When you remove a dep from your config (or exclude it from the current host with an `os:` filter, a `users=` filter with a known effective account, or an `mgr:` filter once the package manager is detected), `shdeps update` will notify you that it's orphaned. Run `shdeps prune` to clean up the artifacts:
 
 ```bash
 # Remove a dep from config, then update
@@ -724,7 +732,7 @@ exists; this Bash section documents the shell-facing contract specifically.
 | `shdeps_prune [-y] [--dry-run]`   | Remove orphaned deps no longer in config                                                    |
 | `shdeps_load`                     | Parse config and return dep count                                                           |
 | `shdeps_version`                  | Print version string                                                                        |
-| `shdeps_filter_match <spec>`      | Check if the current platform, host, and package manager match a filter spec (e.g., `os:linux,host:nas,mgr:apt`) |
+| `shdeps_filter_match <spec>`      | Check if the current platform, host, package manager, and effective account match a filter spec (e.g., `os:linux,host:nas,mgr:apt,users=root`) |
 | `shdeps_platform_match <spec>`    | Check if current platform matches a spec (e.g., `linux,macos`, `!wsl`)                      |
 | `shdeps_host_match <spec>`        | Check if current hostname matches a spec (e.g., `nas,taylor`, `!workstation`)               |
 | `shdeps_platform`                 | Print normalized platform name (`linux`, `macos`, `wsl`)                                    |

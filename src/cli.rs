@@ -2213,6 +2213,7 @@ fn list_fields(state: &State) -> (&'static str, String) {
         State::Skipped(SkipReason::Platform) => ("skipped", "(platform)".to_owned()),
         State::Skipped(SkipReason::Host) => ("skipped", "(host)".to_owned()),
         State::Skipped(SkipReason::ManagerFilter) => ("skipped", "(manager filter)".to_owned()),
+        State::Skipped(SkipReason::UserFilter) => ("skipped", "(user filter)".to_owned()),
         State::Skipped(SkipReason::PackageManager) => ("skipped", "(pkg manager)".to_owned()),
     }
 }
@@ -2240,6 +2241,9 @@ where
         }
         State::Skipped(SkipReason::ManagerFilter) => {
             writeln!(stdout, "{}: skipped (manager filter)", status.name)?;
+        }
+        State::Skipped(SkipReason::UserFilter) => {
+            writeln!(stdout, "{}: skipped (user filter)", status.name)?;
         }
         State::Skipped(SkipReason::PackageManager) => {
             writeln!(stdout, "{}: skipped (pkg manager)", status.name)?;

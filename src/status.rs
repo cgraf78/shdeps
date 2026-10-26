@@ -29,6 +29,8 @@ pub enum SkipReason {
     Host,
     /// The dependency's `mgr:` filter excludes the active package manager.
     ManagerFilter,
+    /// The dependency's `users=` filter excludes the effective account.
+    UserFilter,
     /// The active package-manager override resolves to `NONE`.
     PackageManager,
 }
@@ -163,6 +165,7 @@ where
         1 => return Ok(State::Skipped(SkipReason::Platform)),
         2 => return Ok(State::Skipped(SkipReason::Host)),
         3 => return Ok(State::Skipped(SkipReason::ManagerFilter)),
+        4 => return Ok(State::Skipped(SkipReason::UserFilter)),
         _ => {}
     }
 
@@ -445,6 +448,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(status.state, State::Skipped(SkipReason::ManagerFilter));
+    }
+
+    #[test]
+    fn user_filtered_dependencies_are_skipped_before_method_checks() {
+        let roots = roots();
+        let manifest = Manifest::default();
+        let runner = FakeRunner::default();
+        let env = RuntimeEnv::new("linux", "workstation")
+            .with_effective_user(Some("operator".to_owned()));
+        let package_versions = BTreeMap::new();
+        let context = context(
+            &roots,
+            &env,
+            &manifest,
+            &runner,
+            &NoCustomProbe,
+            "apt",
+            &package_versions,
+        );
+
+        let status = classify(
+            &parse_entry("tool|custom|tool|-|users=root", Some("apt")),
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(status.state, State::Skipped(SkipReason::UserFilter));
     }
 
     #[test]

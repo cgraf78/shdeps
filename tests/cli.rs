@@ -604,6 +604,21 @@ fn read_only_api_outputs_machine_clean_lines() {
     assert_eq!(text(&manager_mismatch.stdout), "");
     assert_eq!(text(&manager_mismatch.stderr), "");
 
+    let mut user_mismatch =
+        fixture.command(["__api", "filter-match", "users=shdeps_no_such_account"]);
+    user_mismatch.env("USER", "shdeps_no_such_account");
+    user_mismatch.env("LOGNAME", "shdeps_no_such_account");
+    let user_mismatch = run(&mut user_mismatch);
+    assert_eq!(user_mismatch.status.code(), Some(4));
+    assert_eq!(text(&user_mismatch.stdout), "");
+    assert_eq!(text(&user_mismatch.stderr), "");
+
+    let user_match =
+        run(&mut fixture.command(["__api", "filter-match", "users=!shdeps_no_such_account"]));
+    assert_success(&user_match);
+    assert_eq!(text(&user_match.stdout), "");
+    assert_eq!(text(&user_match.stderr), "");
+
     let links = run(&mut fixture.command(["__api", "dep-links", "owner/tool"]));
     assert_success(&links);
     assert_eq!(
@@ -2406,6 +2421,33 @@ fn check_reports_installed_skipped_missing_and_unknown() {
         text(&usage.stderr),
         "error: check requires a dependency name\nUsage: shdeps check <name>\n"
     );
+}
+
+#[test]
+fn user_filtered_dependency_is_skipped_by_list_check_and_update() {
+    let fixture = Fixture::new("user-filtered-commands");
+    fixture.write(
+        "conf/deps.conf",
+        "owner/tool github:repo tool - users=shdeps_no_such_account\n",
+    );
+    let missing_path = fixture.dir.join("missing-path");
+    fs::create_dir_all(&missing_path).unwrap();
+
+    let listed = run(&mut fixture.command(["list"]));
+    assert_success(&listed);
+    assert!(text(&listed.stdout).contains("owner/tool"));
+    assert!(text(&listed.stdout).contains("(user filter)"));
+
+    let checked = run(&mut fixture.command(["check", "owner/tool"]));
+    assert_success(&checked);
+    assert_eq!(text(&checked.stdout), "owner/tool: skipped (user filter)\n");
+
+    let mut update = fixture.command(["update"]);
+    update.env("PATH", &missing_path);
+    let updated = run(&mut update);
+    assert_success(&updated);
+    assert!(!text(&updated.stderr).contains("missing required tools"));
+    assert!(!fixture.dir.join("share/owner/tool").exists());
 }
 
 #[test]
