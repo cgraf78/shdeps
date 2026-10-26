@@ -32,7 +32,7 @@ pub struct Entry {
     pub cmd_explicit: bool,
     /// Package-manager override list for `pkg` dependencies.
     pub aliases: String,
-    /// Combined `os:`/`host:`/`mgr:` filter string.
+    /// Combined legacy or plural-key filter string.
     pub filter: String,
 }
 
@@ -965,7 +965,7 @@ mod tests {
         assert!(entries.contains(&"cgraf78/ds|github".to_owned()));
         assert!(entries.contains(&"prettier|npm".to_owned()));
         assert!(entries.contains(&"nerd-fonts|custom".to_owned()));
-        assert!(entries.contains(&"openai/codex|github:release|-|-|host:nas".to_owned()));
+        assert!(entries.contains(&"openai/codex|github:release|-|-|hosts=nas".to_owned()));
         assert!(entries.contains(&"ast-grep|cargo|-|-|mgr:!brew,mgr:!pacman".to_owned()));
     }
 

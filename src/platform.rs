@@ -93,7 +93,7 @@ impl RuntimeEnv {
     }
 }
 
-/// Result of evaluating a combined `os:`/`host:`/`mgr:`/`users=` filter.
+/// Result of evaluating a combined dependency filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMatch {
     /// The filter applies to the current runtime identity.
@@ -106,6 +106,8 @@ pub enum FilterMatch {
     ManagerMismatch,
     /// The `users=` portion rejected or could not verify the effective account.
     UserMismatch,
+    /// The plural-key grammar contains an unknown or misplaced clause.
+    InvalidFilter,
 }
 
 impl FilterMatch {
@@ -118,6 +120,7 @@ impl FilterMatch {
             Self::HostMismatch => 2,
             Self::ManagerMismatch => 3,
             Self::UserMismatch => 4,
+            Self::InvalidFilter => 5,
         }
     }
 }
@@ -166,10 +169,13 @@ pub fn manager_match(spec: &str, env: &RuntimeEnv) -> bool {
     match_specs(spec, &[env.package_manager()], CaseMode::Lowercase)
 }
 
-/// Returns whether a combined `os:`/`host:`/`mgr:`/`users=` filter matches the runtime.
+/// Returns whether a combined legacy or plural-key filter matches the runtime.
 #[must_use]
 pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
     let specs = FilterSpecs::parse(spec);
+    if specs.invalid {
+        return FilterMatch::InvalidFilter;
+    }
     if specs.platform_rejects(env) {
         return FilterMatch::PlatformMismatch;
     }
@@ -192,7 +198,7 @@ pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
 /// `filter_match` alone, because some identities are probes that can be
 /// wrong transiently:
 ///
-/// - `host:` never proves exclusion. `hostname` yields an empty value when
+/// - `host:` and `hosts=` never prove exclusion. `hostname` yields an empty value when
 ///   the probe fails, and on macOS without a fixed `HostName` it follows the
 ///   network (DHCP or reverse DNS), so a non-empty value can still be a
 ///   transient misidentification.
@@ -210,6 +216,9 @@ pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
 #[must_use]
 pub fn provably_excludes(spec: &str, env: &RuntimeEnv) -> bool {
     let specs = FilterSpecs::parse(spec);
+    if specs.invalid || specs.hosts_invalid || specs.users_invalid {
+        return false;
+    }
     specs.platform_rejects(env)
         || (!env.package_manager().is_empty() && specs.manager_rejects(env))
         || specs.user_mismatch_proven(env)
@@ -218,8 +227,10 @@ pub fn provably_excludes(spec: &str, env: &RuntimeEnv) -> bool {
 /// Per-dimension specs split out of one combined filter.
 #[derive(Default)]
 struct FilterSpecs {
+    invalid: bool,
     platform: String,
     host: String,
+    hosts_invalid: bool,
     manager: String,
     users: String,
     users_present: bool,
@@ -229,20 +240,53 @@ struct FilterSpecs {
 impl FilterSpecs {
     fn parse(spec: &str) -> Self {
         let mut specs = Self::default();
-        for token in spec.split(',').filter(|token| !token.is_empty()) {
-            if let Some(value) = token.strip_prefix("os:") {
-                append_spec(&mut specs.platform, value);
-            } else if let Some(value) = token.strip_prefix("host:") {
+        let plural = spec.contains(';')
+            || spec.starts_with("hosts=")
+            || spec
+                .strip_prefix("users=")
+                .is_some_and(|value| !value.split(',').skip(1).any(is_legacy_token));
+        if !plural {
+            specs.parse_legacy(spec, false);
+            return specs;
+        }
+        for clause in spec.split(';') {
+            if clause.is_empty() {
+                specs.invalid = true;
+                continue;
+            }
+            if let Some(value) = clause.strip_prefix("hosts=") {
+                // An omitted `;` must not silently discard a root-only key.
+                specs.hosts_invalid |= !valid_name_list(value);
                 append_spec(&mut specs.host, value);
-            } else if let Some(value) = token.strip_prefix("mgr:") {
-                append_spec(&mut specs.manager, value);
-            } else if let Some(value) = token.strip_prefix("users=") {
+            } else if let Some(value) = clause.strip_prefix("users=") {
                 specs.users_present = true;
-                specs.users_invalid |= value.is_empty();
+                specs.users_invalid |= !valid_users_spec(value);
                 append_spec(&mut specs.users, value);
+            } else {
+                specs.parse_legacy(clause, true);
             }
         }
         specs
+    }
+
+    fn parse_legacy(&mut self, clause: &str, strict: bool) {
+        for token in clause.split(',').filter(|token| !token.is_empty()) {
+            if let Some(value) = token.strip_prefix("os:") {
+                append_spec(&mut self.platform, value);
+            } else if let Some(value) = token.strip_prefix("host:") {
+                append_spec(&mut self.host, value);
+            } else if let Some(value) = token.strip_prefix("mgr:") {
+                append_spec(&mut self.manager, value);
+            } else if let Some(value) = token.strip_prefix("users=") {
+                self.users_present = true;
+                self.users_invalid |= value.is_empty();
+                append_spec(&mut self.users, value);
+            } else if strict || is_mistyped_key(token) {
+                // Legacy unknown colon tokens remain ignored. In the new
+                // grammar, accepting one would widen a host/user restriction.
+                self.invalid = true;
+            }
+        }
     }
 
     fn platform_rejects(&self, env: &RuntimeEnv) -> bool {
@@ -250,7 +294,7 @@ impl FilterSpecs {
     }
 
     fn host_rejects(&self, env: &RuntimeEnv) -> bool {
-        !self.host.is_empty() && !host_match(&self.host, env)
+        self.hosts_invalid || (!self.host.is_empty() && !host_match(&self.host, env))
     }
 
     fn manager_rejects(&self, env: &RuntimeEnv) -> bool {
@@ -281,6 +325,10 @@ fn users_match(spec: &str, effective_user: Option<&str>) -> bool {
 }
 
 fn valid_users_spec(spec: &str) -> bool {
+    valid_name_list(spec)
+}
+
+fn valid_name_list(spec: &str) -> bool {
     spec.split(',').all(|item| {
         let name = item.strip_prefix('!').unwrap_or(item);
         !name.is_empty()
@@ -288,6 +336,18 @@ fn valid_users_spec(spec: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     })
+}
+
+fn is_legacy_token(token: &str) -> bool {
+    // A colon or equals cannot be part of an account name. Preserve the old
+    // parser's handling of unknown tokens mixed with repeated `users=` keys.
+    token.contains([':', '='])
+}
+
+fn is_mistyped_key(token: &str) -> bool {
+    ["host=", "user=", "user:", "hosts:", "users:"]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
 }
 
 fn append_spec(spec: &mut String, value: &str) {
@@ -509,6 +569,99 @@ mod tests {
     }
 
     #[test]
+    fn plural_filters_use_semicolons_between_keys_and_commas_within_lists() {
+        let root =
+            RuntimeEnv::new("linux", "server-b").with_effective_user(Some("root".to_owned()));
+        let backup =
+            RuntimeEnv::new("linux", "server-c").with_effective_user(Some("backup".to_owned()));
+        let operator =
+            RuntimeEnv::new("linux", "server-b").with_effective_user(Some("operator".to_owned()));
+        let other =
+            RuntimeEnv::new("linux", "other-host").with_effective_user(Some("root".to_owned()));
+
+        let filter = "hosts=server-a,server-b,server-c;users=root,backup";
+        assert_eq!(filter_match(filter, &root), FilterMatch::Match);
+        assert_eq!(filter_match(filter, &backup), FilterMatch::Match);
+        assert_eq!(filter_match(filter, &operator), FilterMatch::UserMismatch);
+        assert_eq!(filter_match(filter, &other), FilterMatch::HostMismatch);
+        assert!(provably_excludes(filter, &operator));
+        assert!(!provably_excludes(filter, &other));
+    }
+
+    #[test]
+    fn plural_filters_reject_empty_or_unseparated_keys_without_pruning() {
+        let root = RuntimeEnv::new("linux", "nas").with_effective_user(Some("root".to_owned()));
+
+        for filter in [
+            "hosts=",
+            "hosts=nas,",
+            "hosts=nas,,other-host",
+            "hosts=nas,users=root",
+            "hosts=nas;users=",
+            "hosts=nas;users=root,",
+            "hosts=nas;users=root,backup,users=operator",
+            "hosts=nas;",
+        ] {
+            assert_ne!(filter_match(filter, &root), FilterMatch::Match, "{filter}");
+            assert!(!provably_excludes(filter, &root), "{filter}");
+        }
+    }
+
+    #[test]
+    fn plural_filters_reject_unknown_keys_without_install_or_prune() {
+        let root = RuntimeEnv::new("linux", "nas").with_effective_user(Some("root".to_owned()));
+        let operator =
+            RuntimeEnv::new("linux", "nas").with_effective_user(Some("operator".to_owned()));
+
+        for filter in [
+            "hosts=nas,other-host;user=root",
+            "hosts=nas,other-host;users:root",
+            "host=nas;users=root",
+            "host=nas",
+            "user:root",
+            "os:linux,hosts=nas,other-host;users=root",
+            "users=root;host=nas",
+        ] {
+            assert_ne!(filter_match(filter, &root), FilterMatch::Match, "{filter}");
+            assert_ne!(
+                filter_match(filter, &operator),
+                FilterMatch::Match,
+                "{filter}"
+            );
+            assert!(!provably_excludes(filter, &operator), "{filter}");
+        }
+    }
+
+    #[test]
+    fn plural_filters_preserve_legacy_repeated_prefixes() {
+        let root = RuntimeEnv::new("linux", "nas").with_effective_user(Some("root".to_owned()));
+        let filter = "os:linux,host:nas,host:other-host,mgr:apt,users=root,users=backup";
+        let root = root.with_package_manager("apt");
+
+        assert_eq!(filter_match(filter, &root), FilterMatch::Match);
+        assert_eq!(
+            filter_match("users=root,arch:x86_64", &root),
+            FilterMatch::Match
+        );
+        assert_eq!(
+            filter_match("hosts=nas;users=root;mgr:apt", &root),
+            FilterMatch::Match
+        );
+        assert_eq!(
+            filter_match("host:nas,users=root", &root),
+            FilterMatch::Match
+        );
+        assert_eq!(
+            filter_match("hosts=NAS,!other-host;users=root,!operator", &root),
+            FilterMatch::Match
+        );
+        assert_eq!(
+            filter_match("hosts=nas,!nas;users=root", &root),
+            FilterMatch::HostMismatch
+        );
+    }
+
+    #[test]
     fn users_filter_rejects_empty_or_malformed_names() {
         let root = RuntimeEnv::new("linux", "nas").with_effective_user(Some("root".to_owned()));
 
@@ -638,6 +791,8 @@ mod tests {
         assert_eq!(FilterMatch::PlatformMismatch.exit_code(), 1);
         assert_eq!(FilterMatch::HostMismatch.exit_code(), 2);
         assert_eq!(FilterMatch::ManagerMismatch.exit_code(), 3);
+        assert_eq!(FilterMatch::UserMismatch.exit_code(), 4);
+        assert_eq!(FilterMatch::InvalidFilter.exit_code(), 5);
     }
 
     #[test]

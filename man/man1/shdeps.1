@@ -245,7 +245,21 @@ Use
 to skip a specific manager.
 .TP
 .B filter
-Combined platform, hostname, package-manager, and effective-account filter using
+Combined platform, hostname, package-manager, and effective-account filter.
+For host and account lists, separate keys with a semicolon and names within
+each list with a comma, for example
+.BR hosts=nas,laptop;users=root,backup .
+Quote semicolon-bearing filters when passing them as shell arguments.
+The
+.B hosts=
+key is case-insensitive; the
+.B users=
+key is case-sensitive. Prefix a name with
+.B !
+to exclude it. Empty or malformed lists and unknown semicolon clauses block
+installation without authorizing prune.
+.PP
+The older repeated-prefix syntax remains supported using
 .B os:
 ,
 .B host:
@@ -255,12 +269,18 @@ and
 ,
 and
 .B users=
-prefixes.
-Comma-separated (e.g.,
+tokens. Each value repeats its prefix in a comma-separated filter (e.g.,
 .BR os:linux,host:nas,mgr:apt,users=root ).
-Prefix with
+For example,
+.B host:nas,host:laptop
+selects either host, while
+.B host:nas,laptop
+does not select laptop. The older platform and manager tokens can be combined
+with plural lists using a semicolon, for example
+.BR os:linux,mgr:apt;hosts=nas,laptop;users=root .
+Exclusions also use
 .B !
-to exclude (e.g.,
+(e.g.,
 .BR os:!wsl,mgr:!pacman ).
 Termux exposes
 .B mgr:android
