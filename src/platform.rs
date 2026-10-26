@@ -648,6 +648,10 @@ mod tests {
             FilterMatch::Match
         );
         assert_eq!(
+            filter_match("os:linux;hosts=nas,other-host;users=root", &root),
+            FilterMatch::Match
+        );
+        assert_eq!(
             filter_match("host:nas,users=root", &root),
             FilterMatch::Match
         );
