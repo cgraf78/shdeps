@@ -1,17 +1,18 @@
-//! Platform, host, package-manager, and combined filter matching.
+//! Platform, host, package-manager, account, and combined filter matching.
 //!
 //! `shdeps` uses these predicates to decide whether a dependency applies to a
 //! machine before any install work starts. The rules intentionally mirror the
 //! Bash reference, including asymmetric case handling: platform specs are
 //! compared exactly, while host specs are folded to lowercase.
 
-/// Runtime identity used by platform and host filters.
+/// Runtime identity used by dependency filters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeEnv {
     platform: String,
     host: String,
     package_manager: String,
     android: bool,
+    effective_user: Option<String>,
 }
 
 impl RuntimeEnv {
@@ -28,6 +29,7 @@ impl RuntimeEnv {
             host: host.into().to_lowercase(),
             package_manager: String::new(),
             android: false,
+            effective_user: None,
         }
     }
 
@@ -45,6 +47,13 @@ impl RuntimeEnv {
         self
     }
 
+    /// Records the account resolved from the process's effective UID.
+    #[must_use]
+    pub fn with_effective_user(mut self, effective_user: Option<String>) -> Self {
+        self.effective_user = effective_user;
+        self
+    }
+
     /// Returns the normalized platform name.
     #[must_use]
     pub fn platform(&self) -> &str {
@@ -55,6 +64,12 @@ impl RuntimeEnv {
     #[must_use]
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// Returns the effective account, or `None` when the OS cannot resolve it.
+    #[must_use]
+    pub fn effective_user(&self) -> Option<&str> {
+        self.effective_user.as_deref()
     }
 
     /// Returns whether release assets must target Android/Bionic.
@@ -78,7 +93,7 @@ impl RuntimeEnv {
     }
 }
 
-/// Result of evaluating a combined `os:`/`host:`/`mgr:` filter.
+/// Result of evaluating a combined `os:`/`host:`/`mgr:`/`users=` filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMatch {
     /// The filter applies to the current runtime identity.
@@ -89,6 +104,8 @@ pub enum FilterMatch {
     HostMismatch,
     /// The `mgr:` portion rejected the active package manager.
     ManagerMismatch,
+    /// The `users=` portion rejected or could not verify the effective account.
+    UserMismatch,
 }
 
 impl FilterMatch {
@@ -100,6 +117,7 @@ impl FilterMatch {
             Self::PlatformMismatch => 1,
             Self::HostMismatch => 2,
             Self::ManagerMismatch => 3,
+            Self::UserMismatch => 4,
         }
     }
 }
@@ -148,7 +166,7 @@ pub fn manager_match(spec: &str, env: &RuntimeEnv) -> bool {
     match_specs(spec, &[env.package_manager()], CaseMode::Lowercase)
 }
 
-/// Returns whether a combined `os:`/`host:`/`mgr:` filter matches the runtime.
+/// Returns whether a combined `os:`/`host:`/`mgr:`/`users=` filter matches the runtime.
 #[must_use]
 pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
     let specs = FilterSpecs::parse(spec);
@@ -160,6 +178,9 @@ pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
     }
     if specs.manager_rejects(env) {
         return FilterMatch::ManagerMismatch;
+    }
+    if specs.user_rejects(env) {
+        return FilterMatch::UserMismatch;
     }
 
     FilterMatch::Match
@@ -181,21 +202,28 @@ pub fn filter_match(spec: &str, env: &RuntimeEnv) -> FilterMatch {
 ///   deterministic PATH lookup.
 /// - `os:` always proves exclusion: the platform always resolves (`uname`
 ///   falls back to the compile-time OS).
+/// - `users=` proves exclusion only after the effective UID resolves to an
+///   account. Missing identity blocks installation but must not prune data.
 ///
 /// Unlike `filter_match`, every dimension is checked so an unproven host
 /// mismatch cannot mask a known package-manager mismatch.
 #[must_use]
 pub fn provably_excludes(spec: &str, env: &RuntimeEnv) -> bool {
     let specs = FilterSpecs::parse(spec);
-    specs.platform_rejects(env) || (!env.package_manager().is_empty() && specs.manager_rejects(env))
+    specs.platform_rejects(env)
+        || (!env.package_manager().is_empty() && specs.manager_rejects(env))
+        || specs.user_mismatch_proven(env)
 }
 
-/// Per-dimension specs split out of one combined `os:`/`host:`/`mgr:` filter.
+/// Per-dimension specs split out of one combined filter.
 #[derive(Default)]
 struct FilterSpecs {
     platform: String,
     host: String,
     manager: String,
+    users: String,
+    users_present: bool,
+    users_invalid: bool,
 }
 
 impl FilterSpecs {
@@ -208,6 +236,10 @@ impl FilterSpecs {
                 append_spec(&mut specs.host, value);
             } else if let Some(value) = token.strip_prefix("mgr:") {
                 append_spec(&mut specs.manager, value);
+            } else if let Some(value) = token.strip_prefix("users=") {
+                specs.users_present = true;
+                specs.users_invalid |= value.is_empty();
+                append_spec(&mut specs.users, value);
             }
         }
         specs
@@ -224,6 +256,38 @@ impl FilterSpecs {
     fn manager_rejects(&self, env: &RuntimeEnv) -> bool {
         !self.manager.is_empty() && !manager_match(&self.manager, env)
     }
+
+    fn user_rejects(&self, env: &RuntimeEnv) -> bool {
+        self.users_present
+            && (self.users_invalid || !users_match(&self.users, env.effective_user()))
+    }
+
+    fn user_mismatch_proven(&self, env: &RuntimeEnv) -> bool {
+        self.users_present
+            && !self.users_invalid
+            && valid_users_spec(&self.users)
+            && env.effective_user().is_some()
+            && !users_match(&self.users, env.effective_user())
+    }
+}
+
+/// Refuse malformed names even in negated-only lists; a typo must not turn a
+/// root-only declaration into an allow-everyone rule.
+fn users_match(spec: &str, effective_user: Option<&str>) -> bool {
+    let Some(effective_user) = effective_user else {
+        return false;
+    };
+    valid_users_spec(spec) && match_specs(spec, &[effective_user], CaseMode::Exact)
+}
+
+fn valid_users_spec(spec: &str) -> bool {
+    spec.split(',').all(|item| {
+        let name = item.strip_prefix('!').unwrap_or(item);
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    })
 }
 
 fn append_spec(spec: &mut String, value: &str) {
@@ -406,6 +470,71 @@ mod tests {
 
         assert_eq!(filter_match("", &env), FilterMatch::Match);
         assert_eq!(filter_match("arch:x86_64", &env), FilterMatch::Match);
+    }
+
+    #[test]
+    fn users_filter_fails_closed_without_a_trusted_account() {
+        let env = RuntimeEnv::new("linux", "nas");
+
+        assert_ne!(filter_match("users=root", &env), FilterMatch::Match);
+        assert_ne!(filter_match("users=!root", &env), FilterMatch::Match);
+        assert!(!provably_excludes("users=root", &env));
+        assert!(!provably_excludes("users=!root", &env));
+    }
+
+    #[test]
+    fn users_filter_matches_effective_account_name() {
+        let root = RuntimeEnv::new("linux", "nas").with_effective_user(Some("root".to_owned()));
+        let operator =
+            RuntimeEnv::new("linux", "nas").with_effective_user(Some("operator".to_owned()));
+
+        assert_eq!(filter_match("users=root", &root), FilterMatch::Match);
+        assert_eq!(
+            filter_match("users=root", &operator),
+            FilterMatch::UserMismatch
+        );
+        assert_eq!(
+            filter_match("users=!root", &root),
+            FilterMatch::UserMismatch
+        );
+        assert_eq!(filter_match("users=!root", &operator), FilterMatch::Match);
+        assert_eq!(
+            filter_match("users=root,users=operator", &operator),
+            FilterMatch::Match
+        );
+        assert_eq!(
+            filter_match("users=root,users=operator,users=!operator", &operator),
+            FilterMatch::UserMismatch
+        );
+    }
+
+    #[test]
+    fn users_filter_rejects_empty_or_malformed_names() {
+        let root = RuntimeEnv::new("linux", "nas").with_effective_user(Some("root".to_owned()));
+
+        for spec in ["users=", "users=!", "users=root,users=", "users=roo/t"] {
+            assert_eq!(
+                filter_match(spec, &root),
+                FilterMatch::UserMismatch,
+                "{spec}"
+            );
+            assert!(!provably_excludes(spec, &root), "{spec}");
+        }
+        assert_eq!(
+            filter_match("users=,users=root", &root),
+            FilterMatch::UserMismatch
+        );
+        assert!(!provably_excludes("users=,users=root", &root));
+    }
+
+    #[test]
+    fn users_filter_is_proven_only_for_a_known_account() {
+        let root = RuntimeEnv::new("linux", "nas").with_effective_user(Some("root".to_owned()));
+
+        assert!(!provably_excludes("users=root", &root));
+        assert!(provably_excludes("users=operator", &root));
+        assert!(provably_excludes("users=!root", &root));
+        assert!(provably_excludes("host:other,users=operator", &root));
     }
 
     #[test]

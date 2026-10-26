@@ -1524,6 +1524,20 @@ fn pkg_excluded_on_this_host_is_not_reported() {
 }
 
 #[test]
+fn dependency_excluded_by_effective_account_is_not_reported() {
+    let fixture = Fixture::new("account-filtered");
+    fixture.append(
+        "conf/deps.conf",
+        "root-only custom - - users=shdeps_no_such_account\n",
+    );
+
+    let output = fixture.health();
+
+    assert_exit(&output, 0);
+    assert!(keys(&output).is_empty());
+}
+
+#[test]
 fn pkg_manager_qualified_command_resolves_like_update() {
     let fixture = Fixture::new("pkg-qualified");
     fixture.fake_apt();

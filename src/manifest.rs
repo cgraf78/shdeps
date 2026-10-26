@@ -191,7 +191,8 @@ impl Manifest {
     /// update performs with its own cleanup journal, and a transiently
     /// misdetected package manager must not turn such rows into orphans.
     /// Filters count only through `platform::provably_excludes`, so `host:`
-    /// filters and an unknown package manager never orphan anything.
+    /// filters, an unknown package manager, and an unknown effective account
+    /// never orphan anything.
     #[must_use]
     pub fn orphans(&self, config: &[Entry], env: &RuntimeEnv) -> Vec<ManifestEntry> {
         let configured = owner_names(config, env);
@@ -541,6 +542,29 @@ mod tests {
         assert_eq!(
             manifest.orphans(&config, &known),
             vec![ManifestEntry::new("ast-grep", "custom", "ast-grep", "")]
+        );
+    }
+
+    #[test]
+    fn orphan_detection_requires_a_known_account_for_user_filters() {
+        let manifest = Manifest::parse("backup|custom|backup|\n");
+        let config = [parse_entry("backup|custom|-|-|users=root", None)];
+
+        assert!(manifest.orphans(&config, &linux()).is_empty());
+        assert!(
+            manifest
+                .orphans(
+                    &config,
+                    &linux().with_effective_user(Some("root".to_owned()))
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            manifest.orphans(
+                &config,
+                &linux().with_effective_user(Some("operator".to_owned()))
+            ),
+            vec![ManifestEntry::new("backup", "custom", "backup", "")]
         );
     }
 
