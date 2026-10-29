@@ -7405,6 +7405,14 @@ while [ $((fixture_loop_23 = ${fixture_loop_23:-0} + 1)) -le 300 ]; do /bin/slee
     );
     let _ = fs::remove_file(&continued);
 
+    // Ctrl-Z cannot stop a child in uninterruptible sleep: the SIGTSTP
+    // stays pending until the kernel wait finishes. Wait for a
+    // signal-receptive state first.
+    wait_until(
+        LIVENESS_TIMEOUT,
+        || !process_is_uninterruptible(child_pid),
+        "foreground child to leave uninterruptible sleep before Ctrl-Z",
+    );
     master.write_all(&[26]).unwrap();
     master.flush().unwrap();
     wait_until(
@@ -7545,6 +7553,14 @@ raise SystemExit(128 + os.WTERMSIG(status))
         "pipeline child to own the terminal",
     );
 
+    // Ctrl-Z cannot stop a child in uninterruptible sleep: the SIGTSTP
+    // stays pending until the kernel wait finishes. Wait for a
+    // signal-receptive state first.
+    wait_until(
+        LIVENESS_TIMEOUT,
+        || !process_is_uninterruptible(child_pid),
+        "pipeline child to leave uninterruptible sleep before Ctrl-Z",
+    );
     master.write_all(&[26]).unwrap();
     master.flush().unwrap();
     wait_until(
@@ -7756,6 +7772,14 @@ while [ $((fixture_loop_25 = ${fixture_loop_25:-0} + 1)) -le 300 ]; do /bin/slee
         "child to own the terminal before Ctrl-Z",
     );
 
+    // Ctrl-Z cannot stop a child in uninterruptible sleep: the SIGTSTP
+    // stays pending until the kernel wait finishes. Wait for a
+    // signal-receptive state first.
+    wait_until(
+        LIVENESS_TIMEOUT,
+        || !process_is_uninterruptible(child_pid),
+        "foreground child to leave uninterruptible sleep before Ctrl-Z",
+    );
     master.write_all(&[26]).unwrap();
     master.flush().unwrap();
     wait_until(
@@ -9433,6 +9457,31 @@ fn process_is_stopped(pid: u32) -> bool {
             capture_output(Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]))
                 .expect("ps should inspect the PTY test process");
         output.status.success() && text(&output.stdout).trim_start().starts_with('T')
+    }
+}
+
+/// Whether a process is in uninterruptible sleep (Linux `D` state). A
+/// process there cannot act on any signal, including the SIGTSTP a PTY
+/// line discipline delivers for Ctrl-Z, until its kernel wait finishes.
+/// macOS keeps this helper a no-op: the observed failures are Linux-only,
+/// and the existing stop bound remains the backstop there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_uninterruptible(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.chars().next())
+            })
+            .is_some_and(|state| state == 'D')
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = pid;
+        false
     }
 }
 
