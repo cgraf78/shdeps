@@ -241,7 +241,7 @@ SH
 #!/usr/bin/env bash
 set -u
 "$SHDEPS_TEST_REAL_TAR" "$@" || exit $?
-if [[ "${SHDEPS_TEST_PHASE:-}" == extract && "${1:-}" == -xzf ]]; then
+if [[ "${SHDEPS_TEST_PHASE:-}" == extract && "${1:-}" == -oxzf ]]; then
   archive="$2"
   printf '%s\n' "$$" >"$SHDEPS_TEST_MARKERS/worker.pid"
   printf '%s\n' "${archive%/*}" >"$SHDEPS_TEST_MARKERS/scratch.path"

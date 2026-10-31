@@ -1879,7 +1879,10 @@ _install_release_core() {
     _install_release_fail "artifact" "refusing to extract $archive: contains absolute or traversal paths"
     return $?
   fi
-  if ! _install_run tar -xzf "$tmp/$archive" -C "$bundle"; then
+  # Root's tar otherwise restores the release builder's numeric IDs, and the
+  # later cp -p carries those IDs into the live install. GNU and BSD tar both
+  # use -o on extraction to keep the invoking user's ownership instead.
+  if ! _install_run tar -oxzf "$tmp/$archive" -C "$bundle"; then
     _install_release_fail "artifact" "failed to extract $archive"
     return $?
   fi
