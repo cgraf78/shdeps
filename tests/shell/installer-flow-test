@@ -244,6 +244,9 @@ echo "=== install.sh source installs ==="
 
 _install_script="$SHDEPS_DIR/install.sh"
 _source_repo="$SHDEPS_DIR"
+# Container runners can mount the source checkout under another UID. Trust
+# only this fixture's source in the private Git config used by its clones.
+git config --global --add safe.directory "$_source_repo" || exit 1
 _lua_api_link=$(_tmpdir)/lib/shdeps
 export SHDEPS_LUA_DIR="$_lua_api_link"
 _build_bin=$(_mock_bin)
