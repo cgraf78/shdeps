@@ -2171,9 +2171,7 @@ exists() { return 0; }
 version() { printf '9.9.9\n'; }
 "#,
     );
-    let head = capture_output(Command::new("git").args([
-        "-C",
-        fixture.dir.join("git/tool").to_str().unwrap(),
+    let head = capture_output(fixture.git(&fixture.dir.join("git/tool")).args([
         "rev-parse",
         "--short",
         "HEAD",
@@ -10357,6 +10355,57 @@ fn fixture_returns_the_physical_temp_tree() {
     assert_eq!(fixture.dir, fs::canonicalize(&fixture.dir).unwrap());
 }
 
+#[test]
+fn git_fixtures_preserve_a_caller_repository() {
+    let caller = Fixture::new("git-caller");
+    caller.write("repo/owned", "before the fixture\n");
+    let root = caller.dir.join("repo");
+    let git = |args: &[&str]| {
+        let output = run(caller.git(&root).args(args));
+        assert_success(&output);
+        text(&output.stdout)
+    };
+    git(&["init", "--quiet", "--template="]);
+    git(&["add", "owned"]);
+    git(&[
+        "-c",
+        "user.name=Caller",
+        "-c",
+        "user.email=caller@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "sentinel",
+    ]);
+    caller.write("repo/owned", "uncommitted caller change\n");
+    let state = || {
+        (
+            git(&["rev-parse", "HEAD"]),
+            git(&["ls-files", "--stage"]),
+            git(&["remote", "-v"]),
+        )
+    };
+    let before = state();
+
+    // Pass ambient repository selectors to a separate process so concurrent
+    // integration cases cannot observe a change to the test binary's env.
+    let case = "update_verbose_groups_items_by_update_area";
+    let output = run(Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", case])
+        .env("GIT_DIR", root.join(".git"))
+        .env("GIT_WORK_TREE", &root));
+    assert_eq!(
+        state(),
+        before,
+        "fixture changed the caller's HEAD, index or remote"
+    );
+    assert_success(&output);
+    assert!(
+        text(&output.stdout).contains(&format!("test {case} ... ok")),
+        "child did not run the Git-backed fixture"
+    );
+}
+
 impl Fixture {
     fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
@@ -10371,6 +10420,23 @@ impl Fixture {
         // directory through `/var` while canonical paths use `/private/var`.
         let dir = fs::canonicalize(&dir).unwrap();
         Self { dir }
+    }
+
+    /// Build a real Git command for a checkout owned by this fixture.
+    fn git(&self, root: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .env_clear()
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
+            .env("HOME", self.dir.join("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "core.hooksPath=/dev/null", "-C"])
+            .arg(root);
+        command
     }
 
     fn command<const N: usize>(&self, args: [&str; N]) -> Command {
@@ -10455,15 +10521,7 @@ impl Fixture {
     fn initialize_dev_checkout(&self, short_name: &str, origin: &str) {
         let root = self.dir.join("git").join(short_name);
         let run = |args: &[&str]| {
-            let output = capture_output(
-                Command::new("git")
-                    .env("GIT_CONFIG_NOSYSTEM", "1")
-                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                    .args(["-c", "core.hooksPath=/dev/null", "-C"])
-                    .arg(&root)
-                    .args(args),
-            )
-            .unwrap();
+            let output = capture_output(self.git(&root).args(args)).unwrap();
             assert!(
                 output.status.success(),
                 "git -C {} {} failed: {}",
@@ -10472,7 +10530,7 @@ impl Fixture {
                 String::from_utf8_lossy(&output.stderr)
             );
         };
-        run(&["init", "--quiet"]);
+        run(&["init", "--quiet", "--template="]);
         run(&["add", "--all"]);
         run(&[
             "-c",
