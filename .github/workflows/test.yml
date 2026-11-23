@@ -84,8 +84,9 @@ jobs:
       shellcheck-inventory-path: .github/shellcheck-files.txt
       # Shell-owned behavior lives under tests/shell. Cargo integration tests
       # stay in the conventional tests/*.rs location.
+      # Exercise relative fixture entry points with a caller's CDPATH set.
       test-command: >
-        tests/shell/helpers-test &&
+        CDPATH=. tests/shell/helpers-test &&
         tests/shell/install-sh-test &&
         tests/shell/install-interruption-test &&
         tests/shell/completion-test &&

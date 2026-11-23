@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-SHDEPS_DIR=$(cd "$(dirname "$0")/../.." && pwd)
+SHDEPS_DIR=$(CDPATH='' cd "$(dirname "$0")/../.." && pwd)
 
 # shellcheck source=helpers.sh
 . "$(dirname "$0")/helpers.sh"
