@@ -8,7 +8,7 @@
 
 set -uo pipefail
 
-SHDEPS_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SHDEPS_DIR="$(CDPATH='' cd "$(dirname "$0")/../.." && pwd)"
 SHDEPS_RUST_CLI="${SHDEPS_RUST_CLI:-$SHDEPS_DIR/target/debug/shdeps}"
 # The Rust binary owns version formatting, and the wrapper must pass that exact
 # line through. The timestamp keeps release identities readable, while the

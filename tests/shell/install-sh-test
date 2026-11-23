@@ -25,7 +25,7 @@ _test_dir=$(
     */*) dir="${src%/*}" ;;
     *) dir="." ;;
   esac
-  cd -P -- "$dir" && pwd
+  CDPATH='' cd -P -- "$dir" && pwd
 )
 _repo_root=$(cd -P -- "$_test_dir/../.." && pwd)
 

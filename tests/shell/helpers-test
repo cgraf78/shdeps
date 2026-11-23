@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+REPO_ROOT=$(CDPATH='' cd "$(dirname "$0")/../.." && pwd)
 report=$(mktemp) || exit 1
 fixture=""
 caller_config=""
