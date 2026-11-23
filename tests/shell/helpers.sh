@@ -12,6 +12,13 @@
 
 PASS=0
 FAIL=0
+# The installer tests prepend scratch command directories to PATH.
+case "${TMPDIR:-/tmp}" in
+  *:*)
+    printf '%s\n' "shdeps test TMPDIR must not contain ':' for mock PATH entries" >&2
+    exit 2
+    ;;
+esac
 _SHDEPS_TEST_TMP_ROOT=$(mktemp -d) || exit 1
 
 # Git treats inherited repository and configuration selectors as higher

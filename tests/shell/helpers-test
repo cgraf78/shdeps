@@ -5,11 +5,13 @@ REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 report=$(mktemp) || exit 1
 fixture=""
 caller_config=""
+colon_tmp=""
 
 cleanup() {
   rm -f "$report"
   [[ -z "$fixture" ]] || rm -rf "$fixture"
   [[ -z "$caller_config" ]] || rm -f "$caller_config"
+  [[ -z "$colon_tmp" ]] || rm -rf "$colon_tmp"
 }
 trap cleanup EXIT
 
@@ -48,3 +50,12 @@ if [[ $(cat "$caller_config") != $'[audit]\n\tsentinel = preserved' ]]; then
   exit 1
 fi
 echo "PASS: mock HOME leaves the caller Git config untouched"
+
+colon_tmp=$(mktemp -d "${TMPDIR:-/tmp}/shdeps:test.XXXXXX") || exit 1
+status=0
+output=$(TMPDIR="$colon_tmp" bash -c 'source "$1"' bash "$REPO_ROOT/tests/shell/helpers.sh" 2>&1) || status=$?
+if [[ "$status" != 2 || "$output" != *"test TMPDIR must not contain ':'"* ]]; then
+  echo "FAIL: fixture accepted an invalid mock PATH (exit $status): $output" >&2
+  exit 1
+fi
+echo "PASS: fixture rejects a colon in TMPDIR before locating mock commands"
