@@ -244,6 +244,9 @@ echo "=== install.sh source installs ==="
 
 _install_script="$SHDEPS_DIR/install.sh"
 _source_repo="$SHDEPS_DIR"
+# Container runners can mount the source checkout under another UID. Trust
+# only this fixture's source in the private Git config used by its clones.
+git config --global --add safe.directory "$_source_repo" || exit 1
 _lua_api_link=$(_tmpdir)/lib/shdeps
 export SHDEPS_LUA_DIR="$_lua_api_link"
 _build_bin=$(_mock_bin)
@@ -492,7 +495,7 @@ else
   _bootstrap_state=$(_tmpdir)/bootstrap-current
   _bootstrap_bin=$(_tmpdir)/bootstrap-bin
   _bootstrap_markers=$(_tmpdir)/bootstrap-markers
-  _bootstrap_home=$(_mock_home)
+  _bootstrap_home=$(_tmpdir) || exit 1
   mkdir -p "$_bootstrap_state" "$_bootstrap_bin"
   cp -R "$_updated_payload/." "$_bootstrap_state/"
   HOME="$_bootstrap_home" PATH="$_release_fakebin:$PATH" \

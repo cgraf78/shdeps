@@ -12,7 +12,23 @@
 
 PASS=0
 FAIL=0
+# The installer tests prepend scratch command directories to PATH.
+case "${TMPDIR:-/tmp}" in
+  *:*)
+    printf '%s\n' "shdeps test TMPDIR must not contain ':' for mock PATH entries" >&2
+    exit 2
+    ;;
+esac
 _SHDEPS_TEST_TMP_ROOT=$(mktemp -d) || exit 1
+
+# Git treats inherited repository and configuration selectors as higher
+# priority than the fixture's working directory and local configuration.
+unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_DIR GIT_GRAFT_FILE
+unset GIT_INDEX_FILE GIT_NAMESPACE GIT_NO_REPLACE_OBJECTS GIT_OBJECT_DIRECTORY
+unset GIT_PREFIX GIT_QUARANTINE_PATH GIT_REPLACE_REF_BASE GIT_SHALLOW_FILE
+unset GIT_TEMPLATE_DIR GIT_WORK_TREE GIT_IMPLICIT_WORK_TREE
+unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$_SHDEPS_TEST_TMP_ROOT/gitconfig"
 
 # install.sh publishes the physical Lua tree so a stable link never depends on
 # an intermediate directory symlink. macOS commonly exposes this distinction:
