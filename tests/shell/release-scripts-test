@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-SHDEPS_DIR="$(CDPATH='' cd "$(dirname "$0")/../.." && pwd)"
+SHDEPS_DIR="$(CDPATH='' cd "$(dirname "$0")/../.." && pwd -P)"
 
 # shellcheck source=helpers.sh
 . "$(dirname "$0")/helpers.sh"
@@ -51,13 +51,45 @@ done
 # The reverse direction is the one that actually bites: adding a completion or
 # Lua module and forgetting to ship it. Markdown in these trees is contributor
 # documentation rather than runtime payload, so it is excluded deliberately.
-while IFS= read -r _tracked; do
-  if _declared "$_tracked"; then
-    _pass "release config: ships tracked file: $_tracked"
-  else
-    _fail "release config: ships tracked file: $_tracked"
-  fi
-done < <(git -C "$SHDEPS_DIR" ls-files -- completions lua man/man1/shdeps.1 ':!:*.md')
+checkout_gitconfig="$_SHDEPS_TEST_TMP_ROOT/checkout-gitconfig"
+# The CI container can mount the checkout under another uid. Only the tracked
+# payload scan uses this protected config for the exact source directory.
+git config --file "$checkout_gitconfig" safe.directory "$SHDEPS_DIR" || {
+  _fail "release config: cannot configure checkout ownership for the payload scan"
+  _test_summary
+}
+_check_tracked_payload() {
+  local inventory="$_SHDEPS_TEST_TMP_ROOT/payload.list" tracked
+  GIT_CONFIG_GLOBAL="$checkout_gitconfig" git -C "$SHDEPS_DIR" ls-files -z -- \
+    completions lua man/man1/shdeps.1 ':!:*.md' >"$inventory" ||
+    return
+  while IFS= read -r -d '' tracked; do
+    if _declared "$tracked"; then
+      _pass "release config: ships tracked file: $tracked"
+    else
+      _fail "release config: ships tracked file: $tracked"
+    fi
+  done <"$inventory"
+}
+
+_check_tracked_payload || _fail "release config: enumerates tracked runtime payload"
+probe_status=0
+probe_output=$(GIT_TEST_ASSUME_DIFFERENT_OWNER=1 _check_tracked_payload) || probe_status=$?
+_assert_exit "release config: reads its checkout under a different owner" 0 "$probe_status"
+_assert_contains "release config: foreign-owned checkout still has its tracked man page" \
+  "ships tracked file: man/man1/shdeps.1" "$probe_output"
+
+probe_status=0
+probe_output=$(
+  # shellcheck disable=SC2329 # Used by _check_tracked_payload below.
+  git() {
+    printf '%s\0' man/man1/shdeps.1
+    return 17
+  }
+  _check_tracked_payload
+) || probe_status=$?
+_assert_exit "release config: rejects incomplete runtime enumeration" 17 "$probe_status"
+_assert_eq "release config: ignores a partial runtime list" "" "$probe_output"
 
 # The sourceable wrapper is the public Bash API and install.sh is how an
 # extracted archive activates itself. Losing either silently breaks bootstrap.
