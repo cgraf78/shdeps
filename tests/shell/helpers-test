@@ -4,10 +4,12 @@ set -u
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 report=$(mktemp) || exit 1
 fixture=""
+caller_config=""
 
 cleanup() {
   rm -f "$report"
   [[ -z "$fixture" ]] || rm -rf "$fixture"
+  [[ -z "$caller_config" ]] || rm -f "$caller_config"
 }
 trap cleanup EXIT
 
@@ -29,3 +31,20 @@ if [[ -e "$fixture" || -L "$fixture" ]]; then
 fi
 
 echo "PASS: command-substitution temporary directory is removed on exit"
+
+caller_config=$(mktemp) || exit 1
+printf '[audit]\n\tsentinel = preserved\n' >"$caller_config"
+if ! GIT_CONFIG_GLOBAL="$caller_config" bash -c '
+  set -eu
+  source "$1"
+  _mock_home
+  [[ $(git config --global user.name) == Test ]]
+' bash "$REPO_ROOT/tests/shell/helpers.sh"; then
+  echo "FAIL: mock HOME did not initialize a writable fixture Git config" >&2
+  exit 1
+fi
+if [[ $(cat "$caller_config") != $'[audit]\n\tsentinel = preserved' ]]; then
+  echo "FAIL: mock HOME overwrote the caller Git config" >&2
+  exit 1
+fi
+echo "PASS: mock HOME leaves the caller Git config untouched"

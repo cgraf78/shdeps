@@ -492,7 +492,7 @@ else
   _bootstrap_state=$(_tmpdir)/bootstrap-current
   _bootstrap_bin=$(_tmpdir)/bootstrap-bin
   _bootstrap_markers=$(_tmpdir)/bootstrap-markers
-  _bootstrap_home=$(_mock_home)
+  _bootstrap_home=$(_tmpdir) || exit 1
   mkdir -p "$_bootstrap_state" "$_bootstrap_bin"
   cp -R "$_updated_payload/." "$_bootstrap_state/"
   HOME="$_bootstrap_home" PATH="$_release_fakebin:$PATH" \
