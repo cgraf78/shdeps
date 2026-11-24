@@ -18,8 +18,8 @@
 # than the caller's working directory. Release commands run from CI job steps,
 # `cargo` wrappers, and interactive shells, and the crate layout is the fixed
 # reference point in all three.
-RELEASE_SCRIPTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-RELEASE_REPO_ROOT=$(cd "$RELEASE_SCRIPTS_DIR/.." && pwd)
+RELEASE_SCRIPTS_DIR=$(CDPATH='' cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+RELEASE_REPO_ROOT=$(CDPATH='' cd -- "$RELEASE_SCRIPTS_DIR/.." && pwd)
 
 # The config contract, in one place. release_load_config fills these in from
 # scripts/release.conf and rejects the ones that are still empty but required.
@@ -515,27 +515,31 @@ release_restore_bounded_command_traps() {
 }
 
 release_signal_command_group() {
-  local root=$1 signal=$2 member members
+  local group=$1 signal=$2
 
-  members=$(ps -eo pid=,pgid= 2>/dev/null |
-    awk -v group="$root" -v root="$root" '$2 == group && $1 != root { print $1 }')
-  for member in $members; do
-    kill -s "$signal" "$member" 2>/dev/null || true
-  done
-  kill -s "$signal" "$root" 2>/dev/null || true
+  # Monitor mode puts the command in a group led by its PID. The kernel
+  # delivers the signal to its current members, including any children the
+  # command started after TERM. A process-list snapshot can miss them.
+  kill -s "$signal" -- "-$group" 2>/dev/null || true
 }
 
 release_abort_bounded_command() {
-  local signal=$1
+  local signal=$pending_signal
+  [[ -n "$signal" ]] || return 0
+  pending_signal=''
 
+  # Finish the active teardown even if another signal reaches the caller.
+  trap '' HUP INT TERM
+  if [[ -n "$watchdog" ]]; then
+    release_signal_command_group "$watchdog" TERM
+    wait "$watchdog" 2>/dev/null || true
+    watchdog=''
+  fi
   if [[ -n "$pid" ]]; then
     release_signal_command_group "$pid" TERM
     release_signal_command_group "$pid" KILL
     wait "$pid" 2>/dev/null || true
-  fi
-  if [[ -n "$watchdog" ]]; then
-    kill "$watchdog" 2>/dev/null || true
-    wait "$watchdog" 2>/dev/null || true
+    pid=''
   fi
   [[ "$monitor_enabled" == 1 ]] || set +m
   rm -f "$marker"
@@ -543,51 +547,74 @@ release_abort_bounded_command() {
   kill -s "$signal" "$bounded_command_shell_pid"
 }
 
+release_request_bounded_stop() {
+  # The trap and teardown share release_bounded_command's local state.
+  # The first signal owns cleanup even when the caller's restored trap returns.
+  ((pending_status == 0)) || return 0
+  pending_signal=$1 pending_status=$2
+  if ((handles_ready)); then
+    release_abort_bounded_command
+  fi
+}
+
 release_bounded_command() {
   local timeout_seconds=${RELEASE_NETWORK_TIMEOUT_SECONDS:-120}
   local kill_after=${RELEASE_NETWORK_KILL_AFTER_SECONDS:-5}
   local bounded_command_shell_pid marker old_hup_trap old_int_trap old_term_trap
   local monitor_enabled=0 pid='' watchdog='' status
+  local handles_ready=0 pending_signal='' pending_status=0
 
   marker=$(mktemp "${TMPDIR:-/tmp}/release-network-timeout.XXXXXX") || return 1
   rm -f "$marker"
-  bounded_command_shell_pid=$(sh -c 'printf "%s\n" "$PPID"')
+  # Replace the substitution shell to get this caller's PID even when an
+  # older Bash keeps that intermediate shell for a simple command.
+  bounded_command_shell_pid=$(exec sh -c 'printf "%s\n" "$PPID"')
   old_hup_trap=$(trap -p HUP)
   old_int_trap=$(trap -p INT)
   old_term_trap=$(trap -p TERM)
-  trap 'release_abort_bounded_command HUP' HUP
-  trap 'release_abort_bounded_command INT' INT
-  trap 'release_abort_bounded_command TERM' TERM
+  # Bash can run a trap between forking and assigning $!. Defer cancellation
+  # until both child handles are recorded so neither can escape teardown.
+  trap 'release_request_bounded_stop HUP 129' HUP
+  trap 'release_request_bounded_stop INT 130' INT
+  trap 'release_request_bounded_stop TERM 143' TERM
   [[ $- != *m* ]] || monitor_enabled=1
+  # A command substitution can inherit the option without active job control.
+  # Re-enable it explicitly before launching the groups this call will own.
+  set +m
   set -m
   "$@" &
   pid=$!
-  [[ "$monitor_enabled" == 1 ]] || set +m
   (
-    local sleeper=
-    trap '[[ -z "$sleeper" ]] || kill "$sleeper" 2>/dev/null || true' EXIT
+    # The watchdog's sleep belongs to its group, so the caller can cancel
+    # both even when interrupted while the timer is starting up.
+    set +m
     trap 'exit 0' HUP INT TERM
-
-    sleep "$timeout_seconds" &
-    sleeper=$!
-    wait "$sleeper" 2>/dev/null || exit 0
-    sleeper=
+    sleep "$timeout_seconds" || exit 0
     if kill -0 "$pid" 2>/dev/null; then
       : >"$marker"
       release_signal_command_group "$pid" TERM
-      sleep "$kill_after" &
-      sleeper=$!
-      wait "$sleeper" 2>/dev/null || exit 0
-      sleeper=
+      sleep "$kill_after" || exit 0
       release_signal_command_group "$pid" KILL
     fi
-  ) &
+  ) </dev/null >/dev/null 2>&1 &
   watchdog=$!
-  if wait "$pid"; then status=0; else status=$?; fi
-  if [[ ! -f "$marker" ]]; then
-    kill "$watchdog" 2>/dev/null || true
+  [[ "$monitor_enabled" == 1 ]] || set +m
+  handles_ready=1
+  if ((pending_status)); then
+    release_abort_bounded_command
+    return "$pending_status"
   fi
-  wait "$watchdog" 2>/dev/null || true
+  if wait "$pid"; then status=0; else status=$?; fi
+  if [[ -n "$watchdog" ]]; then
+    if [[ ! -f "$marker" ]]; then
+      release_signal_command_group "$watchdog" TERM
+    fi
+    wait "$watchdog" 2>/dev/null || true
+  fi
+  watchdog='' pid=''
+  if ((pending_status)); then
+    return "$pending_status"
+  fi
   release_restore_bounded_command_traps
   if [[ -f "$marker" ]]; then status=124; fi
   rm -f "$marker"
