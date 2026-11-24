@@ -640,7 +640,7 @@ release_remote_ref_matches() {
 release_cut() {
   local push=0 dry_run=0
   local remote branch remote_ref head_commit remote_commit tag tag_type tagged_commit
-  local remote_tag_status gh_error push_status tag_exists=0
+  local worktree_status remote_tag_status gh_error push_status tag_exists=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -670,7 +670,12 @@ release_cut() {
     release_die "run from $branch"
     return 1
   }
-  [[ -z $(git status --porcelain) ]] || {
+  # Release cleanliness cannot depend on the caller's status preferences.
+  worktree_status=$(git status --porcelain --untracked-files=normal --ignore-submodules=none) || {
+    release_die "cannot check worktree status"
+    return 1
+  }
+  [[ -z "$worktree_status" ]] || {
     release_die "worktree must be clean"
     return 1
   }
