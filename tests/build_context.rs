@@ -226,6 +226,30 @@ fn cargo_reuses_unchanged_linked_worktree_and_tracks_branch_commit() {
 }
 
 #[test]
+fn cargo_refreshes_version_when_a_symbolic_branch_is_retargeted() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let next = fixture.git(
+        &repo,
+        &["commit-tree", "HEAD^{tree}", "-m", "alternate head"],
+    );
+    fixture.git(&repo, &["update-ref", "refs/heads/alternate", &next]);
+    fixture.git(
+        &repo,
+        &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+    );
+    fixture.git(&repo, &["symbolic-ref", "HEAD", "refs/heads/alias"]);
+    assert_eq!(run(&mut fixture.cargo(&repo)), fixture.version(&repo));
+
+    // Only the intermediate ref changes. HEAD and both leaf refs stay put.
+    fixture.git(
+        &repo,
+        &["symbolic-ref", "refs/heads/alias", "refs/heads/alternate"],
+    );
+    assert_eq!(run(&mut fixture.cargo(&repo)), fixture.version(&repo));
+}
+
+#[test]
 fn cargo_tracks_reftable_linked_branch_commit() {
     let Some(fixture) = Fixture::with_reftable(true) else {
         return; // Older Git builds have only the files backend.
