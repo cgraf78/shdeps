@@ -250,6 +250,53 @@ fn cargo_refreshes_version_when_a_symbolic_branch_is_retargeted() {
 }
 
 #[test]
+fn cargo_tracks_an_ordinary_branch_when_git_lacks_one_hop_lookup() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let real_git = run(fixture.command("sh", &repo).args(["-c", "command -v git"]));
+    let bin = fixture.target.join("old-git-bin");
+    fs::create_dir(&bin).unwrap();
+    let script = r#"#!/usr/bin/env sh
+for option do
+    [ "$option" != --no-recurse ] || exit 129
+done
+PATH=$SYMBOLIC_FIXTURE_PATH
+export PATH
+exec "$SYMBOLIC_FIXTURE_GIT" "$@"
+"#;
+    // Produce the executable in a child, so parallel test subprocesses
+    // cannot inherit a descriptor open for writing it.
+    run(fixture
+        .command("sh", &repo)
+        .args([
+            "-c",
+            "printf '%s\\n' \"$2\" >\"$1\" || exit 1\nchmod 700 \"$1\"",
+            "write-fixture",
+        ])
+        .arg(bin.join("git"))
+        .arg(script));
+    let ambient_path = std::env::var_os("PATH").unwrap();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&ambient_path)))
+            .unwrap();
+    let build = || {
+        let mut command = fixture.cargo(&repo);
+        command
+            .env("PATH", &path)
+            .env("SYMBOLIC_FIXTURE_PATH", &ambient_path)
+            .env("SYMBOLIC_FIXTURE_GIT", &real_git);
+        run(&mut command)
+    };
+    assert_eq!(build(), fixture.version(&repo));
+
+    fixture.git(
+        &repo,
+        &["commit", "--quiet", "--allow-empty", "-m", "new head"],
+    );
+    assert_eq!(build(), fixture.version(&repo));
+}
+
+#[test]
 fn cargo_tracks_reftable_linked_branch_commit() {
     let Some(fixture) = Fixture::with_reftable(true) else {
         return; // Older Git builds have only the files backend.

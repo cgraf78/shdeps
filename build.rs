@@ -61,7 +61,10 @@ fn watch_git_head() {
         watch_reftable();
         return;
     }
-    let Some(mut reference) = symbolic_target("HEAD") else {
+    // Git before 2.39 can still report the leaf ref recursively.
+    let Some(mut reference) =
+        symbolic_target("HEAD").or_else(|| git_output(&["symbolic-ref", "--quiet", "HEAD"]))
+    else {
         return;
     };
 
