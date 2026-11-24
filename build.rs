@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,7 +61,10 @@ fn watch_git_head() {
         watch_reftable();
         return;
     }
-    let Some(reference) = git_output(&["symbolic-ref", "--quiet", "HEAD"]) else {
+    // Git before 2.39 can still report the leaf ref recursively.
+    let Some(mut reference) =
+        symbolic_target("HEAD").or_else(|| git_output(&["symbolic-ref", "--quiet", "HEAD"]))
+    else {
         return;
     };
 
@@ -68,14 +72,26 @@ fn watch_git_head() {
     if let Some(packed) = git_path("packed-refs").filter(|path| path.is_file()) {
         println!("cargo:rerun-if-changed={}", packed.display());
     }
-    let Some(loose) = git_path(&reference) else {
-        return;
-    };
-    // A packed-only branch gets a loose ref on its next update. Watch the
-    // containing directory until then, since Cargo always reruns on missing paths.
-    if let Some(existing) = loose.ancestors().find(|path| path.exists()) {
-        println!("cargo:rerun-if-changed={}", existing.display());
+    let mut visited = HashSet::new();
+    while visited.insert(reference.clone()) {
+        let Some(loose) = git_path(&reference) else {
+            return;
+        };
+        // A packed-only branch gets a loose ref on its next update. Watch the
+        // containing directory until then, since Cargo always reruns on missing paths.
+        if let Some(existing) = loose.ancestors().find(|path| path.exists()) {
+            println!("cargo:rerun-if-changed={}", existing.display());
+        }
+        let Some(target) = symbolic_target(&reference) else {
+            break;
+        };
+        reference = target;
     }
+}
+
+/// Follow one hop so retargeting an intermediate symbolic branch triggers a build.
+fn symbolic_target(reference: &str) -> Option<String> {
+    git_output(&["symbolic-ref", "--quiet", "--no-recurse", reference])
 }
 
 /// Reftable stores branch refs in the common index and linked HEADs in a local index.
