@@ -127,14 +127,12 @@ fn build_command(program: &str) -> Command {
     let mut command = Command::new(program);
     command.env_remove("BASH_ENV").env_remove("ENV");
     // Git hooks and wrappers can export metadata for a different checkout.
-    // Clear the repository-local variables reported by git rev-parse --local-env-vars
-    // before reading HEAD, its storage paths, or a commit timestamp.
+    // Clear repository selectors before reading HEAD, storage paths, or timestamps.
+    // Keep command configuration so callers can explicitly trust a checkout with
+    // safe.directory, including when the build runs under a different account.
     for name in [
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_COMMON_DIR",
-        "GIT_CONFIG",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS",
         "GIT_DIR",
         "GIT_GRAFT_FILE",
         "GIT_IMPLICIT_WORK_TREE",

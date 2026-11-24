@@ -253,6 +253,26 @@ fn cargo_keeps_build_provenance_scoped_to_the_checkout() {
 }
 
 #[test]
+fn cargo_honors_command_scoped_safe_directory() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let commit = fixture.commit_at(&repo, "2026-02-03T04:05:06Z");
+    let canonical_repo = repo.canonicalize().unwrap();
+
+    // Exercise Git's actual ownership check without changing fixture ownership.
+    assert_eq!(
+        run(fixture
+            .cargo(&repo)
+            .env_remove("SHDEPS_BUILD_TIMESTAMP")
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "safe.directory")
+            .env("GIT_CONFIG_VALUE_0", canonical_repo)),
+        format!("20260203-040506-{}", &commit[..8]),
+    );
+}
+
+#[test]
 fn cargo_ignores_an_ambient_git_common_directory() {
     let fixture = Fixture::new();
     let repo = fixture.repo();
