@@ -106,6 +106,16 @@ impl Fixture {
         run(self.command("git", repo).args(args))
     }
 
+    /// Move HEAD without touching any package inputs and return its new commit.
+    fn commit_at(&self, repo: &Path, date: &str) -> String {
+        run(self
+            .command("git", repo)
+            .args(["commit", "--quiet", "--allow-empty", "-m", "dated commit"])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date));
+        self.git(repo, &["rev-parse", "HEAD"])
+    }
+
     // Use the toolchain that built this test, with its registry and targets in the fixture.
     fn cargo(&self, repo: &Path) -> Command {
         let cargo = Path::new(env!("CARGO"));
@@ -205,6 +215,77 @@ fn source_snapshot_accepts_an_explicit_commit() {
             .cargo(&snapshot)
             .env("SHDEPS_BUILD_COMMIT", "deadbeef")),
         "20010203-040506-deadbeef",
+    );
+}
+
+#[test]
+fn cargo_keeps_build_provenance_scoped_to_the_checkout() {
+    let fixture = Fixture::new();
+    let repo = fixture.linked();
+    let foreign_fixture = Fixture::new();
+    let foreign = foreign_fixture.repo();
+    foreign_fixture.commit_at(&foreign, "2026-01-02T03:04:05Z");
+    let commit = fixture.commit_at(&repo, "2026-02-03T04:05:06Z");
+    let expected = format!("20260203-040506-{}", &commit[..8]);
+    let build = || {
+        let mut command = fixture.cargo(&repo);
+        command
+            .env_remove("SHDEPS_BUILD_TIMESTAMP")
+            .env("GIT_DIR", foreign.join(".git"))
+            .env("GIT_WORK_TREE", &foreign);
+        command
+    };
+    assert_eq!(run(&mut build()), expected);
+
+    // Dropping the unrelated environment must leave the cached stamp valid.
+    let clean = checked(fixture.cargo(&repo).env_remove("SHDEPS_BUILD_TIMESTAMP"));
+    assert_eq!(String::from_utf8_lossy(&clean.stdout).trim(), expected);
+    let diagnostics = String::from_utf8_lossy(&clean.stderr);
+    assert!(diagnostics.contains("Fresh build-context"), "{diagnostics}");
+
+    // The cached build should follow only the checkout that supplied the stamp.
+    foreign_fixture.commit_at(&foreign, "2026-03-04T05:06:07Z");
+    let unchanged = checked(&mut build());
+    let diagnostics = String::from_utf8_lossy(&unchanged.stderr);
+    assert!(diagnostics.contains("Fresh build-context"), "{diagnostics}");
+    let next = fixture.commit_at(&repo, "2026-04-05T06:07:08Z");
+    assert_eq!(run(&mut build()), format!("20260405-060708-{}", &next[..8]));
+}
+
+#[test]
+fn cargo_ignores_an_ambient_git_common_directory() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let foreign_fixture = Fixture::new();
+    let foreign = foreign_fixture.repo();
+    foreign_fixture.commit_at(&foreign, "2026-01-02T03:04:05Z");
+    let commit = fixture.commit_at(&repo, "2026-02-03T04:05:06Z");
+
+    assert_eq!(
+        run(fixture
+            .cargo(&repo)
+            .env_remove("SHDEPS_BUILD_TIMESTAMP")
+            .env("GIT_COMMON_DIR", foreign.join(".git"))),
+        format!("20260203-040506-{}", &commit[..8]),
+    );
+}
+
+#[test]
+fn cargo_ignores_an_ambient_git_object_directory() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo();
+    let foreign_fixture = Fixture::new();
+    let commit = fixture.commit_at(&repo, "2026-02-03T04:05:06Z");
+
+    assert_eq!(
+        run(fixture
+            .cargo(&repo)
+            .env_remove("SHDEPS_BUILD_TIMESTAMP")
+            .env(
+                "GIT_OBJECT_DIRECTORY",
+                foreign_fixture.repo().join(".git/objects")
+            )),
+        format!("20260203-040506-{}", &commit[..8]),
     );
 }
 

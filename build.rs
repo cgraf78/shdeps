@@ -122,10 +122,32 @@ fn git_output(args: &[&str]) -> Option<String> {
     Some(stdout.strip_suffix('\n').unwrap_or(&stdout).to_owned())
 }
 
-/// Prevent shell-backed tools and the Bash formatter from sourcing caller startup files.
+/// Scope Git discovery in both direct commands and the Bash version formatter.
 fn build_command(program: &str) -> Command {
     let mut command = Command::new(program);
     command.env_remove("BASH_ENV").env_remove("ENV");
+    // Git hooks and wrappers can export metadata for a different checkout.
+    // Clear the repository-local variables reported by git rev-parse --local-env-vars
+    // before reading HEAD, its storage paths, or a commit timestamp.
+    for name in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    ] {
+        command.env_remove(name);
+    }
     // Cargo runs this script in the crate root. For an exported snapshot,
     // keep Git and the formatter's timestamp lookup from searching parents.
     if !Path::new(".git").exists() {
